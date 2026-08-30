@@ -701,6 +701,8 @@ const IRP_MJ_DEVICE_CONTROL: u64 = major::IRP_MJ_DEVICE_CONTROL as u64;
 const IRP_MJ_INTERNAL_DEVICE_CONTROL: u64 = major::IRP_MJ_INTERNAL_DEVICE_CONTROL as u64;
 const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
+const IRP_MN_QUERY_DEVICE_RELATIONS: u64 = nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS as u64;
+const IRP_MN_QUERY_ID: u64 = nt_pnp_abi::IRP_MN_QUERY_ID as u64;
 const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// `IRP_MJ_CLOSE` releases the FILE_OBJECT. Cleanup may disconnect the open first, but the same
 /// FILE_OBJECT must remain available for close through the per-open FILE_OBJECT registry.
@@ -31720,6 +31722,40 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 allocated_resources_translated,
             }
         }
+        IRP_MJ_PNP if minor == IRP_MN_QUERY_DEVICE_RELATIONS => {
+            if inlen != 0
+                || outlen != 0
+                || request.parameter_offset != 0
+                || request.parameter_len != 0
+            {
+                pool_free(irp);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            WdmIoStackParameters::PnpQueryDeviceRelations {
+                relation_type: fsctl as u32,
+            }
+        }
+        IRP_MJ_PNP if minor == IRP_MN_QUERY_ID => {
+            if inlen != 0
+                || outlen != 0
+                || request.parameter_offset != 0
+                || request.parameter_len != 0
+            {
+                pool_free(irp);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            WdmIoStackParameters::PnpQueryId {
+                id_type: fsctl as u32,
+            }
+        }
         _ => WdmIoStackParameters::None,
     };
     let iosl_bytes =
@@ -34799,6 +34835,7 @@ fn projection_fsctl(irp: &IrpProjection) -> u64 {
         IoParameters::SetInformation(p) => p.info_class as u64,
         IoParameters::QueryVolumeInformation(p) => p.information_class as u64,
         IoParameters::SetVolumeInformation(p) => p.information_class as u64,
+        IoParameters::Pnp(p) => p.wire_argument().unwrap_or(0) as u64,
         _ => 0,
     }
 }
@@ -34849,7 +34886,7 @@ fn hosted_irp_dispatch_request(
     }
     let (parameter_offset, parameter_len) = match &irp.parameters {
         IoParameters::Pnp(parameters) => parameters
-            .start
+            .start_parameters()
             .map(|start| {
                 (
                     start.raw_resource_list_len,
@@ -43924,7 +43961,7 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
             status: nt_status::NtStatus::INVALID_PARAMETER,
         };
     };
-    let Some(start) = parameters.start else {
+    let Some(start) = parameters.start_parameters() else {
         return PnpBackendDispatch::NotDispatched {
             status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         };

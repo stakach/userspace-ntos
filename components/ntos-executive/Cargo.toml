@@ -71,6 +71,7 @@ nt-root-bus = { path = "../../crates/nt-root-bus" }
 # PnP resource-assignment policy — PCI enum + BAR-size probe + CM_RESOURCE_LIST build. The
 # executive-side broker (pnp.rs) mints the caps this policy's resource list describes.
 nt-pnp = { path = "../../crates/nt-pnp" }
+nt-pnp-abi = { path = "../../crates/nt-pnp-abi" }
 nt-pnp-manager = { path = "../../crates/nt-pnp-manager" }
 nt-power-manager = { path = "../../crates/nt-power-manager" }
 nt-power-types = { path = "../../crates/nt-power-types" }

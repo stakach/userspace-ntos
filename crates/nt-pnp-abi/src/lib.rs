@@ -43,7 +43,24 @@ pub const IRP_MN_CANCEL_REMOVE_DEVICE: u8 = 0x03;
 pub const IRP_MN_STOP_DEVICE: u8 = 0x04;
 pub const IRP_MN_QUERY_STOP_DEVICE: u8 = 0x05;
 pub const IRP_MN_CANCEL_STOP_DEVICE: u8 = 0x06;
+pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 0x07;
+pub const IRP_MN_QUERY_ID: u8 = 0x13;
 pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
+
+pub const BUS_RELATIONS: u32 = 0;
+pub const EJECTION_RELATIONS: u32 = 1;
+pub const POWER_RELATIONS: u32 = 2;
+pub const REMOVAL_RELATIONS: u32 = 3;
+pub const TARGET_DEVICE_RELATION: u32 = 4;
+pub const SINGLE_BUS_RELATIONS: u32 = 5;
+pub const TRANSPORT_RELATIONS: u32 = 6;
+
+pub const BUS_QUERY_DEVICE_ID: u32 = 0;
+pub const BUS_QUERY_HARDWARE_IDS: u32 = 1;
+pub const BUS_QUERY_COMPATIBLE_IDS: u32 = 2;
+pub const BUS_QUERY_INSTANCE_ID: u32 = 3;
+pub const BUS_QUERY_DEVICE_SERIAL_NUMBER: u32 = 4;
+pub const BUS_QUERY_CONTAINER_ID: u32 = 5;
 
 /// The v0.1 devnode state machine (spec §8.1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -263,5 +280,9 @@ mod tests {
         assert_eq!(IRP_MJ_PNP, 27);
         assert_eq!(IRP_MN_START_DEVICE, 0);
         assert_eq!(IRP_MN_REMOVE_DEVICE, 2);
+        assert_eq!(IRP_MN_QUERY_DEVICE_RELATIONS, 7);
+        assert_eq!(IRP_MN_QUERY_ID, 0x13);
+        assert_eq!(BUS_RELATIONS, 0);
+        assert_eq!(BUS_QUERY_INSTANCE_ID, 3);
     }
 }

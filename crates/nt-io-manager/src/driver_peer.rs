@@ -221,9 +221,9 @@ fn build_dispatch_request(
             0,
             0,
         ),
-        crate::irp::IoParameters::Pnp(p) => match p.start {
+        crate::irp::IoParameters::Pnp(p) => match p.start_parameters() {
             Some(start) => (
-                0,
+                p.wire_argument().unwrap_or(0),
                 p.input_len(),
                 0,
                 0,
@@ -237,7 +237,21 @@ fn build_dispatch_request(
                 start.raw_resource_list_len,
                 start.translated_resource_list_len,
             ),
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (
+                p.wire_argument().unwrap_or(0),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
         },
         _ => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     };

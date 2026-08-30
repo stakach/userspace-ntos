@@ -18408,3 +18408,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     canonical top-of-stack route, and retains or aborts that exact queue owner across pending,
     malformed, and transport-failure paths. Only the returned PDO array may drive subsequent
     `IRP_MN_QUERY_ID` requests and CM publication.
+
+    B3 typed PnP query IRP substrate (2026-08-30): the canonical PnP ABI now names native
+    `IRP_MN_QUERY_DEVICE_RELATIONS`, `IRP_MN_QUERY_ID`, relation types, and bus query-ID types.
+    `nt-io-manager::PnpParameters` represents lifecycle, START, relation query, and ID query as
+    mutually exclusive typed states; callers cannot combine a START resource payload with a query
+    selector. Both direct hosted dispatch and driver-peer wire projection carry the query selector
+    explicitly, and the hosted WDM builder writes the selector into the native
+    `IO_STACK_LOCATION.Parameters` union for the real driver call.
+
+    Validation passes all `236/236` `nt-io-manager` tests and `5/5` `nt-pnp-abi` tests. The
+    freestanding executive check passes at the unchanged 209-warning baseline. Review adjustment:
+    the typed query path is ready, but relation ownership still must not be completed from an opaque
+    driver pointer. The next worker slice must claim one invalidation, dispatch the typed relation
+    IRP through the canonical top of stack, retain pending completion identity, and copy the returned
+    `DEVICE_RELATIONS` allocation through the owning component's validated pool alias before that
+    allocation is released. Malformed pointers/counts and indeterminate transport remain barriers.

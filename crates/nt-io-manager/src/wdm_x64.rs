@@ -156,6 +156,12 @@ pub enum WdmIoStackParameters {
         allocated_resources: u64,
         allocated_resources_translated: u64,
     },
+    PnpQueryDeviceRelations {
+        relation_type: u32,
+    },
+    PnpQueryId {
+        id_type: u32,
+    },
 }
 
 impl Default for WdmIoStackParameters {
@@ -431,6 +437,12 @@ pub fn write_wdm_io_stack_location(
         } => {
             put_u64(bytes, 0x08, allocated_resources);
             put_u64(bytes, 0x10, allocated_resources_translated);
+        }
+        WdmIoStackParameters::PnpQueryDeviceRelations { relation_type } => {
+            put_u32(bytes, 0x08, relation_type);
+        }
+        WdmIoStackParameters::PnpQueryId { id_type } => {
+            put_u32(bytes, 0x08, id_type);
         }
     }
     Ok(())

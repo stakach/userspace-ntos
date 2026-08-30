@@ -135,7 +135,15 @@ pub struct PnpStartParameters {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct PnpParameters {
     pub minor: u8,
-    pub start: Option<PnpStartParameters>,
+    kind: PnpParameterKind,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum PnpParameterKind {
+    Lifecycle,
+    Start(PnpStartParameters),
+    QueryDeviceRelations { relation_type: u32 },
+    QueryId { id_type: u32 },
 }
 
 impl PnpParameters {
@@ -143,7 +151,10 @@ impl PnpParameters {
         if minor == nt_pnp_abi::IRP_MN_START_DEVICE || !Self::is_lifecycle_minor(minor) {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        Ok(Self { minor, start: None })
+        Ok(Self {
+            minor,
+            kind: PnpParameterKind::Lifecycle,
+        })
     }
 
     pub fn start(
@@ -159,22 +170,64 @@ impl PnpParameters {
         }
         Ok(Self {
             minor: nt_pnp_abi::IRP_MN_START_DEVICE,
-            start: Some(PnpStartParameters {
+            kind: PnpParameterKind::Start(PnpStartParameters {
                 raw_resource_list_len,
                 translated_resource_list_len,
             }),
         })
     }
 
+    pub const fn query_device_relations(relation_type: u32) -> Self {
+        Self {
+            minor: nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS,
+            kind: PnpParameterKind::QueryDeviceRelations { relation_type },
+        }
+    }
+
+    pub const fn query_id(id_type: u32) -> Self {
+        Self {
+            minor: nt_pnp_abi::IRP_MN_QUERY_ID,
+            kind: PnpParameterKind::QueryId { id_type },
+        }
+    }
+
+    pub const fn start_parameters(self) -> Option<PnpStartParameters> {
+        match self.kind {
+            PnpParameterKind::Start(start) => Some(start),
+            _ => None,
+        }
+    }
+
+    pub const fn relation_type(self) -> Option<u32> {
+        match self.kind {
+            PnpParameterKind::QueryDeviceRelations { relation_type } => Some(relation_type),
+            _ => None,
+        }
+    }
+
+    pub const fn id_type(self) -> Option<u32> {
+        match self.kind {
+            PnpParameterKind::QueryId { id_type } => Some(id_type),
+            _ => None,
+        }
+    }
+
+    pub const fn wire_argument(self) -> Option<u32> {
+        match self.kind {
+            PnpParameterKind::QueryDeviceRelations { relation_type } => Some(relation_type),
+            PnpParameterKind::QueryId { id_type } => Some(id_type),
+            _ => None,
+        }
+    }
+
     pub fn input_len(self) -> u32 {
-        self.start
-            .map(|start| {
-                start
-                    .raw_resource_list_len
-                    .checked_add(start.translated_resource_list_len)
-                    .expect("validated PnP START extents overflowed")
-            })
-            .unwrap_or(0)
+        match self.kind {
+            PnpParameterKind::Start(start) => start
+                .raw_resource_list_len
+                .checked_add(start.translated_resource_list_len)
+                .expect("validated PnP START extents overflowed"),
+            _ => 0,
+        }
     }
 
     fn is_lifecycle_minor(minor: u8) -> bool {
