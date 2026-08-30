@@ -19500,14 +19500,9 @@ impl ExecNtHandler {
         else {
             return Ok(false);
         };
-        let mut state = LiveDeviceActionState::new(event).map_err(|()| STATUS_INVALID_PARAMETER)?;
-        if matches!(state.event.kind, nt_config_client::DeviceActionKind::Change) {
-            state
-                .owner
-                .retain_barrier(STATUS_NOT_SUPPORTED)
-                .map_err(|_| STATUS_INVALID_PARAMETER)?;
-        }
-        self.pnp_live_action = Some(state);
+        self.pnp_live_action = Some(
+            LiveDeviceActionState::new(event).map_err(|()| STATUS_INVALID_PARAMETER)?,
+        );
         Ok(true)
     }
 
@@ -19577,9 +19572,10 @@ impl ExecNtHandler {
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
-    pub(crate) fn pnp_complete_live_removal(
+    pub(crate) fn pnp_complete_live_operation(
         &mut self,
         identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
         owner_slot: usize,
         status: u32,
     ) -> Result<(), u32> {
@@ -19590,17 +19586,14 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_PARAMETER)?;
         state
             .owner
-            .complete(
-                nt_pnp_manager::DeviceActionLifecycleOperation::Remove,
-                owner_slot,
-                status,
-            )
+            .complete(operation, owner_slot, status)
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
-    pub(crate) fn pnp_retain_live_removal_barrier(
+    pub(crate) fn pnp_retain_live_operation_barrier(
         &mut self,
         identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
         status: u32,
     ) -> Result<(), u32> {
         let state = self
@@ -19608,10 +19601,15 @@ impl ExecNtHandler {
             .as_mut()
             .filter(|state| state.matches(identity))
             .ok_or(STATUS_INVALID_PARAMETER)?;
-        if state.owner.lifecycle()
-            == (nt_pnp_manager::DeviceActionLifecycleState::Barrier { status })
-        {
-            return Ok(());
+        match state.owner.lifecycle() {
+            nt_pnp_manager::DeviceActionLifecycleState::Barrier {
+                status: current_status,
+            } if current_status == status => return Ok(()),
+            nt_pnp_manager::DeviceActionLifecycleState::InFlight {
+                operation: current_operation,
+                ..
+            } if current_operation == operation => {}
+            _ => return Err(STATUS_INVALID_PARAMETER),
         }
         state
             .owner
@@ -19928,6 +19926,120 @@ impl ExecNtHandler {
         }
     }
 
+    fn pnp_begin_live_operation_claim(
+        &mut self,
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
+        owner_slot: usize,
+    ) -> Result<(), u32> {
+        let state = self
+            .pnp_live_action
+            .as_mut()
+            .filter(|state| state.matches(identity))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if state.owner.respond().is_ok() && state.owner.begin(operation, owner_slot).is_ok() {
+            return Ok(());
+        }
+        let _ = state.owner.retain_barrier(STATUS_INVALID_PARAMETER);
+        Err(STATUS_INVALID_PARAMETER)
+    }
+
+    unsafe fn pnp_begin_rebalance(
+        &mut self,
+        device_id: u64,
+        driver_id: u64,
+        ready_for_pnp: bool,
+        spec: DriverServiceLaunchSpec,
+        live_identity: Option<nt_pnp_manager::DeviceActionClaimIdentity>,
+    ) -> u32 {
+        const OPERATION: nt_pnp_manager::DeviceActionLifecycleOperation =
+            nt_pnp_manager::DeviceActionLifecycleOperation::Rebalance;
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        let reservation = match self.pending_pnp_operations.reserve() {
+            Ok(reservation) => reservation,
+            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+        };
+        let owner_slot = reservation.slot();
+        if let Some(identity) = live_identity {
+            if let Err(status) = self.pnp_begin_live_operation_claim(identity, OPERATION, owner_slot)
+            {
+                self.pending_pnp_operations
+                    .cancel(reservation)
+                    .expect("rejected live rebalance lost its reservation");
+                return status;
+            }
+        }
+
+        let mut batch = OwnedHostedPnpRebalance::new(device_id, driver_id, ready_for_pnp, spec);
+        match batch.drive() {
+            OwnedHostedPnpRebalanceProgress::AwaitingCompletion => {
+                self.pending_pnp_operation_transfer = Some(PendingPnpOperationTransfer {
+                    operation: OwnedPendingPnpOperation::Rebalance(batch),
+                    reservation,
+                    kind: live_identity
+                        .map(|identity| PendingPnpOperationTransferKind::DeviceAction {
+                            identity,
+                            operation: OPERATION,
+                        })
+                        .unwrap_or(PendingPnpOperationTransferKind::User),
+                });
+                nt_status::NtStatus::PENDING.raw() as u32
+            }
+            OwnedHostedPnpRebalanceProgress::Complete(result) => {
+                self.pending_pnp_operations
+                    .cancel(reservation)
+                    .expect("synchronous PnP rebalance lost its reservation");
+                let status = match result {
+                    Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
+                    Err(failure) => failure.status.raw() as u32,
+                };
+                if let Some(identity) = live_identity {
+                    if self
+                        .pnp_complete_live_operation(identity, OPERATION, owner_slot, status)
+                        .is_err()
+                    {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    let _ = self.pnp_try_acknowledge_live_action();
+                }
+                status
+            }
+            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) => {
+                let status = failure.status.raw() as u32;
+                let owner = if let Some(identity) = live_identity {
+                    if self
+                        .pnp_retain_live_operation_barrier(identity, OPERATION, status)
+                        .is_err()
+                    {
+                        self.pending_pnp_operations
+                            .cancel(reservation)
+                            .expect("invalid live rebalance barrier lost its reservation");
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    PendingPnpOperationOwner::DeviceAction {
+                        identity,
+                        operation: OPERATION,
+                        reply: None,
+                    }
+                } else {
+                    PendingPnpOperationOwner::User(None)
+                };
+                self.pending_pnp_operations
+                    .publish(
+                        reservation,
+                        PendingPnpOperation {
+                            operation: OwnedPendingPnpOperation::Rebalance(batch),
+                            owner,
+                        },
+                    )
+                    .expect("indeterminate PnP rebalance rejected its barrier owner");
+                status
+            }
+        }
+    }
+
     unsafe fn pnp_control_reset_device(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_DEVICE_CONTROL_LEN {
             return STATUS_INVALID_PARAMETER;
@@ -19964,46 +20076,7 @@ impl ExecNtHandler {
             Ok(device_id) => device_id,
             Err(status) => return status.raw() as u32,
         };
-        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        let reservation = match self.pending_pnp_operations.reserve() {
-            Ok(reservation) => reservation,
-            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
-        };
-        let mut batch =
-            OwnedHostedPnpRebalance::new(device_id, driver_id, ready_for_pnp, spec);
-        match batch.drive() {
-            OwnedHostedPnpRebalanceProgress::AwaitingCompletion => {
-                self.pending_pnp_operation_transfer = Some(PendingPnpOperationTransfer {
-                    operation: OwnedPendingPnpOperation::Rebalance(batch),
-                    reservation,
-                    kind: PendingPnpOperationTransferKind::User,
-                });
-                nt_status::NtStatus::PENDING.raw() as u32
-            }
-            OwnedHostedPnpRebalanceProgress::Complete(result) => {
-                self.pending_pnp_operations
-                    .cancel(reservation)
-                    .expect("synchronous PnP rebalance lost its reservation");
-                match result {
-                    Ok(_) => 0,
-                    Err(failure) => failure.status.raw() as u32,
-                }
-            }
-            OwnedHostedPnpRebalanceProgress::OwnershipLost(failure) => {
-                self.pending_pnp_operations
-                    .publish(
-                        reservation,
-                        PendingPnpOperation {
-                            operation: OwnedPendingPnpOperation::Rebalance(batch),
-                            owner: PendingPnpOperationOwner::User(None),
-                        },
-                    )
-                    .expect("indeterminate PnP rebalance rejected its barrier owner");
-                failure.status.raw() as u32
-            }
-        }
+        self.pnp_begin_rebalance(device_id, driver_id, ready_for_pnp, spec, None)
     }
 
     unsafe fn pnp_begin_removal(
@@ -20012,6 +20085,8 @@ impl ExecNtHandler {
         kind: HostedPnpRemovalKind,
         live_identity: Option<nt_pnp_manager::DeviceActionClaimIdentity>,
     ) -> u32 {
+        const OPERATION: nt_pnp_manager::DeviceActionLifecycleOperation =
+            nt_pnp_manager::DeviceActionLifecycleOperation::Remove;
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -20021,33 +20096,12 @@ impl ExecNtHandler {
         };
         let owner_slot = reservation.slot();
         if let Some(identity) = live_identity {
-            let accepted = if let Some(state) = self
-                .pnp_live_action
-                .as_mut()
-                .filter(|state| state.matches(identity))
+            if let Err(status) = self.pnp_begin_live_operation_claim(identity, OPERATION, owner_slot)
             {
-                if state.owner.respond().is_ok()
-                    && state
-                        .owner
-                        .begin(
-                            nt_pnp_manager::DeviceActionLifecycleOperation::Remove,
-                            owner_slot,
-                        )
-                        .is_ok()
-                {
-                    true
-                } else {
-                    let _ = state.owner.retain_barrier(STATUS_INVALID_PARAMETER);
-                    false
-                }
-            } else {
-                false
-            };
-            if !accepted {
                 self.pending_pnp_operations
                     .cancel(reservation)
                     .expect("rejected live removal lost its reservation");
-                return STATUS_INVALID_PARAMETER;
+                return status;
             }
         }
 
@@ -20058,7 +20112,10 @@ impl ExecNtHandler {
                     operation: OwnedPendingPnpOperation::Removal(removal),
                     reservation,
                     kind: live_identity
-                        .map(PendingPnpOperationTransferKind::DeviceAction)
+                        .map(|identity| PendingPnpOperationTransferKind::DeviceAction {
+                            identity,
+                            operation: OPERATION,
+                        })
                         .unwrap_or(PendingPnpOperationTransferKind::User),
                 });
                 nt_status::NtStatus::PENDING.raw() as u32
@@ -20073,7 +20130,7 @@ impl ExecNtHandler {
                 };
                 if let Some(identity) = live_identity {
                     if self
-                        .pnp_complete_live_removal(identity, owner_slot, status)
+                        .pnp_complete_live_operation(identity, OPERATION, owner_slot, status)
                         .is_err()
                     {
                         return STATUS_INVALID_PARAMETER;
@@ -20086,7 +20143,7 @@ impl ExecNtHandler {
                 let status = failure.status.raw() as u32;
                 let owner = if let Some(identity) = live_identity {
                     if self
-                        .pnp_retain_live_removal_barrier(identity, status)
+                        .pnp_retain_live_operation_barrier(identity, OPERATION, status)
                         .is_err()
                     {
                         self.pending_pnp_operations
@@ -20096,6 +20153,7 @@ impl ExecNtHandler {
                     }
                     PendingPnpOperationOwner::DeviceAction {
                         identity,
+                        operation: OPERATION,
                         reply: None,
                     }
                 } else {
@@ -20163,7 +20221,12 @@ impl ExecNtHandler {
             if !state.delivered {
                 return STATUS_INVALID_PARAMETER;
             }
-            if state.event.kind == nt_config_client::DeviceActionKind::Removal {
+            let kind = state.event.kind;
+            if matches!(
+                kind,
+                nt_config_client::DeviceActionKind::Change
+                    | nt_config_client::DeviceActionKind::Removal
+            ) {
                 match state.owner.lifecycle() {
                     nt_pnp_manager::DeviceActionLifecycleState::InFlight { .. } => {
                         return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
@@ -20176,17 +20239,61 @@ impl ExecNtHandler {
                 }
                 let identity = state.owner.identity();
                 let instance = state.event.publication.instance_id.clone();
-                let (device_id, _) = match driver_launch::hosted_function_device_context_for_instance(
-                    &instance,
-                ) {
-                    Ok(context) => context,
-                    Err(status) => return status.raw() as u32,
+                return match kind {
+                    nt_config_client::DeviceActionKind::Change => {
+                        let spec = match live_config_existing_device_launch_spec(
+                            &instance,
+                            SERVICE_DEMAND_START,
+                        ) {
+                            Ok(spec) if spec.class == driver_launch::DriverClass::Device => spec,
+                            Ok(_) => return STATUS_INVALID_PARAMETER,
+                            Err(status) => return status as u32,
+                        };
+                        if spec.devnodes.len() != 1 {
+                            return STATUS_INVALID_PARAMETER;
+                        }
+                        let Some((driver_id, ready_for_pnp)) =
+                            driver_launch::loaded_driver_pnp_start_context(
+                                &spec.driver_object_path,
+                            )
+                        else {
+                            return STATUS_DEVICE_NOT_READY;
+                        };
+                        if !ready_for_pnp {
+                            return STATUS_DEVICE_NOT_READY;
+                        }
+                        let device_id =
+                            match driver_launch::hosted_function_device_id_for_instance(
+                                &instance,
+                                driver_id,
+                            ) {
+                                Ok(device_id) => device_id,
+                                Err(status) => return status.raw() as u32,
+                            };
+                        self.pnp_begin_rebalance(
+                            device_id,
+                            driver_id,
+                            ready_for_pnp,
+                            spec,
+                            Some(identity),
+                        )
+                    }
+                    nt_config_client::DeviceActionKind::Removal => {
+                        let (device_id, _) =
+                            match driver_launch::hosted_function_device_context_for_instance(
+                                &instance,
+                            ) {
+                                Ok(context) => context,
+                                Err(status) => return status.raw() as u32,
+                            };
+                        self.pnp_begin_removal(
+                            device_id,
+                            HostedPnpRemovalKind::Surprise,
+                            Some(identity),
+                        )
+                    }
+                    nt_config_client::DeviceActionKind::Arrival => unreachable!(),
                 };
-                return self.pnp_begin_removal(
-                    device_id,
-                    HostedPnpRemovalKind::Surprise,
-                    Some(identity),
-                );
             }
         }
         if let Some(state) = self.pnp_live_action.as_mut() {

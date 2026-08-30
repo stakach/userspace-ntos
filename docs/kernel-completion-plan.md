@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 ## Objective
 
@@ -19183,3 +19183,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hotplug remove/re-enumerate acceptance that proves one NIC can disappear and return without
     disturbing a sibling. Keep driver unload separate from per-device removal and retain exact CM
     claims across every asynchronous step.
+
+    B3 live change/rebalance action checkpoint (2026-08-31, implementation green): a delivered
+    Configuration Manager `Change` action no longer enters an unsupported barrier or retires after
+    notification response alone. `PlugPlayControlUserResponse` resolves the action's current CM
+    service metadata, exact loaded driver generation, and existing function-device binding, then
+    enters the same retained QUERY_STOP/STOP-or-CANCEL, filter, arbitration, and START owner used by
+    `PlugPlayControlResetDevice`. The existing FDO stack is restarted in place; AddDevice is not
+    called again and no service, driver, or device identity is inferred by position.
+
+    Rebalance and removal continuations now retain both the exact CM claim and the typed lifecycle
+    operation. Synchronous completion and timer/DPC redrive must match generation, operation, and
+    reserved owner slot before publishing terminal state and acknowledging the CM journal. Lost
+    transport retains the same operation-specific barrier. The generic pending-PnP pump no longer
+    assumes every live action is removal, and the former explicit `Change` fallback is deleted.
+    A focused coordinator test proves that neither a START completion nor a different rebalance slot
+    can retire the claim.
+
+    Formatting and `git diff --check` are clean. Focused validation passes `nt-pnp-manager` 48/48,
+    `nt-driver-start` 6/6, `nt-power-manager` 15/15, and `nt-io-manager` 241/241; the freestanding
+    executive check passes at the unchanged 209-warning baseline. The pre-existing long-running
+    desktop QEMU still owns the serialized boot lane, so this checkpoint does not start a competing
+    build or boot.
+
+    Review adjustment: live START, change/rebalance, orderly removal, surprise/final removal, and
+    driver unload now share exact canonical owners. Continue B3 with removed-instance
+    re-enumeration: prove that a later bus-relations generation may publish the same stable NT
+    instance as a new canonical PDO only after the prior devnode, stack, interfaces, resources,
+    power record, and CM removal action are fully retired. Stale relation claims and stale device
+    actions must remain generation-fenced. Add a two-NIC host proof first, then run one serialized
+    hotplug remove/re-add desktop acceptance when the existing QEMU lane is released.

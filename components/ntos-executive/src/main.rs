@@ -23671,7 +23671,10 @@ impl OwnedPendingPnpOperation {
 #[derive(Clone, Copy)]
 enum PendingPnpOperationTransferKind {
     User,
-    DeviceAction(nt_pnp_manager::DeviceActionClaimIdentity),
+    DeviceAction {
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
+    },
 }
 
 struct PendingPnpOperationTransfer {
@@ -23684,14 +23687,24 @@ enum PendingPnpOperationOwner {
     User(Option<NativeDriverStartReply>),
     DeviceAction {
         identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
         reply: Option<NativeDriverStartReply>,
     },
 }
 
 impl PendingPnpOperationOwner {
-    fn device_action_identity(&self) -> Option<nt_pnp_manager::DeviceActionClaimIdentity> {
+    fn device_action(
+        &self,
+    ) -> Option<(
+        nt_pnp_manager::DeviceActionClaimIdentity,
+        nt_pnp_manager::DeviceActionLifecycleOperation,
+    )> {
         match self {
-            Self::DeviceAction { identity, .. } => Some(*identity),
+            Self::DeviceAction {
+                identity,
+                operation,
+                ..
+            } => Some((*identity, *operation)),
             Self::User(_) => None,
         }
     }

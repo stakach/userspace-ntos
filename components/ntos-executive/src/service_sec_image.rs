@@ -22528,9 +22528,14 @@ unsafe fn pending_pnp_operation_transfer(
     });
     let owner = match kind {
         PendingPnpOperationTransferKind::User => PendingPnpOperationOwner::User(reply),
-        PendingPnpOperationTransferKind::DeviceAction(identity) => {
-            PendingPnpOperationOwner::DeviceAction { identity, reply }
-        }
+        PendingPnpOperationTransferKind::DeviceAction {
+            identity,
+            operation,
+        } => PendingPnpOperationOwner::DeviceAction {
+            identity,
+            operation,
+            reply,
+        },
     };
     nt_handler
         .pending_pnp_operations
@@ -22713,14 +22718,14 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
         match progress {
             OwnedPendingPnpOperationProgress::AwaitingCompletion => {}
             OwnedPendingPnpOperationProgress::Complete(status) => {
-                let device_action_identity = nt_handler
+                let device_action = nt_handler
                     .pending_pnp_operations
                     .get(slot)
-                    .and_then(|pending| pending.owner.device_action_identity());
-                if let Some(identity) = device_action_identity {
+                    .and_then(|pending| pending.owner.device_action());
+                if let Some((identity, operation)) = device_action {
                     nt_handler
-                        .pnp_complete_live_removal(identity, slot, status)
-                        .expect("terminal live removal lost its exact action owner");
+                        .pnp_complete_live_operation(identity, operation, slot, status)
+                        .expect("terminal live PnP operation lost its exact action owner");
                     let _ = nt_handler.pnp_try_acknowledge_live_action();
                 }
                 let mut pending = nt_handler
@@ -22739,14 +22744,14 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
                 completed = completed.saturating_add(1);
             }
             OwnedPendingPnpOperationProgress::OwnershipLost(status) => {
-                let device_action_identity = nt_handler
+                let device_action = nt_handler
                     .pending_pnp_operations
                     .get(slot)
-                    .and_then(|pending| pending.owner.device_action_identity());
-                if let Some(identity) = device_action_identity {
+                    .and_then(|pending| pending.owner.device_action());
+                if let Some((identity, operation)) = device_action {
                     nt_handler
-                        .pnp_retain_live_removal_barrier(identity, status)
-                        .expect("lost live removal ownership lost its exact action claim");
+                        .pnp_retain_live_operation_barrier(identity, operation, status)
+                        .expect("lost live PnP ownership lost its exact action claim");
                 }
                 let reply = nt_handler
                     .pending_pnp_operations

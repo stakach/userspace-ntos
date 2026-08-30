@@ -2244,6 +2244,28 @@ mod tests {
     }
 
     #[test]
+    fn device_action_rebalance_retires_only_the_exact_owner() {
+        let mut owner = DeviceActionOwner::new(action_identity()).unwrap();
+        owner.respond().unwrap();
+        owner
+            .begin(DeviceActionLifecycleOperation::Rebalance, 7)
+            .unwrap();
+        assert_eq!(
+            owner.complete(DeviceActionLifecycleOperation::Start, 7, 0),
+            Err(DeviceActionOwnerError::WrongOwner)
+        );
+        assert_eq!(
+            owner.complete(DeviceActionLifecycleOperation::Rebalance, 8, 0),
+            Err(DeviceActionOwnerError::WrongOwner)
+        );
+        owner
+            .complete(DeviceActionLifecycleOperation::Rebalance, 7, 0)
+            .unwrap();
+        assert!(owner.ready_to_acknowledge());
+        assert_eq!(owner.acknowledge(), Ok(action_identity()));
+    }
+
+    #[test]
     fn device_action_identity_and_response_are_fail_closed() {
         assert_eq!(
             DeviceActionOwner::new(DeviceActionClaimIdentity {
