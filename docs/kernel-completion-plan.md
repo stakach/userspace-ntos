@@ -18512,3 +18512,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     desktop acceptance to catch driver-contract regressions from removing post-AddDevice attach.
     Once accepted, advance the retained relation-query owner by resolving every returned PDO in the
     bus provider's authenticated domain and dispatching the four real typed QUERY_ID requests.
+
+    B3 native QUERY_ID decoder checkpoint (2026-08-30, crate accepted): `nt-pnp-manager` now copies
+    driver-owned `IRP_MN_QUERY_ID` results into PnP-owned strings for `BusQueryDeviceID`,
+    `BusQueryInstanceID`, `BusQueryHardwareIDs`, and `BusQueryCompatibleIDs`. It consumes only the
+    terminator-bounded prefix of allocator capacity, distinguishes single UTF-16 strings from native
+    `MULTI_SZ`, enforces the NT 200-character per-entry bound and device/instance separator rules,
+    rejects control/non-ASCII/comma characters and duplicate multi-string entries, and normalizes
+    spaces to underscores as the NT PnP path does. Empty compatible-ID lists remain representable;
+    callers must separately require a nonempty hardware-ID set before relation publication.
+
+    Focused `nt-pnp-manager` validation passes `39/39`. Serialized desktop acceptance for the prior
+    dynamic device-lifetime checkpoint is still pending because an independently running QEMU owns
+    the repository's single boot lane; the runner refused to build or launch a competing image.
+    Next integrate the decoder into the retained relation owner. Resolve each copied PDO through the
+    exact allocation/provider domain, dispatch one typed QUERY_ID IRP at a time, retain synchronous
+    or pending output pointers until copied, free each exact provider-pool allocation only after a
+    successful owned copy, and ACK pending completions before advancing to the next ID or child.

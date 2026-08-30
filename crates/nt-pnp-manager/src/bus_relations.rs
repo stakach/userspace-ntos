@@ -56,6 +56,142 @@ pub fn copy_device_relations_x64(bytes: &[u8]) -> Result<Vec<u64>, DeviceRelatio
     Ok(objects)
 }
 
+pub const MAX_BUS_QUERY_ID_CHARS: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BusQueryIdValue {
+    Single(String),
+    Multi(Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusQueryIdCopyError {
+    UnsupportedType,
+    MissingTerminator,
+    EmptyId,
+    IdTooLong,
+    InvalidCharacter,
+    InvalidSeparators,
+    DuplicateId,
+    InsufficientResources,
+}
+
+/// Copy one driver-owned `IRP_MN_QUERY_ID` result from its native UTF-16 allocation.
+///
+/// Device and instance IDs are single strings; hardware and compatible IDs are `MULTI_SZ` values.
+/// The allocator may provide capacity after the terminator, so trailing bytes are ignored. NT PnP
+/// IDs are printable ASCII, exclude commas, normalize spaces to underscores, and carry at most one
+/// device-id separator (none for an instance ID).
+pub fn copy_bus_query_id_x64(
+    bytes: &[u8],
+    id_type: u32,
+) -> Result<BusQueryIdValue, BusQueryIdCopyError> {
+    match id_type {
+        nt_pnp_abi::BUS_QUERY_DEVICE_ID => {
+            let (value, separators, _) = copy_query_id_entry(bytes, 0)?;
+            if separators != 1 {
+                return Err(BusQueryIdCopyError::InvalidSeparators);
+            }
+            Ok(BusQueryIdValue::Single(value))
+        }
+        nt_pnp_abi::BUS_QUERY_INSTANCE_ID => {
+            let (value, separators, _) = copy_query_id_entry(bytes, 0)?;
+            if separators != 0 {
+                return Err(BusQueryIdCopyError::InvalidSeparators);
+            }
+            Ok(BusQueryIdValue::Single(value))
+        }
+        nt_pnp_abi::BUS_QUERY_HARDWARE_IDS | nt_pnp_abi::BUS_QUERY_COMPATIBLE_IDS => {
+            copy_query_id_multi_sz(bytes)
+        }
+        _ => Err(BusQueryIdCopyError::UnsupportedType),
+    }
+}
+
+fn copy_query_id_entry(
+    bytes: &[u8],
+    start_units: usize,
+) -> Result<(String, usize, usize), BusQueryIdCopyError> {
+    let mut value = String::new();
+    value
+        .try_reserve(MAX_BUS_QUERY_ID_CHARS)
+        .map_err(|_| BusQueryIdCopyError::InsufficientResources)?;
+    let mut separators = 0usize;
+    let mut length = 0usize;
+    loop {
+        let unit_index = start_units
+            .checked_add(length)
+            .ok_or(BusQueryIdCopyError::IdTooLong)?;
+        let byte_index = unit_index
+            .checked_mul(2)
+            .ok_or(BusQueryIdCopyError::IdTooLong)?;
+        let unit = read_query_id_unit(bytes, byte_index)?;
+        if unit == 0 {
+            if length == 0 {
+                return Err(BusQueryIdCopyError::EmptyId);
+            }
+            return Ok((value, separators, unit_index + 1));
+        }
+        if length >= MAX_BUS_QUERY_ID_CHARS {
+            return Err(BusQueryIdCopyError::IdTooLong);
+        }
+        if !(0x20..=0x7f).contains(&unit) || unit == b',' as u16 {
+            return Err(BusQueryIdCopyError::InvalidCharacter);
+        }
+        let byte = if unit == b' ' as u16 {
+            b'_'
+        } else {
+            unit as u8
+        };
+        if byte == b'\\' {
+            separators += 1;
+            if separators > 1 {
+                return Err(BusQueryIdCopyError::InvalidSeparators);
+            }
+        }
+        value.push(byte as char);
+        length += 1;
+    }
+}
+
+fn copy_query_id_multi_sz(bytes: &[u8]) -> Result<BusQueryIdValue, BusQueryIdCopyError> {
+    let mut values = Vec::new();
+    let mut cursor = 0usize;
+    loop {
+        let byte_index = cursor
+            .checked_mul(2)
+            .ok_or(BusQueryIdCopyError::IdTooLong)?;
+        if read_query_id_unit(bytes, byte_index)? == 0 {
+            if values.is_empty() && read_query_id_unit(bytes, byte_index + 2)? != 0 {
+                return Err(BusQueryIdCopyError::MissingTerminator);
+            }
+            return Ok(BusQueryIdValue::Multi(values));
+        }
+        let (value, _separators, next) = copy_query_id_entry(bytes, cursor)?;
+        if values
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&value))
+        {
+            return Err(BusQueryIdCopyError::DuplicateId);
+        }
+        values
+            .try_reserve(1)
+            .map_err(|_| BusQueryIdCopyError::InsufficientResources)?;
+        values.push(value);
+        cursor = next;
+    }
+}
+
+fn read_query_id_unit(bytes: &[u8], byte_index: usize) -> Result<u16, BusQueryIdCopyError> {
+    let end = byte_index
+        .checked_add(2)
+        .ok_or(BusQueryIdCopyError::MissingTerminator)?;
+    let pair = bytes
+        .get(byte_index..end)
+        .ok_or(BusQueryIdCopyError::MissingTerminator)?;
+    Ok(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
 /// Exact ownership of one queued `IoInvalidateDeviceRelations` request. The PDO is represented by
 /// its canonical I/O Manager device ID rather than a hosted address, so queue ownership survives
 /// component-local projections.
@@ -652,6 +788,20 @@ mod tests {
         bytes
     }
 
+    fn native_query_id(units: &[u16], trailing_bytes: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.reserve(units.len() * 2 + trailing_bytes);
+        for unit in units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.resize(bytes.len() + trailing_bytes, 0xa5);
+        bytes
+    }
+
+    fn query_units(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(core::iter::once(0)).collect()
+    }
+
     fn child(pdo: u64, instance: &str, hardware: &[&str]) -> BusReportedChild {
         BusReportedChild::new(
             pdo,
@@ -698,6 +848,106 @@ mod tests {
         assert_eq!(
             copy_device_relations_x64(&native_relations(&[0x1000, 0x1000], 24)),
             Err(DeviceRelationsCopyError::DuplicatePdo)
+        );
+    }
+
+    #[test]
+    fn native_query_id_copies_single_strings_and_normalizes_spaces() {
+        let device = native_query_id(&query_units(r"PCI\VEN 1234&DEV_5678"), 17);
+        assert_eq!(
+            copy_bus_query_id_x64(&device, nt_pnp_abi::BUS_QUERY_DEVICE_ID),
+            Ok(BusQueryIdValue::Single(r"PCI\VEN_1234&DEV_5678".into()))
+        );
+        let instance = native_query_id(&query_units("0000:01"), 0);
+        assert_eq!(
+            copy_bus_query_id_x64(&instance, nt_pnp_abi::BUS_QUERY_INSTANCE_ID),
+            Ok(BusQueryIdValue::Single("0000:01".into()))
+        );
+    }
+
+    #[test]
+    fn native_query_id_copies_multi_sz_and_accepts_empty_compatible_ids() {
+        let units: Vec<u16> = r"PCI\VEN_1234&DEV_5678"
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .chain(r"PCI\VEN_1234".encode_utf16())
+            .chain([0, 0])
+            .collect();
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&units, 9),
+                nt_pnp_abi::BUS_QUERY_HARDWARE_IDS
+            ),
+            Ok(BusQueryIdValue::Multi(vec![
+                r"PCI\VEN_1234&DEV_5678".into(),
+                r"PCI\VEN_1234".into(),
+            ]))
+        );
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&[0, 0], 0),
+                nt_pnp_abi::BUS_QUERY_COMPATIBLE_IDS
+            ),
+            Ok(BusQueryIdValue::Multi(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn native_query_id_rejects_malformed_and_duplicate_values() {
+        assert_eq!(
+            copy_bus_query_id_x64(&native_query_id(&[0], 0), nt_pnp_abi::BUS_QUERY_DEVICE_ID),
+            Err(BusQueryIdCopyError::EmptyId)
+        );
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&query_units("NO_SEPARATOR"), 0),
+                nt_pnp_abi::BUS_QUERY_DEVICE_ID
+            ),
+            Err(BusQueryIdCopyError::InvalidSeparators)
+        );
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&[b'A' as u16, b',' as u16, 0], 0),
+                nt_pnp_abi::BUS_QUERY_INSTANCE_ID
+            ),
+            Err(BusQueryIdCopyError::InvalidCharacter)
+        );
+        let duplicate: Vec<u16> = r"PCI\VEN_1234"
+            .encode_utf16()
+            .chain([0])
+            .chain(r"pci\ven_1234".encode_utf16())
+            .chain([0, 0])
+            .collect();
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&duplicate, 0),
+                nt_pnp_abi::BUS_QUERY_HARDWARE_IDS
+            ),
+            Err(BusQueryIdCopyError::DuplicateId)
+        );
+        let unterminated = native_query_id(&query_units(r"PCI\VEN_1234")[..12], 0);
+        assert_eq!(
+            copy_bus_query_id_x64(&unterminated, nt_pnp_abi::BUS_QUERY_HARDWARE_IDS),
+            Err(BusQueryIdCopyError::MissingTerminator)
+        );
+    }
+
+    #[test]
+    fn native_query_id_enforces_the_nt_per_entry_limit() {
+        let mut value = String::from(r"PCI\");
+        value.extend(core::iter::repeat_n('A', MAX_BUS_QUERY_ID_CHARS - 4));
+        assert!(copy_bus_query_id_x64(
+            &native_query_id(&query_units(&value), 0),
+            nt_pnp_abi::BUS_QUERY_DEVICE_ID
+        )
+        .is_ok());
+        value.push('B');
+        assert_eq!(
+            copy_bus_query_id_x64(
+                &native_query_id(&query_units(&value), 0),
+                nt_pnp_abi::BUS_QUERY_DEVICE_ID
+            ),
+            Err(BusQueryIdCopyError::IdTooLong)
         );
     }
 
