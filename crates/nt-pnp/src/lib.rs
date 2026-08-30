@@ -31,7 +31,7 @@ mod pci_inventory;
 
 pub use pci_interrupt_routes::{
     PciInterruptRoute, PciInterruptRouteClaim, PciInterruptRouteError, PciInterruptRouteOwner,
-    PciRouteFunction, PreparedPciInterruptRoutePublication,
+    PciRouteFunction, PreparedPciInterruptRoutePublication, PreparedPciInterruptRouteRevocation,
 };
 pub use pci_inventory::{
     CommittedPciInventoryUpdate, PciInventory, PciInventoryError, PciLocation, PciResourceChange,

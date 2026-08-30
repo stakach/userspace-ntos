@@ -19889,3 +19889,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ambiguous, stale, malformed, or electrically conflicting route remains a whole-transaction
     barrier. The active older desktop VM remains untouched, so serialized runtime provider and SCI
     acceptance is still open.
+
+    B3 ACPI evaluation ABI and provider-generation ownership checkpoint (2026-08-31, crate
+    accepted): `nt-acpi` now owns the exact standard File-less `IOCTL_ACPI_EVAL_METHOD` contract:
+    an argument-free 8-byte NameSeg input, the shipped amd64 provider's 20-byte output probe,
+    bounded required-length validation, and exact single-integer decoding for `_SEG` and `_BBN`.
+    The frozen byte tests reject malformed NameSegs, signatures, counts, short probes, non-growing
+    retries, and allocation ceilings. Successful `_PRT` and `_CRS` decoders now require the
+    provider's declared output length to equal the complete supplied result; trailing capacity is
+    not silently accepted. An exact empty `_PRT` package is retained as an authoritative empty
+    table rather than treated as a transport failure. Focused `nt-acpi` validation passes 28/28.
+
+    `PciInterruptRouteOwner` now binds every prepared publication and retained claim to the exact
+    nonzero ACPI provider relation generation as well as the PCI inventory and route-owner
+    generations. A stale provider generation cannot publish, resolve, validate, or revoke routes.
+    Complete revocation is now an inert prepare/commit transaction, so the executive can finish all
+    fallible work and durable Configuration Manager publication before changing accepted IRQ
+    authority. Dropping a prepared revocation leaves the live route set intact. Focused `nt-pnp`
+    validation passes 46/46. Both reproducible ReactOS provider workflow runs `33337712029` and
+    `33337963089` completed successfully.
+
+    Review adjustment: the earlier wording that every PCI bridge is an ACPI PDO was incorrect and
+    has been removed from the implementation target. Exact root PDOs are selected only from the
+    provider-owned `ACPI\\PNP0A03`/`ACPI\\PNP0A08` identities. `_SEG` and `_BBN` must be evaluated
+    on that exact PDO; only the ACPI-defined missing-method default of zero is allowed, values are
+    range checked, and `_BBN` is cross-checked against its retained BusNumber resource. The current
+    CF8/CFC inventory is segment zero, so any nonzero `_SEG` is a barrier until segment-aware ECAM
+    ownership exists. The provider's hardcoded parent `PNP_BUS_INFORMATION.BusNumber` is never
+    accepted as routing scope.
+
+    HID-less downstream bridge namespace objects are not PnP PDOs in the shipped provider. Extend
+    the retained provider patch with standard `IOCTL_ACPI_EVAL_METHOD_EX`, enumerate descendant
+    `_PRT` scopes through multilevel NameSeg-filtered namespace enumeration, and evaluate their full
+    `_ADR`/`_PRT` paths through the exact root PDO endpoint. Correlate `_ADR` to the unique live PCI
+    bridge BDF and its retained SecondaryBus resource, inheriting the root segment. Ambiguous,
+    missing, non-bridge, or incomplete scope coverage is a whole-publication barrier; there is no
+    swizzle, first-match, manufactured-PDO, or root-only fallback. Retain the resulting ACPI scope
+    catalog under its own provider-scope generation and install the live `PciInventory`/route owner
+    in the executive. One relation query cannot own the complete topology: ACPI-root children, root
+    PCI children, and each downstream bridge's children are separate BusRelations publications and
+    may arrive in any order. Each relevant relation commit must therefore update the durable scope
+    catalog atomically, complete its normal devnode/relation/invalidation transaction, and schedule
+    one serialized reconciler. The reconciler snapshots the exact scope-catalog and inventory
+    generations, prepares only a complete route replacement, and commits it independently. Missing
+    facts leave no usable new route; consumers see either the previous exact claim or a generation
+    mismatch, never a partial set. Do not bind claims to the global BusRelationTable generation,
+    because unrelated bus changes would create false route-identity churn.

@@ -10,10 +10,15 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod eval;
 mod madt;
 mod namespace;
 mod pci_routing;
 
+pub use eval::{
+    eval_method_input, eval_output_required_len, parse_integer_evaluation, AcpiEvalError,
+    ACPI_EVAL_INPUT_BUFFER_LEN, ACPI_EVAL_OUTPUT_PROBE_LEN, IOCTL_ACPI_EVAL_METHOD,
+};
 pub use madt::{
     parse_madt_interrupt_topology, resolve_ioapic_gsi, validate_ioapic_route_extents,
     IoApicRouteError, IoApicRouteExtent, MadtError, MadtInterruptTopology, MadtIoApic,

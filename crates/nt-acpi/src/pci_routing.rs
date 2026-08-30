@@ -127,8 +127,7 @@ pub fn parse_pci_routing_table(
     let count = read_u32(bytes, 8)? as usize;
     if read_u32(bytes, 0)? != EVAL_OUTPUT_SIGNATURE
         || declared_len < EVAL_OUTPUT_HEADER_LEN
-        || declared_len > bytes.len()
-        || count == 0
+        || declared_len != bytes.len()
         || count > MAX_PCI_ROUTING_ENTRIES
         || count > (declared_len - EVAL_OUTPUT_HEADER_LEN) / PCI_ROUTING_ENTRY_STORAGE_LEN
     {
@@ -216,7 +215,7 @@ pub fn parse_interrupt_resource_template(
     let count = read_u32(bytes, 8)? as usize;
     if read_u32(bytes, 0)? != EVAL_OUTPUT_SIGNATURE
         || declared_len < EVAL_OUTPUT_HEADER_LEN
-        || declared_len > bytes.len()
+        || declared_len != bytes.len()
         || count != 1
     {
         return Err(PciRoutingError::InvalidEvaluationBuffer);
@@ -627,6 +626,27 @@ mod tests {
                 active_low: true,
                 shared: true,
             }
+        );
+    }
+
+    #[test]
+    fn empty_prt_is_an_exact_authoritative_empty_table() {
+        let bytes = eval_output(&[]);
+        assert_eq!(bytes.len(), EVAL_OUTPUT_HEADER_LEN);
+        assert_eq!(
+            parse_pci_routing_table(0, 0, &bytes).unwrap(),
+            PciRoutingTable {
+                segment: 0,
+                bus: 0,
+                entries: vec![],
+            }
+        );
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(
+            parse_pci_routing_table(0, 0, &trailing),
+            Err(PciRoutingError::InvalidEvaluationBuffer)
         );
     }
 
