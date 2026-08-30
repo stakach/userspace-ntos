@@ -329,6 +329,7 @@ generate_trap_stubs! {
     (nt_resume_process, "NtResumeProcess", 213, 1),
     (nt_resume_thread, "NtResumeThread", 214, 2),
     (nt_save_key, "NtSaveKey", 215, 2),
+    (nt_save_key_ex, "NtSaveKeyEx", 216, 3),
     (nt_secure_connect_port, "NtSecureConnectPort", 218, 9),
     (nt_set_context_thread, "NtSetContextThread", 221, 2),
     (nt_set_debug_filter_state, "NtSetDebugFilterState", 222, 3),

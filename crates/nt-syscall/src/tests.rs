@@ -294,6 +294,12 @@ fn save_key_keeps_native_argument_contract() {
     assert!(NativeServiceTable::test_profile()
         .number_of(NativeService::NtSaveKey)
         .is_some());
+    assert_eq!(NativeService::NtSaveKeyEx.name(), "NtSaveKeyEx");
+    assert_eq!(NativeService::NtSaveKeyEx.arg_count(), (3, 3));
+    assert_eq!(nt_syscall_abi::ssn_of("NtSaveKeyEx"), Some(216));
+    assert!(NativeServiceTable::test_profile()
+        .number_of(NativeService::NtSaveKeyEx)
+        .is_some());
 }
 
 #[test]

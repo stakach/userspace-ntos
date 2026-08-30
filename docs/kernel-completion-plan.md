@@ -18174,3 +18174,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the missing `NtSaveKeyEx` ABI. After that acceptance, atomically delete post-publish replay, the
     SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure diagnostic;
     retain only boot composition plus CM journal/checkpoint persistence.
+
+    CM-owned SYSTEM save export (2026-08-30, focused validation accepted; serialized desktop proof
+    remains): the configuration ABI now exposes a bounded lease-bound export stream distinct from
+    checkpointing. CM captures the exact leased key and descendants as an immutable standalone hive,
+    stamps the transfer with the live mount generation, supports both clean and dirty generations,
+    and neither changes nor acknowledges checkpoint dirty state. Root leases export the complete
+    mounted SYSTEM hive; subtree leases preserve the selected root's class, security, values, and
+    descendants without serializing ancestors or siblings. Invalid, closed, replaced, or deleted
+    lease identities fail without reopening a path.
+
+    `NtSaveKey` now exports SYSTEM state only through the handle's exact CM lease. Borrowed boot
+    SYSTEM cells and any leftover executive mutable-SYSTEM identities fail closed rather than
+    serializing stale state; non-SYSTEM mutable and borrowed hives retain their existing owners. The
+    missing `NtSaveKeyEx` syscall is present in the shared syscall ABI, Rust ntdll trap exports, native
+    service table, and executive dispatch at SSN 216 with the exact three-argument contract. Its
+    format selector is validated before privilege, accepting only `REG_STANDARD_FORMAT`,
+    `REG_LATEST_FORMAT`, or `REG_NO_COMPRESSION` as NT does.
+
+    Focused validation passes `4/4` `nt-config-abi`, `24/24` `nt-config-server`, `18/18`
+    `nt-config-client`, `79/79` `nt-syscall`, and `709/709` `nt-ntdll` tests. Formatting,
+    `git diff --check`, and the freestanding executive release check pass at the established
+    209-warning baseline.
+
+    Review adjustment: the final mirror-retirement prerequisite is closed at the focused boundary.
+    Run the serialized release/desktop proof for CM save export, then remove post-publish replay,
+    the SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure
+    diagnostics atomically. Retain boot-only REGF composition and CM journal/checkpoint persistence;
+    do not retain a compatibility export or replay fallback.

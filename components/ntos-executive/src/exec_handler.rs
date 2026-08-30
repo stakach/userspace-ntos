@@ -5975,14 +5975,28 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_save_key(&mut self, key_handle: u64, file_handle: u64) -> u32 {
+        self.nt_save_key_ex(key_handle, file_handle, 1)
+    }
+
+    unsafe fn nt_save_key_ex(&mut self, key_handle: u64, file_handle: u64, flags: u32) -> u32 {
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+        const REG_STANDARD_FORMAT: u32 = 1;
+        const REG_LATEST_FORMAT: u32 = 2;
+        const REG_NO_COMPRESSION: u32 = 4;
         const KEY_READ: u32 = 0x0002_0019;
         NT_SAVE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
 
+        if !matches!(
+            flags,
+            REG_STANDARD_FORMAT | REG_LATEST_FORMAT | REG_NO_COMPRESSION
+        ) {
+            return STATUS_INVALID_PARAMETER;
+        }
         if !self.current_token_has_privilege(nt_security::SE_BACKUP) {
             NT_SAVE_KEY_NO_PRIVILEGE.fetch_add(1, Ordering::Relaxed);
             return STATUS_PRIVILEGE_NOT_HELD;
@@ -6001,15 +6015,19 @@ impl ExecNtHandler {
             Ok(key) => key,
             Err(status) => return status,
         };
-        if is_virtual_registry_key(key)
-            || overlay_key_idx(key).is_some()
-            || key == MACHINE_ROOT_KEY
-            || key == USER_ROOT_KEY
-        {
-            return STATUS_ACCESS_DENIED;
-        }
         let owned_image;
-        let image = if let Some(mutable_key) = self.mutable_registry_key(key) {
+        let image = if let Some(lease) = self.cm_system_key_target(key).map(|target| target.lease) {
+            owned_image = match crate::config_manager_export_leased_system_hive(lease) {
+                Ok(exported) => exported.image,
+                Err(status) => return status as u32,
+            };
+            owned_image.as_slice()
+        } else if let Some(mutable_key) = self.mutable_registry_key(key) {
+            // Runtime SYSTEM identity is exclusively CM-owned. A leftover executive mirror handle
+            // must never become an alternate serialization authority.
+            if mutable_key.hive == HIVE_SEL_SYSTEM {
+                return STATUS_INVALID_HANDLE;
+            }
             let Some(hive) = self.mutable_hives.hive(mutable_key.hive) else {
                 return STATUS_INVALID_HANDLE;
             };
@@ -6039,7 +6057,18 @@ impl ExecNtHandler {
                 }
             };
             owned_image.as_slice()
+        } else if is_virtual_registry_key(key)
+            || overlay_key_idx(key).is_some()
+            || key == MACHINE_ROOT_KEY
+            || key == USER_ROOT_KEY
+        {
+            return STATUS_ACCESS_DENIED;
         } else {
+            // A borrowed boot SYSTEM cell is historical bootstrap state, not the live registry.
+            // Native opens now mint CM leases, so reaching this identity is stale and must fail.
+            if hive_sel(key) == HIVE_SEL_SYSTEM {
+                return STATUS_INVALID_HANDLE;
+            }
             let (hive, cell) = match self.base_hive(key) {
                 Some(hive) => hive,
                 None => return STATUS_INVALID_HANDLE,
@@ -33723,11 +33752,12 @@ impl ExecNtHandler {
                 }
                 0
             }
-            // `NtSaveKey(KeyHandle, FileHandle)` — save a mounted hive key to a caller-opened file.
-            // Mutable hive keys write their live `nt-hive-core` image, with subkeys serialized as
-            // standalone subtree hives. Borrowed-regf roots without mutable ownership retain the raw
-            // read-only image path.
+            // Save an exact key or subtree to the caller-opened file. SYSTEM handles export from
+            // their CM lease; local mutable hives retain the same native entry points.
             NativeService::NtSaveKey => unsafe { self.nt_save_key(args[0], args[1]) },
+            NativeService::NtSaveKeyEx => unsafe {
+                self.nt_save_key_ex(args[0], args[1], args[2] as u32)
+            },
             // ★ NtLoadKey* / NtUnloadKey* — mount and detach a per-user hive at
             // `HKEY_USERS\<SID>`. `userenv!CreateUserProfileExW` and `LoadUserProfileW` usually go
             // through the base APIs (`RegLoadKeyW`/`RegUnLoadKeyW`), but the ntdll-visible variants

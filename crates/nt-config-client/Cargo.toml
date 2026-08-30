@@ -9,11 +9,11 @@ authors.workspace = true
 
 [dependencies]
 nt-config-abi = { workspace = true }
+nt-hive-core = { workspace = true }
 
 [dev-dependencies]
 nt-config-manager = { workspace = true }
 nt-config-server = { workspace = true }
-nt-hive-core = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

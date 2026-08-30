@@ -28,13 +28,14 @@ use nt_config_abi::{
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
     read_utf16, win32_service_plan_kind, win32_service_process_kind, CmDevicePropertyRequest,
     CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
-    CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest, CmHiveMutationRequest,
-    CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest,
-    CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
-    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
+    CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest,
+    CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
+    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_CHECKPOINT_CHUNK_BYTES,
     CM_HIVE_CHECKPOINT_HEADER_BYTES, CM_HIVE_CHECKPOINT_MAGIC, CM_HIVE_CHECKPOINT_VERSION,
+    CM_HIVE_EXPORT_HEADER_BYTES, CM_HIVE_EXPORT_MAGIC, CM_HIVE_EXPORT_VERSION,
     CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_RECORD_HEADER_BYTES,
     CM_HIVE_KEY_RECORD_MAGIC, CM_HIVE_KEY_RECORD_VERSION, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
     CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_HIVE_MUTATION_CHUNK_BYTES,
@@ -54,8 +55,9 @@ use nt_config_manager::{
 };
 use nt_hive_core::{
     collect_reactos_network_adapter_bindings, decode_image, encode_log_record, try_encode_image,
-    CellId, CurrentControlSet, Hive, HiveKind, HiveLogOp, HiveTransaction,
-    ReactOsNetworkAdapterBinding, SYSTEM_HIVE_PATH,
+    try_encode_subtree_image, CellId, CurrentControlSet, Hive, HiveEncodeError, HiveKind,
+    HiveLogOp, HiveSubtreeEncodeError, HiveTransaction, ReactOsNetworkAdapterBinding,
+    SYSTEM_HIVE_PATH,
 };
 
 /// CM admits multiple immutable key readers, but abandoned transfers must not retain an unbounded
@@ -71,6 +73,7 @@ const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+const STATUS_KEY_DELETED: i32 = 0xC000_017Cu32 as i32;
 const STATUS_REVISION_MISMATCH: i32 = 0xC000_0059u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
@@ -756,6 +759,11 @@ struct HiveKeySnapshotKey {
     identity: HiveKeySnapshotIdentity,
 }
 
+struct HiveExportSnapshotKey {
+    mount: u16,
+    key_lease_token: u64,
+}
+
 struct PnpQuerySnapshotKey {
     query_kind: u16,
     selector: u32,
@@ -801,6 +809,7 @@ pub struct CmServer {
     next_system_checkpoint_token: u64,
     system_key_leases: SystemKeyLeaseBank,
     hive_key_snapshots: SnapshotPool<HiveKeySnapshotKey>,
+    hive_export_snapshots: SnapshotPool<HiveExportSnapshotKey>,
     driver_launch_plan_snapshots: SnapshotBank<u16>,
     win32_service_launch_plan_snapshots: SnapshotBank<u16>,
     pnp_query_snapshots: SnapshotBank<PnpQuerySnapshotKey>,
@@ -831,6 +840,10 @@ impl CmServer {
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
                 MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
             ),
+            hive_export_snapshots: SnapshotPool::with_limits(
+                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
+                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+            ),
             driver_launch_plan_snapshots: SnapshotBank::new(),
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
             pnp_query_snapshots: SnapshotBank::new(),
@@ -853,6 +866,10 @@ impl CmServer {
             next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::with_limits(
+                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
+                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+            ),
+            hive_export_snapshots: SnapshotPool::with_limits(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
                 MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
             ),
@@ -896,6 +913,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_LEASED_HIVE_RECORD => {
                 self.op_query_leased_hive_record(in_buf, out_buf)
             }
+            opcode::CM_OP_EXPORT_LEASED_HIVE => self.op_export_leased_hive(in_buf, out_buf),
             opcode::CM_OP_QUERY_LAUNCH_PLAN => self.op_query_launch_plan(in_buf, out_buf),
             opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN => {
                 self.op_query_win32_service_plan(in_buf, out_buf)
@@ -2321,6 +2339,120 @@ impl CmServer {
                             HiveKeySnapshotIdentity::Lease(token)
                                 if token == req.key_lease_token
                         )
+                }) {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                reply(STATUS_SUCCESS, 0)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_export_leased_hive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmLeasedHiveKeyRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmLeasedHiveKeyRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req.mount != hive_mount::SYSTEM
+            || buf.len() != header_size
+            || req.key_lease_token == 0
+            || req.chunk_capacity as usize > CM_HIVE_KEY_CHUNK_BYTES
+            || req.chunk_capacity as usize > out_buf.len()
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        match req.operation {
+            hive_key_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(lease) = self.system_key_leases.get(req.key_lease_token) else {
+                    return reply(STATUS_INVALID_HANDLE, 0);
+                };
+                let key = lease.key;
+                let Some(mounted) = self.system_hive.as_ref() else {
+                    return reply(STATUS_DEVICE_NOT_READY, 0);
+                };
+                if mounted.hive.key_path(key).is_none() {
+                    return reply(STATUS_KEY_DELETED, mounted.generation);
+                }
+                let image = if key == mounted.hive.root() {
+                    match try_encode_image(&mounted.hive) {
+                        Ok(image) => image,
+                        Err(HiveEncodeError::OutOfMemory | HiveEncodeError::SizeOverflow) => {
+                            return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                        }
+                    }
+                } else {
+                    match try_encode_subtree_image(&mounted.hive, key) {
+                        Ok(image) => image,
+                        Err(HiveSubtreeEncodeError::InvalidRoot) => {
+                            return reply(STATUS_KEY_DELETED, mounted.generation);
+                        }
+                        Err(HiveSubtreeEncodeError::Encode(
+                            HiveEncodeError::OutOfMemory | HiveEncodeError::SizeOverflow,
+                        )) => {
+                            return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                        }
+                    }
+                };
+                let image_len = image.len();
+                let Ok(image_len_bytes) = u32::try_from(image_len) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                };
+                let export_header = CmHiveExportHeader {
+                    magic: CM_HIVE_EXPORT_MAGIC,
+                    version: CM_HIVE_EXPORT_VERSION,
+                    header_size: CM_HIVE_EXPORT_HEADER_BYTES as u16,
+                    mount_generation: mounted.generation,
+                    image_len_bytes,
+                    _reserved: 0,
+                };
+                let Some(total_len) = CM_HIVE_EXPORT_HEADER_BYTES.checked_add(image_len) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                };
+                let mut value = Vec::new();
+                if value.try_reserve_exact(total_len).is_err() {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                }
+                value.extend_from_slice(export_header.as_bytes());
+                value.extend_from_slice(&image);
+                let Some(chunk) = self.hive_export_snapshots.begin(
+                    HiveExportSnapshotKey {
+                        mount: req.mount,
+                        key_lease_token: req.key_lease_token,
+                    },
+                    value,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation);
+                };
+                snapshot_reply(chunk)
+            }
+            hive_key_transfer::PULL => {
+                if req.transfer_token == 0 || req.chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(chunk) = self.hive_export_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |key| key.mount == req.mount && key.key_lease_token == req.key_lease_token,
+                ) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                snapshot_reply(chunk)
+            }
+            hive_key_transfer::ABORT => {
+                if req.transfer_token == 0 || req.value_offset != 0 || req.chunk_capacity != 0 {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                if !self.hive_export_snapshots.abort(req.transfer_token, |key| {
+                    key.mount == req.mount && key.key_lease_token == req.key_lease_token
                 }) {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }

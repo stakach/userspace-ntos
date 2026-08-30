@@ -41,6 +41,9 @@ pub const CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_HIVE_KEY_RECORD_MAGIC: u32 = 0x524B_4D43; // `CMKR`
 pub const CM_HIVE_KEY_RECORD_VERSION: u16 = 2;
 pub const CM_HIVE_KEY_RECORD_HEADER_BYTES: usize = 24;
+pub const CM_HIVE_EXPORT_MAGIC: u32 = 0x5845_4D43; // `CMEX`
+pub const CM_HIVE_EXPORT_VERSION: u16 = 1;
+pub const CM_HIVE_EXPORT_HEADER_BYTES: usize = 24;
 pub const CM_MAX_HIVE_PATH_UNITS: usize = 512;
 /// Maximum payload carried by one immutable driver launch-plan completion frame.
 pub const CM_LAUNCH_PLAN_CHUNK_BYTES: usize = 4096;
@@ -103,6 +106,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_LEASED_HIVE_RECORD: u16 = 0x2159;
     /// Export and acknowledge one generation-stamped SYSTEM checkpoint image.
     pub const CM_OP_CHECKPOINT_SYSTEM_HIVE: u16 = 0x215a;
+    /// Export an immutable standalone hive image from an exact leased SYSTEM key.
+    pub const CM_OP_EXPORT_LEASED_HIVE: u16 = 0x215b;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -402,6 +407,19 @@ pub struct CmLeasedHiveKeyRequest {
     pub transfer_token: u64,
 }
 
+/// Fixed prefix on a lease-bound standalone hive export. The remaining bytes are exactly one
+/// `nt-hive-core` image rooted at the leased key.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveExportHeader {
+    pub magic: u32,
+    pub version: u16,
+    pub header_size: u16,
+    pub mount_generation: u64,
+    pub image_len_bytes: u32,
+    pub _reserved: u32,
+}
+
 /// `query_leased_hive_record`: a narrow immutable record addressed by a key lease. BEGIN carries
 /// the record selector and optional UTF-16 value name; PULL/ABORT use only the two opaque tokens.
 #[repr(C)]
@@ -554,6 +572,7 @@ wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
 wire!(CmHiveKeyLeaseRequest);
 wire!(CmLeasedHiveKeyRequest);
+wire!(CmHiveExportHeader);
 wire!(CmLeasedHiveRecordRequest);
 wire!(CmHiveMutationRequest);
 wire!(CmHiveCheckpointRequest);
@@ -771,7 +790,10 @@ mod tests {
     #[test]
     fn mounted_hive_mutation_has_stable_wire_layout() {
         assert_eq!(opcode::CM_OP_MUTATE_SYSTEM_HIVE, 0x2156);
+        assert_eq!(opcode::CM_OP_EXPORT_LEASED_HIVE, 0x215b);
         assert_eq!(hive_key_lease_operation::RESOLVE, 3);
+        assert_eq!(core::mem::size_of::<CmHiveExportHeader>(), 24);
+        assert_eq!(CM_HIVE_EXPORT_HEADER_BYTES, 24);
         assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveMutationRecord>(), 24);
         assert_eq!(CM_HIVE_MUTATION_RECORD_HEADER_BYTES, 24);

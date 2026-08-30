@@ -970,12 +970,11 @@ pub const SSN_NT_SET_VALUE_KEY: u64 = 256;
 pub const SSN_NT_FLUSH_KEY: u64 = 83;
 /// Bypass switch for the `NtFlushKey` gate specs (see the `build_nt_table` row). `true` in tree.
 pub const NT_FLUSH_KEY_SERVICED: bool = true;
-/// `NtSaveKey(IN HANDLE KeyHandle, IN HANDLE FileHandle)` — `ntoskrnl/config/ntapi.c:1634`
-/// (`sysfuncs.lst` line 216 -> SSN 215, two arguments). Dynamically loaded profile hive roots can
-/// be saved by writing their live mutable-hive image to a writable FILE_OBJECT. Boot hive roots
-/// retain their borrowed `regf` backing until D3 gives them a real checkpoint provider; subkey save
-/// still requires a subtree serializer and fails visibly instead of reporting success.
+/// `NtSaveKey(IN HANDLE KeyHandle, IN HANDLE FileHandle)` — `ntoskrnl/config/ntapi.c:1634`.
 pub const SSN_NT_SAVE_KEY: u64 = 215;
+/// `NtSaveKeyEx(IN HANDLE KeyHandle, IN HANDLE FileHandle, IN ULONG Flags)` — the extended native
+/// save entry point immediately following `NtSaveKey` in the ReactOS/NT5 service table.
+pub const SSN_NT_SAVE_KEY_EX: u64 = 216;
 /// **FILE_OBJECT LIFETIME switch** (bypass experiment for `exec_npfs_file_object_lifetime` +
 /// `exec_npfs_concurrent_irp_read_and_write`). `true` in tree = the NT lifetime: ONE FILE_OBJECT per
 /// OPEN, reused by every IRP on that open, destroyed at CLEANUP/CLOSE. `false` restores the old
@@ -15989,6 +15988,23 @@ pub(crate) unsafe fn config_manager_query_leased_system_hive_key_information(
     Ok(information)
 }
 
+pub(crate) unsafe fn config_manager_export_leased_system_hive(
+    lease: nt_config_client::SystemHiveKeyLease,
+) -> Result<nt_config_client::ExportedSystemHive, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let exported = client.export_leased_system_hive(lease)?;
+    if exported.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(exported)
+}
+
 pub(crate) unsafe fn config_manager_query_leased_system_hive_value(
     lease: nt_config_client::SystemHiveKeyLease,
     name: &str,
@@ -24930,6 +24946,7 @@ fn build_nt_table() -> NativeServiceTable {
                 },
             ),
             (NativeService::NtSaveKey, SSN_NT_SAVE_KEY as u32),
+            (NativeService::NtSaveKeyEx, SSN_NT_SAVE_KEY_EX as u32),
             // ★ `NtLoadKey` / `NtUnloadKey` — mount a per-user hive at `HKEY_USERS\<SID>`.
             // BYPASS EXPERIMENT SWITCH: flip `NT_LOAD_KEY_SERVICED` to `false` and both SSNs leave
             // the table exactly as before this batch -> `userenv!CreateUserProfileExW`'s
