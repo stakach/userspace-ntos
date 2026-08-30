@@ -17577,3 +17577,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     security result, executable-name branch, retroactive member rewrite, or permissive fallback was
     added. The remaining job limit is `JOB_OBJECT_LIMIT_WORKINGSET`; begin it only by giving Memory
     Manager authoritative per-process resident-set accounting and a real trim/pageout transaction.
+
+    Working-set ownership foundation (2026-08-30, focused validation accepted; executive composition
+    remains): the NT5 boundary has been audited against `psjob.c`, `wslist.c`, and `lockvm.c`. Ps owns
+    the job's byte-valued minimum/maximum policy and membership. MM converts the effective values to
+    pages, preserves a process's current bound when a zero is supplied to its adjust operation,
+    requires privilege before increasing the resident minimum, rejects a maximum that cannot retain
+    the locked entries plus the eight-page fluid reserve, trims before publishing a smaller maximum,
+    and selects replacement before admitting a page at a hard maximum. Commitment accounting is not
+    a substitute for any of these operations.
+
+    The no-std `nt-memory-manager` owner now provides generation-checked per-process working-set
+    policy, oldest-eligible victim plans, explicit locked/non-evictable exclusion, hard-limit admission
+    plans, and a private-page backing store. Pagefile writes own complete 4 KiB contents before frame
+    teardown; multi-page batches reserve and copy every record before publication, and stale policy or
+    pagefile plans fail without mutation. Per-process rundown removes exact backing records. The
+    existing client-frame registry now records replacement age, so eviction order belongs to the same
+    record that owns the process mapping and its seL4 caps. Focused `nt-memory-manager` validation
+    passes `30/30` without warnings.
+
+    Review adjustment: do not enable `JOB_OBJECT_LIMIT_WORKINGSET` yet. The executive currently has
+    two real resident-map owners: the growable client-frame registry covers private, mapped-section,
+    private-image and COW mappings, while clean shareable image mappings retain their process caps in
+    the image-cap bank. Compose both into one MM resident snapshot, with shareable image entries
+    counted and evictable through their existing source cache. For owned private/COW victims, copy the
+    live frame into the MM pagefile batch before detaching win32k and reclaiming caps; on refault,
+    restore that exact content before removing its backing record. Then wire adjustment/admission,
+    assignment/inheritance, disable, and process rundown transactionally and remove the syscall's
+    disabled flag handling. A short maximum must fail when locked pages make it non-fluid; it must
+    never silently exceed the limit or discard private contents.

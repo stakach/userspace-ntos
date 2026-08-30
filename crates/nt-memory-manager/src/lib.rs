@@ -23,6 +23,7 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 mod client_frame;
 mod commit;
 mod runtime_section;
+mod working_set;
 
 pub use client_frame::{
     ClientFrameInsert, ClientFrameInsertError, ClientFrameRecord, ClientFrameRegistry,
@@ -39,6 +40,12 @@ pub use runtime_section::{
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,
     SECTION_ATTR_SEC_BASED, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
     SECTION_ATTR_SEC_RESERVE,
+};
+pub use working_set::{
+    PagefileBatchPlan, PagefileStore, PagefileStoreStats, PagefileWrite, PagefileWritePlan,
+    WorkingSetAdjustmentPlan, WorkingSetLimits, WorkingSetOwnerId, WorkingSetPage, WorkingSetTable,
+    WorkingSetTableStats, FLUID_WORKING_SET_PAGES, STATUS_BAD_WORKING_SET_LIMIT,
+    WORKING_SET_PAGE_SIZE,
 };
 
 // NTSTATUS

@@ -9,6 +9,7 @@ pub struct ClientFrameRecord {
     pub alias_cap: u64,
     pub source_cap: u64,
     pub owns_frame: bool,
+    pub age: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub struct ClientFrameRegistryStats {
 
 pub struct ClientFrameRegistry {
     records: Vec<ClientFrameRecord>,
+    next_age: u64,
     high_water: usize,
     growths: u64,
     allocation_failures: u64,
@@ -48,6 +50,7 @@ impl ClientFrameRegistry {
     pub const fn new() -> Self {
         Self {
             records: Vec::new(),
+            next_age: 1,
             high_water: 0,
             growths: 0,
             allocation_failures: 0,
@@ -81,6 +84,8 @@ impl ClientFrameRegistry {
         source_cap: u64,
         owns_frame: bool,
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
+        let age = self.next_age;
+        self.next_age = self.next_age.saturating_add(1);
         if let Some(index) = self.index_for(pi, page) {
             let record = &mut self.records[index];
             if record.frame != frame {
@@ -100,6 +105,7 @@ impl ClientFrameRegistry {
             if record.source_cap == 0 && source_cap != 0 {
                 record.source_cap = source_cap;
             }
+            record.age = age;
             return Ok(ClientFrameInsert::Updated);
         }
 
@@ -120,6 +126,7 @@ impl ClientFrameRegistry {
             alias_cap,
             source_cap,
             owns_frame,
+            age,
         });
         self.high_water = self.high_water.max(self.records.len());
         Ok(ClientFrameInsert::Inserted { grew })
@@ -132,6 +139,15 @@ impl ClientFrameRegistry {
 
     pub fn get(&self, pi: u64, page: u64) -> Option<ClientFrameRecord> {
         self.get_with_index(pi, page).map(|(_, record)| record)
+    }
+
+    pub fn touch(&mut self, pi: u64, page: u64) -> bool {
+        let Some(index) = self.index_for(pi, page) else {
+            return false;
+        };
+        self.records[index].age = self.next_age;
+        self.next_age = self.next_age.saturating_add(1);
+        true
     }
 
     pub fn take(&mut self, pi: u64, page: u64) -> Option<ClientFrameRecord> {
