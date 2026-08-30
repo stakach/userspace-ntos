@@ -152,6 +152,10 @@ impl MutationLeaseBank {
     pub(crate) fn invalidate(&mut self) {
         self.lease = None;
     }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.lease.is_some()
+    }
 }
 
 fn decode_utf16(bytes: &[u8], max_units: usize) -> Option<String> {

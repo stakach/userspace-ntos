@@ -5886,6 +5886,85 @@ impl ExecNtHandler {
         mounted
     }
 
+    fn checkpoint_system_hive_from_config_manager(
+        &mut self,
+        file_path: &str,
+        dirty_cells: usize,
+    ) -> u32 {
+        let mut prepared = match unsafe { crate::config_manager_prepare_system_hive_checkpoint() } {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => {
+                CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                print_str(
+                    b"[cm-flush] CM reported clean SYSTEM while executive mirror is dirty\n",
+                );
+                return STATUS_UNSUCCESSFUL;
+            }
+            Err(status) => {
+                REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return status as u32;
+            }
+        };
+        let image_len = prepared.image.len();
+        let image = core::mem::take(&mut prepared.image);
+        let mut provider = crate::writable_fs::WritableHiveIoProvider::new(file_path);
+        let persist =
+            nt_hive_core::HiveIoProvider::write_primary_image_atomic_owned(&mut provider, image)
+                .and_then(|()| nt_hive_core::HiveIoProvider::flush_image(&mut provider))
+                .and_then(|()| nt_hive_core::HiveIoProvider::truncate_log(&mut provider))
+                .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider));
+        if let Err(err) = persist {
+            unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] CM-owned SYSTEM checkpoint persistence failed path=");
+            print_ascii_str(file_path);
+            print_str(b"\n");
+            return Self::mutable_hive_journal_status(err);
+        }
+        if let Err(status) =
+            unsafe { crate::config_manager_acknowledge_system_hive_checkpoint(&prepared) }
+        {
+            unsafe { crate::config_manager_abort_system_hive_checkpoint(&prepared) };
+            REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] CM-owned SYSTEM checkpoint acknowledgement failed status=0x");
+            print_hex(status as u32);
+            print_str(b"\n");
+            return status as u32;
+        }
+
+        let compatibility_ok = self
+            .mutable_hives
+            .hive_mut(HIVE_SEL_SYSTEM)
+            .is_some_and(|hive| {
+                hive.acknowledge_checkpoint(prepared.hive_sequence, prepared.image_generation)
+            });
+        if !compatibility_ok {
+            CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[cm-flush] executive SYSTEM mirror checkpoint acknowledgement failed\n");
+        }
+        self.writable_fs_dirty = true;
+        self.writable_fs_commit_required = true;
+        REG_FLUSH_KEY_BOOT_HIVE_CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+        REG_FLUSH_KEY_BOOT_HIVE_BYTES.store(image_len as u64, Ordering::Relaxed);
+        if let Some(bit) = Self::boot_mutable_hive_pending_bit(HIVE_SEL_SYSTEM) {
+            self.mutable_hive_journal_pending_boot_mask &= !bit;
+            self.mutable_hive_journal_dirty_boot_mask &= !bit;
+        }
+        print_str(b"[cm-flush] CM-owned SYSTEM checkpoint ");
+        print_u64(image_len as u64);
+        print_str(b"B dirty-cells=");
+        print_u64(dirty_cells as u64);
+        print_str(b" generation=");
+        print_u64(prepared.mount_generation);
+        print_str(b" sequence=");
+        print_u64(prepared.hive_sequence);
+        print_str(b" path=");
+        print_ascii_str(file_path);
+        print_str(b"\n");
+        nt_fs::STATUS_SUCCESS
+    }
+
     fn checkpoint_boot_mutable_hive(&mut self, hive_sel: u32, dirty_cells: usize) -> u32 {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         if dirty_cells == 0 {
@@ -5901,6 +5980,9 @@ impl ExecNtHandler {
         print_str(b" path=");
         print_ascii_str(file_path);
         print_str(b"\n");
+        if hive_sel == HIVE_SEL_SYSTEM {
+            return self.checkpoint_system_hive_from_config_manager(file_path, dirty_cells);
+        }
         let image_len = {
             let Some(hive) = self.mutable_hives.hive(hive_sel) else {
                 return STATUS_INVALID_HANDLE;

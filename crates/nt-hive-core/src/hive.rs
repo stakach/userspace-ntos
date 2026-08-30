@@ -776,6 +776,19 @@ impl Hive {
         self.clean_sequence = self.sequence;
     }
 
+    /// Commit one externally persisted checkpoint image for this exact live state.
+    ///
+    /// Checkpoint transports must exclude mutation while the image is in flight. A stale sequence
+    /// or unexpected image generation therefore leaves both generation and dirty state unchanged.
+    pub fn acknowledge_checkpoint(&mut self, sequence: u64, image_generation: u64) -> bool {
+        if sequence != self.sequence || image_generation != self.generation.saturating_add(1) {
+            return false;
+        }
+        self.generation = image_generation;
+        self.clean_sequence = sequence;
+        true
+    }
+
     /// A boot/import path has just populated this hive from already-persistent backing bytes.
     ///
     /// The imported cells are the new clean baseline: future `HiveManager::mutate` calls should be

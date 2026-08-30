@@ -540,6 +540,25 @@ fn hive_transaction_commit_publishes_all_mutations() {
 }
 
 #[test]
+fn checkpoint_acknowledgement_requires_exact_live_identity() {
+    let mut hive = mountable_system_hive();
+    hive.finish_clean_import();
+    let service = hive.create_key(r"ControlSet001\Services\Checkpointed");
+    assert!(hive.set_dword(service, "Start", 2));
+    let sequence = hive.sequence;
+    let image_generation = hive.generation.saturating_add(1);
+    let dirty = hive.dirty_count();
+    assert!(dirty > 0);
+
+    assert!(!hive.acknowledge_checkpoint(sequence - 1, image_generation));
+    assert!(!hive.acknowledge_checkpoint(sequence, image_generation + 1));
+    assert_eq!(hive.dirty_count(), dirty);
+    assert!(hive.acknowledge_checkpoint(sequence, image_generation));
+    assert_eq!(hive.generation, image_generation);
+    assert_eq!(hive.dirty_count(), 0);
+}
+
+#[test]
 fn mount_table_currentcontrolset_resolver() {
     let mut mt = HiveMountTable::new();
     let mut system = mountable_system_hive();

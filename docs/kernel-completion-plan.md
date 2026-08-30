@@ -2980,11 +2980,13 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   relative-name identity, duplicate-handle lifetime, final close, query, enumeration, and security
   now use CM-owned opaque leases and bounded immutable records. Runtime mutation preparation,
   physical-path replay-record encoding, and publication are also CM-owned; the executive only makes
-  CM's exact prepared record bytes durable before asking CM to publish them. D5 remains open because
-  SYSTEM checkpoint-image export and several non-native boot/setup consumers still depend on the
-  executive compatibility mirror. Move checkpoint export behind CM, migrate those consumers, and
-  delete the mirror replay/storage machinery; never reduce a live key to a reopenable path or retain
-  a second mutation authority.
+  CM's exact prepared record bytes durable before asking CM to publish them. CM also owns bounded,
+  generation-stamped SYSTEM checkpoint image export and acknowledges it only after the executive's
+  storage provider atomically replaces and flushes the image and truncates and flushes the replay
+  log. D5 remains open because several non-native boot/setup consumers and checkpoint scheduling
+  still depend on the executive compatibility mirror. Migrate those consumers, then delete mirror
+  replay/storage and projection diagnostics together; never reduce a live key to a reopenable path
+  or retain a second mutation authority.
 
 ## Immediate Iteration
 
@@ -17837,3 +17839,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     records, then delete executive SYSTEM mirror replay, checkpoint serialization, and projection
     diagnostics together. Do not retain a best-effort mirror or an executive image encoder as a
     fallback.
+
+    CM-owned SYSTEM checkpoint export acceptance (2026-08-30): CM ABI version 4 adds a bounded
+    `BEGIN`/`PULL`/`ACK`/`ABORT` checkpoint stream. `BEGIN` takes a single-flight lease that excludes
+    SYSTEM mutations and whole-mount replacement, snapshots the exact live hive sequence and mount
+    generation, and streams a fixed metadata envelope followed by the CM-encoded image stamped with
+    the next image generation. The live hive stays dirty throughout transfer. `ACK` succeeds only
+    after the complete byte stream has been pulled and the exact sequence, mount generation, image
+    generation, and transfer token still match; `ABORT` releases the lease without clearing dirty
+    state. A clean hive returns no transfer, and an executive/CM dirty-state disagreement now fails
+    closed as a projection error rather than accepting mirror state.
+
+    The executive's SYSTEM `NtFlushKey`, service-loop, and quiesce checkpoint branch no longer
+    measures or encodes its compatibility hive. It asks CM for the image, transfers ownership of
+    those bytes to the writable provider, atomically replaces and flushes `SYSTEM`, truncates and
+    flushes `SYSTEM.LOG`, and only then acknowledges CM. Any persistence or acknowledgement failure
+    aborts the CM lease and preserves the dirty authoritative hive for retry. Other hive mounts retain
+    their existing owners in this slice. Focused validation passes `nt-config-abi` `4/4`,
+    `nt-hive-core` `81/81` plus `gen_hive` `14/14`, `nt-config-server` `24/24`, and
+    `nt-config-client` `16/16`; the freestanding executive release check remains at the established
+    209-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-cm-checkpoint-final-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. The live workload
+    exercises four CM-owned SYSTEM image exports, including the final 472616-byte generation-2535,
+    sequence-3039 checkpoint. CM reports 2532 accepted runtime transactions with zero rejection or
+    projection failures, and all boot-hive checkpoints complete with zero failures. Explorer completes
+    687 real api0 redirects with zero callback or dead-callback failures, installs 18 client WndProcs
+    without replay, reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch flushes
+    covering 184 records, and paints all `480000/480000` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: authoritative SYSTEM journal and image serialization are now both CM-owned;
+    the executive is only the storage transport. D5 remains open for mirror retirement. Inventory the
+    remaining non-native boot/setup reads and dirty scheduling that touch `mutable_hives` SYSTEM,
+    migrate each to a CM lease or narrow immutable record, and delete executive SYSTEM replay,
+    checkpoint acknowledgement, storage, and projection counters in the same accepted slices. Do not
+    add a mirror fallback if a consumer lacks a CM operation; add the narrow CM operation instead.

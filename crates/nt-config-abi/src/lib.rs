@@ -11,7 +11,7 @@
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;
 pub const CM_OPCODE_MAX: u16 = 0x21ff;
-pub const CM_ABI_VERSION: u16 = 3;
+pub const CM_ABI_VERSION: u16 = 4;
 pub const CM_MAX_INSTANCE_UNITS: usize = 512;
 /// Maximum property payload carried by one SURT completion frame.
 pub const CM_DEVICE_PROPERTY_CHUNK_BYTES: usize = 4096;
@@ -26,6 +26,11 @@ pub const CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 16;
 pub const CM_HIVE_IMPORT_CHUNK_BYTES: usize = 4064;
 /// Maximum journal payload carried by one mounted-hive mutation request frame.
 pub const CM_HIVE_MUTATION_CHUNK_BYTES: usize = 4056;
+/// Maximum SYSTEM checkpoint bytes returned in one SURT completion frame.
+pub const CM_HIVE_CHECKPOINT_CHUNK_BYTES: usize = 4096;
+pub const CM_HIVE_CHECKPOINT_MAGIC: u32 = 0x4843_4D43; // `CMCH`
+pub const CM_HIVE_CHECKPOINT_VERSION: u16 = 1;
+pub const CM_HIVE_CHECKPOINT_HEADER_BYTES: usize = 40;
 pub const CM_HIVE_MUTATION_RECORD_HEADER_BYTES: usize = 24;
 pub const CM_MAX_HIVE_VALUE_NAME_UNITS: usize = 512;
 /// Maximum payload carried by one mounted-hive key snapshot completion frame.
@@ -96,6 +101,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_LEASED_HIVE_KEY: u16 = 0x2158;
     /// Return one bounded immutable key/value record addressed by an owned SYSTEM key lease.
     pub const CM_OP_QUERY_LEASED_HIVE_RECORD: u16 = 0x2159;
+    /// Export and acknowledge one generation-stamped SYSTEM checkpoint image.
+    pub const CM_OP_CHECKPOINT_SYSTEM_HIVE: u16 = 0x215a;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -153,6 +160,15 @@ pub mod hive_mutation_transfer {
     /// Publish the prepared mutation after its replay records are durable.
     pub const COMMIT: u16 = 5;
     pub const ABORT: u16 = 6;
+}
+
+/// Operation carried by [`CmHiveCheckpointRequest::operation`].
+pub mod hive_checkpoint_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    /// Acknowledge that the complete image atomically replaced its durable primary and log.
+    pub const ACK: u16 = 3;
+    pub const ABORT: u16 = 4;
 }
 
 /// Operation encoded in one [`CmHiveMutationRecord`].
@@ -423,6 +439,39 @@ pub struct CmHiveMutationRequest {
     pub lease_token: u64,
 }
 
+/// `checkpoint_system_hive`: a single-flight, generation-checked checkpoint export. BEGIN returns
+/// the first bytes of [`CmHiveCheckpointHeader`] followed by the encoded hive image; PULL continues
+/// at the exact byte offset; ACK marks the exported sequence clean only after storage made the image
+/// and empty replay log durable; ABORT leaves the mounted hive dirty.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveCheckpointRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub expected_generation: u64,
+    pub transfer_token: u64,
+}
+
+/// Fixed prefix on every complete SYSTEM checkpoint transfer. The bytes following this header are
+/// exactly `image_len_bytes` of `nt-hive-core` image data and are the only bytes written to the
+/// durable SYSTEM primary.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveCheckpointHeader {
+    pub magic: u32,
+    pub version: u16,
+    pub header_size: u16,
+    pub mount_generation: u64,
+    pub hive_sequence: u64,
+    pub image_generation: u64,
+    pub image_len_bytes: u32,
+    pub _reserved: u32,
+}
+
 /// Header for one path-addressed operation in a SYSTEM mutation journal. Payload order is UTF-16LE
 /// path, UTF-16LE value/class name, then raw data. Lengths exclude terminators.
 #[repr(C)]
@@ -504,6 +553,8 @@ wire!(CmHiveKeyLeaseRequest);
 wire!(CmLeasedHiveKeyRequest);
 wire!(CmLeasedHiveRecordRequest);
 wire!(CmHiveMutationRequest);
+wire!(CmHiveCheckpointRequest);
+wire!(CmHiveCheckpointHeader);
 wire!(CmHiveMutationRecord);
 wire!(CmLaunchPlanRequest);
 wire!(CmPnpQueryRequest);
@@ -547,7 +598,7 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                40, 0, 3, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc,
+                40, 0, 4, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc,
                 0xbb, 0xaa, 0x99, 0x00, 0xff, 0xee, 0xdd, 40, 0, 0, 0, 0xcc, 0xbb, 0xaa, 0x99,
                 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
             ]
@@ -578,7 +629,7 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                32, 0, 3, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 32, 0, 0,
+                32, 0, 4, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 32, 0, 0,
                 0, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
             ]
         );
@@ -599,12 +650,16 @@ mod tests {
         assert_eq!(opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE, 0x2157);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_KEY, 0x2158);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_RECORD, 0x2159);
+        assert_eq!(opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE, 0x215a);
         assert_eq!(CM_HIVE_KEY_RECORD_VERSION, 2);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyLeaseRequest>(), 24);
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);
+        assert_eq!(core::mem::size_of::<CmHiveCheckpointRequest>(), 32);
+        assert_eq!(core::mem::size_of::<CmHiveCheckpointHeader>(), 40);
+        assert_eq!(CM_HIVE_CHECKPOINT_HEADER_BYTES, 40);
 
         let import = CmHiveImportRequest {
             abi_size: 32,
@@ -693,6 +748,21 @@ mod tests {
         };
         assert_eq!(core::mem::size_of::<CmPnpQueryRequest>(), 48);
         assert_eq!(CmPnpQueryRequest::from_bytes(pnp.as_bytes()), Some(pnp));
+
+        let checkpoint = CmHiveCheckpointRequest {
+            abi_size: 32,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_checkpoint_transfer::PULL,
+            mount: hive_mount::SYSTEM,
+            value_offset: 0x1122_3344,
+            chunk_capacity: 0x5566_7788,
+            expected_generation: 0x0102_0304_0506_0708,
+            transfer_token: 0x1112_1314_1516_1718,
+        };
+        assert_eq!(
+            CmHiveCheckpointRequest::from_bytes(checkpoint.as_bytes()),
+            Some(checkpoint)
+        );
     }
 
     #[test]
@@ -721,7 +791,7 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                40, 0, 3, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 40, 0, 0, 0, 0x88, 0x77, 0x66,
+                40, 0, 4, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 40, 0, 0, 0, 0x88, 0x77, 0x66,
                 0x55, 0xcc, 0xbb, 0xaa, 0x99, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14,
                 0x13, 0x12, 0x11,
             ]

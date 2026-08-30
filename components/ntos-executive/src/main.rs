@@ -16065,6 +16065,39 @@ pub(crate) unsafe fn config_manager_abort_system_hive_mutation(
     }
 }
 
+pub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint(
+) -> Result<Option<nt_config_client::PreparedSystemHiveCheckpoint>, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
+        .prepare_system_hive_checkpoint(expected_generation)
+}
+
+pub(crate) unsafe fn config_manager_acknowledge_system_hive_checkpoint(
+    prepared: &nt_config_client::PreparedSystemHiveCheckpoint,
+) -> Result<(), i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 || prepared.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
+        .acknowledge_system_hive_checkpoint(prepared)
+}
+
+pub(crate) unsafe fn config_manager_abort_system_hive_checkpoint(
+    prepared: &nt_config_client::PreparedSystemHiveCheckpoint,
+) {
+    if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
+        client.abort_system_hive_checkpoint(prepared);
+    }
+}
+
 /// The I/O Manager transport wrapper (carries the extra `flags` + a u64 `information`).
 struct IoChan<'a>(RingChannel<'a>);
 impl nt_io_client::Backend for IoChan<'_> {

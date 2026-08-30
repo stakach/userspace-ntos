@@ -22,20 +22,23 @@ use mutation::{decode_mutation_journal, HiveMutation, MutationLeaseBank, Mutatio
 use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 
 use nt_config_abi::{
-    device_property_transfer, driver_service_class, driver_service_transfer, hive_import_transfer,
-    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer,
-    launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
-    pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
-    win32_service_process_kind, CmDevicePropertyRequest, CmDriverServiceRequest,
-    CmEnumerateKeyRequest, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
-    CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest,
-    CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
-    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    device_property_transfer, driver_service_class, driver_service_transfer,
+    hive_checkpoint_transfer, hive_import_transfer, hive_key_lease_operation, hive_key_transfer,
+    hive_mount, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
+    leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
+    read_utf16, win32_service_plan_kind, win32_service_process_kind, CmDevicePropertyRequest,
+    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
+    CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest, CmHiveMutationRequest,
+    CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest,
+    CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
+    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
-    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
-    CM_HIVE_KEY_RECORD_HEADER_BYTES, CM_HIVE_KEY_RECORD_MAGIC, CM_HIVE_KEY_RECORD_VERSION,
-    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
-    CM_HIVE_MUTATION_CHUNK_BYTES, CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_CHECKPOINT_CHUNK_BYTES,
+    CM_HIVE_CHECKPOINT_HEADER_BYTES, CM_HIVE_CHECKPOINT_MAGIC, CM_HIVE_CHECKPOINT_VERSION,
+    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_RECORD_HEADER_BYTES,
+    CM_HIVE_KEY_RECORD_MAGIC, CM_HIVE_KEY_RECORD_VERSION, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_HIVE_MUTATION_CHUNK_BYTES,
+    CM_LAUNCH_PLAN_CHUNK_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES,
     CM_LAUNCH_PLAN_SNAPSHOT_MAGIC, CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS,
     CM_MAX_HIVE_VALUE_NAME_UNITS, CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES,
     CM_MAX_SERVICE_UNITS, CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
@@ -50,9 +53,9 @@ use nt_config_manager::{
     SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
-    collect_reactos_network_adapter_bindings, decode_image, encode_log_record, CellId,
-    CurrentControlSet, Hive, HiveKind, HiveLogOp, HiveTransaction, ReactOsNetworkAdapterBinding,
-    SYSTEM_HIVE_PATH,
+    collect_reactos_network_adapter_bindings, decode_image, encode_log_record, try_encode_image,
+    CellId, CurrentControlSet, Hive, HiveKind, HiveLogOp, HiveTransaction,
+    ReactOsNetworkAdapterBinding, SYSTEM_HIVE_PATH,
 };
 
 /// CM admits multiple immutable key readers, but abandoned transfers must not retain an unbounded
@@ -775,6 +778,15 @@ struct PreparedSystemHiveMutation {
     durable_journal: Vec<u8>,
 }
 
+struct PreparedSystemHiveCheckpoint {
+    token: u64,
+    mount_generation: u64,
+    hive_sequence: u64,
+    image_generation: u64,
+    value: Vec<u8>,
+    offset: usize,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
@@ -785,6 +797,8 @@ pub struct CmServer {
     next_hive_import_token: u64,
     system_mutation_leases: MutationLeaseBank,
     prepared_system_mutation: Option<PreparedSystemHiveMutation>,
+    prepared_system_checkpoint: Option<PreparedSystemHiveCheckpoint>,
+    next_system_checkpoint_token: u64,
     system_key_leases: SystemKeyLeaseBank,
     hive_key_snapshots: SnapshotPool<HiveKeySnapshotKey>,
     driver_launch_plan_snapshots: SnapshotBank<u16>,
@@ -810,6 +824,8 @@ impl CmServer {
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(),
             prepared_system_mutation: None,
+            prepared_system_checkpoint: None,
+            next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::with_limits(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
@@ -833,6 +849,8 @@ impl CmServer {
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(),
             prepared_system_mutation: None,
+            prepared_system_checkpoint: None,
+            next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::with_limits(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
@@ -871,6 +889,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),
+            opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE => self.op_checkpoint_system_hive(in_buf, out_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
@@ -1257,7 +1276,9 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                if self.prepared_system_mutation.is_some() {
+                if self.prepared_system_mutation.is_some()
+                    || self.prepared_system_checkpoint.is_some()
+                {
                     return reply(STATUS_DEVICE_BUSY, 0);
                 }
                 let token = self.next_hive_import_token;
@@ -1325,7 +1346,9 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                if self.prepared_system_mutation.is_some() {
+                if self.prepared_system_mutation.is_some()
+                    || self.prepared_system_checkpoint.is_some()
+                {
                     return reply(STATUS_DEVICE_BUSY, 0);
                 }
                 let Some(index) = self.hive_imports.iter().position(|import| {
@@ -1576,7 +1599,9 @@ impl CmServer {
                         current_generation,
                     );
                 }
-                if self.prepared_system_mutation.is_some() {
+                if self.prepared_system_mutation.is_some()
+                    || self.prepared_system_checkpoint.is_some()
+                {
                     return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
                 match self
@@ -1775,6 +1800,178 @@ impl CmServer {
                 if !aborted {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
+                reply(STATUS_SUCCESS, current_generation)
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, current_generation),
+        }
+    }
+
+    fn op_checkpoint_system_hive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmHiveCheckpointRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmHiveCheckpointRequest>();
+        let chunk_capacity = req.chunk_capacity as usize;
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req.mount != hive_mount::SYSTEM
+            || buf.len() != header_size
+            || chunk_capacity > CM_HIVE_CHECKPOINT_CHUNK_BYTES
+            || chunk_capacity > out_buf.len()
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let Some(current_generation) = self.system_hive.as_ref().map(|hive| hive.generation) else {
+            return reply(STATUS_DEVICE_NOT_READY, 0);
+        };
+        if req.expected_generation == 0 || req.expected_generation != current_generation {
+            return reply(
+                if req.expected_generation == 0 {
+                    STATUS_INVALID_PARAMETER
+                } else {
+                    STATUS_REVISION_MISMATCH
+                },
+                current_generation,
+            );
+        }
+
+        match req.operation {
+            hive_checkpoint_transfer::BEGIN => {
+                if req.transfer_token != 0 || req.value_offset != 0 || chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                if self.prepared_system_checkpoint.is_some()
+                    || self.prepared_system_mutation.is_some()
+                    || self.system_mutation_leases.is_busy()
+                    || !self.hive_imports.is_empty()
+                {
+                    return reply(STATUS_DEVICE_BUSY, current_generation);
+                }
+                let mounted = self.system_hive.as_mut().unwrap();
+                if mounted.hive.dirty_count() == 0 {
+                    return reply_with_info(STATUS_SUCCESS, 0, current_generation, 0);
+                }
+                let hive_sequence = mounted.hive.sequence;
+                let previous_image_generation = mounted.hive.generation;
+                let image_generation = previous_image_generation.saturating_add(1);
+                mounted.hive.generation = image_generation;
+                let image_result = try_encode_image(&mounted.hive);
+                mounted.hive.generation = previous_image_generation;
+                let image = match image_result {
+                    Ok(image) => image,
+                    Err(_) => return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation),
+                };
+                let Ok(image_len_bytes) = u32::try_from(image.len()) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                let checkpoint_header = CmHiveCheckpointHeader {
+                    magic: CM_HIVE_CHECKPOINT_MAGIC,
+                    version: CM_HIVE_CHECKPOINT_VERSION,
+                    header_size: CM_HIVE_CHECKPOINT_HEADER_BYTES as u16,
+                    mount_generation: current_generation,
+                    hive_sequence,
+                    image_generation,
+                    image_len_bytes,
+                    _reserved: 0,
+                };
+                let Some(total_len) = CM_HIVE_CHECKPOINT_HEADER_BYTES.checked_add(image.len())
+                else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                let mut value = Vec::new();
+                if value.try_reserve_exact(total_len).is_err() {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                }
+                value.extend_from_slice(checkpoint_header.as_bytes());
+                value.extend_from_slice(&image);
+                let token = self.next_system_checkpoint_token;
+                let Some(next_token) = token.checked_add(1) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                if token == 0 {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                }
+                let written = core::cmp::min(chunk_capacity, value.len());
+                out_buf[..written].copy_from_slice(&value[..written]);
+                self.next_system_checkpoint_token = next_token;
+                self.prepared_system_checkpoint = Some(PreparedSystemHiveCheckpoint {
+                    token,
+                    mount_generation: current_generation,
+                    hive_sequence,
+                    image_generation,
+                    value,
+                    offset: written,
+                });
+                reply_with_info(STATUS_SUCCESS, written as u32, total_len as u64, token)
+            }
+            hive_checkpoint_transfer::PULL => {
+                if req.transfer_token == 0 || chunk_capacity == 0 {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let Some(prepared) = self.prepared_system_checkpoint.as_mut() else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                if prepared.token != req.transfer_token
+                    || prepared.mount_generation != req.expected_generation
+                    || prepared.offset != req.value_offset as usize
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let end = core::cmp::min(
+                    prepared.offset.saturating_add(chunk_capacity),
+                    prepared.value.len(),
+                );
+                let written = end - prepared.offset;
+                out_buf[..written].copy_from_slice(&prepared.value[prepared.offset..end]);
+                prepared.offset = end;
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    prepared.value.len() as u64,
+                    prepared.token,
+                )
+            }
+            hive_checkpoint_transfer::ACK => {
+                if req.transfer_token == 0 || chunk_capacity != 0 {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let Some(prepared) = self.prepared_system_checkpoint.take() else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                if prepared.token != req.transfer_token
+                    || prepared.mount_generation != req.expected_generation
+                    || prepared.offset != prepared.value.len()
+                    || req.value_offset as usize != prepared.value.len()
+                {
+                    self.prepared_system_checkpoint = Some(prepared);
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let mounted = self.system_hive.as_mut().unwrap();
+                if mounted.generation != prepared.mount_generation
+                    || !mounted
+                        .hive
+                        .acknowledge_checkpoint(prepared.hive_sequence, prepared.image_generation)
+                {
+                    self.prepared_system_checkpoint = Some(prepared);
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                reply_with_info(STATUS_SUCCESS, 0, current_generation, req.transfer_token)
+            }
+            hive_checkpoint_transfer::ABORT => {
+                if req.transfer_token == 0 || req.value_offset != 0 || chunk_capacity != 0 {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let matches = self
+                    .prepared_system_checkpoint
+                    .as_ref()
+                    .is_some_and(|prepared| {
+                        prepared.token == req.transfer_token
+                            && prepared.mount_generation == req.expected_generation
+                    });
+                if !matches {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                self.prepared_system_checkpoint = None;
                 reply(STATUS_SUCCESS, current_generation)
             }
             _ => reply(STATUS_INVALID_PARAMETER, current_generation),
@@ -2844,6 +3041,26 @@ mod tests {
         bytes
     }
 
+    fn hive_checkpoint_request(
+        operation: u16,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+        expected_generation: u64,
+    ) -> Vec<u8> {
+        let header = CmHiveCheckpointRequest {
+            abi_size: core::mem::size_of::<CmHiveCheckpointRequest>() as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            mount: hive_mount::SYSTEM,
+            value_offset,
+            chunk_capacity,
+            expected_generation,
+            transfer_token,
+        };
+        Vec::from(header.as_bytes())
+    }
+
     fn begin_hive_import(server: &mut CmServer, image: &[u8]) -> u64 {
         let response = server.dispatch(
             opcode::CM_OP_IMPORT_HIVE,
@@ -3349,6 +3566,141 @@ mod tests {
 
         server.prepared_system_mutation = None;
         assert_eq!(commit_hive_import(&mut server, token, &second), 2);
+    }
+
+    #[test]
+    fn system_checkpoint_is_single_flight_and_acknowledges_exact_image() {
+        let mut hive = selected_system_hive(1);
+        let key = hive.create_key(r"ControlSet001\Services\Checkpointed");
+        assert!(hive.set_value(
+            key,
+            "Payload",
+            RegistryValueType::Binary,
+            vec![0x5a; CM_HIVE_CHECKPOINT_CHUNK_BYTES + 73],
+        ));
+        hive.finish_clean_import();
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
+        let mutations = [HiveMutation::SetValue {
+            path: String::from(r"\Registry\Machine\System\CurrentControlSet\Services\Checkpointed"),
+            name: String::from("Start"),
+            value_type: RegistryValueType::Dword as u32,
+            data: 2u32.to_le_bytes().to_vec(),
+        }];
+        assert_eq!(server.commit_system_hive_mutations(&mutations, 2), Ok(()));
+
+        let mut first = [0u8; 257];
+        let begin = server.dispatch(
+            opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+            &hive_checkpoint_request(hive_checkpoint_transfer::BEGIN, 0, 0, first.len() as u32, 2),
+            &mut first,
+        );
+        assert_eq!(begin.status, STATUS_SUCCESS);
+        assert_ne!(begin.detail1, 0);
+        assert!(begin.detail0 as usize > CM_HIVE_CHECKPOINT_CHUNK_BYTES);
+
+        let replacement = encode_image(&selected_system_hive(2));
+        let blocked_import = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(
+                hive_import_transfer::BEGIN,
+                0,
+                0,
+                replacement.len() as u32,
+                &[],
+            ),
+            &mut [],
+        );
+        assert_eq!(blocked_import.status, STATUS_DEVICE_BUSY);
+        let blocked_mutation = CmHiveMutationRequest {
+            abi_size: core::mem::size_of::<CmHiveMutationRequest>() as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_mutation_transfer::BEGIN,
+            mount: hive_mount::SYSTEM,
+            journal_offset: 0,
+            chunk_offset: 0,
+            chunk_len_bytes: 0,
+            journal_len_bytes: 1,
+            expected_generation: 2,
+            lease_token: 0,
+        };
+        assert_eq!(
+            server
+                .dispatch(
+                    opcode::CM_OP_MUTATE_SYSTEM_HIVE,
+                    blocked_mutation.as_bytes(),
+                    &mut [],
+                )
+                .status,
+            STATUS_DEVICE_BUSY
+        );
+
+        let premature_ack = server.dispatch(
+            opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+            &hive_checkpoint_request(
+                hive_checkpoint_transfer::ACK,
+                begin.detail1,
+                begin.information,
+                0,
+                2,
+            ),
+            &mut [],
+        );
+        assert_eq!(premature_ack.status, STATUS_INVALID_PARAMETER);
+        assert!(server.system_hive.as_ref().unwrap().hive.dirty_count() > 0);
+
+        let mut value = Vec::from(&first[..begin.information as usize]);
+        while value.len() < begin.detail0 as usize {
+            let capacity = core::cmp::min(
+                CM_HIVE_CHECKPOINT_CHUNK_BYTES,
+                begin.detail0 as usize - value.len(),
+            );
+            let mut chunk = vec![0u8; capacity];
+            let pull = server.dispatch(
+                opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+                &hive_checkpoint_request(
+                    hive_checkpoint_transfer::PULL,
+                    begin.detail1,
+                    value.len() as u32,
+                    capacity as u32,
+                    2,
+                ),
+                &mut chunk,
+            );
+            assert_eq!(pull.status, STATUS_SUCCESS);
+            value.extend_from_slice(&chunk[..pull.information as usize]);
+        }
+        let header = CmHiveCheckpointHeader::from_bytes(&value).unwrap();
+        assert_eq!(header.magic, CM_HIVE_CHECKPOINT_MAGIC);
+        assert_eq!(header.mount_generation, 2);
+        assert_eq!(
+            header.image_len_bytes as usize,
+            value.len() - header.header_size as usize
+        );
+        let checkpoint_hive = decode_image(&value[header.header_size as usize..]).unwrap();
+        assert_eq!(checkpoint_hive.sequence, header.hive_sequence);
+        assert_eq!(checkpoint_hive.generation, header.image_generation);
+        let key = checkpoint_hive
+            .open_key(r"ControlSet001\Services\Checkpointed")
+            .unwrap();
+        assert_eq!(checkpoint_hive.query_dword(key, "Start"), Some(2));
+
+        let ack = server.dispatch(
+            opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE,
+            &hive_checkpoint_request(
+                hive_checkpoint_transfer::ACK,
+                begin.detail1,
+                value.len() as u32,
+                0,
+                2,
+            ),
+            &mut [],
+        );
+        assert_eq!(ack.status, STATUS_SUCCESS);
+        let mounted = server.system_hive.as_ref().unwrap();
+        assert_eq!(mounted.generation, 2);
+        assert_eq!(mounted.hive.generation, header.image_generation);
+        assert_eq!(mounted.hive.dirty_count(), 0);
     }
 
     #[test]
