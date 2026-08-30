@@ -16,6 +16,7 @@ native_transport = []
 nt-alpc-abi = { workspace = true }
 nt-syscall-abi = { path = "../nt-syscall-abi" }
 nt-ntdll-layout = { workspace = true }
+nt-printf = { workspace = true }
 nt-compat-exports = { workspace = true }
 nt-kernel-exec = { workspace = true }
 nt-nls = { workspace = true }

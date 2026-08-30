@@ -17,7 +17,7 @@ use nt_config_abi::{
     device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
     driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
     hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_flags,
-    hive_mutation_kind, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
+    hive_mutation_kind, hive_mutation_transfer, key_flags, launch_plan_kind, launch_plan_transfer,
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
     win32_service_plan_kind, win32_service_process_kind, CmDeviceActionRequest,
     CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
@@ -1103,9 +1103,20 @@ impl<B: Backend> ConfigClient<B> {
 
     /// Create (or get) a key by full path. `Ok(key_id)`.
     pub fn create_key(&mut self, path: &str) -> Result<u64, i32> {
-        let r = self.key_op(opcode::CM_OP_CREATE_KEY, path);
+        self.create_key_with_options(path, false)
+            .map(|(key, _created)| key)
+    }
+
+    /// Create (or get) a key and preserve the NT volatile-key option.
+    pub fn create_key_with_options(
+        &mut self,
+        path: &str,
+        volatile: bool,
+    ) -> Result<(u64, bool), i32> {
+        let flags = if volatile { key_flags::VOLATILE } else { 0 };
+        let r = self.key_op_with_flags(opcode::CM_OP_CREATE_KEY, path, flags);
         if r.status == STATUS_SUCCESS {
-            Ok(r.detail0)
+            Ok((r.detail0, r.detail1 != 0))
         } else {
             Err(r.status)
         }
@@ -3420,10 +3431,14 @@ impl<B: Backend> ConfigClient<B> {
     }
 
     fn key_op(&mut self, op: u16, path: &str) -> CmReply {
+        self.key_op_with_flags(op, path, 0)
+    }
+
+    fn key_op_with_flags(&mut self, op: u16, path: &str, flags: u16) -> CmReply {
         let path_bytes = utf16_bytes(path);
         let hdr = CmKeyRequest {
             abi_size: core::mem::size_of::<CmKeyRequest>() as u16,
-            _pad: 0,
+            flags,
             path_offset: core::mem::size_of::<CmKeyRequest>() as u32,
             path_len_bytes: path_bytes.len() as u32,
         };

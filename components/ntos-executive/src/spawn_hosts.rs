@@ -1949,6 +1949,50 @@ unsafe fn component_pump_loop(
                 );
             pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, handle, 0, 0);
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, thread_id) =
+                crate::driver_launch::service_hosted_driver_ps_get_current_thread_id(
+                    ch,
+                    msg.badge,
+                    *reply_cap,
+                );
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                thread_id,
+                0,
+                0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_PCI_CONFIG_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, transferred) =
+                crate::driver_launch::service_hosted_driver_pci_config(
+                    ch,
+                    msg.m0,
+                    msg.m1,
+                    msg.m2,
+                    msg.m3,
+                    msg.badge,
+                    *reply_cap,
+                );
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                transferred,
+                0,
+                0
+            );
+            continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_TERMINATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
         {

@@ -93,6 +93,7 @@ members = [
     "crates/nt-win32k-job",
     "crates/nt-syscall-abi",
     "crates/nt-ntdll-layout",
+    "crates/nt-printf",
     "crates/nt-ntdll",
     "tools/driver-import-report",
     "tools/ntdll-dll-verify",
@@ -199,4 +200,5 @@ nt-user-callback = { path = "crates/nt-user-callback" }
 nt-win32k-job = { path = "crates/nt-win32k-job" }
 nt-syscall-abi = { path = "crates/nt-syscall-abi" }
 nt-ntdll-layout = { path = "crates/nt-ntdll-layout" }
+nt-printf = { path = "crates/nt-printf" }
 nt-ntdll = { path = "crates/nt-ntdll" }

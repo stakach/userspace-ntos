@@ -1,5 +1,7 @@
 //! Allocation-free NT CRT printf formatting core.
 
+#![no_std]
+
 /// ABI type the formatter needs from the variadic argument source.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ArgumentKind {
@@ -937,6 +939,16 @@ mod tests {
         Ok(output.units.into_iter().map(|unit| unit as u8).collect())
     }
 
+    fn render_wide(format: &[u16], values: &[u64]) -> Result<Vec<u16>, ()> {
+        let mut args = TestArgs { values, index: 0 };
+        let mut output = TestOutput {
+            units: Vec::new(),
+            capacity: usize::MAX,
+        };
+        unsafe { format_wide(format.as_ptr(), &mut args, &mut output)? };
+        Ok(output.units)
+    }
+
     #[test]
     fn integers_flags_width_precision_and_lengths() {
         assert_eq!(
@@ -988,6 +1000,23 @@ mod tests {
         assert_eq!(
             render(b"%.*S\0", &[2, wide_without_nul.as_ptr() as u64]),
             Ok(b"OK".to_vec())
+        );
+    }
+
+    #[test]
+    fn wide_driver_formats_cover_nt5_narrow_and_wide_strings() {
+        let format = "ACPI\\%hs %.*s %08X\0".encode_utf16().collect::<Vec<_>>();
+        let narrow = b"PNP0C08\0";
+        let wide = "DSDT-extra\0".encode_utf16().collect::<Vec<_>>();
+        let expected = "ACPI\\PNP0C08 DSDT 0000002A"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            render_wide(
+                &format,
+                &[narrow.as_ptr() as u64, 4, wide.as_ptr() as u64, 0x2a]
+            ),
+            Ok(expected)
         );
     }
 

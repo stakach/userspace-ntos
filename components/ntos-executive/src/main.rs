@@ -15975,6 +15975,16 @@ pub(crate) unsafe fn config_manager_create_key(path: &str) -> Result<u64, i32> {
     client.create_key(path)
 }
 
+pub(crate) unsafe fn config_manager_create_key_with_options(
+    path: &str,
+    volatile: bool,
+) -> Result<(u64, bool), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.create_key_with_options(path, volatile)
+}
+
 pub(crate) unsafe fn config_manager_open_key(path: &str) -> bool {
     CONFIG_CLIENT_PTR
         .as_mut()

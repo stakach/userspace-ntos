@@ -69,7 +69,7 @@ pub mod loader;
 pub mod marshal;
 pub mod native_call;
 pub mod nls;
-pub mod printf;
+pub use nt_printf as printf;
 pub mod rtl;
 pub mod stubs;
 pub mod sync;

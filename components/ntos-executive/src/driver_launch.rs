@@ -22,7 +22,7 @@
 
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
-use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -550,6 +550,7 @@ pub const V_NAMED_DEVICE: u32 = 0x40; // at least one named IoCreateDevice call 
 pub const V_SYMLINK: u32 = 0x80; // IoCreateSymbolicLink declared a valid link/target
 
 const PASSIVE_LEVEL: u8 = 0;
+const APC_LEVEL: u8 = 1;
 const DISPATCH_LEVEL: u8 = 2;
 const TIMER_NOTIFICATION_OBJECT: u8 = 8;
 const TIMER_SYNCHRONIZATION_OBJECT: u8 = 9;
@@ -646,6 +647,8 @@ pub const FSD_SERVICE_PULL_IRP_OUTPUT_LABEL: u64 = 0x77F;
 pub const FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL: u64 = 0x780;
 pub const FSD_SERVICE_ROOT_PDO_PNP_LABEL: u64 = 0x781;
 pub const FSD_SERVICE_DEVICE_LABEL: u64 = 0x782;
+pub const FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL: u64 = 0x783;
+pub const FSD_SERVICE_PCI_CONFIG_LABEL: u64 = 0x784;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -682,6 +685,8 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_PUSH_IRP_OUTPUT_LABEL
             | FSD_SERVICE_ROOT_PDO_PNP_LABEL
             | FSD_SERVICE_DEVICE_LABEL
+            | FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
+            | FSD_SERVICE_PCI_CONFIG_LABEL
     )
 }
 
@@ -4434,172 +4439,341 @@ extern "win64" fn s_strcpy(dst: u64, src: u64) -> u64 {
     dst
 }
 
-unsafe fn sprintf_put(dst: u64, written: &mut usize, byte: u8) {
-    if *written < 4095 {
-        write_volatile((dst + *written as u64) as *mut u8, byte);
-    }
-    *written = (*written).saturating_add(1);
+extern "win64" fn s_strcmp(left: u64, right: u64) -> i32 {
+    s_strncmp(left, right, usize::MAX)
 }
 
-unsafe fn sprintf_uint(
-    dst: u64,
-    written: &mut usize,
-    mut value: u64,
-    radix: u64,
-    width: usize,
-    pad: u8,
-    uppercase: bool,
-) {
-    let mut tmp = [0u8; 32];
-    let mut len = 0usize;
-    loop {
-        let digit = (value % radix) as u8;
-        tmp[len] = if digit < 10 {
-            b'0' + digit
-        } else if uppercase {
-            b'A' + digit - 10
+extern "win64" fn s_strncmp(left: u64, right: u64, count: usize) -> i32 {
+    if left == 0 || right == 0 {
+        return i32::from(left != 0) - i32::from(right != 0);
+    }
+    unsafe {
+        let mut index = 0usize;
+        while index < count {
+            let left_byte = read_volatile((left + index as u64) as *const u8);
+            let right_byte = read_volatile((right + index as u64) as *const u8);
+            if left_byte != right_byte {
+                return left_byte as i32 - right_byte as i32;
+            }
+            if left_byte == 0 {
+                break;
+            }
+            index += 1;
+        }
+    }
+    0
+}
+
+extern "win64" fn s_strncpy(dst: u64, src: u64, count: usize) -> u64 {
+    if dst == 0 {
+        return 0;
+    }
+    unsafe {
+        let mut index = 0usize;
+        let mut terminated = src == 0;
+        while index < count {
+            let byte = if terminated {
+                0
+            } else {
+                read_volatile((src + index as u64) as *const u8)
+            };
+            write_volatile((dst + index as u64) as *mut u8, byte);
+            terminated |= byte == 0;
+            index += 1;
+        }
+    }
+    dst
+}
+
+extern "win64" fn s_strcat(dst: u64, src: u64) -> u64 {
+    if dst == 0 {
+        return 0;
+    }
+    let offset = s_strlen(dst);
+    s_strcpy(dst.saturating_add(offset), src);
+    dst
+}
+
+extern "win64" fn s_strstr(haystack: u64, needle: u64) -> u64 {
+    if haystack == 0 || needle == 0 {
+        return 0;
+    }
+    let needle_len = s_strlen(needle);
+    if needle_len == 0 {
+        return haystack;
+    }
+    let haystack_len = s_strlen(haystack);
+    if needle_len > haystack_len {
+        return 0;
+    }
+    let mut offset = 0u64;
+    while offset <= haystack_len - needle_len {
+        if s_strncmp(haystack + offset, needle, needle_len as usize) == 0 {
+            return haystack + offset;
+        }
+        offset += 1;
+    }
+    0
+}
+
+extern "win64" fn s_wcsstr(haystack: u64, needle: u64) -> u64 {
+    if haystack == 0 || needle == 0 {
+        return 0;
+    }
+    let needle_len = s_wcslen(needle);
+    if needle_len == 0 {
+        return haystack;
+    }
+    let haystack_len = s_wcslen(haystack);
+    if needle_len > haystack_len {
+        return 0;
+    }
+    unsafe {
+        let mut offset = 0u64;
+        while offset <= haystack_len - needle_len {
+            let mut matched = true;
+            let mut index = 0u64;
+            while index < needle_len {
+                let left = read_volatile((haystack + (offset + index) * 2) as *const u16);
+                let right = read_volatile((needle + index * 2) as *const u16);
+                if left != right {
+                    matched = false;
+                    break;
+                }
+                index += 1;
+            }
+            if matched {
+                return haystack + offset * 2;
+            }
+            offset += 1;
+        }
+    }
+    0
+}
+
+extern "win64" fn s_tolower(value: i32) -> i32 {
+    if (b'A' as i32..=b'Z' as i32).contains(&value) {
+        value + (b'a' - b'A') as i32
+    } else {
+        value
+    }
+}
+
+struct Win64PrintfArguments {
+    registers: [u64; 3],
+    register_count: usize,
+    index: usize,
+    stack_cursor: u64,
+}
+
+impl nt_printf::Arguments for Win64PrintfArguments {
+    unsafe fn next(&mut self, _kind: nt_printf::ArgumentKind) -> u64 {
+        let value = if self.index < self.register_count {
+            self.registers[self.index]
+        } else if self.stack_cursor != 0 {
+            let value = read_unaligned(self.stack_cursor as *const u64);
+            self.stack_cursor = self.stack_cursor.saturating_add(8);
+            value
         } else {
-            b'a' + digit - 10
+            0
         };
-        len += 1;
-        value /= radix;
-        if value == 0 {
-            break;
-        }
-    }
-    let mut pad_count = width.saturating_sub(len);
-    while pad_count != 0 {
-        sprintf_put(dst, written, pad);
-        pad_count -= 1;
-    }
-    while len != 0 {
-        len -= 1;
-        sprintf_put(dst, written, tmp[len]);
+        self.index = self.index.saturating_add(1);
+        value
     }
 }
 
-unsafe fn sprintf_str(dst: u64, written: &mut usize, src: u64) {
-    if src == 0 {
-        for &b in b"(null)" {
-            sprintf_put(dst, written, b);
+impl Win64PrintfArguments {
+    fn new(registers: [u64; 3], register_count: usize, caller_rsp: u64) -> Self {
+        Self {
+            registers,
+            register_count,
+            index: 0,
+            // Win64 reserves 32 bytes of caller shadow space. The first variadic stack argument is
+            // therefore five pointer-sized slots above the return address.
+            stack_cursor: caller_rsp.checked_add(0x28).unwrap_or(0),
         }
-        return;
-    }
-    let mut i = 0u64;
-    while i < 1024 {
-        let b = read_volatile((src + i) as *const u8);
-        if b == 0 {
-            break;
-        }
-        sprintf_put(dst, written, b);
-        i += 1;
     }
 }
 
-/// `int sprintf(char *out, const char *fmt, ...)` — bounded NT-host CRT formatter for the integer
-/// and string forms used by ReactOS networking paths.
-extern "win64" fn s_sprintf(
+struct VaListPrintfArguments {
+    cursor: u64,
+}
+
+impl nt_printf::Arguments for VaListPrintfArguments {
+    unsafe fn next(&mut self, _kind: nt_printf::ArgumentKind) -> u64 {
+        if self.cursor == 0 {
+            return 0;
+        }
+        let value = read_unaligned(self.cursor as *const u64);
+        self.cursor = self.cursor.saturating_add(8);
+        value
+    }
+}
+
+struct NarrowPrintfOutput {
+    buffer: u64,
+    capacity: usize,
+    position: usize,
+}
+
+impl nt_printf::Output for NarrowPrintfOutput {
+    fn write(&mut self, unit: u16) -> bool {
+        if self.position >= self.capacity {
+            return false;
+        }
+        unsafe {
+            write_unaligned((self.buffer + self.position as u64) as *mut u8, unit as u8);
+        }
+        self.position += 1;
+        true
+    }
+}
+
+struct WidePrintfOutput {
+    buffer: u64,
+    capacity: usize,
+    position: usize,
+}
+
+impl nt_printf::Output for WidePrintfOutput {
+    fn write(&mut self, unit: u16) -> bool {
+        if self.position >= self.capacity {
+            return false;
+        }
+        unsafe {
+            write_unaligned(
+                (self.buffer + self.position as u64 * 2) as *mut u16,
+                unit,
+            );
+        }
+        self.position += 1;
+        true
+    }
+}
+
+unsafe fn format_narrow_driver<A: nt_printf::Arguments>(
     dst: u64,
+    capacity: usize,
     fmt: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-    a4: u64,
-    a5: u64,
-    a6: u64,
-    a7: u64,
+    args: &mut A,
 ) -> i32 {
     if dst == 0 || fmt == 0 {
         return -1;
     }
-    let args = [a0, a1, a2, a3, a4, a5, a6, a7];
-    let mut argi = 0usize;
-    let mut written = 0usize;
-    let mut pos = 0u64;
-    unsafe {
-        while pos < 4096 {
-            let b = read_volatile((fmt + pos) as *const u8);
-            if b == 0 {
-                break;
+    let mut output = NarrowPrintfOutput {
+        buffer: dst,
+        capacity,
+        position: 0,
+    };
+    match nt_printf::format_narrow(fmt as *const u8, args, &mut output) {
+        Ok(length) => {
+            if length < capacity {
+                write_unaligned((dst + length as u64) as *mut u8, 0);
             }
-            pos += 1;
-            if b != b'%' {
-                sprintf_put(dst, &mut written, b);
-                continue;
-            }
-            let mut spec = read_volatile((fmt + pos) as *const u8);
-            if spec == 0 {
-                break;
-            }
-            pos += 1;
-            if spec == b'%' {
-                sprintf_put(dst, &mut written, b'%');
-                continue;
-            }
-            let pad = if spec == b'0' {
-                spec = read_volatile((fmt + pos) as *const u8);
-                pos += 1;
-                b'0'
-            } else {
-                b' '
-            };
-            let mut width = 0usize;
-            while spec.is_ascii_digit() {
-                width = width
-                    .saturating_mul(10)
-                    .saturating_add((spec - b'0') as usize);
-                spec = read_volatile((fmt + pos) as *const u8);
-                pos += 1;
-            }
-            while spec == b'l' || spec == b'I' || spec == b'z' || spec == b't' {
-                spec = read_volatile((fmt + pos) as *const u8);
-                pos += 1;
-            }
-            let arg = if argi < args.len() {
-                let v = args[argi];
-                argi += 1;
-                v
-            } else {
-                0
-            };
-            match spec {
-                b'd' | b'i' => {
-                    let signed = arg as i64;
-                    if signed < 0 {
-                        sprintf_put(dst, &mut written, b'-');
-                        sprintf_uint(
-                            dst,
-                            &mut written,
-                            signed.wrapping_neg() as u64,
-                            10,
-                            width,
-                            pad,
-                            false,
-                        );
-                    } else {
-                        sprintf_uint(dst, &mut written, signed as u64, 10, width, pad, false);
-                    }
-                }
-                b'u' => sprintf_uint(dst, &mut written, arg, 10, width, pad, false),
-                b'x' => sprintf_uint(dst, &mut written, arg, 16, width, pad, false),
-                b'X' => sprintf_uint(dst, &mut written, arg, 16, width, pad, true),
-                b'p' => {
-                    sprintf_put(dst, &mut written, b'0');
-                    sprintf_put(dst, &mut written, b'x');
-                    sprintf_uint(dst, &mut written, arg, 16, width.max(16), b'0', false);
-                }
-                b'c' => sprintf_put(dst, &mut written, arg as u8),
-                b's' => sprintf_str(dst, &mut written, arg),
-                _ => {
-                    sprintf_put(dst, &mut written, b'%');
-                    sprintf_put(dst, &mut written, spec);
-                }
-            }
+            i32::try_from(length).unwrap_or(-1)
         }
-        write_volatile((dst + written.min(4095) as u64) as *mut u8, 0);
+        Err(()) => -1,
     }
-    written.min(i32::MAX as usize) as i32
+}
+
+unsafe fn format_wide_driver<A: nt_printf::Arguments>(
+    dst: u64,
+    capacity: usize,
+    fmt: u64,
+    args: &mut A,
+) -> i32 {
+    if dst == 0 || fmt == 0 {
+        return -1;
+    }
+    let mut output = WidePrintfOutput {
+        buffer: dst,
+        capacity,
+        position: 0,
+    };
+    match nt_printf::format_wide(fmt as *const u16, args, &mut output) {
+        Ok(length) => {
+            if length < capacity {
+                write_unaligned((dst + length as u64 * 2) as *mut u16, 0);
+            }
+            i32::try_from(length).unwrap_or(-1)
+        }
+        Err(()) => -1,
+    }
+}
+
+#[no_mangle]
+extern "win64" fn s_sprintf_body(
+    dst: u64,
+    fmt: u64,
+    a0: u64,
+    a1: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
+    unsafe { format_narrow_driver(dst, usize::MAX, fmt, &mut args) }
+}
+
+#[no_mangle]
+extern "win64" fn s_snprintf_body(
+    dst: u64,
+    count: usize,
+    fmt: u64,
+    a0: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, 0, 0], 1, caller_rsp);
+    unsafe { format_narrow_driver(dst, count, fmt, &mut args) }
+}
+
+#[no_mangle]
+extern "win64" fn s_swprintf_body(
+    dst: u64,
+    fmt: u64,
+    a0: u64,
+    a1: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
+    unsafe { format_wide_driver(dst, usize::MAX, fmt, &mut args) }
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl hosted_sprintf_gate",
+    "hosted_sprintf_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_sprintf_body",
+    "add rsp, 0x38",
+    "ret",
+    ".globl hosted_snprintf_gate",
+    "hosted_snprintf_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_snprintf_body",
+    "add rsp, 0x38",
+    "ret",
+    ".globl hosted_swprintf_gate",
+    "hosted_swprintf_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_swprintf_body",
+    "add rsp, 0x38",
+    "ret",
+);
+
+extern "win64" {
+    fn hosted_sprintf_gate();
+    fn hosted_snprintf_gate();
+    fn hosted_swprintf_gate();
+}
+
+extern "win64" fn s_vsnwprintf(dst: u64, count: usize, fmt: u64, va_list: u64) -> i32 {
+    let mut args = VaListPrintfArguments { cursor: va_list };
+    unsafe { format_wide_driver(dst, count, fmt, &mut args) }
 }
 
 const DRIVER_REGISTRY_HANDLE_BASE: u64 = 0xFFFF_FF00_4452_0000;
@@ -4626,6 +4800,10 @@ const HOSTED_REGISTRY_OP_ENUMERATE_KEY: u64 = 4;
 const HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE: u64 = 5;
 const HOSTED_REGISTRY_OP_QUERY_PATH_VALUE: u64 = 6;
 const HOSTED_REGISTRY_OP_SET_HANDLE_VALUE: u64 = 7;
+const HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY: u64 = 8;
+const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
+const REG_CREATED_NEW_KEY: u32 = 1;
+const REG_OPENED_EXISTING_KEY: u32 = 2;
 const HOSTED_DEVICE_OP_QUERY_PROPERTY_BEGIN: u64 = 1;
 const HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL: u64 = 2;
 const HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT: u64 = 3;
@@ -10581,6 +10759,132 @@ unsafe fn hosted_lower_irql(irql: u8) {
     hosted_set_current_irql(irql);
 }
 
+fn hosted_fast_mutex_failure(mutex: u64, status: i32) -> ! {
+    // A failed kernel wait means ownership cannot be established. Continuing would silently break
+    // mutual exclusion, so fail closed through the driver's normal bugcheck boundary.
+    s_ke_bug_check_ex(
+        0xC4,
+        0x4654_4D58,
+        mutex,
+        status as u32 as u64,
+        s_ps_get_current_thread_id(),
+    );
+    loop {
+        crate::yield_now();
+    }
+}
+
+/// `VOID ExInitializeFastMutex(PFAST_MUTEX)` using the NT5 x64 layout.
+extern "win64" fn s_ex_initialize_fast_mutex(mutex: u64) {
+    if mutex == 0 {
+        return;
+    }
+    unsafe {
+        use nt_kernel_exec::executive_sync::fast_mutex_layout;
+        write_unaligned((mutex + fast_mutex_layout::COUNT as u64) as *mut i32, 1);
+        write_unaligned((mutex + fast_mutex_layout::OWNER as u64) as *mut u64, 0);
+        write_unaligned((mutex + fast_mutex_layout::CONTENTION as u64) as *mut u32, 0);
+        s_ke_initialize_event(mutex + fast_mutex_layout::EVENT as u64, 1, 0);
+        write_unaligned(
+            (mutex + fast_mutex_layout::OLD_IRQL as u64) as *mut u32,
+            PASSIVE_LEVEL as u32,
+        );
+    }
+}
+
+/// `VOID ExAcquireFastMutex(PFAST_MUTEX)`.
+extern "win64" fn s_ex_acquire_fast_mutex(mutex: u64) {
+    if mutex == 0 {
+        hosted_fast_mutex_failure(mutex, STATUS_INVALID_PARAMETER);
+    }
+    let old_irql = unsafe { hosted_raise_irql(APC_LEVEL) };
+    let current_thread = s_ps_get_current_thread_id();
+    if current_thread == 0 {
+        unsafe { hosted_lower_irql(old_irql) };
+        hosted_fast_mutex_failure(mutex, STATUS_INVALID_HANDLE);
+    }
+    use nt_kernel_exec::executive_sync::fast_mutex_layout;
+    let count = unsafe { &*((mutex + fast_mutex_layout::COUNT as u64) as *const AtomicI32) };
+    if count.fetch_sub(1, Ordering::SeqCst) != 1 {
+        let contention = unsafe {
+            &*((mutex + fast_mutex_layout::CONTENTION as u64) as *const AtomicU32)
+        };
+        contention.fetch_add(1, Ordering::Relaxed);
+        let status = s_ke_wait_for_single_object(
+            mutex + fast_mutex_layout::EVENT as u64,
+            0,
+            0,
+            0,
+            0,
+        );
+        if status != STATUS_SUCCESS {
+            unsafe { hosted_lower_irql(old_irql) };
+            hosted_fast_mutex_failure(mutex, status);
+        }
+    }
+    unsafe {
+        write_unaligned(
+            (mutex + fast_mutex_layout::OWNER as u64) as *mut u64,
+            current_thread,
+        );
+        write_unaligned(
+            (mutex + fast_mutex_layout::OLD_IRQL as u64) as *mut u32,
+            old_irql as u32,
+        );
+    }
+}
+
+/// `VOID ExReleaseFastMutex(PFAST_MUTEX)`.
+extern "win64" fn s_ex_release_fast_mutex(mutex: u64) {
+    if mutex == 0 {
+        hosted_fast_mutex_failure(mutex, STATUS_INVALID_PARAMETER);
+    }
+    use nt_kernel_exec::executive_sync::fast_mutex_layout;
+    let old_irql = unsafe {
+        write_unaligned((mutex + fast_mutex_layout::OWNER as u64) as *mut u64, 0);
+        read_unaligned((mutex + fast_mutex_layout::OLD_IRQL as u64) as *const u32) as u8
+    };
+    let count = unsafe { &*((mutex + fast_mutex_layout::COUNT as u64) as *const AtomicI32) };
+    if count.fetch_add(1, Ordering::SeqCst) < 0 {
+        let _ = s_ke_set_event(mutex + fast_mutex_layout::EVENT as u64, 0, 0);
+    }
+    unsafe { hosted_lower_irql(old_irql) };
+}
+
+/// `BOOLEAN ExTryToAcquireFastMutex(PFAST_MUTEX)`.
+extern "win64" fn s_ex_try_to_acquire_fast_mutex(mutex: u64) -> u8 {
+    if mutex == 0 {
+        return 0;
+    }
+    use nt_kernel_exec::executive_sync::fast_mutex_layout;
+    let old_irql = unsafe { hosted_raise_irql(APC_LEVEL) };
+    let count = unsafe { &*((mutex + fast_mutex_layout::COUNT as u64) as *const AtomicI32) };
+    if count
+        .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        unsafe { hosted_lower_irql(old_irql) };
+        return 0;
+    }
+    let current_thread = s_ps_get_current_thread_id();
+    if current_thread == 0 {
+        count.store(1, Ordering::SeqCst);
+        unsafe { hosted_lower_irql(old_irql) };
+        return 0;
+    }
+    unsafe {
+        write_unaligned(
+            (mutex + fast_mutex_layout::OWNER as u64) as *mut u64,
+            current_thread,
+        );
+        write_unaligned(
+            (mutex + fast_mutex_layout::OLD_IRQL as u64) as *mut u32,
+            old_irql as u32,
+        );
+    }
+    1
+}
+
 /// `KIRQL KeGetCurrentIrql()`.
 extern "win64" fn s_ke_get_current_irql() -> u8 {
     unsafe { hosted_current_irql() }
@@ -12500,6 +12804,24 @@ extern "win64" fn s_ps_get_current_process_id() -> u64 {
     4
 }
 
+/// `HANDLE PsGetCurrentThreadId()` from the executive-owned hosted thread table.
+extern "win64" fn s_ps_get_current_thread_id() -> u64 {
+    let (_label, status, thread_id, _, _) = unsafe {
+        call_on4(
+            FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    if status as u32 as i32 == STATUS_SUCCESS {
+        thread_id
+    } else {
+        0
+    }
+}
+
 /// `PTEB PsGetCurrentThreadTeb()`.
 extern "win64" fn s_ps_get_current_thread_teb() -> u64 {
     0
@@ -12679,6 +13001,58 @@ unsafe fn write_rtl_direct_registry_value(value_type: u32, data: &[u8], entry_co
         }
         _ => STATUS_NOT_SUPPORTED,
     }
+}
+
+/// `NTSTATUS ZwCreateKey(...)` against the executive Configuration Manager.
+extern "win64" fn s_zw_create_key(
+    handle_out: u64,
+    _desired_access: u32,
+    object_attributes: u64,
+    title_index: u32,
+    class: u64,
+    create_options: u32,
+    disposition: u64,
+) -> i32 {
+    unsafe {
+        if handle_out != 0 {
+            write_unaligned(handle_out as *mut u64, 0);
+        }
+        if disposition != 0 {
+            write_unaligned(disposition as *mut u32, 0);
+        }
+        if handle_out == 0 || title_index != 0 || class != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if create_options & !REG_OPTION_VOLATILE != 0 {
+            return STATUS_NOT_SUPPORTED;
+        }
+        let Some((root, name)) =
+            object_attributes_root_and_name::<HOSTED_REGISTRY_PATH_MAX>(object_attributes)
+        else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        if !write_registry_arg_ascii(
+            HOSTED_REGISTRY_ARG_KEY_LEN,
+            HOSTED_REGISTRY_ARG_KEY_OFF,
+            &name,
+        ) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let (status, handle, create_disposition) = hosted_registry_broker_call(
+            HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY,
+            root,
+            create_options as u64,
+            0,
+        );
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        write_unaligned(handle_out as *mut u64, handle);
+        if disposition != 0 {
+            write_unaligned(disposition as *mut u32, create_disposition as u32);
+        }
+    }
+    STATUS_SUCCESS
 }
 
 /// `NTSTATUS ZwOpenKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES)`.
@@ -13107,59 +13481,39 @@ unsafe fn hosted_pci_device_function() -> (u32, u32, u32) {
     (address, dev, func)
 }
 
-unsafe fn hosted_pci_slot_number_matches(slot_number: u32) -> bool {
-    let (address, dev, func) = hosted_pci_device_function();
-    let nt_slot_number = dev | (func << 5);
-    let legacy_devfn_slot_number = (dev << 3) | func;
-    slot_number == nt_slot_number
-        || slot_number == legacy_devfn_slot_number
-        || slot_number == address
-        || (func == 0 && slot_number == dev)
-}
+const HOSTED_PCI_CONFIG_OP_READ: u64 = 0;
+const HOSTED_PCI_CONFIG_OP_WRITE: u64 = 1;
 
-unsafe fn hosted_pci_config_byte(offset: u32) -> u8 {
-    let vendor_device =
-        read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32);
-    let class_rev = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_CLASS_REV) as *const u32);
-    let pci_irq = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_PCI_IRQ) as *const u32);
-    let value = match offset {
-        0x00..=0x03 => vendor_device,
-        0x04..=0x07 => {
-            if first_shared_address_resource(FSD_SHARED_VADDR, SH_RESOURCE_ADDRESS_KIND_PORT)
-                .is_some()
-            {
-                0x0000_0007 // COMMAND: I/O space + memory space + bus master enabled.
-            } else {
-                0x0000_0006 // COMMAND: memory space + bus master enabled, STATUS clear.
-            }
-        }
-        0x08..=0x0B => class_rev,
-        0x10..=0x27 => {
-            let bar_index = ((offset - 0x10) / 4) as u8;
-            if let Some(resource) = find_shared_address_resource_by_bar(FSD_SHARED_VADDR, bar_index)
-            {
-                if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
-                    (resource.raw_start as u32 & 0xFFFF_FFFC) | 1
-                } else {
-                    (resource.raw_start as u32 & 0xFFFF_FFF0) | (resource.pci_flags as u32 & 0xF)
-                }
-            } else if bar_index != 0 {
-                find_shared_address_resource_by_bar(FSD_SHARED_VADDR, bar_index - 1)
-                    .filter(|resource| {
-                        resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY
-                            && resource.pci_flags & 0x6 == 0x4
-                    })
-                    .map(|resource| (resource.raw_start >> 32) as u32)
-                    .unwrap_or(0)
-            } else {
-                0
-            }
-        }
-        0x2C..=0x2F => 0,
-        0x3C..=0x3F => pci_irq,
-        _ => 0,
+fn hosted_pci_config_call(
+    op: u64,
+    bus_number: u32,
+    slot_number: u32,
+    buffer: u64,
+    offset: u32,
+    length: u32,
+) -> u32 {
+    if buffer == 0 || length == 0 {
+        return 0;
+    }
+    if nt_pnp::validate_pci_config_access(bus_number, slot_number, offset, length).is_err() {
+        return 0;
+    }
+    let bus_slot = bus_number as u64 | ((slot_number as u64) << 32);
+    let range = offset as u64 | ((length as u64) << 32);
+    let (_label, status, transferred, _, _) = unsafe {
+        call_on4(
+            (FSD_SERVICE_PCI_CONFIG_LABEL << 12) | 4,
+            bus_slot,
+            buffer,
+            range,
+            op,
+        )
     };
-    ((value >> ((offset & 3) * 8)) & 0xFF) as u8
+    if status as u32 as i32 == STATUS_SUCCESS {
+        transferred.min(length as u64) as u32
+    } else {
+        0
+    }
 }
 
 extern "win64" fn s_hal_get_bus_data_by_offset(
@@ -13170,28 +13524,17 @@ extern "win64" fn s_hal_get_bus_data_by_offset(
     offset: u32,
     length: u32,
 ) -> u32 {
-    if buffer == 0 || length == 0 {
+    if bus_data_type != BUS_DATA_TYPE_PCI_CONFIGURATION {
         return 0;
     }
-    unsafe {
-        if bus_data_type != BUS_DATA_TYPE_PCI_CONFIGURATION
-            || !hosted_resource_identity_active()
-            || read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
-                != HOSTED_INTERFACE_TYPE_PCIBUS
-            || bus_number
-                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
-            || !hosted_pci_slot_number_matches(slot_number)
-        {
-            return 0;
-        }
-        let mut copied = 0u32;
-        while copied < length && offset.saturating_add(copied) < 0x100 {
-            let b = hosted_pci_config_byte(offset + copied);
-            write_unaligned((buffer + copied as u64) as *mut u8, b);
-            copied += 1;
-        }
-        copied
-    }
+    hosted_pci_config_call(
+        HOSTED_PCI_CONFIG_OP_READ,
+        bus_number,
+        slot_number,
+        buffer,
+        offset,
+        length,
+    )
 }
 
 extern "win64" fn s_hal_get_bus_data(
@@ -13205,19 +13548,155 @@ extern "win64" fn s_hal_get_bus_data(
 }
 
 extern "win64" fn s_hal_set_bus_data_by_offset(
-    _bus_data_type: u32,
-    _bus_number: u32,
-    _slot_number: u32,
-    _buffer: u64,
-    _offset: u32,
-    _length: u32,
+    bus_data_type: u32,
+    bus_number: u32,
+    slot_number: u32,
+    buffer: u64,
+    offset: u32,
+    length: u32,
 ) -> u32 {
-    0
+    if bus_data_type != BUS_DATA_TYPE_PCI_CONFIGURATION {
+        return 0;
+    }
+    hosted_pci_config_call(
+        HOSTED_PCI_CONFIG_OP_WRITE,
+        bus_number,
+        slot_number,
+        buffer,
+        offset,
+        length,
+    )
 }
 
-/// Serial debug print forwarder (`vDbgPrintExWithPrefix` etc.) — swallow.
-extern "win64" fn s_dbg_print() -> i32 {
-    0
+struct DebugPrintfOutput;
+
+impl nt_printf::Output for DebugPrintfOutput {
+    fn write(&mut self, unit: u16) -> bool {
+        debug_put_char(unit as u8);
+        true
+    }
+}
+
+unsafe fn write_debug_prefix(prefix: u64) {
+    if prefix == 0 {
+        return;
+    }
+    let mut cursor = prefix;
+    loop {
+        let byte = read_volatile(cursor as *const u8);
+        if byte == 0 {
+            return;
+        }
+        debug_put_char(byte);
+        cursor = cursor.saturating_add(1);
+    }
+}
+
+unsafe fn format_debug_driver<A: nt_printf::Arguments>(
+    prefix: u64,
+    fmt: u64,
+    args: &mut A,
+) -> i32 {
+    if fmt == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    write_debug_prefix(prefix);
+    let mut output = DebugPrintfOutput;
+    match nt_printf::format_narrow(fmt as *const u8, args, &mut output) {
+        Ok(_) => STATUS_SUCCESS,
+        Err(()) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+#[no_mangle]
+extern "win64" fn s_dbg_print_body(
+    fmt: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, a1, a2], 3, caller_rsp);
+    unsafe { format_debug_driver(0, fmt, &mut args) }
+}
+
+#[no_mangle]
+extern "win64" fn s_dbg_print_ex_body(
+    _component_id: u64,
+    _level: u64,
+    fmt: u64,
+    a0: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, 0, 0], 1, caller_rsp);
+    unsafe { format_debug_driver(0, fmt, &mut args) }
+}
+
+#[no_mangle]
+extern "win64" fn s_video_port_debug_print_body(
+    _level: u64,
+    fmt: u64,
+    a0: u64,
+    a1: u64,
+    caller_rsp: u64,
+) -> i32 {
+    let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
+    unsafe { format_debug_driver(0, fmt, &mut args) }
+}
+
+extern "win64" fn s_vdbg_print_ex(
+    _component_id: u32,
+    _level: u32,
+    fmt: u64,
+    va_list: u64,
+) -> i32 {
+    let mut args = VaListPrintfArguments { cursor: va_list };
+    unsafe { format_debug_driver(0, fmt, &mut args) }
+}
+
+extern "win64" fn s_vdbg_print_ex_with_prefix(
+    prefix: u64,
+    _component_id: u32,
+    _level: u32,
+    fmt: u64,
+    va_list: u64,
+) -> i32 {
+    let mut args = VaListPrintfArguments { cursor: va_list };
+    unsafe { format_debug_driver(prefix, fmt, &mut args) }
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl hosted_dbg_print_gate",
+    "hosted_dbg_print_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_dbg_print_body",
+    "add rsp, 0x38",
+    "ret",
+    ".globl hosted_dbg_print_ex_gate",
+    "hosted_dbg_print_ex_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_dbg_print_ex_body",
+    "add rsp, 0x38",
+    "ret",
+    ".globl hosted_video_port_debug_print_gate",
+    "hosted_video_port_debug_print_gate:",
+    "mov r11, rsp",
+    "sub rsp, 0x38",
+    "mov [rsp + 0x20], r11",
+    "call s_video_port_debug_print_body",
+    "add rsp, 0x38",
+    "ret",
+);
+
+extern "win64" {
+    fn hosted_dbg_print_gate();
+    fn hosted_dbg_print_ex_gate();
+    fn hosted_video_port_debug_print_gate();
 }
 
 extern "win64" fn s_dbg_query_debug_filter_state(_component_id: u32, _level: u32) -> u8 {
@@ -13558,22 +14037,6 @@ unsafe fn find_shared_address_resource_by_va(
             && resource.va != 0
             && range_within_grant(resource.va, resource.map_len, start, len)
         {
-            return Some(resource);
-        }
-        index += 1;
-    }
-    None
-}
-
-unsafe fn find_shared_address_resource_by_bar(
-    sh: u64,
-    bar_index: u8,
-) -> Option<SharedAddressResource> {
-    let count = shared_address_resource_count(sh)?;
-    let mut index = 0;
-    while index < count {
-        let resource = read_shared_address_resource(sh, index)?;
-        if resource.resource_index == bar_index {
             return Some(resource);
         }
         index += 1;
@@ -29801,8 +30264,27 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind("strlen", s_strlen as *const () as usize as u64);
     reg.bind("strcpy", s_strcpy as *const () as usize as u64);
-    reg.bind("sprintf", s_sprintf as *const () as usize as u64);
+    reg.bind("strcmp", s_strcmp as *const () as usize as u64);
+    reg.bind("strncmp", s_strncmp as *const () as usize as u64);
+    reg.bind("strncpy", s_strncpy as *const () as usize as u64);
+    reg.bind("strcat", s_strcat as *const () as usize as u64);
+    reg.bind("strstr", s_strstr as *const () as usize as u64);
+    reg.bind("tolower", s_tolower as *const () as usize as u64);
+    reg.bind(
+        "sprintf",
+        hosted_sprintf_gate as *const () as usize as u64,
+    );
+    reg.bind(
+        "_snprintf",
+        hosted_snprintf_gate as *const () as usize as u64,
+    );
+    reg.bind(
+        "swprintf",
+        hosted_swprintf_gate as *const () as usize as u64,
+    );
+    reg.bind("_vsnwprintf", s_vsnwprintf as *const () as usize as u64);
     reg.bind("wcslen", s_wcslen as *const () as usize as u64);
+    reg.bind("wcsstr", s_wcsstr as *const () as usize as u64);
     reg.bind("_wcsicmp", s_wcsicmp as *const () as usize as u64);
     reg.bind("wcsicmp", s_wcsicmp as *const () as usize as u64);
     reg.bind("wcsncmp", s_wcsncmp as *const () as usize as u64);
@@ -29859,6 +30341,7 @@ fn register_fsd_trampolines() -> bool {
         s_rtl_upcase_unicode_char as *const () as usize as u64,
     );
     reg.bind("ZwClose", s_zw_close as *const () as usize as u64);
+    reg.bind("ZwCreateKey", s_zw_create_key as *const () as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as *const () as usize as u64);
     reg.bind(
         "ZwEnumerateKey",
@@ -30042,7 +30525,19 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "ExInitializeFastMutex",
-        s_init_small_struct as *const () as usize as u64,
+        s_ex_initialize_fast_mutex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExAcquireFastMutex",
+        s_ex_acquire_fast_mutex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExReleaseFastMutex",
+        s_ex_release_fast_mutex as *const () as usize as u64,
+    );
+    reg.bind(
+        "ExTryToAcquireFastMutex",
+        s_ex_try_to_acquire_fast_mutex as *const () as usize as u64,
     );
     reg.bind(
         "KeInitializeMutex",
@@ -30196,6 +30691,10 @@ fn register_fsd_trampolines() -> bool {
         s_ps_get_current_process_id as *const () as usize as u64,
     );
     reg.bind(
+        "PsGetCurrentThreadId",
+        s_ps_get_current_thread_id as *const () as usize as u64,
+    );
+    reg.bind(
         "PsGetCurrentThread",
         s_current_process as *const () as usize as u64,
     );
@@ -30227,14 +30726,23 @@ fn register_fsd_trampolines() -> bool {
         "IoGetCurrentProcess",
         s_io_get_current_process as *const () as usize as u64,
     );
-    // Debug print forwarders
+    // Debug print exports retain their distinct Win64 variadic and va_list ABIs.
     reg.bind(
         "vDbgPrintExWithPrefix",
-        s_dbg_print as *const () as usize as u64,
+        s_vdbg_print_ex_with_prefix as *const () as usize as u64,
     );
-    reg.bind("vDbgPrintEx", s_dbg_print as *const () as usize as u64);
-    reg.bind("DbgPrint", s_dbg_print as *const () as usize as u64);
-    reg.bind("DbgPrintEx", s_dbg_print as *const () as usize as u64);
+    reg.bind(
+        "vDbgPrintEx",
+        s_vdbg_print_ex as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgPrint",
+        hosted_dbg_print_gate as *const () as usize as u64,
+    );
+    reg.bind(
+        "DbgPrintEx",
+        hosted_dbg_print_ex_gate as *const () as usize as u64,
+    );
     reg.bind(
         "DbgQueryDebugFilterState",
         s_dbg_query_debug_filter_state as *const () as usize as u64,
@@ -30350,7 +30858,9 @@ fn lookup_videoprt_export(name: &str) -> Option<u64> {
         "VideoPortZeroMemory" | "VideoPortZeroDeviceMemory" => {
             Some(s_video_port_zero_memory as *const () as usize as u64)
         }
-        "VideoPortDebugPrint" => Some(s_dbg_print as *const () as usize as u64),
+        "VideoPortDebugPrint" => {
+            Some(hosted_video_port_debug_print_gate as *const () as usize as u64)
+        }
         _ => None,
     }
 }
@@ -32871,6 +33381,8 @@ pub(crate) struct DriverComponent {
     pub driver_id: u64,
     /// The component host's TCB — used to `TCB_Suspend` it if its pump WALLS (transport risk R2).
     pub tcb: u64,
+    /// Dynamic thread-table identity assigned to the initial component thread.
+    pub main_thread_id: u64,
     /// The component host's CNode — dynamic PnP grants install hardware caps here.
     pub cnode: u64,
     /// The unguarded root cap for the component CNode object.
@@ -34283,6 +34795,17 @@ unsafe fn load_driver_reserved(
         print_str(b"\n");
         return None;
     }
+    let main_thread_id = {
+        let table = hosted_driver_thread_table_mut(instance)?;
+        let handle = table
+            .create(primary_run_va.checked_add(entry_rva as u64)?, 0)
+            .ok()?;
+        if table.attach_tcb(handle, tcb).is_err() {
+            let _ = table.remove(handle);
+            return None;
+        }
+        handle
+    };
     register_instance_transport(
         instance,
         DriverInstance {
@@ -34305,6 +34828,7 @@ unsafe fn load_driver_reserved(
             thunk_len,
             thunk_next,
             tcb,
+            main_thread_id,
             cnode,
             raw_cnode,
             sched_context,
@@ -34472,6 +34996,7 @@ unsafe fn load_driver_reserved(
         hosted_domain_cookie: domain.hosted_domain_cookie,
         driver_id,
         tcb,
+        main_thread_id,
         cnode,
         raw_cnode,
         sched_context,
@@ -44760,6 +45285,7 @@ pub(crate) struct DriverInstance {
     pub thunk_len: u64,
     pub thunk_next: u64,
     pub tcb: u64,
+    pub main_thread_id: u64,
     pub cnode: u64,
     pub raw_cnode: u64,
     pub sched_context: u64,
@@ -44799,6 +45325,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     thunk_len: 0,
     thunk_next: 0,
     tcb: 0,
+    main_thread_id: 0,
     cnode: 0,
     raw_cnode: 0,
     sched_context: 0,
@@ -45142,6 +45669,24 @@ fn hosted_driver_runtime_by_badge(
             .copied()
             .find(|rt| rt.instance == instance && rt.badge == badge)
     }
+}
+
+fn hosted_driver_current_thread_id(
+    instance: usize,
+    inst: DriverInstance,
+    badge: u64,
+) -> Option<u64> {
+    let (handle, tcb) = if badge == 0 {
+        (inst.main_thread_id, inst.tcb)
+    } else {
+        let runtime = hosted_driver_runtime_by_badge(instance, badge)?;
+        (runtime.handle, runtime.tcb)
+    };
+    if handle == 0 || tcb == 0 {
+        return None;
+    }
+    let thread = unsafe { hosted_driver_thread_table_mut(instance)?.get(handle)? };
+    (thread.tcb == tcb && thread.exit_status.is_none()).then_some(handle)
 }
 
 unsafe fn remove_hosted_driver_thread_runtime(
@@ -45670,6 +46215,7 @@ fn register_instance(dc: &DriverComponent) {
         thunk_len: dc.thunk_len,
         thunk_next: dc.thunk_next,
         tcb: dc.tcb,
+        main_thread_id: dc.main_thread_id,
         cnode: dc.cnode,
         raw_cnode: dc.raw_cnode,
         sched_context: dc.sched_context,
@@ -46234,6 +46780,70 @@ fn instance_for_pump_channel(
     Some((instance, inst))
 }
 
+pub(crate) fn service_hosted_driver_pci_config(
+    ch: &crate::spawn_hosts::PumpChannel,
+    bus_slot: u64,
+    component_buffer: u64,
+    range: u64,
+    op: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> (i32, u64) {
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_ACCESS_DENIED, 0);
+    };
+    if !matches!(op, HOSTED_PCI_CONFIG_OP_READ | HOSTED_PCI_CONFIG_OP_WRITE) {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let bus_number = bus_slot as u32;
+    let slot_number = (bus_slot >> 32) as u32;
+    let offset = range as u32;
+    let length = (range >> 32) as u32;
+    let access = match nt_pnp::validate_pci_config_access(
+        bus_number,
+        slot_number,
+        offset,
+        length,
+    ) {
+        Ok(access) if access.length != 0 => access,
+        _ => return (STATUS_INVALID_PARAMETER, 0),
+    };
+    let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    if caller_badge != 0 && runtime.is_none() {
+        return (STATUS_ACCESS_DENIED, 0);
+    }
+    let Some(exec_buffer) = component_to_exec_va_for_instance(
+        instance,
+        inst,
+        component_buffer,
+        access.length as u64,
+    )
+    .or_else(|| {
+        runtime.and_then(|worker| {
+            hosted_worker_component_to_exec_va(
+                worker,
+                component_buffer,
+                access.length as u64,
+            )
+        })
+    }) else {
+        return (STATUS_INVALID_PARAMETER, 0);
+    };
+    let result = unsafe {
+        if op == HOSTED_PCI_CONFIG_OP_READ {
+            let output = core::slice::from_raw_parts_mut(exec_buffer as *mut u8, access.length as usize);
+            crate::pnp::read_pci_config(access, output)
+        } else {
+            let input = core::slice::from_raw_parts(exec_buffer as *const u8, access.length as usize);
+            crate::pnp::write_pci_config(access, input)
+        }
+    };
+    match result {
+        Ok(()) => (STATUS_SUCCESS, access.length as u64),
+        Err(status) => (status.raw(), 0),
+    }
+}
+
 fn service_hosted_irp_bank_pull(
     ch: &crate::spawn_hosts::PumpChannel,
     transfer_id: u64,
@@ -46432,6 +47042,51 @@ pub(crate) fn service_hosted_driver_registry(
                     return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
                 };
                 service_hosted_driver_open_registry_path(path)
+            }
+            HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY => {
+                if a2 as u32 & !REG_OPTION_VOLATILE != 0 || a2 > u32::MAX as u64 {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                }
+                let Some(name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                    arg,
+                    HOSTED_REGISTRY_ARG_KEY_LEN,
+                    HOSTED_REGISTRY_ARG_KEY_OFF,
+                    true,
+                ) else {
+                    return (STATUS_INVALID_PARAMETER, 0, 0);
+                };
+                let root_slot = if a1 == 0 {
+                    None
+                } else {
+                    match driver_registry_handle_slot(a1) {
+                        Some(slot) if slot.kind == DriverRegistryHandleKind::CmKey => Some(slot),
+                        _ => return (STATUS_INVALID_HANDLE, 0, 0),
+                    }
+                };
+                let Some(path) = cm_registry_path_from_object_attributes(root_slot.as_ref(), &name)
+                else {
+                    return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
+                };
+                let volatile = a2 as u32 & REG_OPTION_VOLATILE != 0;
+                let created = match crate::config_manager_create_key_with_options(
+                    path.as_str(),
+                    volatile,
+                ) {
+                    Ok((_key, created)) => created,
+                    Err(status) => return (status, 0, 0),
+                };
+                let Some(handle) = allocate_cm_registry_handle(path) else {
+                    return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+                };
+                (
+                    STATUS_SUCCESS,
+                    handle,
+                    if created {
+                        REG_CREATED_NEW_KEY as u64
+                    } else {
+                        REG_OPENED_EXISTING_KEY as u64
+                    },
+                )
             }
             HOSTED_REGISTRY_OP_OPEN_DEVICE_KEY => {
                 if !hosted_pdo_known_at(inst.exec_shared_va, a1) {
@@ -46721,6 +47376,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
     let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let current_thread_id = hosted_driver_current_thread_id(instance, inst, caller_badge);
     let Some(exec_object) = hosted_driver_wait_object_exec_va(instance, inst, runtime, object)
     else {
         HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
@@ -46759,7 +47415,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     }
                 };
                 HOSTED_DRIVER_WAIT_SINGLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                let Some(runtime) = runtime else {
+                let Some(thread_handle) = current_thread_id else {
                     HOSTED_DRIVER_WAIT_SINGLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                     return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
                 };
@@ -46771,7 +47427,7 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                 objects.push(exec_object);
                 let Some(fresh_reply_cap) = park_hosted_driver_wait(
                     instance,
-                    runtime.handle,
+                    thread_handle,
                     active_reply_cap,
                     objects,
                     false,
@@ -46787,8 +47443,8 @@ pub(crate) fn service_hosted_driver_ke_wait_single(
                     print_str(b" badge=");
                     print_u64(caller_badge);
                     print_str(b" handle=0x");
-                    print_hex((runtime.handle >> 32) as u32);
-                    print_hex(runtime.handle as u32);
+                    print_hex((thread_handle >> 32) as u32);
+                    print_hex(thread_handle as u32);
                     print_str(b" object=0x");
                     print_hex((object >> 32) as u32);
                     print_hex(object as u32);
@@ -46848,6 +47504,7 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
         return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
     };
     let runtime = hosted_driver_runtime_by_badge(instance, caller_badge);
+    let current_thread_id = hosted_driver_current_thread_id(instance, inst, caller_badge);
     let Some(exec_array) =
         hosted_driver_wait_array_exec_va(instance, inst, runtime, object_array, bytes)
     else {
@@ -46932,13 +47589,13 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     }
                 };
                 HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING.fetch_add(1, Ordering::Relaxed);
-                let Some(runtime) = runtime else {
+                let Some(thread_handle) = current_thread_id else {
                     HOSTED_DRIVER_WAIT_MULTIPLE_REJECTS.fetch_add(1, Ordering::Relaxed);
                     return HostedDriverWaitServiceResult::Reply(STATUS_INVALID_PARAMETER);
                 };
                 let Some(fresh_reply_cap) = park_hosted_driver_wait(
                     instance,
-                    runtime.handle,
+                    thread_handle,
                     active_reply_cap,
                     objects,
                     wait_all,
@@ -46954,8 +47611,8 @@ pub(crate) fn service_hosted_driver_ke_wait_multiple(
                     print_str(b" badge=");
                     print_u64(caller_badge);
                     print_str(b" handle=0x");
-                    print_hex((runtime.handle >> 32) as u32);
-                    print_hex(runtime.handle as u32);
+                    print_hex((thread_handle >> 32) as u32);
+                    print_hex(thread_handle as u32);
                     print_str(b" count=");
                     print_u64(count as u64);
                     if wait_all {
@@ -47344,6 +48001,20 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
         print_str(b"\n");
     }
     (STATUS_SUCCESS, handle)
+}
+
+pub(crate) fn service_hosted_driver_ps_get_current_thread_id(
+    ch: &crate::spawn_hosts::PumpChannel,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> (i32, u64) {
+    let Some((instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_INVALID_PARAMETER, 0);
+    };
+    match hosted_driver_current_thread_id(instance, inst, caller_badge) {
+        Some(thread_id) => (STATUS_SUCCESS, thread_id),
+        None => (STATUS_INVALID_HANDLE, 0),
+    }
 }
 
 pub(crate) fn service_hosted_driver_ps_terminate_system_thread(

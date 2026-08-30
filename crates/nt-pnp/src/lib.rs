@@ -988,6 +988,51 @@ pub struct PlatformResourceProfile {
     pub interrupt: PlatformInterruptResource,
 }
 
+/// A validated type-0 PCI configuration-space access.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciConfigAccess {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub offset: u8,
+    pub length: u16,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PciConfigAccessError {
+    InvalidBus,
+    InvalidSlot,
+    InvalidRange,
+}
+
+/// Validate the NT `PCI_SLOT_NUMBER` and conventional 256-byte configuration-space range.
+pub fn validate_pci_config_access(
+    bus: u32,
+    slot: u32,
+    offset: u32,
+    length: u32,
+) -> Result<PciConfigAccess, PciConfigAccessError> {
+    if bus > u8::MAX as u32 {
+        return Err(PciConfigAccessError::InvalidBus);
+    }
+    if slot & !0xff != 0 {
+        return Err(PciConfigAccessError::InvalidSlot);
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or(PciConfigAccessError::InvalidRange)?;
+    if offset > 0xff || length > 0x100 || end > 0x100 {
+        return Err(PciConfigAccessError::InvalidRange);
+    }
+    Ok(PciConfigAccess {
+        bus: bus as u8,
+        device: (slot & 0x1f) as u8,
+        function: ((slot >> 5) & 0x7) as u8,
+        offset: offset as u8,
+        length: length as u16,
+    })
+}
+
 fn platform_memory_flags(resource: PlatformMemoryResource) -> u16 {
     if resource.writable {
         CM_RESOURCE_MEMORY_READ_WRITE
@@ -2879,6 +2924,36 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 1);
         assert_eq!(bytes[60], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
         assert_eq!(bytes[80], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+    }
+
+    #[test]
+    fn pci_config_access_decodes_native_slot_and_rejects_reserved_or_wrapped_ranges() {
+        assert_eq!(
+            validate_pci_config_access(7, 19 | (3 << 5), 0xfc, 4),
+            Ok(PciConfigAccess {
+                bus: 7,
+                device: 19,
+                function: 3,
+                offset: 0xfc,
+                length: 4,
+            })
+        );
+        assert_eq!(
+            validate_pci_config_access(256, 0, 0, 4),
+            Err(PciConfigAccessError::InvalidBus)
+        );
+        assert_eq!(
+            validate_pci_config_access(0, 0x100, 0, 4),
+            Err(PciConfigAccessError::InvalidSlot)
+        );
+        assert_eq!(
+            validate_pci_config_access(0, 0, 0xff, 2),
+            Err(PciConfigAccessError::InvalidRange)
+        );
+        assert_eq!(
+            validate_pci_config_access(0, 0, u32::MAX, 2),
+            Err(PciConfigAccessError::InvalidRange)
+        );
     }
 
     #[test]

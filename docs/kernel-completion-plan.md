@@ -2719,6 +2719,35 @@ Review adjustment: add the separate two-devnode WDM fixture next. Its START must
 terminal native demand reply and resumed replyless boot progression. Keep it separate from the
 existing synchronous DMA/PnP fixture so the two lifecycle modes remain independently diagnosable.
 
+ACPI hosted-driver import checkpoint (2026-08-31): the shipped ReactOS `acpi.sys` has 67 unique
+`ntoskrnl.exe`/`hal.dll` imports and every name now resolves through the hosted kernel export
+registry. This checkpoint closes the semantic gaps found behind that name-level audit rather than
+counting bound stubs as support. The former ntdll-local printf parser is now the neutral `no_std`
+`nt-printf` crate, consumed by both ntdll and hosted kernel drivers. `sprintf`, `_snprintf`,
+`swprintf`, `DbgPrint`, `DbgPrintEx`, and `VideoPortDebugPrint` enter through real Win64 variadic
+register/stack gates with no fixed argument ceiling; the va-list exports retain their distinct ABI.
+Hosted `DbgPrint` output reaches the serial debug sink instead of disappearing.
+
+The ACPI synchronization and registry imports now use real executive mechanisms: the main
+`DriverEntry` thread has executive-owned waitable thread identity, `PsGetCurrentThreadId` resolves
+main and worker callers dynamically, main-thread dispatcher waits use the same reply-cap parking
+path as worker waits, and the native x64 fast-mutex layout raises/restores APC level and parks on its
+embedded event under contention. `ZwCreateKey` crosses the Configuration Manager broker, preserves
+`REG_OPTION_VOLATILE`, and returns the real created/opened disposition. The old HAL PCI snapshot is
+deleted: `HalGetBusDataByOffset` and `HalSetBusDataByOffset` validate native `PCI_SLOT_NUMBER` and
+256-byte range semantics in host-tested `nt-pnp`, authenticate and translate the caller's real
+component buffer, then perform serialized live configuration reads or partial-dword writes through
+the executive-owned PCI mechanism-1 capability. No driver/service identity or single-function PCI
+fallback remains in that path.
+
+Local validation for this checkpoint is green: `nt-printf` 9/9, `nt-pnp` 35/35,
+`nt-config-server` 26/26, `nt-config-client` 19/19, `nt-kernel-exec` 173/173, `nt-ntdll` 701/701,
+and the freestanding executive check. Runtime acceptance remains open because the current desktop
+QEMU lane predates this binary and must not be disturbed. The next serialized runtime step is a
+fresh desktop boot that proves real `acpi.sys` load, `DriverEntry`, PCI namespace discovery, SCI
+connection, and clean shell paint; failures must extend the generic HAL/PnP/power mechanisms rather
+than add ACPI service-name handling.
+
 ### A. SCM-Controlled Service Startup
 
 - `[x]` A0: Inventory the current SCM/service startup path and mark the static boundaries still in

@@ -25,7 +25,7 @@ use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 use nt_config_abi::{
     device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
     driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
-    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer,
+    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer, key_flags,
     launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
     pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
     win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
@@ -1058,17 +1058,27 @@ impl CmServer {
         let Some(req) = CmKeyRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
+        if req.flags & !key_flags::VOLATILE != 0 {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
         let Some(path) = decode(buf, req.path_offset, req.path_len_bytes) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
+        let created = self.cm.registry().open_key(&path).is_none();
         let key = self.cm.registry_mut().create_key(&path);
-        reply(STATUS_SUCCESS, key)
+        if created && req.flags & key_flags::VOLATILE != 0 {
+            self.cm.registry_mut().set_volatile(key, true);
+        }
+        reply_with_info(STATUS_SUCCESS, 0, key, created as u64)
     }
 
     fn op_open_key(&mut self, buf: &[u8]) -> CmReply {
         let Some(req) = CmKeyRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
+        if req.flags != 0 {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
         let Some(path) = decode(buf, req.path_offset, req.path_len_bytes) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
@@ -3435,6 +3445,20 @@ mod tests {
         bytes
     }
 
+    fn key_request(path: &str, flags: u16) -> Vec<u8> {
+        let path_bytes = utf16(path);
+        let header_size = core::mem::size_of::<CmKeyRequest>();
+        let header = CmKeyRequest {
+            abi_size: header_size as u16,
+            flags,
+            path_offset: header_size as u32,
+            path_len_bytes: path_bytes.len() as u32,
+        };
+        let mut bytes = Vec::from(header.as_bytes());
+        bytes.extend_from_slice(&path_bytes);
+        bytes
+    }
+
     fn request_with_bytes(instance_bytes: &[u8], property: u32, output_capacity: u32) -> Vec<u8> {
         request_bank(
             instance_bytes,
@@ -3688,6 +3712,23 @@ mod tests {
         cm.registry_mut()
             .set_string(key, "FriendlyName", "Intel Test Adapter");
         CmServer::with_config(cm)
+    }
+
+    #[test]
+    fn create_key_preserves_volatile_option_and_disposition() {
+        let path = r"\Registry\Machine\Hardware\ACPI\DSDT";
+        let request = key_request(path, key_flags::VOLATILE);
+        let mut server = server();
+        let created = server.dispatch(opcode::CM_OP_CREATE_KEY, &request, &mut []);
+        assert_eq!(created.status, STATUS_SUCCESS);
+        assert_eq!(created.detail1, 1);
+        assert!(server.cm.registry().is_volatile(created.detail0));
+
+        let opened = server.dispatch(opcode::CM_OP_CREATE_KEY, &request, &mut []);
+        assert_eq!(opened.status, STATUS_SUCCESS);
+        assert_eq!(opened.detail0, created.detail0);
+        assert_eq!(opened.detail1, 0);
+        assert!(server.cm.registry().is_volatile(opened.detail0));
     }
 
     #[test]

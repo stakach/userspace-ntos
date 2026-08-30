@@ -1,0 +1,13 @@
+[package]
+name = "nt-printf"
+description = "Allocation-free, host-tested NT5 CRT printf formatting shared by ntdll and kernel driver exports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

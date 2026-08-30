@@ -54,6 +54,85 @@ pub(crate) unsafe fn enumerate_pci_hierarchy(
     )
 }
 
+/// Read one validated PCI configuration-space range through the executive-owned mechanism #1 cap.
+/// Calls are serialized by the hosted-driver service pump, so the address/data port pair cannot be
+/// interleaved by two isolated drivers.
+pub(crate) unsafe fn read_pci_config(
+    access: nt_pnp::PciConfigAccess,
+    output: &mut [u8],
+) -> Result<(), nt_status::NtStatus> {
+    if PCI_CONFIG_IO_CAP == 0 {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    if output.len() != access.length as usize {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let start = access.offset as usize;
+    let end = start + output.len();
+    let mut register = start & !3;
+    while register < end {
+        let bytes = pci_read32(
+            PCI_CONFIG_IO_CAP,
+            access.bus,
+            access.device,
+            access.function,
+            register as u8,
+        )
+        .to_le_bytes();
+        let copy_start = start.max(register);
+        let copy_end = end.min(register + 4);
+        output[copy_start - start..copy_end - start]
+            .copy_from_slice(&bytes[copy_start - register..copy_end - register]);
+        register += 4;
+    }
+    Ok(())
+}
+
+/// Write one validated PCI configuration-space range. Partial dwords use a serialized read-modify-
+/// write cycle so bytes outside the caller's range retain their hardware values.
+pub(crate) unsafe fn write_pci_config(
+    access: nt_pnp::PciConfigAccess,
+    input: &[u8],
+) -> Result<(), nt_status::NtStatus> {
+    if PCI_CONFIG_IO_CAP == 0 {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    if input.len() != access.length as usize {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let start = access.offset as usize;
+    let end = start + input.len();
+    let mut register = start & !3;
+    while register < end {
+        let copy_start = start.max(register);
+        let copy_end = end.min(register + 4);
+        let mut bytes = if copy_start == register && copy_end == register + 4 {
+            [0; 4]
+        } else {
+            pci_read32(
+                PCI_CONFIG_IO_CAP,
+                access.bus,
+                access.device,
+                access.function,
+                register as u8,
+            )
+            .to_le_bytes()
+        };
+        bytes[copy_start - register..copy_end - register]
+            .copy_from_slice(&input[copy_start - start..copy_end - start]);
+        pci_write32(
+            PCI_CONFIG_IO_CAP,
+            access.bus,
+            access.device,
+            access.function,
+            register as u8,
+            u32::from_le_bytes(bytes),
+        );
+        register += 4;
+    }
+    Ok(())
+}
+
 /// Program the platform-selected INTx line into PCI configuration space immediately before START.
 /// The returned record makes the write transactional with the remaining device-start operation.
 pub(crate) unsafe fn program_pci_interrupt_line(

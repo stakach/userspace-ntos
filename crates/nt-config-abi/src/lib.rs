@@ -289,12 +289,17 @@ pub struct CmReply {
     pub detail1: u64,
 }
 
+pub mod key_flags {
+    /// Create the leaf as a volatile key. Ignored when opening an existing key.
+    pub const VOLATILE: u16 = 0x0001;
+}
+
 /// `create_key` / `open_key`: a single key path (UTF-16LE) at `[path_offset..]`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CmKeyRequest {
     pub abi_size: u16,
-    pub _pad: u16,
+    pub flags: u16,
     pub path_offset: u32,
     pub path_len_bytes: u32,
 }
