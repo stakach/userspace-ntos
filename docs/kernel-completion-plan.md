@@ -18175,8 +18175,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure diagnostic;
     retain only boot composition plus CM journal/checkpoint persistence.
 
-    CM-owned SYSTEM save export (2026-08-30, focused validation accepted; serialized desktop proof
-    remains): the configuration ABI now exposes a bounded lease-bound export stream distinct from
+    CM-owned SYSTEM save export acceptance (2026-08-30): the configuration ABI now exposes a
+    bounded lease-bound export stream distinct from
     checkpointing. CM captures the exact leased key and descendants as an immutable standalone hive,
     stamps the transfer with the live mount generation, supports both clean and dirty generations,
     and neither changes nor acknowledges checkpoint dirty state. Root leases export the complete
@@ -18197,8 +18197,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `git diff --check`, and the freestanding executive release check pass at the established
     209-warning baseline.
 
-    Review adjustment: the final mirror-retirement prerequisite is closed at the focused boundary.
-    Run the serialized release/desktop proof for CM save export, then remove post-publish replay,
-    the SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure
-    diagnostics atomically. Retain boot-only REGF composition and CM journal/checkpoint persistence;
-    do not retain a compatibility export or replay fallback.
+    Serialized acceptance `.tmp/run-desktop-cm-save-export-final-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. CM reaches
+    generation 2544 after 2540 accepted runtime transactions with zero rejection or projection
+    failure; native SYSTEM leases remain balanced at `1339/1337/2/0`. Explorer completes 668 real
+    api0 redirects with zero callback or dead-callback failures, installs 18 client WndProcs without
+    replay, reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering
+    184 records, and paints all `786432/786432` framebuffer pixels with at least 32 colours. The PE
+    hard gate also verifies all 224 native `Nt*` exports and their 224 `Zw*` aliases.
+
+    Review adjustment: the final mirror-retirement prerequisite is accepted end to end. Remove
+    post-publish replay, the SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and
+    projection-failure diagnostics atomically. Retain boot-only REGF composition and CM
+    journal/checkpoint persistence; do not retain a compatibility export or replay fallback.
