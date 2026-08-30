@@ -10,8 +10,10 @@
 
 extern crate alloc;
 
+mod bus_properties;
 mod bus_relations;
 
+pub use bus_properties::*;
 pub use bus_relations::*;
 
 use alloc::string::{String, ToString};

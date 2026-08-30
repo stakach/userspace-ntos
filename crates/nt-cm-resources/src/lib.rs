@@ -92,6 +92,114 @@ pub const IO_RESOURCE_REQUIREMENTS_HEADER_SIZE: usize =
 /// Native size of one `IO_RESOURCE_DESCRIPTOR` on NT x64.
 pub const IO_RESOURCE_DESCRIPTOR_SIZE: usize = 32;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NativeResourceListError {
+    Truncated,
+    Empty,
+    SizeOverflow,
+    InvalidDescriptor,
+    InconsistentSize,
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> Result<u32, NativeResourceListError> {
+    let bytes = buf
+        .get(offset..offset.saturating_add(4))
+        .ok_or(NativeResourceListError::Truncated)?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("four-byte native resource field"),
+    ))
+}
+
+fn checked_native_end(offset: usize, length: usize) -> Result<usize, NativeResourceListError> {
+    offset
+        .checked_add(length)
+        .ok_or(NativeResourceListError::SizeOverflow)
+}
+
+/// Return the exact counted prefix of a native `CM_RESOURCE_LIST` allocation.
+/// Allocator capacity after that prefix is ignored. Device-specific payload is accepted only when
+/// its descriptor is last in a partial list, matching the native trailing-data representation.
+pub fn validate_cm_resource_list_extent(buf: &[u8]) -> Result<usize, NativeResourceListError> {
+    let full_count = read_u32(buf, 0)? as usize;
+    if full_count == 0 {
+        return Err(NativeResourceListError::Empty);
+    }
+    let mut cursor = 4usize;
+    for _ in 0..full_count {
+        let header_end = checked_native_end(cursor, 16)?;
+        if header_end > buf.len() {
+            return Err(NativeResourceListError::Truncated);
+        }
+        let descriptor_count = read_u32(buf, cursor + 12)? as usize;
+        let descriptor_bytes = descriptor_count
+            .checked_mul(PARTIAL_DESCRIPTOR_SIZE)
+            .ok_or(NativeResourceListError::SizeOverflow)?;
+        let descriptors_end = checked_native_end(header_end, descriptor_bytes)?;
+        if descriptors_end > buf.len() {
+            return Err(NativeResourceListError::Truncated);
+        }
+        let mut device_specific_bytes = 0usize;
+        for index in 0..descriptor_count {
+            let descriptor = header_end + index * PARTIAL_DESCRIPTOR_SIZE;
+            let resource_type = buf[descriptor];
+            if resource_type > CM_RESOURCE_TYPE_BUS_NUMBER {
+                return Err(NativeResourceListError::InvalidDescriptor);
+            }
+            if resource_type == CM_RESOURCE_TYPE_DEVICE_SPECIFIC {
+                if index + 1 != descriptor_count {
+                    return Err(NativeResourceListError::InvalidDescriptor);
+                }
+                device_specific_bytes = read_u32(buf, descriptor + 4)? as usize;
+            }
+        }
+        cursor = checked_native_end(descriptors_end, device_specific_bytes)?;
+        if cursor > buf.len() {
+            return Err(NativeResourceListError::Truncated);
+        }
+    }
+    Ok(cursor)
+}
+
+/// Return the exact self-described prefix of a native `IO_RESOURCE_REQUIREMENTS_LIST` allocation.
+/// The top-level `ListSize`, alternative count, and every descriptor count must agree exactly.
+pub fn validate_io_resource_requirements_list_extent(
+    buf: &[u8],
+) -> Result<usize, NativeResourceListError> {
+    if buf.len() < IO_RESOURCE_REQUIREMENTS_FIXED_SIZE {
+        return Err(NativeResourceListError::Truncated);
+    }
+    let list_size = read_u32(buf, 0)? as usize;
+    let alternatives = read_u32(buf, 28)? as usize;
+    if alternatives == 0 || list_size < IO_RESOURCE_REQUIREMENTS_HEADER_SIZE {
+        return Err(NativeResourceListError::Empty);
+    }
+    if list_size > buf.len() {
+        return Err(NativeResourceListError::Truncated);
+    }
+    let mut cursor = IO_RESOURCE_REQUIREMENTS_FIXED_SIZE;
+    for _ in 0..alternatives {
+        let header_end = checked_native_end(cursor, IO_RESOURCE_LIST_HEADER_SIZE)?;
+        if header_end > list_size {
+            return Err(NativeResourceListError::InconsistentSize);
+        }
+        let descriptor_count = read_u32(buf, cursor + 4)? as usize;
+        if descriptor_count == 0 {
+            return Err(NativeResourceListError::Empty);
+        }
+        let descriptor_bytes = descriptor_count
+            .checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)
+            .ok_or(NativeResourceListError::SizeOverflow)?;
+        cursor = checked_native_end(header_end, descriptor_bytes)?;
+        if cursor > list_size {
+            return Err(NativeResourceListError::InconsistentSize);
+        }
+    }
+    if cursor != list_size {
+        return Err(NativeResourceListError::InconsistentSize);
+    }
+    Ok(list_size)
+}
+
 /// One memory or port constraint in an `IO_RESOURCE_REQUIREMENTS_LIST`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IoAddressRequirement {
@@ -1099,6 +1207,92 @@ mod tests {
         assert_eq!(u32::from_le_bytes(buf[44..48].try_into().unwrap()), 9); // Level
         assert_eq!(u32::from_le_bytes(buf[48..52].try_into().unwrap()), 0x30); // Vector
         assert_eq!(u64::from_le_bytes(buf[52..60].try_into().unwrap()), 0xF); // Affinity
+    }
+
+    #[test]
+    fn native_cm_resource_extent_uses_counts_not_allocator_capacity() {
+        let mut buf = [0xcc; 96];
+        let written = build_memory_interrupt_list(
+            &mut buf,
+            INTERFACE_TYPE_INTERNAL,
+            3,
+            MemoryDescriptor {
+                start: 0x1000,
+                length: 0x1000,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            },
+            InterruptDescriptor {
+                level: 5,
+                vector: 0x30,
+                affinity: 1,
+                flags: 0,
+                share: CM_RESOURCE_SHARE_SHARED,
+            },
+        )
+        .unwrap();
+        assert_eq!(written, 60);
+        assert_eq!(validate_cm_resource_list_extent(&buf), Ok(60));
+        assert_eq!(
+            validate_cm_resource_list_extent(&buf[..59]),
+            Err(NativeResourceListError::Truncated)
+        );
+        buf[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            validate_cm_resource_list_extent(&buf),
+            Err(NativeResourceListError::Truncated)
+        );
+    }
+
+    #[test]
+    fn native_requirements_extent_cross_checks_all_alternatives() {
+        let first = [IoResourceRequirement::Memory(IoAddressRequirement {
+            option: IO_RESOURCE_REQUIRED,
+            share: CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
+            flags: 0,
+            length: 0x1000,
+            alignment: 0x1000,
+            minimum: 0x1000,
+            maximum: 0x1fff,
+        })];
+        let second = [IoResourceRequirement::Interrupt(IoInterruptRequirement {
+            option: IO_RESOURCE_ALTERNATIVE,
+            share: CM_RESOURCE_SHARE_SHARED,
+            flags: 0,
+            minimum_vector: 1,
+            maximum_vector: 15,
+            affinity_policy: 0,
+            priority_policy: 0,
+            targeted_processors: 1,
+        })];
+        let alternatives = [
+            IoResourceAlternative {
+                descriptors: &first,
+            },
+            IoResourceAlternative {
+                descriptors: &second,
+            },
+        ];
+        let mut buf = [0xaa; 160];
+        let written = build_io_resource_requirements_lists(
+            &mut buf,
+            INTERFACE_TYPE_PCI_BUS,
+            0,
+            7,
+            &alternatives,
+        )
+        .unwrap();
+        assert_eq!(written, 112);
+        assert_eq!(validate_io_resource_requirements_list_extent(&buf), Ok(112));
+        assert_eq!(
+            validate_io_resource_requirements_list_extent(&buf[..111]),
+            Err(NativeResourceListError::Truncated)
+        );
+        buf[0..4].copy_from_slice(&116u32.to_le_bytes());
+        assert_eq!(
+            validate_io_resource_requirements_list_extent(&buf),
+            Err(NativeResourceListError::InconsistentSize)
+        );
     }
 
     #[test]

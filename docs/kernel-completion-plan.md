@@ -18646,3 +18646,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and pending-completion rules as QUERY_ID. `QUERY_CAPABILITIES` remains a separate following
     slice because its initialized `DEVICE_CAPABILITIES` is an in/out stack pointer, not an
     `IoStatus.Information` allocation.
+
+    B3 native bus-property owned-copy checkpoint (2026-08-30, crate accepted):
+    `nt-cm-resources` now validates the exact native extent of counted `CM_RESOURCE_LIST` and
+    self-described `IO_RESOURCE_REQUIREMENTS_LIST` allocations. It cross-checks every full-resource
+    and alternative-list count, rejects truncation, overflow, invalid descriptor layout, and an
+    inconsistent `ListSize`, while deliberately ignoring allocator capacity after the native
+    prefix. Device-specific resource data is accepted only in its native trailing position.
+
+    A focused `nt-pnp-manager::bus_properties` module copies those validated prefixes into
+    PnP-owned storage and decodes the fixed 24-byte x64 `PNP_BUS_INFORMATION` value without retaining
+    a provider pointer. Focused validation passes `13/13` `nt-cm-resources` and `42/42`
+    `nt-pnp-manager` tests; formatting, `git diff --check`, and the freestanding executive check
+    pass at the 209-warning baseline. Review adjustment: wire these decoders into the retained
+    per-child transaction using the typed information-query IRPs. The provider allocation remains
+    live until owned copy succeeds, pending completion ACK follows copy/free, and only allocation
+    pressure retries. Keep the resulting property records staged until capability query and an
+    allocation-free PnP devnode publication owner exist; CM must not be published first and then
+    discover that canonical PDO-property publication can fail.
