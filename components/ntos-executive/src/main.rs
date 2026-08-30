@@ -14514,7 +14514,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             .memory_window(bar.index)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         memory_grants.push(driver_launch::HostedMemoryResourceGrant {
-            bar_index: bar.index,
+            resource_index: bar.index,
             raw_start: raw.start,
             translated_start: translated.start,
             length: translated.length as u64,
@@ -14558,7 +14558,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for ((bar, raw), translated) in io_bars.iter().zip(&raw_ports).zip(&translated_ports) {
         port_grants.push(driver_launch::HostedPortResourceGrant {
-            bar_index: bar.index,
+            resource_index: bar.index,
             raw_start: raw.start,
             translated_start: translated.start,
             length: translated.length,
@@ -14660,7 +14660,7 @@ unsafe fn grant_hosted_root_devnode_resources(
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     if let (Some(raw_memory), Some(memory)) = (raw_memory, memory) {
         memory_grants.push(driver_launch::HostedMemoryResourceGrant {
-            bar_index: 0,
+            resource_index: 0,
             raw_start: raw_memory.start,
             translated_start: memory.start,
             length: mmio_len,

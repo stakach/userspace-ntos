@@ -13,6 +13,9 @@ use alloc::vec::Vec;
 pub const SDT_HEADER_LEN: usize = 36;
 pub const FADT_SIGNATURE: [u8; 4] = *b"FACP";
 pub const DSDT_SIGNATURE: [u8; 4] = *b"DSDT";
+pub const FACS_SIGNATURE: [u8; 4] = *b"FACS";
+pub const FACS_MIN_LEN: usize = 64;
+pub const ACPI_PAGE_SIZE: u64 = 0x1000;
 
 pub const ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
 pub const ADDRESS_SPACE_SYSTEM_IO: u8 = 1;
@@ -26,7 +29,11 @@ pub enum AcpiError {
     InvalidRootEntryWidth,
     NullTableAddress,
     DuplicateTableAddress,
+    DuplicateFadt,
     Allocation,
+    PhysicalRead,
+    DiscoveryLimit,
+    MissingFadt,
     MissingSciInterrupt,
     InvalidRegisterBlock,
     UnsupportedAddressSpace(u8),
@@ -65,6 +72,10 @@ pub struct AcpiRootTable {
 
 impl AcpiRootTable {
     pub fn parse(bytes: &[u8]) -> Result<Self, AcpiError> {
+        Self::parse_with_entry_limit(bytes, usize::MAX)
+    }
+
+    pub fn parse_with_entry_limit(bytes: &[u8], max_entries: usize) -> Result<Self, AcpiError> {
         let header = validate_sdt(bytes)?;
         let entry_width = match &header.signature {
             b"RSDT" => 4,
@@ -76,6 +87,9 @@ impl AcpiRootTable {
             return Err(AcpiError::InvalidRootEntryWidth);
         }
         let count = payload_len / entry_width;
+        if count > max_entries {
+            return Err(AcpiError::DiscoveryLimit);
+        }
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(count)
@@ -163,6 +177,7 @@ pub struct EventRegisterPair {
 pub struct FixedAcpiDescription {
     pub revision: u8,
     pub sci_interrupt: u16,
+    pub facs_address: Option<u64>,
     pub dsdt_address: u64,
     pub pm1a_event: Option<EventRegisterPair>,
     pub pm1b_event: Option<EventRegisterPair>,
@@ -181,6 +196,13 @@ impl FixedAcpiDescription {
         if sci_interrupt == 0 {
             return Err(AcpiError::MissingSciInterrupt);
         }
+        let legacy_facs = read_u32(table, 36)? as u64;
+        let extended_facs = read_optional_u64(table, 132).unwrap_or(0);
+        let facs_address = match (extended_facs, legacy_facs) {
+            (address, _) if address != 0 => Some(address),
+            (_, address) if address != 0 => Some(address),
+            _ => None,
+        };
         let legacy_dsdt = read_u32(table, 40)? as u64;
         let extended_dsdt = read_optional_u64(table, 140).unwrap_or(0);
         let dsdt_address = if extended_dsdt != 0 {
@@ -204,6 +226,7 @@ impl FixedAcpiDescription {
         Ok(Self {
             revision: header.revision,
             sci_interrupt,
+            facs_address,
             dsdt_address,
             pm1a_event,
             pm1b_event,
@@ -211,6 +234,302 @@ impl FixedAcpiDescription {
             gpe1,
         })
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveryLimits {
+    pub max_tables: usize,
+    pub max_table_length: usize,
+}
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_tables: 256,
+            max_table_length: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// Read an exact physical range. Implementations own mapping lifetime and must not return bytes
+/// from outside the caller's firmware-memory authority.
+pub trait PhysicalMemoryReader {
+    fn read(&mut self, address: u64, length: usize) -> Result<Vec<u8>, AcpiError>;
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalTable {
+    pub address: u64,
+    pub length: u32,
+    pub signature: [u8; 4],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalRange {
+    pub start: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpiPlatformResources {
+    pub root: PhysicalTable,
+    /// Checksum-validated SDTs referenced by the root, followed by the FADT-selected DSDT.
+    pub tables: Vec<PhysicalTable>,
+    /// The FACS is not an SDT and therefore has no checksum.
+    pub facs: Option<PhysicalRange>,
+    pub fixed: FixedAcpiDescription,
+    /// Page-normalized, sorted, non-overlapping extents containing every discovered table.
+    pub firmware_memory: Vec<PhysicalRange>,
+    /// Sorted, coalesced SystemMemory/SystemIO blocks needed for fixed ACPI events.
+    pub fixed_registers: Vec<RegisterBlock>,
+}
+
+pub fn discover_platform_resources<R: PhysicalMemoryReader>(
+    reader: &mut R,
+    root_address: u64,
+    root_length: u32,
+    limits: DiscoveryLimits,
+) -> Result<AcpiPlatformResources, AcpiError> {
+    if root_address == 0
+        || root_length as usize > limits.max_table_length
+        || (root_length as usize) < SDT_HEADER_LEN
+        || limits.max_tables == 0
+    {
+        return Err(AcpiError::DiscoveryLimit);
+    }
+    let root_bytes = read_exact(reader, root_address, root_length as usize)?;
+    let root = AcpiRootTable::parse_with_entry_limit(&root_bytes, limits.max_tables)?;
+    if root.header.length != root_length {
+        return Err(AcpiError::InvalidLength);
+    }
+
+    let root_table = PhysicalTable {
+        address: root_address,
+        length: root.header.length,
+        signature: root.header.signature,
+    };
+    let mut tables = Vec::new();
+    tables
+        .try_reserve_exact(root.entries.len().saturating_add(1))
+        .map_err(|_| AcpiError::Allocation)?;
+    let mut fadt_bytes = None;
+    for address in root.entries {
+        let (table, bytes) = read_sdt(reader, address, limits.max_table_length)?;
+        if table.signature == FADT_SIGNATURE {
+            if fadt_bytes.is_some() {
+                return Err(AcpiError::DuplicateFadt);
+            }
+            fadt_bytes = Some(bytes);
+        }
+        tables.push(table);
+    }
+    let fixed = FixedAcpiDescription::parse(&fadt_bytes.ok_or(AcpiError::MissingFadt)?)?;
+
+    if tables.len() >= limits.max_tables {
+        return Err(AcpiError::DiscoveryLimit);
+    }
+    if tables
+        .iter()
+        .any(|table| table.address == fixed.dsdt_address)
+    {
+        return Err(AcpiError::DuplicateTableAddress);
+    }
+    let (dsdt, _) = read_sdt(reader, fixed.dsdt_address, limits.max_table_length)?;
+    if dsdt.signature != DSDT_SIGNATURE {
+        return Err(AcpiError::InvalidSignature);
+    }
+    tables.push(dsdt);
+
+    let facs = fixed
+        .facs_address
+        .map(|address| read_facs(reader, address, limits.max_table_length))
+        .transpose()?;
+    let mut firmware_extents = Vec::new();
+    firmware_extents
+        .try_reserve_exact(tables.len().saturating_add(2))
+        .map_err(|_| AcpiError::Allocation)?;
+    firmware_extents.push(PhysicalRange {
+        start: root_table.address,
+        length: root_table.length as u64,
+    });
+    firmware_extents.extend(tables.iter().map(|table| PhysicalRange {
+        start: table.address,
+        length: table.length as u64,
+    }));
+    if let Some(facs) = facs {
+        firmware_extents.push(facs);
+    }
+
+    Ok(AcpiPlatformResources {
+        root: root_table,
+        tables,
+        facs,
+        fixed_registers: normalized_fixed_registers(&fixed)?,
+        firmware_memory: normalize_page_ranges(&firmware_extents)?,
+        fixed,
+    })
+}
+
+fn read_exact<R: PhysicalMemoryReader>(
+    reader: &mut R,
+    address: u64,
+    length: usize,
+) -> Result<Vec<u8>, AcpiError> {
+    let bytes = reader.read(address, length)?;
+    if bytes.len() != length {
+        return Err(AcpiError::PhysicalRead);
+    }
+    Ok(bytes)
+}
+
+fn read_sdt<R: PhysicalMemoryReader>(
+    reader: &mut R,
+    address: u64,
+    max_table_length: usize,
+) -> Result<(PhysicalTable, Vec<u8>), AcpiError> {
+    if address == 0 {
+        return Err(AcpiError::NullTableAddress);
+    }
+    let header = read_exact(reader, address, SDT_HEADER_LEN)?;
+    let length = read_u32(&header, 4)? as usize;
+    if length < SDT_HEADER_LEN || length > max_table_length {
+        return Err(AcpiError::DiscoveryLimit);
+    }
+    let bytes = read_exact(reader, address, length)?;
+    let header = validate_sdt(&bytes)?;
+    Ok((
+        PhysicalTable {
+            address,
+            length: header.length,
+            signature: header.signature,
+        },
+        bytes,
+    ))
+}
+
+fn read_facs<R: PhysicalMemoryReader>(
+    reader: &mut R,
+    address: u64,
+    max_table_length: usize,
+) -> Result<PhysicalRange, AcpiError> {
+    if address == 0 {
+        return Err(AcpiError::NullTableAddress);
+    }
+    let header = read_exact(reader, address, 8)?;
+    if header[..4] != FACS_SIGNATURE {
+        return Err(AcpiError::InvalidSignature);
+    }
+    let length = read_u32(&header, 4)? as usize;
+    if length < FACS_MIN_LEN || length > max_table_length {
+        return Err(AcpiError::DiscoveryLimit);
+    }
+    let _ = read_exact(reader, address, length)?;
+    Ok(PhysicalRange {
+        start: address,
+        length: length as u64,
+    })
+}
+
+fn normalized_fixed_registers(
+    fixed: &FixedAcpiDescription,
+) -> Result<Vec<RegisterBlock>, AcpiError> {
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(4)
+        .map_err(|_| AcpiError::Allocation)?;
+    for pair in [fixed.pm1a_event, fixed.pm1b_event, fixed.gpe0, fixed.gpe1]
+        .into_iter()
+        .flatten()
+    {
+        let length = pair
+            .status
+            .length
+            .checked_add(pair.enable.length)
+            .ok_or(AcpiError::InvalidRegisterBlock)?;
+        if pair.status.address_space != pair.enable.address_space
+            || pair.status.address.checked_add(pair.status.length as u64)
+                != Some(pair.enable.address)
+        {
+            return Err(AcpiError::InvalidRegisterBlock);
+        }
+        blocks.push(RegisterBlock {
+            address_space: pair.status.address_space,
+            address: pair.status.address,
+            length,
+        });
+    }
+    blocks.sort_unstable_by_key(|block| (block.address_space, block.address));
+    let mut normalized: Vec<RegisterBlock> = Vec::new();
+    normalized
+        .try_reserve_exact(blocks.len())
+        .map_err(|_| AcpiError::Allocation)?;
+    for block in blocks {
+        if let Some(previous) = normalized.last_mut() {
+            let previous_end = previous
+                .address
+                .checked_add(previous.length as u64)
+                .ok_or(AcpiError::InvalidRegisterBlock)?;
+            let block_end = block
+                .address
+                .checked_add(block.length as u64)
+                .ok_or(AcpiError::InvalidRegisterBlock)?;
+            if previous.address_space == block.address_space && block.address <= previous_end {
+                previous.length = u8::try_from(previous_end.max(block_end) - previous.address)
+                    .map_err(|_| AcpiError::InvalidRegisterBlock)?;
+                continue;
+            }
+        }
+        normalized.push(block);
+    }
+    Ok(normalized)
+}
+
+fn normalize_page_ranges(ranges: &[PhysicalRange]) -> Result<Vec<PhysicalRange>, AcpiError> {
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(ranges.len())
+        .map_err(|_| AcpiError::Allocation)?;
+    for range in ranges {
+        let end = range
+            .start
+            .checked_add(range.length)
+            .ok_or(AcpiError::InvalidLength)?;
+        if range.length == 0 {
+            return Err(AcpiError::InvalidLength);
+        }
+        let start = range.start & !(ACPI_PAGE_SIZE - 1);
+        let end = end
+            .checked_add(ACPI_PAGE_SIZE - 1)
+            .ok_or(AcpiError::InvalidLength)?
+            & !(ACPI_PAGE_SIZE - 1);
+        pages.push(PhysicalRange {
+            start,
+            length: end - start,
+        });
+    }
+    pages.sort_unstable_by_key(|range| range.start);
+    let mut normalized: Vec<PhysicalRange> = Vec::new();
+    normalized
+        .try_reserve_exact(pages.len())
+        .map_err(|_| AcpiError::Allocation)?;
+    for range in pages {
+        if let Some(previous) = normalized.last_mut() {
+            let previous_end = previous
+                .start
+                .checked_add(previous.length)
+                .ok_or(AcpiError::InvalidLength)?;
+            let range_end = range
+                .start
+                .checked_add(range.length)
+                .ok_or(AcpiError::InvalidLength)?;
+            if range.start <= previous_end {
+                previous.length = previous_end.max(range_end) - previous.start;
+                continue;
+            }
+        }
+        normalized.push(range);
+    }
+    Ok(normalized)
 }
 
 fn parse_event_pair(
@@ -329,6 +648,37 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    struct TestPhysicalMemory {
+        regions: Vec<(u64, Vec<u8>)>,
+        reads: Vec<(u64, usize)>,
+    }
+
+    impl TestPhysicalMemory {
+        fn new(regions: Vec<(u64, Vec<u8>)>) -> Self {
+            Self {
+                regions,
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    impl PhysicalMemoryReader for TestPhysicalMemory {
+        fn read(&mut self, address: u64, length: usize) -> Result<Vec<u8>, AcpiError> {
+            self.reads.push((address, length));
+            let end = address
+                .checked_add(length as u64)
+                .ok_or(AcpiError::PhysicalRead)?;
+            let Some((base, bytes)) = self.regions.iter().find(|(base, bytes)| {
+                let region_end = base.saturating_add(bytes.len() as u64);
+                address >= *base && end <= region_end
+            }) else {
+                return Err(AcpiError::PhysicalRead);
+            };
+            let offset = (address - *base) as usize;
+            Ok(bytes[offset..offset + length].to_vec())
+        }
+    }
+
     fn finish_table(mut table: Vec<u8>, signature: &[u8; 4]) -> Vec<u8> {
         table[0..4].copy_from_slice(signature);
         let length = table.len() as u32;
@@ -358,6 +708,13 @@ mod tests {
         table[offset + 2] = 0;
         table[offset + 3] = 1;
         write_u64(table, offset + 4, address);
+    }
+
+    fn facs(length: usize) -> Vec<u8> {
+        let mut table = vec![0; length];
+        table[..4].copy_from_slice(b"FACS");
+        write_u32(&mut table, 4, length as u32);
+        table
     }
 
     #[test]
@@ -437,5 +794,119 @@ mod tests {
             block.split_status_enable(),
             Err(AcpiError::InvalidRegisterBlock)
         );
+    }
+
+    #[test]
+    fn platform_discovery_walks_fadt_dsdt_and_facs_into_exact_resources() {
+        const ROOT: u64 = 0x7ffe_1000;
+        const FADT: u64 = 0x7ffe_2000;
+        const SSDT: u64 = 0x7ffe_2800;
+        const DSDT: u64 = 0x7ffe_3000;
+        const FACS: u64 = 0x7ffe_3f80;
+
+        let mut xsdt = vec![0; SDT_HEADER_LEN + 16];
+        write_u64(&mut xsdt, SDT_HEADER_LEN, FADT);
+        write_u64(&mut xsdt, SDT_HEADER_LEN + 8, SSDT);
+        let xsdt = finish_table(xsdt, b"XSDT");
+
+        let mut fadt = vec![0; 244];
+        write_u32(&mut fadt, 36, FACS as u32);
+        write_u32(&mut fadt, 40, DSDT as u32);
+        write_u64(&mut fadt, 132, FACS);
+        write_u64(&mut fadt, 140, DSDT);
+        write_u16(&mut fadt, 46, 9);
+        fadt[88] = 4;
+        fadt[92] = 8;
+        write_gas(&mut fadt, 148, ADDRESS_SPACE_SYSTEM_IO, 32, 0x600);
+        write_gas(&mut fadt, 220, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed8_0000);
+
+        let regions = vec![
+            (ROOT, xsdt.clone()),
+            (FADT, finish_table(fadt, b"FACP")),
+            (SSDT, finish_table(vec![0; 80], b"SSDT")),
+            (DSDT, finish_table(vec![0; 0x900], b"DSDT")),
+            (FACS, facs(FACS_MIN_LEN)),
+        ];
+        let mut memory = TestPhysicalMemory::new(regions);
+        let resources = discover_platform_resources(
+            &mut memory,
+            ROOT,
+            xsdt.len() as u32,
+            DiscoveryLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resources.root.signature, *b"XSDT");
+        assert_eq!(resources.fixed.sci_interrupt, 9);
+        assert_eq!(resources.fixed.facs_address, Some(FACS));
+        assert_eq!(resources.tables.len(), 3);
+        assert_eq!(resources.tables.last().unwrap().signature, *b"DSDT");
+        assert_eq!(
+            resources.firmware_memory,
+            vec![PhysicalRange {
+                start: ROOT,
+                length: 0x3000,
+            }]
+        );
+        assert_eq!(
+            resources.fixed_registers,
+            vec![
+                RegisterBlock {
+                    address_space: ADDRESS_SPACE_SYSTEM_MEMORY,
+                    address: 0xfed8_0000,
+                    length: 8,
+                },
+                RegisterBlock {
+                    address_space: ADDRESS_SPACE_SYSTEM_IO,
+                    address: 0x600,
+                    length: 4,
+                },
+            ]
+        );
+        assert!(memory.reads.contains(&(FACS, FACS_MIN_LEN)));
+    }
+
+    #[test]
+    fn platform_discovery_rejects_duplicate_fadt_and_table_limits_before_body_read() {
+        const ROOT: u64 = 0x1000;
+        const FADT_A: u64 = 0x2000;
+        const FADT_B: u64 = 0x3000;
+        let mut xsdt = vec![0; SDT_HEADER_LEN + 16];
+        write_u64(&mut xsdt, SDT_HEADER_LEN, FADT_A);
+        write_u64(&mut xsdt, SDT_HEADER_LEN + 8, FADT_B);
+        let xsdt = finish_table(xsdt, b"XSDT");
+        let mut fadt = vec![0; 116];
+        write_u16(&mut fadt, 46, 9);
+        write_u32(&mut fadt, 40, 0x4000);
+        let fadt = finish_table(fadt, b"FACP");
+        let mut memory = TestPhysicalMemory::new(vec![
+            (ROOT, xsdt.clone()),
+            (FADT_A, fadt.clone()),
+            (FADT_B, fadt),
+        ]);
+        assert_eq!(
+            discover_platform_resources(
+                &mut memory,
+                ROOT,
+                xsdt.len() as u32,
+                DiscoveryLimits::default(),
+            ),
+            Err(AcpiError::DuplicateFadt)
+        );
+
+        let mut limited = TestPhysicalMemory::new(vec![(ROOT, xsdt.clone())]);
+        assert_eq!(
+            discover_platform_resources(
+                &mut limited,
+                ROOT,
+                xsdt.len() as u32,
+                DiscoveryLimits {
+                    max_tables: 1,
+                    ..DiscoveryLimits::default()
+                },
+            ),
+            Err(AcpiError::DiscoveryLimit)
+        );
+        assert_eq!(limited.reads, vec![(ROOT, xsdt.len())]);
     }
 }

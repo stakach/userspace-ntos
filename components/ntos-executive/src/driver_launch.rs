@@ -444,10 +444,11 @@ pub const SH_VIDEO_DISPI_SELECTED_INDEX: u64 = 0xA30; // out: last Bochs DISPI i
 pub const SH_RESOURCE_ADDRESS_COUNT: u64 = 0xA38;
 pub const SH_RESOURCE_ADDRESS_CAPACITY: u64 = 0xA40;
 pub const SH_RESOURCE_ADDRESS_RECORDS: u64 = 0xA48;
-pub const SH_RESOURCE_ADDRESS_RECORD_CAPACITY: u64 = nt_pnp::PCI_NUM_BARS as u64 + 1;
+pub const SH_RESOURCE_KIND_CAPACITY: u8 = 16;
+pub const SH_RESOURCE_ADDRESS_RECORD_CAPACITY: u64 = SH_RESOURCE_KIND_CAPACITY as u64 * 2;
 pub const SH_RESOURCE_ADDRESS_RECORD_SIZE: u64 = 0x40;
 pub const SH_RESOURCE_ADDRESS_KIND: u64 = 0x00;
-pub const SH_RESOURCE_ADDRESS_BAR_INDEX: u64 = 0x01;
+pub const SH_RESOURCE_ADDRESS_INDEX: u64 = 0x01;
 pub const SH_RESOURCE_ADDRESS_FLAGS: u64 = 0x02;
 pub const SH_RESOURCE_ADDRESS_SHARE: u64 = 0x04;
 pub const SH_RESOURCE_ADDRESS_PCI_FLAGS: u64 = 0x05;
@@ -460,7 +461,8 @@ pub const SH_RESOURCE_ADDRESS_RESERVED: u64 = 0x30;
 pub const SH_RESOURCE_ADDRESS_COMPONENT_CAP: u64 = 0x38;
 pub const SH_RESOURCE_ADDRESS_KIND_MEMORY: u8 = 1;
 pub const SH_RESOURCE_ADDRESS_KIND_PORT: u8 = 2;
-pub const SH_HANDOFF_ARENA_BASE: u64 = 0xC40;
+pub const SH_HANDOFF_ARENA_BASE: u64 = SH_RESOURCE_ADDRESS_RECORDS
+    + SH_RESOURCE_ADDRESS_RECORD_CAPACITY * SH_RESOURCE_ADDRESS_RECORD_SIZE;
 pub const SH_HANDOFF_ARENA_LIMIT: u64 = FSD_SHARED_FRAMES * 0x1000;
 pub const SH_SUPPORT_RECORD_CAPACITY: u64 = 16;
 pub const SH_SUPPORT_RECORD_SIZE: u64 = 0x10;
@@ -13334,7 +13336,7 @@ fn range_within_grant(grant_start: u64, grant_len: u64, start: u64, len: u64) ->
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct SharedAddressResource {
     kind: u8,
-    bar_index: u8,
+    resource_index: u8,
     flags: u16,
     share: u8,
     pci_flags: u8,
@@ -13371,7 +13373,7 @@ unsafe fn read_shared_address_resource(sh: u64, index: u64) -> Option<SharedAddr
     let record = shared_address_resource_record(sh, index)?;
     let resource = SharedAddressResource {
         kind: read_volatile((record + SH_RESOURCE_ADDRESS_KIND) as *const u8),
-        bar_index: read_volatile((record + SH_RESOURCE_ADDRESS_BAR_INDEX) as *const u8),
+        resource_index: read_volatile((record + SH_RESOURCE_ADDRESS_INDEX) as *const u8),
         flags: read_volatile((record + SH_RESOURCE_ADDRESS_FLAGS) as *const u16),
         share: read_volatile((record + SH_RESOURCE_ADDRESS_SHARE) as *const u8),
         pci_flags: read_volatile((record + SH_RESOURCE_ADDRESS_PCI_FLAGS) as *const u8),
@@ -13388,8 +13390,9 @@ unsafe fn read_shared_address_resource(sh: u64, index: u64) -> Option<SharedAddr
     if !matches!(
         resource.kind,
         SH_RESOURCE_ADDRESS_KIND_MEMORY | SH_RESOURCE_ADDRESS_KIND_PORT
-    ) || (resource.bar_index as usize >= nt_pnp::PCI_NUM_BARS
-        && !(resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.bar_index == u8::MAX))
+    ) || (resource.resource_index >= SH_RESOURCE_KIND_CAPACITY
+        && !(resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
+            && resource.resource_index == u8::MAX))
         || !matches!(
             resource.share,
             nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
@@ -13409,8 +13412,8 @@ unsafe fn write_shared_address_resource(sh: u64, index: u64, value: SharedAddres
     };
     write_volatile((record + SH_RESOURCE_ADDRESS_KIND) as *mut u8, value.kind);
     write_volatile(
-        (record + SH_RESOURCE_ADDRESS_BAR_INDEX) as *mut u8,
-        value.bar_index,
+        (record + SH_RESOURCE_ADDRESS_INDEX) as *mut u8,
+        value.resource_index,
     );
     write_volatile(
         (record + SH_RESOURCE_ADDRESS_FLAGS) as *mut u16,
@@ -13474,7 +13477,10 @@ unsafe fn publish_shared_address_resources(sh: u64, resources: &[SharedAddressRe
             )
             || resources[..index]
                 .iter()
-                .any(|prior| prior.kind == resource.kind && prior.bar_index == resource.bar_index)
+                .any(|prior| {
+                    prior.kind == resource.kind
+                        && prior.resource_index == resource.resource_index
+                })
         {
             return false;
         }
@@ -13567,7 +13573,7 @@ unsafe fn find_shared_address_resource_by_bar(
     let mut index = 0;
     while index < count {
         let resource = read_shared_address_resource(sh, index)?;
-        if resource.bar_index == bar_index {
+        if resource.resource_index == bar_index {
             return Some(resource);
         }
         index += 1;
@@ -39608,20 +39614,23 @@ fn hosted_resource_id(device_id: u64, kind: u64) -> Option<u64> {
     device_id.checked_mul(0x100)?.checked_add(kind)
 }
 
-fn hosted_mmio_resource_id(device_id: u64, bar_index: u8) -> Option<u64> {
-    ((bar_index as usize) < nt_pnp::PCI_NUM_BARS).then_some(())?;
-    hosted_resource_id(device_id, HOSTED_MMIO_RESOURCE_KIND_BASE + bar_index as u64)
+fn hosted_mmio_resource_id(device_id: u64, resource_index: u8) -> Option<u64> {
+    (resource_index < SH_RESOURCE_KIND_CAPACITY).then_some(())?;
+    hosted_resource_id(
+        device_id,
+        HOSTED_MMIO_RESOURCE_KIND_BASE + resource_index as u64,
+    )
 }
 
 fn hosted_interrupt_resource_id(device_id: u64) -> Option<u64> {
     hosted_resource_id(device_id, HOSTED_INTERRUPT_RESOURCE_KIND)
 }
 
-fn hosted_io_port_resource_id(device_id: u64, bar_index: u8) -> Option<u64> {
-    ((bar_index as usize) < nt_pnp::PCI_NUM_BARS).then_some(())?;
+fn hosted_io_port_resource_id(device_id: u64, resource_index: u8) -> Option<u64> {
+    (resource_index < SH_RESOURCE_KIND_CAPACITY).then_some(())?;
     hosted_resource_id(
         device_id,
-        HOSTED_IO_PORT_RESOURCE_KIND_BASE + bar_index as u64,
+        HOSTED_IO_PORT_RESOURCE_KIND_BASE + resource_index as u64,
     )
 }
 
@@ -42352,7 +42361,7 @@ unsafe fn claim_hosted_supplemental_port_range(
     let supplemental_index = hosted_state_address_resources(&state)
         .iter()
         .position(|resource| {
-            resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.bar_index == u8::MAX
+            resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.resource_index == u8::MAX
         });
 
     if start == 0 && length == 0 {
@@ -42435,7 +42444,7 @@ unsafe fn claim_hosted_supplemental_port_range(
     let index = state.address_resource_count as usize;
     state.address_resources[index] = SharedAddressResource {
         kind: SH_RESOURCE_ADDRESS_KIND_PORT,
-        bar_index: u8::MAX,
+        resource_index: u8::MAX,
         share: nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE,
         raw_start: start,
         translated_start: start,
@@ -43410,7 +43419,7 @@ unsafe fn hosted_mmio_read_u32(state: HostedDeviceResourceState, offset: u64) ->
         .iter()
         .copied()
         .find(|resource| {
-            resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY && resource.bar_index == 0
+            resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY && resource.resource_index == 0
         })?;
     if resource.broker_va_or_root_cap == 0 || offset.checked_add(4)? > resource.map_len {
         return None;
@@ -43428,7 +43437,7 @@ unsafe fn hosted_mmio_write_u32(state: HostedDeviceResourceState, offset: u64, v
         .iter()
         .copied()
         .find(|resource| {
-            resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY && resource.bar_index == 0
+            resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY && resource.resource_index == 0
         })
     else {
         return false;
@@ -43449,7 +43458,7 @@ fn hosted_io_port_for_state_offset(
         .iter()
         .copied()
         .find(|resource| {
-            resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.bar_index == 0
+            resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.resource_index == 0
         })?;
     let cap = resource.broker_va_or_root_cap;
     if cap == 0 || end > resource.len {
@@ -48244,13 +48253,15 @@ unsafe fn call_add_device_for_existing_pdo(
 /// Grant a hosted device driver access to the MMIO/port/interrupt resources selected for its
 /// devnode.
 ///
-/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START: memory BARs are
-/// granted in the shared page, while `mmio_map_pages` controls the bounded prefix eagerly mapped
-/// into the isolated component VSpace for direct `MmMapIoSpace` access. I/O-only PCI devices pass
-/// zero for the MMIO fields and still receive their port cap, interrupt resource, and DMA window.
+/// This is the executive mechanism behind the `CM_RESOURCE_LIST` passed at START. Each address
+/// resource has a kind-local index; PCI callers use the real BAR number while platform buses may
+/// publish non-PCI memory and port resources through the same contract. `map_pages` controls the
+/// bounded memory prefix eagerly mapped into the isolated component VSpace for direct
+/// `MmMapIoSpace` access. I/O-only devices pass no memory grants and still receive their port caps,
+/// interrupt resource, and optional DMA window.
 #[derive(Clone, Copy)]
 pub(crate) struct HostedMemoryResourceGrant {
-    pub bar_index: u8,
+    pub resource_index: u8,
     pub raw_start: u64,
     pub translated_start: u64,
     pub length: u64,
@@ -48266,7 +48277,7 @@ pub(crate) struct HostedMemoryResourceGrant {
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostedPortResourceGrant {
-    pub bar_index: u8,
+    pub resource_index: u8,
     pub raw_start: u64,
     pub translated_start: u64,
     pub length: u32,
@@ -48319,10 +48330,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
 
     let mut video_memory = None;
     for (index, grant) in memory.iter().enumerate() {
-        if grant.bar_index as usize >= nt_pnp::PCI_NUM_BARS
+        if grant.resource_index >= SH_RESOURCE_KIND_CAPACITY
             || memory[..index]
                 .iter()
-                .any(|prior| prior.bar_index == grant.bar_index)
+                .any(|prior| prior.resource_index == grant.resource_index)
             || grant.raw_start == 0
             || grant.translated_start == 0
             || grant.length == 0
@@ -48361,10 +48372,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         else {
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         };
-        if grant.bar_index as usize >= nt_pnp::PCI_NUM_BARS
+        if grant.resource_index >= SH_RESOURCE_KIND_CAPACITY
             || ports[..index]
                 .iter()
-                .any(|prior| prior.bar_index == grant.bar_index)
+                .any(|prior| prior.resource_index == grant.resource_index)
             || grant.raw_start == 0
             || grant.translated_start == 0
             || grant.length == 0
@@ -48508,7 +48519,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         }
         resources.push(SharedAddressResource {
             kind: SH_RESOURCE_ADDRESS_KIND_MEMORY,
-            bar_index: grant.bar_index,
+            resource_index: grant.resource_index,
             flags: grant.flags,
             share: grant.share,
             pci_flags: grant.pci_flags as u8,
@@ -48631,7 +48642,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         issued_port_caps.push(cap);
         resources.push(SharedAddressResource {
             kind: SH_RESOURCE_ADDRESS_KIND_PORT,
-            bar_index: grant.bar_index,
+            resource_index: grant.resource_index,
             flags: grant.flags,
             share: grant.share,
             pci_flags: grant.pci_flags as u8,
@@ -48653,13 +48664,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             return Err(status);
         }
     }
-    resources.sort_unstable_by_key(|resource| resource.bar_index);
+    resources.sort_unstable_by_key(|resource| (resource.kind, resource.resource_index));
 
     for resource in &resources {
         let resource_id = if resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY {
-            hosted_mmio_resource_id(device_id, resource.bar_index)
+            hosted_mmio_resource_id(device_id, resource.resource_index)
         } else {
-            hosted_io_port_resource_id(device_id, resource.bar_index)
+            hosted_io_port_resource_id(device_id, resource.resource_index)
         };
         let Some(resource_id) = resource_id else {
             rollback_staged_hosted_resource_grant(
@@ -48956,7 +48967,8 @@ unsafe fn record_hosted_mmio_usage(
             true,
         )
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let expected_resource_id = hosted_mmio_resource_id(binding.device_id, resource.bar_index)
+        let expected_resource_id =
+            hosted_mmio_resource_id(binding.device_id, resource.resource_index)
             .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
         let mapped = hosted_resource_manager_mut()
             .map_io_space(owner, mapped_phys, mapped_len, nt_hal_abi::MM_NON_CACHED)

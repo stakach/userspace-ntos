@@ -19389,3 +19389,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     extend generic hosted-driver grant metadata for ACPI table and fixed-event resources without a
     service-name branch. The executive live PCI census consumes only the resulting genuine bus
     notification.
+
+    B3 ACPI physical-resource discovery checkpoint (2026-08-31, implementation green): the
+    host-tested `nt-acpi` policy now walks a loader-selected RSDT/XSDT through an exact physical
+    reader contract with explicit table-count and byte limits. Every root entry is read in two
+    stages, checksum validated, and retained with its real 64-bit physical address and extent.
+    Discovery requires exactly one FADT, follows its selected extended-or-legacy DSDT and optional
+    FACS pointers, validates the DSDT signature and FACS shape, and rejects duplicates, short reads,
+    oversized tables, and ambiguous FADTs. The resulting firmware-memory authority is page aligned,
+    sorted, and coalesced; PM1/GPE blocks are independently normalized by address space without
+    introducing physical mapping or I/O policy into the crate. Focused `nt-acpi` validation passes
+    7/7.
+
+    The hosted-driver resource ABI no longer encodes a six-PCI-BAR ceiling. Address publications
+    now use kind-local resource indices with bounded capacity for sixteen memory and sixteen port
+    resources. PCI drivers continue to use their genuine BAR numbers, while root/platform buses can
+    publish several firmware-table and fixed-register extents through the same checked path. The
+    resource-manager IDs remain disjoint by kind, duplicate indices fail closed, and the expanded
+    records consume reserved shared-arena space rather than enlarging a driver component. The
+    freestanding executive check remains green at the 209-warning baseline.
+
+    Review adjustment: next implement an executive physical reader over BootInfo device-untyped
+    authority that retains one canonical frame-cap set for both validation and later component
+    mapping. It must handle table spans crossing the page-sized ACPI untypeds, include the genuine
+    BIOS RSDP search windows required by the shipped ACPICA `AcpiFindRootPointer`, and publish the
+    resulting memory/port/SCI resources on the canonical ACPI root PDO selected from registry/PnP
+    identity. Do not select `acpi.sys` by service name and do not synthesize an RSDP or table bytes.
