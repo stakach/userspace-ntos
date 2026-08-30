@@ -1,11 +1,14 @@
 //! Checked buffers for the standard ACPI PDO method-evaluation IOCTL.
 
 pub const IOCTL_ACPI_EVAL_METHOD: u32 = 0x0032_c004;
+pub const IOCTL_ACPI_EVAL_METHOD_EX: u32 = 0x0032_c018;
 pub const ACPI_EVAL_INPUT_BUFFER_LEN: usize = 8;
+pub const ACPI_EVAL_INPUT_BUFFER_EX_LEN: usize = 260;
 /// Native `sizeof(ACPI_EVAL_OUTPUT_BUFFER)` for the shipped amd64 provider.
 pub const ACPI_EVAL_OUTPUT_PROBE_LEN: usize = 20;
 
 const EVAL_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"BieA");
+const EVAL_INPUT_EX_SIGNATURE: u32 = u32::from_be_bytes(*b"AieA");
 const EVAL_OUTPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"BoeA");
 const EVAL_OUTPUT_HEADER_LEN: usize = 12;
 const METHOD_ARGUMENT_STORAGE_LEN: usize = 8;
@@ -30,6 +33,21 @@ pub fn eval_method_input(
     let mut input = [0u8; ACPI_EVAL_INPUT_BUFFER_LEN];
     input[..4].copy_from_slice(&EVAL_INPUT_SIGNATURE.to_le_bytes());
     input[4..].copy_from_slice(&method);
+    Ok(input)
+}
+
+/// Build a no-argument full-path `ACPI_EVAL_INPUT_BUFFER_EX`.
+pub fn eval_method_input_ex(
+    method_path: &str,
+) -> Result<[u8; ACPI_EVAL_INPUT_BUFFER_EX_LEN], AcpiEvalError> {
+    if method_path.len() >= ACPI_EVAL_INPUT_BUFFER_EX_LEN - 4
+        || crate::namespace::validate_absolute_path(method_path.as_bytes()).is_err()
+    {
+        return Err(AcpiEvalError::InvalidMethodName);
+    }
+    let mut input = [0u8; ACPI_EVAL_INPUT_BUFFER_EX_LEN];
+    input[..4].copy_from_slice(&EVAL_INPUT_EX_SIGNATURE.to_le_bytes());
+    input[4..4 + method_path.len()].copy_from_slice(method_path.as_bytes());
     Ok(input)
 }
 
@@ -123,6 +141,23 @@ mod tests {
         );
         assert_eq!(
             eval_method_input(*b"_prT"),
+            Err(AcpiEvalError::InvalidMethodName)
+        );
+    }
+
+    #[test]
+    fn extended_input_is_exact_bounded_canonical_full_path() {
+        let input = eval_method_input_ex("\\_SB_.PCI0.BRG0._PRT").unwrap();
+        assert_eq!(&input[..4], &[0x41, 0x65, 0x69, 0x41]);
+        assert_eq!(&input[4..24], b"\\_SB_.PCI0.BRG0._PRT");
+        assert_eq!(input[24], 0);
+        assert!(input[25..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            eval_method_input_ex("_SB_.PCI0._PRT"),
+            Err(AcpiEvalError::InvalidMethodName)
+        );
+        assert_eq!(
+            eval_method_input_ex("\\_SB_.pci0._PRT"),
             Err(AcpiEvalError::InvalidMethodName)
         );
     }

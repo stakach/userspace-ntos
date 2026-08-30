@@ -5,10 +5,13 @@ use alloc::vec::Vec;
 
 pub const IOCTL_ACPI_ENUM_CHILDREN: u32 = 0x0032_c020;
 pub const ACPI_ENUM_CHILDREN_INPUT_LEN: usize = 16;
+pub const ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN: usize = 17;
 
 const ENUM_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"HieA");
 const ENUM_OUTPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"GieA");
 const ENUM_CHILDREN_IMMEDIATE_ONLY: u32 = 1;
+const ENUM_CHILDREN_MULTILEVEL: u32 = 2;
+const ENUM_CHILDREN_NAME_IS_FILTER: u32 = 4;
 const ENUM_OUTPUT_HEADER_LEN: usize = 8;
 const ENUM_CHILD_HEADER_LEN: usize = 8;
 const ACPI_OBJECT_HAS_CHILDREN: u32 = 1;
@@ -73,6 +76,19 @@ impl AcpiNamespaceChildren {
     }
 }
 
+/// Exact full paths returned by a multilevel NameSeg filter. Unlike immediate enumeration, a
+/// filtered result does not include the queried PDO itself and may legitimately be empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpiNamespaceMatches {
+    objects: Vec<AcpiNamespaceChild>,
+}
+
+impl AcpiNamespaceMatches {
+    pub fn objects(&self) -> &[AcpiNamespaceChild] {
+        &self.objects
+    }
+}
+
 /// Build the C-sized immediate-only input buffer. The trailing four bytes represent the
 /// `ANYSIZE_ARRAY` element plus native structure padding and remain zero when no filter is used.
 pub fn immediate_namespace_children_input() -> [u8; ACPI_ENUM_CHILDREN_INPUT_LEN] {
@@ -80,6 +96,20 @@ pub fn immediate_namespace_children_input() -> [u8; ACPI_ENUM_CHILDREN_INPUT_LEN
     input[0..4].copy_from_slice(&ENUM_INPUT_SIGNATURE.to_le_bytes());
     input[4..8].copy_from_slice(&ENUM_CHILDREN_IMMEDIATE_ONLY.to_le_bytes());
     input
+}
+
+/// Build the exact variable-sized input for a multilevel NameSeg-filtered namespace walk.
+pub fn multilevel_namespace_filter_input(
+    name: [u8; 4],
+) -> Result<[u8; ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN], AcpiNamespaceError> {
+    validate_relative_path(&name).map_err(|_| AcpiNamespaceError::InvalidInput)?;
+    let mut input = [0u8; ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN];
+    input[0..4].copy_from_slice(&ENUM_INPUT_SIGNATURE.to_le_bytes());
+    input[4..8]
+        .copy_from_slice(&(ENUM_CHILDREN_MULTILEVEL | ENUM_CHILDREN_NAME_IS_FILTER).to_le_bytes());
+    input[8..12].copy_from_slice(&5u32.to_le_bytes());
+    input[12..16].copy_from_slice(&name);
+    Ok(input)
 }
 
 /// Validate the standard overflow header, where `NumberOfChildren` carries the exact required
@@ -107,6 +137,25 @@ pub fn parse_namespace_children(
     bytes: &[u8],
     maximum_children: usize,
 ) -> Result<AcpiNamespaceChildren, AcpiNamespaceError> {
+    let children = parse_namespace_records(bytes, maximum_children)?;
+    if children.is_empty() {
+        return Err(AcpiNamespaceError::LimitExceeded);
+    }
+    Ok(AcpiNamespaceChildren { children })
+}
+
+/// Decode an exact successful multilevel NameSeg-filtered enumeration result.
+pub fn parse_namespace_matches(
+    bytes: &[u8],
+    maximum_objects: usize,
+) -> Result<AcpiNamespaceMatches, AcpiNamespaceError> {
+    parse_namespace_records(bytes, maximum_objects).map(|objects| AcpiNamespaceMatches { objects })
+}
+
+fn parse_namespace_records(
+    bytes: &[u8],
+    maximum_records: usize,
+) -> Result<Vec<AcpiNamespaceChild>, AcpiNamespaceError> {
     if bytes.len() < ENUM_OUTPUT_HEADER_LEN {
         return Err(AcpiNamespaceError::Truncated);
     }
@@ -114,7 +163,7 @@ pub fn parse_namespace_children(
         return Err(AcpiNamespaceError::InvalidOutput);
     }
     let count = read_u32(bytes, 4)? as usize;
-    if count == 0 || count > maximum_children {
+    if count > maximum_records {
         return Err(AcpiNamespaceError::LimitExceeded);
     }
     if count > (bytes.len() - ENUM_OUTPUT_HEADER_LEN) / (ENUM_CHILD_HEADER_LEN + 2) {
@@ -160,7 +209,7 @@ pub fn parse_namespace_children(
     if cursor != bytes.len() {
         return Err(AcpiNamespaceError::InvalidOutput);
     }
-    Ok(AcpiNamespaceChildren { children })
+    Ok(children)
 }
 
 /// Resolve an absolute or relative `_PRT` reference against exact provider-published PDO paths.
@@ -230,7 +279,7 @@ fn joined_path_eq(candidate: &str, scope: &str, relative: &str) -> bool {
     }
 }
 
-fn validate_absolute_path(path: &[u8]) -> Result<(), AcpiNamespaceError> {
+pub(crate) fn validate_absolute_path(path: &[u8]) -> Result<(), AcpiNamespaceError> {
     if path == b"\\" {
         return Ok(());
     }
@@ -289,6 +338,39 @@ mod tests {
         assert_eq!(&input[0..4], &ENUM_INPUT_SIGNATURE.to_le_bytes());
         assert_eq!(u32::from_le_bytes(input[4..8].try_into().unwrap()), 1);
         assert_eq!(&input[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn multilevel_filter_has_distinct_exact_input_and_zero_result_contract() {
+        assert_eq!(
+            multilevel_namespace_filter_input(*b"_PRT").unwrap(),
+            [0x41, 0x65, 0x69, 0x48, 6, 0, 0, 0, 5, 0, 0, 0, b'_', b'P', b'R', b'T', 0,]
+        );
+        assert_eq!(
+            multilevel_namespace_filter_input(*b"_prT"),
+            Err(AcpiNamespaceError::InvalidInput)
+        );
+
+        let empty = output(&[]);
+        assert_eq!(parse_namespace_matches(&empty, 8).unwrap().objects(), &[]);
+        assert_eq!(
+            parse_namespace_children(&empty, 8),
+            Err(AcpiNamespaceError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn filtered_paths_are_exact_canonical_and_unique_without_self_assumption() {
+        let bytes = output(&[(0, "\\_SB_.PCI0._PRT"), (0, "\\_SB_.PCI0.BRG0._PRT")]);
+        let matches = parse_namespace_matches(&bytes, 2).unwrap();
+        assert_eq!(matches.objects().len(), 2);
+        assert_eq!(matches.objects()[0].path.as_str(), "\\_SB_.PCI0._PRT");
+
+        let duplicate = output(&[(0, "\\_SB_.PCI0._PRT"), (0, "\\_SB_.PCI0._PRT")]);
+        assert_eq!(
+            parse_namespace_matches(&duplicate, 2),
+            Err(AcpiNamespaceError::DuplicatePath)
+        );
     }
 
     #[test]

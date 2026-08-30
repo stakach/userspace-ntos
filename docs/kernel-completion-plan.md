@@ -19935,3 +19935,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     facts leave no usable new route; consumers see either the previous exact claim or a generation
     mismatch, never a partial set. Do not bind claims to the global BusRelationTable generation,
     because unrelated bus changes would create false route-identity churn.
+
+    B3 filtered namespace and full-path provider checkpoint (2026-08-31, source, artifact, and
+    crate accepted): `nt-acpi` now owns the exact 17-byte multilevel NameSeg-filtered
+    `IOCTL_ACPI_ENUM_CHILDREN` request, a separate zero-or-more filtered-result parser, and the
+    exact no-argument 260-byte `ACPI_EVAL_INPUT_BUFFER_EX` request for canonical absolute paths.
+    Filter results remain bounded, canonical, unique, and exactly sized without assuming that the
+    queried root PDO appears as record zero. The full-path request rejects relative, lowercase,
+    overlong, or otherwise noncanonical namespace paths before they reach the provider. Focused
+    `nt-acpi` validation passes 31/31.
+
+    The retained ReactOS provider now implements synchronous and asynchronous
+    `IOCTL_ACPI_EVAL_METHOD_EX` for all four standard extended signatures. It validates that the
+    IOCTL and signature family agree, bounds and terminates the 256-byte full path, checks complex
+    argument extents without integer wrap, and evaluates that path relative to the exact root PDO's
+    ACPICA handle. This supplies a real endpoint for HID-less downstream `_ADR` and `_PRT` objects;
+    no PDO, root-only, or short-NameSeg substitute is manufactured. Rust-micro commits `b9a958d`
+    and `fccce09` are on `main`. The canonical provider is 451,072 bytes at SHA-256
+    `91be86e9d8e41d5aceca9ba22285554bb571eaa18d22ddb2957734caad7f2f87`, built by accepted run
+    `33339179501`; branch verification run `33339285105` and promoted-main run `33339405680` also
+    compile, verify, and upload the provider successfully. MSVC Debug builds vary only in PE
+    timestamp and CodeView identity metadata, so the manifest deliberately pins the exact accepted
+    boot artifact rather than claiming byte-identical Debug output across runs.
+
+    Review adjustment: the provider and checked buffer contracts needed for descendant scope
+    discovery are complete. The next B3 slice is executive ownership: install one live PCI
+    inventory, one generation-owned ACPI scope catalog, and one interrupt-route owner; have each
+    relevant ACPI/PCI relation commit publish only validated catalog facts; then run a serialized
+    reconciler that snapshots both catalog and inventory generations and atomically replaces the
+    complete route set. Root `_SEG`/`_BBN`, filtered `_ADR`/`_PRT`, exact link `_CRS`, bridge BDF and
+    SecondaryBus correlation, route electrical attributes, and GSI ownership must all agree before
+    publication. Missing or stale facts remain a hard barrier, with no swizzle or partial route.
