@@ -19334,8 +19334,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     windows, grants, and CM actions; then commit the full inventory generation atomically. Resource
     changes on retained functions must use the existing change/rebalance owner, not destructive
     reprobe. A genuine trigger is blocked on a platform boundary that is now explicit: rust-micro
-    parses ACPI tables internally but its rootserver extended BootInfo publishes only TSC frequency,
-    not the ACPI RSDP. Publish the validated RSDP through the standard x86 ACPI BootInfo header and
-    make the corresponding ACPI table/device resources claimable by the executive. Then add a small
-    host-tested FADT/DSDT SCI/GPE notification owner and connect its PCI bus notification to this
-    census transaction. Do not poll PCI config space or synthesize a relation invalidation.
+    parses ACPI tables internally but its rootserver ABI does not publish ACPI root-table authority.
+    BOOTBOOT has already consumed the firmware RSDP and supplies the selected RSDT/XSDT, so do not
+    mislabel that address as the standard RSDP BootInfo payload. Publish an explicit validated root
+    table descriptor and make the corresponding ACPI table resources claimable by the executive.
+    Then add a small host-tested FADT/DSDT SCI/GPE notification owner and connect its PCI bus
+    notification to this census transaction. Do not poll PCI config space or synthesize a relation
+    invalidation.
+
+    B3 microkernel ACPI authority checkpoint (2026-08-31, implementation green): rust-micro now
+    validates BOOTBOOT's selected RSDT/XSDT and publishes its real physical address, checked length,
+    table kind, and validity flag in the existing extern-rootserver BootInfo extension. The matching
+    `sel4-rt` ABI exposes a typed `BootAcpiRootTable`; invalid flags, address, length, or kind return
+    no authority. This is deliberately not the standard ACPI-RSDP header because the loader no
+    longer retains that firmware pointer.
+
+    ACPI reclaim ranges from the live BOOTBOOT memory map are decomposed into non-overlapping,
+    page-aligned device untypeds. Unaligned ranges, capacity exhaustion, overlap ambiguity, or a root
+    table not fully covered by those capabilities fails boot rather than publishing an unusable
+    pointer. The same computed list drives both CSpace caps and BootInfo metadata. Existing PCI BAR
+    and fixed architectural device ranges remain unique, and the range spec now rejects overlapping
+    untypeds explicitly.
+
+    The rust-micro `extern-rootserver,spec` freestanding check passes, its plain
+    `extern-rootserver` check passes, and the parent executive compiles against the extended
+    `sel4-rt` layout at the unchanged 209-warning baseline. The microkernel commit was pushed before
+    advancing the parent submodule pointer. Review adjustment: ACPI memory authority is now
+    available without adding AML policy to the microkernel. Next create a host-tested executive-side
+    ACPI table mapper/parser, derive the FADT SCI interrupt and fixed event/GPE register blocks from
+    firmware, and interpret only the namespace/event methods needed to deliver PCI bus notifications.
+    Keep IRQ acknowledgement and table-frame minting in the executive mechanism layer; keep AML and
+    PnP notification policy outside rust-micro.
