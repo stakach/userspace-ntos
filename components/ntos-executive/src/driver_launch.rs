@@ -420,11 +420,6 @@ pub const SH_VIDEO_MEMORY_LEN: u64 = 0x758; // in: caller-visible video memory b
 pub const SH_VIDEO_MEMORY_CALLER_VA: u64 = 0x760; // in: VA mapped in the EngDeviceIoControl caller
 pub const SH_VIDEO_MEMORY_MAPPED_VA: u64 = 0x768; // out: last VideoPortMapMemory caller VA
 pub const SH_RESOURCE_IO_PORT_OUT32_FAULTS: u64 = 0x778; // out: serviced WRITE_PORT_ULONG calls
-pub const SH_DEVICE_INTERFACE_LINK_LEN: u64 = 0x780; // out: IoSetDeviceInterfaceState link bytes
-pub const SH_DEVICE_INTERFACE_TARGET_LEN: u64 = 0x782; // out: target DeviceName bytes
-pub const SH_DEVICE_INTERFACE_STATE: u64 = 0x784; // out: 1=enable, 0=disable
-pub const SH_DEVICE_INTERFACE_LINK_BUF: u64 = 0x790; // out: UTF-16LE path capture
-pub const SH_DEVICE_INTERFACE_TARGET_BUF: u64 = 0x890; // out: UTF-16LE path capture
 pub const SH_HOSTED_CURRENT_IRQL: u64 = 0x990; // in/out: hosted KIRQL byte for patched CR8 helpers
 pub const SH_VIDEO_HW_DEVICE_EXTENSION: u64 = 0x9A0; // out: allocated miniport device extension
 pub const SH_VIDEO_HW_FIND_ADAPTER: u64 = 0x9A8; // out: captured VIDEO_HW_INITIALIZATION_DATA.HwFindAdapter
@@ -4640,12 +4635,19 @@ const HOSTED_DEVICE_OP_DETACH: u64 = 8;
 const HOSTED_DEVICE_OP_DELETE: u64 = 9;
 const HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK: u64 = 10;
 const HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK: u64 = 11;
+const HOSTED_DEVICE_OP_REGISTER_INTERFACE: u64 = 12;
+const HOSTED_DEVICE_OP_SET_INTERFACE_STATE: u64 = 13;
+const HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN: u64 = 0;
+const HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF: u64 = 2;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
 const HOSTED_DEVICE_ARG_DATA_CAP: u64 = REP_DATA_LEN as u64;
 const _: () =
     assert!(HOSTED_DEVICE_ARG_DATA_OFF + HOSTED_DEVICE_ARG_DATA_CAP == FSD_ARG_MAPPED_BYTES);
 const HOSTED_EXPORT_NAME_MAX: usize = 96;
 const HOSTED_INTERFACE_LINK_MAX: usize = 192;
+const _: () = assert!(
+    HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF + (HOSTED_INTERFACE_LINK_MAX as u64) * 2 <= FSD_ARG_BYTES
+);
 type HostedRegistryIdentityId = usize;
 const INVALID_HOSTED_REGISTRY_IDENTITY_ID: HostedRegistryIdentityId = usize::MAX;
 
@@ -4780,16 +4782,25 @@ enum DriverRegistryHandleKind {
 
 #[derive(Clone, Copy)]
 struct HostedDeviceInterfaceRegistration {
+    owner_domain: HostedDomainIdentity,
+    pdo_device_id: u64,
+    class_guid: [u64; 2],
+    reference: HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
     symbolic_link: HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
-    target: HostedAscii<HOSTED_EXPORT_NAME_MAX>,
     enabled: bool,
     used: bool,
 }
 
 const EMPTY_HOSTED_DEVICE_INTERFACE_REGISTRATION: HostedDeviceInterfaceRegistration =
     HostedDeviceInterfaceRegistration {
+        owner_domain: HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(0),
+            cookie: 0,
+        },
+        pdo_device_id: 0,
+        class_guid: [0; 2],
+        reference: HostedAscii::empty(),
         symbolic_link: HostedAscii::empty(),
-        target: HostedAscii::empty(),
         enabled: false,
         used: false,
     };
@@ -5332,20 +5343,12 @@ fn push_hex_u8<const N: usize>(out: &mut HostedAscii<N>, value: u8) -> bool {
     push_hex_u32(out, value as u32, 2)
 }
 
-unsafe fn guid_to_hosted_ascii(guid: u64) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
-    if guid == 0 {
-        return None;
-    }
-    let d1 = read_unaligned(guid as *const u32);
-    let d2 = read_unaligned((guid + 4) as *const u16);
-    let d3 = read_unaligned((guid + 6) as *const u16);
-    let mut d4 = [0u8; 8];
-    let mut i = 0usize;
-    while i < d4.len() {
-        d4[i] = read_unaligned((guid + 8 + i as u64) as *const u8);
-        i += 1;
-    }
-
+fn guid_parts_to_hosted_ascii(
+    d1: u32,
+    d2: u16,
+    d3: u16,
+    d4: [u8; 8],
+) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
     let mut out = HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty();
     if !out.push_byte(b'{')
         || !push_hex_u32(&mut out, d1, 8)
@@ -5360,7 +5363,7 @@ unsafe fn guid_to_hosted_ascii(guid: u64) -> Option<HostedAscii<HOSTED_DRIVER_KE
     {
         return None;
     }
-    i = 2;
+    let mut i = 2usize;
     while i < d4.len() {
         if !push_hex_u8(&mut out, d4[i]) {
             return None;
@@ -5371,6 +5374,28 @@ unsafe fn guid_to_hosted_ascii(guid: u64) -> Option<HostedAscii<HOSTED_DRIVER_KE
         return None;
     }
     Some(out)
+}
+
+fn guid_words_to_hosted_ascii(
+    words: [u64; 2],
+) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
+    let first = words[0].to_le_bytes();
+    guid_parts_to_hosted_ascii(
+        u32::from_le_bytes(first[..4].try_into().ok()?),
+        u16::from_le_bytes(first[4..6].try_into().ok()?),
+        u16::from_le_bytes(first[6..8].try_into().ok()?),
+        words[1].to_le_bytes(),
+    )
+}
+
+unsafe fn guid_to_hosted_ascii(guid: u64) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
+    if guid == 0 {
+        return None;
+    }
+    guid_words_to_hosted_ascii([
+        read_unaligned(guid as *const u64),
+        read_unaligned((guid + 8) as *const u64),
+    ])
 }
 
 unsafe fn copy_bytes_unchecked(dst: u64, src: u64, len: u64) {
@@ -5571,6 +5596,12 @@ unsafe fn hosted_symbolic_link_operation(op: u64) -> i32 {
         0,
         0,
     );
+    status as u32 as i32
+}
+
+unsafe fn hosted_device_interface_operation(op: u64, pdo: u64, arg2: u64, arg3: u64) -> i32 {
+    let (_label, status, _, _, _) =
+        call_on4((FSD_SERVICE_DEVICE_LABEL << 12) | 4, op, pdo, arg2, arg3);
     status as u32 as i32
 }
 
@@ -6202,12 +6233,6 @@ unsafe fn clear_shared_path_len_at(sh: u64, len_off: u64) {
     write_volatile((sh + len_off) as *mut u16, 0);
 }
 
-unsafe fn clear_shared_device_interface_state_at(sh: u64) {
-    write_volatile((sh + SH_DEVICE_INTERFACE_LINK_LEN) as *mut u16, 0);
-    write_volatile((sh + SH_DEVICE_INTERFACE_TARGET_LEN) as *mut u16, 0);
-    write_volatile((sh + SH_DEVICE_INTERFACE_STATE) as *mut u32, 0);
-}
-
 unsafe fn copy_wstr_to_shared(src: u64, len: u16, len_off: u64, buf_off: u64) {
     let mut off = 0u64;
     while off < len as u64 {
@@ -6218,22 +6243,62 @@ unsafe fn copy_wstr_to_shared(src: u64, len: u16, len_off: u64, buf_off: u64) {
     write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, len);
 }
 
-unsafe fn copy_ascii_to_shared_utf16<const N: usize>(
+unsafe fn clear_hosted_device_interface_arg() {
+    write_volatile(
+        (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *mut u16,
+        0,
+    );
+}
+
+unsafe fn copy_ascii_to_hosted_device_interface_arg<const N: usize>(
     value: &HostedAscii<N>,
-    len_off: u64,
-    buf_off: u64,
 ) -> i32 {
     let len = value.len.saturating_mul(2);
-    if len > SH_CAPTURED_PATH_BYTES {
-        return STATUS_BUFFER_TOO_SMALL;
+    if value.is_empty()
+        || len > HOSTED_INTERFACE_LINK_MAX.saturating_mul(2)
+        || len > u16::MAX as usize
+    {
+        return STATUS_INVALID_PARAMETER;
     }
     let mut i = 0usize;
     while i < value.len {
-        let out = FSD_SHARED_VADDR + buf_off + (i as u64) * 2;
-        write_volatile(out as *mut u16, value.bytes[i] as u16);
+        write_volatile(
+            (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF + (i as u64) * 2)
+                as *mut u16,
+            value.bytes[i] as u16,
+        );
         i += 1;
     }
-    write_volatile((FSD_SHARED_VADDR + len_off) as *mut u16, len as u16);
+    write_volatile(
+        (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *mut u16,
+        len as u16,
+    );
+    STATUS_SUCCESS
+}
+
+unsafe fn copy_unicode_to_hosted_device_interface_arg(unicode_string: u64) -> i32 {
+    let Some((len, _max, buffer)) = unicode_string_triplet(unicode_string) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if len == 0
+        || (len & 1) != 0
+        || len as usize > HOSTED_INTERFACE_LINK_MAX.saturating_mul(2)
+        || buffer == 0
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut offset = 0u64;
+    while offset < len as u64 {
+        write_volatile(
+            (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF + offset) as *mut u8,
+            read_unaligned((buffer + offset) as *const u8),
+        );
+        offset += 1;
+    }
+    write_volatile(
+        (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN) as *mut u16,
+        len,
+    );
     STATUS_SUCCESS
 }
 
@@ -6834,7 +6899,7 @@ fn build_hosted_interface_link(
         return None;
     }
     let mut out = HostedAscii::<HOSTED_INTERFACE_LINK_MAX>::empty();
-    if !out.push_str("\\??\\") || !out.push_str(guid.as_str()) || !out.push_byte(b'#') {
+    if !out.push_str("\\??\\") {
         return None;
     }
     let mut i = 0usize;
@@ -6849,12 +6914,53 @@ fn build_hosted_interface_link(
         }
         i += 1;
     }
-    if !reference.is_empty() {
-        if !out.push_byte(b'#') || !out.push_str(reference.as_str()) {
-            return None;
-        }
+    if !out.push_byte(b'#') || !out.push_ascii(guid) {
+        return None;
+    }
+    if !reference.is_empty()
+        && (!out.push_byte(b'\\') || !out.push_ascii(reference))
+    {
+        return None;
     }
     Some(out)
+}
+
+fn parse_hosted_interface_reference(
+    symbolic_link: &HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
+    guid: &HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
+    instance_path: &HostedAscii<HOSTED_INSTANCE_PATH_MAX>,
+) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
+    let base = build_hosted_interface_link(
+        guid,
+        instance_path,
+        &HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty(),
+    )?;
+    if symbolic_link.len < base.len {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < base.len {
+        if ascii_upcase_u8(symbolic_link.bytes[i]) != ascii_upcase_u8(base.bytes[i]) {
+            return None;
+        }
+        i += 1;
+    }
+    if symbolic_link.len == base.len {
+        return Some(HostedAscii::empty());
+    }
+    if symbolic_link.bytes[base.len] != b'\\' {
+        return None;
+    }
+    let mut reference = HostedAscii::<HOSTED_DRIVER_KEY_NAME_MAX>::empty();
+    i = base.len + 1;
+    while i < symbolic_link.len {
+        let byte = symbolic_link.bytes[i];
+        if byte == b'\\' || byte == b'/' || !reference.push_byte(byte) {
+            return None;
+        }
+        i += 1;
+    }
+    (!reference.is_empty()).then_some(reference)
 }
 
 unsafe fn hosted_device_interface_registrations_mut(
@@ -6866,48 +6972,86 @@ unsafe fn hosted_device_interface_registrations_mut(
     slot.as_mut().unwrap()
 }
 
-unsafe fn upsert_hosted_device_interface(
+unsafe fn hosted_interface_instance_path(
+    owner_domain: HostedDomainIdentity,
+    pdo_device_id: u64,
+    pdo_object: u64,
+    sh: u64,
+) -> Option<HostedAscii<HOSTED_INSTANCE_PATH_MAX>> {
+    if let Some(binding) = hosted_device_bindings().and_then(|bindings| {
+        bindings.iter().copied().find(|binding| {
+            binding.used
+                && binding.projection_domain == owner_domain
+                && binding.pdo_device_id == pdo_device_id
+                && binding.pdo_object == pdo_object
+        })
+    }) {
+        return hosted_registry_identity(binding.registry_identity_id)
+            .map(|identity| identity.instance_path);
+    }
+    let inflight_pdo = read_volatile((sh + SH_REQ_FILEID) as *const u64);
+    if inflight_pdo == pdo_object {
+        shared_registry_identity_at(sh).map(|identity| identity.instance_path)
+    } else {
+        None
+    }
+}
+
+unsafe fn register_hosted_device_interface(
+    owner_domain: HostedDomainIdentity,
+    pdo_device_id: u64,
+    class_guid: [u64; 2],
+    reference: HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>,
     symbolic_link: HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
-    target: HostedAscii<HOSTED_EXPORT_NAME_MAX>,
 ) -> Result<(), nt_status::NtStatus> {
+    if owner_domain.domain_id.raw() == 0 || owner_domain.cookie == 0 || pdo_device_id == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
     let table = hosted_device_interface_registrations_mut();
     for slot in table.iter_mut() {
-        if slot.used && hosted_ascii_eq_ignore_case(&slot.symbolic_link, &symbolic_link) {
-            slot.target = target;
-            return Ok(());
+        if !slot.used {
+            continue;
+        }
+        let exact_key = slot.owner_domain == owner_domain
+            && slot.pdo_device_id == pdo_device_id
+            && slot.class_guid == class_guid
+            && hosted_ascii_eq_ignore_case(&slot.reference, &reference);
+        let exact_link = hosted_ascii_eq_ignore_case(&slot.symbolic_link, &symbolic_link);
+        if exact_key || exact_link {
+            return if exact_key && exact_link {
+                Ok(())
+            } else {
+                Err(nt_status::NtStatus::OBJECT_NAME_COLLISION)
+            };
         }
     }
     for slot in table.iter_mut() {
         if !slot.used {
             *slot = HostedDeviceInterfaceRegistration {
+                owner_domain,
+                pdo_device_id,
+                class_guid,
+                reference,
                 symbolic_link,
-                target,
                 enabled: false,
                 used: true,
             };
             return Ok(());
         }
     }
+    table
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     table.push(HostedDeviceInterfaceRegistration {
+        owner_domain,
+        pdo_device_id,
+        class_guid,
+        reference,
         symbolic_link,
-        target,
         enabled: false,
         used: true,
     });
     Ok(())
-}
-
-unsafe fn clear_hosted_device_interface<const N: usize>(symbolic_link: &HostedAscii<N>) {
-    let Some(table) = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_INTERFACE_REGISTRATIONS)).as_mut()
-    else {
-        return;
-    };
-    for slot in table.iter_mut() {
-        if slot.used && hosted_ascii_eq_ignore_case(&slot.symbolic_link, symbolic_link) {
-            *slot = EMPTY_HOSTED_DEVICE_INTERFACE_REGISTRATION;
-            return;
-        }
-    }
 }
 
 /// `NTSTATUS IoRegisterDeviceInterface(...)`.
@@ -6954,79 +7098,59 @@ extern "win64" fn s_io_register_device_interface(
             };
             reference
         };
+        if reference
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte == b'\\' || *byte == b'/')
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
         let Some(symbolic_link) =
             build_hosted_interface_link(&guid, &identity.instance_path, &reference)
         else {
             return STATUS_INVALID_PARAMETER;
         };
-        let target = identity.export_name;
-        if target.is_empty() {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        if let Err(status) = upsert_hosted_device_interface(symbolic_link, target) {
-            return status.raw();
-        }
         let status = write_allocated_unicode_string_from_ascii(symbolic_link_name, &symbolic_link);
         if status < 0 {
-            clear_hosted_device_interface(&symbolic_link);
+            return status;
         }
-        status
+        let _reply_guard = component_device_reply_lock();
+        clear_hosted_device_interface_arg();
+        let capture_status = copy_ascii_to_hosted_device_interface_arg(&symbolic_link);
+        if capture_status < 0 {
+            s_rtl_free_unicode_string(symbolic_link_name);
+            return capture_status;
+        }
+        let broker_status = hosted_device_interface_operation(
+            HOSTED_DEVICE_OP_REGISTER_INTERFACE,
+            pdo,
+            read_unaligned(class_guid as *const u64),
+            read_unaligned((class_guid + 8) as *const u64),
+        );
+        clear_hosted_device_interface_arg();
+        if broker_status < 0 {
+            s_rtl_free_unicode_string(symbolic_link_name);
+        }
+        broker_status
     }
 }
 
 extern "win64" fn s_io_set_device_interface_state(symbolic_link_name: u64, enable: u8) -> i32 {
     unsafe {
-        clear_shared_device_interface_state_at(FSD_SHARED_VADDR);
-        let Some((link_buf, link_len)) = unicode_string_parts(symbolic_link_name) else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let Some(symbolic_link) =
-            unicode_string_to_hosted_ascii::<HOSTED_INTERFACE_LINK_MAX>(symbolic_link_name, false)
-        else {
-            return STATUS_INVALID_PARAMETER;
-        };
-        let Some(table) =
-            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_INTERFACE_REGISTRATIONS)).as_mut()
-        else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        let Some(slot) = table.iter_mut().find(|slot| {
-            slot.used && hosted_ascii_eq_ignore_case(&slot.symbolic_link, &symbolic_link)
-        }) else {
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        };
-        if (enable != 0) == slot.enabled {
-            return STATUS_SUCCESS;
+        let _reply_guard = component_device_reply_lock();
+        clear_hosted_device_interface_arg();
+        let capture_status = copy_unicode_to_hosted_device_interface_arg(symbolic_link_name);
+        if capture_status < 0 {
+            return capture_status;
         }
-        copy_wstr_to_shared(
-            link_buf,
-            link_len,
-            SH_DEVICE_INTERFACE_LINK_LEN,
-            SH_DEVICE_INTERFACE_LINK_BUF,
+        let status = hosted_device_interface_operation(
+            HOSTED_DEVICE_OP_SET_INTERFACE_STATE,
+            0,
+            (enable != 0) as u64,
+            0,
         );
-        if enable != 0 {
-            let status = copy_ascii_to_shared_utf16(
-                &slot.target,
-                SH_DEVICE_INTERFACE_TARGET_LEN,
-                SH_DEVICE_INTERFACE_TARGET_BUF,
-            );
-            if status < 0 {
-                clear_shared_device_interface_state_at(FSD_SHARED_VADDR);
-                return status;
-            }
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DEVICE_INTERFACE_STATE) as *mut u32,
-                1,
-            );
-            slot.enabled = true;
-        } else {
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DEVICE_INTERFACE_STATE) as *mut u32,
-                0,
-            );
-            slot.enabled = false;
-        }
-        STATUS_SUCCESS
+        clear_hosted_device_interface_arg();
+        status
     }
 }
 
@@ -33965,7 +34089,6 @@ unsafe fn load_driver_reserved(
         PASSIVE_LEVEL,
     );
     clear_dma_allocation_records(win.shared_va);
-    clear_shared_device_interface_state_at(win.shared_va);
     clear_shared_registry_identity_at(win.shared_va);
     let (exec_thunk_va, run_thunk_va, thunk_len, thunk_next) =
         if planned_images.executable_thunk_frames == 0 {
@@ -38374,33 +38497,137 @@ fn validate_hosted_driver_device_projections(
     Ok(device_count)
 }
 
-unsafe fn apply_hosted_device_interface_state(sh: u64) -> Result<(), nt_status::NtStatus> {
-    let (link_len, link_utf16) = read_shared_path_capture(
-        sh,
-        SH_DEVICE_INTERFACE_LINK_LEN,
-        SH_DEVICE_INTERFACE_LINK_BUF,
-    );
-    if link_len == 0 {
+unsafe fn shared_path_ascii_at<const N: usize>(
+    sh: u64,
+    len_offset: u64,
+    buffer_offset: u64,
+) -> Option<HostedAscii<N>> {
+    let len = read_volatile((sh + len_offset) as *const u16) as usize;
+    if len == 0 || len > N.saturating_mul(2) || (len & 1) != 0 {
+        return None;
+    }
+    let mut path = HostedAscii::<N>::empty();
+    let mut offset = 0usize;
+    while offset < len {
+        let low = read_volatile((sh + buffer_offset + offset as u64) as *const u8);
+        let high = read_volatile((sh + buffer_offset + offset as u64 + 1) as *const u8);
+        if high != 0 || low == 0 || low > 0x7f || !path.push_byte(low) {
+            return None;
+        }
+        offset += 2;
+    }
+    Some(path)
+}
+
+fn hosted_device_interface_target(
+    pdo_device_id: u64,
+) -> Result<NtPath, nt_status::NtStatus> {
+    let mut current = io_manager_mut()
+        .top_of_device_stack(nt_io_manager::DeviceId(pdo_device_id))?;
+    let limit = io_manager_mut().device_count().saturating_add(1);
+    let mut depth = 0usize;
+    while depth < limit {
+        let (name, lower, delete_pending) = {
+            let device = io_manager_mut()
+                .device(current)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            (device.name.clone(), device.attached_to, device.delete_pending)
+        };
+        if delete_pending {
+            return Err(nt_status::NtStatus::DELETE_PENDING);
+        }
+        if let Some(name) = name {
+            return Ok(name);
+        }
+        let Some(next) = lower else {
+            return Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND);
+        };
+        current = next;
+        depth += 1;
+    }
+    Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+}
+
+unsafe fn set_hosted_device_interface_state(
+    owner_domain: HostedDomainIdentity,
+    symbolic_link: HostedAscii<HOSTED_INTERFACE_LINK_MAX>,
+    enable: bool,
+) -> Result<(), nt_status::NtStatus> {
+    let (index, registration) = hosted_device_interface_registrations_mut()
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, registration)| {
+            registration.used
+                && registration.owner_domain == owner_domain
+                && hosted_ascii_eq_ignore_case(&registration.symbolic_link, &symbolic_link)
+        })
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if io_manager_mut()
+        .hosted_device_address_by_identity(
+            registration.owner_domain,
+            nt_io_manager::DeviceId(registration.pdo_device_id),
+        )
+        .is_none()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if registration.enabled == enable {
         return Ok(());
     }
-    let link =
-        captured_nt_path(&link_utf16, link_len).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let state = read_volatile((sh + SH_DEVICE_INTERFACE_STATE) as *const u32);
-    if state == 0 {
-        match io_manager_mut().delete_symbolic_link(&link) {
-            Ok(()) | Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND) => Ok(()),
-            Err(status) => Err(status),
-        }
+    let link = parse_nt_path(symbolic_link.as_str())
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if enable {
+        let target = hosted_device_interface_target(registration.pdo_device_id)?;
+        io_manager_mut().create_symbolic_link(&link, &target)?;
     } else {
-        let (target_len, target_utf16) = read_shared_path_capture(
-            sh,
-            SH_DEVICE_INTERFACE_TARGET_LEN,
-            SH_DEVICE_INTERFACE_TARGET_BUF,
-        );
-        let target = captured_nt_path(&target_utf16, target_len)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-        io_manager_mut().create_symbolic_link(&link, &target)
+        io_manager_mut().delete_symbolic_link(&link)?;
     }
+    let slot = hosted_device_interface_registrations_mut()
+        .get_mut(index)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !slot.used
+        || slot.owner_domain != registration.owner_domain
+        || slot.pdo_device_id != registration.pdo_device_id
+        || slot.class_guid != registration.class_guid
+        || !hosted_ascii_eq_ignore_case(&slot.reference, &registration.reference)
+        || !hosted_ascii_eq_ignore_case(&slot.symbolic_link, &registration.symbolic_link)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    slot.enabled = enable;
+    Ok(())
+}
+
+unsafe fn clear_hosted_device_interfaces(
+    domain: HostedDomainIdentity,
+    pdo_device_id: Option<u64>,
+) -> u64 {
+    let mut failures = 0u64;
+    for registration in hosted_device_interface_registrations_mut().iter_mut() {
+        if !registration.used
+            || registration.owner_domain != domain
+            || pdo_device_id.is_some_and(|device_id| registration.pdo_device_id != device_id)
+        {
+            continue;
+        }
+        let namespace_released = if registration.enabled {
+            parse_nt_path(registration.symbolic_link.as_str()).is_some_and(|link| {
+                matches!(
+                    io_manager_mut().delete_symbolic_link(&link),
+                    Ok(()) | Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)
+                )
+            })
+        } else {
+            true
+        };
+        if namespace_released {
+            *registration = EMPTY_HOSTED_DEVICE_INTERFACE_REGISTRATION;
+        } else {
+            failures += 1;
+        }
+    }
+    failures
 }
 
 #[derive(Clone, Copy)]
@@ -38995,7 +39222,6 @@ struct HostedPnpTransaction {
     mmio_usage_published: bool,
     interrupt_usage_published: bool,
     dma_usage_published: bool,
-    interface_state_published: bool,
     resource_snapshot_published: bool,
     power_state_published: bool,
 }
@@ -39790,7 +40016,6 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
     let mmio_usage_published = transaction.mmio_usage_published;
     let interrupt_usage_published = transaction.interrupt_usage_published;
     let dma_usage_published = transaction.dma_usage_published;
-    let interface_state_published = transaction.interface_state_published;
     let resource_snapshot_published = transaction.resource_snapshot_published;
     let sh = instance_by_driver_id(binding.driver_id)
         .map(|(_, instance)| instance.exec_shared_va)
@@ -39834,16 +40059,6 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
             .find(|transaction| transaction.irp_id == irp_id)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
             .dma_usage_published = true;
-    }
-    if !interface_state_published {
-        if terminal_status.is_success() {
-            apply_hosted_device_interface_state(sh)?;
-        }
-        hosted_pnp_transactions_mut()
-            .iter_mut()
-            .find(|transaction| transaction.irp_id == irp_id)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
-            .interface_state_published = true;
     }
     if !resource_snapshot_published {
         refresh_hosted_device_resource_state(binding, sh);
@@ -40013,7 +40228,6 @@ unsafe fn clear_hosted_resource_projection(
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
     clear_shared_io_port_evidence_at(sh);
     write_volatile((sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64, 0);
-    clear_shared_device_interface_state_at(sh);
     clear_dpc_queue_projection(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
@@ -40222,8 +40436,94 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_DELETE
             | HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK
             | HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
+            | HOSTED_DEVICE_OP_REGISTER_INTERFACE
+            | HOSTED_DEVICE_OP_SET_INTERFACE_STATE
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_REGISTER_INTERFACE {
+        let (_, inst, pdo_device_id) =
+            match authenticated_hosted_pdo(ch, pdo_object, active_reply_cap) {
+                Ok(resolved) => resolved,
+                Err(status) => return (status.raw(), 0, 0, 0),
+            };
+        let owner_domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        if inst.exec_arg_va == 0 {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        }
+        let Some(symbolic_link) = (unsafe {
+            shared_path_ascii_at::<HOSTED_INTERFACE_LINK_MAX>(
+                inst.exec_arg_va,
+                HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
+                HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
+            )
+        }) else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        if parse_nt_path(symbolic_link.as_str()).is_none() {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        }
+        let class_guid = [arg2, arg3];
+        let Some(guid) = guid_words_to_hosted_ascii(class_guid) else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        let Some(instance_path) = (unsafe {
+            hosted_interface_instance_path(
+                owner_domain,
+                pdo_device_id.raw(),
+                pdo_object,
+                ch.shared_va,
+            )
+        }) else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        };
+        let Some(reference) =
+            parse_hosted_interface_reference(&symbolic_link, &guid, &instance_path)
+        else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        return match unsafe {
+            register_hosted_device_interface(
+                owner_domain,
+                pdo_device_id.raw(),
+                class_guid,
+                reference,
+                symbolic_link,
+            )
+        } {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
+    }
+    if op == HOSTED_DEVICE_OP_SET_INTERFACE_STATE {
+        let Some((_, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        };
+        let owner_domain = HostedDomainIdentity {
+            domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
+            cookie: inst.hosted_domain_cookie,
+        };
+        if inst.exec_arg_va == 0 {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
+        }
+        let Some(symbolic_link) = (unsafe {
+            shared_path_ascii_at::<HOSTED_INTERFACE_LINK_MAX>(
+                inst.exec_arg_va,
+                HOSTED_DEVICE_INTERFACE_ARG_LINK_LEN,
+                HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF,
+            )
+        }) else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        return match unsafe {
+            set_hosted_device_interface_state(owner_domain, symbolic_link, arg2 != 0)
+        } {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
     }
     if op == HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK
         || op == HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
@@ -41692,31 +41992,6 @@ unsafe fn restore_hosted_device_resource_state(
     Ok(state)
 }
 
-unsafe fn copy_provider_dispatch_side_effects(dst_sh: u64, src_sh: u64) {
-    write_volatile(
-        (dst_sh + SH_DEVICE_INTERFACE_LINK_LEN) as *mut u16,
-        read_volatile((src_sh + SH_DEVICE_INTERFACE_LINK_LEN) as *const u16),
-    );
-    write_volatile(
-        (dst_sh + SH_DEVICE_INTERFACE_TARGET_LEN) as *mut u16,
-        read_volatile((src_sh + SH_DEVICE_INTERFACE_TARGET_LEN) as *const u16),
-    );
-    write_volatile(
-        (dst_sh + SH_DEVICE_INTERFACE_STATE) as *mut u32,
-        read_volatile((src_sh + SH_DEVICE_INTERFACE_STATE) as *const u32),
-    );
-    copy_bytes(
-        dst_sh + SH_DEVICE_INTERFACE_LINK_BUF,
-        src_sh + SH_DEVICE_INTERFACE_LINK_BUF,
-        SH_CAPTURED_PATH_BYTES as u64,
-    );
-    copy_bytes(
-        dst_sh + SH_DEVICE_INTERFACE_TARGET_BUF,
-        src_sh + SH_DEVICE_INTERFACE_TARGET_BUF,
-        SH_CAPTURED_PATH_BYTES as u64,
-    );
-}
-
 unsafe fn project_provider_device_dispatch_state(
     binding: HostedDeviceBinding,
     dependent_sh: u64,
@@ -41732,8 +42007,6 @@ unsafe fn project_provider_device_dispatch_state(
     write_hosted_resource_state_projection(provider_sh, state, false);
     ensure_dpc_queue_projection(provider_sh);
     copy_provider_dma_allocation_records(provider_sh, dependent_sh);
-    copy_provider_dispatch_side_effects(provider_sh, dependent_sh);
-    clear_shared_device_interface_state_at(provider_sh);
     Ok(())
 }
 
@@ -41746,7 +42019,6 @@ unsafe fn import_provider_device_dispatch_state(
     write_hosted_resource_state_projection(dependent_sh, state, false);
     copy_provider_mmio_mapping_state(dependent_sh, provider_sh);
     copy_provider_dma_allocation_records(dependent_sh, provider_sh);
-    copy_provider_dispatch_side_effects(dependent_sh, provider_sh);
 }
 
 fn io_port_in_range(port: u16, base: u64, len: u64) -> bool {
@@ -43526,6 +43798,17 @@ unsafe fn drain_hosted_device_retirements() -> usize {
             index += 1;
             continue;
         }
+        let interface_failures = clear_hosted_device_interfaces(
+            retirement.domain,
+            Some(retirement.device_id.raw()),
+        );
+        if interface_failures != 0 {
+            hosted_device_retirements_mut()[index].barrier_status =
+                Some(nt_status::NtStatus::DEVICE_BUSY);
+            progress = progress.saturating_add(1);
+            index += 1;
+            continue;
+        }
         if io_manager_mut().device(retirement.device_id).is_some() {
             match io_manager_mut().destroy_device(retirement.device_id) {
                 Ok(_) => progress = progress.saturating_add(1),
@@ -44740,6 +45023,17 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if let Some(domain) = retiring_domain {
         unsafe {
             hosted_device_property_transfers_mut().remove_domain(domain);
+        }
+    }
+    if let Some(domain) = retiring_domain {
+        let failures = unsafe { clear_hosted_device_interfaces(domain, None) };
+        if failures != 0 {
+            teardown_blocked = true;
+            print_str(b"[driver-launch] device interface release failed inst=");
+            print_u64(i as u64);
+            print_str(b" failures=");
+            print_u64(failures);
+            print_str(b"\n");
         }
     }
     clear_hosted_driver_waits_for_instance(i);
@@ -46536,7 +46830,6 @@ unsafe fn dispatch_provider_add_device_for_instance(
     write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
     write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
     clear_shared_path_len_at(sh, SH_DEVICE_NAME_LEN);
-    clear_shared_device_interface_state_at(sh);
 
     let ch = crate::spawn_hosts::PumpChannel {
         fault_ep: provider_inst.fault_ep,
@@ -48557,7 +48850,6 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     if raw_resource_list.is_empty() {
         restore_hosted_device_resource_state(binding, sh, false).map_err(local_failure)?;
     }
-    clear_shared_device_interface_state_at(sh);
 
     let raw_len = u32::try_from(raw_resource_list.len())
         .map_err(|_| local_failure(nt_status::NtStatus::INVALID_PARAMETER))?;
@@ -48614,7 +48906,6 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         mmio_usage_published: false,
         interrupt_usage_published: false,
         dma_usage_published: false,
-        interface_state_published: false,
         resource_snapshot_published: false,
         power_state_published: false,
     };

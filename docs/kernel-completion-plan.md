@@ -18980,3 +18980,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     generation-protected registration keyed by canonical PDO, class GUID, and reference string.
     Enable/disable must resolve the current top of the PDO stack dynamically rather than store a
     string target. Remove the shared device-interface capture once that exact lifecycle is green.
+
+    B3 canonical device-interface lifecycle checkpoint (2026-08-31, implementation green):
+    `IoRegisterDeviceInterface` and `IoSetDeviceInterfaceState` now cross the authenticated hosted
+    device broker synchronously. The executive owns each registration by hosted-domain generation,
+    canonical PDO `DeviceId`, raw 128-bit interface-class GUID, and validated reference string. The
+    component retains no authoritative interface table and START completion no longer replays
+    captured interface side effects between dependent/provider shared frames.
+
+    Interface names now follow the NT5 layout used by ReactOS:
+    `\\??\\<instance-path-with-#>#{GUID}\\ReferenceString`. Reference strings containing path
+    separators are rejected. Registration sends the raw GUID words separately from the transient
+    link capture; the broker reconstructs the expected prefix from the exact canonical PDO registry
+    identity, extracts the reference, and rejects any path that does not match that tuple. Duplicate
+    keys are idempotent only when the complete link agrees, while cross-owner or cross-key link
+    collisions fail closed.
+
+    Enabling an interface resolves the current top of the canonical PDO attachment stack and walks
+    down to the first live named device at the actual call site. No Linkage export string or
+    last-created device name is stored as a target. Namespace creation/deletion completes before the
+    hosted call returns, and the enabled bit is committed only after the I/O Manager operation
+    succeeds. Exact PDO retirement removes its enabled interfaces before device destruction; driver
+    teardown removes every registration owned by that hosted-domain generation before unregistering
+    the domain. Failed namespace retirement becomes a teardown barrier rather than leaving an
+    unauthenticated stale link.
+
+    The shared link/target length and buffers, deferred interface-state cell, PnP transaction
+    publication flag, START-time namespace mutation, and provider-frame side-effect copying are
+    deleted. Synchronous link payloads use the existing locked argument bank and are cleared before
+    releasing it; they are not persistent component state. Formatting, `git diff --check`, focused
+    `nt-io-manager` validation (`238/238`), focused `nt-pnp-manager` validation (`46/46`), and the
+    freestanding executive check pass at the unchanged 209-warning baseline. The pre-existing
+    `-no-shutdown` QEMU still owns the single boot lane, so this slice has not started a competing
+    desktop proof.
+
+    Review adjustment: the static interface target/capture debt is closed. Continue B3 with the
+    multi-device lifecycle mirror: drive canonical QUERY_STOP/STOP/CANCEL_STOP and
+    QUERY_REMOVE/SURPRISE_REMOVE/REMOVE transactions across independently bound sibling devices,
+    release/re-arbitrate exact resource grants, retire per-device provider mirrors/timers/work
+    items, and unload a driver only after all of its device stacks and callback owners quiesce. Remove
+    any obsolete atomic START/REMOVE machinery encountered rather than retaining a fallback path.
