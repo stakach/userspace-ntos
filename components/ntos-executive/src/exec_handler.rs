@@ -7301,25 +7301,39 @@ impl ExecNtHandler {
             self.registry_user_root_security_descriptor = Some(descriptor.to_vec());
             return Ok(());
         }
+        // An explicit overlay handle retains overlay identity. A native CM lease likewise retains
+        // CM identity even if an overlay for the same path appears after the handle was opened.
+        if let Some(index) = overlay_key_idx(target) {
+            if self.overlay.set_key_security_descriptor(index, descriptor) {
+                return Ok(());
+            }
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        if let Some(path) = self
+            .cm_system_key_target(target)
+            .map(|target| target.physical_path.clone())
+        {
+            self.persist_and_publish_system_mutations(
+                &[OwnedSystemHiveMutation::SetKeySecurity {
+                    path,
+                    descriptor: descriptor.to_vec(),
+                }],
+                SystemHiveMutationOrigin::Runtime,
+            )?;
+            self.note_mutable_hives_changed();
+            return Ok(());
+        }
         if let Some(index) = self.registry_overlay_index(target) {
             if self.overlay.set_key_security_descriptor(index, descriptor) {
                 return Ok(());
             }
-            return Err(0xC000_0008);
+            return Err(STATUS_INVALID_HANDLE);
         }
         if let Some(key) = self.mutable_registry_key(target) {
             if key.hive == HIVE_SEL_SYSTEM {
-                let path = self.mutable_key_path(key).ok_or(STATUS_INVALID_HANDLE)?;
-                self.persist_and_publish_system_mutations(
-                    &[OwnedSystemHiveMutation::SetKeySecurity {
-                        path,
-                        descriptor: descriptor.to_vec(),
-                    }],
-                    SystemHiveMutationOrigin::Runtime,
-                )?;
-            } else {
-                self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
+                return Err(STATUS_INVALID_HANDLE);
             }
+            self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
             self.note_mutable_hives_changed();
             return Ok(());
         }
@@ -7687,10 +7701,13 @@ impl ExecNtHandler {
         mut visit: impl FnMut(u32, &[u8]) -> R,
     ) -> Result<Option<R>, u32> {
         if let Some(target) = self.cm_system_key_target(target) {
-            let value =
-                unsafe { crate::config_manager_query_leased_system_hive_value(target.lease, name) }
-                    .map_err(|status| status as u32)?;
-            return Ok(Some(visit(value.value_type, &value.data)));
+            return match unsafe {
+                crate::config_manager_query_leased_system_hive_value(target.lease, name)
+            } {
+                Ok(value) => Ok(Some(visit(value.value_type, &value.data))),
+                Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => Ok(None),
+                Err(status) => Err(status as u32),
+            };
         }
         let result = (|| -> Option<R> {
             if let Some(index) = self.registry_overlay_index(target) {
@@ -7748,37 +7765,10 @@ impl ExecNtHandler {
         name: &str,
         value_type: u32,
         data: &[u8],
-    ) -> Option<bool> {
-        if let Some(index) = self.registry_overlay_index(target) {
-            if self.overlay.value_is_deleted(index, name) {
-                return None;
-            }
-            if let Some((ty, existing)) = self.overlay.value(index, name) {
-                return Some(ty == value_type && existing == data);
-            }
-            let path = self.overlay.path(index)?;
-            if let Some(key) = self.mutable_registry_key_by_path(path) {
-                let (ty, existing) = self.mutable_hives.query_value(key, name)?;
-                return Some(ty as u32 == value_type && existing == data);
-            }
-            if self.mutable_hive_owns_path(path) {
-                return None;
-            }
-            let key = self.resolve_key(path)?;
-            let (hive, cell) = self.base_hive(key)?;
-            return hive.value_matches(cell, name, value_type, data);
-        }
-        if let Some(key) = self.mutable_registry_key(target) {
-            let (ty, existing) = self.mutable_hives.query_value(key, name)?;
-            return Some(ty as u32 == value_type && existing == data);
-        }
-        if let Some(path) = self.registry_target_path(target) {
-            if self.mutable_hive_owns_path(&path) {
-                return None;
-            }
-        }
-        let (hive, cell) = self.base_hive(target)?;
-        hive.value_matches(cell, name, value_type, data)
+    ) -> Result<Option<bool>, u32> {
+        self.registry_value_with_result(target, name, |existing_type, existing| {
+            existing_type == value_type && existing == data
+        })
     }
 
     unsafe fn read_user_data_vec(
@@ -32694,8 +32684,9 @@ impl ExecNtHandler {
                 0 // STATUS_SUCCESS
             },
             // NtSetValueKey captured args: KeyHandle=args[0], *ValueName=args[1],
-            // TitleIndex=args[2], Type=args[3], Data=args[4], DataSize=args[5]. Mounted-hive keys
-            // write into `MutableHiveSet`; overlay handles keep using the volatile overlay.
+            // TitleIndex=args[2], Type=args[3], Data=args[4], DataSize=args[5]. CM leases own
+            // SYSTEM mutations, other mounted hives write through `MutableHiveSet`, and explicit
+            // overlay handles retain overlay identity.
             NativeService::NtSetValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x2) {
                     Ok(key) => key,
@@ -32740,11 +32731,20 @@ impl ExecNtHandler {
 
                 let mut shadow_path_scratch = [0u8; 2048];
                 let mut shadow_path_len = 0usize;
+                let cm_lease = self.cm_system_key_target(key).map(|target| target.lease);
                 let existing_overlay = if let Some(index) = overlay_key_idx(key) {
                     if self.overlay.path(index).is_none() {
                         return 0xC000_0008;
                     }
                     Some(index)
+                } else if let Some(target) = self.cm_system_key_target(key) {
+                    shadow_path_len = target.physical_path.len();
+                    if shadow_path_len > shadow_path_scratch.len() {
+                        return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
+                    }
+                    shadow_path_scratch[..shadow_path_len]
+                        .copy_from_slice(target.physical_path.as_bytes());
+                    None
                 } else {
                     let path = match self.registry_target_path(key) {
                         Some(path) => path,
@@ -32783,28 +32783,38 @@ impl ExecNtHandler {
                     core::str::from_utf8(&key_path_trace_scratch[..key_path_trace_len])
                         .unwrap_or("")
                 });
-                let mutable_target = if overlay_key_idx(key).is_none() && existing_overlay.is_none()
+                let mutable_target = if cm_lease.is_none()
+                    && overlay_key_idx(key).is_none()
+                    && existing_overlay.is_none()
                 {
                     self.mutable_registry_key(key)
                 } else {
                     None
                 };
                 let existing_matches = if let Some(data_view) = data_view {
-                    self.registry_value_matches(key, &name, ty, data_view) == Some(true)
-                } else if let Some(mutable_key) = mutable_target {
-                    self.mutable_hives
-                        .query_value(mutable_key, &name)
-                        .is_some_and(|(existing_ty, existing_data)| {
-                            existing_ty as u32 == ty
+                    match self.registry_value_matches(key, &name, ty, data_view) {
+                        Ok(Some(matches)) => matches,
+                        Ok(None) => false,
+                        Err(status) => return status,
+                    }
+                } else {
+                    match self.registry_value_with_result(
+                        key,
+                        &name,
+                        |existing_ty, existing_data| {
+                            existing_ty == ty
                                 && existing_data.len() == data_size
                                 && self.user_data_equals(
                                     data_ptr,
                                     existing_data,
                                     REG_VALUE_SCRATCH_CAP,
                                 )
-                        })
-                } else {
-                    false
+                        },
+                    ) {
+                        Ok(Some(matches)) => matches,
+                        Ok(None) => false,
+                        Err(status) => return status,
+                    }
                 };
                 if existing_matches {
                     bump_progress();
@@ -32861,39 +32871,46 @@ impl ExecNtHandler {
                     Ok(name) => name,
                     Err(_) => return 0xC000_0033,
                 };
-                if let Some(mutable_key) = mutable_target {
+                if cm_lease.is_some() {
                     let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
                         return 0xC000_000D;
                     };
-                    if mutable_key.hive == HIVE_SEL_SYSTEM {
-                        let value_data = match data_view {
-                            Some(data) => data.to_vec(),
-                            None => match self.read_user_data_vec(
-                                data_ptr,
-                                data_size,
-                                REG_VALUE_SCRATCH_CAP,
-                            ) {
-                                Ok(data) => data,
-                                Err(status) => return status,
-                            },
-                        };
-                        let Some(path) = self.mutable_key_path(mutable_key) else {
-                            return STATUS_INVALID_HANDLE;
-                        };
-                        if let Err(status) = self.persist_and_publish_system_mutations(
-                            &[OwnedSystemHiveMutation::SetValue {
-                                path,
-                                name: durable_name.into(),
-                                value_type,
-                                data: value_data,
-                            }],
-                            SystemHiveMutationOrigin::Runtime,
+                    let value_data = match data_view {
+                        Some(data) => data.to_vec(),
+                        None => match self.read_user_data_vec(
+                            data_ptr,
+                            data_size,
+                            REG_VALUE_SCRATCH_CAP,
                         ) {
-                            return status;
-                        }
-                        self.note_mutable_hives_changed();
-                        return 0;
+                            Ok(data) => data,
+                            Err(status) => return status,
+                        },
+                    };
+                    let path = match core::str::from_utf8(&shadow_path_scratch[..shadow_path_len]) {
+                        Ok(path) => alloc::string::String::from(path),
+                        Err(_) => return 0xC000_003B,
+                    };
+                    if let Err(status) = self.persist_and_publish_system_mutations(
+                        &[OwnedSystemHiveMutation::SetValue {
+                            path,
+                            name: durable_name.into(),
+                            value_type,
+                            data: value_data,
+                        }],
+                        SystemHiveMutationOrigin::Runtime,
+                    ) {
+                        return status;
                     }
+                    self.note_mutable_hives_changed();
+                    return 0;
+                }
+                if let Some(mutable_key) = mutable_target {
+                    if mutable_key.hive == HIVE_SEL_SYSTEM {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    let Some(value_type) = nt_hive_core::RegistryValueType::from_u32(ty) else {
+                        return 0xC000_000D;
+                    };
                     let copy_source =
                         self.registry_value_copy_source_for_user_data(data_ptr, data_size, ty);
                     if let Some(source) = copy_source {
@@ -33067,6 +33084,28 @@ impl ExecNtHandler {
                 if key == MACHINE_ROOT_KEY || key == USER_ROOT_KEY {
                     return STATUS_CANNOT_DELETE;
                 }
+                if let Some((lease, path)) = self
+                    .cm_system_key_target(key)
+                    .map(|target| (target.lease, target.physical_path.clone()))
+                {
+                    let information = match unsafe {
+                        crate::config_manager_query_leased_system_hive_key_information(lease)
+                    } {
+                        Ok(information) => information,
+                        Err(status) => return status as u32,
+                    };
+                    if information.subkey_count != 0 {
+                        return STATUS_CANNOT_DELETE;
+                    }
+                    if let Err(status) = self.persist_and_publish_system_mutations(
+                        &[OwnedSystemHiveMutation::DeleteKey { path }],
+                        SystemHiveMutationOrigin::Runtime,
+                    ) {
+                        return status;
+                    }
+                    self.note_mutable_hives_changed();
+                    return 0;
+                }
                 if self.registry_key_stats(key).subkeys != 0 {
                     return STATUS_CANNOT_DELETE;
                 }
@@ -33083,18 +33122,10 @@ impl ExecNtHandler {
                 }
                 let key_path = self.registry_target_path(key);
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
-                    let mutation_status = if mutable_key.hive == HIVE_SEL_SYSTEM {
-                        let Some(path) = key_path.clone() else {
-                            return STATUS_INVALID_HANDLE;
-                        };
-                        self.persist_and_publish_system_mutations(
-                            &[OwnedSystemHiveMutation::DeleteKey { path }],
-                            SystemHiveMutationOrigin::Runtime,
-                        )
-                        .map(|_| ())
-                    } else {
-                        self.journal_delete_mutable_key(mutable_key)
-                    };
+                    if mutable_key.hive == HIVE_SEL_SYSTEM {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    let mutation_status = self.journal_delete_mutable_key(mutable_key);
                     match mutation_status {
                         Ok(()) => {
                             if let Some(path) = key_path.as_deref() {
@@ -33115,8 +33146,10 @@ impl ExecNtHandler {
                 };
                 let transient_scope = allocator::enter_transient();
                 let name = self.read_registry_ustr_name(args[1]);
-                if self.registry_value_with(key, &name, |_, _| ()).is_none() {
-                    return 0xC000_0034; // STATUS_OBJECT_NAME_NOT_FOUND
+                match self.registry_value_with_result(key, &name, |_, _| ()) {
+                    Ok(Some(())) => {}
+                    Ok(None) => return 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
+                    Err(status) => return status,
                 }
                 let mut name_scratch = [0u8; 1024];
                 let name_len = name.len();
@@ -33124,17 +33157,50 @@ impl ExecNtHandler {
                     return 0xC000_0033; // STATUS_OBJECT_NAME_INVALID
                 }
                 name_scratch[..name_len].copy_from_slice(name.as_bytes());
-                let overlay_index = self.registry_overlay_index(key);
-                let mutable_key = overlay_index
-                    .is_none()
-                    .then(|| self.mutable_registry_key(key))
-                    .flatten();
+                let mut cm_path_scratch = [0u8; 2048];
+                let cm_path_len = if let Some(target) = self.cm_system_key_target(key) {
+                    if target.physical_path.len() > cm_path_scratch.len() {
+                        return 0xC000_003B;
+                    }
+                    cm_path_scratch[..target.physical_path.len()]
+                        .copy_from_slice(target.physical_path.as_bytes());
+                    target.physical_path.len()
+                } else {
+                    0
+                };
+                let overlay_index = if cm_path_len != 0 {
+                    None
+                } else {
+                    self.registry_overlay_index(key)
+                };
+                let mutable_key = if cm_path_len == 0 && overlay_index.is_none() {
+                    self.mutable_registry_key(key)
+                } else {
+                    None
+                };
                 drop(name);
                 drop(transient_scope);
                 let name = match core::str::from_utf8(&name_scratch[..name_len]) {
                     Ok(name) => name,
                     Err(_) => return 0xC000_0033,
                 };
+                if cm_path_len != 0 {
+                    let path = match core::str::from_utf8(&cm_path_scratch[..cm_path_len]) {
+                        Ok(path) => alloc::string::String::from(path),
+                        Err(_) => return 0xC000_003B,
+                    };
+                    if let Err(status) = self.persist_and_publish_system_mutations(
+                        &[OwnedSystemHiveMutation::DeleteValue {
+                            path,
+                            name: name.into(),
+                        }],
+                        SystemHiveMutationOrigin::Runtime,
+                    ) {
+                        return status;
+                    }
+                    self.note_mutable_hives_changed();
+                    return 0;
+                }
                 if let Some(index) = overlay_index {
                     if !self.overlay.delete_value(index, name) {
                         return 0xC000_0008;
@@ -33143,21 +33209,10 @@ impl ExecNtHandler {
                     return 0;
                 }
                 if let Some(mutable_key) = mutable_key {
-                    let mutation_status = if mutable_key.hive == HIVE_SEL_SYSTEM {
-                        let Some(path) = self.mutable_key_path(mutable_key) else {
-                            return STATUS_INVALID_HANDLE;
-                        };
-                        self.persist_and_publish_system_mutations(
-                            &[OwnedSystemHiveMutation::DeleteValue {
-                                path,
-                                name: name.into(),
-                            }],
-                            SystemHiveMutationOrigin::Runtime,
-                        )
-                        .map(|_| ())
-                    } else {
-                        self.journal_delete_mutable_value(mutable_key, name)
-                    };
+                    if mutable_key.hive == HIVE_SEL_SYSTEM {
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    let mutation_status = self.journal_delete_mutable_value(mutable_key, name);
                     if let Err(status) = mutation_status {
                         return status;
                     }

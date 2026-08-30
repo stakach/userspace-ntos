@@ -2984,8 +2984,11 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   generation-stamped SYSTEM checkpoint image export and acknowledges it only after the executive's
   storage provider atomically replaces and flushes the image and truncates and flushes the replay
   log. Hosted win32k registry imports now use a pointer-free pump protocol whose executive-owned
-  handles carry exact CM leases; win32k no longer maps or parses the raw SYSTEM hive. D5 remains open
-  because several executive boot/setup consumers still depend on the compatibility mirror.
+  handles carry exact CM leases; win32k no longer maps or parses the raw SYSTEM hive. Native SYSTEM
+  discovery, runtime value queries, indexed enumeration, key information/security queries, and
+  set/delete/security writes now retain CM lease identity without consulting or mutating the
+  compatibility mirror. D5 remains open for CM-backed overlay composition plus the remaining
+  executive bootstrap readers.
   SYSTEM dirty state, checkpoint admission, and checkpoint acknowledgement are now exclusively
   CM-owned; the executive schedules only the other mounted hives by local dirty-cell count. Migrate
   the remaining SYSTEM consumers, then delete mirror replay/storage and projection diagnostics
@@ -18005,3 +18008,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     post-publish SYSTEM replay, the SYSTEM `MutableHiveSet` mount/storage, and its projection-failure
     diagnostic together. Retain `MutableHiveSet` for SOFTWARE, SECURITY, SAM, DEFAULT, and dynamic
     user hives; do not add a second SYSTEM authority or fallback.
+
+    Native SYSTEM write-identity acceptance (2026-08-30): `NtSetValueKey`, `NtDeleteValueKey`,
+    `NtDeleteKey`, and registry-key security updates now preserve the provider identity captured by
+    the opened handle. An explicit overlay handle continues to mutate its overlay object, while an
+    opaque CM handle queries through its exact lease and publishes a generation-checked CM mutation
+    against its captured physical path. A later overlay for the same pathname cannot redirect an
+    already-open CM handle. Normal CM value absence maps to the native not-found outcome, whereas
+    lease and transport failures propagate unchanged. Any legacy SYSTEM mutable-key identity that
+    reaches these write paths now fails closed instead of journaling the compatibility mirror. The
+    superseded SYSTEM mutation arms and duplicate value-comparison implementation have been removed.
+
+    The freestanding executive release check remains at the established 209-warning baseline.
+    Serialized acceptance `.tmp/run-headless-cm-native-writes-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. CM reaches
+    generation 2535 after 2532 accepted runtime transactions with zero rejection or compatibility
+    projection failure. Native SYSTEM leases remain balanced at `1337/1335/2/0`; Explorer completes
+    677 real api0 redirects with zero callback or dead-callback failures, installs 18 client
+    WndProcs without replay, reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch
+    flushes covering 184 records, and paints all `786432/786432` framebuffer pixels with at least 32
+    colours.
+
+    Review adjustment: native CM write identity is accepted. The next D5 slice is truthful volatile
+    SYSTEM overlay inheritance: replace overlay value, subkey, class, security, and key-stat
+    composition against `MutableHiveSet` with narrow exact CM lease operations, and treat CM as the
+    mounted SYSTEM authority when deciding whether a nonvolatile shadow yields. After that, migrate
+    the remaining timezone/RTC and driver-service bootstrap reads, then delete SYSTEM mirror replay,
+    mount/storage, and projection diagnostics together.
