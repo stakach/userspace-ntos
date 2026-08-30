@@ -27374,24 +27374,6 @@ fn check(name: &[u8], ok: bool, passed: &mut u64) {
     print_str(b"\n");
 }
 
-fn captured_utf16le_ascii_path(bytes: &[u8], len: u16) -> Option<alloc::string::String> {
-    let len = len as usize;
-    if len == 0 || len > bytes.len() || (len & 1) != 0 {
-        return None;
-    }
-    let mut out = alloc::string::String::new();
-    let mut off = 0usize;
-    while off < len {
-        let unit = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        if !(0x20..=0x7e).contains(&unit) {
-            return None;
-        }
-        out.push(char::from_u32(unit as u32)?);
-        off += 2;
-    }
-    Some(out)
-}
-
 fn publish_npfs_io_objects<B: nt_object_client::Backend>(
     object_client: &mut ObjectClient<B>,
     dc: &driver_launch::DriverComponent,
@@ -27401,20 +27383,18 @@ fn publish_npfs_io_objects<B: nt_object_client::Backend>(
     let driver_ok = driver_object_route_registered(object_client, dc, driver_object_path);
     check(b"npfs_driver_object_registered", driver_ok, passed);
 
-    let device_path = captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
-    let device_declared = device_path.as_deref() == Some("\\Device\\NamedPipe");
+    let device_info = object_client.query_object("\\Device\\NamedPipe", true).ok();
+    let device_declared = device_info.as_ref().is_some_and(|info| {
+        info.route_kind == 2
+            && info.owner_component == driver_launch::IO_MANAGER_COMPONENT_ID
+            && driver_launch::device_owned_by_driver(info.owner_local_id, dc.driver_id)
+    });
     check(b"npfs_named_device_declared", device_declared, passed);
-    let device_ok = device_path.as_deref().is_some_and(|path| {
-        let object_id = driver_launch::device_object_id(dc.device_id);
-        object_id != 0 && {
-            let info = object_client.query_object(path, true).ok();
-            info.is_some_and(|info| {
-                info.route_kind == 2
-                    && info.owner_component == driver_launch::IO_MANAGER_COMPONENT_ID
-                    && info.owner_local_id == dc.device_id
-                    && info.object_id.0 == object_id
-            })
-        }
+    let device_ok = device_info.as_ref().is_some_and(|info| {
+        let object_id = driver_launch::device_object_id(info.owner_local_id);
+        object_id != 0
+            && info.object_id.0 == object_id
+            && driver_launch::device_owned_by_driver(info.owner_local_id, dc.driver_id)
     });
     check(b"npfs_device_object_registered", device_ok, passed);
 }
@@ -30938,20 +30918,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 HostedPnpStartOptions::boot_service(),
                 &mut driver_start_bootstrap,
             ) {
-                let device_path =
-                    captured_utf16le_ascii_path(&dc.device_name_utf16, dc.device_name_len);
-                if device_path.as_deref() == Some("\\Device\\NamedPipe") {
+                let named_pipe_device = c
+                    .query_object("\\Device\\NamedPipe", true)
+                    .ok()
+                    .is_some_and(|info| {
+                        info.route_kind == 2
+                            && info.owner_component == driver_launch::IO_MANAGER_COMPONENT_ID
+                            && driver_launch::device_owned_by_driver(
+                                info.owner_local_id,
+                                dc.driver_id,
+                            )
+                    });
+                if named_pipe_device {
                     named_pipe_provider = Some((dc, spec.driver_object_path));
                     continue;
                 }
                 print_str(b"[driver-launch] service ");
                 print_str(spec.service_name.as_bytes());
-                print_str(b" did not publish named-pipe device");
-                if let Some(path) = device_path {
-                    print_str(b" device=");
-                    print_str(path.as_bytes());
-                }
-                print_str(b"\n");
+                print_str(b" did not own \\Device\\NamedPipe\n");
             } else {
                 print_str(b"[driver-launch] boot/system service ");
                 print_str(spec.service_name.as_bytes());
@@ -30968,7 +30952,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             check(
                 b"npfs_device_created",
-                (dc.verdict & V_DEVICE) != 0 && dc.devobj != 0,
+                (dc.verdict & V_DEVICE) != 0
+                    && driver_launch::driver_has_live_device(dc.driver_id),
                 &mut passed,
             );
             check(

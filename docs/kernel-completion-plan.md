@@ -18930,3 +18930,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     snapshot fields and `resolve_io_device` machinery that no longer owns a real lifetime. After
     that audit, resume B3 at dynamic removal/stop rebalance and driver unload across multiple
     independently bound devices.
+
+    B3 dynamic DriverEntry publication checkpoint (2026-08-31, implementation green):
+    `DriverComponent` no longer carries `devobj`, `device_id`, a captured device name, or a captured
+    symbolic-link pair. The dead device-id reconstruction and last-created-device validation path
+    are deleted. Every `IoCreateDevice` already publishes its canonical I/O Manager record and
+    hosted-domain projection synchronously; load completion now enumerates the complete driver
+    device set and validates every projection. Initial IRP readiness is derived from the live
+    canonical set, while drivers without a control device remain explicitly activated by their
+    AddDevice or lifecycle owner.
+
+    `IoCreateSymbolicLink` and `IoDeleteSymbolicLink` now cross the authenticated hosted-device
+    broker synchronously and mutate the canonical I/O Manager/Object Manager namespace at the
+    actual call site. This removes the post-DriverEntry last-link replay and supports any number of
+    links and deletions from any loaded driver. NPFS discovery and its object checks resolve
+    `\\Device\\NamedPipe` dynamically and verify that its canonical `DeviceId` belongs to the loaded
+    driver; they no longer consume captured component fields.
+
+    Formatting, `git diff --check`, focused `nt-io-manager` validation (`238/238`), and the
+    freestanding executive check pass at the unchanged 209-warning baseline. The existing QEMU
+    process still owns the serialized desktop lane, so no second boot was started.
+
+    Review adjustment: `SH_DEVOBJ` now remains only as an overloaded shared transport cell. Some
+    paths use it correctly as the exact active IRP/video device supplied by the executive, but
+    `IoCreateDevice` and AddDevice still use it as a last-created fallback. Split/rename the active
+    request field, return the attached FDO from canonical attachment state only, derive AddDevice
+    names from the canonical device record, and remove all last-created writes and fallback reads.
+    Then audit the analogous device-interface capture and proceed to multi-device STOP/REMOVE and
+    unload/rebalance ownership.

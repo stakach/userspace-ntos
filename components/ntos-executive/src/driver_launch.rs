@@ -4638,6 +4638,8 @@ const HOSTED_DEVICE_OP_CREATE: u64 = 6;
 const HOSTED_DEVICE_OP_ATTACH: u64 = 7;
 const HOSTED_DEVICE_OP_DETACH: u64 = 8;
 const HOSTED_DEVICE_OP_DELETE: u64 = 9;
+const HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK: u64 = 10;
+const HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK: u64 = 11;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
 const HOSTED_DEVICE_ARG_DATA_CAP: u64 = REP_DATA_LEN as u64;
 const _: () =
@@ -5555,6 +5557,17 @@ unsafe fn hosted_device_delete(device: u64) -> i32 {
         (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
         HOSTED_DEVICE_OP_DELETE,
         device,
+        0,
+        0,
+    );
+    status as u32 as i32
+}
+
+unsafe fn hosted_symbolic_link_operation(op: u64) -> i32 {
+    let (_label, status, _, _, _) = call_on4(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        op,
+        0,
         0,
         0,
     );
@@ -9685,8 +9698,7 @@ extern "win64" fn s_dma_put_scatter_gather_list(
     }
 }
 
-/// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)` — capture the driver-declared
-/// link so the executive can publish it through the kernel object namespace after DriverEntry.
+/// `NTSTATUS IoCreateSymbolicLink(PUNICODE_STRING, PUNICODE_STRING)`.
 extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
     unsafe {
         clear_shared_path_len(SH_SYMLINK_LINK_LEN);
@@ -9704,23 +9716,34 @@ extern "win64" fn s_io_create_symbolic_link(link: u64, target: u64) -> i32 {
             SH_SYMLINK_TARGET_LEN,
             SH_SYMLINK_TARGET_BUF,
         );
-        let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
-        write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v | V_SYMLINK);
+        let status = hosted_symbolic_link_operation(HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK);
+        clear_shared_path_len(SH_SYMLINK_LINK_LEN);
+        clear_shared_path_len(SH_SYMLINK_TARGET_LEN);
+        if status >= 0 {
+            let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
+            write_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *mut u32, v | V_SYMLINK);
+        }
+        status
     }
-    0
 }
 
-/// `NTSTATUS IoDeleteSymbolicLink(PUNICODE_STRING)` — delete the driver-declared link through the
-/// canonical I/O Manager/Object Manager path instead of resolving the import to a no-op.
+/// `NTSTATUS IoDeleteSymbolicLink(PUNICODE_STRING)`.
 extern "win64" fn s_io_delete_symbolic_link(link: u64) -> i32 {
     unsafe {
-        let Some(path) = unicode_string_nt_path(link) else {
+        clear_shared_path_len(SH_SYMLINK_LINK_LEN);
+        clear_shared_path_len(SH_SYMLINK_TARGET_LEN);
+        let Some((link_buf, link_len)) = unicode_string_parts(link) else {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         };
-        match io_manager_mut().delete_symbolic_link(&path) {
-            Ok(()) => 0,
-            Err(status) => status.raw(),
-        }
+        copy_wstr_to_shared(
+            link_buf,
+            link_len,
+            SH_SYMLINK_LINK_LEN,
+            SH_SYMLINK_LINK_BUF,
+        );
+        let status = hosted_symbolic_link_operation(HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK);
+        clear_shared_path_len(SH_SYMLINK_LINK_LEN);
+        status
     }
 }
 
@@ -32588,19 +32611,8 @@ pub(crate) struct DriverComponent {
     pub drvobj: u64,
     /// The DriverExtension->AddDevice pointer captured after DriverEntry, if any.
     pub add_device: u64,
-    /// The recorded control DEVICE_OBJECT VA (\Device\NamedPipe for npfs).
-    pub devobj: u64,
     /// The DriverObject->DriverUnload pointer captured after DriverEntry.
     pub driver_unload: u64,
-    /// UTF-16LE path captured from `IoCreateDevice(DeviceName)`, if the driver created a named
-    /// device object.
-    pub device_name_len: u16,
-    pub device_name_utf16: [u8; SH_CAPTURED_PATH_BYTES],
-    /// UTF-16LE paths captured from `IoCreateSymbolicLink`, if the driver declared a link.
-    pub symlink_link_len: u16,
-    pub symlink_link_utf16: [u8; SH_CAPTURED_PATH_BYTES],
-    pub symlink_target_len: u16,
-    pub symlink_target_utf16: [u8; SH_CAPTURED_PATH_BYTES],
     /// The DriverEntry verdict bitmask ([`V_ENTERED`] etc.).
     pub verdict: u32,
     /// Whether DriverEntry ran to its dispatch loop (parked) vs faulted mid-init.
@@ -32643,8 +32655,6 @@ pub(crate) struct DriverComponent {
     pub hosted_domain_cookie: u64,
     /// Canonical executive/I/O route id for this driver binding.
     pub driver_id: u64,
-    /// Canonical executive/I/O route id for this driver's named control device, if any.
-    pub device_id: u64,
     /// The component host's TCB — used to `TCB_Suspend` it if its pump WALLS (transport risk R2).
     pub tcb: u64,
     /// The component host's CNode — dynamic PnP grants install hardware caps here.
@@ -34135,15 +34145,8 @@ unsafe fn load_driver_reserved(
     let support_status = read_volatile((win.shared_va + SH_SUPPORT_DE_STATUS) as *const i32);
     let support_verdict = read_volatile((win.shared_va + SH_SUPPORT_VERDICT) as *const u32);
     let drvobj = read_volatile((win.shared_va + SH_DRVOBJ) as *const u64);
-    let devobj = read_volatile((win.shared_va + SH_DEVOBJ) as *const u64);
     let driver_unload = read_volatile((win.shared_va + SH_DRIVER_UNLOAD) as *const u64);
     let add_device = read_volatile((win.shared_va + SH_ADD_DEVICE) as *const u64);
-    let (device_name_len, device_name_utf16) =
-        read_shared_path_capture(win.shared_va, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF);
-    let (symlink_link_len, symlink_link_utf16) =
-        read_shared_path_capture(win.shared_va, SH_SYMLINK_LINK_LEN, SH_SYMLINK_LINK_BUF);
-    let (symlink_target_len, symlink_target_utf16) =
-        read_shared_path_capture(win.shared_va, SH_SYMLINK_TARGET_LEN, SH_SYMLINK_TARGET_BUF);
     print_str(b"[npfs-svc] DriverEntry ");
     if finished {
         print_str(b"RETURNED status=0x");
@@ -34165,9 +34168,6 @@ unsafe fn load_driver_reserved(
     print_u64(faults);
     print_str(b" demand=");
     print_u64(demand);
-    print_str(b" devobj=0x");
-    print_hex((devobj >> 32) as u32);
-    print_hex(devobj as u32);
     if support_images.count != 0 {
         print_str(b" support_count=");
         print_u64(support_images.count as u64);
@@ -34235,14 +34235,7 @@ unsafe fn load_driver_reserved(
         fault_ep,
         drvobj,
         add_device,
-        devobj,
         driver_unload,
-        device_name_len,
-        device_name_utf16,
-        symlink_link_len,
-        symlink_link_utf16,
-        symlink_target_len,
-        symlink_target_utf16,
         verdict,
         finished,
         exec_shared_va: win.shared_va,
@@ -34265,7 +34258,6 @@ unsafe fn load_driver_reserved(
         hosted_domain_id: domain.hosted_domain_id,
         hosted_domain_cookie: domain.hosted_domain_cookie,
         driver_id,
-        device_id: 0,
         tcb,
         cnode,
         raw_cnode,
@@ -34273,10 +34265,10 @@ unsafe fn load_driver_reserved(
         map_cap_bank,
         reply_cap: active_reply_cap,
     };
-    let device_id = match resolve_io_device(driver_id, &dc) {
-        Ok(device_id) => device_id,
+    let device_count = match validate_hosted_driver_device_projections(&dc) {
+        Ok(device_count) => device_count,
         Err(status) => {
-            print_str(b"[driver-launch] IoManager device resolve failed status=0x");
+            print_str(b"[driver-launch] IoManager device validation failed status=0x");
             print_hex(status.raw() as u32);
             print_str(b" for ");
             print_str(driver_object_path.as_bytes());
@@ -34285,16 +34277,9 @@ unsafe fn load_driver_reserved(
             return None;
         }
     };
-    let dc = DriverComponent { device_id, ..dc };
-    if let Err(status) = register_io_symbolic_link(&dc) {
-        print_str(b"[driver-launch] IoManager symlink publish failed status=0x");
-        print_hex(status.raw() as u32);
-        print_str(b" for ");
-        print_str(driver_object_path.as_bytes());
-        print_str(b"\n");
-        clear_driver_object_extensions_for_driver_object(drvobj);
-        return None;
-    }
+    print_str(b"[driver-launch] canonical devices=");
+    print_u64(device_count as u64);
+    print_str(b"\n");
     // Record the live instance and publish canonical driver/device route ids for callers.
     register_instance(&dc);
     Some(dc)
@@ -37456,18 +37441,6 @@ fn captured_nt_path(bytes: &[u8; SH_CAPTURED_PATH_BYTES], len: u16) -> Option<Nt
     NtPath::parse(&units[..len / 2]).ok()
 }
 
-unsafe fn unicode_string_nt_path(us: u64) -> Option<NtPath> {
-    let (buf, len) = unicode_string_parts(us)?;
-    let mut units = [0u16; SH_CAPTURED_PATH_BYTES / 2];
-    let count = len as usize / 2;
-    let mut i = 0usize;
-    while i < count {
-        units[i] = read_unaligned((buf + (i * 2) as u64) as *const u16);
-        i += 1;
-    }
-    NtPath::parse(&units[..count]).ok()
-}
-
 struct HostedDriverBackend {
     instance: usize,
 }
@@ -38345,9 +38318,8 @@ unsafe fn validate_and_sync_hosted_device_projection(
     device_id: nt_io_manager::DeviceId,
     expected_driver: DriverId,
     expected_driver_object: u64,
-    expected_name: Option<&NtPath>,
 ) -> Result<(), nt_status::NtStatus> {
-    let (extension_size, device_type, characteristics, driver_id, canonical_name) = {
+    let (extension_size, device_type, characteristics, driver_id) = {
         let record = io_manager_mut()
             .device(device_id)
             .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
@@ -38356,10 +38328,9 @@ unsafe fn validate_and_sync_hosted_device_projection(
             record.device_type,
             record.characteristics,
             record.driver_id,
-            record.name.clone(),
         )
     };
-    if driver_id != expected_driver || canonical_name.as_ref() != expected_name {
+    if driver_id != expected_driver {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
@@ -38396,52 +38367,38 @@ unsafe fn validate_and_sync_hosted_device_projection(
     Ok(())
 }
 
-fn resolve_io_device(driver_id: u64, dc: &DriverComponent) -> Result<u64, nt_status::NtStatus> {
-    if dc.devobj == 0 {
-        if dc.device_name_len != 0 {
-            return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
-        return Ok(0);
-    }
-    let name = if dc.device_name_len == 0 {
-        None
-    } else {
-        Some(
-            captured_nt_path(&dc.device_name_utf16, dc.device_name_len)
-                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
-        )
-    };
+fn validate_hosted_driver_device_projections(
+    dc: &DriverComponent,
+) -> Result<usize, nt_status::NtStatus> {
     let domain = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(dc.hosted_domain_id),
         cookie: dc.hosted_domain_cookie,
     };
-    let device_id = io_manager_mut()
-        .hosted_device_by_identity(domain, dc.devobj)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let inst = instance(dc.instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    unsafe {
-        validate_and_sync_hosted_device_projection(
-            inst,
-            domain,
-            dc.devobj,
-            device_id,
-            DriverId(driver_id),
-            dc.drvobj,
-            name.as_ref(),
-        )?;
+    let driver_id = DriverId(dc.driver_id);
+    let device_count = io_manager_mut().devices_of(driver_id).len();
+    let mut index = 0usize;
+    while index < device_count {
+        let device_id = *io_manager_mut()
+            .devices_of(driver_id)
+            .get(index)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let device_object = io_manager_mut()
+            .hosted_device_address_by_identity(domain, device_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        unsafe {
+            validate_and_sync_hosted_device_projection(
+                inst,
+                domain,
+                device_object,
+                device_id,
+                driver_id,
+                dc.drvobj,
+            )?;
+        }
+        index += 1;
     }
-    Ok(device_id.raw())
-}
-
-fn register_io_symbolic_link(dc: &DriverComponent) -> Result<(), nt_status::NtStatus> {
-    if dc.symlink_link_len == 0 && dc.symlink_target_len == 0 {
-        return Ok(());
-    }
-    let link = captured_nt_path(&dc.symlink_link_utf16, dc.symlink_link_len)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let target = captured_nt_path(&dc.symlink_target_utf16, dc.symlink_target_len)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    io_manager_mut().create_symbolic_link(&link, &target)
+    Ok(device_count)
 }
 
 unsafe fn apply_hosted_device_interface_state(sh: u64) -> Result<(), nt_status::NtStatus> {
@@ -40290,8 +40247,47 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_ATTACH
             | HOSTED_DEVICE_OP_DETACH
             | HOSTED_DEVICE_OP_DELETE
+            | HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK
+            | HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK
+        || op == HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
+    {
+        if instance_for_pump_channel(ch, active_reply_cap).is_none() {
+            return (STATUS_ACCESS_DENIED, 0, 0, 0);
+        }
+        let (link_len, link_capture) = unsafe {
+            read_shared_path_capture(
+                ch.shared_va,
+                SH_SYMLINK_LINK_LEN,
+                SH_SYMLINK_LINK_BUF,
+            )
+        };
+        let Some(link) = captured_nt_path(&link_capture, link_len) else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        if op == HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK {
+            return match io_manager_mut().delete_symbolic_link(&link) {
+                Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+                Err(status) => (status.raw(), 0, 0, 0),
+            };
+        }
+        let (target_len, target_capture) = unsafe {
+            read_shared_path_capture(
+                ch.shared_va,
+                SH_SYMLINK_TARGET_LEN,
+                SH_SYMLINK_TARGET_BUF,
+            )
+        };
+        let Some(target) = captured_nt_path(&target_capture, target_len) else {
+            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+        };
+        return match io_manager_mut().create_symbolic_link(&link, &target) {
+            Ok(()) => (STATUS_SUCCESS, 0, 0, 0),
+            Err(status) => (status.raw(), 0, 0, 0),
+        };
     }
     if op == HOSTED_DEVICE_OP_CREATE {
         let Some((_instance, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
@@ -43637,6 +43633,31 @@ pub(crate) fn device_object_id(device_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
+pub(crate) fn device_owned_by_driver(device_id: u64, driver_id: u64) -> bool {
+    io_manager_mut()
+        .device(nt_io_manager::DeviceId(device_id))
+        .is_some_and(|device| device.driver_id.raw() == driver_id && !device.delete_pending)
+}
+
+pub(crate) fn driver_has_live_device(driver_id: u64) -> bool {
+    let driver_id = DriverId(driver_id);
+    let device_count = io_manager_mut().devices_of(driver_id).len();
+    let mut index = 0usize;
+    while index < device_count {
+        let Some(device_id) = io_manager_mut().devices_of(driver_id).get(index).copied() else {
+            return false;
+        };
+        if io_manager_mut()
+            .device(device_id)
+            .is_some_and(|device| !device.delete_pending)
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn nt_path_ascii(path: &NtPath) -> Option<Vec<u8>> {
     let units = path.to_units();
     let mut out = Vec::new();
@@ -44480,6 +44501,32 @@ fn register_instance_transport(i: usize, inst: DriverInstance) {
     }
 }
 
+fn driver_component_has_live_device(dc: &DriverComponent) -> bool {
+    let driver_id = DriverId(dc.driver_id);
+    let domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(dc.hosted_domain_id),
+        cookie: dc.hosted_domain_cookie,
+    };
+    let device_count = io_manager_mut().devices_of(driver_id).len();
+    let mut index = 0usize;
+    while index < device_count {
+        let Some(device_id) = io_manager_mut().devices_of(driver_id).get(index).copied() else {
+            return false;
+        };
+        let live = io_manager_mut()
+            .device(device_id)
+            .is_some_and(|device| !device.delete_pending)
+            && io_manager_mut()
+                .hosted_device_address_by_identity(domain, device_id)
+                .is_some();
+        if live {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn register_instance(dc: &DriverComponent) {
     // SAFETY: single-threaded executive; the table is written here + read in dispatch_irp.
     let t = unsafe { driver_instances_mut() };
@@ -44517,10 +44564,10 @@ fn register_instance(dc: &DriverComponent) {
         driver_object: dc.drvobj,
         driver_unload: dc.driver_unload,
         add_device: dc.add_device,
-        // Default readiness = npfs's historic rule (parked + a control device object). A
-        // driver that fills its MJ table but creates no control device (a minimal filter/FSD)
-        // is marked ready explicitly by the caller via `register_instance_ready`.
-        ready: dc.finished && dc.devobj != 0,
+        // Drivers with at least one live canonical device can receive ordinary IRPs immediately.
+        // A driver that creates no control device is marked ready explicitly after AddDevice or by
+        // its lifecycle owner.
+        ready: dc.finished && driver_component_has_live_device(dc),
         used: true,
     };
 }
@@ -46963,6 +47010,12 @@ unsafe fn call_add_device_for_existing_pdo(
         let device_id = io_manager_mut()
             .hosted_device_by_identity(projection_domain, add_device.fdo_object)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if io_manager_mut()
+            .device(device_id)
+            .is_none_or(|device| device.name.as_ref() != fdo_name.as_ref())
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
         fdo_device_id = Some(device_id);
         validate_and_sync_hosted_device_projection(
             projection_inst,
@@ -46971,7 +47024,6 @@ unsafe fn call_add_device_for_existing_pdo(
             device_id,
             DriverId(driver_id),
             add_device.driver_object,
-            fdo_name.as_ref(),
         )?;
         match io_manager_mut()
             .device(device_id)
