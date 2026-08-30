@@ -49,6 +49,9 @@ pub const IRP_MN_QUERY_RESOURCES: u8 = 0x0A;
 pub const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u8 = 0x0B;
 pub const IRP_MN_QUERY_ID: u8 = 0x13;
 pub const IRP_MN_QUERY_BUS_INFORMATION: u8 = 0x15;
+
+/// Native NT5 x64 `DEVICE_CAPABILITIES` extent.
+pub const DEVICE_CAPABILITIES_X64_SIZE: usize = 64;
 pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
 
 pub const BUS_RELATIONS: u32 = 0;

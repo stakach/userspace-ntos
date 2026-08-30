@@ -225,7 +225,7 @@ fn build_dispatch_request(
             Some(start) => (
                 p.wire_argument().unwrap_or(0),
                 p.input_len(),
-                0,
+                p.output_len(),
                 0,
                 0,
                 0,
@@ -239,8 +239,8 @@ fn build_dispatch_request(
             ),
             None => (
                 p.wire_argument().unwrap_or(0),
-                0,
-                0,
+                p.input_len(),
+                p.output_len(),
                 0,
                 0,
                 0,

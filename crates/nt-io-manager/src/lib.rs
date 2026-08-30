@@ -2082,6 +2082,11 @@ mod tests {
             PnpParameters::query_information(nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES),
             Err(NtStatus::INVALID_PARAMETER)
         );
+        let capabilities = PnpParameters::query_capabilities();
+        assert_eq!(capabilities.minor, nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES);
+        assert_eq!(capabilities.input_len(), 64);
+        assert_eq!(capabilities.output_len(), 64);
+        assert_eq!(capabilities.payload_len(), 64);
         assert_eq!(
             PnpParameters::start(24, 0),
             Err(NtStatus::INVALID_PARAMETER)
@@ -2488,6 +2493,43 @@ mod tests {
     }
 
     #[test]
+    fn prepared_query_capabilities_returns_exact_synchronous_payload() {
+        let mut io = io();
+        let returned = std::vec![0x5a; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new()));
+        let backend = RecordingBackend {
+            seen: seen.clone(),
+            status: NtStatus::SUCCESS,
+            information: 0,
+            file_context: None,
+            output: returned.clone(),
+        };
+        let (client, root, _, _) = pnp_test_stack(&mut io, Box::new(backend));
+        let initialized = std::vec![0xa5; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
+        let prepared = io
+            .prepare_external_pnp_to_device(
+                client,
+                root,
+                0,
+                PnpParameters::query_capabilities(),
+                &initialized,
+            )
+            .unwrap();
+        assert_eq!(
+            io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::ReturnedPayload {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                payload: returned,
+            }
+        );
+        let recorded = &seen.borrow()[0];
+        assert_eq!(recorded.input_len, 64);
+        assert_eq!(recorded.output_len, 64);
+        assert_eq!(recorded.buffer, initialized);
+    }
+
+    #[test]
     fn peer_pnp_wire_request_preserves_start_split() {
         let control = MockPeerControl::new();
         let mut io = io();
@@ -2579,6 +2621,28 @@ mod tests {
         let request = control.last_request().unwrap();
         assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_ID);
         assert_eq!(request.ioctl_code, nt_pnp_abi::BUS_QUERY_INSTANCE_ID);
+
+        let capabilities = PnpParameters::query_capabilities();
+        let mut capability_buffer = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
+        let _ = io
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(capabilities),
+                nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u32,
+                nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u32,
+                &mut capability_buffer,
+            )
+            .unwrap();
+        let request = control.last_request().unwrap();
+        assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES);
+        assert_eq!(request.input_len, 64);
+        assert_eq!(request.output_len, 64);
+        assert_eq!(request.ioctl_code, 0);
     }
 
     // --- Open / create path (Milestone 5) ----------------------------------
@@ -4784,6 +4848,7 @@ mod tests {
         output: std::vec::Vec<u8>,
         completion_ready: bool,
         completion_status: NtStatus,
+        completion_information: Option<u64>,
         fail_ack: bool,
         acknowledgements: usize,
         defer_completion_until_cancel: bool,
@@ -4831,7 +4896,9 @@ mod tests {
             Some(DriverCompletion {
                 irp_id: state.irp_id?,
                 status: state.completion_status,
-                information: state.output.len() as u64,
+                information: state
+                    .completion_information
+                    .unwrap_or(state.output.len() as u64),
                 file_context: None,
             })
         }
@@ -4947,6 +5014,53 @@ mod tests {
             om.copy_completed_irp_output(irp_id, 0, &mut output),
             Err(NtStatus::INVALID_PARAMETER)
         );
+    }
+
+    #[test]
+    fn pending_query_capabilities_copies_payload_independently_of_information() {
+        let returned = std::vec![0x7b; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
+        let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
+            output: returned.clone(),
+            completion_status: NtStatus::SUCCESS,
+            completion_information: Some(0),
+            ..RetainedOutputState::default()
+        }));
+        let mut io = io();
+        let (client, root, _, _) = pnp_test_stack(
+            &mut io,
+            Box::new(RetainedOutputBackend {
+                state: state.clone(),
+            }),
+        );
+        let initialized = [0xa5; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
+        let prepared = io
+            .prepare_external_pnp_to_device(
+                client,
+                root,
+                0,
+                PnpParameters::query_capabilities(),
+                &initialized,
+            )
+            .unwrap();
+        let irp_id = prepared.irp_id();
+        assert_eq!(
+            io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Pending { irp_id }
+        );
+        assert_eq!(io.pump(), 1);
+        assert_eq!(io.completed_irp(irp_id).unwrap().information, 0);
+        let mut copied = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
+        assert_eq!(
+            io.copy_completed_pnp_payload(irp_id, 0, &mut copied[..17]),
+            Ok(17)
+        );
+        assert_eq!(
+            io.copy_completed_pnp_payload(irp_id, 17, &mut copied[17..]),
+            Ok(47)
+        );
+        assert_eq!(copied.as_slice(), returned.as_slice());
+        io.acknowledge_completed_irp_strict(irp_id).unwrap();
+        assert_eq!(state.borrow().acknowledgements, 1);
     }
 
     #[test]
@@ -6892,6 +7006,23 @@ mod tests {
         assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_ID);
         assert_eq!(le_u32(&stack, 0x08), nt_pnp_abi::BUS_QUERY_HARDWARE_IDS);
         assert_eq!(le_u64(&stack, 0x28), 0x5555);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_PNP,
+                minor: nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES,
+                device_object: 0x6666,
+                parameters: WdmIoStackParameters::PnpQueryCapabilities {
+                    capabilities: 0x7777,
+                },
+                ..WdmIoStackLocationInit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES);
+        assert_eq!(le_u64(&stack, 0x08), 0x7777);
+        assert_eq!(le_u64(&stack, 0x28), 0x6666);
     }
 
     #[test]

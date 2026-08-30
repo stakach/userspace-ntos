@@ -164,6 +164,9 @@ pub enum WdmIoStackParameters {
     PnpQueryId {
         id_type: u32,
     },
+    PnpQueryCapabilities {
+        capabilities: u64,
+    },
 }
 
 impl Default for WdmIoStackParameters {
@@ -449,6 +452,9 @@ pub fn write_wdm_io_stack_location(
         }
         WdmIoStackParameters::PnpQueryId { id_type } => {
             put_u32(bytes, 0x08, id_type);
+        }
+        WdmIoStackParameters::PnpQueryCapabilities { capabilities } => {
+            put_u64(bytes, 0x08, capabilities);
         }
     }
     Ok(())

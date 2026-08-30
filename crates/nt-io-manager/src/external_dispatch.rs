@@ -47,10 +47,17 @@ impl PreparedExternalPnpIrp {
 }
 
 /// Exact outcome of entering a prepared canonical PnP request.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExternalPnpDispatchResult {
     /// The outer device-stack call returned a terminal status.
     Returned { status: NtStatus, information: u64 },
+    /// A synchronous in/out PnP request returned its exact request-owned payload. Native callers
+    /// must validate this independently of `IoStatus.Information`.
+    ReturnedPayload {
+        status: NtStatus,
+        information: u64,
+        payload: Vec<u8>,
+    },
     /// The outer device-stack call returned `STATUS_PENDING`; the canonical IRP remains owned by
     /// the I/O manager until a genuine terminal completion is acknowledged.
     Pending { irp_id: IrpId },
@@ -74,7 +81,7 @@ impl<P> IoManager<P> {
         parameters: PnpParameters,
         payload: &[u8],
     ) -> Result<PreparedExternalPnpIrp, NtStatus> {
-        let expected_len = parameters.input_len() as usize;
+        let expected_len = parameters.payload_len() as usize;
         if payload.len() != expected_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -102,7 +109,7 @@ impl<P> IoManager<P> {
         parameters: PnpParameters,
         owned_payload: Vec<u8>,
     ) -> Result<PreparedExternalPnpIrp, NtStatus> {
-        let expected_len = parameters.input_len() as usize;
+        let expected_len = parameters.payload_len() as usize;
         if owned_payload.len() != expected_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -127,8 +134,8 @@ impl<P> IoManager<P> {
             buffer_id: 0,
             offset: 0,
             len: expected_len as u32,
-            input_len: expected_len as u32,
-            output_len: 0,
+            input_len: parameters.input_len(),
+            output_len: parameters.output_len(),
             access: BufferAccess::ReadWrite,
         });
         let irp_id = self.allocate_irp(irp)?;
@@ -206,8 +213,22 @@ impl<P> IoManager<P> {
                 && irp.state == IrpState::Initialized
                 && irp.file_id.is_none()
                 && irp.buffer.is_some_and(|buffer| {
-                    buffer.input_len as usize == prepared.payload.len()
-                        && buffer.output_len == 0
+                    buffer.input_len
+                        == irp
+                            .current_stack()
+                            .and_then(|stack| match &stack.parameters {
+                                IoParameters::Pnp(parameters) => Some(parameters.input_len()),
+                                _ => None,
+                            })
+                            .unwrap_or(u32::MAX)
+                        && buffer.output_len
+                            == irp
+                                .current_stack()
+                                .and_then(|stack| match &stack.parameters {
+                                    IoParameters::Pnp(parameters) => Some(parameters.output_len()),
+                                    _ => None,
+                                })
+                                .unwrap_or(u32::MAX)
                         && buffer.len as usize == prepared.payload.len()
                 })
         });
@@ -255,10 +276,21 @@ impl<P> IoManager<P> {
                     irp.transition(IrpState::Completing);
                     irp.transition(IrpState::Completed);
                 }
+                let returns_payload = self
+                    .irp(irp_id)
+                    .is_some_and(|irp| irp.buffer.is_some_and(|buffer| buffer.output_len != 0));
                 self.free_irp(irp_id);
-                ExternalPnpDispatchResult::Returned {
-                    status,
-                    information,
+                if returns_payload {
+                    ExternalPnpDispatchResult::ReturnedPayload {
+                        status,
+                        information,
+                        payload: prepared.payload,
+                    }
+                } else {
+                    ExternalPnpDispatchResult::Returned {
+                        status,
+                        information,
+                    }
                 }
             }
             PnpBackendDispatch::Pending => {
@@ -540,10 +572,11 @@ impl<P> IoManager<P> {
         match &params {
             IoParameters::Pnp(parameters) => {
                 let expected_input = parameters.input_len();
+                let expected_output = parameters.output_len();
                 if major != nt_io_abi::major::IRP_MJ_PNP
                     || input_len != expected_input
-                    || output_len != 0
-                    || system_buffer.len() != expected_input as usize
+                    || output_len != expected_output
+                    || system_buffer.len() != parameters.payload_len() as usize
                 {
                     return Err(NtStatus::INVALID_PARAMETER);
                 }

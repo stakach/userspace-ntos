@@ -18692,3 +18692,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     completion ownership, and decode the validated capability result. Then add an allocation-free
     prepared PnP devnode batch so capability/resource publication and the durable CM relation can
     commit in the correct order without partial state.
+
+    B3 native device-capability transaction checkpoint (2026-08-30, implementation green):
+    `nt-io-manager` now models `IRP_MN_QUERY_CAPABILITIES` as the native initialized 64-byte x64
+    `DEVICE_CAPABILITIES` in/out stack payload. Its input, output, and request-owned storage extents
+    are typed independently, the hosted WDM projection places the exact buffer pointer in the stack
+    union, and driver-peer transport carries both extents. Synchronous dispatch returns the mutated
+    owned payload explicitly; pending completion exposes it only through an exact completed-PnP
+    copy operation. Neither path derives the structural copy length from `IoStatus.Information`,
+    which native drivers normally leave at zero for this IRP.
+
+    The retained BusRelations owner now issues the capability query for every authenticated child
+    after the pointer-returning bus properties. It initializes Size, Version, Address, and UINumber
+    according to the native contract; revalidates canonical PDO, origin driver, completion
+    driver/device, PnP major/minor, client, and completion origin; then copies and decodes only the
+    PnP-owned fields. Failed driver queries become explicit `KnownNone`. Successful malformed or
+    short payloads, topology drift, unexpected payloads on any other PnP minor, and indeterminate
+    transport retain the invalidation as barriers. Pending completion is acknowledged only after
+    the full payload has been copied and decoded.
+
+    Focused validation passes `6/6` `nt-pnp-abi`, `238/238` `nt-io-manager`, and `43/43`
+    `nt-pnp-manager` tests; formatting, `git diff --check`, and the freestanding executive check
+    pass at the unchanged 209-warning baseline. Review adjustment: all native child properties now
+    exist in the retained relation transaction but remain intentionally unpublished. Next add a
+    prepared PnP devnode batch that owns complete instance/property records and reserves every
+    allocation before durable CM publication. Its commit must be allocation-free and generation
+    fenced, publish the existing canonical PDO rather than constructing a replacement, and either
+    accept an exact existing devnode idempotently or reject conflicting immutable properties. Only
+    after both CM and PnP publication are prepared may the transaction commit CM, devnodes, the
+    relation table, and the invalidation claim in that order.

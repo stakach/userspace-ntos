@@ -145,6 +145,7 @@ enum PnpParameterKind {
     QueryDeviceRelations { relation_type: u32 },
     QueryId { id_type: u32 },
     QueryInformation,
+    QueryCapabilities,
 }
 
 impl PnpParameters {
@@ -209,6 +210,15 @@ impl PnpParameters {
         })
     }
 
+    /// Construct `IRP_MN_QUERY_CAPABILITIES`, whose stack parameter points to an initialized
+    /// request-owned `DEVICE_CAPABILITIES` buffer that the driver mutates in place.
+    pub const fn query_capabilities() -> Self {
+        Self {
+            minor: nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES,
+            kind: PnpParameterKind::QueryCapabilities,
+        }
+    }
+
     pub const fn start_parameters(self) -> Option<PnpStartParameters> {
         match self.kind {
             PnpParameterKind::Start(start) => Some(start),
@@ -244,8 +254,20 @@ impl PnpParameters {
                 .raw_resource_list_len
                 .checked_add(start.translated_resource_list_len)
                 .expect("validated PnP START extents overflowed"),
+            PnpParameterKind::QueryCapabilities => nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u32,
             _ => 0,
         }
+    }
+
+    pub fn output_len(self) -> u32 {
+        match self.kind {
+            PnpParameterKind::QueryCapabilities => nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u32,
+            _ => 0,
+        }
+    }
+
+    pub fn payload_len(self) -> u32 {
+        self.input_len().max(self.output_len())
     }
 
     fn is_lifecycle_minor(minor: u8) -> bool {
@@ -314,7 +336,7 @@ impl IoParameters {
             IoParameters::SetVolumeInformation(p) => (p.length.min(cap), 0),
             IoParameters::NotifyDirectory(p) => (0, p.length.min(cap)),
             IoParameters::LockControl(_) => (0, 0),
-            IoParameters::Pnp(p) => (p.input_len().min(cap), 0),
+            IoParameters::Pnp(p) => (p.input_len().min(cap), p.output_len().min(cap)),
             _ => (0, 0),
         }
     }

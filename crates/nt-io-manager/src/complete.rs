@@ -395,6 +395,58 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(copied)
     }
 
+    /// Copy the retained request-owned payload of a completed in/out PnP request. Unlike ordinary
+    /// read output, native PnP stack payloads are not sized by `IoStatus.Information`.
+    pub fn copy_completed_pnp_payload(
+        &mut self,
+        irp_id: IrpId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let (driver_id, payload_len) = {
+            let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if irp.state != IrpState::Completed
+                || irp.origin_major != major::IRP_MJ_PNP
+                || irp.origin_minor != nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let output_len = irp
+                .buffer
+                .map(|buffer| buffer.output_len as usize)
+                .filter(|length| *length == nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            (
+                irp.current_stack()
+                    .ok_or(NtStatus::INVALID_PARAMETER)?
+                    .driver_id,
+                output_len,
+            )
+        };
+        let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if offset > payload_len {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let copy_capacity = output.len().min(payload_len - offset);
+        if copy_capacity == 0 {
+            return Ok(0);
+        }
+        let backend_index = self
+            .driver(driver_id)
+            .map(|driver| driver.backend.0 as usize)
+            .filter(|index| *index < self.backends.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let copied = self.backends[backend_index].copy_completion_output(
+            irp_id,
+            offset as u64,
+            &mut output[..copy_capacity],
+        )?;
+        if copied > copy_capacity {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(copied)
+    }
+
     /// Acknowledge a published completion, reclaim its canonical IRP, and resume
     /// any FILE_OBJECT close that was waiting for this reference. Consumers may
     /// acknowledge independent ready requests out of enumeration order.
