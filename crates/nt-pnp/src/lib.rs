@@ -131,7 +131,7 @@ pub struct PciDevice {
     pub device: u16,
     /// The 24-bit class code `(base_class << 16) | (sub_class << 8) | prog_if`.
     pub class: u32,
-    /// The PCI interrupt line (IRQ) from config 0x3C low byte.
+    /// Observed PCI config `InterruptLine` byte. This is inventory data, never route authority.
     pub irq_line: u8,
     /// The PCI interrupt pin (0 = none/MSI-only, 1 = INTA .. 4 = INTD).
     pub irq_pin: u8,
@@ -171,6 +171,7 @@ pub struct PciFunctionSnapshot {
     pub vendor: u16,
     pub device: u16,
     pub class: u32,
+    /// Observed PCI config `InterruptLine` byte. Resource routing ignores this value.
     pub irq_line: u8,
     pub irq_pin: u8,
     pub header_type: u8,
@@ -1268,8 +1269,9 @@ fn port_bar_flags() -> u16 {
 /// Build the bus-relative and translated boot-resource snapshots for one PCI function.
 ///
 /// BAR addresses use identity translation on the current x86 platform. Interrupt routing is kept
-/// distinct: the raw list contains the PCI line with all-processor affinity, while the translated
-/// list contains the vector and affinity selected by the interrupt broker.
+/// distinct: when the platform has published an assignment, the raw list contains its bus-level
+/// GSI while the translated list contains the vector and affinity selected by the interrupt
+/// broker. The observational PCI `InterruptLine` register is never route authority.
 pub fn pci_boot_resources(
     device: &PciDevice,
     translated_interrupt: Option<PciInterruptAssignment>,
@@ -1277,10 +1279,7 @@ pub fn pci_boot_resources(
     if device.irq_pin > 4 {
         return Err(ResourceRequirementsError::InvalidInterruptPin);
     }
-    let has_raw_interrupt = device.irq_pin != 0 && !matches!(device.irq_line, 0 | u8::MAX);
-    if (device.irq_pin == 0 && translated_interrupt.is_some())
-        || has_raw_interrupt != translated_interrupt.is_some()
-    {
+    if device.irq_pin == 0 && translated_interrupt.is_some() {
         return Err(ResourceRequirementsError::MissingInterruptTranslation);
     }
     let descriptor_count = device
@@ -1288,7 +1287,7 @@ pub fn pci_boot_resources(
         .iter()
         .filter(|bar| bar.is_present())
         .count()
-        .saturating_add(has_raw_interrupt as usize);
+        .saturating_add(translated_interrupt.is_some() as usize);
     if descriptor_count == 0 {
         return Ok(None);
     }
@@ -1324,15 +1323,14 @@ pub fn pci_boot_resources(
         raw_descriptors.push(descriptor);
         translated_descriptors.push(descriptor);
     }
-    if has_raw_interrupt {
+    if let Some(translated) = translated_interrupt {
         raw_descriptors.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
-            level: device.irq_line as u32,
-            vector: device.irq_line as u32,
+            level: translated.bus_level,
+            vector: translated.bus_level,
             affinity: u64::MAX,
             flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
             share: CM_RESOURCE_SHARE_SHARED,
         }));
-        let translated = translated_interrupt.unwrap();
         translated_descriptors.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
             level: translated.vector,
             vector: translated.vector,
@@ -2158,13 +2156,21 @@ mod tests {
     }
 
     #[test]
-    fn pci_boot_resources_preserve_bar_order_flags_and_interrupt_translation() {
+    fn pci_boot_resources_use_platform_gsi_not_config_interrupt_line() {
         let m = nic_mock();
         let device =
             enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v)).unwrap();
-        let resources = pci_boot_resources(&device, interrupt(5, true, 0x3))
-            .unwrap()
-            .unwrap();
+        let resources = pci_boot_resources(
+            &device,
+            Some(PciInterruptAssignment {
+                bus_level: 19,
+                vector: 5,
+                latched: true,
+                affinity: 0x3,
+            }),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(resources.raw.len(), 80);
         assert_eq!(resources.translated.len(), 80);
@@ -2187,11 +2193,11 @@ mod tests {
         }
         assert_eq!(
             u32::from_le_bytes(resources.raw[64..68].try_into().unwrap()),
-            11
+            19
         );
         assert_eq!(
             u32::from_le_bytes(resources.raw[68..72].try_into().unwrap()),
-            11
+            19
         );
         assert_eq!(
             u64::from_le_bytes(resources.raw[72..80].try_into().unwrap()),
@@ -2217,6 +2223,23 @@ mod tests {
             u16::from_le_bytes(resources.translated[62..64].try_into().unwrap()),
             CM_RESOURCE_INTERRUPT_LATCHED
         );
+    }
+
+    #[test]
+    fn pci_boot_resources_omit_unpublished_config_line() {
+        let m = nic_mock();
+        let device =
+            enumerate_function(0, 3, 0, |o| m.read(3, 0, o), |o, v| m.write(3, 0, o, v)).unwrap();
+        assert_eq!(device.irq_line, 11);
+
+        let resources = pci_boot_resources(&device, None).unwrap().unwrap();
+        for bytes in [&resources.raw, &resources.translated] {
+            assert_eq!(bytes.len(), 60);
+            assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 2);
+            assert!(!bytes[20..]
+                .chunks_exact(20)
+                .any(|descriptor| descriptor[0] == nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT));
+        }
     }
 
     #[test]

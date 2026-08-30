@@ -2125,17 +2125,7 @@ const HOSTED_BOOT_FRAMEBUFFER_EAGER_MMIO_PAGES: u64 = 32;
 pub const RESLIST_VADDR: u64 = 0x0000_0100_105F_D000;
 const _: () =
     assert!(STORAGE_SHARED_END <= RESLIST_VADDR || RESLIST_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
-/// The IOAPIC pins PCI INTx routes to on q35 (GSI 16..23) — the NIC's exact pin is
-/// chipset-routed, so we cover them all (edge-triggered, one delivery per assertion).
-const Q35_PCI_INTX_IOAPIC_ROUTE_MASK: u32 = 0x00FF_0000;
-const Q35_PCI_INTX_ROUTES: nt_pnp::PciIntxRoutingTable =
-    nt_pnp::PciIntxRoutingTable::new(0, [Some(16), Some(17), Some(18), Some(19)]);
-/// The PIT is routed through GSI 2 on PC/q35 systems. HPET Timer 0 advertises it as legal, but
-/// sharing the executive delay timer with the kernel tick gives the delay path false expiries.
-const LEGACY_PIT_IOAPIC_ROUTE_MASK: u32 = 1u32 << 2;
-const HPET_SHARED_IOAPIC_ROUTE_MASK: u32 =
-    Q35_PCI_INTX_IOAPIC_ROUTE_MASK | LEGACY_PIT_IOAPIC_ROUTE_MASK;
-const IOAPIC_ROUTE_PIN_NONE: u64 = u64::MAX;
+const IOAPIC_ROUTE_GSI_NONE: u64 = u64::MAX;
 
 // HPET register offsets (from the mapped MMIO base).
 const HPET_GEN_CONF: u64 = 0x10;
@@ -3004,15 +2994,17 @@ pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
 }
 const DELAY_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
 pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
-/// Bound-notification namespace for genuine hosted hardware IRQs. The low 32 bits are an IOAPIC
-/// line bitmap, allowing deliveries on several lines to coalesce without losing identity.
+/// Bound-notification namespace for genuine hosted hardware IRQs. Payload bits identify dynamic
+/// live route slots rather than physical GSIs, so sparse/high firmware interrupt numbers do not
+/// constrain the transport.
 pub(crate) const HOSTED_IRQ_EVENT_BADGE: u64 = 0x2000_0000_0000_0000;
-pub(crate) const HOSTED_IRQ_LINE_BADGE_MASK: u64 = u32::MAX as u64;
+pub(crate) const HOSTED_IRQ_EVENT_SLOT_COUNT: u8 = 61;
+pub(crate) const HOSTED_IRQ_EVENT_BADGE_MASK: u64 = HOSTED_IRQ_EVENT_BADGE - 1;
 
 #[inline]
-pub(crate) const fn hosted_irq_lines_from_badge(badge: u64) -> u32 {
+pub(crate) const fn hosted_irq_lines_from_badge(badge: u64) -> u64 {
     if badge & HOSTED_IRQ_EVENT_BADGE != 0 {
-        (badge & HOSTED_IRQ_LINE_BADGE_MASK) as u32
+        badge & HOSTED_IRQ_EVENT_BADGE_MASK
     } else {
         0
     }
@@ -3468,8 +3460,8 @@ static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
 static EXEC_EVENT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static EXEC_EVENT_NOTIFICATION_BOUND: AtomicBool = AtomicBool::new(false);
 static DELAY_TIMER_BADGED_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
-static HPET_PROBE_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
-static DELAY_TIMER_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
+static HPET_PROBE_IOAPIC_GSI: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_GSI_NONE);
+static DELAY_TIMER_IOAPIC_GSI: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_GSI_NONE);
 static KUSER_CLOCK_INIT_OK: AtomicBool = AtomicBool::new(false);
 static KUSER_CLOCK_INITIAL_TICK: AtomicU64 = AtomicU64::new(0);
 static KUSER_CLOCK_PUBLISH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -6996,7 +6988,7 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     let spurious = TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed);
     let past = TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed);
     let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
-    let delay_pin = DELAY_TIMER_IOAPIC_PIN.load(Ordering::Relaxed);
+    let delay_gsi = DELAY_TIMER_IOAPIC_GSI.load(Ordering::Relaxed);
     let config = if handler != 0 {
         unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) }
     } else {
@@ -7014,11 +7006,11 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     print_u64(past);
     print_str(b" T0_CONFIG=0x");
     print_hex_u64(config);
-    print_str(b" pin=");
-    if delay_pin == IOAPIC_ROUTE_PIN_NONE {
+    print_str(b" gsi=");
+    if delay_gsi == IOAPIC_ROUTE_GSI_NONE {
         print_str(b"none");
     } else {
-        print_u64(delay_pin);
+        print_u64(delay_gsi);
     }
     print_str(b" (bit1=level bit2=enable)\n");
     // A boot that never armed the timer must show no deliveries at all (nothing is fabricated);
@@ -7027,8 +7019,9 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     let shape = if handler == 0 {
         seen == 0 && spurious == 0
     } else {
-        let isolated_route = delay_pin != IOAPIC_ROUTE_PIN_NONE
-            && (ioapic_route_pin_mask(delay_pin) & HPET_SHARED_IOAPIC_ROUTE_MASK) == 0;
+        let isolated_route = delay_gsi != IOAPIC_ROUTE_GSI_NONE
+            && delay_gsi != HPET_PROBE_IOAPIC_GSI.load(Ordering::Relaxed)
+            && (ioapic_route_gsi_mask(delay_gsi) & driver_launch::hosted_irq_gsi_mask()) == 0;
         (config & HPET_TN_INT_TYPE_LEVEL) != 0
             && isolated_route
             && seen >= 1
@@ -14311,7 +14304,6 @@ enum HostedDevnodeGrantKind {
 
 struct HostedDevnodeGrant {
     kind: HostedDevnodeGrantKind,
-    pci_interrupt_line: Option<PciInterruptLineProgramming>,
     raw_resource_list: alloc::vec::Vec<u8>,
     translated_resource_list: alloc::vec::Vec<u8>,
     mmio_phys: u64,
@@ -14514,11 +14506,6 @@ unsafe fn grant_hosted_pci_devnode_resources(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
     }
-    let pci_interrupt_line = if let Some(interrupt) = interrupt {
-        program_pci_interrupt_line(&grant.device, interrupt.vector)?
-    } else {
-        None
-    };
     let raw_memory: Vec<_> = grant
         .assignment
         .memory_resources(nt_pnp::ResourceView::Raw)
@@ -14612,9 +14599,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             grant.device.vendor,
             grant.device.device,
             grant.device.class,
-            interrupt
-                .map(|interrupt| interrupt.vector as u8)
-                .unwrap_or(0),
+            grant.device.irq_line,
             grant.device.irq_pin,
         ),
         &memory_grants,
@@ -14641,9 +14626,6 @@ unsafe fn grant_hosted_pci_devnode_resources(
         context_lease,
     );
     if let Err(status) = resource_grant {
-        if let Some(programming) = pci_interrupt_line {
-            let _ = restore_pci_interrupt_line(programming);
-        }
         return Err(status);
     }
     Ok(Some(HostedDevnodeGrant {
@@ -14651,7 +14633,6 @@ unsafe fn grant_hosted_pci_devnode_resources(
             dev: grant.device.dev,
             func: grant.device.func,
         },
-        pci_interrupt_line,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: memory.map(|memory| memory.start).unwrap_or(0),
@@ -14748,7 +14729,6 @@ unsafe fn grant_hosted_root_devnode_resources(
     )?;
     Ok(Some(HostedDevnodeGrant {
         kind: HostedDevnodeGrantKind::RootBus,
-        pci_interrupt_line: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: memory.map(|memory| memory.start).unwrap_or(0),
@@ -14922,7 +14902,6 @@ unsafe fn grant_hosted_platform_devnode_resources(
     )?;
     Ok(Some(HostedDevnodeGrant {
         kind: HostedDevnodeGrantKind::RootBus,
-        pci_interrupt_line: None,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
         mmio_phys: translated_memory.first().map(|memory| memory.start).unwrap_or(0),
@@ -17332,15 +17311,15 @@ fn release_reply_pool_cap(cap: u64) {
     }
 }
 
-fn ioapic_route_pin_mask(pin: u64) -> u32 {
-    if pin < 32 {
-        1u32 << (pin as u32)
+fn ioapic_route_gsi_mask(gsi: u64) -> u32 {
+    if gsi < 32 {
+        1u32 << (gsi as u32)
     } else {
         0
     }
 }
 
-fn highest_ioapic_route_pin(mask: u32) -> Option<u64> {
+fn highest_ioapic_route_gsi(mask: u32) -> Option<u64> {
     if mask == 0 {
         None
     } else {
@@ -17348,8 +17327,8 @@ fn highest_ioapic_route_pin(mask: u32) -> Option<u64> {
     }
 }
 
-fn select_delay_hpet_route_pin(route_cap: u32, used_mask: u32) -> Option<u64> {
-    highest_ioapic_route_pin(route_cap & !used_mask & !HPET_SHARED_IOAPIC_ROUTE_MASK)
+fn select_delay_hpet_route_gsi(route_cap: u32, used_mask: u32) -> Option<u64> {
+    highest_ioapic_route_gsi(route_cap & !used_mask)
 }
 
 unsafe fn executive_event_notification() -> Result<u64, nt_status::NtStatus> {
@@ -17449,16 +17428,17 @@ unsafe fn delay_timer_init() -> bool {
         initial_config & !HPET_TN_INT_ENB,
     );
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let used_mask = ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Relaxed))
-        | driver_launch::hosted_irq_line_mask();
-    let Some(pin) = select_delay_hpet_route_pin(route_cap, used_mask) else {
+    let used_mask = ioapic_route_gsi_mask(HPET_PROBE_IOAPIC_GSI.load(Ordering::Relaxed))
+        | driver_launch::hosted_irq_gsi_mask();
+    let Some(gsi) = select_delay_hpet_route_gsi(route_cap, used_mask) else {
         print_str(b"[delay] HPET timer0 has no non-shared IOAPIC route route_cap=0x");
         print_hex(route_cap);
         print_str(b" used=0x");
         print_hex(used_mask);
-        print_str(b" shared=0x");
-        print_hex(HPET_SHARED_IOAPIC_ROUTE_MASK);
         print_str(b"\n");
+        return false;
+    };
+    let Some(route) = resolve_platform_ioapic_gsi(gsi as u32) else {
         return false;
     };
     if executive_event_notification().is_err() {
@@ -17467,7 +17447,13 @@ unsafe fn delay_timer_init() -> bool {
     let Ok(badged) = mint_executive_event_badge(DELAY_TIMER_BADGE) else {
         return false;
     };
-    let Ok(handler) = issue_ioapic_irq_handler_checked(pin, DELAY_TIMER_IRQ, true, false) else {
+    let Ok(handler) = issue_ioapic_irq_handler_checked(
+        route.controller_ordinal as u64,
+        route.local_pin as u64,
+        DELAY_TIMER_IRQ,
+        true,
+        false,
+    ) else {
         let _ = delete_executive_event_badge(badged);
         return false;
     };
@@ -17479,19 +17465,19 @@ unsafe fn delay_timer_init() -> bool {
     // The shared executive event notification is already bound to the root TCB, so an HPET signal
     // cancels any blocking receive and returns DELAY_TIMER_BADGE with empty msginfo.
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    // LEVEL-triggered (matching the IOAPIC pin we just issued) and DISARMED: the timer delivers
+    // LEVEL-triggered (matching the IOAPIC route we just issued) and DISARMED: the timer delivers
     // only while `delay_timer_rearm` has a real deadline to arm it with. Init used to set
     // `Tn_INT_ENB` here and never clear it again, which is what made the disarm path a no-op.
-    let config = HPET_TN_INT_TYPE_LEVEL | (pin << 9);
+    let config = HPET_TN_INT_TYPE_LEVEL | (gsi << 9);
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
     initialize_hpet_monotonic_epoch(period);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
     DELAY_TIMER_BADGED_NOTIFICATION.store(badged, Ordering::Relaxed);
-    DELAY_TIMER_IOAPIC_PIN.store(pin, Ordering::Relaxed);
-    print_str(b"[delay] timer ready pin=");
-    print_u64(pin);
+    DELAY_TIMER_IOAPIC_GSI.store(gsi, Ordering::Relaxed);
+    print_str(b"[delay] timer ready gsi=");
+    print_u64(gsi);
     print_str(b" irq=");
     print_u64(DELAY_TIMER_IRQ);
     print_str(b" period_fs=");
@@ -19329,6 +19315,7 @@ pub(crate) unsafe fn set_recv_mr(i: usize, v: u64) {
 /// word 122. The kernel also programs IOAPIC RTE[pin] → pin fires vector+0x20.
 unsafe fn ioapic_issue_irq_handler_r(
     dest_slot: u64,
+    ioapic_ordinal: u64,
     pin: u64,
     vector: u64,
     level: u64,
@@ -19350,7 +19337,7 @@ unsafe fn ioapic_issue_irq_handler_r(
         inout("rsi") msginfo => reply,
         in("r10") dest_slot, // mr0 = index (dest slot)
         in("r8") 64u64,      // mr1 = depth (init CNode: guard=0, so depth 64 resolves the slot)
-        in("r9") 0u64,       // mr2 = ioapic id (ignored)
+        in("r9") ioapic_ordinal, // mr2 = zero-based controller ordinal in MADT order
         in("r15") pin,       // mr3 = pin
         in("r12") 0u64,
         in("r13") 0u64,
@@ -19362,15 +19349,24 @@ unsafe fn ioapic_issue_irq_handler_r(
 
 unsafe fn ioapic_issue_irq_handler(
     dest_slot: u64,
+    ioapic_ordinal: u64,
     pin: u64,
     vector: u64,
     level: u64,
     polarity: u64,
 ) {
-    let _ = ioapic_issue_irq_handler_r(dest_slot, pin, vector, level, polarity);
+    let _ = ioapic_issue_irq_handler_r(
+        dest_slot,
+        ioapic_ordinal,
+        pin,
+        vector,
+        level,
+        polarity,
+    );
 }
 
 pub(crate) unsafe fn issue_ioapic_irq_handler_checked(
+    ioapic_ordinal: u64,
     pin: u64,
     vector: u64,
     level_sensitive: bool,
@@ -19384,6 +19380,7 @@ pub(crate) unsafe fn issue_ioapic_irq_handler_checked(
     };
     let error = ioapic_issue_irq_handler_r(
         handler,
+        ioapic_ordinal,
         pin,
         vector,
         u64::from(level_sensitive),
@@ -19438,9 +19435,12 @@ pub(crate) unsafe fn clear_ioapic_irq_handler(
     Ok(())
 }
 
-pub(crate) fn executive_reserved_ioapic_line_mask() -> u32 {
-    ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Acquire))
-        | ioapic_route_pin_mask(DELAY_TIMER_IOAPIC_PIN.load(Ordering::Acquire))
+pub(crate) fn executive_ioapic_gsi_reserved(gsi: u32) -> bool {
+    [
+        HPET_PROBE_IOAPIC_GSI.load(Ordering::Acquire),
+        DELAY_TIMER_IOAPIC_GSI.load(Ordering::Acquire),
+    ]
+    .contains(&(gsi as u64))
 }
 
 /// The fixed object path for a syscall's directory index.
@@ -20839,8 +20839,6 @@ struct HostedPciHardwareGrant {
     dev: u8,
     func: u8,
     memory: Vec<HostedPciMemoryGrant>,
-    interrupt_vector: u32,
-    interrupt_latched: bool,
     dma_frame_base: u64,
     dma_pages: u64,
     dma_logical: u64,
@@ -20851,8 +20849,6 @@ impl HostedPciHardwareGrant {
     fn for_device(
         device: &nt_pnp::PciDevice,
         memory: Vec<HostedPciMemoryGrant>,
-        interrupt_vector: u32,
-        interrupt_latched: bool,
         dma: Option<HostedPciDmaGrant>,
     ) -> Option<Self> {
         let memory_bar_count = device
@@ -20897,8 +20893,6 @@ impl HostedPciHardwareGrant {
             dev: device.dev,
             func: device.func,
             memory,
-            interrupt_vector,
-            interrupt_latched,
             dma_frame_base,
             dma_pages,
             dma_logical,
@@ -20948,16 +20942,7 @@ struct HostedPciGrantDiscoveryReport {
     dma_not_required: u64,
     dma_failures: u64,
     missing_memory_bar: u64,
-    missing_interrupt: u64,
     claim_failures: u64,
-}
-
-fn hosted_pci_interrupt_vector(device: &nt_pnp::PciDevice) -> Option<u32> {
-    match (device.irq_pin, device.irq_line) {
-        (1..=4, line) if !matches!(line, 0 | u8::MAX) => Some(line as u32),
-        (1..=4, _) => Q35_PCI_INTX_ROUTES.route(device),
-        _ => None,
-    }
 }
 
 fn hosted_pci_driver_needs_dma(device: &nt_pnp::PciDevice) -> bool {
@@ -21156,7 +21141,6 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     report.missing_memory_bar += 1;
                     continue;
                 }
-                let interrupt_vector = hosted_pci_interrupt_vector(device).unwrap_or(0);
                 let Some(memory) = claim_hosted_pci_memory_grants(bi, device) else {
                     report.claim_failures += 1;
                     continue;
@@ -21168,8 +21152,6 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                         let Some(grant) = HostedPciHardwareGrant::for_device(
                             device,
                             memory,
-                            interrupt_vector,
-                            false,
                             Some(dma),
                         ) else {
                             report.claim_failures += 1;
@@ -21199,8 +21181,6 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     let Some(grant) = HostedPciHardwareGrant::for_device(
                         device,
                         memory,
-                        interrupt_vector,
-                        false,
                         None,
                     ) else {
                         report.claim_failures += 1;
@@ -21435,9 +21415,9 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         device.dev,
                         device.func,
                         memory,
-                        hosted_pci_interrupt_vector(device).is_some(),
-                        grant.interrupt_vector,
-                        grant.interrupt_latched,
+                        false,
+                        0,
+                        false,
                         grant.dma_frame_base,
                         grant.dma_pages,
                         dma_va,
@@ -28525,6 +28505,10 @@ struct Fat32 {
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
+    if initialize_platform_ioapic_topology(bi).is_err() {
+        print_str(b"[boot] platform did not publish a valid IOAPIC topology\n");
+        park();
+    }
     let Some(tsc_frequency_hz) = bi.tsc_frequency_hz() else {
         print_str(b"[boot] platform did not publish a calibrated TSC frequency\n");
         park();
@@ -29303,7 +29287,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
 
     // --- P1: a real hardware interrupt. Program HPET timer 0 for a one-shot, route
-    // it to an IOAPIC pin, get an IRQ-handler cap for that pin (which programs the
+    // it to an IOAPIC GSI, resolve its owning controller/pin, get an IRQ-handler cap (which programs
     // IOAPIC RTE), bind a badged notification, arm the timer, and confirm the real
     // interrupt is delivered. Poll non-blocking so a misfire fails, never hangs.
     if mmio_mapped {
@@ -29319,10 +29303,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             &mut passed,
         );
         if route_cap != 0 {
-            let pin = (31 - route_cap.leading_zeros()) as u64; // highest allowed pin
-            HPET_PROBE_IOAPIC_PIN.store(pin, Ordering::Relaxed);
-            print_str(b"[ntos-exec] HPET timer0 IOAPIC pin = ");
-            print_u64(pin);
+            let gsi = (31 - route_cap.leading_zeros()) as u64;
+            let route = resolve_platform_ioapic_gsi(gsi as u32)
+                .expect("HPET route capability must name one published IOAPIC GSI");
+            HPET_PROBE_IOAPIC_GSI.store(gsi, Ordering::Relaxed);
+            print_str(b"[ntos-exec] HPET timer0 IOAPIC GSI = ");
+            print_u64(gsi);
             print_str(b", vector = ");
             print_u64(IRQ_VECTOR);
             print_str(b"\n");
@@ -29357,15 +29343,20 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // delivers once, the kernel masks the line, and the host wakes cleanly.
             let handler = alloc_slot();
             ioapic_issue_irq_handler(
-                handler, pin, IRQ_VECTOR, /*level*/ 1, /*polarity*/ 0,
+                handler,
+                route.controller_ordinal as u64,
+                route.local_pin as u64,
+                IRQ_VECTOR,
+                /*level*/ 1,
+                /*polarity*/ 0,
             );
             let _ = irq_handler_set_notification(handler, irq_ntfn_badged);
             // Hand the isolated ISR "driver host" ONLY the IRQ + result notifications;
             // its ISR thread blocks on the IRQ and reports via the result notification.
             spawn_isr(isr::isr_entry, irq_ntfn_isr, result_ntfn_badged, 100);
 
-            // Program timer 0: interrupt enable + route to `pin`, LEVEL-triggered, one-shot.
-            let newcfg = (1u64 << 1) | (1u64 << 2) | (pin << 9);
+            // Program timer 0: interrupt enable + route to `gsi`, LEVEL-triggered, one-shot.
+            let newcfg = (1u64 << 1) | (1u64 << 2) | (gsi << 9);
             core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, newcfg);
             // Comparator = now + a small delta so it fires within our poll window.
             let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
@@ -29682,19 +29673,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_str(b"\n");
                 if let Some(dma_grant) = dma_grant {
                     hosted_pci_dma_grants += 1;
-                    if let Some(interrupt_vector) = hosted_pci_interrupt_vector(device) {
-                        if let Some(grant) = HostedPciHardwareGrant::for_device(
-                            device,
-                            memory,
-                            interrupt_vector,
-                            false,
-                            Some(dma_grant),
-                        ) {
-                            hosted_pci_hardware_grants.push(grant);
-                            hosted_pci_existing_grants += 1;
-                        } else {
-                            hosted_pci_existing_grant_failures += 1;
-                        }
+                    if let Some(grant) =
+                        HostedPciHardwareGrant::for_device(device, memory, Some(dma_grant))
+                    {
+                        hosted_pci_hardware_grants.push(grant);
+                        hosted_pci_existing_grants += 1;
                     } else {
                         hosted_pci_existing_grant_failures += 1;
                     }
@@ -31464,8 +31447,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_grant_discovery.dma_failures);
     print_str(b" missing-mmio=");
     print_u64(hosted_pci_grant_discovery.missing_memory_bar);
-    print_str(b" missing-int=");
-    print_u64(hosted_pci_grant_discovery.missing_interrupt);
     print_str(b" claim-failures=");
     print_u64(hosted_pci_grant_discovery.claim_failures);
     print_str(b"\n");
@@ -31475,7 +31456,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             == hosted_pci_grant_discovery.existing_grants
                 + hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.missing_memory_bar == 0
-            && hosted_pci_grant_discovery.missing_interrupt == 0
             && hosted_pci_grant_discovery.dma_grants + hosted_pci_grant_discovery.dma_not_required
                 == hosted_pci_grant_discovery.claimed_grants
             && hosted_pci_grant_discovery.dma_failures == 0

@@ -32,15 +32,6 @@ use nt_pnp::{
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
 static mut PCI_CONFIG_IO_CAP: u64 = 0;
 
-#[derive(Copy, Clone)]
-pub(crate) struct PciInterruptLineProgramming {
-    bus: u8,
-    dev: u8,
-    func: u8,
-    previous_line: u8,
-    assigned_line: u8,
-}
-
 /// Enumerate the complete configured PCI hierarchy through `nt-pnp` using the executive's
 /// port-I/O config access. The walk follows validated PCI-to-PCI bridge bus windows from bus 0.
 pub(crate) unsafe fn enumerate_pci_hierarchy(
@@ -131,112 +122,6 @@ pub(crate) unsafe fn write_pci_config(
         register += 4;
     }
     Ok(())
-}
-
-/// Program the platform-selected INTx line into PCI configuration space immediately before START.
-/// The returned record makes the write transactional with the remaining device-start operation.
-pub(crate) unsafe fn program_pci_interrupt_line(
-    device: &PciDevice,
-    assigned_line: u32,
-) -> Result<Option<PciInterruptLineProgramming>, nt_status::NtStatus> {
-    if device.irq_pin == 0 {
-        return if assigned_line == 0 {
-            Ok(None)
-        } else {
-            Err(nt_status::NtStatus::INVALID_PARAMETER)
-        };
-    }
-    let assigned_line = u8::try_from(assigned_line)
-        .ok()
-        .filter(|line| *line != u8::MAX)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    if PCI_CONFIG_IO_CAP == 0 {
-        print_str(b"[pnp] PCI InterruptLine program rejected: configuration authority absent\n");
-        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
-    }
-    let interrupt = pci_read32(PCI_CONFIG_IO_CAP, device.bus, device.dev, device.func, 0x3c);
-    let previous_line = interrupt as u8;
-    if previous_line != device.irq_line {
-        print_str(b"[pnp] PCI InterruptLine program rejected: stale snapshot current=");
-        print_u64(previous_line as u64);
-        print_str(b" enumerated=");
-        print_u64(device.irq_line as u64);
-        print_str(b" assigned=");
-        print_u64(assigned_line as u64);
-        print_str(b"\n");
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    if previous_line != assigned_line {
-        pci_write32(
-            PCI_CONFIG_IO_CAP,
-            device.bus,
-            device.dev,
-            device.func,
-            0x3c,
-            (interrupt & !0xff) | assigned_line as u32,
-        );
-        if pci_read32(PCI_CONFIG_IO_CAP, device.bus, device.dev, device.func, 0x3c) as u8
-            != assigned_line
-        {
-            print_str(b"[pnp] PCI InterruptLine write did not latch bus=");
-            print_u64(device.bus as u64);
-            print_str(b" dev=");
-            print_u64(device.dev as u64);
-            print_str(b" func=");
-            print_u64(device.func as u64);
-            print_str(b" assigned=");
-            print_u64(assigned_line as u64);
-            print_str(b"\n");
-            pci_write32(
-                PCI_CONFIG_IO_CAP,
-                device.bus,
-                device.dev,
-                device.func,
-                0x3c,
-                interrupt,
-            );
-            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        }
-    }
-    Ok(Some(PciInterruptLineProgramming {
-        bus: device.bus,
-        dev: device.dev,
-        func: device.func,
-        previous_line,
-        assigned_line,
-    }))
-}
-
-pub(crate) unsafe fn restore_pci_interrupt_line(programming: PciInterruptLineProgramming) -> bool {
-    if PCI_CONFIG_IO_CAP == 0 || programming.previous_line == programming.assigned_line {
-        return PCI_CONFIG_IO_CAP != 0;
-    }
-    let interrupt = pci_read32(
-        PCI_CONFIG_IO_CAP,
-        programming.bus,
-        programming.dev,
-        programming.func,
-        0x3c,
-    );
-    if interrupt as u8 != programming.assigned_line {
-        return false;
-    }
-    pci_write32(
-        PCI_CONFIG_IO_CAP,
-        programming.bus,
-        programming.dev,
-        programming.func,
-        0x3c,
-        (interrupt & !0xff) | programming.previous_line as u32,
-    );
-    pci_read32(
-        PCI_CONFIG_IO_CAP,
-        programming.bus,
-        programming.dev,
-        programming.func,
-        0x3c,
-    ) as u8
-        == programming.previous_line
 }
 
 /// The PCI function and raw/translated START resource bytes selected for one registry devnode.

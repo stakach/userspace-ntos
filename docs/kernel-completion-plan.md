@@ -19745,3 +19745,75 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     component client, File-less request, major/minor/control code, relation claim, and hosted-domain
     identity before copying or acknowledgement. Prepare the complete resolved route publication
     before registry/CM side effects and commit or revoke it with the same accepted bus transaction.
+
+    B3 firmware-owned IOAPIC topology checkpoint (2026-08-31, implementation green): rust-micro
+    now validates the complete MADT controller catalog instead of discovering only its first
+    IOAPIC. Known MADT entries use exact lengths and reserved encodings; every controller has a
+    dedicated uncached mapping, a unique firmware id/address/GSI base, a matching hardware id, and
+    a hardware-reported redirection count whose GSI range cannot overlap another controller. Boot
+    masks and clears every hardware-sized redirection entry before publishing the immutable
+    catalog. There is no `0xfec00000` fallback, 24-entry assumption, saturating GSI alias, ignored
+    controller id, or controller-wide vector scan.
+
+    IRQControl now consumes the real zero-based MADT controller ordinal and controller-local pin.
+    Each issued handler owns that exact source until its final capability is deleted; notification
+    Clear preserves source ownership, final deletion masks and releases it, and duplicate vector or
+    source claims fail with revocation semantics before hardware is changed. Delivery, Ack, Clear,
+    and teardown are constant-time exact-route operations. Handler caps participate in checked
+    32-bit capability refcounts. Routes target the measured BSP APIC id, unsupported MSI issuance
+    fails closed, and vectors without installed IRQ gates are rejected rather than programmed.
+    The rust-micro freestanding `extern-rootserver,spec` and production checks pass at their existing
+    warning baselines. Commits `5b96a24` and `b65a2bc` were pushed to `rust-micro` before advancing
+    the parent submodule.
+
+    B3 typed GSI/controller handoff checkpoint (2026-08-31, implementation green): the microkernel
+    publishes its firmware-ordered `{gsi_base, redirection_entries}` catalog in a bounded typed
+    extended-BootInfo chunk. IOAPIC MMIO and programming authority remain kernel-private. `sel4-rt`
+    validates the chunk framing, reserved fields, nonzero extents, arithmetic, and overlap before
+    exposing it. `nt-acpi` now retains ordered MADT IOAPIC descriptors alongside interrupt-source
+    overrides and host-tests exact multi-controller resolution, nonzero bases, gaps, high GSIs,
+    overlaps, and unroutable inputs. The executive requires the BootInfo and independently mapped
+    MADT catalogs to match in order before publishing ACPI platform resources.
+
+    HPET proof, delay timing, ACPI SCI, and hosted device IRQ issuance now resolve a physical GSI to
+    one exact `{controller ordinal, local pin}` before invoking IRQControl. Hosted IRQ badges use
+    dynamically allocated live-route slots rather than `1 << GSI`; sparse and GSI >= 32 routes no
+    longer overflow the pending mask, while any number of device connections can share one
+    electrically compatible physical route. The compiled q35 PIRQ table and PCI config
+    `InterruptLine` authority were deleted. PCI hardware windows now publish MMIO/DMA only until a
+    generation-owned provider route exists; absence of `_PRT/_CRS` publication is a barrier, not a
+    fallback. Focused `nt-acpi` validation passes 24/24, the executive freestanding check passes at
+    the unchanged 209-warning baseline, and formatting plus `git diff --check` are clean.
+
+    B3 PCI config-line authority removal checkpoint (2026-08-31, implementation green): PCI
+    BootResources no longer infer a raw interrupt from the config-space `InterruptLine` byte. A
+    provider-owned assignment supplies both the raw bus-level GSI and translated vector; without
+    that assignment the PDO publishes only its BAR resources while retaining an interrupt
+    requirement for later arbitration. Host tests prove that a populated config byte is omitted
+    without a provider route and cannot replace the assignment's GSI.
+
+    The executive no longer writes PCI register `0x3c` during START, retains an InterruptLine
+    programming record, publishes that record into device state, or restores the byte on rollback.
+    Those branches and types were deleted across PnP preparation, resource grant, canonical START,
+    completion publication, and rollback. The byte remains only as explicitly named observational
+    PCI config inventory returned through bus-data access. Focused `nt-pnp` validation passes 45/45;
+    `nt-acpi` remains 24/24; and the executive freestanding check remains green at the unchanged
+    209-warning baseline.
+
+    Review adjustment: runtime validation is deferred because the existing 12-hour desktop QEMU
+    still owns the serialized boot lane and was not interrupted. Continue B3 with provider
+    conformance for standard `IOCTL_ACPI_ENUM_CHILDREN` and unique no-UID PDO identities, then add
+    the one-at-a-time namespace, `_PRT`, and route-specific `_CRS` phases to the retained bus
+    transaction. Commit the complete route set atomically with its inventory/devnode generation;
+    only that claim may add PCI interrupt resources or mint handlers. Runtime acceptance must cover
+    synthetic multi-controller layouts with gaps/nonzero bases/high GSIs, stale-generation route
+    revocation, two shared NIC consumers, genuine ACPI SCI delivery, and a serialized desktop boot.
+
+    Before broad hardware acceptance, extend rust-micro's installed external IRQ entry/vector
+    allocator beyond the current explicit IRQ 1..15 gates without colliding with exceptions, LAPIC
+    timer, IPIs, or syscall vectors. Implement genuine MSI/MSI-X programming and ownership before
+    accepting those IRQControl labels. The single bound-notification route namespace currently has
+    61 simultaneous physical-route slots; connection count is unbounded through sharing, but more
+    than 61 distinct live routes requires notification sharding rather than another fixed bitmap.
+    Remove the remaining HPET boot-proof reservation from ordinary production policy once a generic
+    timer resource owner provides the same hardware acceptance evidence.

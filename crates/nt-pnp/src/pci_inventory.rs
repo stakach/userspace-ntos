@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_change_is_distinct_from_programmable_irq_line_refresh() {
+    fn resource_change_is_distinct_from_observed_irq_line_refresh() {
         let old = function(0, 3, 0x8086, 0x100e, 0xfebc_0000);
         let mut refreshed = old.clone();
         refreshed.irq_line = 5;

@@ -1141,14 +1141,7 @@ where
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ));
         };
-        let firmware_routed = device.irq_pin != 0 && !matches!(device.irq_line, 0 | u8::MAX);
-        let boot_interrupt = firmware_routed.then_some(nt_pnp::PciInterruptAssignment {
-            bus_level: device.irq_line as u32,
-            vector: window.interrupt_vector,
-            latched: window.interrupt_latched,
-            affinity: 1,
-        });
-        let Some(bus_resources) = build_devnode_pci_bus_resources(device, boot_interrupt) else {
+        let Some(bus_resources) = build_devnode_pci_bus_resources(device, None) else {
             return Err(release_context_lease_after_error(
                 lease,
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -1578,14 +1571,9 @@ unsafe fn start_filtered_devnode(
                     device_id,
                     &grant.raw_resource_list,
                     &grant.translated_resource_list,
-                    grant.pci_interrupt_line,
                 ),
                 Err(status) => CanonicalStartDisposition::Terminal {
-                    status: rollback_pre_dispatch_start(
-                        device_id,
-                        grant.pci_interrupt_line,
-                        status,
-                    ),
+                    status: rollback_pre_dispatch_start(device_id, status),
                     waited: false,
                 },
             }
@@ -1595,14 +1583,14 @@ unsafe fn start_filtered_devnode(
             &[],
             &[],
         ) {
-            Ok(()) => canonical_start_status(device_id, &[], &[], None),
+            Ok(()) => canonical_start_status(device_id, &[], &[]),
             Err(status) => CanonicalStartDisposition::Terminal {
-                status: rollback_pre_dispatch_start(device_id, None, status),
+                status: rollback_pre_dispatch_start(device_id, status),
                 waited: false,
             },
         },
         Err(status) => {
-            let status = rollback_pre_dispatch_start(device_id, None, status);
+            let status = rollback_pre_dispatch_start(device_id, status);
             print_resource_grant_failure(options.trace, service_name, instance_id, status);
             CanonicalStartDisposition::Terminal {
                 status,
@@ -1679,13 +1667,11 @@ unsafe fn canonical_start_status(
     device_id: u64,
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
-    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
 ) -> CanonicalStartDisposition {
     match driver_launch::start_hosted_device_canonical(
         device_id,
         raw_resource_list,
         translated_resource_list,
-        pci_interrupt_line,
     ) {
         Ok(driver_launch::HostedPnpStartOutcome::Started) => CanonicalStartDisposition::Terminal {
             status: nt_status::NtStatus::SUCCESS,
@@ -1710,7 +1696,7 @@ unsafe fn canonical_start_status(
             observe_canonical_start(irp_id, false, true)
         }
         Err(failure) if failure.rollback_safe => CanonicalStartDisposition::Terminal {
-            status: rollback_pre_dispatch_start(device_id, pci_interrupt_line, failure.status),
+            status: rollback_pre_dispatch_start(device_id, failure.status),
             waited: false,
         },
         Err(failure) => CanonicalStartDisposition::Terminal {
@@ -1757,20 +1743,10 @@ unsafe fn observe_canonical_start(
 
 unsafe fn rollback_pre_dispatch_start(
     device_id: u64,
-    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
     original_status: nt_status::NtStatus,
 ) -> nt_status::NtStatus {
     if let Err(status) = driver_launch::rollback_hosted_device_start(device_id) {
         return status;
-    }
-    if pci_interrupt_line
-        .map(|programming| crate::pnp::restore_pci_interrupt_line(programming))
-        .is_some_and(|restored| !restored)
-    {
-        print_str(b"[driver-launch] PCI InterruptLine rollback failed device_id=");
-        print_u64(device_id);
-        print_str(b"\n");
-        return nt_status::NtStatus::UNSUCCESSFUL;
     }
     original_status
 }

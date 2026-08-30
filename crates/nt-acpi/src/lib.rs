@@ -14,7 +14,11 @@ mod madt;
 mod namespace;
 mod pci_routing;
 
-pub use madt::{parse_madt_interrupt_overrides, MadtError};
+pub use madt::{
+    parse_madt_interrupt_topology, resolve_ioapic_gsi, validate_ioapic_route_extents,
+    IoApicRouteError, IoApicRouteExtent, MadtError, MadtInterruptTopology, MadtIoApic,
+    ResolvedIoApicRoute,
+};
 pub use namespace::{
     immediate_namespace_children_input, namespace_children_required_len, parse_namespace_children,
     resolve_namespace_reference, AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError,
@@ -48,6 +52,7 @@ pub enum AcpiError {
     DuplicateTableAddress,
     DuplicateFadt,
     DuplicateMadt,
+    MissingMadt,
     Allocation,
     PhysicalRead,
     DiscoveryLimit,
@@ -297,6 +302,9 @@ pub struct AcpiPlatformResources {
     /// The FACS is not an SDT and therefore has no checksum.
     pub facs: Option<PhysicalRange>,
     pub fixed: FixedAcpiDescription,
+    /// IOAPICs in firmware MADT order. Hardware route extents are supplied separately by the
+    /// microkernel after it validates each controller's version register.
+    pub io_apics: Vec<MadtIoApic>,
     /// MADT ISA-source translations used when an ACPI link reports a legacy IRQ.
     pub interrupt_overrides: Vec<LegacyIrqOverride>,
     /// Page-normalized, sorted, non-overlapping extents containing every discovered table.
@@ -334,7 +342,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         .try_reserve_exact(root.entries.len().saturating_add(1))
         .map_err(|_| AcpiError::Allocation)?;
     let mut fadt_bytes = None;
-    let mut interrupt_overrides = None;
+    let mut madt_topology = None;
     for address in root.entries {
         let (table, bytes) = read_sdt(reader, address, limits.max_table_length)?;
         if table.signature == FADT_SIGNATURE {
@@ -343,16 +351,16 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
             }
             fadt_bytes = Some(bytes);
         } else if table.signature == MADT_SIGNATURE {
-            if interrupt_overrides.is_some() {
+            if madt_topology.is_some() {
                 return Err(AcpiError::DuplicateMadt);
             }
-            interrupt_overrides =
-                Some(parse_madt_interrupt_overrides(&bytes).map_err(|_| AcpiError::InvalidMadt)?);
+            madt_topology =
+                Some(parse_madt_interrupt_topology(&bytes).map_err(|_| AcpiError::InvalidMadt)?);
         }
         tables.push(table);
     }
     let fixed = FixedAcpiDescription::parse(&fadt_bytes.ok_or(AcpiError::MissingFadt)?)?;
-    let interrupt_overrides = interrupt_overrides.unwrap_or_default();
+    let madt_topology = madt_topology.ok_or(AcpiError::MissingMadt)?;
 
     if tables.len() >= limits.max_tables {
         return Err(AcpiError::DiscoveryLimit);
@@ -395,7 +403,8 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         facs,
         fixed_registers: normalized_fixed_registers(&fixed)?,
         firmware_memory: normalize_physical_ranges(&firmware_extents)?,
-        interrupt_overrides,
+        io_apics: madt_topology.io_apics,
+        interrupt_overrides: madt_topology.interrupt_overrides,
         fixed,
     })
 }
@@ -936,6 +945,9 @@ mod tests {
 
         let mut madt = vec![0; SDT_HEADER_LEN + 8];
         write_u32(&mut madt, SDT_HEADER_LEN + 4, 1);
+        madt.extend_from_slice(&[1, 12, 0, 0]);
+        madt.extend_from_slice(&0xfec0_0000u32.to_le_bytes());
+        madt.extend_from_slice(&0u32.to_le_bytes());
         madt.extend_from_slice(&[2, 10, 0, 9]);
         madt.extend_from_slice(&20u32.to_le_bytes());
         madt.extend_from_slice(&0x000fu16.to_le_bytes());
@@ -962,6 +974,14 @@ mod tests {
         assert_eq!(resources.fixed.facs_address, Some(FACS));
         assert_eq!(resources.tables.len(), 4);
         assert_eq!(resources.tables.last().unwrap().signature, *b"DSDT");
+        assert_eq!(
+            resources.io_apics,
+            vec![MadtIoApic {
+                id: 0,
+                address: 0xfec0_0000,
+                gsi_base: 0,
+            }]
+        );
         assert_eq!(
             resources.interrupt_overrides,
             vec![LegacyIrqOverride {

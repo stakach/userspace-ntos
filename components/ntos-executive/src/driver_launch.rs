@@ -372,7 +372,7 @@ pub const SH_RESOURCE_BUS_NUMBER: u64 = 0x4D0; // in: granted bus number
 pub const SH_RESOURCE_ADDRESS: u64 = 0x4D8; // in: DevicePropertyAddress value
 pub const SH_RESOURCE_PCI_VENDOR_DEVICE: u64 = 0x4E0; // in: PCI config dword 0x00
 pub const SH_RESOURCE_PCI_CLASS_REV: u64 = 0x4E8; // in: PCI config dword 0x08
-pub const SH_RESOURCE_PCI_IRQ: u64 = 0x4F0; // in: PCI interrupt line/pin bytes
+pub const SH_RESOURCE_PCI_IRQ: u64 = 0x4F0; // in: observed PCI config line/pin bytes
 pub const SH_REGISTRY_IDENTITY_FLAGS: u64 = 0x500; // in: hosted registry identity flags
 pub const SH_REGISTRY_INSTANCE_LEN: u64 = 0x504; // in: ASCII bytes in instance path
 pub const SH_REGISTRY_DRIVER_KEY_LEN: u64 = 0x506; // in: ASCII bytes in class driver key
@@ -6869,7 +6869,7 @@ pub(crate) struct HostedBusIdentity {
     pub pci_vendor_id: u16,
     pub pci_device_id: u16,
     pub pci_class: u32,
-    pub pci_irq_line: u8,
+    pub pci_config_irq_line: u8,
     pub pci_irq_pin: u8,
 }
 
@@ -6882,7 +6882,7 @@ impl HostedBusIdentity {
             pci_vendor_id: 0,
             pci_device_id: 0,
             pci_class: 0,
-            pci_irq_line: 0,
+            pci_config_irq_line: 0,
             pci_irq_pin: 0,
         }
     }
@@ -6904,7 +6904,7 @@ impl HostedBusIdentity {
             pci_vendor_id: vendor,
             pci_device_id: device,
             pci_class: class,
-            pci_irq_line: irq_line,
+            pci_config_irq_line: irq_line,
             pci_irq_pin: irq_pin,
         }
     }
@@ -39482,7 +39482,6 @@ struct HostedDeviceResourceState {
     video_memory_phys: u64,
     video_memory_len: u64,
     video_memory_caller_va: u64,
-    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
     pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
     evidence: HostedHardwareEvidence,
 }
@@ -39491,12 +39490,15 @@ struct HostedDeviceResourceState {
 struct HostedIrqConnection {
     binding: HostedDeviceBinding,
     interrupt_id: u64,
-    line: u32,
+    gsi: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedIrqLine {
-    line: u32,
+    gsi: u32,
+    controller_ordinal: u16,
+    local_pin: u16,
+    event_bit: u8,
     vector: u32,
     level_sensitive: bool,
     active_low: bool,
@@ -39544,7 +39546,7 @@ static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
-static HOSTED_IRQ_PENDING_LINES: AtomicU32 = AtomicU32::new(0);
+static HOSTED_IRQ_PENDING_EVENTS: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
 static mut HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS: Option<
@@ -39803,8 +39805,6 @@ struct HostedPnpTransaction {
     phase: HostedPnpTransactionPhase,
     driver_status: Option<nt_status::NtStatus>,
     barrier_status: Option<nt_status::NtStatus>,
-    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
-    pci_line_published: bool,
     mmio_usage_published: bool,
     interrupt_usage_published: bool,
     dma_usage_published: bool,
@@ -40230,7 +40230,8 @@ unsafe fn install_pending_hosted_pnp_context_lease(
         pci_vendor_device: (bus_identity.pci_device_id as u32) << 16
             | bus_identity.pci_vendor_id as u32,
         pci_class_rev: (bus_identity.pci_class & 0x00FF_FFFF) << 8,
-        pci_irq: bus_identity.pci_irq_line as u32 | ((bus_identity.pci_irq_pin as u32) << 8),
+        pci_irq: bus_identity.pci_config_irq_line as u32
+            | ((bus_identity.pci_irq_pin as u32) << 8),
         pnp_context_lease: Some(lease),
         ..HostedDeviceResourceState::default()
     };
@@ -40807,8 +40808,6 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
     let terminal_status = transaction
         .driver_status
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let pci_interrupt_line = transaction.pci_interrupt_line;
-    let pci_line_published = transaction.pci_line_published;
     let mmio_usage_published = transaction.mmio_usage_published;
     let interrupt_usage_published = transaction.interrupt_usage_published;
     let dma_usage_published = transaction.dma_usage_published;
@@ -40817,21 +40816,6 @@ unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status
         .map(|(_, instance)| instance.exec_shared_va)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
 
-    if !pci_line_published {
-        let state = hosted_device_resource_states_mut()
-            .iter_mut()
-            .find(|state| {
-                state.device_id == binding.device_id
-                    && state.projection_domain == binding.projection_domain
-            })
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        state.pci_interrupt_line = pci_interrupt_line;
-        hosted_pnp_transactions_mut()
-            .iter_mut()
-            .find(|transaction| transaction.irp_id == irp_id)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
-            .pci_line_published = true;
-    }
     if !mmio_usage_published {
         record_hosted_mmio_usage(binding, sh)?;
         hosted_pnp_transactions_mut()
@@ -41192,28 +41176,43 @@ unsafe fn hosted_irq_connections() -> Option<&'static Vec<HostedIrqConnection>> 
     (*core::ptr::addr_of!(HOSTED_IRQ_CONNECTIONS)).as_ref()
 }
 
-pub(crate) fn hosted_irq_line_mask() -> u32 {
+pub(crate) fn hosted_irq_gsi_mask() -> u32 {
     unsafe {
         hosted_irq_lines()
             .map(|lines| {
-                lines
-                    .iter()
-                    .fold(0u32, |mask, route| mask | (1u32 << route.line))
+                lines.iter().fold(0u32, |mask, route| {
+                    if route.gsi < u32::BITS {
+                        mask | (1u32 << route.gsi)
+                    } else {
+                        mask
+                    }
+                })
             })
             .unwrap_or(0)
     }
 }
 
 pub(crate) fn hosted_irq_routes_active() -> bool {
-    hosted_irq_line_mask() != 0
+    unsafe { hosted_irq_lines().is_some_and(|lines| !lines.is_empty()) }
 }
 
-pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u32 {
-    let lines = crate::hosted_irq_lines_from_badge(badge);
-    if lines != 0 {
-        HOSTED_IRQ_PENDING_LINES.fetch_or(lines, Ordering::AcqRel);
+pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u64 {
+    let events = crate::hosted_irq_lines_from_badge(badge);
+    if events != 0 {
+        HOSTED_IRQ_PENDING_EVENTS.fetch_or(events, Ordering::AcqRel);
     }
-    lines
+    events
+}
+
+unsafe fn allocate_hosted_irq_event_bit() -> Option<u8> {
+    let used = hosted_irq_lines()
+        .map(|lines| {
+            lines
+                .iter()
+                .fold(0u64, |bits, line| bits | (1u64 << line.event_bit))
+        })
+        .unwrap_or(0);
+    (0..crate::HOSTED_IRQ_EVENT_SLOT_COUNT).find(|bit| used & (1u64 << bit) == 0)
 }
 
 unsafe fn install_hosted_irq_connection(
@@ -41244,18 +41243,21 @@ unsafe fn install_hosted_irq_connection(
             != (route.mode == nt_hal_abi::INT_MODE_LATCHED)
         || state.interrupt_shared != (route.share == nt_hal_abi::SHARE_SHARED)
         || !state.interrupt_route_authoritative
-        || route.line >= 24
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let hardware_route = crate::resolve_platform_ioapic_gsi(route.line)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
 
     if let Some(existing) = hosted_irq_lines().and_then(|lines| {
         lines
             .iter()
             .copied()
-            .find(|existing| existing.line == route.line)
+            .find(|existing| existing.gsi == route.line)
     }) {
-        if existing.vector != route.translated_vector
+        if existing.controller_ordinal != hardware_route.controller_ordinal
+            || existing.local_pin != hardware_route.local_pin
+            || existing.vector != route.translated_vector
             || existing.level_sensitive != !state.interrupt_latched
             || existing.active_low != state.interrupt_active_low
             || !existing.shared
@@ -41269,7 +41271,7 @@ unsafe fn install_hosted_irq_connection(
         hosted_irq_connections_mut().push(HostedIrqConnection {
             binding,
             interrupt_id,
-            line: route.line,
+            gsi: route.line,
         });
         return Ok(());
     }
@@ -41278,7 +41280,7 @@ unsafe fn install_hosted_irq_connection(
         lines
             .iter()
             .any(|existing| existing.vector == route.translated_vector)
-    }) || crate::executive_reserved_ioapic_line_mask() & (1u32 << route.line) != 0
+    }) || crate::executive_ioapic_gsi_reserved(route.line)
     {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
@@ -41288,11 +41290,14 @@ unsafe fn install_hosted_irq_connection(
     hosted_irq_connections_mut()
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let event_bit = allocate_hosted_irq_event_bit()
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
 
-    let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << route.line);
+    let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << event_bit);
     let notification_cap = crate::mint_executive_event_badge(badge)?;
     let handler_cap = match crate::issue_ioapic_irq_handler_checked(
-        route.line as u64,
+        hardware_route.controller_ordinal as u64,
+        hardware_route.local_pin as u64,
         route.translated_vector as u64,
         !state.interrupt_latched,
         state.interrupt_active_low,
@@ -41304,7 +41309,10 @@ unsafe fn install_hosted_irq_connection(
         }
     };
     hosted_irq_lines_mut().push(HostedIrqLine {
-        line: route.line,
+        gsi: route.line,
+        controller_ordinal: hardware_route.controller_ordinal,
+        local_pin: hardware_route.local_pin,
+        event_bit,
         vector: route.translated_vector,
         level_sensitive: !state.interrupt_latched,
         active_low: state.interrupt_active_low,
@@ -41315,7 +41323,7 @@ unsafe fn install_hosted_irq_connection(
     hosted_irq_connections_mut().push(HostedIrqConnection {
         binding,
         interrupt_id,
-        line: route.line,
+        gsi: route.line,
     });
     if let Err(status) = crate::irq_handler_set_notification_checked(handler_cap, notification_cap)
     {
@@ -41346,7 +41354,7 @@ unsafe fn retire_hosted_irq_connection(
     let last_on_line = hosted_irq_connections().is_none_or(|connections| {
         connections
             .iter()
-            .filter(|candidate| candidate.line == connection.line)
+            .filter(|candidate| candidate.gsi == connection.gsi)
             .count()
             == 1
     });
@@ -41355,14 +41363,14 @@ unsafe fn retire_hosted_irq_connection(
             lines
                 .iter()
                 .copied()
-                .find(|line| line.line == connection.line)
+                .find(|line| line.gsi == connection.gsi)
         })
     } else {
         None
     };
     if let Some(line) = line {
         crate::clear_ioapic_irq_handler(line.handler_cap)?;
-        hosted_irq_lines_mut().retain(|candidate| candidate.line != line.line);
+        hosted_irq_lines_mut().retain(|candidate| candidate.gsi != line.gsi);
         crate::delete_executive_event_badge(line.notification_cap)?;
     }
     hosted_irq_connections_mut().retain(|candidate| candidate.interrupt_id != interrupt_id);
@@ -41397,7 +41405,7 @@ unsafe fn dispatch_hosted_irq_connection(
     let route = hosted_resource_manager_mut()
         .connected_interrupt_route(connection.interrupt_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if route.line != connection.line {
+    if route.line != connection.gsi {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let (_, inst) = instance_by_driver_id(binding.driver_id)
@@ -41434,13 +41442,13 @@ unsafe fn dispatch_hosted_irq_connection(
     Ok(information != 0)
 }
 
-unsafe fn service_hosted_irq_line(line_number: u32) -> Result<u64, nt_status::NtStatus> {
+unsafe fn service_hosted_irq_event(event_bit: u8) -> Result<u64, nt_status::NtStatus> {
     let line = hosted_irq_lines()
         .and_then(|lines| {
             lines
                 .iter()
                 .copied()
-                .find(|line| line.line == line_number)
+                .find(|line| line.event_bit == event_bit)
         })
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let mut connections = Vec::new();
@@ -41451,7 +41459,7 @@ unsafe fn service_hosted_irq_line(line_number: u32) -> Result<u64, nt_status::Nt
         connections.extend(
             live.iter()
                 .copied()
-                .filter(|connection| connection.line == line_number),
+                .filter(|connection| connection.gsi == line.gsi),
         );
     }
     let mut claimed = 0u64;
@@ -41474,19 +41482,19 @@ unsafe fn service_hosted_irq_line(line_number: u32) -> Result<u64, nt_status::Nt
 pub(crate) unsafe fn drain_pending_hosted_irqs() -> u64 {
     let mut serviced = 0u64;
     loop {
-        let pending = HOSTED_IRQ_PENDING_LINES.swap(0, Ordering::AcqRel);
+        let pending = HOSTED_IRQ_PENDING_EVENTS.swap(0, Ordering::AcqRel);
         if pending == 0 {
             return serviced;
         }
         let mut bits = pending;
         while bits != 0 {
-            let line = bits.trailing_zeros();
-            bits &= !(1u32 << line);
-            match service_hosted_irq_line(line) {
+            let event_bit = bits.trailing_zeros() as u8;
+            bits &= !(1u64 << event_bit);
+            match service_hosted_irq_event(event_bit) {
                 Ok(_) => serviced += 1,
                 Err(status) => {
-                    print_str(b"[hosted-irq] dispatch failed line=");
-                    print_u64(line as u64);
+                    print_str(b"[hosted-irq] dispatch failed event=");
+                    print_u64(event_bit as u64);
                     print_str(b" status=0x");
                     print_hex(status.raw() as u32);
                     print_str(b"\n");
@@ -42902,7 +42910,6 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         video_memory_phys: read_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *const u64),
         video_memory_len: read_volatile((sh + SH_VIDEO_MEMORY_LEN) as *const u64),
         video_memory_caller_va: read_volatile((sh + SH_VIDEO_MEMORY_CALLER_VA) as *const u64),
-        pci_interrupt_line: previous_state.and_then(|state| state.pci_interrupt_line),
         pnp_context_lease: previous_state.and_then(|state| state.pnp_context_lease),
         evidence,
     }
@@ -48056,7 +48063,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     );
     write_volatile(
         (sh + SH_RESOURCE_PCI_IRQ) as *mut u32,
-        bus_identity.pci_irq_line as u32 | ((bus_identity.pci_irq_pin as u32) << 8),
+        bus_identity.pci_config_irq_line as u32 | ((bus_identity.pci_irq_pin as u32) << 8),
     );
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
@@ -49061,8 +49068,6 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
         barrier_status: None,
-        pci_interrupt_line: None,
-        pci_line_published: false,
         mmio_usage_published: false,
         interrupt_usage_published: false,
         dma_usage_published: false,
@@ -49178,7 +49183,6 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     device_id: u64,
     raw_resource_list: &[u8],
     translated_resource_list: &[u8],
-    pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
 ) -> Result<HostedPnpStartOutcome, HostedPnpStartFailure> {
     let local_failure = |status| HostedPnpStartFailure {
         status,
@@ -49268,8 +49272,6 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
         barrier_status: None,
-        pci_interrupt_line,
-        pci_line_published: false,
         mmio_usage_published: false,
         interrupt_usage_published: false,
         dma_usage_published: false,

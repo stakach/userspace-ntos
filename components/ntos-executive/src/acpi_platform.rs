@@ -6,6 +6,7 @@
 
 use crate::*;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const PAGE_SIZE: u64 = nt_acpi::ACPI_PAGE_SIZE;
 const MAX_CANONICAL_PAGES: u64 = 4096;
@@ -13,6 +14,49 @@ const BIOS_DATA_AREA_POINTER: u64 = 0x40e;
 const EBDA_SCAN_BYTES: u64 = 1024;
 const HIGH_BIOS_BASE: u64 = 0xe0000;
 const HIGH_BIOS_BYTES: u64 = 0x20000;
+
+const EMPTY_IOAPIC_EXTENT: nt_acpi::IoApicRouteExtent = nt_acpi::IoApicRouteExtent {
+    gsi_base: 0,
+    redirection_entries: 0,
+};
+
+static PLATFORM_IOAPIC_COUNT: AtomicU32 = AtomicU32::new(0);
+static mut PLATFORM_IOAPICS: [nt_acpi::IoApicRouteExtent; sel4_rt::MAX_BOOT_IOAPICS] =
+    [EMPTY_IOAPIC_EXTENT; sel4_rt::MAX_BOOT_IOAPICS];
+
+pub(crate) unsafe fn initialize_platform_ioapic_topology(
+    boot_info: &BootInfo,
+) -> Result<(), nt_status::NtStatus> {
+    if PLATFORM_IOAPIC_COUNT.load(Ordering::Acquire) != 0 {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let controllers = boot_info
+        .ioapic_topology()
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    for (ordinal, controller) in controllers.iter().enumerate() {
+        PLATFORM_IOAPICS[ordinal] = nt_acpi::IoApicRouteExtent {
+            gsi_base: controller.gsi_base,
+            redirection_entries: controller.redirection_entries,
+        };
+    }
+    PLATFORM_IOAPIC_COUNT.store(controllers.len() as u32, Ordering::Release);
+    Ok(())
+}
+
+pub(crate) fn resolve_platform_ioapic_gsi(gsi: u32) -> Option<nt_acpi::ResolvedIoApicRoute> {
+    let count = PLATFORM_IOAPIC_COUNT.load(Ordering::Acquire) as usize;
+    let controllers = unsafe { &PLATFORM_IOAPICS[..count] };
+    nt_acpi::resolve_ioapic_gsi(controllers, gsi).ok()
+}
+
+fn validate_platform_ioapic_firmware(
+    controllers: &[nt_acpi::MadtIoApic],
+) -> Result<(), nt_status::NtStatus> {
+    let count = PLATFORM_IOAPIC_COUNT.load(Ordering::Acquire) as usize;
+    let kernel = unsafe { &PLATFORM_IOAPICS[..count] };
+    nt_acpi::validate_ioapic_route_extents(controllers, kernel)
+        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)
+}
 
 pub(crate) const ACPI_ROOT_INSTANCE_PATH: &str = r"ACPI_HAL\PNP0C08\0";
 pub(crate) const ACPI_ROOT_HARDWARE_ID: &str = r"ACPI_HAL\PNP0C08";
@@ -374,6 +418,7 @@ unsafe fn discover_acpi_platform_authority_inner(
     if discovery.root.signature != expected_root_signature {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
+    validate_platform_ioapic_firmware(&discovery.io_apics)?;
 
     let bda = nt_acpi::PhysicalMemoryReader::read(&mut reader, BIOS_DATA_AREA_POINTER, 2)
         .map_err(|_| reader.failure.unwrap_or(nt_status::NtStatus::UNSUCCESSFUL))?;
