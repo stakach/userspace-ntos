@@ -395,6 +395,70 @@ impl<P: ObjectManagerPort> IoManager<P> {
         Ok(copied)
     }
 
+    /// Copy a completed METHOD_BUFFERED device-control payload by its declared output capacity,
+    /// independently of `IoStatus.Information`.
+    ///
+    /// This is the pending-completion companion to
+    /// [`IoManager::buffered_device_control_device_payload`]. It exists for standard IOCTLs that
+    /// define a valid structured failure/overflow payload while returning zero Information.
+    pub fn copy_completed_buffered_device_control_payload(
+        &mut self,
+        irp_id: IrpId,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        let (driver_id, output_capacity) = {
+            let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
+            if irp.state != IrpState::Completed
+                || !matches!(
+                    irp.origin_major,
+                    major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL
+                )
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let stack = irp.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
+            let method = match &stack.parameters {
+                crate::irp::IoParameters::DeviceControl(parameters)
+                | crate::irp::IoParameters::InternalDeviceControl(parameters) => {
+                    nt_io_abi::ioctl::method(parameters.ioctl_code)
+                }
+                _ => return Err(NtStatus::INVALID_PARAMETER),
+            };
+            if method != nt_io_abi::ioctl::METHOD_BUFFERED {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            (
+                stack.driver_id,
+                irp.buffer
+                    .map(|buffer| buffer.output_len as usize)
+                    .unwrap_or(0),
+            )
+        };
+        let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if offset > output_capacity {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let copy_capacity = output.len().min(output_capacity - offset);
+        if copy_capacity == 0 {
+            return Ok(0);
+        }
+        let backend_index = self
+            .driver(driver_id)
+            .map(|driver| driver.backend.0 as usize)
+            .filter(|index| *index < self.backends.len())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let copied = self.backends[backend_index].copy_completion_output(
+            irp_id,
+            offset as u64,
+            &mut output[..copy_capacity],
+        )?;
+        if copied > copy_capacity {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(copied)
+    }
+
     /// Copy the retained request-owned payload of a completed in/out PnP request. Unlike ordinary
     /// read output, native PnP stack payloads are not sized by `IoStatus.Information`.
     pub fn copy_completed_pnp_payload(

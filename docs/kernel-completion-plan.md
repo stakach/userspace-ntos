@@ -19716,3 +19716,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     IOAPIC MADT entries, hardware-reported redirection counts, ordinal/local-pin ABI handling,
     controller-wide mask scans, and no `0xfec00000`, first-controller, saturating, or 24-entry
     fallback.
+
+    B3 ACPI namespace-enumeration substrate checkpoint (2026-08-31, crate accepted): `nt-acpi`
+    now encodes the exact 16-byte immediate-only `ACPI_ENUM_CHILDREN_INPUT_BUFFER`, validates the
+    standard overflow header and caller-supplied allocation ceiling, and decodes the complete
+    self-first variable output without trusting record counts, lengths, flags, NUL termination, or
+    trailing bytes. Fully qualified paths are validated as canonical ACPI NameSeg chains and
+    duplicate paths fail closed.
+
+    `_PRT` source resolution now accepts either an absolute provider path or performs the ACPI
+    nearest-scope upward search from the exact PCI-root/bridge path across exact candidate PDO
+    paths. It does not globally match a final NameSeg, infer a link from HID/UID, or accept an
+    ambiguous duplicate. Focused `nt-acpi` validation passes 22/22.
+
+    The I/O Manager now has a general File-less METHOD_BUFFERED operation for kernel contracts that
+    define a returned error/overflow payload independently of `IoStatus.Information`. Inline
+    completion copies the complete zero-initialized output capacity; pending completion retains the
+    same capacity and exposes an exact validated copy operation before strict acknowledgement.
+    Ordinary handle and Device-object IOCTL methods retain Information-bounded copy semantics, so
+    this does not widen user output or reinterpret unrelated drivers. Focused `nt-io-manager`
+    validation passes 245/245, including inline and retained-pending zero-Information overflow
+    headers.
+
+    Review adjustment: the standard namespace data plane is ready. Next add provider conformance
+    for `IOCTL_ACPI_ENUM_CHILDREN` and no-UID duplicate PDO identity, then extend the serialized
+    hosted relation owner with one-at-a-time namespace, `_PRT`, and route-specific `_CRS` query
+    phases. Each pending completion must revalidate the exact origin/current driver and Device,
+    component client, File-less request, major/minor/control code, relation claim, and hosted-domain
+    identity before copying or acknowledgement. Prepare the complete resolved route publication
+    before registry/CM side effects and commit or revoke it with the same accepted bus transaction.

@@ -11,9 +11,15 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod madt;
+mod namespace;
 mod pci_routing;
 
 pub use madt::{parse_madt_interrupt_overrides, MadtError};
+pub use namespace::{
+    immediate_namespace_children_input, namespace_children_required_len, parse_namespace_children,
+    resolve_namespace_reference, AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError,
+    AcpiNamespacePath, ACPI_ENUM_CHILDREN_INPUT_LEN, IOCTL_ACPI_ENUM_CHILDREN,
+};
 pub use pci_routing::{
     parse_interrupt_resource_template, parse_pci_routing_table, resolve_pci_routing_table,
     InterruptResource, InterruptSource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,

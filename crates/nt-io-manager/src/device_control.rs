@@ -105,6 +105,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             input,
             output,
             internal,
+            false,
         )?;
         match completion {
             ExternalDispatchResult::Completed {
@@ -126,7 +127,32 @@ impl<P: ObjectManagerPort> IoManager<P> {
         output: &mut [u8],
         internal: bool,
     ) -> Result<ExternalDispatchResult, NtStatus> {
-        self.ioctl_target(client, device_id, None, ioctl_code, input, output, internal)
+        self.ioctl_target(
+            client, device_id, None, ioctl_code, input, output, internal, false,
+        )
+    }
+
+    /// Dispatch a File-less METHOD_BUFFERED control and copy the complete zero-initialized output
+    /// capacity on an inline completion, independently of `IoStatus.Information`.
+    ///
+    /// Some standard kernel IOCTL contracts return a structured error/overflow payload while
+    /// leaving Information at zero. Callers must still validate the terminal status and the
+    /// contract-specific header. A pending request uses
+    /// [`IoManager::copy_completed_buffered_device_control_payload`] before strict acknowledgement.
+    pub fn buffered_device_control_device_payload(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        if ioctl::method(ioctl_code) != ioctl::METHOD_BUFFERED {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.ioctl_target(
+            client, device_id, None, ioctl_code, input, output, false, true,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -139,6 +165,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         input: &[u8],
         output: &mut [u8],
         internal: bool,
+        copy_full_buffered_output: bool,
     ) -> Result<ExternalDispatchResult, NtStatus> {
         validate_transfer(input.len())?;
         validate_transfer(output.len())?;
@@ -205,7 +232,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
             user_buffer,
         )?;
         if let ExternalDispatchResult::Completed { information, .. } = completion {
-            let n = (information as usize).min(output.len());
+            let n = if copy_full_buffered_output {
+                debug_assert_eq!(method, ioctl::METHOD_BUFFERED);
+                output.len()
+            } else {
+                (information as usize).min(output.len())
+            };
             match method {
                 ioctl::METHOD_BUFFERED => output[..n].copy_from_slice(&sysbuf[..n]),
                 ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT => {

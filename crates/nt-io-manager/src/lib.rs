@@ -3319,6 +3319,52 @@ mod tests {
     }
 
     #[test]
+    fn buffered_device_object_ioctl_preserves_zero_information_overflow_header() {
+        let mut om = io();
+        let client = om.register_client();
+        let warning = NtStatus(0x8000_0005u32 as i32); // STATUS_BUFFER_OVERFLOW.
+        let header = b"AeiH\x40\x00\x00\x00";
+        let (driver, _) = external_recording_driver(&mut om, "\\Driver\\Acpi", warning, 0, header);
+        let device = om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            driver,
+            Some(path("\\Device\\AcpiPdo0")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ));
+        let code = ioctl::ctl_code(
+            0x32,
+            8,
+            ioctl::METHOD_BUFFERED,
+            ioctl::FILE_READ_ACCESS | ioctl::FILE_WRITE_ACCESS,
+        );
+        let mut output = [0u8; 8];
+        assert_eq!(
+            om.buffered_device_control_device_payload(
+                client,
+                device,
+                code,
+                b"AeiH\x01\x00\x00\x00\0\0\0\0\0\0\0\0",
+                &mut output,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: warning,
+                information: 0,
+                file_context: None,
+            })
+        );
+        assert_eq!(&output, header);
+
+        let neither = any_ioctl(0x820, ioctl::METHOD_NEITHER);
+        assert_eq!(
+            om.buffered_device_control_device_payload(client, device, neither, &[], &mut output,),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
     fn device_object_internal_ioctl_selects_internal_major() {
         let mut om = io();
         let client = om.register_client();
@@ -5359,6 +5405,67 @@ mod tests {
             Ok(47)
         );
         assert_eq!(copied.as_slice(), returned.as_slice());
+        io.acknowledge_completed_irp_strict(irp_id).unwrap();
+        assert_eq!(state.borrow().acknowledgements, 1);
+    }
+
+    #[test]
+    fn pending_buffered_ioctl_copies_contract_payload_independently_of_information() {
+        let returned = b"AeiH\x80\x00\x00\x00".to_vec();
+        let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
+            output: returned.clone(),
+            completion_status: NtStatus(0x8000_0005u32 as i32),
+            completion_information: Some(0),
+            ..RetainedOutputState::default()
+        }));
+        let mut io = io();
+        let client = io.register_client();
+        let driver = io
+            .create_driver(
+                &path("\\Driver\\PendingAcpi"),
+                Box::new(RetainedOutputBackend {
+                    state: state.clone(),
+                }),
+            )
+            .unwrap();
+        let device = io.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            driver,
+            Some(path("\\Device\\PendingAcpiPdo")),
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ));
+        let code = ioctl::ctl_code(
+            0x32,
+            8,
+            ioctl::METHOD_BUFFERED,
+            ioctl::FILE_READ_ACCESS | ioctl::FILE_WRITE_ACCESS,
+        );
+        let mut dispatch_output = [0u8; 8];
+        let irp_id = match io
+            .buffered_device_control_device_payload(
+                client,
+                device,
+                code,
+                b"AeiH\x01\x00\x00\x00\0\0\0\0\0\0\0\0",
+                &mut dispatch_output,
+            )
+            .unwrap()
+        {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending buffered IOCTL, got {other:?}"),
+        };
+        assert_eq!(io.pump(), 1);
+        assert_eq!(io.completed_irp(irp_id).unwrap().information, 0);
+        let mut copied = [0u8; 8];
+        assert_eq!(
+            io.copy_completed_buffered_device_control_payload(irp_id, 0, &mut copied),
+            Ok(8)
+        );
+        assert_eq!(copied.as_slice(), returned.as_slice());
+        assert_eq!(io.copy_completed_irp_output(irp_id, 0, &mut copied), Ok(0));
         io.acknowledge_completed_irp_strict(irp_id).unwrap();
         assert_eq!(state.borrow().acknowledgements, 1);
     }
