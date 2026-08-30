@@ -20055,3 +20055,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     one complete authenticated `AcpiPciScopeSource`, prepare its catalog replacement before durable
     CM mutation, and commit it at the existing relation transaction boundary. Route-table and link
     evaluation follows against the resulting resolved scope catalog.
+
+    B3 root-method transport checkpoint (2026-08-31, implementation green): the live retained
+    BusRelations query now classifies exact ACPI PCI-root children and evaluates `_SEG` followed by
+    `_BBN` through the standard File-less `IOCTL_ACPI_EVAL_METHOD` path. Non-root children are marked
+    structurally not applicable rather than probed. Both synchronous and pending calls use the exact
+    8-byte method input and 20-byte integer output, retain and revalidate the canonical IRP/client/
+    origin/completion-driver/completion-device/PDO identities, copy the complete retained system
+    buffer, and acknowledge pending completion before changing phases. Only exact
+    `STATUS_OBJECT_NAME_NOT_FOUND` with zero Information supplies the ACPI-defined zero default;
+    every other failure remains a barrier. Success requires Information 20 and exact single-integer
+    decoding.
+
+    After both values arrive, the query validates the root identity, canonical namespace self path,
+    ranges, and exact retained BusNumber boot resource through the host-tested root builder. A
+    relation cannot publish while any child remains unqueried or mid-evaluation. The resulting root
+    observation remains owned by the relation transaction for the next filtered discovery phase;
+    it is not published as a partial catalog. The freestanding executive check is green at the
+    unchanged 209-warning baseline and `git diff --check` passes.
+
+    Review adjustment: add multilevel filtered enumeration phases for `_ADR` and `_PRT` on each
+    accepted root, including the same exact overflow/retry/Information and pending-IRP validation.
+    Feed both complete result sets into `plan_acpi_pci_scope_methods`, evaluate every planned `_ADR`
+    through full-path METHOD_EX, and only then prepare the authenticated catalog source. Move the
+    new relation helper block into a focused same-namespace source file while extending these phases
+    so `driver_launch.rs` does not continue absorbing ACPI-specific transport code.
