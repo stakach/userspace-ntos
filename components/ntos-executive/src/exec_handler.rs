@@ -3527,6 +3527,7 @@ impl ExecNtHandler {
         let mut token_store = nt_security::TokenStore::with_capacity(64);
         let anonymous_logon_tokens = token_store.insert_anonymous_logon_tokens();
         write_field!(token_store, token_store);
+        write_field!(job_token_policies, nt_security::JobTokenPolicyStore::new());
         write_field!(anonymous_logon_tokens, anonymous_logon_tokens);
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
         write_field!(writable_fs_dirty, false);
@@ -9716,13 +9717,34 @@ impl ExecNtHandler {
             }
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        let token = self
+        let parent_token = self
             .pm
             .process_primary_token(parent)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        self.token_store
-            .retain(token)
-            .map_err(|_| nt_process::STATUS_INVALID_HANDLE)?;
+        let token = if let Some(job) = selected_job {
+            let security_limits = self.pm.job_security_limits(job)?;
+            if self.job_token_policies.flags(job) != security_limits {
+                return Err(nt_process::STATUS_INVALID_PARAMETER);
+            }
+            if security_limits & nt_process::job::JOB_OBJECT_SECURITY_ONLY_TOKEN != 0 {
+                self.job_token_policies
+                    .duplicate_only_primary(&mut self.token_store, job)?
+            } else {
+                self.token_store.duplicate(
+                    parent_token,
+                    nt_security::TokenType::Primary,
+                    nt_security::SecurityImpersonationLevel::Anonymous,
+                    false,
+                )?
+            }
+        } else {
+            self.token_store.duplicate(
+                parent_token,
+                nt_security::TokenType::Primary,
+                nt_security::SecurityImpersonationLevel::Anonymous,
+                false,
+            )?
+        };
         if let Err(status) = self.publish_registered_hosted_process_metadata(image) {
             let _ = self.token_store.release(token);
             return Err(status);
@@ -19207,8 +19229,8 @@ impl ExecNtHandler {
     /// `NtSetInformationProcess(ProcessAccessToken)`: capture the native two-HANDLE structure, but
     /// assign only its Token member. ReactOS fills Thread in advapi32 and the kernel deliberately
     /// ignores it (`ntoskrnl/ps/query.c`, ProcessAccessToken), so resolving that handle here would
-    /// reject valid callers. TokenStore does not yet model token ancestry; require the real enabled
-    /// assignment privilege for the independent interactive logon token used by CreateProcessAsUser.
+    /// reject valid callers. A child token needs no assignment privilege; all other tokens require
+    /// the caller's effective token to hold enabled `SeAssignPrimaryTokenPrivilege`.
     unsafe fn nt_set_process_access_token_with_user_memory(
         &mut self,
         args: &[u64],
@@ -19233,20 +19255,10 @@ impl ExecNtHandler {
             Some(pid) => pid,
             None => return STATUS_INVALID_HANDLE,
         };
-        let target = match self
-            .pm
-            .resolve_process_handle(caller, args[0], PROCESS_SET_INFORMATION)
-        {
-            Ok(pid) => pid,
-            Err(status) => return status,
-        };
         let token = match self.token_id_for_handle(token_handle, TOKEN_ASSIGN_PRIMARY) {
             Ok(token) => token,
             Err(status) => return status,
         };
-        if !self.current_token_has_privilege(nt_security::SE_ASSIGN_PRIMARY_TOKEN) {
-            return STATUS_PRIVILEGE_NOT_HELD;
-        }
         if self
             .token_store
             .get(token)
@@ -19254,10 +19266,31 @@ impl ExecNtHandler {
         {
             return nt_security::STATUS_BAD_TOKEN_TYPE;
         }
+        let caller_token = match self.pm.process_primary_token(caller) {
+            Some(token) => token,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let is_child = match self.token_store.is_child_token(token, caller_token) {
+            Ok(is_child) => is_child,
+            Err(status) => return status,
+        };
+        if !is_child && !self.current_token_has_privilege(nt_security::SE_ASSIGN_PRIMARY_TOKEN) {
+            return STATUS_PRIVILEGE_NOT_HELD;
+        }
+        let target = match self
+            .pm
+            .resolve_process_handle(caller, args[0], PROCESS_SET_INFORMATION)
+        {
+            Ok(pid) => pid,
+            Err(status) => return status,
+        };
         if self.token_store.retain(token).is_err() {
             return STATUS_INVALID_HANDLE;
         }
-        let old = match self.pm.replace_process_primary_token(target, Some(token)) {
+        let old = match self
+            .pm
+            .replace_process_primary_token(target, Some(token))
+        {
             Ok(old) => old,
             Err(status) => {
                 let _ = self.token_store.release(token);
@@ -20348,6 +20381,41 @@ impl ExecNtHandler {
         tid: nt_process::ThreadId,
         replacement: Option<nt_process::ImpersonationContext>,
     ) -> u32 {
+        let replacement = if let Some(mut context) = replacement {
+            let target_pid = match self.pm.thread(tid) {
+                Some(thread) => thread.process_id,
+                None => {
+                    let _ = self.token_store.release(context.token);
+                    return STATUS_INVALID_HANDLE;
+                }
+            };
+            if let Some(job) = self.pm.process_job(target_pid) {
+                let limits = match self.pm.job_security_limits(job) {
+                    Ok(limits) => limits,
+                    Err(status) => {
+                        let _ = self.token_store.release(context.token);
+                        return status;
+                    }
+                };
+                if self.job_token_policies.flags(job) != limits {
+                    let _ = self.token_store.release(context.token);
+                    return STATUS_INVALID_PARAMETER;
+                }
+                if limits != 0 {
+                    context.token = match self.job_token_policies.admit_owned_impersonation(
+                        &mut self.token_store,
+                        job,
+                        context.token,
+                    ) {
+                        Ok(token) => token,
+                        Err(status) => return status,
+                    };
+                }
+            }
+            Some(context)
+        } else {
+            None
+        };
         let old = match self.pm.replace_thread_impersonation(tid, replacement) {
             Ok(old) => old,
             Err(status) => {
@@ -23349,12 +23417,49 @@ impl ExecNtHandler {
 
     fn drain_job_destructions(&mut self) {
         while let Some(destruction) = self.pm.take_job_destruction() {
+            let provider_flags = self.job_token_policies.flags(destruction.id);
+            let security_ready = self
+                .job_token_policies
+                .validate_rundown(&self.token_store, destruction.id);
+            if provider_flags != destruction.security_limits
+                || !matches!(
+                    security_ready,
+                    Ok(present) if present == (destruction.security_limits != 0)
+                )
+            {
+                let status = security_ready.err().unwrap_or(STATUS_INVALID_PARAMETER);
+                print_str(b"[ps-job] security policy rundown preflight failed id=");
+                print_u64(destruction.id as u64);
+                print_str(b" ps/provider=0x");
+                print_hex(destruction.security_limits);
+                print_str(b"/0x");
+                print_hex(provider_flags);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                let restored = self.pm.restore_job_destruction(destruction);
+                debug_assert!(restored);
+                break;
+            }
             if let Err(status) = self.dispatch_win32_job_callout(
                 destruction.id,
                 win32k_subsystem::PS_W32_JOB_CALLOUT_TERMINATE,
                 0,
             ) {
                 print_str(b"[ps-job] win32k job rundown retained id=");
+                print_u64(destruction.id as u64);
+                print_str(b" status=0x");
+                print_hex(status);
+                print_str(b"\n");
+                let restored = self.pm.restore_job_destruction(destruction);
+                debug_assert!(restored);
+                break;
+            }
+            if let Err(status) = self
+                .job_token_policies
+                .rundown(&mut self.token_store, destruction.id)
+            {
+                print_str(b"[ps-job] security policy rundown failed id=");
                 print_u64(destruction.id as u64);
                 print_str(b" status=0x");
                 print_hex(status);
@@ -23775,17 +23880,27 @@ impl ExecNtHandler {
             Some(pid) => pid,
             None => return nt_process::STATUS_INVALID_HANDLE,
         };
+        let security_limits = match self.pm.job_security_limits(id) {
+            Ok(limits) => limits,
+            Err(status) => return status,
+        };
+        if self.job_token_policies.flags(id) != security_limits {
+            return STATUS_INVALID_PARAMETER;
+        }
         let pid = match self.pm.resolve_process_handle(
             caller,
             args[1],
-            nt_process::PROCESS_SET_QUOTA | nt_process::PROCESS_TERMINATE,
+            nt_process::PROCESS_SET_QUOTA
+                | nt_process::PROCESS_TERMINATE
+                | if security_limits & nt_process::job::JOB_OBJECT_SECURITY_ONLY_TOKEN != 0 {
+                    nt_process::PROCESS_SET_INFORMATION
+                } else {
+                    0
+                },
         ) {
             Ok(pid) => pid,
             Err(status) => return status,
         };
-        if self.pm.job_security_limits(id).unwrap_or(0) != 0 {
-            return STATUS_NOT_SUPPORTED;
-        }
         let Some(target_pi) = self.pi_for_pid(pid) else {
             return nt_process::STATUS_INVALID_HANDLE;
         };
@@ -23805,11 +23920,27 @@ impl ExecNtHandler {
             Ok(assignment) => assignment,
             Err(status) => return status,
         };
-        let mut win32_member_prepared = false;
         let ui_restrictions = match self.pm.job_ui_restrictions(id) {
             Ok(restrictions) => restrictions,
             Err(status) => return status,
         };
+        let replacement_token = if security_limits == 0 {
+            None
+        } else {
+            let current = match self.pm.process_primary_token(pid) {
+                Some(token) => token,
+                None => return STATUS_INVALID_HANDLE,
+            };
+            match self.job_token_policies.prepare_primary_replacement(
+                &mut self.token_store,
+                id,
+                current,
+            ) {
+                Ok(replacement) => replacement,
+                Err(status) => return status,
+            }
+        };
+        let mut win32_member_prepared = false;
         if assignment.status() == 0 && ui_restrictions != 0 {
             if let Some(w32process) = self.pm.process_win32(pid) {
                 if let Err(status) = self.dispatch_win32_job_callout(
@@ -23817,6 +23948,9 @@ impl ExecNtHandler {
                     win32k_subsystem::PS_W32_JOB_CALLOUT_ADD_PROCESS,
                     w32process,
                 ) {
+                    if let Some(token) = replacement_token {
+                        let _ = self.token_store.release(token);
+                    }
                     return status;
                 }
                 win32_member_prepared = true;
@@ -23832,13 +23966,28 @@ impl ExecNtHandler {
                             win32k_subsystem::PS_W32_JOB_CONTROL_REMOVE_PROCESS,
                             w32process,
                         ) {
+                            if let Some(token) = replacement_token {
+                                let _ = self.token_store.release(token);
+                            }
                             return rollback_status;
                         }
                     }
                 }
+                if let Some(token) = replacement_token {
+                    let _ = self.token_store.release(token);
+                }
                 return status;
             }
         };
+        if let Some(token) = replacement_token {
+            let old = self
+                .pm
+                .replace_process_primary_token(pid, Some(token))
+                .expect("prepared job assignment retains its live EPROCESS");
+            if let Some(old) = old {
+                let _ = self.token_store.release(old);
+            }
+        }
         if status == 0 {
             self.sync_process_commit_limit(pid)
                 .expect("accepted job memory limit is page-normalized for a registered process");
@@ -24000,13 +24149,51 @@ impl ExecNtHandler {
                 (0, 4, &fixed[..4])
             }
             nt_process::job_abi::JobInformationClass::SecurityLimit => {
-                let value = match self.pm.job_security_limits(id) {
-                    Ok(value) => value,
+                let flags = match self.pm.job_security_limits(id) {
+                    Ok(flags) => flags,
                     Err(status) => return status,
                 };
-                fixed[..40].fill(0);
-                fixed[..4].copy_from_slice(&value.to_le_bytes());
-                (0, 40, &fixed[..40])
+                if self.job_token_policies.flags(id) != flags {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let filter = self.job_token_policies.filter(id);
+                let required = match filter {
+                    Some(filter) => match filter.encoded_length() {
+                        Some(length) => length,
+                        None => return STATUS_INSUFFICIENT_RESOURCES,
+                    },
+                    None => nt_security::JOB_SECURITY_LIMIT_INFORMATION_SIZE,
+                };
+                if length < required {
+                    if args[4] != 0
+                        && !self.xas_try_write_buf(args[4], &(required as u32).to_le_bytes())
+                    {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
+                    return STATUS_BUFFER_OVERFLOW;
+                }
+                if variable.try_reserve_exact(required).is_err() {
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+                variable.resize(required, 0);
+                let actual = match nt_security::encode_job_security_limit_information(
+                    flags,
+                    filter,
+                    args[2],
+                    &mut variable,
+                ) {
+                    Ok(actual) => actual,
+                    Err(required) => {
+                        if args[4] != 0
+                            && !self
+                                .xas_try_write_buf(args[4], &(required as u32).to_le_bytes())
+                        {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
+                        return STATUS_BUFFER_OVERFLOW;
+                    }
+                };
+                (0, actual, &variable[..actual])
             }
             nt_process::job_abi::JobInformationClass::EndOfJobTime => {
                 let value = match self.pm.job_end_of_job_time_action(id) {
@@ -24186,13 +24373,110 @@ impl ExecNtHandler {
                 }
             }
             nt_process::job_abi::JobInformationClass::SecurityLimit => {
-                let value = u32::from_le_bytes(input[..4].try_into().unwrap());
-                if value != 0 {
-                    return STATUS_NOT_SUPPORTED;
+                let requested = u32::from_le_bytes(input[..4].try_into().unwrap());
+                let plan = match self.pm.prepare_job_security_limits(id, requested) {
+                    Ok(plan) => plan,
+                    Err(status) => return status,
+                };
+                if plan.previous() == plan.limits() {
+                    return 0;
                 }
-                self.pm
-                    .set_job_security_limits(id, value)
-                    .map_or_else(|status| status, |()| 0)
+                let only_token = if requested & nt_process::job::JOB_OBJECT_SECURITY_ONLY_TOKEN != 0
+                {
+                    let handle = u64::from_le_bytes(input[8..16].try_into().unwrap());
+                    if handle == 0 {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    let token = match self.token_id_for_handle(
+                        handle,
+                        nt_security::TOKEN_ASSIGN_PRIMARY
+                            | nt_security::TOKEN_DUPLICATE
+                            | nt_security::TOKEN_IMPERSONATE,
+                    ) {
+                        Ok(token) => token,
+                        Err(status) => return status,
+                    };
+                    let caller = match self.pm_pid_for_pi(self.pi) {
+                        Some(pid) => pid,
+                        None => return STATUS_INVALID_HANDLE,
+                    };
+                    let caller_token = match self.pm.process_primary_token(caller) {
+                        Some(token) => token,
+                        None => return STATUS_INVALID_HANDLE,
+                    };
+                    let is_child = match self.token_store.is_child_token(token, caller_token) {
+                        Ok(is_child) => is_child,
+                        Err(status) => return status,
+                    };
+                    if !is_child
+                        && !self.current_token_has_privilege(nt_security::SE_ASSIGN_PRIMARY_TOKEN)
+                    {
+                        return STATUS_PRIVILEGE_NOT_HELD;
+                    }
+                    Some(token)
+                } else {
+                    None
+                };
+                let filter = if requested & nt_process::job::JOB_OBJECT_SECURITY_FILTER_TOKENS != 0
+                {
+                    let sids_to_disable =
+                        u64::from_le_bytes(input[16..24].try_into().unwrap());
+                    let privileges_to_delete =
+                        u64::from_le_bytes(input[24..32].try_into().unwrap());
+                    let restricted_sids =
+                        u64::from_le_bytes(input[32..40].try_into().unwrap());
+                    Some(nt_security::JobTokenFilter {
+                        sids_to_disable: if sids_to_disable == 0 {
+                            alloc::vec::Vec::new()
+                        } else {
+                            match self.capture_token_groups_input(sids_to_disable) {
+                                Ok(groups) => groups,
+                                Err(status) => return status,
+                            }
+                        },
+                        privileges_to_delete: if privileges_to_delete == 0 {
+                            alloc::vec::Vec::new()
+                        } else {
+                            match self.capture_token_privileges_input(privileges_to_delete) {
+                                Ok(privileges) => privileges,
+                                Err(status) => return status,
+                            }
+                        },
+                        restricted_sids: if restricted_sids == 0 {
+                            alloc::vec::Vec::new()
+                        } else {
+                            match self.capture_token_groups_input(restricted_sids) {
+                                Ok(groups) => groups,
+                                Err(status) => return status,
+                            }
+                        },
+                    })
+                } else {
+                    None
+                };
+                let update = match self.job_token_policies.install_update(
+                    &mut self.token_store,
+                    id,
+                    plan.previous(),
+                    plan.limits(),
+                    only_token,
+                    filter,
+                ) {
+                    Ok(update) => update,
+                    Err(status) => return status,
+                };
+                match self.pm.commit_job_security_limits(plan) {
+                    Ok(()) => 0,
+                    Err(status) => {
+                        match self
+                            .job_token_policies
+                            .rollback_update(&mut self.token_store, update)
+                        {
+                            Ok(()) => status,
+                            Err(rollback_status) => rollback_status,
+                        }
+                    }
+                }
             }
             nt_process::job_abi::JobInformationClass::EndOfJobTime => {
                 let value = u32::from_le_bytes(input[..4].try_into().unwrap());

@@ -22382,6 +22382,9 @@ struct ExecNtHandler {
     /// Stable, reference-counted token objects. Each EPROCESS records its primary `TokenId`; token
     /// handles and ETHREAD impersonation contexts retain independent references and their storage.
     token_store: nt_security::TokenStore,
+    /// Security Reference Monitor-owned material for legacy NT5 job token restrictions. Ps keeps
+    /// only the opaque JobId and authoritative flags; this store owns token/filter references.
+    job_token_policies: nt_security::JobTokenPolicyStore,
     /// The two security-subsystem-owned Anonymous Logon identities. Each syscall selects one by
     /// current LSA policy and retains a separate reference for the target ETHREAD.
     anonymous_logon_tokens: nt_security::AnonymousLogonTokenIds,

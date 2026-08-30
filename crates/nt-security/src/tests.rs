@@ -2732,9 +2732,11 @@ fn job_only_token_publication_rolls_back_and_rundown_releases_ownership() {
         TokenType::Primary
     );
     tokens.release(process_token).unwrap();
+    assert_eq!(jobs.validate_rundown(&tokens, 3), Ok(true));
     assert_eq!(jobs.rundown(&mut tokens, 3), Ok(true));
     assert_eq!(tokens.reference_count(source), Some(1));
     assert_eq!(jobs.rundown(&mut tokens, 3), Ok(false));
+    assert_eq!(jobs.validate_rundown(&tokens, 3), Ok(false));
 }
 
 #[test]
@@ -2759,6 +2761,12 @@ fn job_no_admin_and_restricted_admission_fail_closed() {
     );
     assert_eq!(
         jobs.prepare_primary_replacement(&mut tokens, 1, user),
+        Ok(None)
+    );
+
+    tokens.retain(user).unwrap();
+    assert_eq!(
+        jobs.admit_owned_impersonation(&mut tokens, 1, user),
         Err(STATUS_ACCESS_DENIED)
     );
 
@@ -2776,6 +2784,11 @@ fn job_no_admin_and_restricted_admission_fail_closed() {
     assert_eq!(
         jobs.prepare_primary_replacement(&mut tokens, 1, restricted),
         Ok(None)
+    );
+    tokens.retain(restricted).unwrap();
+    assert_eq!(
+        jobs.admit_owned_impersonation(&mut tokens, 1, restricted),
+        Ok(restricted)
     );
 }
 
@@ -2807,4 +2820,175 @@ fn job_impersonation_filter_consumes_source_and_returns_independent_token() {
     let admitted_body = tokens.get(admitted).unwrap();
     assert!(!admitted_body.is_administrator());
     assert!(admitted_body.is_restricted());
+}
+
+#[test]
+fn empty_job_impersonation_filter_remains_an_active_policy() {
+    let mut tokens = TokenStore::new();
+    let source = tokens.insert(AccessToken::user(MACHINE));
+    tokens.retain(source).unwrap();
+    let mut jobs = JobTokenPolicyStore::new();
+    jobs.install_update(
+        &mut tokens,
+        2,
+        0,
+        JOB_OBJECT_SECURITY_FILTER_TOKENS,
+        None,
+        Some(JobTokenFilter::default()),
+    )
+    .unwrap();
+
+    assert_eq!(jobs.filter(2), Some(&JobTokenFilter::default()));
+    let admitted = jobs
+        .admit_owned_impersonation(&mut tokens, 2, source)
+        .unwrap();
+    assert_ne!(admitted, source);
+    assert_eq!(tokens.reference_count(source), Some(1));
+}
+
+#[test]
+fn job_security_query_encoding_is_exact_and_relocatable() {
+    let filter = JobTokenFilter {
+        sids_to_disable: vec![(Sid::administrators(), 0x10)],
+        privileges_to_delete: vec![(Luid { low: 7, high: -1 }, 0x20)],
+        restricted_sids: vec![(Sid::everyone(), 0x40)],
+    };
+    assert_eq!(filter.encoded_length(), Some(132));
+    let base = 0x0000_0100_2345_6000u64;
+    let mut output = [0xcc; 132];
+    assert_eq!(
+        encode_job_security_limit_information(
+            JOB_OBJECT_SECURITY_FILTER_TOKENS,
+            Some(&filter),
+            base,
+            &mut output,
+        ),
+        Ok(132)
+    );
+    assert_eq!(u32::from_le_bytes(output[..4].try_into().unwrap()), 8);
+    assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 0);
+    assert_eq!(
+        u64::from_le_bytes(output[16..24].try_into().unwrap()),
+        base + 40
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[24..32].try_into().unwrap()),
+        base + 80
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[32..40].try_into().unwrap()),
+        base + 96
+    );
+    assert_eq!(
+        u64::from_le_bytes(output[48..56].try_into().unwrap()),
+        base + 64
+    );
+    assert_eq!(u32::from_le_bytes(output[56..60].try_into().unwrap()), 0x10);
+    assert_eq!(u32::from_le_bytes(output[80..84].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(output[84..88].try_into().unwrap()), 7);
+    assert_eq!(i32::from_le_bytes(output[88..92].try_into().unwrap()), -1);
+    assert_eq!(u32::from_le_bytes(output[92..96].try_into().unwrap()), 0x20);
+
+    let mut short = [0u8; 131];
+    assert_eq!(
+        encode_job_security_limit_information(8, Some(&filter), base, &mut short),
+        Err(132)
+    );
+}
+
+#[test]
+fn token_store_tracks_real_child_lineage_not_matching_identity() {
+    let mut tokens = TokenStore::new();
+    let parent = tokens.insert(AccessToken::user(MACHINE));
+    let same_identity = tokens.insert(AccessToken::user(MACHINE));
+    let duplicate = tokens
+        .duplicate(
+            parent,
+            TokenType::Primary,
+            SecurityImpersonationLevel::Anonymous,
+            false,
+        )
+        .unwrap();
+    let child = tokens
+        .filter(
+            parent,
+            TokenFilterRequest {
+                flags: 0,
+                sids_to_disable: &[],
+                privileges_to_delete: &[],
+                restricted_sids: &[(Sid::everyone(), 0)],
+            },
+        )
+        .unwrap();
+    assert_eq!(tokens.is_child_token(child, parent), Ok(true));
+    assert_eq!(tokens.is_child_token(duplicate, parent), Ok(false));
+    assert_eq!(tokens.is_child_token(same_identity, parent), Ok(false));
+
+    let child_duplicate = tokens
+        .duplicate(
+            child,
+            TokenType::Primary,
+            SecurityImpersonationLevel::Anonymous,
+            false,
+        )
+        .unwrap();
+    assert_eq!(tokens.is_child_token(child_duplicate, parent), Ok(true));
+}
+
+#[test]
+fn restricted_only_job_restricts_impersonation_not_the_forcible_primary() {
+    let mut tokens = TokenStore::new();
+    let plain = tokens.insert(AccessToken::user(MACHINE));
+    let restricted = tokens
+        .filter(
+            plain,
+            TokenFilterRequest {
+                flags: 0,
+                sids_to_disable: &[],
+                privileges_to_delete: &[],
+                restricted_sids: &[(Sid::everyone(), 0)],
+            },
+        )
+        .unwrap();
+    let mut jobs = JobTokenPolicyStore::new();
+    let flags = JOB_OBJECT_SECURITY_RESTRICTED_TOKEN | JOB_OBJECT_SECURITY_ONLY_TOKEN;
+    jobs.install_update(&mut tokens, 1, 0, flags, Some(plain), None)
+        .unwrap();
+    let replacement = jobs
+        .prepare_primary_replacement(&mut tokens, 1, plain)
+        .unwrap()
+        .unwrap();
+    assert!(!tokens.get(replacement).unwrap().is_restricted());
+
+    tokens.retain(plain).unwrap();
+    assert_eq!(
+        jobs.admit_owned_impersonation(&mut tokens, 1, plain),
+        Err(STATUS_ACCESS_DENIED)
+    );
+    tokens.retain(restricted).unwrap();
+    assert_eq!(
+        jobs.admit_owned_impersonation(&mut tokens, 1, restricted),
+        Ok(restricted)
+    );
+
+    jobs.install_update(
+        &mut tokens,
+        2,
+        0,
+        JOB_OBJECT_SECURITY_ONLY_TOKEN,
+        Some(plain),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        jobs.install_update(
+            &mut tokens,
+            2,
+            JOB_OBJECT_SECURITY_ONLY_TOKEN,
+            flags,
+            None,
+            None,
+        ),
+        Err(STATUS_INVALID_PARAMETER)
+    );
 }

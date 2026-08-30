@@ -17506,16 +17506,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Job security-limit transaction foundation (2026-08-30, focused validation accepted; executive
     composition remains): Ps now owns a monotonic, generation-checked security-limit plan instead of a
-    replaceable flag word. `ONLY_TOKEN` and `FILTER_TOKENS` are one-shot and mutually exclusive, neither
-    may be combined with `RESTRICTED_TOKEN`, zero is a no-op rather than a way to revoke policy, and a
-    stale provider/manager commit cannot overwrite newer state. Ps still stores no token, SID, privilege,
-    or filter material.
+    replaceable flag word. `ONLY_TOKEN` and `FILTER_TOKENS` are one-shot and mutually exclusive;
+    `RESTRICTED_TOKEN` may accompany or precede either mode but cannot be layered on after a token mode
+    is already installed. Zero is a no-op rather than a way to revoke policy, and a stale
+    provider/manager commit cannot overwrite newer state. Ps still stores no token, SID, privilege, or
+    filter material.
 
     The Security Manager now owns the corresponding provider policy keyed only by opaque JobId. It
     captures filter inputs into owned SID/LUID vectors, retains and validates the primary job token,
     duplicates an independent primary token for `ONLY_TOKEN` process admission, rejects administrative
-    or unrestricted identities for the respective flags, applies `FILTER_TOKENS` while impersonating,
-    and releases exact references during rollback and job rundown. Empty filters and mismatched provider
+    primary tokens during `NO_ADMIN` assignment, rejects unrestricted impersonation under
+    `RESTRICTED_TOKEN`, applies `FILTER_TOKENS` while impersonating, and releases exact references during
+    rollback and job rundown. An all-null filter remains valid active policy, while mismatched provider
     generations fail closed. Focused validation passes `nt-process` `146/146` and `nt-security` `86/86`.
 
     Review adjustment: wire the native 40-byte x64 security-limit structure into this boundary next.
@@ -17525,3 +17527,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Then apply admission to existing-process assignment, inherited child creation, every ETHREAD
     impersonation entry point, primary-token replacement, and EJOB rundown before serialized desktop
     acceptance.
+
+    Native job token-restriction composition (2026-08-30, focused validation accepted; serialized
+    desktop proof remains): the executive now captures the native 40-byte x64
+    `JOBOBJECT_SECURITY_LIMIT_INFORMATION` structure and all pointed SID/privilege arrays before
+    publication. `JobToken` is resolved with assign-primary, duplicate, and impersonate access; a real
+    parent-token lineage check or enabled `SeAssignPrimaryTokenPrivilege` authorizes it. Queries are
+    encoded from Security Manager-owned material with relocated caller-buffer pointers, exact required
+    length, `STATUS_BUFFER_OVERFLOW` for short buffers, and no internal token handle disclosure. The old
+    nonzero `STATUS_NOT_SUPPORTED` route is deleted.
+
+    Provider installation and the Ps policy commit form one rollback transaction. In native NT5 these
+    security flags are prospective: setting them does not rewrite existing EPROCESS primary tokens or
+    existing ETHREAD impersonation contexts. `ONLY_TOKEN` duplicates an independent primary on later
+    process assignment and inherited child creation. `NO_ADMIN` rejects later assignment of an
+    administrative primary. `RESTRICTED_TOKEN` rejects later unrestricted impersonation, and
+    `FILTER_TOKENS` filters each later impersonation operation. Explicit, LPC, and anonymous
+    impersonation all cross that single Security Manager admission boundary. Job rundown releases the
+    exact provider-owned material. Ps carries its final authoritative mask in the destruction record,
+    and a read-only Security Manager preflight validates provider identity and retained token ownership
+    before win32k commits its independent teardown. Ps otherwise keeps only stable JobId membership and
+    flags; token references, filters, lineage, and admission decisions remain in `nt-security`.
+
+    Normal token duplication now preserves its source's existing `ParentTokenId`, while filtering sets
+    the new token's parent to the exact source token identity. This prevents equal-user/session tokens
+    from satisfying the child-token rule. Both job-token installation and ordinary
+    `ProcessAccessToken` replacement now accept a true child without requiring
+    `SeAssignPrimaryTokenPrivilege`, while non-child assignment checks the caller's effective token.
+    `ProcessAccessToken` remains the native primary-token operation and does not invent a job-policy
+    override. Focused validation passes `nt-security` `90/90` and `nt-process` `147/147`; formatting,
+    `git diff --check`, and the freestanding executive check pass at the established 209-warning
+    baseline.
+
+    Review adjustment: the Security Manager ownership, native ABI, prospective assignment/inheritance,
+    impersonation admission, child-token authorization, rollback, and rundown slices are closed. Run the
+    serialized release build and desktop acceptance next. If unrestricted Explorer boot remains
+    unchanged, continue the job-object family with resident working-set ownership only after Memory
+    Manager has real resident accounting, trimming, and pageout; do not approximate it with commitment
+    accounting.

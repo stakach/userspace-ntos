@@ -2876,7 +2876,7 @@ fn dbgk_attach_does_not_report_initialized_pool_threads() {
     let dbg_thread = pm.create_thread(debugger, 0x100, 0, false).unwrap();
     let target = pm.create_process("target.exe", None, None);
     let main = pm.create_thread(target, 0x2000, 0, false).unwrap();
-    let dormant = pm.create_dormant_thread(target).unwrap();
+    let _dormant = pm.create_dormant_thread(target).unwrap();
 
     assert_eq!(
         pm.debug_active_process(

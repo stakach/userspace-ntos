@@ -829,6 +829,7 @@ struct TokenObject {
     token: AccessToken,
     references: u32,
     token_luid: Luid,
+    parent_token_luid: Option<Luid>,
     modified_luid: Luid,
     expiration_time: i64,
     dynamic_charged: u32,
@@ -940,6 +941,7 @@ impl TokenStore {
             token,
             references: 1,
             token_luid,
+            parent_token_luid: None,
             modified_luid,
             expiration_time,
             dynamic_charged,
@@ -972,6 +974,23 @@ impl TokenStore {
             .get(id.slot())?
             .as_ref()
             .map(|entry| entry.references)
+    }
+
+    /// Whether `candidate` carries `parent` as its native `ParentTokenId`. Filtering establishes
+    /// that relation and ordinary duplication preserves it; matching users or logon sessions alone
+    /// never confer child-token status.
+    pub fn is_child_token(&self, candidate: TokenId, parent: TokenId) -> Result<bool, u32> {
+        let candidate = self
+            .objects
+            .get(candidate.slot())
+            .and_then(Option::as_ref)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let parent = self
+            .objects
+            .get(parent.slot())
+            .and_then(Option::as_ref)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        Ok(candidate.parent_token_luid == Some(parent.token_luid))
     }
 
     pub fn retain(&mut self, id: TokenId) -> Result<(), u32> {
@@ -1016,7 +1035,14 @@ impl TokenStore {
         impersonation_level: SecurityImpersonationLevel,
         effective_only: bool,
     ) -> Result<TokenId, u32> {
-        let (duplicate, modified_luid, expiration_time, dynamic_charged, token_source) = {
+        let (
+            duplicate,
+            inherited_parent_token_luid,
+            modified_luid,
+            expiration_time,
+            dynamic_charged,
+            token_source,
+        ) = {
             let source = self
                 .objects
                 .get(source.slot())
@@ -1026,6 +1052,7 @@ impl TokenStore {
                 source
                     .token
                     .duplicate(token_type, impersonation_level, effective_only)?,
+                source.parent_token_luid,
                 source.modified_luid,
                 source.expiration_time,
                 source.dynamic_charged,
@@ -1038,6 +1065,7 @@ impl TokenStore {
             token: duplicate,
             references: 1,
             token_luid,
+            parent_token_luid: inherited_parent_token_luid,
             modified_luid,
             expiration_time,
             dynamic_charged,
@@ -1055,7 +1083,7 @@ impl TokenStore {
         source: TokenId,
         request: crate::token_filter::TokenFilterRequest<'_>,
     ) -> Result<TokenId, u32> {
-        let (filtered, expiration_time, dynamic_charged, token_source) = {
+        let (filtered, parent_token_luid, expiration_time, dynamic_charged, token_source) = {
             let source = self
                 .objects
                 .get(source.slot())
@@ -1063,6 +1091,7 @@ impl TokenStore {
                 .ok_or(STATUS_INVALID_HANDLE)?;
             (
                 crate::token_filter::filter_access_token(&source.token, request)?,
+                source.token_luid,
                 source.expiration_time,
                 source.dynamic_charged,
                 source.source,
@@ -1075,6 +1104,7 @@ impl TokenStore {
             token: filtered,
             references: 1,
             token_luid,
+            parent_token_luid: Some(parent_token_luid),
             modified_luid,
             expiration_time,
             dynamic_charged,

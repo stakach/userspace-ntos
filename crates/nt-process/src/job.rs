@@ -299,6 +299,7 @@ pub struct JobCloseAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobDestruction {
     pub id: JobId,
+    pub security_limits: u32,
     pub released_completion_port: Option<CompletionPortAssociation>,
 }
 
@@ -450,6 +451,7 @@ impl JobStore {
             let next = job.set_next;
             self.destructions[slot] = Some(JobDestruction {
                 id: job.id,
+                security_limits: job.security_limits,
                 released_completion_port: job.completion_port,
             });
 
@@ -1420,23 +1422,19 @@ impl JobStore {
         let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
         let exclusive = JOB_OBJECT_SECURITY_ONLY_TOKEN | JOB_OBJECT_SECURITY_FILTER_TOKENS;
         if requested & JOB_OBJECT_SECURITY_RESTRICTED_TOKEN != 0
-            && (job.security_limits | requested) & exclusive != 0
+            && job.security_limits & exclusive != 0
         {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
         if requested & JOB_OBJECT_SECURITY_ONLY_TOKEN != 0
             && ((job.security_limits & exclusive != 0)
-                || requested
-                    & (JOB_OBJECT_SECURITY_FILTER_TOKENS | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
-                    != 0)
+                || requested & JOB_OBJECT_SECURITY_FILTER_TOKENS != 0)
         {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
         if requested & JOB_OBJECT_SECURITY_FILTER_TOKENS != 0
             && ((job.security_limits & exclusive != 0)
-                || requested
-                    & (JOB_OBJECT_SECURITY_ONLY_TOKEN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
-                    != 0)
+                || requested & JOB_OBJECT_SECURITY_ONLY_TOKEN != 0)
         {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
@@ -1668,6 +1666,7 @@ mod tests {
             jobs.take_destruction(),
             Some(JobDestruction {
                 id: job,
+                security_limits: 0,
                 released_completion_port: Some(association),
             })
         );
@@ -1808,23 +1807,56 @@ mod tests {
         );
 
         let filter = jobs.create(0).unwrap();
-        assert_eq!(
-            jobs.prepare_security_limits(
-                filter,
-                JOB_OBJECT_SECURITY_FILTER_TOKENS | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN
-            ),
-            Err(crate::STATUS_INVALID_PARAMETER)
-        );
-        jobs.set_security_limits(filter, JOB_OBJECT_SECURITY_FILTER_TOKENS)
-            .unwrap();
+        jobs.set_security_limits(
+            filter,
+            JOB_OBJECT_SECURITY_FILTER_TOKENS | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN,
+        )
+        .unwrap();
         assert_eq!(
             jobs.prepare_security_limits(filter, JOB_OBJECT_SECURITY_ONLY_TOKEN),
             Err(crate::STATUS_INVALID_PARAMETER)
         );
 
+        let restricted_first = jobs.create(0).unwrap();
+        jobs.set_security_limits(restricted_first, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN)
+            .unwrap();
+        jobs.set_security_limits(restricted_first, JOB_OBJECT_SECURITY_ONLY_TOKEN)
+            .unwrap();
+
         assert_eq!(
             jobs.prepare_security_limits(filter, JOB_OBJECT_SECURITY_VALID_FLAGS << 1),
             Err(crate::STATUS_INVALID_PARAMETER)
         );
+    }
+
+    #[test]
+    fn failed_ps_security_commit_rolls_back_provider_publication() {
+        let mut jobs = JobStore::new();
+        let job = jobs.create(0).unwrap();
+        let stale = jobs
+            .prepare_security_limits(job, JOB_OBJECT_SECURITY_NO_ADMIN)
+            .unwrap();
+        jobs.set_security_limits(job, JOB_OBJECT_SECURITY_NO_ADMIN)
+            .unwrap();
+
+        let mut tokens = nt_security::TokenStore::new();
+        let mut provider = nt_security::JobTokenPolicyStore::new();
+        let update = provider
+            .install_update(
+                &mut tokens,
+                job,
+                stale.previous(),
+                stale.limits(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(provider.flags(job), JOB_OBJECT_SECURITY_NO_ADMIN);
+        assert_eq!(
+            jobs.commit_security_limits(stale),
+            Err(crate::STATUS_INVALID_PARAMETER)
+        );
+        provider.rollback_update(&mut tokens, update).unwrap();
+        assert_eq!(provider.flags(job), 0);
     }
 }

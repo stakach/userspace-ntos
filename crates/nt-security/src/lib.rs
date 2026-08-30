@@ -42,9 +42,10 @@ pub use create_token::{
     TOKEN_PRIVILEGES_ARRAY_OFFSET,
 };
 pub use job_token::{
-    JobTokenFilter, JobTokenPolicyStore, JobTokenPolicyUpdate, JOB_OBJECT_SECURITY_FILTER_TOKENS,
-    JOB_OBJECT_SECURITY_NO_ADMIN, JOB_OBJECT_SECURITY_ONLY_TOKEN,
-    JOB_OBJECT_SECURITY_RESTRICTED_TOKEN, JOB_OBJECT_SECURITY_VALID_FLAGS,
+    encode_job_security_limit_information, JobTokenFilter, JobTokenPolicyStore,
+    JobTokenPolicyUpdate, JOB_OBJECT_SECURITY_FILTER_TOKENS, JOB_OBJECT_SECURITY_NO_ADMIN,
+    JOB_OBJECT_SECURITY_ONLY_TOKEN, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN,
+    JOB_OBJECT_SECURITY_VALID_FLAGS, JOB_SECURITY_LIMIT_INFORMATION_SIZE,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_sd::{
