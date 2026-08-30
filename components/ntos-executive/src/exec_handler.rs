@@ -578,9 +578,9 @@ fn is_system_registry_path(path: &str) -> bool {
         || canonical.starts_with(r"\registry\machine\system\")
 }
 
-fn with_system_hive_key_lease<R>(
+fn with_opened_system_hive_key<R>(
     path: &str,
-    visit: impl FnOnce(Option<nt_config_client::SystemHiveKeyLease>) -> Result<R, u32>,
+    visit: impl FnOnce(Option<&nt_config_client::OpenedSystemHiveKey>) -> Result<R, u32>,
 ) -> Result<R, u32> {
     if !is_system_registry_path(path) {
         return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
@@ -590,10 +590,17 @@ fn with_system_hive_key_lease<R>(
         Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => return visit(None),
         Err(status) => return Err(status as u32),
     };
-    let result = visit(Some(opened.lease));
+    let result = visit(Some(&opened));
     unsafe { config_manager_close_system_hive_key(opened.lease) }
         .map_err(|status| status as u32)?;
     result
+}
+
+fn with_system_hive_key_lease<R>(
+    path: &str,
+    visit: impl FnOnce(Option<nt_config_client::SystemHiveKeyLease>) -> Result<R, u32>,
+) -> Result<R, u32> {
+    with_opened_system_hive_key(path, |opened| visit(opened.map(|opened| opened.lease)))
 }
 
 fn query_system_hive_value(
@@ -660,6 +667,7 @@ struct CollectSystemSetupSeedTarget {
     keys: core::cell::RefCell<alloc::vec::Vec<CachedSystemSetupKey>>,
     mutations: alloc::vec::Vec<OwnedSystemHiveMutation>,
     failed: core::cell::Cell<bool>,
+    failure_status: core::cell::Cell<u32>,
 }
 
 impl CollectSystemSetupSeedTarget {
@@ -668,6 +676,14 @@ impl CollectSystemSetupSeedTarget {
             keys: core::cell::RefCell::new(alloc::vec::Vec::new()),
             mutations: alloc::vec::Vec::new(),
             failed: core::cell::Cell::new(false),
+            failure_status: core::cell::Cell::new(0),
+        }
+    }
+
+    fn note_failure(&self, status: u32) {
+        self.failed.set(true);
+        if self.failure_status.get() == 0 {
+            self.failure_status.set(status);
         }
     }
 
@@ -680,7 +696,7 @@ impl CollectSystemSetupSeedTarget {
         path: &str,
     ) -> Result<Option<nt_config_client::SystemHiveKeyLease>, u32> {
         if !self.owns_system_path(path) {
-            self.failed.set(true);
+            self.note_failure(STATUS_OBJECT_PATH_SYNTAX_BAD);
             return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
         }
         let canonical_path = nt_hive_core::canon_path(path);
@@ -718,7 +734,7 @@ impl CollectSystemSetupSeedTarget {
                 Ok(None)
             }
             Err(status) => {
-                self.failed.set(true);
+                self.note_failure(status as u32);
                 Err(status as u32)
             }
         }
@@ -738,13 +754,13 @@ impl CollectSystemSetupSeedTarget {
             Ok(value) => match nt_hive_core::RegistryValueType::from_u32(value.value_type) {
                 Some(value_type) => Some((value_type, value.data)),
                 None => {
-                    self.failed.set(true);
+                    self.note_failure(STATUS_OBJECT_TYPE_MISMATCH);
                     None
                 }
             },
             Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => None,
-            Err(_) => {
-                self.failed.set(true);
+            Err(status) => {
+                self.note_failure(status as u32);
                 None
             }
         }
@@ -761,10 +777,11 @@ impl CollectSystemSetupSeedTarget {
     }
 
     fn close_leases(&mut self) {
-        for key in self.keys.get_mut().drain(..) {
+        let keys = core::mem::take(self.keys.get_mut());
+        for key in keys {
             if let CachedSystemSetupKey::Open { lease, .. } = key {
-                if unsafe { config_manager_close_system_hive_key(lease) }.is_err() {
-                    self.failed.set(true);
+                if let Err(status) = unsafe { config_manager_close_system_hive_key(lease) } {
+                    self.note_failure(status as u32);
                 }
             }
         }
@@ -774,6 +791,16 @@ impl CollectSystemSetupSeedTarget {
         self.close_leases();
         let mutations = core::mem::take(&mut self.mutations);
         (mutations, self.failed.get())
+    }
+
+    fn finish_required(mut self) -> Result<alloc::vec::Vec<OwnedSystemHiveMutation>, u32> {
+        self.close_leases();
+        let mutations = core::mem::take(&mut self.mutations);
+        if self.failed.get() {
+            Err(self.failure_status.get())
+        } else {
+            Ok(mutations)
+        }
     }
 
     fn pending_value(
@@ -835,7 +862,7 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget {
         data: alloc::vec::Vec<u8>,
     ) -> bool {
         if !self.owns_system_path(path) {
-            self.failed.set(true);
+            self.note_failure(STATUS_OBJECT_PATH_SYNTAX_BAD);
             return false;
         }
         if self.value_matches(path, name, value_type, &data) {
@@ -896,6 +923,8 @@ static NT_WAIT_FOR_DEBUG_EVENT_SERVICE_ENTRY: ExecServiceHandler =
 static NT_QUERY_ATTRIBUTES_FILE_SERVICE_ENTRY: ExecServiceHandler =
     exec_nt_query_attributes_file_service_entry;
 const SETUP_UNATTEND_PATH: &[u8] = b"reactos\\unattend.inf";
+const SYSTEM_NLS_LANGUAGE_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language";
 const NT_DEFAULT_LOCALE_ID: u32 = 0x0409;
 const NT_BOGUS_LOCALE_ID: u32 = 0xffff_0000;
 const CM_BOOT_FLAG_SMSS: u32 = 0;
@@ -2691,40 +2720,68 @@ const LOCAL_BYTE_LOCK_IRP_TAG: u64 = 0x8000_0000_0000_0000;
 const LOCAL_DIRECTORY_NOTIFY_IRP_TAG: u64 = 0x9000_0000_0000_0000;
 const LOCAL_ID_PAYLOAD_MASK: u64 = 0x0fff_ffff_ffff_ffff;
 
-fn seed_time_zone(
-    hives: &nt_hive_core::MutableHiveSet,
-) -> nt_kernel_exec::timezone::TimeZoneInformation {
-    use nt_kernel_exec::timezone::{TimeZoneInformation, TimeZoneRegistryField};
-
-    let mut information = TimeZoneInformation::default();
-    let Some(key) = hives
-        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation")
-    else {
-        return information;
-    };
-    for (name, field) in [
-        ("Bias", TimeZoneRegistryField::Bias),
-        ("StandardName", TimeZoneRegistryField::StandardName),
-        ("StandardBias", TimeZoneRegistryField::StandardBias),
-        ("StandardStart", TimeZoneRegistryField::StandardStart),
-        ("DaylightName", TimeZoneRegistryField::DaylightName),
-        ("DaylightBias", TimeZoneRegistryField::DaylightBias),
-        ("DaylightStart", TimeZoneRegistryField::DaylightStart),
-    ] {
-        if let Some((value_type, data)) = hives.query_value(key, name) {
-            let _ = information.apply_registry_value(field, value_type as u32, data);
-        }
-    }
-    information
+struct SystemTimeConfiguration {
+    information: nt_kernel_exec::timezone::TimeZoneInformation,
+    real_time_is_universal: bool,
 }
 
-fn seed_real_time_is_universal(hives: &nt_hive_core::MutableHiveSet) -> bool {
+impl Default for SystemTimeConfiguration {
+    fn default() -> Self {
+        Self {
+            information: nt_kernel_exec::timezone::TimeZoneInformation::default(),
+            real_time_is_universal: false,
+        }
+    }
+}
+
+fn query_system_time_configuration() -> Result<SystemTimeConfiguration, u32> {
+    use nt_kernel_exec::timezone::{TimeZoneInformation, TimeZoneRegistryField};
+
+    const KEY: &str =
+        r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation";
     const REG_DWORD: u32 = 4;
-    hives
-        .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation")
-        .and_then(|key| hives.query_value(key, "RealTimeIsUniversal"))
-        .filter(|(value_type, data)| *value_type as u32 == REG_DWORD && data.len() == 4)
-        .is_some_and(|(_, data)| u32::from_le_bytes(data.try_into().unwrap()) != 0)
+
+    with_system_hive_key_lease(KEY, |lease| {
+        let Some(lease) = lease else {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        let mut information = TimeZoneInformation::default();
+        for (name, field) in [
+            ("Bias", TimeZoneRegistryField::Bias),
+            ("StandardName", TimeZoneRegistryField::StandardName),
+            ("StandardBias", TimeZoneRegistryField::StandardBias),
+            ("StandardStart", TimeZoneRegistryField::StandardStart),
+            ("DaylightName", TimeZoneRegistryField::DaylightName),
+            ("DaylightBias", TimeZoneRegistryField::DaylightBias),
+            ("DaylightStart", TimeZoneRegistryField::DaylightStart),
+        ] {
+            match unsafe { config_manager_query_leased_system_hive_value(lease, name) } {
+                Ok(value) => {
+                    if !information.apply_registry_value(field, value.value_type, &value.data) {
+                        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+                    }
+                }
+                Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => {
+                    return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+                }
+                Err(status) => return Err(status as u32),
+            }
+        }
+        let real_time_is_universal = match unsafe {
+            config_manager_query_leased_system_hive_value(lease, "RealTimeIsUniversal")
+        } {
+            Ok(value) if value.value_type == REG_DWORD && value.data.len() == 4 => {
+                u32::from_le_bytes(value.data.as_slice().try_into().unwrap()) != 0
+            }
+            Ok(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
+            Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => false,
+            Err(status) => return Err(status as u32),
+        };
+        Ok(SystemTimeConfiguration {
+            information,
+            real_time_is_universal,
+        })
+    })
 }
 
 fn effective_time_zone(
@@ -2957,15 +3014,31 @@ fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
     seen.then_some(value)
 }
 
-fn parse_unattend_locale_id(bytes: &[u8]) -> Option<u32> {
+fn parse_decimal_u32(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    let mut seen = false;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(u32::from(byte - b'0'))?;
+        seen = true;
+    }
+    seen.then_some(value)
+}
+
+fn parse_unattend_value<'a>(bytes: &'a [u8], wanted_key: &[u8]) -> Result<Option<&'a [u8]>, ()> {
     let mut in_unattend = false;
+    let mut found = None;
     for raw_line in bytes.split(|byte| *byte == b'\n') {
         let line = trim_ascii(strip_inf_comment(raw_line));
         if line.is_empty() {
             continue;
         }
         if line.first() == Some(&b'[') {
-            let end = line.iter().position(|byte| *byte == b']')?;
+            let end = line.iter().position(|byte| *byte == b']').ok_or(())?;
             in_unattend = ascii_eq_ignore_case(trim_ascii(&line[1..end]), b"Unattend");
             continue;
         }
@@ -2976,7 +3049,7 @@ fn parse_unattend_locale_id(bytes: &[u8]) -> Option<u32> {
             continue;
         };
         let key = trim_ascii(&line[..eq]);
-        if !ascii_eq_ignore_case(key, b"LocaleID") {
+        if !ascii_eq_ignore_case(key, wanted_key) {
             continue;
         }
         let mut value = trim_ascii(&line[eq + 1..]);
@@ -2986,9 +3059,29 @@ fn parse_unattend_locale_id(bytes: &[u8]) -> Option<u32> {
         {
             value = trim_ascii(&value[1..value.len() - 1]);
         }
-        return parse_hex_u32(value);
+        if found.replace(value).is_some() {
+            return Err(());
+        }
     }
-    None
+    Ok(found)
+}
+
+fn parse_unattend_time_zone_index(bytes: &[u8]) -> Result<Option<u32>, ()> {
+    let Some(enabled) = parse_unattend_value(bytes, b"UnattendSetupEnabled")? else {
+        return Ok(None);
+    };
+    if ascii_eq_ignore_case(enabled, b"no") {
+        return Ok(None);
+    }
+    if !ascii_eq_ignore_case(enabled, b"yes") {
+        return Err(());
+    }
+    let signature = parse_unattend_value(bytes, b"Signature")?.ok_or(())?;
+    if !ascii_eq_ignore_case(signature, b"$ReactOS$") {
+        return Err(());
+    }
+    let encoded = parse_unattend_value(bytes, b"TimeZoneIndex")?.ok_or(())?;
+    parse_decimal_u32(encoded).map(Some).ok_or(())
 }
 
 fn lower_hex_digit(value: u32) -> u8 {
@@ -3042,6 +3135,18 @@ fn parse_utf16le_ascii_hex_u32(bytes: &[u8]) -> Option<u32> {
     parse_hex_u32(trim_ascii(&ascii[..len]))
 }
 
+fn query_system_default_language_id() -> Result<u32, u32> {
+    let Some((value_type, data)) =
+        query_system_hive_value(SYSTEM_NLS_LANGUAGE_PATH, "Default")?
+    else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    if value_type != nt_hive_core::RegistryValueType::Sz {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    parse_utf16le_ascii_hex_u32(&data).ok_or(0xC000_014C)
+}
+
 fn locale_id_ascii4(locale_id: u32, out: &mut [u8; 4]) {
     let mut i = 0usize;
     while i < 4 {
@@ -3051,17 +3156,28 @@ fn locale_id_ascii4(locale_id: u32, out: &mut [u8; 4]) {
     }
 }
 
-unsafe fn setup_locale_id_from_unattend() -> Option<u32> {
-    let fs = crate::fs_loader::exec_fs()?;
-    let (cluster, size, attributes) =
-        crate::fs_loader::fat_open_path_entry(&fs, SETUP_UNATTEND_PATH)?;
+unsafe fn setup_time_zone_index_from_unattend() -> Result<Option<u32>, u32> {
+    let Some(fs) = crate::fs_loader::exec_fs() else {
+        return Ok(None);
+    };
+    let Some((cluster, size, attributes)) =
+        crate::fs_loader::fat_open_path_entry(&fs, SETUP_UNATTEND_PATH)
+    else {
+        return Ok(None);
+    };
     if attributes & 0x10 != 0 {
-        return None;
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
     }
     let scratch = &mut *core::ptr::addr_of_mut!(SETUP_UNATTEND_SCRATCH);
-    let wanted = (size as usize).min(scratch.len());
+    let wanted = size as usize;
+    if wanted > scratch.len() {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let read = crate::fs_loader::fat_read_file_range(&fs, cluster, size, 0, &mut scratch[..wanted]);
-    parse_unattend_locale_id(&scratch[..read])
+    if read != wanted {
+        return Err(STATUS_DEVICE_DATA_ERROR);
+    }
+    parse_unattend_time_zone_index(&scratch[..read]).map_err(|_| 0xC000_014C)
 }
 
 fn zeroed_process_slot_u64_vec() -> alloc::vec::Vec<u64> {
@@ -3585,9 +3701,9 @@ impl ExecNtHandler {
             );
             print_str(b")\n");
         }
-        let time_zone_information = seed_time_zone(&mutable_hives);
-        let real_time_is_universal = seed_real_time_is_universal(&mutable_hives);
-        unsafe { publish_time_zone(&time_zone_information, nt_system_time_100ns()) };
+        let time_configuration = SystemTimeConfiguration::default();
+        let time_zone_information = time_configuration.information;
+        let real_time_is_universal = time_configuration.real_time_is_universal;
         let BootstrapProcessManagerSeed {
             pm,
             pids: bootstrap_pids,
@@ -3775,6 +3891,42 @@ impl ExecNtHandler {
         handler.provision_volatile_hardware_registry();
         trace_setup_provision_phase(b"hardware-end", 0);
         if require_boot_system {
+            trace_setup_provision_phase(b"timezone-begin", 0);
+            let configuration = match query_system_time_configuration() {
+                Ok(configuration) => {
+                    print_str(b"[timezone-setup] persisted SYSTEM timezone retained\n");
+                    configuration
+                }
+                Err(STATUS_OBJECT_NAME_NOT_FOUND) => {
+                    if let Err(status) = handler.provision_reactos_time_zone_setup() {
+                        print_str(b"[timezone-setup] installation failed status=0x");
+                        print_hex(status);
+                        print_str(b"\n");
+                        panic!("materialize ReactOS setup timezone through Config Manager");
+                    }
+                    match query_system_time_configuration() {
+                        Ok(configuration) => configuration,
+                        Err(status) => {
+                            print_str(b"[timezone-setup] installed policy query failed status=0x");
+                            print_hex(status);
+                            print_str(b"\n");
+                            panic!("query installed ReactOS timezone through Config Manager");
+                        }
+                    }
+                }
+                Err(status) => {
+                    print_str(b"[timezone-setup] persisted policy invalid status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    panic!("validate persisted ReactOS timezone through Config Manager");
+                }
+            };
+            handler.time_zone_information = configuration.information;
+            handler.real_time_is_universal = configuration.real_time_is_universal;
+            unsafe {
+                publish_time_zone(&handler.time_zone_information, nt_system_time_100ns())
+            };
+            trace_setup_provision_phase(b"timezone-end", 1);
             trace_setup_provision_phase(b"locale-begin", 0);
             unsafe { handler.provision_default_user_locale() };
             trace_setup_provision_phase(b"locale-end", 0);
@@ -3796,6 +3948,10 @@ impl ExecNtHandler {
             trace_setup_provision_phase(b"shell-com-begin", 0);
             handler.provision_reactos_explorer_shell_com_classes();
             trace_setup_provision_phase(b"shell-com-end", 0);
+        } else {
+            unsafe {
+                publish_time_zone(&handler.time_zone_information, nt_system_time_100ns())
+            };
         }
         handler
     }
@@ -3924,6 +4080,88 @@ impl ExecNtHandler {
         print_str(b"\" FeatureSet=0x");
         print_hex(processor.processor_feature_bits);
         print_str(b"\n");
+    }
+
+    /// Materialize the timezone selected by ReactOS setup through the CM mutation path.
+    ///
+    /// An enabled unattended file may select an explicit index. Normal interactive setup maps the
+    /// installed NLS language through SOFTWARE's `Time Zones\IndexMapping`. The selected SOFTWARE
+    /// record supplies the names and TZI payload; no timezone policy is embedded here.
+    fn provision_reactos_time_zone_setup(
+        &mut self,
+    ) -> Result<nt_hive_core::ReactOsTimeZoneSeedOutcome, u32> {
+        const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+
+        let (selected_index, selection_source): (u32, &[u8]) =
+            match unsafe { setup_time_zone_index_from_unattend()? } {
+                Some(index) => (index, b"enabled unattend.inf"),
+                None => {
+                    let language_id = query_system_default_language_id()?;
+                    let index = nt_hive_core::reactos_time_zone_index_for_language(
+                        &self.mutable_hives,
+                        language_id,
+                    )
+                    .map_err(|error| match error {
+                        nt_hive_core::ReactOsTimeZoneDatabaseError::DatabaseMissing
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::LanguageMappingMissing => {
+                            STATUS_OBJECT_NAME_NOT_FOUND
+                        }
+                        nt_hive_core::ReactOsTimeZoneDatabaseError::IndexMappingInvalid
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::LanguageMappingAmbiguous
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::SelectionMissing
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::SelectionAmbiguous
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::StandardNameInvalid
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::DaylightNameInvalid
+                        | nt_hive_core::ReactOsTimeZoneDatabaseError::TziInvalid => {
+                            STATUS_REGISTRY_CORRUPT
+                        }
+                    })?;
+                    (index, b"NLS Language/Time Zones IndexMapping")
+                }
+            };
+        let setup = nt_hive_core::reactos_time_zone_setup_from_mutable_hives(
+            &self.mutable_hives,
+            selected_index,
+        )
+        .map_err(|error| match error {
+            nt_hive_core::ReactOsTimeZoneDatabaseError::DatabaseMissing
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::LanguageMappingMissing
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::SelectionMissing => {
+                STATUS_OBJECT_NAME_NOT_FOUND
+            }
+            nt_hive_core::ReactOsTimeZoneDatabaseError::IndexMappingInvalid
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::LanguageMappingAmbiguous
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::SelectionAmbiguous
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::StandardNameInvalid
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::DaylightNameInvalid
+            | nt_hive_core::ReactOsTimeZoneDatabaseError::TziInvalid => STATUS_REGISTRY_CORRUPT,
+        })?;
+        let mut target = CollectSystemSetupSeedTarget::new();
+        let outcome = nt_hive_core::seed_reactos_time_zone_setup_into_target(&mut target, &setup);
+        let mutations = target.finish_required()?;
+        let outcome = outcome.map_err(|error| match error {
+            nt_hive_core::ReactOsTimeZoneSeedError::IncompleteExistingConfiguration => {
+                STATUS_REGISTRY_CORRUPT
+            }
+            nt_hive_core::ReactOsTimeZoneSeedError::TargetRejected => STATUS_UNSUCCESSFUL,
+        })?;
+        if mutations.is_empty() {
+            print_str(b"[timezone-setup] persisted SYSTEM timezone retained index=");
+            print_u64(selected_index as u64);
+            print_str(b"\n");
+            return Ok(outcome);
+        }
+        let generation = self
+            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)?;
+        self.note_mutable_hives_changed();
+        print_str(b"[timezone-setup] ReactOS timezone index=");
+        print_u64(selected_index as u64);
+        print_str(b" selected from ");
+        print_str(selection_source);
+        print_str(b" committed through CM generation ");
+        print_u64(generation);
+        print_str(b"\n");
+        Ok(outcome)
     }
 
     /// Put the mounted SYSTEM hive into the normal installed-boot setup state.
@@ -4473,56 +4711,27 @@ impl ExecNtHandler {
     /// A LiveCD never runs it, so the hive it ships has no locale — the same shape of gap as the
     /// missing `ntuser.dat`.
     ///
-    /// This performs that setup step at setup's own locations. ReactOS setup reads `LocaleID` from
-    /// `reactos\unattend.inf`, formats it as eight lowercase hex digits, writes that full string to
-    /// HKU `.DEFAULT\Control Panel\International\Locale`, then writes the low four digits to
-    /// HKLM `SYSTEM\CurrentControlSet\Control\Nls\Language::{Default,InstallLanguage}`.
-    ///
-    /// ★ BYPASS SWITCH `PROVISION_DEFAULT_USER_LOCALE`.
+    /// This performs that setup step at setup's own locations. The installed NLS language is the
+    /// authoritative locale selected by setup. Its eight-digit LCID is written to HKU `.DEFAULT`,
+    /// while the low four digits remain in HKLM
+    /// `SYSTEM\CurrentControlSet\Control\Nls\Language::{Default,InstallLanguage}`.
     ///
     /// # Safety
     /// Runs during construction; the overlay owns the strings it allocates.
     unsafe fn provision_default_user_locale(&mut self) {
-        if !PROVISION_DEFAULT_USER_LOCALE {
-            return;
-        }
-        const NLS_LANGUAGE: &str =
-            r"\Registry\Machine\System\CurrentControlSet\Control\Nls\Language";
         const USER_INTERNATIONAL: &str = r"\Registry\User\.Default\Control Panel\International";
         const REG_SZ: u32 = 1;
         let mut locale_ascii = [0u8; 8];
-        let locale_source: &[u8] = if let Some(locale_id) = setup_locale_id_from_unattend() {
-            locale_id_ascii8(locale_id, &mut locale_ascii);
-            b"reactos\\unattend.inf"
-        } else {
-            let (source_ty, language_id) = match query_system_hive_value(NLS_LANGUAGE, "Default") {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    print_str(
-                        b"[locale-setup] no LocaleID in unattend.inf and HKLM\\...\\Nls\\Language\\Default absent -> no user locale\n",
-                    );
-                    return;
-                }
-                Err(status) => {
-                    print_str(
-                        b"[locale-setup] CM HKLM\\...\\Nls\\Language\\Default query failed status=0x",
-                    );
-                    print_hex(status);
-                    print_str(b"\n");
-                    return;
-                }
-            };
-            if source_ty != nt_hive_core::RegistryValueType::Sz {
-                print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not REG_SZ -> no user locale\n");
+        let locale_id = match query_system_default_language_id() {
+            Ok(locale_id) => locale_id,
+            Err(status) => {
+                print_str(b"[locale-setup] installed NLS language query failed status=0x");
+                print_hex(status);
+                print_str(b"\n");
                 return;
             }
-            let Some(locale_id) = parse_utf16le_ascii_hex_u32(&language_id) else {
-                print_str(b"[locale-setup] HKLM\\...\\Nls\\Language\\Default is not a hex LCID -> no user locale\n");
-                return;
-            };
-            locale_id_ascii8(locale_id, &mut locale_ascii);
-            b"HKLM\\SYSTEM\\...\\Nls\\Language\\Default"
         };
+        locale_id_ascii8(locale_id, &mut locale_ascii);
         let system_ascii = &locale_ascii[4..8];
         if let (Some(locale_id), Some(langid)) =
             (parse_hex_u32(&locale_ascii), parse_hex_u32(system_ascii))
@@ -4567,7 +4776,7 @@ impl ExecNtHandler {
         trace_setup_provision_phase(b"locale-user-value-end", user_locale_changed as u64);
         trace_setup_provision_phase(b"locale-system-key-begin", 0);
         let mut target = CollectSystemSetupSeedTarget::new();
-        if !target.has_key(NLS_LANGUAGE) {
+        if !target.has_key(SYSTEM_NLS_LANGUAGE_PATH) {
             let (_, failed) = target.finish();
             if failed {
                 print_str(b"[locale-setup] CM HKLM\\...\\Nls\\Language open failed\n");
@@ -4580,7 +4789,7 @@ impl ExecNtHandler {
         trace_setup_provision_phase(b"locale-system-default-begin", system_locale_len as u64);
         let system_default_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
             &mut target,
-            NLS_LANGUAGE,
+            SYSTEM_NLS_LANGUAGE_PATH,
             "Default",
             nt_hive_core::RegistryValueType::Sz,
             system_locale[..system_locale_len].to_vec(),
@@ -4592,7 +4801,7 @@ impl ExecNtHandler {
         trace_setup_provision_phase(b"locale-install-language-begin", system_locale_len as u64);
         let install_language_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
             &mut target,
-            NLS_LANGUAGE,
+            SYSTEM_NLS_LANGUAGE_PATH,
             "InstallLanguage",
             nt_hive_core::RegistryValueType::Sz,
             system_locale[..system_locale_len].to_vec(),
@@ -4641,7 +4850,7 @@ impl ExecNtHandler {
         print_str(b" (REG type ");
         print_u64(REG_SZ as u64);
         print_str(b", from ");
-        print_str(locale_source);
+        print_str(b"HKLM\\SYSTEM\\...\\Nls\\Language\\Default");
         print_str(b") | HKLM\\...\\Nls\\Language Default=");
         for &byte in system_ascii {
             debug_put_char(byte);
@@ -6930,61 +7139,16 @@ impl ExecNtHandler {
         if !self.xas_read(buffer, &mut bytes[..byte_len]) {
             return Err(STATUS_ACCESS_VIOLATION);
         }
-        let mut path = alloc::string::String::new();
+        let mut units = [0u16; MAX_DRIVER_SERVICE_PATH_BYTES / 2];
         for index in 0..byte_len / 2 {
             let unit = u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
-            if !(0x20..=0x7e).contains(&unit) {
+            if unit == 0 {
                 return Err(STATUS_OBJECT_NAME_INVALID);
             }
-            path.push(char::from_u32(unit as u32).ok_or(STATUS_OBJECT_NAME_INVALID)?);
+            units[index] = unit;
         }
-        Ok(path)
-    }
-
-    fn driver_service_name_from_registry_path(
-        &self,
-        path: &str,
-    ) -> Result<alloc::string::String, u32> {
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        const STATUS_OBJECT_NAME_INVALID: u32 = 0xC000_0033;
-        const STATUS_OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
-
-        let (hive_id, relative_path) = self
-            .mutable_hives
-            .resolve_path(path)
-            .ok_or(STATUS_OBJECT_PATH_SYNTAX_BAD)?;
-        if hive_id != HIVE_SEL_SYSTEM {
-            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
-        }
-        let selected = self
-            .mutable_hives
-            .hive(HIVE_SEL_SYSTEM)
-            .and_then(|hive| hive.current_control_set().ok())
-            .ok_or(STATUS_OBJECT_PATH_SYNTAX_BAD)?;
-        let comps: alloc::vec::Vec<&str> = relative_path
-            .split('\\')
-            .filter(|component| !component.is_empty())
-            .collect();
-        if comps.len() != 3
-            || !comps[0].eq_ignore_ascii_case(selected.as_str())
-            || !comps[1].eq_ignore_ascii_case("Services")
-        {
-            return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
-        }
-        let service = comps[2];
-        if service.is_empty() {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let bytes = service.as_bytes();
-        if !bytes
-            .iter()
-            .copied()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
-            || bytes.windows(2).any(|w| w == b"..")
-        {
-            return Err(STATUS_OBJECT_NAME_INVALID);
-        }
-        Ok(alloc::string::String::from(service))
+        alloc::string::String::from_utf16(&units[..byte_len / 2])
+            .map_err(|_| STATUS_OBJECT_NAME_INVALID)
     }
 
     unsafe fn nt_load_driver(&mut self, service_name_ustr: u64) -> u32 {
@@ -7001,12 +7165,8 @@ impl ExecNtHandler {
             Ok(path) => path,
             Err(status) => return status,
         };
-        let service = match self.driver_service_name_from_registry_path(&service_path) {
-            Ok(service) => service,
-            Err(status) => return status,
-        };
-        let spec = match live_config_driver_service_launch_spec(
-            &service,
+        let spec = match live_config_driver_service_launch_spec_from_registry_path(
+            &service_path,
             nt_config_manager::SERVICE_DEMAND_START,
         ) {
             Ok(spec) => spec,
@@ -7094,12 +7254,8 @@ impl ExecNtHandler {
             Ok(path) => path,
             Err(status) => return status,
         };
-        let service = match self.driver_service_name_from_registry_path(&service_path) {
-            Ok(service) => service,
-            Err(status) => return status,
-        };
-        let driver_object_path = match live_config_driver_service_launch_spec(
-            &service,
+        let driver_object_path = match live_config_driver_service_launch_spec_from_registry_path(
+            &service_path,
             nt_config_manager::SERVICE_DEMAND_START,
         ) {
             Ok(spec) => spec.driver_object_path,
@@ -19163,20 +19319,25 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let refreshed_time_zone = (new_time == 0).then(|| seed_time_zone(&self.mutable_hives));
-        let refreshed_real_time_is_universal =
-            (new_time == 0).then(|| seed_real_time_is_universal(&self.mutable_hives));
+        let refreshed_time_configuration = if new_time == 0 {
+            match query_system_time_configuration() {
+                Ok(configuration) => Some(configuration),
+                Err(status) => return status,
+            }
+        } else {
+            None
+        };
         let requested_system_time = if new_time == 0 {
             let persistent_time = match persistent_clock_read_100ns() {
                 Ok(time) => time,
                 Err(error) => return persistent_clock_error_status(error),
             };
-            if refreshed_real_time_is_universal.unwrap() {
+            let configuration = refreshed_time_configuration.as_ref().unwrap();
+            if configuration.real_time_is_universal {
                 persistent_time
             } else {
                 let current = nt_system_time_100ns();
-                let bias =
-                    effective_time_zone(refreshed_time_zone.as_ref().unwrap(), current).bias_100ns;
+                let bias = effective_time_zone(&configuration.information, current).bias_100ns;
                 let Some(system_time) = adjusted_native_time(persistent_time, bias) else {
                     return STATUS_INVALID_PARAMETER;
                 };
@@ -19218,9 +19379,9 @@ impl ExecNtHandler {
             Err(nt_time::ClockError::InvalidSystemTime) => return STATUS_INVALID_PARAMETER,
             Err(nt_time::ClockError::MonotonicRegression) => return STATUS_UNSUCCESSFUL,
         };
-        if let Some(information) = refreshed_time_zone {
-            self.time_zone_information = information;
-            self.real_time_is_universal = refreshed_real_time_is_universal.unwrap();
+        if let Some(configuration) = refreshed_time_configuration {
+            self.time_zone_information = configuration.information;
+            self.real_time_is_universal = configuration.real_time_is_universal;
         }
         // Latch this before the optional copyout: NT has already moved the clock if that later
         // write faults, so the service-loop tail must still publish and re-evaluate deadlines.
@@ -21720,13 +21881,9 @@ impl ExecNtHandler {
             "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Lsa";
         const POLICY_VALUE: &str = "EveryoneIncludesAnonymous";
 
-        let key = self
-            .mutable_registry_key_by_path(LSA_CONTROL_PATH)
-            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-        let (value_type, data) = self
-            .mutable_hives
-            .query_value(key, POLICY_VALUE)
-            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let (value_type, data) =
+            query_system_hive_value(LSA_CONTROL_PATH, POLICY_VALUE)?
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         if value_type != nt_hive_core::RegistryValueType::Dword || data.len() != 4 {
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
         }

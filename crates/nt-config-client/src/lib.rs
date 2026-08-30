@@ -49,6 +49,9 @@ pub trait Backend {
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+const STATUS_OBJECT_PATH_SYNTAX_BAD: i32 = 0xC000_003Bu32 as i32;
+const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
@@ -140,6 +143,15 @@ pub struct DriverServiceBinding {
     pub load_order_group: Option<String>,
     pub tag: Option<u32>,
     pub devnodes: Vec<DriverServiceDevnode>,
+}
+
+/// One driver service proven to be an immediate child of the mounted SYSTEM hive's active
+/// `CurrentControlSet\Services` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveDriverServiceBinding {
+    pub mount_generation: u64,
+    pub physical_path: String,
+    pub binding: DriverServiceBinding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -728,6 +740,31 @@ fn utf16_bytes(s: &str) -> Vec<u8> {
     v
 }
 
+fn immediate_registry_child_name<'a>(path: &'a str, parent: &str) -> Option<&'a str> {
+    let path = path.strip_prefix('\\')?;
+    let parent = parent.strip_prefix('\\')?;
+    if path.is_empty()
+        || parent.is_empty()
+        || path.ends_with('\\')
+        || parent.ends_with('\\')
+        || path.contains("\\\\")
+        || parent.contains("\\\\")
+    {
+        return None;
+    }
+    let mut path_components = path.split('\\');
+    for parent_component in parent.split('\\') {
+        if !path_components
+            .next()?
+            .eq_ignore_ascii_case(parent_component)
+        {
+            return None;
+        }
+    }
+    let child = path_components.next()?;
+    (!child.is_empty() && path_components.next().is_none()).then_some(child)
+}
+
 fn append_hive_mutation_record(
     journal: &mut Vec<u8>,
     kind: u16,
@@ -1150,6 +1187,67 @@ impl<B: Backend> ConfigClient<B> {
                 token = response.detail1;
             }
         }
+    }
+
+    /// Resolve a driver service only when `service_path` names an immediate child of the mounted
+    /// active `CurrentControlSet\Services` key. All leases are released before this returns.
+    pub fn query_active_driver_service_by_registry_path(
+        &mut self,
+        service_path: &str,
+    ) -> Result<ActiveDriverServiceBinding, i32> {
+        const ACTIVE_SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
+
+        let active_services = self.open_system_hive_key_with_path(ACTIVE_SERVICES_PATH)?;
+        let candidate = match self.open_system_hive_key_with_path(service_path) {
+            Ok(candidate) => candidate,
+            Err(status) => {
+                let _ = self.close_system_hive_key(active_services.lease);
+                return Err(status);
+            }
+        };
+        let generation = active_services.lease.opened_generation;
+        let validation = (|| {
+            if candidate.lease.opened_generation != generation {
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+            let service_name = immediate_registry_child_name(
+                &candidate.physical_path,
+                &active_services.physical_path,
+            )
+            .ok_or(STATUS_OBJECT_PATH_SYNTAX_BAD)?;
+            let binding = self.query_driver_service(service_name)?;
+            if !binding.service_name.eq_ignore_ascii_case(service_name) {
+                return Err(STATUS_REGISTRY_CORRUPT);
+            }
+            let information = self.query_leased_system_hive_key_information(candidate.lease)?;
+            if information.mount_generation != generation {
+                return Err(STATUS_DEVICE_NOT_READY);
+            }
+            if !information
+                .path
+                .eq_ignore_ascii_case(&candidate.physical_path)
+            {
+                return Err(STATUS_REGISTRY_CORRUPT);
+            }
+            Ok(ActiveDriverServiceBinding {
+                mount_generation: generation,
+                physical_path: candidate.physical_path.clone(),
+                binding,
+            })
+        })();
+
+        // Both identities must be released even when one close fails. A validation failure remains
+        // the primary error, while a successful validation also requires stable close generations.
+        let candidate_close = self.close_system_hive_key(candidate.lease);
+        let active_services_close = self.close_system_hive_key(active_services.lease);
+        let resolved = match validation {
+            Ok(resolved) => resolved,
+            Err(status) => return Err(status),
+        };
+        if candidate_close? != generation || active_services_close? != generation {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        Ok(resolved)
     }
 
     /// Atomically publish one complete `nt-hive-core` SYSTEM image in the isolated
@@ -2847,6 +2945,14 @@ mod tests {
         server: CmServer,
     }
 
+    struct TrackingDirect {
+        server: CmServer,
+        successful_opens: usize,
+        successful_closes: usize,
+        skew_second_open_generation: bool,
+        skew_first_close_generation: bool,
+    }
+
     /// Model the integrated service: dispatch into a whole page even when the final caller's slice
     /// is smaller, then copy completion bytes exactly as `RingChannel` does.
     struct Framed {
@@ -2866,6 +2972,34 @@ mod tests {
             self.server.dispatch(opcode, in_buf, out_buf)
         }
     }
+    impl Backend for TrackingDirect {
+        fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+            let lease_operation = if opcode == opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE {
+                CmHiveKeyLeaseRequest::from_bytes(in_buf).map(|request| request.operation)
+            } else {
+                None
+            };
+            let mut reply = self.server.dispatch(opcode, in_buf, out_buf);
+            if reply.status == STATUS_SUCCESS {
+                match lease_operation {
+                    Some(hive_key_lease_operation::OPEN) => {
+                        self.successful_opens += 1;
+                        if self.skew_second_open_generation && self.successful_opens == 2 {
+                            reply.detail0 = reply.detail0.saturating_add(1);
+                        }
+                    }
+                    Some(hive_key_lease_operation::CLOSE) => {
+                        self.successful_closes += 1;
+                        if self.skew_first_close_generation && self.successful_closes == 1 {
+                            reply.detail0 = reply.detail0.saturating_add(1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            reply
+        }
+    }
 
     fn client() -> ConfigClient<Direct> {
         client_with_server(CmServer::new())
@@ -2873,6 +3007,42 @@ mod tests {
 
     fn client_with_server(server: CmServer) -> ConfigClient<Direct> {
         ConfigClient::new(Direct { server })
+    }
+
+    fn tracking_client(
+        skew_second_open_generation: bool,
+        skew_first_close_generation: bool,
+    ) -> ConfigClient<TrackingDirect> {
+        ConfigClient::new(TrackingDirect {
+            server: CmServer::new(),
+            successful_opens: 0,
+            successful_closes: 0,
+            skew_second_open_generation,
+            skew_first_close_generation,
+        })
+    }
+
+    fn active_driver_service_identity_hive() -> Hive {
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 2);
+        for (control_set, image_path) in [
+            ("ControlSet001", r"system32\drivers\inactive.sys"),
+            ("ControlSet002", r"system32\drivers\active.sys"),
+        ] {
+            let service = hive.create_key(&format!(r"{control_set}\Services\Stable"));
+            hive.set_dword(service, "Type", SERVICE_KERNEL_DRIVER);
+            hive.set_dword(service, "Start", SERVICE_DEMAND_START);
+            assert!(hive.set_value(
+                service,
+                "ImagePath",
+                RegistryValueType::ExpandSz,
+                encode_sz(image_path),
+            ));
+        }
+        hive.create_key(r"ControlSet002\Services\Stable\Parameters");
+        hive.finish_clean_import();
+        hive
     }
 
     #[test]
@@ -3669,6 +3839,94 @@ mod tests {
         assert_eq!(binding.start_type, 3);
         assert_eq!(binding.devnodes.len(), 73);
         assert_eq!(binding.devnodes.last().unwrap().instance_id, late_instance);
+    }
+
+    #[test]
+    fn active_driver_service_registry_path_requires_exact_active_physical_child() {
+        const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
+
+        let mut client = tracking_client(false, false);
+        assert_eq!(
+            client.import_system_hive(&encode_image(&active_driver_service_identity_hive())),
+            Ok(1)
+        );
+
+        let resolved = client
+            .query_active_driver_service_by_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Services\stable",
+            )
+            .unwrap();
+        assert_eq!(resolved.mount_generation, 1);
+        assert!(resolved
+            .physical_path
+            .eq_ignore_ascii_case(r"\Registry\Machine\System\ControlSet002\Services\Stable"));
+        assert_eq!(resolved.binding.service_name, "Stable");
+        assert_eq!(resolved.binding.image_path, r"system32\drivers\active.sys");
+
+        let direct_active = client
+            .query_active_driver_service_by_registry_path(
+                r"\registry\machine\system\controlset002\services\STABLE",
+            )
+            .unwrap();
+        assert_eq!(direct_active.binding.service_name, "Stable");
+        assert_eq!(
+            client.query_active_driver_service_by_registry_path(
+                r"\Registry\Machine\System\ControlSet001\Services\Stable",
+            ),
+            Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
+        );
+        assert_eq!(
+            client.query_active_driver_service_by_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Stable\Parameters",
+            ),
+            Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
+        );
+        assert_eq!(
+            client.query_active_driver_service_by_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Missing",
+            ),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            client.backend.successful_opens,
+            client.backend.successful_closes
+        );
+    }
+
+    #[test]
+    fn active_driver_service_registry_path_fences_generation_and_closes_both_leases() {
+        let image = encode_image(&active_driver_service_identity_hive());
+        let service_path = r"\Registry\Machine\System\CurrentControlSet\Services\Stable";
+
+        let mut open_skew = tracking_client(true, false);
+        assert_eq!(open_skew.import_system_hive(&image), Ok(1));
+        assert_eq!(
+            open_skew.query_active_driver_service_by_registry_path(service_path),
+            Err(STATUS_DEVICE_NOT_READY)
+        );
+        assert_eq!(open_skew.backend.successful_opens, 2);
+        assert_eq!(open_skew.backend.successful_closes, 2);
+
+        let mut close_skew = tracking_client(false, true);
+        assert_eq!(close_skew.import_system_hive(&image), Ok(1));
+        assert_eq!(
+            close_skew.query_active_driver_service_by_registry_path(service_path),
+            Err(STATUS_DEVICE_NOT_READY)
+        );
+        assert_eq!(close_skew.backend.successful_opens, 2);
+        assert_eq!(close_skew.backend.successful_closes, 2);
+
+        let mut primary_error = tracking_client(false, true);
+        assert_eq!(primary_error.import_system_hive(&image), Ok(1));
+        assert_eq!(
+            primary_error.query_active_driver_service_by_registry_path(
+                r"\Registry\Machine\System\ControlSet001\Services\Stable",
+            ),
+            Err(STATUS_OBJECT_PATH_SYNTAX_BAD),
+            "a physical-identity validation error remains primary when close fencing also fails"
+        );
+        assert_eq!(primary_error.backend.successful_opens, 2);
+        assert_eq!(primary_error.backend.successful_closes, 2);
     }
 
     #[test]

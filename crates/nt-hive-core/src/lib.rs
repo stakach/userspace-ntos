@@ -24,6 +24,7 @@ mod reactos_registration;
 pub use overlay::{canon_path, RegistryOverlay};
 pub use reactos_registration::{
     collect_reactos_network_adapter_bindings, reactos_network_ipv4_defaults_for_interface,
+    reactos_time_zone_index_for_language, reactos_time_zone_setup_from_mutable_hives,
     seed_reactos_default_user_shell_folders_in_mutable_hives,
     seed_reactos_explorer_shell_com_classes,
     seed_reactos_explorer_shell_com_classes_in_mutable_hives,
@@ -33,15 +34,18 @@ pub use reactos_registration::{
     seed_reactos_network_bindings_from_pnp_driver_bindings_into_target,
     seed_reactos_network_setup_in_config_manager, seed_reactos_network_setup_in_mutable_hives,
     seed_reactos_network_setup_into_target, seed_reactos_print_setup_in_mutable_hives,
-    seed_reactos_print_setup_into_target, seed_reactos_user_profile_shell_folders_in_mutable_hives,
+    seed_reactos_print_setup_into_target, seed_reactos_time_zone_setup_into_target,
+    seed_reactos_user_profile_shell_folders_in_mutable_hives,
     seed_reactos_user_profile_shell_folders_into_target, utf16le_sz,
     ReactOsComClassRegistrationScript, ReactOsNetworkAdapterBinding, ReactOsNetworkIpv4Defaults,
     ReactOsNetworkSetupSeedStats, ReactOsPrintEnvironmentRegistration, ReactOsPrintSetupSeedStats,
     ReactOsProfileShellFolder, ReactOsProfileShellFolderSeedStats, ReactOsSetupSeedTarget,
-    CLSID_REBAR_BAND_SITE, CLSID_START_MENU, REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
+    ReactOsTimeZoneDatabaseError, ReactOsTimeZoneSeedError, ReactOsTimeZoneSeedOutcome,
+    ReactOsTimeZoneSetup, CLSID_REBAR_BAND_SITE, CLSID_START_MENU,
+    REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_REBAR_BAND_SITE,
     REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU,
     REACTOS_EXPLORER_SHELL_COM_REGISTRATION_SCRIPTS, REACTOS_PRINT_ENVIRONMENTS,
-    REACTOS_USER_PROFILE_SHELL_FOLDERS,
+    REACTOS_TIME_ZONE_INFORMATION_PATH, REACTOS_USER_PROFILE_SHELL_FOLDERS,
 };
 
 pub use codec::{

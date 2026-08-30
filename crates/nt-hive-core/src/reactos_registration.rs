@@ -223,6 +223,266 @@ pub struct ReactOsProfileShellFolderSeedStats {
     pub user_shell_folder_values: u32,
 }
 
+const REACTOS_TIME_ZONE_DATABASE_ROOT: &str =
+    r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Time Zones";
+pub const REACTOS_TIME_ZONE_INFORMATION_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation";
+const REG_TZI_FORMAT_SIZE: usize = 44;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactOsTimeZoneSetup {
+    standard_name: Vec<u8>,
+    daylight_name: Vec<u8>,
+    tzi: [u8; REG_TZI_FORMAT_SIZE],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactOsTimeZoneDatabaseError {
+    DatabaseMissing,
+    IndexMappingInvalid,
+    LanguageMappingMissing,
+    LanguageMappingAmbiguous,
+    SelectionMissing,
+    SelectionAmbiguous,
+    StandardNameInvalid,
+    DaylightNameInvalid,
+    TziInvalid,
+}
+
+fn parse_utf16_ascii_integer(bytes: &[u8], radix: u32) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut value = 0u32;
+    for pair in bytes.chunks_exact(2) {
+        if pair[1] != 0 {
+            return None;
+        }
+        let digit = match pair[0] {
+            b'0'..=b'9' => u32::from(pair[0] - b'0'),
+            b'a'..=b'f' if radix == 16 => u32::from(pair[0] - b'a') + 10,
+            b'A'..=b'F' if radix == 16 => u32::from(pair[0] - b'A') + 10,
+            _ => return None,
+        };
+        if digit >= radix {
+            return None;
+        }
+        value = value.checked_mul(radix)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+fn strict_multi_sz_fields(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    if bytes.len() < 4 || bytes.len() % 2 != 0 || bytes[bytes.len() - 4..] != [0, 0, 0, 0] {
+        return None;
+    }
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    while offset + 1 < bytes.len() {
+        if bytes[offset] != 0 || bytes[offset + 1] != 0 {
+            offset += 2;
+            continue;
+        }
+        if offset == start {
+            return (offset + 2 == bytes.len()).then_some(fields);
+        }
+        fields.push(&bytes[start..offset]);
+        start = offset + 2;
+        offset += 2;
+    }
+    None
+}
+
+/// Resolve ReactOS setup's default timezone index from SOFTWARE `IndexMapping`.
+///
+/// Interactive setup reads the installed NLS language and consumes the alternating language/index
+/// strings in this `REG_MULTI_SZ`. The mapping is kept strict here: malformed pairs and duplicate
+/// matches are registry corruption, while an otherwise valid table without the language is a
+/// distinct missing-policy result.
+pub fn reactos_time_zone_index_for_language(
+    hives: &MutableHiveSet,
+    language_id: u32,
+) -> Result<u32, ReactOsTimeZoneDatabaseError> {
+    let root = hives
+        .resolve_key(REACTOS_TIME_ZONE_DATABASE_ROOT)
+        .ok_or(ReactOsTimeZoneDatabaseError::DatabaseMissing)?;
+    let (value_type, data) = hives
+        .query_value(root, "IndexMapping")
+        .ok_or(ReactOsTimeZoneDatabaseError::IndexMappingInvalid)?;
+    if value_type != RegistryValueType::MultiSz {
+        return Err(ReactOsTimeZoneDatabaseError::IndexMappingInvalid);
+    }
+    let fields = strict_multi_sz_fields(data)
+        .filter(|fields| !fields.is_empty() && fields.len() % 2 == 0)
+        .ok_or(ReactOsTimeZoneDatabaseError::IndexMappingInvalid)?;
+    let mut selected = None;
+    for pair in fields.chunks_exact(2) {
+        let mapped_language = parse_utf16_ascii_integer(pair[0], 16)
+            .ok_or(ReactOsTimeZoneDatabaseError::IndexMappingInvalid)?;
+        let mapped_index = parse_utf16_ascii_integer(pair[1], 10)
+            .ok_or(ReactOsTimeZoneDatabaseError::IndexMappingInvalid)?;
+        if mapped_language != language_id {
+            continue;
+        }
+        if selected.replace(mapped_index).is_some() {
+            return Err(ReactOsTimeZoneDatabaseError::LanguageMappingAmbiguous);
+        }
+    }
+    selected.ok_or(ReactOsTimeZoneDatabaseError::LanguageMappingMissing)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactOsTimeZoneSeedError {
+    IncompleteExistingConfiguration,
+    TargetRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactOsTimeZoneSeedOutcome {
+    AlreadyConfigured,
+    Seeded,
+}
+
+fn valid_time_zone_name_value(value_type: RegistryValueType, data: &[u8]) -> bool {
+    value_type == RegistryValueType::Sz
+        && data.len() >= 2
+        && data.len() <= 64
+        && data.len() % 2 == 0
+        && data[data.len() - 2..] == [0, 0]
+}
+
+/// Resolve the timezone record selected by ReactOS setup from the mounted SOFTWARE database.
+///
+/// ReactOS setup enumerates `...\Time Zones`, selects the entry whose `Index` matches the
+/// unattended setup value, and passes its `Std`, `Dlt`, and `TZI` values to
+/// `SetTimeZoneInformation`. Keeping that selection here makes the setup import host-testable and
+/// avoids embedding a timezone policy in the executive.
+pub fn reactos_time_zone_setup_from_mutable_hives(
+    hives: &MutableHiveSet,
+    selected_index: u32,
+) -> Result<ReactOsTimeZoneSetup, ReactOsTimeZoneDatabaseError> {
+    let root = hives
+        .resolve_key(REACTOS_TIME_ZONE_DATABASE_ROOT)
+        .ok_or(ReactOsTimeZoneDatabaseError::DatabaseMissing)?;
+    let hive = hives
+        .hive(root.hive)
+        .ok_or(ReactOsTimeZoneDatabaseError::DatabaseMissing)?;
+    let mut selected = None;
+    for child_index in 0..hive.subkey_count(root.key) {
+        let Some(child_name) = hive.subkey_name_by_index(root.key, child_index) else {
+            continue;
+        };
+        let Some(child_key) = hive.open_subkey(root.key, child_name) else {
+            continue;
+        };
+        if hive.query_dword(child_key, "Index") != Some(selected_index) {
+            continue;
+        }
+        if selected.replace(child_key).is_some() {
+            return Err(ReactOsTimeZoneDatabaseError::SelectionAmbiguous);
+        }
+    }
+    let selected = selected.ok_or(ReactOsTimeZoneDatabaseError::SelectionMissing)?;
+    let (standard_type, standard_name) = hive
+        .query_value(selected, "Std")
+        .ok_or(ReactOsTimeZoneDatabaseError::StandardNameInvalid)?;
+    if !valid_time_zone_name_value(standard_type, standard_name) {
+        return Err(ReactOsTimeZoneDatabaseError::StandardNameInvalid);
+    }
+    let (daylight_type, daylight_name) = hive
+        .query_value(selected, "Dlt")
+        .ok_or(ReactOsTimeZoneDatabaseError::DaylightNameInvalid)?;
+    if !valid_time_zone_name_value(daylight_type, daylight_name) {
+        return Err(ReactOsTimeZoneDatabaseError::DaylightNameInvalid);
+    }
+    let (tzi_type, tzi_data) = hive
+        .query_value(selected, "TZI")
+        .ok_or(ReactOsTimeZoneDatabaseError::TziInvalid)?;
+    if tzi_type != RegistryValueType::Binary || tzi_data.len() != REG_TZI_FORMAT_SIZE {
+        return Err(ReactOsTimeZoneDatabaseError::TziInvalid);
+    }
+    let mut tzi = [0u8; REG_TZI_FORMAT_SIZE];
+    tzi.copy_from_slice(tzi_data);
+    Ok(ReactOsTimeZoneSetup {
+        standard_name: standard_name.to_vec(),
+        daylight_name: daylight_name.to_vec(),
+        tzi,
+    })
+}
+
+/// Materialize the selected ReactOS setup timezone into SYSTEM without overwriting persisted policy.
+///
+/// A complete existing configuration belongs to the administrator and is left byte-for-byte
+/// unchanged. A partial configuration is corruption rather than an invitation to mix fields from
+/// two zones, so it is rejected without emitting mutations.
+pub fn seed_reactos_time_zone_setup_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+    setup: &ReactOsTimeZoneSetup,
+) -> Result<ReactOsTimeZoneSeedOutcome, ReactOsTimeZoneSeedError> {
+    const REQUIRED_VALUES: [&str; 7] = [
+        "Bias",
+        "StandardName",
+        "StandardBias",
+        "StandardStart",
+        "DaylightName",
+        "DaylightBias",
+        "DaylightStart",
+    ];
+    let existing = REQUIRED_VALUES
+        .iter()
+        .filter(|name| target.has_value(REACTOS_TIME_ZONE_INFORMATION_PATH, name))
+        .count();
+    if existing == REQUIRED_VALUES.len() {
+        return Ok(ReactOsTimeZoneSeedOutcome::AlreadyConfigured);
+    }
+    if existing != 0 {
+        return Err(ReactOsTimeZoneSeedError::IncompleteExistingConfiguration);
+    }
+    if !target.create_key(REACTOS_TIME_ZONE_INFORMATION_PATH) {
+        return Err(ReactOsTimeZoneSeedError::TargetRejected);
+    }
+    let values = [
+        ("Bias", RegistryValueType::Dword, setup.tzi[0..4].to_vec()),
+        (
+            "StandardName",
+            RegistryValueType::Sz,
+            setup.standard_name.clone(),
+        ),
+        (
+            "StandardBias",
+            RegistryValueType::Dword,
+            setup.tzi[4..8].to_vec(),
+        ),
+        (
+            "StandardStart",
+            RegistryValueType::Binary,
+            setup.tzi[12..28].to_vec(),
+        ),
+        (
+            "DaylightName",
+            RegistryValueType::Sz,
+            setup.daylight_name.clone(),
+        ),
+        (
+            "DaylightBias",
+            RegistryValueType::Dword,
+            setup.tzi[8..12].to_vec(),
+        ),
+        (
+            "DaylightStart",
+            RegistryValueType::Binary,
+            setup.tzi[28..44].to_vec(),
+        ),
+    ];
+    for (name, value_type, data) in values {
+        if !target.set_value(REACTOS_TIME_ZONE_INFORMATION_PATH, name, value_type, data) {
+            return Err(ReactOsTimeZoneSeedError::TargetRejected);
+        }
+    }
+    Ok(ReactOsTimeZoneSeedOutcome::Seeded)
+}
+
 impl ReactOsProfileShellFolderSeedStats {
     pub fn total_values(self) -> u32 {
         self.shell_folder_values + self.user_shell_folder_values
@@ -1721,9 +1981,255 @@ mod tests {
             .expect("seeded dword value")
     }
 
+    fn hives_with_time_zone_database() -> MutableHiveSet {
+        let mut hives = MutableHiveSet::new();
+        hives
+            .mount(r"\Registry\Machine\System", 1, mountable_system_hive())
+            .unwrap();
+        let mut software = Hive::new(HiveKind::Software);
+        let time_zones = software.create_key(r"Microsoft\Windows NT\CurrentVersion\Time Zones");
+        software.set_value(
+            time_zones,
+            "IndexMapping",
+            RegistryValueType::MultiSz,
+            nt_config_manager::encode_multi_sz(&["409", "4", "809", "85"]),
+        );
+        let other = software
+            .create_key(r"Microsoft\Windows NT\CurrentVersion\Time Zones\Other Standard Time");
+        software.set_dword(other, "Index", 84);
+        let pacific = software
+            .create_key(r"Microsoft\Windows NT\CurrentVersion\Time Zones\Pacific Standard Time");
+        software.set_dword(pacific, "Index", 4);
+        software.set_value(
+            pacific,
+            "Std",
+            RegistryValueType::Sz,
+            utf16le_sz("Pacific Standard Time"),
+        );
+        software.set_value(
+            pacific,
+            "Dlt",
+            RegistryValueType::Sz,
+            utf16le_sz("Pacific Daylight Time"),
+        );
+        let mut pacific_tzi = [0u8; REG_TZI_FORMAT_SIZE];
+        pacific_tzi[0..4].copy_from_slice(&480i32.to_le_bytes());
+        pacific_tzi[8..12].copy_from_slice(&(-60i32).to_le_bytes());
+        software.set_value(
+            pacific,
+            "TZI",
+            RegistryValueType::Binary,
+            pacific_tzi.to_vec(),
+        );
+        let selected = software
+            .create_key(r"Microsoft\Windows NT\CurrentVersion\Time Zones\GMT Standard Time");
+        software.set_dword(selected, "Index", 85);
+        software.set_value(
+            selected,
+            "Std",
+            RegistryValueType::Sz,
+            utf16le_sz("GMT Standard Time"),
+        );
+        software.set_value(
+            selected,
+            "Dlt",
+            RegistryValueType::Sz,
+            utf16le_sz("GMT Daylight Time"),
+        );
+        let mut tzi = [0u8; REG_TZI_FORMAT_SIZE];
+        tzi[8..12].copy_from_slice(&(-60i32).to_le_bytes());
+        tzi[14..16].copy_from_slice(&10u16.to_le_bytes());
+        tzi[30..32].copy_from_slice(&3u16.to_le_bytes());
+        software.set_value(selected, "TZI", RegistryValueType::Binary, tzi.to_vec());
+        hives
+            .mount(r"\Registry\Machine\Software", 2, software)
+            .unwrap();
+        hives
+    }
+
     #[test]
     fn utf16le_sz_is_nul_terminated() {
         assert_eq!(utf16le_sz("A"), alloc::vec![0x41, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn selected_reactos_time_zone_is_seeded_exactly_once() {
+        let mut hives = hives_with_time_zone_database();
+        let setup = reactos_time_zone_setup_from_mutable_hives(&hives, 85).unwrap();
+        assert_eq!(setup.standard_name, utf16le_sz("GMT Standard Time"));
+        assert_eq!(setup.daylight_name, utf16le_sz("GMT Daylight Time"));
+        assert_eq!(
+            i32::from_le_bytes(setup.tzi[8..12].try_into().unwrap()),
+            -60
+        );
+
+        let outcome = seed_reactos_time_zone_setup_into_target(
+            &mut MutableHiveRgsSeedTarget { hives: &mut hives },
+            &setup,
+        );
+        assert_eq!(outcome, Ok(ReactOsTimeZoneSeedOutcome::Seeded));
+        assert_eq!(
+            hive_value_bytes(&hives, REACTOS_TIME_ZONE_INFORMATION_PATH, "StandardName"),
+            (
+                RegistryValueType::Sz,
+                utf16le_sz("GMT Standard Time").as_slice()
+            )
+        );
+        assert_eq!(
+            hive_value_bytes(&hives, REACTOS_TIME_ZONE_INFORMATION_PATH, "DaylightBias"),
+            (RegistryValueType::Dword, (-60i32).to_le_bytes().as_slice())
+        );
+        assert_eq!(
+            hive_value_bytes(&hives, REACTOS_TIME_ZONE_INFORMATION_PATH, "StandardStart").1,
+            &setup.tzi[12..28]
+        );
+        assert_eq!(
+            seed_reactos_time_zone_setup_into_target(
+                &mut MutableHiveRgsSeedTarget { hives: &mut hives },
+                &setup,
+            ),
+            Ok(ReactOsTimeZoneSeedOutcome::AlreadyConfigured)
+        );
+    }
+
+    #[test]
+    fn reactos_language_mapping_selects_the_setup_time_zone() {
+        let hives = hives_with_time_zone_database();
+        assert_eq!(reactos_time_zone_index_for_language(&hives, 0x0409), Ok(4));
+        assert_eq!(reactos_time_zone_index_for_language(&hives, 0x0809), Ok(85));
+        let setup = reactos_time_zone_setup_from_mutable_hives(
+            &hives,
+            reactos_time_zone_index_for_language(&hives, 0x0409).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(setup.standard_name, utf16le_sz("Pacific Standard Time"));
+        assert_eq!(i32::from_le_bytes(setup.tzi[0..4].try_into().unwrap()), 480);
+    }
+
+    #[test]
+    fn reactos_language_mapping_rejects_missing_ambiguous_and_malformed_policy() {
+        let mut hives = hives_with_time_zone_database();
+        assert_eq!(
+            reactos_time_zone_index_for_language(&hives, 0x0411),
+            Err(ReactOsTimeZoneDatabaseError::LanguageMappingMissing)
+        );
+
+        let root = hives.resolve_key(REACTOS_TIME_ZONE_DATABASE_ROOT).unwrap();
+        assert!(hives.set_value(
+            root,
+            "IndexMapping",
+            RegistryValueType::MultiSz,
+            nt_config_manager::encode_multi_sz(&["409", "4", "0409", "85"])
+        ));
+        assert_eq!(
+            reactos_time_zone_index_for_language(&hives, 0x0409),
+            Err(ReactOsTimeZoneDatabaseError::LanguageMappingAmbiguous)
+        );
+
+        assert!(hives.set_value(
+            root,
+            "IndexMapping",
+            RegistryValueType::MultiSz,
+            alloc::vec![b'4', 0, b'0', 0, b'9', 0, 0, 0]
+        ));
+        assert_eq!(
+            reactos_time_zone_index_for_language(&hives, 0x0409),
+            Err(ReactOsTimeZoneDatabaseError::IndexMappingInvalid)
+        );
+        assert!(hives.set_value(
+            root,
+            "IndexMapping",
+            RegistryValueType::Sz,
+            utf16le_sz("409")
+        ));
+        assert_eq!(
+            reactos_time_zone_index_for_language(&hives, 0x0409),
+            Err(ReactOsTimeZoneDatabaseError::IndexMappingInvalid)
+        );
+    }
+
+    #[test]
+    fn time_zone_setup_preserves_complete_policy_and_rejects_partial_policy() {
+        let mut hives = hives_with_time_zone_database();
+        let setup = reactos_time_zone_setup_from_mutable_hives(&hives, 85).unwrap();
+        assert_eq!(
+            seed_reactos_time_zone_setup_into_target(
+                &mut MutableHiveRgsSeedTarget { hives: &mut hives },
+                &setup,
+            ),
+            Ok(ReactOsTimeZoneSeedOutcome::Seeded)
+        );
+        let key = hives
+            .resolve_key(REACTOS_TIME_ZONE_INFORMATION_PATH)
+            .unwrap();
+        assert!(hives.set_value(
+            key,
+            "Bias",
+            RegistryValueType::Binary,
+            alloc::vec![0xaa, 0xbb]
+        ));
+        assert_eq!(
+            seed_reactos_time_zone_setup_into_target(
+                &mut MutableHiveRgsSeedTarget { hives: &mut hives },
+                &setup,
+            ),
+            Ok(ReactOsTimeZoneSeedOutcome::AlreadyConfigured)
+        );
+        assert_eq!(
+            hive_value_bytes(&hives, REACTOS_TIME_ZONE_INFORMATION_PATH, "Bias"),
+            (RegistryValueType::Binary, &[0xaa, 0xbb][..])
+        );
+
+        let mut partial = hives_with_time_zone_database();
+        let key = partial
+            .create_key(REACTOS_TIME_ZONE_INFORMATION_PATH)
+            .unwrap();
+        assert!(partial.set_value(
+            key,
+            "Bias",
+            RegistryValueType::Dword,
+            120u32.to_le_bytes().to_vec()
+        ));
+        assert_eq!(
+            seed_reactos_time_zone_setup_into_target(
+                &mut MutableHiveRgsSeedTarget {
+                    hives: &mut partial,
+                },
+                &setup,
+            ),
+            Err(ReactOsTimeZoneSeedError::IncompleteExistingConfiguration)
+        );
+        assert_eq!(
+            partial
+                .resolve_key(REACTOS_TIME_ZONE_INFORMATION_PATH)
+                .and_then(|key| partial.query_value(key, "StandardName")),
+            None
+        );
+    }
+
+    #[test]
+    fn time_zone_database_selection_and_payload_are_strict() {
+        let hives = hives_with_time_zone_database();
+        assert_eq!(
+            reactos_time_zone_setup_from_mutable_hives(&hives, 999),
+            Err(ReactOsTimeZoneDatabaseError::SelectionMissing)
+        );
+        let mut malformed = hives_with_time_zone_database();
+        let key = malformed
+            .resolve_key(
+                r"\Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion\Time Zones\GMT Standard Time",
+            )
+            .unwrap();
+        assert!(malformed.set_value(
+            key,
+            "TZI",
+            RegistryValueType::Binary,
+            alloc::vec![0; REG_TZI_FORMAT_SIZE - 1]
+        ));
+        assert_eq!(
+            reactos_time_zone_setup_from_mutable_hives(&malformed, 85),
+            Err(ReactOsTimeZoneDatabaseError::TziInvalid)
+        );
     }
 
     #[test]

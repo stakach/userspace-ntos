@@ -18096,3 +18096,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Only after those paths and `NtSaveKey` are re-audited may the post-publish SYSTEM replay, SYSTEM
     `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure diagnostics be
     deleted atomically. Preserve CM journaling/checkpoint export and boot-only hive composition.
+
+    Time-policy and driver-service identity acceptance (2026-08-30): timezone and persistent-clock
+    policy no longer read the executive's projected SYSTEM tree. Live initialization and
+    `NtSetSystemTime(NULL, ...)` use one exact CM lease for
+    `CurrentControlSet\Control\TimeZoneInformation`, require all seven NT timezone values with
+    their real types and sizes, preserve CM errors, and treat only the optional absent
+    `RealTimeIsUniversal` value as NT local-RTC policy. Complete persisted configuration is
+    validated before setup inputs are consulted and is retained byte-for-byte. Missing installed
+    policy runs a host-testable ReactOS setup import: a genuinely enabled unattended file may name
+    an explicit index; otherwise the installed CM-owned NLS `Default` language is resolved through
+    SOFTWARE's strict `Time Zones\IndexMapping` `REG_MULTI_SZ`, the uniquely indexed timezone's
+    `Std`, `Dlt`, and 44-byte `TZI` record are validated, and the seven destination values are
+    published in one durable CM transaction. The staged disabled LiveCD policy therefore follows
+    the normal en-US mapping to index 4; there is no hard-coded GMT/UTC fallback. Locale setup now
+    uses the same installed NLS authority, and the old locale bypass switch and disabled-media
+    shortcut have been removed.
+
+    `NtLoadDriver` and `NtUnloadDriver` no longer reduce an arbitrary registry path to a leaf service
+    name. The config client opens both the mounted active `CurrentControlSet\Services` key and the
+    requested key, proves that the candidate's physical identity is an immediate child of the
+    active services key in the same mount generation, validates the returned service binding and
+    key-information identity, and closes both leases on every outcome. Inactive control sets,
+    descendants, malformed paths, generation skew, and close-generation skew fail without being
+    redirected. Driver service names are captured from the full caller `UNICODE_STRING`, with the
+    former ASCII-only capture removed. The LSA `EveryoneIncludesAnonymous` policy read likewise now
+    uses an exact CM value rather than the compatibility mirror.
+
+    Focused validation passes `87/87` `nt-hive-core` library tests, `14/14` generated-hive tests,
+    and `18/18` `nt-config-client` tests. The freestanding executive release check remains at the
+    established 209-warning baseline. Serialized acceptance
+    `.tmp/run-headless-cm-policy-driver-timezone-20260830.log` reaches the genuine Explorer desktop
+    with all `299/299` checks passing and the sentinel matched. Setup selects timezone index 4 from
+    NLS/`IndexMapping` and commits it at CM generation 2. CM finishes at generation 2544 after 2540
+    accepted runtime transactions with zero rejection or projection failure; native SYSTEM leases
+    remain balanced at `1339/1337/2/0`. Explorer completes 668 real api0 redirects with zero
+    callback or dead-callback failures, installs 18 client WndProcs without replay, reaches paint
+    begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering 184 records, and
+    paints all `786432/786432` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: timezone/RTC and driver-service bootstrap reads are accepted as CM-owned.
+    Next replace `overlay_canon`'s projected `CurrentControlSet` physicalization with CM-owned path
+    identity, then audit `NtSaveKey` so SYSTEM export is requested only from CM. Once those two
+    consumers are clean, delete post-publish SYSTEM replay, the SYSTEM `MutableHiveSet` mount and
+    storage, its raw runtime hive field, and projection-failure diagnostics together. Retain the
+    boot-only REGF source used to compose CM's initial image and the CM journal/checkpoint path.

@@ -4726,9 +4726,8 @@ fn user_shell_activation_spec(passed: &mut u64) {
             // TOKEN_GROUPS (it dereferences an uninitialised local otherwise).
             && logon_sids >= 1
             // Setup's locale step really seeded the value `SetDefaultLanguage` needs.
-            && (!PROVISION_DEFAULT_USER_LOCALE
-                || (DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
-                    && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0)),
+            && DEFAULT_USER_LOCALE_TYPE.load(Ordering::Relaxed) == 1
+            && DEFAULT_USER_LOCALE_BYTES.load(Ordering::Relaxed) > 0,
         passed,
     );
     userinit_image_pipeline_spec(passed);
@@ -15817,13 +15816,21 @@ pub(crate) unsafe fn config_manager_query_device_property(
     client.query_device_property(instance, property, out)
 }
 
-pub(crate) unsafe fn config_manager_query_driver_service(
-    service: &str,
-) -> Result<nt_config_client::DriverServiceBinding, i32> {
+pub(crate) unsafe fn config_manager_query_active_driver_service_by_registry_path(
+    service_path: &str,
+) -> Result<nt_config_client::ActiveDriverServiceBinding, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.query_driver_service(service)
+    let resolved = client.query_active_driver_service_by_registry_path(service_path)?;
+    if resolved.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(resolved)
 }
 
 pub(crate) unsafe fn config_manager_query_driver_launch_plan(
@@ -21341,12 +21348,13 @@ fn system_hive_boot_driver_launch_plan(
     )
 }
 
-pub(crate) unsafe fn live_config_driver_service_launch_spec(
-    service_name: &str,
+pub(crate) unsafe fn live_config_driver_service_launch_spec_from_registry_path(
+    service_path: &str,
     max_start: u32,
 ) -> Result<DriverServiceLaunchSpec, i32> {
-    let binding = config_manager_query_driver_service(service_name)?;
-    owned_driver_launch_spec_from_live_config_binding(binding, max_start)
+    let resolved =
+        config_manager_query_active_driver_service_by_registry_path(service_path)?;
+    owned_driver_launch_spec_from_live_config_binding(resolved.binding, max_start)
         .ok_or(0xC000_0034u32 as i32)
 }
 
@@ -21628,11 +21636,6 @@ fn system_hive_display_driver_spec() -> Option<&'static SystemHiveDisplayDriverS
     None
 }
 
-/// ★ BYPASS SWITCH for setup's locale step (see `provision_default_user_locale`). `false` leaves
-/// `HKU\.DEFAULT\Control Panel\International` valueless, exactly as the ISO ships it, and
-/// `winlogon!SetDefaultLanguage(Session)` fails again -> `HandleLogon` aborts into
-/// `UnloadUserProfile` and the user shell never starts.
-pub(crate) const PROVISION_DEFAULT_USER_LOCALE: bool = true;
 /// Bytes + REG type of the language id really copied from the SYSTEM hive into the default user's
 /// `Control Panel\International\Locale` (0 = the step did not run).
 pub(crate) static DEFAULT_USER_LOCALE_BYTES: AtomicU64 = AtomicU64::new(0);

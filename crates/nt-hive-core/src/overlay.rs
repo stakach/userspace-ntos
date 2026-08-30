@@ -732,24 +732,17 @@ mod tests {
         assert!(ov.set_key_class(key, Some("DeviceClass")));
         assert_eq!(ov.key_class(key), Some("DeviceClass"));
 
-        let (same, reopened) = ov.create_with_volatility(
-            r"\registry\machine\system\volatile",
-            false,
-        );
+        let (same, reopened) =
+            ov.create_with_volatility(r"\registry\machine\system\volatile", false);
         assert_eq!(same, key);
         assert!(!reopened);
         assert_eq!(ov.key_class(key), Some("DeviceClass"));
 
         assert!(ov.set_key_class(key, Some("")));
         assert_eq!(ov.key_class(key), Some(""));
-        assert_eq!(
-            ov.detach_subtree(r"\registry\machine\system\volatile"),
-            1
-        );
-        let (reattached, created_again) = ov.create_with_volatility(
-            r"\registry\machine\system\volatile",
-            true,
-        );
+        assert_eq!(ov.detach_subtree(r"\registry\machine\system\volatile"), 1);
+        let (reattached, created_again) =
+            ov.create_with_volatility(r"\registry\machine\system\volatile", true);
         assert_eq!(reattached, key);
         assert!(created_again);
         assert_eq!(ov.key_class(reattached), None);
