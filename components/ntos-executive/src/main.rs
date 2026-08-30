@@ -6710,6 +6710,9 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     let cm_runtime_delete_keys = CM_RUNTIME_SYSTEM_DELETE_KEYS.load(Ordering::Relaxed);
     let cm_runtime_set_classes = CM_RUNTIME_SYSTEM_SET_CLASSES.load(Ordering::Relaxed);
     let cm_runtime_set_security = CM_RUNTIME_SYSTEM_SET_SECURITY.load(Ordering::Relaxed);
+    let cm_native_lease_acquires = CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES.load(Ordering::Relaxed);
+    let cm_native_lease_closes = CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.load(Ordering::Relaxed);
+    let cm_native_lease_failures = CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.load(Ordering::Relaxed);
     let cm_runtime_ops = cm_runtime_create_keys
         + cm_runtime_set_values
         + cm_runtime_delete_values
@@ -6768,11 +6771,27 @@ fn lsa_rpc_handoff_specs(passed: &mut u64) {
     print_str(b"/");
     print_u64(cm_runtime_set_security);
     print_str(b"\n");
+    print_str(b"[cm-native-keys] lease acquires/closes/active/failures=");
+    print_u64(cm_native_lease_acquires);
+    print_str(b"/");
+    print_u64(cm_native_lease_closes);
+    print_str(b"/");
+    print_u64(cm_native_lease_acquires.saturating_sub(cm_native_lease_closes));
+    print_str(b"/");
+    print_u64(cm_native_lease_failures);
+    print_str(b"\n");
     check(
         b"exec_cm_runtime_system_mutations_atomic",
         cm_runtime_rejections == 0
             && cm_runtime_projection_failures == 0
             && (cm_runtime_commits == 0 || cm_runtime_ops >= cm_runtime_commits),
+        passed,
+    );
+    check(
+        b"exec_cm_native_system_key_leases",
+        cm_native_lease_acquires != 0
+            && cm_native_lease_closes <= cm_native_lease_acquires
+            && cm_native_lease_failures == 0,
         passed,
     );
     // (1) `NtFlushKey` is a REAL serviced system service, not an unhandled SSN: it is registered in
@@ -15899,6 +15918,41 @@ pub(crate) unsafe fn config_manager_query_system_hive_key(
     Ok(snapshot)
 }
 
+pub(crate) unsafe fn config_manager_open_system_hive_key(
+    path: &str,
+) -> Result<nt_config_client::OpenedSystemHiveKey, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let opened = client.open_system_hive_key_with_path(path)?;
+    if opened.lease.opened_generation != expected_generation {
+        let _ = client.close_system_hive_key(opened.lease);
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(opened)
+}
+
+pub(crate) unsafe fn config_manager_close_system_hive_key(
+    lease: nt_config_client::SystemHiveKeyLease,
+) -> Result<(), i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let generation = client.close_system_hive_key(lease)?;
+    if generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn config_manager_commit_system_hive_mutations(
     mutations: &[nt_config_client::SystemHiveMutation<'_>],
 ) -> Result<u64, i32> {
@@ -19015,15 +19069,19 @@ const USER_ROOT_KEY: KeyRef = 0xFFFF_FF04;
 /// above every mounted-hive selector.
 const MUTABLE_KEY_TAG: u32 = 0x7000_0000;
 const MUTABLE_KEY_MAX: u32 = 0x1000;
+/// A registry `KeyRef` in `[CM_SYSTEM_KEY_TAG, OVERLAY_KEY_TAG)` names one CM-owned SYSTEM key
+/// lease. Its low bits index `ExecNtHandler::cm_system_key_handles`; the isolated Configuration
+/// Manager owns the stable hive-cell identity and the executive owns only the lease reference.
+const CM_SYSTEM_KEY_TAG: u32 = 0x7100_0000;
 /// A registry `KeyRef` in the range `[OVERLAY_KEY_TAG, OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` names an
 /// OVERLAY (created) key; its low bits are the index into `ExecNtHandler::overlay`. The range sits
 /// far above any real cell offset and below the predefined-root sentinel targets.
 const OVERLAY_KEY_TAG: u32 = 0x8000_0000;
 const OVERLAY_KEY_MAX: u32 = 0x1000;
-/// True if a `KeyRef` is an overlay/predefined-root target rather than a genuine mounted
-/// hive cell offset. Real hive KeyRefs keep their selector below `OVERLAY_KEY_TAG`.
+/// True if a `KeyRef` names a mutable-hive target, CM lease, overlay, or predefined root rather
+/// than a borrowed mounted-hive cell. Every borrowed hive selector stays below `MUTABLE_KEY_TAG`.
 fn is_virtual_registry_key(kr: KeyRef) -> bool {
-    (kr >= MUTABLE_KEY_TAG && kr < MUTABLE_KEY_TAG + MUTABLE_KEY_MAX) || kr >= OVERLAY_KEY_TAG
+    kr >= MUTABLE_KEY_TAG
 }
 /// ── Mounted base hives ────────────────────────────────────────────────────────────────────────
 /// FOUR REAL regf files are mounted read-only under `\Registry\Machine`: SYSTEM (::ROSSYS.HIV,
@@ -19062,6 +19120,7 @@ const _: () =
     assert!(HIVE_SEL_DYNAMIC[0] < OVERLAY_KEY_TAG && HIVE_SEL_DYNAMIC[1] < OVERLAY_KEY_TAG);
 const _: () =
     assert!(HIVE_SEL_SAM < MUTABLE_KEY_TAG && MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= OVERLAY_KEY_TAG);
+const _: () = assert!(MUTABLE_KEY_TAG + MUTABLE_KEY_MAX <= CM_SYSTEM_KEY_TAG);
 /// The hive selector bits of a `KeyRef` (meaningful only for a mounted-hive key).
 pub(crate) fn hive_sel(kr: KeyRef) -> u32 {
     kr & HIVE_SEL_MASK
@@ -21544,6 +21603,14 @@ fn mutable_key_idx(kr: KeyRef) -> Option<usize> {
     }
 }
 
+fn cm_system_key_idx(kr: KeyRef) -> Option<usize> {
+    if (CM_SYSTEM_KEY_TAG..OVERLAY_KEY_TAG).contains(&kr) {
+        Some((kr - CM_SYSTEM_KEY_TAG) as usize)
+    } else {
+        None
+    }
+}
+
 /// If a `KeyRef` names an overlay (created) key, return its overlay index.
 fn overlay_key_idx(kr: KeyRef) -> Option<usize> {
     if kr >= OVERLAY_KEY_TAG && kr < OVERLAY_KEY_TAG + OVERLAY_KEY_MAX {
@@ -21820,6 +21887,12 @@ pub(crate) static CM_RUNTIME_SYSTEM_DELETE_VALUES: AtomicU64 = AtomicU64::new(0)
 pub(crate) static CM_RUNTIME_SYSTEM_DELETE_KEYS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_SET_CLASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CM_RUNTIME_SYSTEM_SET_SECURITY: AtomicU64 = AtomicU64::new(0);
+/// CM-owned SYSTEM key identities acquired for native registry handles.
+pub(crate) static CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+/// CM-owned SYSTEM key identities released after the final duplicated handle closes.
+pub(crate) static CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES: AtomicU64 = AtomicU64::new(0);
+/// Failed native SYSTEM lease acquisition, installation, or exact close operations.
+pub(crate) static CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// `NtSaveKey` calls and outcomes. Success is limited to mounted hive roots that can be written to a
 /// writable overlay FILE_OBJECT. Mutable hive roots use the live `nt-hive-core` image so saved state
 /// reflects the Configuration Manager write authority rather than borrowed boot media.
@@ -22364,6 +22437,11 @@ struct PendingLpcConnectionViews {
     acceptor_mapping: Option<MappedLpcPortView>,
 }
 
+struct CmSystemKeyTarget {
+    lease: nt_config_client::SystemHiveKeyLease,
+    physical_path: alloc::string::String,
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS SYSTEM hive (root = \Registry\Machine\System), parsed read-only by
     /// borrowing the regf bytes the storage host read off the disk into HIVEBUF (no 204 KiB copy —
@@ -22399,6 +22477,9 @@ struct ExecNtHandler {
     /// are released when the last process handle to that target closes; dynamic hive unload also
     /// clears entries for that hive so stale handles stop resolving.
     mutable_key_handles: alloc::vec::Vec<Option<ResolvedHiveKey>>,
+    /// Native handle targets for the CM-owned SYSTEM hive. Each slot owns exactly one CM lease;
+    /// duplicated process handles share the slot and final Object Manager release closes the lease.
+    cm_system_key_handles: alloc::vec::Vec<Option<CmSystemKeyTarget>>,
     /// Mutable-hive journal records appended since the last writable-volume snapshot. The log append
     /// itself is synchronous in the mounted volume; this counter batches the expensive snapshot
     /// reserve commit instead of exporting the whole writable volume after every registry value.

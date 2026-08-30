@@ -201,6 +201,13 @@ pub struct SystemHiveKeyLease {
     pub opened_generation: u64,
 }
 
+/// A newly acquired SYSTEM key lease and its CM-resolved physical namespace identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenedSystemHiveKey {
+    pub lease: SystemHiveKeyLease,
+    pub physical_path: String,
+}
+
 struct SnapshotReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -1176,6 +1183,15 @@ impl<B: Backend> ConfigClient<B> {
 
     /// Acquire one stable CM-owned key identity from the mounted SYSTEM hive.
     pub fn open_system_hive_key(&mut self, path: &str) -> Result<SystemHiveKeyLease, i32> {
+        self.open_system_hive_key_with_path(path)
+            .map(|opened| opened.lease)
+    }
+
+    /// Acquire a stable CM-owned key identity and the physical path selected at open time.
+    pub fn open_system_hive_key_with_path(
+        &mut self,
+        path: &str,
+    ) -> Result<OpenedSystemHiveKey, i32> {
         let path_bytes = utf16_bytes(path);
         if path_bytes.is_empty()
             || path_bytes.len() > CM_MAX_HIVE_PATH_UNITS * 2
@@ -1200,18 +1216,44 @@ impl<B: Backend> ConfigClient<B> {
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         request.extend_from_slice(request_header.as_bytes());
         request.extend_from_slice(&path_bytes);
-        let response = self
-            .backend
-            .call(opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE, &request, &mut []);
+        let mut reply_path = [0u8; CM_MAX_HIVE_PATH_UNITS * 4];
+        let response = self.backend.call(
+            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE,
+            &request,
+            &mut reply_path,
+        );
         if response.status != STATUS_SUCCESS {
             return Err(response.status);
         }
-        if response.detail0 == 0 || response.detail1 == 0 {
+        let path_len = response.information as usize;
+        if response.detail0 == 0
+            || response.detail1 == 0
+            || path_len == 0
+            || path_len > reply_path.len()
+        {
+            if response.detail0 != 0 && response.detail1 != 0 {
+                let _ = self.close_system_hive_key(SystemHiveKeyLease {
+                    token: response.detail1,
+                    opened_generation: response.detail0,
+                });
+            }
             return Err(STATUS_INVALID_PARAMETER);
         }
-        Ok(SystemHiveKeyLease {
+        let lease = SystemHiveKeyLease {
             token: response.detail1,
             opened_generation: response.detail0,
+        };
+        let Ok(physical_path) = core::str::from_utf8(&reply_path[..path_len]) else {
+            let _ = self.close_system_hive_key(lease);
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if physical_path.chars().any(|ch| ch == '\0') {
+            let _ = self.close_system_hive_key(lease);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(OpenedSystemHiveKey {
+            lease,
+            physical_path: String::from(physical_path),
         })
     }
 
@@ -2258,9 +2300,16 @@ mod tests {
 
         let mut client = client();
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
-        let lease = client
-            .open_system_hive_key(r"\Registry\Machine\System\CurrentControlSet\Services\Stable")
+        let opened = client
+            .open_system_hive_key_with_path(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Stable",
+            )
             .unwrap();
+        assert_eq!(
+            opened.physical_path,
+            r"\Registry\Machine\System\ControlSet001\Services\Stable"
+        );
+        let lease = opened.lease;
         assert_eq!(lease.opened_generation, 1);
         let leased = client.query_leased_system_hive_key(lease).unwrap();
         assert_eq!(

@@ -2976,10 +2976,12 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   control set onto that selected destination, preserve real REGF key class/security metadata
   through mutable-hive import and image transport, and only then publish the single composed image.
   No `ControlSet001` default, generated-only mount, or metadata-dropping import may remain as a
-  fallback. Those selection/composition/read boundaries are closed; D5 remains open because native
-  SYSTEM key handles and persistence still retain an executive mirror after CM-first mutation. CM
-  now has the crate-tested opaque key-lease boundary required to migrate those handles without
-  reducing an open key to a path that can be retargeted by a later control-set selection change.
+  fallback. Those selection/composition/read boundaries are closed, and native SYSTEM open/create,
+  relative-name identity, duplicate-handle lifetime, and final close now use CM-owned opaque leases.
+  D5 remains open because native query/enumeration/security and durable checkpoint projection still
+  read or persist through the executive mirror after CM-first mutation. Move those remaining
+  operations behind the leased CM identity before deleting the executive SYSTEM handle/projection
+  machinery; never reduce a live key to a reopenable path.
 
 ## Immediate Iteration
 
@@ -17692,3 +17694,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     mutation transaction for writes. Delete the executive SYSTEM-handle cell identity only when every
     native SYSTEM operation crosses this boundary; do not add a path-only handle, dual-write fallback,
     fixed lease ceiling, or automatic reopen after mount replacement.
+
+    Native SYSTEM handle ownership acceptance (2026-08-30): the executive now acquires one CM-owned
+    opaque lease for every native SYSTEM `NtOpenKey`/existing `NtCreateKey`, stores only that lease and
+    CM's resolved physical namespace identity in a growable handle-target table, preserves the physical
+    control-set identity for relative opens, and releases the exact lease only after Object Manager
+    reports the final duplicated process handle gone. Failed handle insertion/copyout rolls the lease
+    back instead of leaking it. Whole-mount generation replacement remains fail-closed; no automatic
+    path reopen, fixed lease ceiling, or borrowed executive cell identity is present on this handle
+    path.
+
+    Lease-open returns the bounded UTF-8 physical path in the acquisition reply, avoiding a complete
+    key snapshot merely to resolve identity for large keys such as `Services`. The immutable leased
+    snapshot protocol remains separate for operations that consume key data. Focused validation keeps
+    `nt-config-server` at `22/22` and `nt-config-client` at `16/16`; the freestanding executive release
+    check returns to the established 209-warning baseline after removing the unused executive snapshot
+    wrapper.
+
+    Serialized acceptance `.tmp/run-headless-cm-native-key-leases-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. The new runtime proof
+    records `1337/1335/2/0` lease acquisitions/final closes/live leases/failures while CM reaches
+    generation 2537 with 2534 accepted runtime transactions, zero rejection, and zero projection
+    failures. Explorer completes 664 real api0 redirects with zero callback failures, installs 18
+    client WndProcs without replay, reaches paint begin/end `2/20` with 185 direct GDI returns and 131
+    batch flushes covering 171 records, and paints all `480000/480000` framebuffer pixels with at least
+    32 colours.
+
+    Review adjustment: native SYSTEM key identity and handle lifetime are accepted. D5 stays active for
+    the data and durability cut: route `NtQueryKey`, `NtQueryValueKey`, key/value enumeration, and key
+    security through immutable snapshots acquired by the existing lease token; then move SYSTEM journal
+    ownership/checkpoint serialization behind CM and delete the executive post-CM projection. Keep
+    focused CM query protocols bounded and generation checked so ordinary value reads do not transfer a
+    complete large key when a narrow record is sufficient.

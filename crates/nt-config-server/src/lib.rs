@@ -713,7 +713,7 @@ impl CmServer {
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
-            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf),
+            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_LAUNCH_PLAN => self.op_query_launch_plan(in_buf, out_buf),
             opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN => {
@@ -1511,7 +1511,7 @@ impl CmServer {
         }
     }
 
-    fn op_system_hive_key_lease(&mut self, buf: &[u8]) -> CmReply {
+    fn op_system_hive_key_lease(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
         let Some(req) = CmHiveKeyLeaseRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
@@ -1566,8 +1566,21 @@ impl CmServer {
                     physical_path.push('\\');
                     physical_path.push_str(&relative);
                 }
+                let path_bytes = physical_path.as_bytes();
+                let path_len = path_bytes.len();
+                if path_len > out_buf.len() {
+                    return reply_with_info(
+                        STATUS_BUFFER_TOO_SMALL,
+                        path_len as u32,
+                        mounted.generation,
+                        0,
+                    );
+                }
+                out_buf[..path_len].copy_from_slice(path_bytes);
                 match self.system_key_leases.open(key, physical_path) {
-                    Ok(token) => reply_with_info(STATUS_SUCCESS, 0, mounted.generation, token),
+                    Ok(token) => {
+                        reply_with_info(STATUS_SUCCESS, path_len as u32, mounted.generation, token)
+                    }
                     Err(SystemKeyLeaseError::Exhausted) => {
                         reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation)
                     }

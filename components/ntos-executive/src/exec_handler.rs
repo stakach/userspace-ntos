@@ -3395,6 +3395,7 @@ impl ExecNtHandler {
         write_field!(hive_mounts, hive_mounts);
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
+        write_field!(cm_system_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(mutable_hive_journal_pending_records, 0);
         write_field!(mutable_hive_journal_pending_boot_mask, 0);
         write_field!(mutable_hive_journal_dirty_boot_mask, 0);
@@ -4466,10 +4467,14 @@ impl ExecNtHandler {
             Self::registry_map_access(desired),
         ) {
             Ok(handle) => handle,
-            Err(_) => return 0xC000_009A,
+            Err(_) => {
+                self.release_registry_key_target(target);
+                return 0xC000_009A;
+            }
         };
         if !self.xas_write_u64(out, handle as u64) {
             let _ = self.pm.take_handle(pid, handle);
+            self.release_registry_key_target(target);
             return 0xC000_0005;
         }
         0
@@ -4512,6 +4517,67 @@ impl ExecNtHandler {
             Ok(target) => self.mint_registry_key(target, desired, out),
             Err(status) => status,
         }
+    }
+
+    fn install_cm_system_key_target(&mut self, target: CmSystemKeyTarget) -> Result<KeyRef, u32> {
+        if let Some(index) = self
+            .cm_system_key_handles
+            .iter()
+            .position(|entry| entry.is_none())
+        {
+            self.cm_system_key_handles[index] = Some(target);
+            return Ok(CM_SYSTEM_KEY_TAG | index as u32);
+        }
+        if self.cm_system_key_handles.len() >= (OVERLAY_KEY_TAG - CM_SYSTEM_KEY_TAG) as usize {
+            return Err(0xC000_009A);
+        }
+        self.cm_system_key_handles
+            .try_reserve_exact(1)
+            .map_err(|_| 0xC000_009Au32)?;
+        self.cm_system_key_handles.push(Some(target));
+        Ok(CM_SYSTEM_KEY_TAG | (self.cm_system_key_handles.len() - 1) as u32)
+    }
+
+    unsafe fn mint_cm_system_registry_key(
+        &mut self,
+        full_path: &str,
+        desired: u32,
+        out: u64,
+    ) -> u32 {
+        let _durable = allocator::enter_durable();
+        let opened = match crate::config_manager_open_system_hive_key(full_path) {
+            Ok(opened) => {
+                CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES.fetch_add(1, Ordering::Relaxed);
+                opened
+            }
+            Err(status) => {
+                CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return status as u32;
+            }
+        };
+        let target = match self.install_cm_system_key_target(CmSystemKeyTarget {
+            lease: opened.lease,
+            physical_path: nt_hive_core::canon_path(&opened.physical_path),
+        }) {
+            Ok(target) => target,
+            Err(status) => {
+                match crate::config_manager_close_system_hive_key(opened.lease) {
+                    Ok(()) => {
+                        CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return status;
+            }
+        };
+        let status = self.mint_registry_key(target, desired, out);
+        if status != 0 {
+            CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+        status
     }
 
     /// Resolve a registry handle owned by the current process and enforce the requested key right.
@@ -4607,7 +4673,34 @@ impl ExecNtHandler {
             .map(|_| key)
     }
 
+    fn cm_system_key_target(&self, target: KeyRef) -> Option<&CmSystemKeyTarget> {
+        self.cm_system_key_handles
+            .get(cm_system_key_idx(target)?)?
+            .as_ref()
+    }
+
     fn release_registry_key_target(&mut self, target: KeyRef) {
+        if let Some(index) = cm_system_key_idx(target) {
+            let object = nt_process::HandleObject::RegistryKey(target);
+            if self.pm.handle_object_count(object) != 0 {
+                return;
+            }
+            if let Some(entry) = self
+                .cm_system_key_handles
+                .get_mut(index)
+                .and_then(Option::take)
+            {
+                match unsafe { crate::config_manager_close_system_hive_key(entry.lease) } {
+                    Ok(()) => {
+                        CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        CM_NATIVE_SYSTEM_KEY_LEASE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            return;
+        }
         let Some(index) = mutable_key_idx(target) else {
             return;
         };
@@ -4973,6 +5066,9 @@ impl ExecNtHandler {
         }
         if target == USER_ROOT_KEY {
             return Some(alloc::string::String::from(r"\registry\user"));
+        }
+        if let Some(target) = self.cm_system_key_target(target) {
+            return Some(target.physical_path.clone());
         }
         if let Some(key) = self.mutable_key_handle(target) {
             return self.mutable_key_path(key);
@@ -7053,7 +7149,11 @@ impl ExecNtHandler {
         }
         if let Some(mutable_key) = self.mutable_registry_key_by_path(full_path) {
             self.note_mutable_registry_key_open(mutable_key, full_path);
-            return Some(self.mint_mutable_registry_key(mutable_key, desired, out));
+            return Some(if mutable_key.hive == HIVE_SEL_SYSTEM {
+                self.mint_cm_system_registry_key(full_path, desired, out)
+            } else {
+                self.mint_mutable_registry_key(mutable_key, desired, out)
+            });
         }
         if self.mutable_hive_owns_path(full_path) {
             self.note_registry_open_miss(full_path);
@@ -31949,7 +32049,11 @@ impl ExecNtHandler {
                 if let Some(mutable_key) = mutable_existing {
                     let status = {
                         let _durable = allocator::enter_durable();
-                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
+                        if mutable_key.hive == HIVE_SEL_SYSTEM {
+                            self.mint_cm_system_registry_key(&full, desired_access, args[0])
+                        } else {
+                            self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
+                        }
                     };
                     if status != 0 {
                         return status;
@@ -32155,7 +32259,11 @@ impl ExecNtHandler {
                     }
                     let status = crate::probe_seg!(
                         9,
-                        self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
+                        if mutable_key.hive == HIVE_SEL_SYSTEM {
+                            self.mint_cm_system_registry_key(canon, desired_access, args[0])
+                        } else {
+                            self.mint_mutable_registry_key(mutable_key, desired_access, args[0])
+                        }
                     );
                     if status != 0 {
                         return status;
