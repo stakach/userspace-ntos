@@ -18629,3 +18629,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unblock either path by fabricating root-bus properties or a second PDO. Serialized desktop
     acceptance remains pending because the independently running QEMU still owns the only boot
     lane and was not interrupted.
+
+    B3 native bus-property query substrate (2026-08-30, crate accepted): the shared PnP ABI now
+    names the NT minors for `QUERY_CAPABILITIES`, `QUERY_RESOURCES`,
+    `QUERY_RESOURCE_REQUIREMENTS`, and `QUERY_BUS_INFORMATION`. `nt-io-manager` models the three
+    pointer-returning, zero-parameter queries as a distinct typed PnP state; callers cannot smuggle
+    them through lifecycle or capability-buffer semantics. Driver-peer projection carries their
+    exact minor with zero wire argument, and the hosted WDM builder now strictly requires empty
+    input/output and an empty stack parameter union for those minors.
+
+    Validation passes `6/6` `nt-pnp-abi` and `236/236` `nt-io-manager` tests; formatting,
+    `git diff --check`, and the freestanding executive check pass at the 209-warning baseline.
+    Review adjustment: add native extent validators and owned-copy decoders for
+    `PNP_BUS_INFORMATION`, `CM_RESOURCE_LIST`, and `IO_RESOURCE_REQUIREMENTS_LIST`, then extend the
+    retained child owner to dispatch those three queries sequentially with the same provider-pool
+    and pending-completion rules as QUERY_ID. `QUERY_CAPABILITIES` remains a separate following
+    slice because its initialized `DEVICE_CAPABILITIES` is an in/out stack pointer, not an
+    `IoStatus.Information` allocation.

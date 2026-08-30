@@ -44,7 +44,11 @@ pub const IRP_MN_STOP_DEVICE: u8 = 0x04;
 pub const IRP_MN_QUERY_STOP_DEVICE: u8 = 0x05;
 pub const IRP_MN_CANCEL_STOP_DEVICE: u8 = 0x06;
 pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 0x07;
+pub const IRP_MN_QUERY_CAPABILITIES: u8 = 0x09;
+pub const IRP_MN_QUERY_RESOURCES: u8 = 0x0A;
+pub const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u8 = 0x0B;
 pub const IRP_MN_QUERY_ID: u8 = 0x13;
+pub const IRP_MN_QUERY_BUS_INFORMATION: u8 = 0x15;
 pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
 
 pub const BUS_RELATIONS: u32 = 0;
@@ -239,6 +243,14 @@ mod tests {
         assert_eq!(size_of::<DeviceState>(), 4);
         assert_eq!(DeviceState::Started as u32, 7);
         assert_eq!(DeviceState::Removed as u32, 12);
+    }
+
+    #[test]
+    fn native_bus_property_query_minors_match_nt() {
+        assert_eq!(IRP_MN_QUERY_CAPABILITIES, 0x09);
+        assert_eq!(IRP_MN_QUERY_RESOURCES, 0x0A);
+        assert_eq!(IRP_MN_QUERY_RESOURCE_REQUIREMENTS, 0x0B);
+        assert_eq!(IRP_MN_QUERY_BUS_INFORMATION, 0x15);
     }
 
     #[test]

@@ -144,6 +144,7 @@ enum PnpParameterKind {
     Start(PnpStartParameters),
     QueryDeviceRelations { relation_type: u32 },
     QueryId { id_type: u32 },
+    QueryInformation,
 }
 
 impl PnpParameters {
@@ -189,6 +190,23 @@ impl PnpParameters {
             minor: nt_pnp_abi::IRP_MN_QUERY_ID,
             kind: PnpParameterKind::QueryId { id_type },
         }
+    }
+
+    /// Construct a PnP query whose result is returned through `IoStatus.Information` and whose
+    /// stack-location parameter union is empty.
+    pub fn query_information(minor: u8) -> Result<Self, NtStatus> {
+        if !matches!(
+            minor,
+            nt_pnp_abi::IRP_MN_QUERY_RESOURCES
+                | nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+                | nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION
+        ) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Self {
+            minor,
+            kind: PnpParameterKind::QueryInformation,
+        })
     }
 
     pub const fn start_parameters(self) -> Option<PnpStartParameters> {

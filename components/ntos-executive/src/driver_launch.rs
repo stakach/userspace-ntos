@@ -703,6 +703,10 @@ const IRP_MJ_PNP: u64 = major::IRP_MJ_PNP as u64;
 const IRP_MN_START_DEVICE: u64 = 0x00;
 const IRP_MN_QUERY_DEVICE_RELATIONS: u64 = nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS as u64;
 const IRP_MN_QUERY_ID: u64 = nt_pnp_abi::IRP_MN_QUERY_ID as u64;
+const IRP_MN_QUERY_RESOURCES: u64 = nt_pnp_abi::IRP_MN_QUERY_RESOURCES as u64;
+const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u64 =
+    nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS as u64;
+const IRP_MN_QUERY_BUS_INFORMATION: u64 = nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION as u64;
 const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// `IRP_MJ_CLOSE` releases the FILE_OBJECT. Cleanup may disconnect the open first, but the same
 /// FILE_OBJECT must remain available for close through the per-open FILE_OBJECT registry.
@@ -31790,6 +31794,29 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             WdmIoStackParameters::PnpQueryId {
                 id_type: fsctl as u32,
             }
+        }
+        IRP_MJ_PNP
+            if matches!(
+                minor,
+                IRP_MN_QUERY_RESOURCES
+                    | IRP_MN_QUERY_RESOURCE_REQUIREMENTS
+                    | IRP_MN_QUERY_BUS_INFORMATION
+            ) =>
+        {
+            if inlen != 0
+                || outlen != 0
+                || fsctl != 0
+                || request.parameter_offset != 0
+                || request.parameter_len != 0
+            {
+                pool_free(irp);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            WdmIoStackParameters::None
         }
         _ => WdmIoStackParameters::None,
     };

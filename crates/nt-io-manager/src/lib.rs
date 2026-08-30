@@ -2068,6 +2068,20 @@ mod tests {
         assert_eq!(id.id_type(), Some(nt_pnp_abi::BUS_QUERY_INSTANCE_ID));
         assert_eq!(id.relation_type(), None);
         assert_eq!(id.input_len(), 0);
+        for minor in [
+            nt_pnp_abi::IRP_MN_QUERY_RESOURCES,
+            nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS,
+            nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION,
+        ] {
+            let query = PnpParameters::query_information(minor).unwrap();
+            assert_eq!(query.minor, minor);
+            assert_eq!(query.wire_argument(), None);
+            assert_eq!(query.input_len(), 0);
+        }
+        assert_eq!(
+            PnpParameters::query_information(nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
         assert_eq!(
             PnpParameters::start(24, 0),
             Err(NtStatus::INVALID_PARAMETER)
