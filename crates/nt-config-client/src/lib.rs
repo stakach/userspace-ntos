@@ -250,6 +250,13 @@ pub struct OpenedSystemHiveKey {
     pub physical_path: String,
 }
 
+/// A SYSTEM namespace path resolved by the mounted CM generation without acquiring a key lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSystemHivePath {
+    pub mount_generation: u64,
+    pub physical_path: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeasedHiveKeyInformation {
     pub mount_generation: u64,
@@ -1640,6 +1647,63 @@ impl<B: Backend> ConfigClient<B> {
     pub fn open_system_hive_key(&mut self, path: &str) -> Result<SystemHiveKeyLease, i32> {
         self.open_system_hive_key_with_path(path)
             .map(|opened| opened.lease)
+    }
+
+    /// Resolve `CurrentControlSet` through CM's mounted SYSTEM identity. The target itself may be
+    /// absent, which lets native create operations select their durable physical path before the
+    /// mutation is submitted.
+    pub fn resolve_system_hive_path(&mut self, path: &str) -> Result<ResolvedSystemHivePath, i32> {
+        let path_bytes = utf16_bytes(path);
+        if path_bytes.is_empty()
+            || path_bytes.len() > CM_MAX_HIVE_PATH_UNITS * 2
+            || path.chars().any(|ch| ch == '\0')
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
+        let request_header = CmHiveKeyLeaseRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_key_lease_operation::RESOLVE,
+            mount: hive_mount::SYSTEM,
+            path_offset: header_size as u32,
+            path_len_bytes: u32::try_from(path_bytes.len())
+                .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            lease_token: 0,
+        };
+        let mut request = Vec::new();
+        request
+            .try_reserve_exact(header_size.saturating_add(path_bytes.len()))
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        request.extend_from_slice(request_header.as_bytes());
+        request.extend_from_slice(&path_bytes);
+        let mut reply_path = [0u8; CM_MAX_HIVE_PATH_UNITS * 4];
+        let response = self.backend.call(
+            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE,
+            &request,
+            &mut reply_path,
+        );
+        if response.status != STATUS_SUCCESS {
+            return Err(response.status);
+        }
+        let path_len = response.information as usize;
+        if response.detail0 == 0
+            || response.detail1 != 0
+            || path_len == 0
+            || path_len > reply_path.len()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let Ok(physical_path) = core::str::from_utf8(&reply_path[..path_len]) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if physical_path.chars().any(|ch| ch == '\0') {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(ResolvedSystemHivePath {
+            mount_generation: response.detail0,
+            physical_path: String::from(physical_path),
+        })
     }
 
     /// Acquire a stable CM-owned key identity and the physical path selected at open time.
@@ -3138,6 +3202,27 @@ mod tests {
 
         let mut client = client();
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+        let resolved_absent = client
+            .resolve_system_hive_path(
+                r"\Registry\Machine\System\CurrentControlSet\Services\Absent\Child",
+            )
+            .unwrap();
+        assert_eq!(resolved_absent.mount_generation, 1);
+        assert_eq!(
+            resolved_absent.physical_path,
+            r"\Registry\Machine\System\ControlSet001\Services\Absent\Child"
+        );
+        let resolved_explicit = client
+            .resolve_system_hive_path(r"\Registry\Machine\System\ControlSet002\Services\Absent")
+            .unwrap();
+        assert_eq!(
+            resolved_explicit.physical_path,
+            r"\Registry\Machine\System\ControlSet002\Services\Absent"
+        );
+        assert_eq!(
+            client.resolve_system_hive_path(r"\Registry\Machine\Software\WrongHive"),
+            Err(STATUS_INVALID_PARAMETER)
+        );
         let opened = client
             .open_system_hive_key_with_path(
                 r"\Registry\Machine\System\CurrentControlSet\Services\Stable",
@@ -3223,6 +3308,14 @@ mod tests {
             .unwrap();
         let generation = client.publish_system_hive_mutation(&prepared).unwrap();
         assert_eq!(generation, 2);
+        let resolved_after_selection_change = client
+            .resolve_system_hive_path(r"\Registry\Machine\System\CurrentControlSet\Services\Absent")
+            .unwrap();
+        assert_eq!(resolved_after_selection_change.mount_generation, 2);
+        assert_eq!(
+            resolved_after_selection_change.physical_path,
+            r"\Registry\Machine\System\ControlSet002\Services\Absent"
+        );
 
         let leased = client.query_leased_system_hive_key(lease).unwrap();
         assert_eq!(leased.mount_generation, 2);

@@ -15938,6 +15938,23 @@ pub(crate) unsafe fn config_manager_open_system_hive_key(
     Ok(opened)
 }
 
+pub(crate) unsafe fn config_manager_resolve_system_hive_path(
+    path: &str,
+) -> Result<nt_config_client::ResolvedSystemHivePath, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let resolved = client.resolve_system_hive_path(path)?;
+    if resolved.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(resolved)
+}
+
 pub(crate) unsafe fn config_manager_close_system_hive_key(
     lease: nt_config_client::SystemHiveKeyLease,
 ) -> Result<(), i32> {

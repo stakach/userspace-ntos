@@ -5067,6 +5067,18 @@ impl ExecNtHandler {
         nt_hive_core::canon_path(&physical)
     }
 
+    /// Resolve a registry path to the identity used for overlay storage. SYSTEM identity belongs
+    /// to CM, including absent descendants being prepared for `NtCreateKey`; other mounted hives
+    /// retain their local mutable-hive identity until they move behind a provider boundary.
+    fn registry_storage_canon(&self, full: &str) -> Result<alloc::string::String, u32> {
+        if is_system_registry_path(full) {
+            let resolved = unsafe { crate::config_manager_resolve_system_hive_path(full) }
+                .map_err(|status| status as u32)?;
+            return Ok(nt_hive_core::canon_path(&resolved.physical_path));
+        }
+        Ok(self.overlay_canon(full))
+    }
+
     /// The mounted base hive a non-virtual `KeyRef` belongs to, plus its in-hive cell offset. The
     /// top nibble of the `KeyRef` selects SYSTEM (0) / SOFTWARE / SECURITY / SAM — see [`hive_sel`]
     /// — or one of the `\Registry\User` mounts in [`ExecNtHandler::hive_mounts`] (`.Default` plus
@@ -7675,7 +7687,10 @@ impl ExecNtHandler {
         desired: u32,
         out: u64,
     ) -> Option<u32> {
-        let canon = self.overlay_canon(full_path);
+        let canon = match self.registry_storage_canon(full_path) {
+            Ok(canon) => canon,
+            Err(status) => return Some(status),
+        };
         if let Some(target) = Self::virtual_registry_root_target_from_canon(&canon) {
             if target == USER_ROOT_KEY {
                 USER_ROOT_OPENED.fetch_add(1, Ordering::Relaxed);
@@ -32828,7 +32843,10 @@ impl ExecNtHandler {
                     Some(f) => f,
                     None => return 0xC000_0034, // STATUS_OBJECT_NAME_NOT_FOUND
                 };
-                let canon = crate::probe_seg!(1, self.overlay_canon(&full));
+                let canon = match crate::probe_seg!(1, self.registry_storage_canon(&full)) {
+                    Ok(canon) => canon,
+                    Err(status) => return status,
+                };
                 if canon == r"\" {
                     return 0xC000_003B; // STATUS_OBJECT_PATH_SYNTAX_BAD
                 }

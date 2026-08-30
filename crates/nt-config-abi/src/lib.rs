@@ -139,6 +139,9 @@ pub mod hive_key_transfer {
 pub mod hive_key_lease_operation {
     pub const OPEN: u16 = 1;
     pub const CLOSE: u16 = 2;
+    /// Resolve a SYSTEM namespace path to its physical control-set identity without opening it.
+    /// The path need not exist; the reply carries no lease token.
+    pub const RESOLVE: u16 = 3;
 }
 
 /// Record selector carried by [`CmLeasedHiveRecordRequest::record_kind`].
@@ -768,6 +771,7 @@ mod tests {
     #[test]
     fn mounted_hive_mutation_has_stable_wire_layout() {
         assert_eq!(opcode::CM_OP_MUTATE_SYSTEM_HIVE, 0x2156);
+        assert_eq!(hive_key_lease_operation::RESOLVE, 3);
         assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveMutationRecord>(), 24);
         assert_eq!(CM_HIVE_MUTATION_RECORD_HEADER_BYTES, 24);

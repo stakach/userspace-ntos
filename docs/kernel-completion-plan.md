@@ -18141,3 +18141,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     consumers are clean, delete post-publish SYSTEM replay, the SYSTEM `MutableHiveSet` mount and
     storage, its raw runtime hive field, and projection-failure diagnostics together. Retain the
     boot-only REGF source used to compose CM's initial image and the CM journal/checkpoint path.
+
+    CM-owned SYSTEM path-identity acceptance (2026-08-30): the configuration ABI now exposes a
+    lease-free `RESOLVE` operation on the mounted SYSTEM namespace. CM resolves
+    `CurrentControlSet` through its own selected control set and returns the physical path plus the
+    exact mount generation without requiring the target to exist. The client validates the bounded
+    path reply and zero lease token; the executive fences the returned generation against its live
+    CM generation. Native open and create paths now resolve their overlay-storage identity through
+    this provider operation before testing volatile shadows, checking parents, or publishing a
+    persistent create. Consequently an absent key created through `CurrentControlSet` and a
+    volatile key reopened through either alias use the same CM-selected physical identity. CM
+    transport and generation failures propagate to the native caller; there is no projected-hive
+    fallback.
+
+    Focused validation passes `4/4` `nt-config-abi`, `24/24` `nt-config-server`, and `18/18`
+    `nt-config-client` tests. The client/server test changes the selected control set at runtime and
+    proves that an absent alias follows the new generation while an explicit physical path remains
+    unchanged. The freestanding executive release check remains at the established 209-warning
+    baseline. Serialized acceptance `.tmp/run-headless-cm-path-identity-final-20260830.log` reaches
+    the genuine Explorer desktop with all `299/299` checks passing and the sentinel matched. CM
+    reaches generation 2544 after 2540 accepted runtime transactions with zero rejection or
+    projection failure; native SYSTEM leases remain balanced at `1339/1337/2/0`. Explorer completes
+    668 real api0 redirects with zero callback or dead-callback failures, installs 18 client
+    WndProcs without replay, reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch
+    flushes covering 184 records, and paints all `786432/786432` framebuffer pixels with at least 32
+    colours.
+
+    Review adjustment: CM now owns fresh and absent SYSTEM namespace physicalization at the native
+    open/create boundary. The final prerequisite for deleting the executive SYSTEM mirror is
+    `NtSaveKey`: add a lease-bound CM root/subtree export that works for clean generations and does
+    not acknowledge checkpoint state, route SYSTEM saves through the exact opened lease, and add
+    the missing `NtSaveKeyEx` ABI. After that acceptance, atomically delete post-publish replay, the
+    SYSTEM `MutableHiveSet` mount/storage, raw runtime hive field, and projection-failure diagnostic;
+    retain only boot composition plus CM journal/checkpoint persistence.

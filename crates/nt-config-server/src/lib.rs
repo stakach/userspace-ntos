@@ -2104,6 +2104,58 @@ impl CmServer {
             .map(|mounted| mounted.generation)
             .unwrap_or(0);
         match req.operation {
+            hive_key_lease_operation::RESOLVE => {
+                if req.lease_token != 0
+                    || req.path_offset as usize != header_size
+                    || req.path_len_bytes == 0
+                    || req.path_len_bytes % 2 != 0
+                    || req.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
+                    || header_size.checked_add(req.path_len_bytes as usize) != Some(buf.len())
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let mut units = [0u16; CM_MAX_HIVE_PATH_UNITS];
+                let Some(unit_count) =
+                    read_utf16(buf, req.path_offset, req.path_len_bytes, &mut units)
+                else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                let units = &units[..unit_count];
+                if units.contains(&0) {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let Ok(path) = String::from_utf16(units) else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                let Some(mounted) = self.system_hive.as_ref() else {
+                    return reply(STATUS_DEVICE_NOT_READY, 0);
+                };
+                let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set)
+                else {
+                    return reply(STATUS_INVALID_PARAMETER, mounted.generation);
+                };
+                let mut physical_path = String::from(SYSTEM_HIVE_PATH);
+                if !relative.is_empty() {
+                    physical_path.push('\\');
+                    physical_path.push_str(&relative);
+                }
+                let path_bytes = physical_path.as_bytes();
+                if path_bytes.len() > out_buf.len() {
+                    return reply_with_info(
+                        STATUS_BUFFER_TOO_SMALL,
+                        path_bytes.len() as u32,
+                        mounted.generation,
+                        0,
+                    );
+                }
+                out_buf[..path_bytes.len()].copy_from_slice(path_bytes);
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    path_bytes.len() as u32,
+                    mounted.generation,
+                    0,
+                )
+            }
             hive_key_lease_operation::OPEN => {
                 if req.lease_token != 0
                     || req.path_offset as usize != header_size
