@@ -19142,3 +19142,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     partial rundown, and unregister the driver/domain only after one retryable transaction has
     committed all owned surfaces. Then run a serialized post-checkpoint desktop acceptance once the
     existing lane is released.
+
+    B3 canonical driver-unload/rundown checkpoint (2026-08-31, implementation green): the
+    host-tested I/O Manager now owns four distinct driver states: loaded, unload requested, unload
+    callback returned, and unloaded. Unload preflight rejects an IRP whose immutable stack contains
+    the driver, either direction of a live device attachment, or an open device reference without
+    mutating the driver/device records. A valid request marks only remaining unattached control
+    devices delete-pending. Callback return is published exactly once, and finalization requires the
+    driver to have deleted every owned device; the I/O Manager no longer synthesizes device deletion
+    from final driver-record removal.
+
+    Native `NtUnloadDriver` now requires every PnP sibling binding, retirement record, device
+    interface, device-resource mapping, and property-transfer owner in the exact hosted-domain
+    generation to be gone before invoking the real `DriverUnload`. The callback may delete its
+    remaining control devices and quiesce its own runtime. A returned callback is never invoked
+    again: subsequent calls resume final rundown from `UnloadCallbackReturned`. Indeterminate
+    callback transport remains an `UnloadRequested` barrier, and a post-callback driver thread,
+    waiter, active timer, queued DPC, device, or IRP returns a real busy/pending status rather than
+    being force-cleared and reported as success.
+
+    Provider dependency/shadow/route/singleton and executable-thunk retirement remains stepwise and
+    retryable inside the existing instance rundown. Before unbinding the hosted Driver-object or
+    removing its canonical Object Manager record, a new generation-exact I/O Manager preflight proves
+    that the domain contains no device/file/provider ownership and either the one expected driver
+    binding or an already-unbound replay. This removes the prior ordering hole where driver-name
+    lookup could disappear before a failed domain unregister was retryable. Broad device/thread/timer
+    clearing remains reachable only as loader rollback machinery; the native unload path proves those
+    live owners absent before entering it.
+
+    Formatting and `git diff --check` are clean. `nt-io-manager` passes 241/241, including active-IRP,
+    upper/lower attachment, callback fence, non-forced device lifetime, and exact domain-preflight
+    tests. The freestanding executive check passes at the unchanged 209-warning baseline. The
+    pre-existing desktop QEMU still owns the serialized boot lane, so no competing boot was started.
+
+    Review adjustment: B3 multi-device STOP/REMOVE and driver/domain unload ownership are closed at
+    the canonical runtime boundary. Once the existing QEMU lane is released, run one serialized
+    desktop acceptance to catch load/unload-state regressions. In parallel planning terms, the next
+    code frontier is live device-action `Change`: replace its explicit barrier with a typed
+    query-stop/rebalance owner when the CM event describes resource/topology change, and add a real
+    hotplug remove/re-enumerate acceptance that proves one NIC can disappear and return without
+    disturbing a sibling. Keep driver unload separate from per-device removal and retain exact CM
+    claims across every asynchronous step.

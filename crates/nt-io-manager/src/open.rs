@@ -14,8 +14,7 @@ use nt_types::{AccessMask, ClientId, HandleValue, NtPath, ObjectId};
 use crate::device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 use crate::dispatch::{DispatchOutcome, DriverDispatchBackend};
 use crate::driver::{
-    DispatchTarget, DriverBackendId, DriverPeerId, DriverRecord, DriverUnloadState,
-    MajorFunctionTable, MockDispatchId,
+    DispatchTarget, DriverBackendId, DriverPeerId, DriverRecord, MajorFunctionTable, MockDispatchId,
 };
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
 use crate::irp::{CreateParameters, IoParameters, IrpState};
@@ -277,10 +276,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
         for device in devices {
             self.destroy_device(device)?;
         }
-        let mut record = self
-            .remove_driver(driver)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        record.unload_state = DriverUnloadState::Unloaded;
+        self.complete_driver_unload_callback(driver)?;
+        let record = self.remove_driver_records_after_unload(driver)?;
         if record.object_id != ObjectId::NULL {
             self.port
                 .delete_driver_object(record.object_id, &record.name)?;

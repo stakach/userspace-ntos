@@ -281,16 +281,58 @@ impl<P> IoManager<P> {
             .map(|(id, _)| id)
     }
 
-    /// Mark a driver unload requested and mark its devices delete-pending. This mutates only
-    /// canonical I/O Manager records; Object Manager namespace teardown is owned by the caller or by
-    /// the Object Manager-backed APIs in `open.rs`.
-    pub fn request_driver_unload_records(&mut self, driver: DriverId) -> Result<(), NtStatus> {
-        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
-        let record = self.driver_mut(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
-        if record.unload_state == DriverUnloadState::Unloaded {
-            return Err(NtStatus::INVALID_PARAMETER);
+    fn driver_has_live_irp(&self, driver: DriverId) -> bool {
+        self.irps.iter().any(|(_, irp)| {
+            irp.origin_driver_id == driver
+                || irp
+                    .stack
+                    .iter()
+                    .any(|location| location.driver_id == driver)
+        })
+    }
+
+    /// Validate the stable preconditions for calling a real `DriverUnload` routine. Unattached
+    /// control devices may remain because the callback owns their deletion. PnP/filter attachments,
+    /// open files, and IRPs captured through this driver are authoritative rundown barriers.
+    pub fn can_begin_driver_unload(&self, driver: DriverId) -> Result<(), NtStatus> {
+        let record = self.driver(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if record.unload_state != DriverUnloadState::Loaded {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
         }
-        record.unload_state = DriverUnloadState::UnloadRequested;
+        if self.driver_has_live_irp(driver) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        if self.devices_of(driver).iter().any(|device_id| {
+            self.device(*device_id).is_some_and(|device| {
+                device.attached_to.is_some()
+                    || self.has_upper_attachment(*device_id)
+                    || self.device_has_live_files(*device_id)
+            })
+        }) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        Ok(())
+    }
+
+    /// Mark a driver unload requested and mark its remaining unattached control devices
+    /// delete-pending. Re-entry is idempotent so an executive can resume a retained rundown without
+    /// making the canonical record look newly loaded.
+    pub fn request_driver_unload_records(&mut self, driver: DriverId) -> Result<(), NtStatus> {
+        let state = self
+            .driver(driver)
+            .map(|record| record.unload_state)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        match state {
+            DriverUnloadState::Loaded => self.can_begin_driver_unload(driver)?,
+            DriverUnloadState::UnloadRequested | DriverUnloadState::UnloadCallbackReturned => {
+                return Ok(())
+            }
+            DriverUnloadState::Unloaded => return Err(NtStatus::INVALID_PARAMETER),
+        }
+        self.driver_mut(driver)
+            .expect("validated driver disappeared before unload request")
+            .unload_state = DriverUnloadState::UnloadRequested;
+        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
         for device in devices {
             if let Some(record) = self.device_mut(device) {
                 record.delete_pending = true;
@@ -304,28 +346,60 @@ impl<P> IoManager<P> {
         if self.driver(driver).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        if self
-            .devices_of(driver)
-            .iter()
-            .any(|device| self.device_has_live_files(*device) || self.has_upper_attachment(*device))
-        {
+        if self.driver_has_live_irp(driver) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        if self.devices_of(driver).iter().any(|device_id| {
+            self.device(*device_id).is_some_and(|device| {
+                device.attached_to.is_some()
+                    || self.device_has_live_files(*device_id)
+                    || self.has_upper_attachment(*device_id)
+            })
+        }) {
             return Err(NtStatus::DELETE_PENDING);
         }
         Ok(())
     }
 
-    /// Remove driver/device records after the caller has run any required driver-owned unload
-    /// routine and torn down Object Manager names.
+    /// Publish that the one real `DriverUnload` invocation returned. The callback is a void routine;
+    /// success here records transport ownership, not completion of device or provider teardown.
+    pub fn complete_driver_unload_callback(&mut self, driver: DriverId) -> Result<(), NtStatus> {
+        let record = self.driver_mut(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
+        match record.unload_state {
+            DriverUnloadState::UnloadRequested => {
+                record.unload_state = DriverUnloadState::UnloadCallbackReturned;
+                Ok(())
+            }
+            DriverUnloadState::UnloadCallbackReturned => Ok(()),
+            DriverUnloadState::Loaded | DriverUnloadState::Unloaded => {
+                Err(NtStatus::INVALID_DEVICE_REQUEST)
+            }
+        }
+    }
+
+    /// Validate final canonical rundown after `DriverUnload` returned. The driver must have deleted
+    /// every owned device and all captured IRPs must be gone; this boundary never force-deletes them.
+    pub fn can_finish_driver_unload(&self, driver: DriverId) -> Result<(), NtStatus> {
+        let record = self.driver(driver).ok_or(NtStatus::INVALID_PARAMETER)?;
+        if record.unload_state != DriverUnloadState::UnloadCallbackReturned {
+            return Err(NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        if self.driver_has_live_irp(driver) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        if !self.devices_of(driver).is_empty() {
+            return Err(NtStatus::DELETE_PENDING);
+        }
+        Ok(())
+    }
+
+    /// Remove only the driver record after its callback and all driver-owned device/IRP teardown.
+    /// Device deletion is deliberately not synthesized here.
     pub fn remove_driver_records_after_unload(
         &mut self,
         driver: DriverId,
     ) -> Result<DriverRecord, NtStatus> {
-        self.request_driver_unload_records(driver)?;
-        self.can_destroy_driver(driver)?;
-        let devices: Vec<DeviceId> = self.devices_of(driver).to_vec();
-        for device in devices {
-            self.delete_device(device)?;
-        }
+        self.can_finish_driver_unload(driver)?;
         let mut record = self
             .remove_driver(driver)
             .ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -1482,12 +1556,104 @@ mod tests {
         assert_eq!(om.destroy_driver(drv).err(), Some(NtStatus::DELETE_PENDING));
         assert_eq!(
             om.driver(drv).unwrap().unload_state,
-            DriverUnloadState::UnloadRequested
+            DriverUnloadState::Loaded
         );
-        assert!(om.device(dev).unwrap().delete_pending);
+        assert!(!om.device(dev).unwrap().delete_pending);
         assert_eq!(
             om.port_mut().open_device_object(&path("\\Device\\Busy")),
             Ok(om.device(dev).unwrap().object_id)
+        );
+    }
+
+    #[test]
+    fn driver_unload_is_callback_fenced_and_never_force_deletes_devices() {
+        let mut om = io();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\RetainedUnload"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let device = om
+            .create_device(
+                driver,
+                Some(&path("\\Device\\RetainedUnload0")),
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
+
+        om.request_driver_unload_records(driver).unwrap();
+        assert_eq!(
+            om.driver(driver).unwrap().unload_state,
+            DriverUnloadState::UnloadRequested
+        );
+        assert!(om.device(device).unwrap().delete_pending);
+        assert_eq!(
+            om.remove_driver_records_after_unload(driver).err(),
+            Some(NtStatus::INVALID_DEVICE_REQUEST)
+        );
+
+        om.complete_driver_unload_callback(driver).unwrap();
+        assert_eq!(
+            om.remove_driver_records_after_unload(driver).err(),
+            Some(NtStatus::DELETE_PENDING)
+        );
+        assert!(om.driver(driver).is_some());
+        assert!(om.device(device).is_some());
+
+        om.destroy_device(device).unwrap();
+        let record = om.remove_driver_records_after_unload(driver).unwrap();
+        assert_eq!(record.unload_state, DriverUnloadState::Unloaded);
+        assert!(om.driver(driver).is_none());
+    }
+
+    #[test]
+    fn driver_unload_refuses_live_irps_and_both_attachment_directions() {
+        let mut pending = MockDriverBackend::new();
+        pending.set_force_pending(true);
+        let (om, _client, irp) = pending_read(pending);
+        let driver = om.irp(irp).unwrap().origin_driver_id;
+        assert_eq!(
+            om.can_begin_driver_unload(driver),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert_eq!(
+            om.driver(driver).unwrap().unload_state,
+            DriverUnloadState::Loaded
+        );
+
+        let mut attached = io();
+        let lower_driver = a_driver(&mut attached);
+        let lower = attached.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            lower_driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::empty(),
+            0,
+        ));
+        let upper_driver = a_driver(&mut attached);
+        let upper = attached.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            upper_driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::empty(),
+            0,
+        ));
+        attached.attach_device_to_stack(upper, lower).unwrap();
+        assert_eq!(
+            attached.can_begin_driver_unload(lower_driver),
+            Err(NtStatus::DELETE_PENDING)
+        );
+        assert_eq!(
+            attached.can_begin_driver_unload(upper_driver),
+            Err(NtStatus::DELETE_PENDING)
         );
     }
 

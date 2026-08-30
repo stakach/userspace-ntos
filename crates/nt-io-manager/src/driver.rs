@@ -213,6 +213,7 @@ pub enum DriverUnloadState {
     #[default]
     Loaded,
     UnloadRequested,
+    UnloadCallbackReturned,
     Unloaded,
 }
 

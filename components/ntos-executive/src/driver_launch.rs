@@ -45204,6 +45204,71 @@ fn clear_hosted_driver_timers_for_instance(instance: usize) {
     }
 }
 
+unsafe fn hosted_driver_runtime_quiesced(instance: usize) -> bool {
+    let threads_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_THREAD_RUNTIMES))
+        .as_ref()
+        .is_none_or(|runtimes| runtimes.iter().all(|runtime| runtime.instance != instance));
+    let waits_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS))
+        .as_ref()
+        .is_none_or(|waiters| waiters.iter().all(|waiter| waiter.instance != instance));
+    let timers_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_TIMERS))
+        .as_ref()
+        .and_then(|queues| queues.get(instance))
+        .is_none_or(|queue| queue.active_count() == 0);
+    let dpcs_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
+        .as_ref()
+        .is_none_or(|activations| {
+            activations
+                .iter()
+                .all(|activation| activation.instance != instance)
+        });
+    threads_quiesced && waits_quiesced && timers_quiesced && dpcs_quiesced
+}
+
+unsafe fn hosted_driver_device_lifetime_quiesced(
+    instance: usize,
+    driver_id: u64,
+    domain: HostedDomainIdentity,
+) -> bool {
+    let bindings_quiesced = hosted_device_bindings().is_none_or(|bindings| {
+        bindings.iter().all(|binding| {
+            !binding.used
+                || binding.driver_id != driver_id
+                    && binding.instance != instance
+                    && binding.projection_instance != instance
+                    && binding.projection_domain != domain
+        })
+    });
+    let retirements_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_RETIREMENTS))
+        .as_ref()
+        .is_none_or(|retirements| {
+            retirements.iter().all(|retirement| {
+                retirement.instance != instance && retirement.domain != domain
+            })
+        });
+    let interfaces_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_INTERFACE_REGISTRATIONS))
+        .as_ref()
+        .is_none_or(|registrations| {
+            registrations
+                .iter()
+                .all(|registration| !registration.used || registration.owner_domain != domain)
+        });
+    let resource_maps_quiesced = (*core::ptr::addr_of!(HOSTED_RESOURCE_MAP_CAPS))
+        .as_ref()
+        .is_none_or(|caps| {
+            caps.iter()
+                .all(|cap| cap.instance != instance && cap.domain != domain)
+        });
+    let property_transfers_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_PROPERTY_TRANSFERS))
+        .as_ref()
+        .is_none_or(|transfers| !transfers.domain_busy(domain));
+    bindings_quiesced
+        && retirements_quiesced
+        && interfaces_quiesced
+        && resource_maps_quiesced
+        && property_transfers_quiesced
+}
+
 fn hosted_driver_thread_error_status(error: HostedDriverThreadError) -> i32 {
     match error {
         HostedDriverThreadError::InvalidStartRoutine | HostedDriverThreadError::InvalidHandle => {
@@ -45825,6 +45890,30 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         print_str(b" (published or in-progress raw callback address remains)\n");
     }
     let inst = instance(i);
+    if !teardown_blocked {
+        if let Some(inst) = inst.filter(|inst| inst.driver_id != 0 && inst.driver_object != 0) {
+            let Some(domain) = instance_domain_identity(inst) else {
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            };
+            if let Err(status) = io_manager_mut()
+                .can_unregister_hosted_domain_after_unbind_driver(
+                    domain,
+                    inst.driver_object,
+                    DriverId(inst.driver_id),
+                )
+            {
+                print_str(b"[driver-launch] hosted domain preflight rejected inst=");
+                print_u64(i as u64);
+                print_str(b" status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+                teardown_blocked = true;
+            }
+        }
+    }
+    if teardown_blocked {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if let Some(inst) = inst {
         unsafe {
             clear_driver_object_extensions_for_driver_object(inst.driver_object);
@@ -50039,20 +50128,38 @@ pub(crate) unsafe fn unload_driver_by_name(
     let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     io_manager_mut().can_unload_hosted_provider(domain)?;
 
-    {
-        let io = io_manager_mut();
-        io.request_driver_unload_records(DriverId(driver_id))?;
-        if let Err(status) = io.can_destroy_driver(DriverId(driver_id)) {
-            if status == nt_status::NtStatus::DELETE_PENDING {
-                return Ok(());
+    let unload_state = io_manager_mut()
+        .driver(DriverId(driver_id))
+        .map(|driver| driver.unload_state)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    match unload_state {
+        nt_io_manager::DriverUnloadState::Loaded => {
+            if !hosted_driver_device_lifetime_quiesced(index, driver_id, domain) {
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
             }
-            return Err(status);
+            io_manager_mut().request_driver_unload_records(DriverId(driver_id))?;
+            if let Err(status) = dispatch_driver_unload_for_instance(index, inst) {
+                register_instance_ready(index, false);
+                return Err(status);
+            }
+            io_manager_mut().complete_driver_unload_callback(DriverId(driver_id))?;
+        }
+        nt_io_manager::DriverUnloadState::UnloadRequested => {
+            // The callback transport did not return, so re-entry cannot prove whether the void
+            // routine ran partially. Keep the exact canonical unload owner as a barrier.
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        nt_io_manager::DriverUnloadState::UnloadCallbackReturned => {}
+        nt_io_manager::DriverUnloadState::Unloaded => {
+            return Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND);
         }
     }
 
-    dispatch_driver_unload_for_instance(index, inst)?;
-    if inst.tcb != 0 {
-        let _ = crate::tcb_suspend_r(inst.tcb);
+    io_manager_mut().can_finish_driver_unload(DriverId(driver_id))?;
+    if !hosted_driver_device_lifetime_quiesced(index, driver_id, domain)
+        || !hosted_driver_runtime_quiesced(index)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     clear_instance(index)
 }

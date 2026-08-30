@@ -175,6 +175,42 @@ impl<P> IoManager<P> {
         Ok(())
     }
 
+    /// Prove that one domain will be unregisterable after removing the exact hosted Driver-object
+    /// binding. This is a non-mutating preflight for a larger unload transaction; an already-unbound
+    /// replay is accepted only when no replacement driver binding exists.
+    pub fn can_unregister_hosted_domain_after_unbind_driver(
+        &self,
+        identity: HostedDomainIdentity,
+        driver_address: u64,
+        driver_id: DriverId,
+    ) -> Result<(), NtStatus> {
+        if driver_address == 0 || driver_id == DriverId::NULL {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let record = self
+            .hosted_domains
+            .get(identity.domain_id)
+            .filter(|record| identity.cookie != 0 && record.cookie == identity.cookie)
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let exact_driver_is_only_binding = record.drivers.is_empty()
+            || record.drivers.len() == 1
+                && record.drivers[0].address == driver_address
+                && record.drivers[0].id == driver_id;
+        let has_inbound_provider_link = self
+            .hosted_domains
+            .iter()
+            .any(|(_, dependent)| dependent.provider == Some(identity));
+        if !exact_driver_is_only_binding
+            || !record.devices.is_empty()
+            || !record.files.is_empty()
+            || record.provider.is_some()
+            || has_inbound_provider_link
+        {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
+        Ok(())
+    }
+
     pub fn hosted_domain(&self, domain: HostedDomainId) -> Option<&HostedDomainRecord> {
         self.hosted_domains.get(domain)
     }
@@ -587,6 +623,48 @@ mod tests {
             io.unregister_hosted_domain(stale),
             Err(NtStatus::INVALID_PARAMETER)
         );
+    }
+
+    #[test]
+    fn driver_unload_domain_preflight_accepts_only_the_exact_last_binding() {
+        let mut io = IoManager::new(MockObjectPort::new());
+        let driver = io
+            .create_driver(
+                &path("\\Driver\\DomainUnload"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let other = io
+            .create_driver(
+                &path("\\Driver\\DomainOther"),
+                Box::new(MockDriverBackend::new()),
+            )
+            .unwrap();
+        let identity = io.register_hosted_domain();
+        io.bind_hosted_driver_identity(identity, 0x2000, driver)
+            .unwrap();
+
+        assert_eq!(
+            io.can_unregister_hosted_domain_after_unbind_driver(identity, 0x2000, driver),
+            Ok(())
+        );
+        assert_eq!(
+            io.can_unregister_hosted_domain_after_unbind_driver(identity, 0x2008, driver),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        io.bind_hosted_driver_identity(identity, 0x3000, other)
+            .unwrap();
+        assert_eq!(
+            io.can_unregister_hosted_domain_after_unbind_driver(identity, 0x2000, driver),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert!(io.unbind_hosted_driver_identity(identity, 0x3000, other));
+        assert!(io.unbind_hosted_driver_identity(identity, 0x2000, driver));
+        assert_eq!(
+            io.can_unregister_hosted_domain_after_unbind_driver(identity, 0x2000, driver),
+            Ok(())
+        );
+        assert_eq!(io.unregister_hosted_domain(identity), Ok(()));
     }
 
     #[test]
