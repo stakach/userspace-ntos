@@ -19848,3 +19848,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     link PDOs for `_CRS`, and atomically prepare/commit the complete route set with the accepted PCI
     inventory/devnode generation. The active older desktop QEMU still owns the serialized boot lane,
     so no runtime build or launch was started for this checkpoint.
+
+    B3 ReactOS ACPI provider-conformance checkpoint (2026-08-31, source and artifact accepted):
+    the exact livecd source commit `4117217b61b97f022e441b11639ca6f2106aaa07` now has a retained
+    GPL provider patch and module-only amd64/MSVC/Debug build lane. `acpi.sys` implements the complete
+    standard immediate/multilevel and optional NameSeg-filtered `IOCTL_ACPI_ENUM_CHILDREN` contract:
+    exact input validation, unfiltered self-first device walks, filtered descendant walks, canonical
+    full paths, any-object child flags, packed variable records, checked sizing, header-only
+    `STATUS_BUFFER_OVERFLOW` with zero Information, and exact successful byte counts. The namespace
+    is snapshotted before output so an overflow never leaks partial records and serialization cannot
+    observe a different walk.
+
+    PDO enumeration now deduplicates only the same ACPICA handle. Every handle-backed PDO retains a
+    stable injective PnP instance identity derived from its full canonical namespace path rather than
+    a pointer, ordinal, `_UID` collision, or literal `0`, and advertises that identity as unique.
+    Destruction releases it through the normal PDO owner. A fixed-feature button PDO has no ACPICA
+    handle and returns `STATUS_INVALID_DEVICE_REQUEST` for namespace enumeration; the executive
+    records that exact initial-probe result as structurally not applicable. It does not fabricate a
+    root path, while `STATUS_NOT_SUPPORTED` still means missing provider implementation and remains
+    a publication barrier.
+
+    The canonical 448,000-byte provider artifact was built successfully by GitHub Actions run
+    `33337712029` and is retained at SHA-256
+    `b3b4252048559705ddaf093523828af54e0b60dc7e8136eda08761bf1bb95e69`. A manifest also pins the
+    source, livecd archive/ISO, stock driver, patch, build tuple, and artifact hashes. The fetcher
+    rejects ambiguous ISOs and verifies every available base-media layer. Every top-level run
+    verifies the retained patch and provider; image creation then overwrites the stock tree entry,
+    reads the FAT file back, and verifies the exact boot bytes. Missing or mismatched data is fatal;
+    there is no stock-driver fallback. A scratch FAT overwrite/readback proof passes, all modified
+    shell scripts parse, formatting and `git diff --check` are clean, and the executive freestanding
+    check remains green at the unchanged 209-warning baseline. Rust-micro commits `2fecd86` and
+    `da772e0` were pushed before advancing the parent submodule.
+
+    Review adjustment: provider namespace identity is now an enforceable boot contract rather than
+    an ignored-source dependency. Next extend the same retained relation transaction with a 20-byte
+    File-less `_PRT` probe and exact overflow retry for every namespace-identified PCI root/bridge
+    PDO. Resolve each direct GSI or link NamePath against the retained namespace snapshot; query
+    `_CRS` only on the exact resolved link PDO, prepare one complete generation-owned route set, and
+    commit it atomically with the existing registry/CM/devnode/bus publication. Any unresolved,
+    ambiguous, stale, malformed, or electrically conflicting route remains a whole-transaction
+    barrier. The active older desktop VM remains untouched, so serialized runtime provider and SCI
+    acceptance is still open.

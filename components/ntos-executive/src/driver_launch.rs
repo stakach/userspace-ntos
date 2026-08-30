@@ -36461,6 +36461,15 @@ unsafe fn classify_hosted_acpi_namespace_result(
     payload: &[u8],
 ) -> HostedNamespaceDisposition {
     if output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN {
+        if status == nt_status::NtStatus::INVALID_DEVICE_REQUEST {
+            return match store_hosted_acpi_namespace(
+                child_index,
+                HostedAcpiNamespaceState::NotApplicable,
+            ) {
+                Ok(()) => HostedNamespaceDisposition::Advance,
+                Err(status) => HostedNamespaceDisposition::Barrier(status),
+            };
+        }
         if status.raw() as u32 != STATUS_BUFFER_OVERFLOW {
             return HostedNamespaceDisposition::Barrier(if status.is_success() {
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST

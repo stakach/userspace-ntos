@@ -178,6 +178,7 @@ if [ ! -f "$REACTOS_KEY" ] || [ ! -f "$RM/.tmp/reactos/ros-win32k.sys" ] \
 else
   say "      ReactOS binaries already staged (cached)"
 fi
+"$RM/scripts/verify_reactos_acpi_provider.sh"
 
 # ---- [4/5] build the executive + kernel + disk image --------------------
 say "[4/5] building ntos-executive + kernel + disk image..."
