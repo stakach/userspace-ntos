@@ -11,7 +11,7 @@
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;
 pub const CM_OPCODE_MAX: u16 = 0x21ff;
-pub const CM_ABI_VERSION: u16 = 2;
+pub const CM_ABI_VERSION: u16 = 3;
 pub const CM_MAX_INSTANCE_UNITS: usize = 512;
 /// Maximum property payload carried by one SURT completion frame.
 pub const CM_DEVICE_PROPERTY_CHUNK_BYTES: usize = 4096;
@@ -146,8 +146,13 @@ pub mod leased_hive_record_kind {
 pub mod hive_mutation_transfer {
     pub const BEGIN: u16 = 1;
     pub const APPEND: u16 = 2;
-    pub const COMMIT: u16 = 3;
-    pub const ABORT: u16 = 4;
+    /// Validate the complete semantic journal and retain its CM-owned replay records.
+    pub const PREPARE: u16 = 3;
+    /// Pull one chunk of the prepared replay records into the completion frame.
+    pub const PULL: u16 = 4;
+    /// Publish the prepared mutation after its replay records are durable.
+    pub const COMMIT: u16 = 5;
+    pub const ABORT: u16 = 6;
 }
 
 /// Operation encoded in one [`CmHiveMutationRecord`].
@@ -398,9 +403,11 @@ pub struct CmLeasedHiveRecordRequest {
     pub _reserved: u16,
 }
 
-/// `mutate_system_hive`: a generation-checked journal upload. BEGIN acquires the sole writer lease
-/// and reserves `journal_len_bytes`; APPEND carries the next ordered chunk; COMMIT validates every
-/// record and atomically publishes one new generation; ABORT releases the lease.
+/// `mutate_system_hive`: a generation-checked journal upload and durability handshake. BEGIN
+/// acquires the sole writer lease and reserves `journal_len_bytes`; APPEND carries the next ordered
+/// semantic chunk; PREPARE validates it and materialises CM-owned replay records; PULL streams those
+/// records to the storage transport; COMMIT publishes one new generation only after storage has
+/// acknowledged durability; ABORT releases either an upload or a prepared mutation.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmHiveMutationRequest {
@@ -540,7 +547,7 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                40, 0, 2, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc,
+                40, 0, 3, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc,
                 0xbb, 0xaa, 0x99, 0x00, 0xff, 0xee, 0xdd, 40, 0, 0, 0, 0xcc, 0xbb, 0xaa, 0x99,
                 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
             ]
@@ -571,7 +578,7 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                32, 0, 2, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 32, 0, 0,
+                32, 0, 3, 0, 2, 0, 0, 0, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 32, 0, 0,
                 0, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
             ]
         );
@@ -714,7 +721,7 @@ mod tests {
         assert_eq!(
             request.as_bytes(),
             &[
-                40, 0, 2, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 40, 0, 0, 0, 0x88, 0x77, 0x66,
+                40, 0, 3, 0, 2, 0, 1, 0, 0x44, 0x33, 0x22, 0x11, 40, 0, 0, 0, 0x88, 0x77, 0x66,
                 0x55, 0xcc, 0xbb, 0xaa, 0x99, 8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14,
                 0x13, 0x12, 0x11,
             ]

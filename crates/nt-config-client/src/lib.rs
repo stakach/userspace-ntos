@@ -84,6 +84,18 @@ pub enum SystemHiveMutation<'a> {
     },
 }
 
+/// One fully validated SYSTEM mutation whose CM-owned replay records must be made durable before
+/// publication. The token and lengths are opaque protocol identity; callers persist
+/// `durable_journal` and pass the complete value back to [`ConfigClient::publish_system_hive_mutation`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSystemHiveMutation {
+    pub expected_generation: u64,
+    pub next_generation: u64,
+    pub lease_token: u64,
+    pub semantic_journal_len: u32,
+    pub durable_journal: Vec<u8>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DriverServiceClass {
     Device,
@@ -1198,14 +1210,14 @@ impl<B: Backend> ConfigClient<B> {
         Ok(commit.detail0)
     }
 
-    /// Atomically apply `mutations` to exactly `expected_generation` of CM's mounted SYSTEM hive.
-    /// The journal streams across as many request frames as required; no operation is visible until
-    /// the complete journal validates and commits.
-    pub fn mutate_system_hive(
+    /// Upload and validate `mutations` against exactly `expected_generation` of CM's mounted SYSTEM
+    /// hive. No mutation is visible yet. The returned replay journal is encoded by CM from the
+    /// physical control-set identity it validated and must be made durable before publication.
+    pub fn prepare_system_hive_mutation(
         &mut self,
         expected_generation: u64,
         mutations: &[SystemHiveMutation<'_>],
-    ) -> Result<u64, i32> {
+    ) -> Result<PreparedSystemHiveMutation, i32> {
         if expected_generation == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
@@ -1262,8 +1274,8 @@ impl<B: Backend> ConfigClient<B> {
             }
             offset = end;
         }
-        let commit = match self.hive_mutation_call(
-            hive_mutation_transfer::COMMIT,
+        let prepare = match self.hive_mutation_call(
+            hive_mutation_transfer::PREPARE,
             token,
             expected_generation,
             journal_len,
@@ -1276,18 +1288,102 @@ impl<B: Backend> ConfigClient<B> {
                 return Err(status);
             }
         };
-        if commit.status != STATUS_SUCCESS
-            || commit.detail0 != expected_generation.saturating_add(1)
-            || commit.detail1 != token
+        let durable_len = prepare.information as usize;
+        if prepare.status != STATUS_SUCCESS
+            || prepare.detail0 != expected_generation.saturating_add(1)
+            || prepare.detail1 != token
         {
             self.abort_hive_mutation(token, expected_generation, journal_len);
-            return Err(if commit.status == STATUS_SUCCESS {
+            return Err(if prepare.status == STATUS_SUCCESS {
                 STATUS_INVALID_PARAMETER
             } else {
-                commit.status
+                prepare.status
             });
         }
-        Ok(commit.detail0)
+        let mut durable_journal = Vec::new();
+        if durable_journal.try_reserve_exact(durable_len).is_err() {
+            self.abort_hive_mutation(token, expected_generation, journal_len);
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        let mut offset = 0usize;
+        let mut chunk = [0u8; CM_HIVE_MUTATION_CHUNK_BYTES];
+        while offset < durable_len {
+            let capacity = core::cmp::min(chunk.len(), durable_len - offset);
+            let response = match self.hive_mutation_control_call(
+                hive_mutation_transfer::PULL,
+                token,
+                expected_generation,
+                offset as u32,
+                journal_len,
+                capacity as u32,
+                &mut chunk[..capacity],
+            ) {
+                Ok(response) => response,
+                Err(status) => {
+                    self.abort_hive_mutation(token, expected_generation, journal_len);
+                    return Err(status);
+                }
+            };
+            let written = response.information as usize;
+            if response.status != STATUS_SUCCESS
+                || written == 0
+                || written > capacity
+                || response.detail0 as usize != durable_len
+                || response.detail1 != token
+            {
+                self.abort_hive_mutation(token, expected_generation, journal_len);
+                return Err(if response.status == STATUS_SUCCESS {
+                    STATUS_INVALID_PARAMETER
+                } else {
+                    response.status
+                });
+            }
+            durable_journal.extend_from_slice(&chunk[..written]);
+            offset += written;
+        }
+        Ok(PreparedSystemHiveMutation {
+            expected_generation,
+            next_generation: prepare.detail0,
+            lease_token: token,
+            semantic_journal_len: journal_len,
+            durable_journal,
+        })
+    }
+
+    /// Publish a prepared mutation after its CM-owned replay journal has been made durable.
+    pub fn publish_system_hive_mutation(
+        &mut self,
+        prepared: &PreparedSystemHiveMutation,
+    ) -> Result<u64, i32> {
+        let response = self.hive_mutation_call(
+            hive_mutation_transfer::COMMIT,
+            prepared.lease_token,
+            prepared.expected_generation,
+            prepared.semantic_journal_len,
+            prepared.semantic_journal_len,
+            &[],
+        )?;
+        if response.status != STATUS_SUCCESS
+            || response.information != 0
+            || response.detail0 != prepared.next_generation
+            || response.detail1 != prepared.lease_token
+        {
+            return Err(if response.status == STATUS_SUCCESS {
+                STATUS_INVALID_PARAMETER
+            } else {
+                response.status
+            });
+        }
+        Ok(response.detail0)
+    }
+
+    /// Discard an uploaded or prepared mutation that has not been published.
+    pub fn abort_prepared_system_hive_mutation(&mut self, prepared: &PreparedSystemHiveMutation) {
+        self.abort_hive_mutation(
+            prepared.lease_token,
+            prepared.expected_generation,
+            prepared.semantic_journal_len,
+        );
     }
 
     /// Acquire one stable CM-owned key identity from the mounted SYSTEM hive.
@@ -1981,6 +2077,42 @@ impl<B: Backend> ConfigClient<B> {
             .call(opcode::CM_OP_MUTATE_SYSTEM_HIVE, &request, &mut []))
     }
 
+    fn hive_mutation_control_call(
+        &mut self,
+        operation: u16,
+        lease_token: u64,
+        expected_generation: u64,
+        journal_offset: u32,
+        journal_len_bytes: u32,
+        chunk_capacity: u32,
+        reply_bytes: &mut [u8],
+    ) -> Result<CmReply, i32> {
+        if chunk_capacity == 0
+            || chunk_capacity as usize > CM_HIVE_MUTATION_CHUNK_BYTES
+            || chunk_capacity as usize > reply_bytes.len()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let header_size = core::mem::size_of::<CmHiveMutationRequest>();
+        let header = CmHiveMutationRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            mount: hive_mount::SYSTEM,
+            journal_offset,
+            chunk_offset: 0,
+            chunk_len_bytes: chunk_capacity,
+            journal_len_bytes,
+            expected_generation,
+            lease_token,
+        };
+        Ok(self.backend.call(
+            opcode::CM_OP_MUTATE_SYSTEM_HIVE,
+            header.as_bytes(),
+            reply_bytes,
+        ))
+    }
+
     fn abort_hive_mutation(
         &mut self,
         lease_token: u64,
@@ -2516,7 +2648,7 @@ mod tests {
         SERVICE_WIN32_OWN_PROCESS, SERVICE_WIN32_SHARE_PROCESS,
     };
     use nt_config_server::CmServer;
-    use nt_hive_core::{encode_image, Hive, HiveKind};
+    use nt_hive_core::{encode_image, try_replay_log, Hive, HiveKind};
 
     /// In-process backend: dispatch straight into the server (no ring).
     struct Direct {
@@ -2708,8 +2840,8 @@ mod tests {
         );
         assert_eq!(leased.mount_generation, 1);
 
-        let generation = client
-            .mutate_system_hive(
+        let prepared = client
+            .prepare_system_hive_mutation(
                 1,
                 &[
                     SystemHiveMutation::SetValue {
@@ -2727,6 +2859,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        let generation = client.publish_system_hive_mutation(&prepared).unwrap();
         assert_eq!(generation, 2);
 
         let leased = client.query_leased_system_hive_key(lease).unwrap();
@@ -2787,6 +2920,7 @@ mod tests {
         let obsolete = hive.create_key(r"ControlSet001\Services\Obsolete");
         hive.set_dword(obsolete, "Value", 1);
         hive.finish_clean_import();
+        let mut replayed = hive.clone();
 
         let mut client = ConfigClient::new(Framed {
             server: CmServer::new(),
@@ -2799,8 +2933,8 @@ mod tests {
         let image = encode_sz(r"system32\dynamic.exe /service");
         let payload = vec![0x5a; CM_HIVE_MUTATION_CHUNK_BYTES * 2 + 37];
         let security = vec![0xa5; 96];
-        let generation = client
-            .mutate_system_hive(
+        let prepared = client
+            .prepare_system_hive_mutation(
                 1,
                 &[
                     SystemHiveMutation::CreateKey { path: service_path },
@@ -2846,6 +2980,29 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert_eq!(prepared.expected_generation, 1);
+        assert_eq!(prepared.next_generation, 2);
+        assert!(prepared.durable_journal.len() > CM_HIVE_MUTATION_CHUNK_BYTES);
+        assert_eq!(
+            client.query_system_hive_key(service_path),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            "a prepared mutation must remain invisible until storage acknowledges it"
+        );
+        let replayed_sequence =
+            try_replay_log(&mut replayed, &prepared.durable_journal, 0).unwrap();
+        assert!(replayed_sequence != 0);
+        let replayed_service = replayed
+            .open_key(r"ControlSet001\Services\DynamicService")
+            .unwrap();
+        assert_eq!(
+            replayed.query_value(replayed_service, "Payload").unwrap().1,
+            payload.as_slice()
+        );
+        assert!(replayed
+            .open_key(r"ControlSet001\Services\Obsolete")
+            .is_none());
+
+        let generation = client.publish_system_hive_mutation(&prepared).unwrap();
         assert_eq!(generation, 2);
 
         let snapshot = client.query_system_hive_key(service_path).unwrap();
@@ -2882,7 +3039,7 @@ mod tests {
 
         let rejected_path = r"\Registry\Machine\System\CurrentControlSet\Services\MustRemainAbsent";
         assert_eq!(
-            client.mutate_system_hive(
+            client.prepare_system_hive_mutation(
                 2,
                 &[
                     SystemHiveMutation::CreateKey {
@@ -2900,7 +3057,7 @@ mod tests {
             Err(STATUS_OBJECT_NAME_NOT_FOUND)
         );
         assert_eq!(
-            client.mutate_system_hive(
+            client.prepare_system_hive_mutation(
                 1,
                 &[SystemHiveMutation::CreateKey {
                     path: rejected_path,

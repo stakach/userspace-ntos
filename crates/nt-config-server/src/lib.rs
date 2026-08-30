@@ -50,8 +50,9 @@ use nt_config_manager::{
     SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
-    collect_reactos_network_adapter_bindings, decode_image, CellId, CurrentControlSet, Hive,
-    HiveKind, HiveTransaction, ReactOsNetworkAdapterBinding, SYSTEM_HIVE_PATH,
+    collect_reactos_network_adapter_bindings, decode_image, encode_log_record, CellId,
+    CurrentControlSet, Hive, HiveKind, HiveLogOp, HiveTransaction, ReactOsNetworkAdapterBinding,
+    SYSTEM_HIVE_PATH,
 };
 
 /// CM admits multiple immutable key readers, but abandoned transfers must not retain an unbounded
@@ -765,6 +766,15 @@ struct MountedSystemHive {
     current_control_set: CurrentControlSet,
 }
 
+struct PreparedSystemHiveMutation {
+    token: u64,
+    expected_generation: u64,
+    next_generation: u64,
+    semantic_journal_len: usize,
+    mutations: Vec<HiveMutation>,
+    durable_journal: Vec<u8>,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
@@ -774,6 +784,7 @@ pub struct CmServer {
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
     system_mutation_leases: MutationLeaseBank,
+    prepared_system_mutation: Option<PreparedSystemHiveMutation>,
     system_key_leases: SystemKeyLeaseBank,
     hive_key_snapshots: SnapshotPool<HiveKeySnapshotKey>,
     driver_launch_plan_snapshots: SnapshotBank<u16>,
@@ -798,6 +809,7 @@ impl CmServer {
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(),
+            prepared_system_mutation: None,
             system_key_leases: SystemKeyLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::with_limits(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
@@ -820,6 +832,7 @@ impl CmServer {
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(),
+            prepared_system_mutation: None,
             system_key_leases: SystemKeyLeaseBank::new(),
             hive_key_snapshots: SnapshotPool::with_limits(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
@@ -857,7 +870,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
-            opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf),
+            opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
@@ -1244,6 +1257,9 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
+                if self.prepared_system_mutation.is_some() {
+                    return reply(STATUS_DEVICE_BUSY, 0);
+                }
                 let token = self.next_hive_import_token;
                 let Some(next_token) = token.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
@@ -1308,6 +1324,9 @@ impl CmServer {
                     || buf.len() != header_size
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                if self.prepared_system_mutation.is_some() {
+                    return reply(STATUS_DEVICE_BUSY, 0);
                 }
                 let Some(index) = self.hive_imports.iter().position(|import| {
                     import.token == req.transfer_token
@@ -1374,6 +1393,112 @@ impl CmServer {
         }
     }
 
+    fn encode_system_hive_mutation_log_record(
+        mutation: &HiveMutation,
+        current_control_set: &CurrentControlSet,
+        sequence: u64,
+    ) -> Result<Vec<u8>, i32> {
+        let path = match mutation {
+            HiveMutation::CreateKey { path }
+            | HiveMutation::SetValue { path, .. }
+            | HiveMutation::DeleteValue { path, .. }
+            | HiveMutation::DeleteKey { path }
+            | HiveMutation::SetKeyClass { path, .. }
+            | HiveMutation::SetKeySecurity { path, .. } => path,
+        };
+        let relative =
+            system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)?;
+        let record = match mutation {
+            HiveMutation::CreateKey { .. } => {
+                encode_log_record(&HiveLogOp::CreateKey { path: &relative }, sequence)
+            }
+            HiveMutation::SetValue {
+                name,
+                value_type,
+                data,
+                ..
+            } => {
+                let value_type =
+                    RegistryValueType::from_u32(*value_type).ok_or(STATUS_INVALID_PARAMETER)?;
+                encode_log_record(
+                    &HiveLogOp::SetValue {
+                        path: &relative,
+                        name,
+                        value_type,
+                        data,
+                    },
+                    sequence,
+                )
+            }
+            HiveMutation::DeleteValue { name, .. } => encode_log_record(
+                &HiveLogOp::DeleteValue {
+                    path: &relative,
+                    name,
+                },
+                sequence,
+            ),
+            HiveMutation::DeleteKey { .. } => {
+                encode_log_record(&HiveLogOp::DeleteKey { path: &relative }, sequence)
+            }
+            HiveMutation::SetKeyClass { class_name, .. } => encode_log_record(
+                &HiveLogOp::SetKeyClass {
+                    path: &relative,
+                    class_name: class_name.as_deref(),
+                },
+                sequence,
+            ),
+            HiveMutation::SetKeySecurity { descriptor, .. } => encode_log_record(
+                &HiveLogOp::SetKeySecurityDescriptor {
+                    path: &relative,
+                    descriptor,
+                },
+                sequence,
+            ),
+        };
+        Ok(record)
+    }
+
+    fn prepare_system_hive_mutations(
+        &mut self,
+        mutations: &[HiveMutation],
+    ) -> Result<Vec<u8>, i32> {
+        let (system_hive, cm) = (&mut self.system_hive, &mut self.cm);
+        let mounted = system_hive.as_mut().ok_or(STATUS_DEVICE_NOT_READY)?;
+        let previous_control_set = mounted.current_control_set.clone();
+        let mut transaction = mounted.hive.begin_transaction();
+        let mut durable_journal = Vec::new();
+        for mutation in mutations {
+            let previous_sequence = transaction.hive().sequence;
+            apply_system_hive_mutation(&mut transaction, &previous_control_set, mutation)?;
+            let sequence = transaction.hive().sequence;
+            if sequence == previous_sequence {
+                continue;
+            }
+            let record = Self::encode_system_hive_mutation_log_record(
+                mutation,
+                &previous_control_set,
+                sequence,
+            )?;
+            durable_journal
+                .try_reserve_exact(record.len())
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            durable_journal.extend_from_slice(&record);
+        }
+        let current_control_set = transaction
+            .current_control_set()
+            .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
+
+        if previous_control_set == current_control_set {
+            let mut registry = cm.registry_mut().begin_transaction();
+            let _ = project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
+        } else {
+            let _ = config_manager_from_system_hive(transaction.hive(), &current_control_set);
+        }
+        // Both validation transactions roll back here. Publication happens only after the caller
+        // has made `durable_journal` stable.
+        Ok(durable_journal)
+    }
+
     fn commit_system_hive_mutations(
         &mut self,
         mutations: &[HiveMutation],
@@ -1408,7 +1533,7 @@ impl CmServer {
         Ok(())
     }
 
-    fn op_mutate_system_hive(&mut self, buf: &[u8]) -> CmReply {
+    fn op_mutate_system_hive(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
         let Some(req) = CmHiveMutationRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
@@ -1450,6 +1575,9 @@ impl CmServer {
                         },
                         current_generation,
                     );
+                }
+                if self.prepared_system_mutation.is_some() {
+                    return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
                 match self
                     .system_mutation_leases
@@ -1493,7 +1621,7 @@ impl CmServer {
                     Err(_) => reply(STATUS_INVALID_PARAMETER, current_generation),
                 }
             }
-            hive_mutation_transfer::COMMIT => {
+            hive_mutation_transfer::PREPARE => {
                 if req.lease_token == 0
                     || req.expected_generation == 0
                     || req.journal_offset as usize != journal_len
@@ -1524,11 +1652,97 @@ impl CmServer {
                 let Some(next_generation) = current_generation.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
-                if let Err(status) = self.commit_system_hive_mutations(&mutations, next_generation)
+                let durable_journal = match self.prepare_system_hive_mutations(&mutations) {
+                    Ok(journal) => journal,
+                    Err(status) => return reply(status, current_generation),
+                };
+                let Ok(durable_len) = u32::try_from(durable_journal.len()) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                self.prepared_system_mutation = Some(PreparedSystemHiveMutation {
+                    token: req.lease_token,
+                    expected_generation: current_generation,
+                    next_generation,
+                    semantic_journal_len: journal_len,
+                    mutations,
+                    durable_journal,
+                });
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    durable_len,
+                    next_generation,
+                    req.lease_token,
+                )
+            }
+            hive_mutation_transfer::PULL => {
+                if req.lease_token == 0
+                    || req.expected_generation == 0
+                    || req.chunk_offset != 0
+                    || chunk_len == 0
+                    || chunk_len > out_buf.len()
+                    || buf.len() != header_size
                 {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                if req.expected_generation != current_generation {
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                let Some(prepared) = self.prepared_system_mutation.as_ref() else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                if prepared.token != req.lease_token
+                    || prepared.expected_generation != req.expected_generation
+                    || prepared.semantic_journal_len != journal_len
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let offset = req.journal_offset as usize;
+                if offset > prepared.durable_journal.len() {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let end = core::cmp::min(
+                    offset.saturating_add(chunk_len),
+                    prepared.durable_journal.len(),
+                );
+                let written = end - offset;
+                out_buf[..written].copy_from_slice(&prepared.durable_journal[offset..end]);
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    written as u32,
+                    prepared.durable_journal.len() as u64,
+                    prepared.token,
+                )
+            }
+            hive_mutation_transfer::COMMIT => {
+                if req.lease_token == 0
+                    || req.expected_generation == 0
+                    || req.journal_offset as usize != journal_len
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                if req.expected_generation != current_generation {
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                let Some(prepared) = self.prepared_system_mutation.take() else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                if prepared.token != req.lease_token
+                    || prepared.expected_generation != req.expected_generation
+                    || prepared.semantic_journal_len != journal_len
+                {
+                    self.prepared_system_mutation = Some(prepared);
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                if let Err(status) =
+                    self.commit_system_hive_mutations(&prepared.mutations, prepared.next_generation)
+                {
+                    self.prepared_system_mutation = Some(prepared);
                     return reply(status, current_generation);
                 }
-                reply_with_info(STATUS_SUCCESS, 0, next_generation, req.lease_token)
+                reply_with_info(STATUS_SUCCESS, 0, prepared.next_generation, prepared.token)
             }
             hive_mutation_transfer::ABORT => {
                 if req.lease_token == 0
@@ -1537,12 +1751,28 @@ impl CmServer {
                     || req.chunk_offset != 0
                     || req.chunk_len_bytes != 0
                     || buf.len() != header_size
-                    || !self.system_mutation_leases.abort(
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let prepared_matches =
+                    self.prepared_system_mutation
+                        .as_ref()
+                        .is_some_and(|prepared| {
+                            prepared.token == req.lease_token
+                                && prepared.expected_generation == req.expected_generation
+                                && prepared.semantic_journal_len == journal_len
+                        });
+                let aborted = if prepared_matches {
+                    self.prepared_system_mutation = None;
+                    true
+                } else {
+                    self.system_mutation_leases.abort(
                         req.lease_token,
                         req.expected_generation,
                         journal_len,
                     )
-                {
+                };
+                if !aborted {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
                 reply(STATUS_SUCCESS, current_generation)
@@ -3067,6 +3297,58 @@ mod tests {
             .hive
             .open_key(r"ControlSet001\Services\Second")
             .is_none());
+    }
+
+    #[test]
+    fn prepared_system_mutation_blocks_mount_replacement() {
+        let first = encode_image(&selected_system_hive(1));
+        let second = encode_image(&selected_system_hive(2));
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &first), 1);
+
+        server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
+            token: 1,
+            expected_generation: 1,
+            next_generation: 2,
+            semantic_journal_len: 0,
+            mutations: Vec::new(),
+            durable_journal: Vec::new(),
+        });
+        let begin = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(hive_import_transfer::BEGIN, 0, 0, second.len() as u32, &[]),
+            &mut [],
+        );
+        assert_eq!(begin.status, STATUS_DEVICE_BUSY);
+        server.prepared_system_mutation = None;
+
+        let token = begin_hive_import(&mut server, &second);
+        push_hive_import(&mut server, token, &second);
+        server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
+            token: 2,
+            expected_generation: 1,
+            next_generation: 2,
+            semantic_journal_len: 0,
+            mutations: Vec::new(),
+            durable_journal: Vec::new(),
+        });
+        let commit = server.dispatch(
+            opcode::CM_OP_IMPORT_HIVE,
+            &hive_import_request(
+                hive_import_transfer::COMMIT,
+                token,
+                second.len() as u32,
+                second.len() as u32,
+                &[],
+            ),
+            &mut [],
+        );
+        assert_eq!(commit.status, STATUS_DEVICE_BUSY);
+        assert_eq!(server.system_hive.as_ref().unwrap().generation, 1);
+        assert_eq!(server.hive_imports.len(), 1);
+
+        server.prepared_system_mutation = None;
+        assert_eq!(commit_hive_import(&mut server, token, &second), 2);
     }
 
     #[test]

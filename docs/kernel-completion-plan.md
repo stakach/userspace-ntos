@@ -2977,11 +2977,14 @@ existing synchronous DMA/PnP fixture so the two lifecycle modes remain independe
   through mutable-hive import and image transport, and only then publish the single composed image.
   No `ControlSet001` default, generated-only mount, or metadata-dropping import may remain as a
   fallback. Those selection/composition/read boundaries are closed, and native SYSTEM open/create,
-  relative-name identity, duplicate-handle lifetime, and final close now use CM-owned opaque leases.
-  D5 remains open because native query/enumeration/security and durable checkpoint projection still
-  read or persist through the executive mirror after CM-first mutation. Move those remaining
-  operations behind the leased CM identity before deleting the executive SYSTEM handle/projection
-  machinery; never reduce a live key to a reopenable path.
+  relative-name identity, duplicate-handle lifetime, final close, query, enumeration, and security
+  now use CM-owned opaque leases and bounded immutable records. Runtime mutation preparation,
+  physical-path replay-record encoding, and publication are also CM-owned; the executive only makes
+  CM's exact prepared record bytes durable before asking CM to publish them. D5 remains open because
+  SYSTEM checkpoint-image export and several non-native boot/setup consumers still depend on the
+  executive compatibility mirror. Move checkpoint export behind CM, migrate those consumers, and
+  delete the mirror replay/storage machinery; never reduce a live key to a reopenable path or retain
+  a second mutation authority.
 
 ## Immediate Iteration
 
@@ -17797,3 +17800,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive post-CM projection and any duplicated SYSTEM read structures that no longer own a
     syscall path. Preserve atomic generation checks and exact failure propagation; do not retain a
     best-effort projection, cache fallback, or second mutation authority.
+
+    CM-owned SYSTEM write-ahead journal acceptance (2026-08-30): CM ABI version 3 replaces the old
+    one-step mutation commit with `BEGIN`/`APPEND`/`PREPARE`/`PULL`/`COMMIT`/`ABORT`. `PREPARE`
+    validates the entire semantic transaction against the exact mounted generation, derives each
+    physical selected-control-set path, applies it only inside a rollback transaction, validates the
+    semantic Config Manager projection, and returns CM-encoded `nt-hive-core` replay records while
+    leaving the live hive and generation unchanged. The executive appends and flushes those exact
+    records to `SYSTEM.LOG` before publication. Append failure aborts the prepared mutation; publish
+    failure truncates the log to its previous length and aborts. Successful publication is therefore
+    the sole authoritative mutation result. Whole-mount import admission and commit now fail with
+    `STATUS_DEVICE_BUSY` while a prepared mutation is in flight instead of discarding it.
+
+    The executive no longer independently encodes or appends a second SYSTEM journal. Its temporary
+    compatibility mirror replays CM's exact durable bytes only after CM publishes, and failure of that
+    bookkeeping cannot change the successful CM result. Sidecar appends remain batched into explicit
+    service-loop/quiesce volume snapshots rather than forcing a full writable-volume checkpoint after
+    every registry mutation. Focused validation passes `nt-config-abi` `4/4`, `nt-config-server`
+    `23/23`, and `nt-config-client` `16/16`; the client proof keeps prepared state invisible, pulls a
+    multi-frame journal, independently replays it, and then explicitly publishes. The freestanding
+    executive release check remains at the established 209-warning baseline.
+
+    Serialized acceptance `.tmp/run-headless-cm-writeahead-final-20260830.log` reaches the genuine
+    Explorer desktop with all `299/299` checks passing and the sentinel matched. CM reaches generation
+    2535 with 2532 accepted runtime transactions, zero rejection, and zero compatibility replay
+    failure. The run performs five writable-volume snapshots total; the first SYSTEM checkpoint batches
+    3106 pending journal records into one service-loop snapshot. Explorer completes 678 real api0
+    redirects with zero callback or dead-callback failures, installs 18 client WndProcs without replay,
+    reaches paint begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering 184
+    records, and paints all `480000/480000` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: the runtime SYSTEM write-ahead transaction is accepted. Next add a bounded,
+    generation-stamped CM checkpoint export stream and acknowledge it only after the provider has
+    atomically replaced and flushed the SYSTEM image. Route `NtFlushKey`, service-loop, and quiesce
+    checkpointing through that owner, migrate the remaining setup/boot consumers to CM leases or narrow
+    records, then delete executive SYSTEM mirror replay, checkpoint serialization, and projection
+    diagnostics together. Do not retain a best-effort mirror or an executive image encoder as a
+    fallback.

@@ -3804,7 +3804,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -3832,7 +3832,7 @@ impl ExecNtHandler {
             && SAM_SETUP_KEYS_CREATED.load(Ordering::Relaxed) == 0
     }
 
-    fn commit_and_project_system_mutations(
+    fn persist_and_publish_system_mutations(
         &mut self,
         mutations: &[OwnedSystemHiveMutation],
         origin: SystemHiveMutationOrigin,
@@ -3841,11 +3841,11 @@ impl ExecNtHandler {
             .iter()
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
-        let generation =
-            match unsafe { crate::config_manager_commit_system_hive_mutations(&client_mutations) }
+        let prepared =
+            match unsafe { crate::config_manager_prepare_system_hive_mutation(&client_mutations) }
                 .map_err(|status| status as u32)
             {
-                Ok(generation) => generation,
+                Ok(prepared) => prepared,
                 Err(status) => {
                     if matches!(origin, SystemHiveMutationOrigin::Runtime) {
                         CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -3853,6 +3853,62 @@ impl ExecNtHandler {
                     return Err(status);
                 }
             };
+        let mut provider = crate::writable_fs::WritableHiveIoProvider::new(
+            crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH,
+        );
+        let previous_log_len = provider.log_len();
+        let journal_result = if prepared.durable_journal.is_empty() {
+            Ok(())
+        } else {
+            nt_hive_core::HiveIoProvider::append_log_record(
+                &mut provider,
+                &prepared.durable_journal,
+            )
+            .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider))
+        };
+        if let Err(err) = journal_result {
+            let _ = provider.truncate_log_to(previous_log_len);
+            unsafe { crate::config_manager_abort_system_hive_mutation(&prepared) };
+            if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+                CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(Self::mutable_hive_journal_status(err));
+        }
+        let generation =
+            match unsafe { crate::config_manager_publish_system_hive_mutation(&prepared) }
+                .map_err(|status| status as u32)
+            {
+                Ok(generation) => generation,
+                Err(status) => {
+                    let rollback = provider.truncate_log_to(previous_log_len);
+                    unsafe { crate::config_manager_abort_system_hive_mutation(&prepared) };
+                    if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+                        CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if rollback.is_err() {
+                        return Err(STATUS_UNSUCCESSFUL);
+                    }
+                    return Err(status);
+                }
+            };
+        if !prepared.durable_journal.is_empty() {
+            self.note_mutable_hive_journal_records(
+                HIVE_SEL_SYSTEM,
+                mutations.len().min(u32::MAX as usize) as u32,
+            );
+            let projection_ok = self
+                .mutable_hives
+                .hive_mut(HIVE_SEL_SYSTEM)
+                .is_some_and(|hive| {
+                    let base_sequence = hive.sequence;
+                    nt_hive_core::try_replay_log(hive, &prepared.durable_journal, base_sequence)
+                        .is_ok()
+                });
+            if !projection_ok {
+                CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                print_str(b"[cm-runtime] executive compatibility mirror replay failed\n");
+            }
+        }
         if matches!(origin, SystemHiveMutationOrigin::Runtime) {
             CM_RUNTIME_SYSTEM_MUTATION_COMMITS.fetch_add(1, Ordering::Relaxed);
             for mutation in mutations {
@@ -3877,55 +3933,6 @@ impl ExecNtHandler {
                     }
                 }
             }
-        }
-        let projection = (|| {
-            for mutation in mutations {
-                match mutation {
-                    OwnedSystemHiveMutation::CreateKey { path } => {
-                        self.ensure_mutable_registry_key_by_path_journaled(path)?;
-                    }
-                    OwnedSystemHiveMutation::SetValue {
-                        path,
-                        name,
-                        value_type,
-                        data,
-                    } => {
-                        let key = self.ensure_mutable_registry_key_by_path_journaled(path)?;
-                        self.journal_set_mutable_value(key, name, *value_type, data)?;
-                    }
-                    OwnedSystemHiveMutation::DeleteValue { path, name } => {
-                        let key = self
-                            .mutable_registry_key_by_path(path)
-                            .ok_or(STATUS_INVALID_HANDLE)?;
-                        self.journal_delete_mutable_value(key, name)?;
-                    }
-                    OwnedSystemHiveMutation::DeleteKey { path } => {
-                        let key = self
-                            .mutable_registry_key_by_path(path)
-                            .ok_or(STATUS_INVALID_HANDLE)?;
-                        self.journal_delete_mutable_key(key)?;
-                    }
-                    OwnedSystemHiveMutation::SetKeyClass { path, class_name } => {
-                        let key = self
-                            .mutable_registry_key_by_path(path)
-                            .ok_or(STATUS_INVALID_HANDLE)?;
-                        self.journal_set_mutable_key_class(key, class_name.as_deref())?;
-                    }
-                    OwnedSystemHiveMutation::SetKeySecurity { path, descriptor } => {
-                        let key = self
-                            .mutable_registry_key_by_path(path)
-                            .ok_or(STATUS_INVALID_HANDLE)?;
-                        self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
-                    }
-                }
-            }
-            Ok::<(), u32>(())
-        })();
-        if let Err(status) = projection {
-            if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-                CM_RUNTIME_SYSTEM_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
-            }
-            return Err(status);
         }
         Ok(generation)
     }
@@ -4000,7 +4007,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -4099,7 +4106,7 @@ impl ExecNtHandler {
             return;
         }
         let generation = match self
-            .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
         {
             Ok(generation) => generation,
             Err(status) => {
@@ -4402,7 +4409,7 @@ impl ExecNtHandler {
             None
         } else {
             match self
-                .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
+                .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
             {
                 Ok(generation) => {
                     self.note_mutable_hives_changed();
@@ -4804,10 +4811,15 @@ impl ExecNtHandler {
     }
 
     fn note_mutable_hive_journal_record(&mut self, hive_sel: u32) {
+        self.note_mutable_hive_journal_records(hive_sel, 1);
+    }
+
+    fn note_mutable_hive_journal_records(&mut self, hive_sel: u32, records: u32) {
         // The sidecar journal record is already appended and flushed here. Whole-volume
         // snapshots are owned by explicit flush/quiesce paths, not by every registry mutation.
-        self.mutable_hive_journal_pending_records =
-            self.mutable_hive_journal_pending_records.saturating_add(1);
+        self.mutable_hive_journal_pending_records = self
+            .mutable_hive_journal_pending_records
+            .saturating_add(records);
         if let Some(bit) = Self::boot_mutable_hive_pending_bit(hive_sel) {
             self.mutable_hive_journal_pending_boot_mask |= bit;
             self.mutable_hive_journal_dirty_boot_mask |= bit;
@@ -7043,7 +7055,7 @@ impl ExecNtHandler {
         if let Some(key) = self.mutable_registry_key(target) {
             if key.hive == HIVE_SEL_SYSTEM {
                 let path = self.mutable_key_path(key).ok_or(STATUS_INVALID_HANDLE)?;
-                self.commit_and_project_system_mutations(
+                self.persist_and_publish_system_mutations(
                     &[OwnedSystemHiveMutation::SetKeySecurity {
                         path,
                         descriptor: descriptor.to_vec(),
@@ -7358,7 +7370,7 @@ impl ExecNtHandler {
             {
                 return Ok(());
             }
-            self.commit_and_project_system_mutations(
+            self.persist_and_publish_system_mutations(
                 &[OwnedSystemHiveMutation::SetValue {
                     path,
                     name: value_name.into(),
@@ -32141,7 +32153,7 @@ impl ExecNtHandler {
                         }
                         if let Err(status) = crate::probe_seg!(
                             7,
-                            self.commit_and_project_system_mutations(
+                            self.persist_and_publish_system_mutations(
                                 &mutations,
                                 SystemHiveMutationOrigin::Runtime,
                             )
@@ -32508,7 +32520,7 @@ impl ExecNtHandler {
                         let Some(path) = self.mutable_key_path(mutable_key) else {
                             return STATUS_INVALID_HANDLE;
                         };
-                        if let Err(status) = self.commit_and_project_system_mutations(
+                        if let Err(status) = self.persist_and_publish_system_mutations(
                             &[OwnedSystemHiveMutation::SetValue {
                                 path,
                                 name: durable_name.into(),
@@ -32707,7 +32719,7 @@ impl ExecNtHandler {
                         let Some(path) = key_path.clone() else {
                             return STATUS_INVALID_HANDLE;
                         };
-                        self.commit_and_project_system_mutations(
+                        self.persist_and_publish_system_mutations(
                             &[OwnedSystemHiveMutation::DeleteKey { path }],
                             SystemHiveMutationOrigin::Runtime,
                         )
@@ -32767,7 +32779,7 @@ impl ExecNtHandler {
                         let Some(path) = self.mutable_key_path(mutable_key) else {
                             return STATUS_INVALID_HANDLE;
                         };
-                        self.commit_and_project_system_mutations(
+                        self.persist_and_publish_system_mutations(
                             &[OwnedSystemHiveMutation::DeleteValue {
                                 path,
                                 name: name.into(),

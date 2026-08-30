@@ -1557,6 +1557,14 @@ pub(crate) unsafe fn append_file(path: &str, data: &[u8]) -> u32 {
 
 /// Truncate a writable-volume file to zero bytes without replacing its node.
 pub(crate) unsafe fn truncate_file(path: &str) -> u32 {
+    truncate_file_to(path, 0)
+}
+
+/// Set a writable-volume file's durable length without replacing its node.
+///
+/// The SYSTEM hive write-ahead path records the previous sidecar length before append and uses this
+/// only to roll back a failed CM publication.
+pub(crate) unsafe fn truncate_file_to(path: &str, length: u64) -> u32 {
     let mut dirtied = false;
     let status = 'truncate: {
         let Some(fs) = writable_fs() else {
@@ -1577,7 +1585,7 @@ pub(crate) unsafe fn truncate_file(path: &str) -> u32 {
         let old_len = fs
             .zw_query_standard_information(file.handle)
             .map_or(0, |info| info.end_of_file);
-        let eof = 0u64.to_le_bytes();
+        let eof = length.to_le_bytes();
         let set_status =
             fs.zw_set_information_file(file.handle, nt_fs::FILE_END_OF_FILE_INFORMATION, &eof);
         let flush_status = if set_status == nt_fs::STATUS_SUCCESS {
@@ -1585,7 +1593,7 @@ pub(crate) unsafe fn truncate_file(path: &str) -> u32 {
         } else {
             set_status
         };
-        dirtied = old_len != 0 || file.information == nt_fs::FILE_CREATED;
+        dirtied = old_len != length || file.information == nt_fs::FILE_CREATED;
         let _ = fs.zw_close(file.handle);
         flush_status
     };
@@ -1723,6 +1731,23 @@ impl WritableHiveIoProvider {
             log_path: alloc::format!("{}.LOG", image_path),
         }
     }
+
+    pub(crate) fn log_len(&self) -> usize {
+        unsafe {
+            (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
+                .as_ref()
+                .and_then(|fs| fs.file_len(&self.log_path))
+                .unwrap_or(0) as usize
+        }
+    }
+
+    pub(crate) fn truncate_log_to(
+        &mut self,
+        length: usize,
+    ) -> Result<(), nt_hive_core::HiveIoError> {
+        let length = u64::try_from(length).map_err(|_| nt_hive_core::HiveIoError::Io)?;
+        hive_io_status(unsafe { truncate_file_to(&self.log_path, length) })
+    }
 }
 
 impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
@@ -1772,12 +1797,7 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
 
     fn get_status(&self) -> nt_hive_core::HiveIoStatus {
         let image_present = unsafe { file_bytes_if_mounted(&self.image_path).is_some() };
-        let log_len = unsafe {
-            (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
-                .as_ref()
-                .and_then(|fs| fs.file_len(&self.log_path))
-                .unwrap_or(0) as usize
-        };
+        let log_len = self.log_len();
         nt_hive_core::HiveIoStatus {
             image_present,
             log_len,
