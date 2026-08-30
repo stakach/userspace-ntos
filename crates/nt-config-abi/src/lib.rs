@@ -60,6 +60,11 @@ pub const CM_MAX_PNP_AUX_BYTES: usize = 16;
 pub const CM_NETWORK_PLAN_SNAPSHOT_MAGIC: u32 = 0x504E_4D43; // `CMNP`
 pub const CM_NETWORK_PLAN_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES: usize = 24;
+/// Maximum payload carried by one device-action completion frame.
+pub const CM_DEVICE_ACTION_CHUNK_BYTES: usize = 4096;
+pub const CM_DEVICE_ACTION_SNAPSHOT_MAGIC: u32 = 0x4144_4D43; // `CMDA`
+pub const CM_DEVICE_ACTION_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES: usize = 32;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_U32_ABSENT: u32 = u32::MAX;
@@ -108,6 +113,8 @@ pub mod opcode {
     pub const CM_OP_CHECKPOINT_SYSTEM_HIVE: u16 = 0x215a;
     /// Export an immutable standalone hive image from an exact leased SYSTEM key.
     pub const CM_OP_EXPORT_LEASED_HIVE: u16 = 0x215b;
+    /// Peek, stream, and exactly acknowledge the next live PnP device action.
+    pub const CM_OP_DEVICE_ACTION: u16 = 0x215c;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -232,6 +239,20 @@ pub mod pnp_query_kind {
     pub const RELATED_DEVICE: u16 = 5;
     pub const DEVICE_DEPTH: u16 = 6;
     pub const BUS_RELATIONS: u16 = 7;
+}
+
+/// Operation carried by [`CmDeviceActionRequest::operation`].
+pub mod device_action_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
+    pub const ACK: u16 = 4;
+}
+
+pub mod device_action_kind {
+    pub const ARRIVAL: u16 = 1;
+    pub const CHANGE: u16 = 2;
+    pub const REMOVAL: u16 = 3;
 }
 
 pub mod network_plan_kind {
@@ -538,6 +559,23 @@ pub struct CmPnpQueryRequest {
     pub transfer_token: u64,
 }
 
+/// `device_action`: one generation/sequence-bound immutable journal entry. BEGIN peeks the current
+/// head, PULL continues its snapshot, ABORT releases only the transfer, and ACK retires only the
+/// exact head identity after the kernel PnP action has reached a terminal state.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmDeviceActionRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub _reserved: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub mount_generation: u64,
+    pub event_sequence: u64,
+    pub transfer_token: u64,
+}
+
 macro_rules! wire {
     ($t:ty) => {
         impl $t {
@@ -580,6 +618,7 @@ wire!(CmHiveCheckpointHeader);
 wire!(CmHiveMutationRecord);
 wire!(CmLaunchPlanRequest);
 wire!(CmPnpQueryRequest);
+wire!(CmDeviceActionRequest);
 
 /// Decode a UTF-16LE slice of `buf` (at `offset`, `len_bytes` long) into a `str`
 /// via the caller's scratch — returns the u16 units. Used by the server.
@@ -673,6 +712,7 @@ mod tests {
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_KEY, 0x2158);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_RECORD, 0x2159);
         assert_eq!(opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE, 0x215a);
+        assert_eq!(opcode::CM_OP_DEVICE_ACTION, 0x215c);
         assert_eq!(CM_HIVE_KEY_RECORD_VERSION, 2);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
@@ -681,6 +721,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);
         assert_eq!(core::mem::size_of::<CmHiveCheckpointRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveCheckpointHeader>(), 40);
+        assert_eq!(core::mem::size_of::<CmDeviceActionRequest>(), 40);
         assert_eq!(CM_HIVE_CHECKPOINT_HEADER_BYTES, 40);
 
         let import = CmHiveImportRequest {

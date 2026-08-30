@@ -22,16 +22,19 @@ use mutation::{decode_mutation_journal, HiveMutation, MutationLeaseBank, Mutatio
 use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 
 use nt_config_abi::{
-    device_property_transfer, driver_service_class, driver_service_transfer,
-    hive_checkpoint_transfer, hive_import_transfer, hive_key_lease_operation, hive_key_transfer,
-    hive_mount, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
-    leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
-    read_utf16, win32_service_plan_kind, win32_service_process_kind, CmDevicePropertyRequest,
+    device_action_kind, device_action_transfer, device_property_transfer, driver_service_class,
+    driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
+    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer,
+    launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
+    pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
+    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
     CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
     CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
     CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest,
     CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
-    CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CM_ABI_VERSION, CM_DEVICE_ACTION_CHUNK_BYTES, CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES,
+    CM_DEVICE_ACTION_SNAPSHOT_MAGIC, CM_DEVICE_ACTION_SNAPSHOT_VERSION,
+    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
     CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_CHECKPOINT_CHUNK_BYTES,
     CM_HIVE_CHECKPOINT_HEADER_BYTES, CM_HIVE_CHECKPOINT_MAGIC, CM_HIVE_CHECKPOINT_VERSION,
@@ -49,9 +52,10 @@ use nt_config_abi::{
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 use nt_config_manager::{
-    device_property, ConfigManager, DevicePropertySource, DriverServiceBinding, DriverServiceClass,
-    RegistryTransaction, RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch,
-    SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
+    device_property, ConfigManager, DeviceActionEvent, DeviceActionJournal,
+    DeviceActionJournalError, DeviceActionKind, DevicePropertySource, DriverServiceBinding,
+    DriverServiceClass, RegistryTransaction, RegistryValueType, Win32ServiceProcessKind,
+    Win32ServiceProcessLaunch, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
     collect_reactos_network_adapter_bindings, decode_image, encode_log_record, try_encode_image,
@@ -96,6 +100,16 @@ fn reply_with_info(status: i32, information: u32, detail0: u64, detail1: u64) ->
         information,
         detail0,
         detail1,
+    }
+}
+
+fn device_action_journal_status(error: DeviceActionJournalError) -> i32 {
+    match error {
+        DeviceActionJournalError::InvalidGeneration => STATUS_REVISION_MISMATCH,
+        DeviceActionJournalError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
+        DeviceActionJournalError::AlreadySeeded
+        | DeviceActionJournalError::DuplicateInstance
+        | DeviceActionJournalError::StaleAcknowledgement => STATUS_INVALID_PARAMETER,
     }
 }
 
@@ -735,6 +749,64 @@ fn encode_network_adapter_plan(
     Some(out)
 }
 
+fn encode_device_action_event(event: &DeviceActionEvent) -> Option<Vec<u8>> {
+    let kind = match event.kind {
+        DeviceActionKind::Arrival => device_action_kind::ARRIVAL,
+        DeviceActionKind::Change => device_action_kind::CHANGE,
+        DeviceActionKind::Removal => device_action_kind::REMOVAL,
+    };
+    let service_class = match event
+        .publication
+        .service
+        .as_ref()
+        .map(|service| service.class)
+    {
+        None => 0,
+        Some(DriverServiceClass::Device) => driver_service_class::DEVICE,
+        Some(DriverServiceClass::FileSystem) => driver_service_class::FILE_SYSTEM,
+    };
+    let mut out = Vec::new();
+    push_u32(&mut out, CM_DEVICE_ACTION_SNAPSHOT_MAGIC);
+    push_u16(&mut out, CM_DEVICE_ACTION_SNAPSHOT_VERSION);
+    push_u16(&mut out, kind);
+    out.extend_from_slice(&event.mount_generation.to_le_bytes());
+    out.extend_from_slice(&event.sequence.to_le_bytes());
+    push_u16(&mut out, service_class);
+    push_u16(&mut out, 0);
+    push_u32(&mut out, 0);
+    debug_assert_eq!(out.len(), CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES);
+
+    push_string(&mut out, &event.publication.instance_id)?;
+    if let Some(service) = &event.publication.service {
+        push_string(&mut out, &service.service_name)?;
+        push_string(&mut out, &service.image_path)?;
+        push_string(&mut out, &service.driver_object_path)?;
+        push_optional_string(&mut out, service.class_guid.as_deref())?;
+        push_u32(&mut out, service.start_type);
+        push_optional_u32(&mut out, service.error_control);
+        push_optional_string(&mut out, service.load_order_group.as_deref())?;
+        push_optional_u32(&mut out, service.tag);
+    }
+    push_optional_string(&mut out, event.publication.pdo_name.as_deref())?;
+    push_optional_string(&mut out, event.publication.driver_key.as_deref())?;
+    push_optional_string(&mut out, event.publication.linkage_export.as_deref())?;
+    push_u32(
+        &mut out,
+        u32::try_from(event.publication.hardware_ids.len()).ok()?,
+    );
+    for id in &event.publication.hardware_ids {
+        push_string(&mut out, id)?;
+    }
+    push_u32(
+        &mut out,
+        u32::try_from(event.publication.compatible_ids.len()).ok()?,
+    );
+    for id in &event.publication.compatible_ids {
+        push_string(&mut out, id)?;
+    }
+    Some(out)
+}
+
 struct DevicePropertySnapshotKey {
     instance: String,
     property: u32,
@@ -769,6 +841,12 @@ struct PnpQuerySnapshotKey {
     selector: u32,
     instance: String,
     auxiliary: Vec<u8>,
+}
+
+#[derive(Copy, Clone)]
+struct DeviceActionSnapshotKey {
+    mount_generation: u64,
+    sequence: u64,
 }
 
 struct MountedSystemHive {
@@ -814,6 +892,8 @@ pub struct CmServer {
     win32_service_launch_plan_snapshots: SnapshotBank<u16>,
     pnp_query_snapshots: SnapshotBank<PnpQuerySnapshotKey>,
     network_adapter_plan_snapshots: SnapshotBank<u16>,
+    device_action_journal: DeviceActionJournal,
+    device_action_snapshot: SnapshotBank<DeviceActionSnapshotKey>,
 }
 
 impl Default for CmServer {
@@ -848,6 +928,8 @@ impl CmServer {
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
             pnp_query_snapshots: SnapshotBank::new(),
             network_adapter_plan_snapshots: SnapshotBank::new(),
+            device_action_journal: DeviceActionJournal::new(),
+            device_action_snapshot: SnapshotBank::new(),
         }
     }
 
@@ -877,6 +959,8 @@ impl CmServer {
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
             pnp_query_snapshots: SnapshotBank::new(),
             network_adapter_plan_snapshots: SnapshotBank::new(),
+            device_action_journal: DeviceActionJournal::new(),
+            device_action_snapshot: SnapshotBank::new(),
         }
     }
 
@@ -920,6 +1004,7 @@ impl CmServer {
             }
             opcode::CM_OP_QUERY_PNP => self.op_query_pnp(in_buf, out_buf),
             opcode::CM_OP_QUERY_NETWORK_PLAN => self.op_query_network_plan(in_buf, out_buf),
+            opcode::CM_OP_DEVICE_ACTION => self.op_device_action(in_buf, out_buf),
             _ => reply(STATUS_INVALID_SYSTEM_SERVICE, 0),
         }
     }
@@ -1399,7 +1484,18 @@ impl CmServer {
                 let Some(generation) = current_generation.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
                 };
-                let cm = config_manager_from_system_hive(&hive, &current_control_set);
+                let mut cm = config_manager_from_system_hive(&hive, &current_control_set);
+                let publications = cm.devnode_publications();
+                let journal_result = if current_generation == 0 {
+                    self.device_action_journal.seed(generation, &publications)
+                } else {
+                    self.device_action_journal
+                        .publish(generation, &publications)
+                        .map(|_| ())
+                };
+                if let Err(error) = journal_result {
+                    return reply(device_action_journal_status(error), current_generation);
+                }
                 self.system_mutation_leases.invalidate();
                 self.system_key_leases.invalidate();
                 self.cm = cm;
@@ -1555,19 +1651,28 @@ impl CmServer {
             .current_control_set()
             .map_err(|_| STATUS_REGISTRY_CORRUPT)?;
 
+        let mut topology =
+            config_manager_from_system_hive(transaction.hive(), &current_control_set);
+        let publications = topology.devnode_publications();
+
         if previous_control_set == current_control_set {
             let mut registry = self.cm.registry_mut().begin_transaction();
             let enum_changed =
                 project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
+            self.device_action_journal
+                .publish(next_generation, &publications)
+                .map_err(device_action_journal_status)?;
             transaction.commit();
             registry.commit();
             if enum_changed {
                 self.cm.refresh_registry_devnodes();
             }
         } else {
-            let cm = config_manager_from_system_hive(transaction.hive(), &current_control_set);
+            self.device_action_journal
+                .publish(next_generation, &publications)
+                .map_err(device_action_journal_status)?;
             transaction.commit();
-            self.cm = cm;
+            self.cm = topology;
         }
         mounted.generation = next_generation;
         mounted.current_control_set = current_control_set;
@@ -2876,6 +2981,128 @@ impl CmServer {
                 reply(STATUS_SUCCESS, 0)
             }
             _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
+    fn op_device_action(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmDeviceActionRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmDeviceActionRequest>();
+        let chunk_capacity = req.chunk_capacity as usize;
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req._reserved != 0
+            || buf.len() != header_size
+            || chunk_capacity > CM_DEVICE_ACTION_CHUNK_BYTES
+            || chunk_capacity > out_buf.len()
+        {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        }
+        let current_generation = self
+            .system_hive
+            .as_ref()
+            .map(|mounted| mounted.generation)
+            .unwrap_or(0);
+        if current_generation == 0 {
+            return reply(STATUS_DEVICE_NOT_READY, 0);
+        }
+
+        match req.operation {
+            device_action_transfer::BEGIN => {
+                if req.value_offset != 0
+                    || chunk_capacity == 0
+                    || req.mount_generation != 0
+                    || req.event_sequence != 0
+                    || req.transfer_token != 0
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let Some(event) = self.device_action_journal.peek() else {
+                    return reply(STATUS_NO_MORE_ENTRIES, current_generation);
+                };
+                let key = DeviceActionSnapshotKey {
+                    mount_generation: event.mount_generation,
+                    sequence: event.sequence,
+                };
+                let Some(value) = encode_device_action_event(event) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                let Some(chunk) =
+                    self.device_action_snapshot
+                        .begin(key, value, chunk_capacity, out_buf)
+                else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
+                };
+                snapshot_reply(chunk)
+            }
+            device_action_transfer::PULL => {
+                if chunk_capacity == 0
+                    || req.mount_generation == 0
+                    || req.event_sequence == 0
+                    || req.transfer_token == 0
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let Some(chunk) = self.device_action_snapshot.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    chunk_capacity,
+                    out_buf,
+                    |key| {
+                        key.mount_generation == req.mount_generation
+                            && key.sequence == req.event_sequence
+                    },
+                ) else {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                };
+                snapshot_reply(chunk)
+            }
+            device_action_transfer::ABORT => {
+                if req.value_offset != 0
+                    || chunk_capacity != 0
+                    || req.mount_generation == 0
+                    || req.event_sequence == 0
+                    || req.transfer_token == 0
+                    || !self
+                        .device_action_snapshot
+                        .abort(req.transfer_token, |key| {
+                            key.mount_generation == req.mount_generation
+                                && key.sequence == req.event_sequence
+                        })
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                reply(STATUS_SUCCESS, current_generation)
+            }
+            device_action_transfer::ACK => {
+                if req.value_offset != 0
+                    || chunk_capacity != 0
+                    || req.mount_generation == 0
+                    || req.event_sequence == 0
+                    || req.transfer_token != 0
+                {
+                    return reply(STATUS_INVALID_PARAMETER, current_generation);
+                }
+                let head_matches = self.device_action_journal.peek().is_some_and(|event| {
+                    event.mount_generation == req.mount_generation
+                        && event.sequence == req.event_sequence
+                });
+                if !head_matches {
+                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                }
+                if let Err(error) = self.device_action_journal.acknowledge(req.event_sequence) {
+                    return reply(device_action_journal_status(error), current_generation);
+                }
+                self.device_action_snapshot.clear();
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    self.device_action_journal.pending_len() as u32,
+                    current_generation,
+                    req.event_sequence,
+                )
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, current_generation),
         }
     }
 

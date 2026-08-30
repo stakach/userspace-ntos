@@ -14,16 +14,19 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use nt_config_abi::{
-    device_property_transfer, driver_service_class, driver_service_transfer,
-    hive_checkpoint_transfer, hive_import_transfer, hive_key_lease_operation, hive_key_transfer,
-    hive_mount, hive_mutation_flags, hive_mutation_kind, hive_mutation_transfer, launch_plan_kind,
-    launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind,
-    pnp_query_transfer, win32_service_plan_kind, win32_service_process_kind,
+    device_action_kind, device_action_transfer, device_property_transfer, driver_service_class,
+    driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
+    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_flags,
+    hive_mutation_kind, hive_mutation_transfer, launch_plan_kind, launch_plan_transfer,
+    leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
+    win32_service_plan_kind, win32_service_process_kind, CmDeviceActionRequest,
     CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
     CmHiveCheckpointRequest, CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest,
     CmHiveKeyRequest, CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest,
     CmLaunchPlanRequest, CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest,
-    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
+    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_ACTION_CHUNK_BYTES,
+    CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES, CM_DEVICE_ACTION_SNAPSHOT_MAGIC,
+    CM_DEVICE_ACTION_SNAPSHOT_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
     CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
     CM_HIVE_CHECKPOINT_CHUNK_BYTES, CM_HIVE_CHECKPOINT_HEADER_BYTES, CM_HIVE_CHECKPOINT_MAGIC,
@@ -53,6 +56,7 @@ const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: i32 = 0xC000_003Bu32 as i32;
 const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
@@ -194,6 +198,45 @@ pub struct PnpQuerySnapshot {
     pub query_kind: u16,
     pub strings: Vec<String>,
     pub payload: Vec<u8>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceActionKind {
+    Arrival,
+    Change,
+    Removal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceActionDriverService {
+    pub service_name: String,
+    pub image_path: String,
+    pub driver_object_path: String,
+    pub class_guid: Option<String>,
+    pub class: DriverServiceClass,
+    pub start_type: u32,
+    pub error_control: Option<u32>,
+    pub load_order_group: Option<String>,
+    pub tag: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceActionPublication {
+    pub instance_id: String,
+    pub service: Option<DeviceActionDriverService>,
+    pub pdo_name: Option<String>,
+    pub driver_key: Option<String>,
+    pub linkage_export: Option<String>,
+    pub hardware_ids: Vec<String>,
+    pub compatible_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceActionEvent {
+    pub mount_generation: u64,
+    pub sequence: u64,
+    pub kind: DeviceActionKind,
+    pub publication: DeviceActionPublication,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,6 +748,115 @@ fn decode_pnp_query_snapshot(bytes: &[u8]) -> Option<PnpQuerySnapshot> {
         query_kind,
         strings,
         payload,
+    })
+}
+
+fn decode_device_action_identity(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.len() < CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES {
+        return None;
+    }
+    let mut reader = SnapshotReader::new(bytes);
+    if reader.u32()? != CM_DEVICE_ACTION_SNAPSHOT_MAGIC
+        || reader.u16()? != CM_DEVICE_ACTION_SNAPSHOT_VERSION
+    {
+        return None;
+    }
+    let kind = reader.u16()?;
+    let mount_generation = reader.u64()?;
+    let sequence = reader.u64()?;
+    let service_class = reader.u16()?;
+    let reserved0 = reader.u16()?;
+    let reserved1 = reader.u32()?;
+    if !matches!(
+        kind,
+        device_action_kind::ARRIVAL | device_action_kind::CHANGE | device_action_kind::REMOVAL
+    ) || mount_generation == 0
+        || sequence == 0
+        || !matches!(
+            service_class,
+            0 | driver_service_class::DEVICE | driver_service_class::FILE_SYSTEM
+        )
+        || reserved0 != 0
+        || reserved1 != 0
+    {
+        return None;
+    }
+    Some((mount_generation, sequence))
+}
+
+fn decode_device_action_event(bytes: &[u8]) -> Option<DeviceActionEvent> {
+    let (mount_generation, sequence) = decode_device_action_identity(bytes)?;
+    let mut reader = SnapshotReader::new(bytes);
+    if reader.u32()? != CM_DEVICE_ACTION_SNAPSHOT_MAGIC
+        || reader.u16()? != CM_DEVICE_ACTION_SNAPSHOT_VERSION
+    {
+        return None;
+    }
+    let kind = match reader.u16()? {
+        device_action_kind::ARRIVAL => DeviceActionKind::Arrival,
+        device_action_kind::CHANGE => DeviceActionKind::Change,
+        device_action_kind::REMOVAL => DeviceActionKind::Removal,
+        _ => return None,
+    };
+    if reader.u64()? != mount_generation || reader.u64()? != sequence {
+        return None;
+    }
+    let service_class = match reader.u16()? {
+        0 => None,
+        driver_service_class::DEVICE => Some(DriverServiceClass::Device),
+        driver_service_class::FILE_SYSTEM => Some(DriverServiceClass::FileSystem),
+        _ => return None,
+    };
+    if reader.u16()? != 0 || reader.u32()? != 0 {
+        return None;
+    }
+    let instance_id = reader.string()?;
+    if instance_id.is_empty() {
+        return None;
+    }
+    let service = if let Some(class) = service_class {
+        Some(DeviceActionDriverService {
+            service_name: reader.string()?,
+            image_path: reader.string()?,
+            driver_object_path: reader.string()?,
+            class_guid: reader.optional_string()?,
+            class,
+            start_type: reader.u32()?,
+            error_control: reader.optional_u32()?,
+            load_order_group: reader.optional_string()?,
+            tag: reader.optional_u32()?,
+        })
+    } else {
+        None
+    };
+    let pdo_name = reader.optional_string()?;
+    let driver_key = reader.optional_string()?;
+    let linkage_export = reader.optional_string()?;
+    let hardware_count = usize::try_from(reader.u32()?).ok()?;
+    let mut hardware_ids = Vec::new();
+    hardware_ids.try_reserve_exact(hardware_count).ok()?;
+    for _ in 0..hardware_count {
+        hardware_ids.push(reader.string()?);
+    }
+    let compatible_count = usize::try_from(reader.u32()?).ok()?;
+    let mut compatible_ids = Vec::new();
+    compatible_ids.try_reserve_exact(compatible_count).ok()?;
+    for _ in 0..compatible_count {
+        compatible_ids.push(reader.string()?);
+    }
+    reader.finished().then_some(DeviceActionEvent {
+        mount_generation,
+        sequence,
+        kind,
+        publication: DeviceActionPublication {
+            instance_id,
+            service,
+            pdo_name,
+            driver_key,
+            linkage_export,
+            hardware_ids,
+            compatible_ids,
+        },
     })
 }
 
@@ -2283,6 +2435,109 @@ impl<B: Backend> ConfigClient<B> {
         }
     }
 
+    /// Peek and stream the next immutable CM-owned device action without acknowledging it.
+    pub fn next_device_action(&mut self) -> Result<Option<DeviceActionEvent>, i32> {
+        let mut value = Vec::new();
+        let mut expected_total = None;
+        let mut identity = None;
+        let mut token = 0u64;
+        let mut reply_bytes = [0u8; CM_DEVICE_ACTION_CHUNK_BYTES];
+        loop {
+            let operation = if token == 0 {
+                device_action_transfer::BEGIN
+            } else {
+                device_action_transfer::PULL
+            };
+            let offset = value.len();
+            let (mount_generation, event_sequence) = identity.unwrap_or((0, 0));
+            let response = self.device_action_call(
+                operation,
+                mount_generation,
+                event_sequence,
+                token,
+                u32::try_from(offset).map_err(|_| STATUS_INVALID_PARAMETER)?,
+                CM_DEVICE_ACTION_CHUNK_BYTES as u32,
+                &mut reply_bytes,
+            );
+            if token == 0 && response.status == STATUS_NO_MORE_ENTRIES {
+                return Ok(None);
+            }
+            if response.status != STATUS_SUCCESS {
+                self.abort_device_action(mount_generation, event_sequence, token);
+                return Err(response.status);
+            }
+            let total = usize::try_from(response.detail0).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            let written = response.information as usize;
+            let reply_token_valid = if token == 0 {
+                (written == total && response.detail1 == 0)
+                    || (written < total && response.detail1 != 0)
+            } else {
+                response.detail1 == token
+            };
+            if total < CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES
+                || expected_total.is_some_and(|expected| expected != total)
+                || !reply_token_valid
+                || written > reply_bytes.len()
+                || offset.checked_add(written).is_none_or(|end| end > total)
+                || (offset < total && written == 0)
+            {
+                self.abort_device_action(
+                    mount_generation,
+                    event_sequence,
+                    if token == 0 { response.detail1 } else { token },
+                );
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if expected_total.is_none() {
+                let Some(first_identity) = decode_device_action_identity(&reply_bytes[..written])
+                else {
+                    self.abort_device_action(0, 0, response.detail1);
+                    return Err(STATUS_INVALID_PARAMETER);
+                };
+                if value.try_reserve_exact(total).is_err() {
+                    self.abort_device_action(first_identity.0, first_identity.1, response.detail1);
+                    return Err(STATUS_INSUFFICIENT_RESOURCES);
+                }
+                identity = Some(first_identity);
+                expected_total = Some(total);
+            }
+            value.extend_from_slice(&reply_bytes[..written]);
+            if value.len() == total {
+                let event = decode_device_action_event(&value).ok_or(STATUS_INVALID_PARAMETER)?;
+                if Some((event.mount_generation, event.sequence)) != identity {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                return Ok(Some(event));
+            }
+            if token == 0 {
+                token = response.detail1;
+            }
+        }
+    }
+
+    /// Retire only the exact journal head after its PnP action has reached a terminal state.
+    pub fn acknowledge_device_action(&mut self, event: &DeviceActionEvent) -> Result<usize, i32> {
+        if event.mount_generation == 0 || event.sequence == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let response = self.device_action_call(
+            device_action_transfer::ACK,
+            event.mount_generation,
+            event.sequence,
+            0,
+            0,
+            0,
+            &mut [],
+        );
+        if response.status != STATUS_SUCCESS {
+            return Err(response.status);
+        }
+        if response.detail0 < event.mount_generation || response.detail1 != event.sequence {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(response.information as usize)
+    }
+
     fn query_launch_plan_bytes(
         &mut self,
         query_opcode: u16,
@@ -2956,6 +3211,52 @@ impl<B: Backend> ConfigClient<B> {
         );
     }
 
+    fn device_action_call(
+        &mut self,
+        operation: u16,
+        mount_generation: u64,
+        event_sequence: u64,
+        transfer_token: u64,
+        value_offset: u32,
+        chunk_capacity: u32,
+        reply_bytes: &mut [u8],
+    ) -> CmReply {
+        let header_size = core::mem::size_of::<CmDeviceActionRequest>();
+        let request = CmDeviceActionRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            _reserved: 0,
+            value_offset,
+            chunk_capacity,
+            mount_generation,
+            event_sequence,
+            transfer_token,
+        };
+        self.backend
+            .call(opcode::CM_OP_DEVICE_ACTION, request.as_bytes(), reply_bytes)
+    }
+
+    fn abort_device_action(
+        &mut self,
+        mount_generation: u64,
+        event_sequence: u64,
+        transfer_token: u64,
+    ) {
+        if mount_generation == 0 || event_sequence == 0 || transfer_token == 0 {
+            return;
+        }
+        let _ = self.device_action_call(
+            device_action_transfer::ABORT,
+            mount_generation,
+            event_sequence,
+            transfer_token,
+            0,
+            0,
+            &mut [],
+        );
+    }
+
     fn launch_plan_call(
         &mut self,
         query_opcode: u16,
@@ -3147,7 +3448,7 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
     use nt_config_manager::{
-        device_property, encode_sz, ConfigManager, RegistryValueType, ENUM_PATH,
+        device_property, encode_multi_sz, encode_sz, ConfigManager, RegistryValueType, ENUM_PATH,
         SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER,
         SERVICE_INTERACTIVE_PROCESS, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
         SERVICE_WIN32_OWN_PROCESS, SERVICE_WIN32_SHARE_PROCESS,
@@ -4361,5 +4662,143 @@ mod tests {
                 .status,
             STATUS_INVALID_PARAMETER
         );
+    }
+
+    #[test]
+    fn device_action_streams_live_binding_and_requires_exact_ack() {
+        let mut hive = Hive::new(HiveKind::System);
+        let select = hive.create_key("Select");
+        hive.set_dword(select, "Current", 1);
+        hive.create_key("ControlSet001");
+        hive.finish_clean_import();
+
+        let mut client = ConfigClient::new(Framed {
+            server: CmServer::new(),
+        });
+        assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
+        assert_eq!(client.next_device_action(), Ok(None));
+
+        let service_path = r"\Registry\Machine\System\ControlSet001\Services\LateDriver";
+        let instance_path = r"\Registry\Machine\System\ControlSet001\Enum\ROOT\LATE\0000";
+        let service_type = SERVICE_KERNEL_DRIVER.to_le_bytes();
+        let start_type = SERVICE_DEMAND_START.to_le_bytes();
+        let image = encode_sz(r"system32\drivers\late.sys");
+        let service_name = encode_sz("LateDriver");
+        let pdo_name = encode_sz(r"\Device\LatePdo0");
+        let hardware_ids: Vec<String> = (0..96)
+            .map(|index| format!(r"ROOT\LATE\HARDWARE_ID_{index:04}_WITH_LONG_IDENTITY"))
+            .collect();
+        let hardware_refs: Vec<&str> = hardware_ids.iter().map(String::as_str).collect();
+        let hardware = encode_multi_sz(&hardware_refs);
+        let prepared = client
+            .prepare_system_hive_mutation(
+                1,
+                &[
+                    SystemHiveMutation::CreateKey { path: service_path },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "Type",
+                        value_type: RegistryValueType::Dword as u32,
+                        data: &service_type,
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "Start",
+                        value_type: RegistryValueType::Dword as u32,
+                        data: &start_type,
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: service_path,
+                        name: "ImagePath",
+                        value_type: RegistryValueType::ExpandSz as u32,
+                        data: &image,
+                    },
+                    SystemHiveMutation::CreateKey {
+                        path: instance_path,
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: instance_path,
+                        name: "Service",
+                        value_type: RegistryValueType::Sz as u32,
+                        data: &service_name,
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: instance_path,
+                        name: "PdoName",
+                        value_type: RegistryValueType::Sz as u32,
+                        data: &pdo_name,
+                    },
+                    SystemHiveMutation::SetValue {
+                        path: instance_path,
+                        name: "HardwareID",
+                        value_type: RegistryValueType::MultiSz as u32,
+                        data: &hardware,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(client.publish_system_hive_mutation(&prepared), Ok(2));
+
+        let event = client.next_device_action().unwrap().unwrap();
+        assert_eq!(event.mount_generation, 2);
+        assert_eq!(event.sequence, 1);
+        assert_eq!(event.kind, DeviceActionKind::Arrival);
+        assert_eq!(event.publication.instance_id, r"ROOT\LATE\0000");
+        assert_eq!(event.publication.hardware_ids, hardware_ids);
+        let service = event.publication.service.as_ref().unwrap();
+        assert_eq!(service.service_name, "LateDriver");
+        assert_eq!(service.start_type, SERVICE_DEMAND_START);
+        assert_eq!(service.class, DriverServiceClass::Device);
+
+        assert_eq!(client.next_device_action(), Ok(Some(event.clone())));
+        let mut stale = event.clone();
+        stale.sequence += 1;
+        assert!(client.acknowledge_device_action(&stale).is_err());
+        assert_eq!(client.next_device_action(), Ok(Some(event.clone())));
+        assert_eq!(client.acknowledge_device_action(&event), Ok(0));
+        assert_eq!(client.next_device_action(), Ok(None));
+
+        let updated_image = encode_sz(r"system32\drivers\late-updated.sys");
+        let prepared = client
+            .prepare_system_hive_mutation(
+                2,
+                &[SystemHiveMutation::SetValue {
+                    path: service_path,
+                    name: "ImagePath",
+                    value_type: RegistryValueType::ExpandSz as u32,
+                    data: &updated_image,
+                }],
+            )
+            .unwrap();
+        assert_eq!(client.publish_system_hive_mutation(&prepared), Ok(3));
+        let changed = client.next_device_action().unwrap().unwrap();
+        assert_eq!(changed.sequence, 2);
+        assert_eq!(changed.kind, DeviceActionKind::Change);
+        assert_eq!(
+            changed
+                .publication
+                .service
+                .as_ref()
+                .map(|service| service.image_path.as_str()),
+            Some(r"system32\drivers\late-updated.sys")
+        );
+        assert_eq!(client.acknowledge_device_action(&changed), Ok(0));
+
+        let prepared = client
+            .prepare_system_hive_mutation(
+                3,
+                &[SystemHiveMutation::DeleteKey {
+                    path: instance_path,
+                }],
+            )
+            .unwrap();
+        assert_eq!(client.publish_system_hive_mutation(&prepared), Ok(4));
+        let removal = client.next_device_action().unwrap().unwrap();
+        assert_eq!(removal.sequence, 3);
+        assert_eq!(removal.kind, DeviceActionKind::Removal);
+        assert_eq!(removal.publication.instance_id, r"ROOT\LATE\0000");
+        assert_eq!(removal.publication.hardware_ids, hardware_ids);
+        assert_eq!(client.acknowledge_device_action(&removal), Ok(0));
+        assert_eq!(client.next_device_action(), Ok(None));
     }
 }
