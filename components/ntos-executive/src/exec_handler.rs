@@ -2873,22 +2873,28 @@ fn zeroed_temporary_process_slot_vec() -> alloc::vec::Vec<nt_process::ProcessId>
     slots
 }
 
+fn registered_win32_callouts_for_manager(
+    pm: &mut nt_process::ProcessManager,
+) -> Result<nt_process::Win32Callouts, u32> {
+    let registered = win32k_subsystem::registered_win32k_callouts()
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    match pm.win32_callouts() {
+        Some(current) if current == registered => Ok(current),
+        Some(_) => Err(nt_process::STATUS_INVALID_PARAMETER),
+        None => {
+            debug_assert!(pm.establish_win32_callouts(registered).is_none());
+            Ok(registered)
+        }
+    }
+}
+
 fn dispatch_win32_job_callout_for_manager(
     pm: &mut nt_process::ProcessManager,
     id: nt_process::job::JobId,
     callout_type: u32,
     data: u64,
 ) -> Result<(), u32> {
-    let registered = win32k_subsystem::registered_win32k_callouts()
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
-    let callouts = match pm.win32_callouts() {
-        Some(current) if current == registered => current,
-        Some(_) => return Err(nt_process::STATUS_INVALID_PARAMETER),
-        None => {
-            debug_assert!(pm.establish_win32_callouts(registered).is_none());
-            registered
-        }
-    };
+    let callouts = registered_win32_callouts_for_manager(pm)?;
     if callouts.job_callout == 0 {
         return Err(STATUS_DEVICE_NOT_READY);
     }
@@ -2908,6 +2914,60 @@ fn dispatch_win32_job_callout_for_manager(
         0 => Ok(()),
         status => Err(status),
     }
+}
+
+fn dispatch_win32_job_atom_for_manager(
+    pm: &mut nt_process::ProcessManager,
+    job: nt_process::job::JobId,
+    operation: u64,
+    value: u64,
+    capacity: u64,
+) -> u32 {
+    let Ok(callouts) = registered_win32_callouts_for_manager(pm) else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+    if callouts.job_callout == 0 {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    let (status, completed) = unsafe {
+        win32k_glue::win32k_dispatch(
+            win32k_subsystem::SSN_WIN32_JOB_ATOM,
+            job as u64,
+            operation,
+            value,
+            capacity,
+        )
+    };
+    if completed {
+        status as u32
+    } else {
+        STATUS_DEVICE_NOT_READY
+    }
+}
+
+unsafe fn stage_win32_job_atom_name(name: &[u16]) -> Result<u64, u32> {
+    let byte_len = name
+        .len()
+        .checked_mul(2)
+        .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+    if byte_len
+        > win32k_subsystem::WIN32K_JOB_ATOM_BYTES
+            - win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF as usize
+    {
+        return Err(nt_process::STATUS_INVALID_PARAMETER);
+    }
+    let stage = win32k_subsystem::WIN32K_JOB_ATOM_VADDR;
+    core::ptr::write_bytes(
+        stage as *mut u8,
+        0,
+        win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF as usize + byte_len,
+    );
+    core::ptr::copy_nonoverlapping(
+        name.as_ptr() as *const u8,
+        (stage + win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF) as *mut u8,
+        byte_len,
+    );
+    Ok(byte_len as u64)
 }
 
 pub(crate) fn win32_job_callout_selftest() -> u64 {
@@ -2937,6 +2997,91 @@ pub(crate) fn win32_job_callout_selftest() -> u64 {
             }
         }
     }
+    const ATOM_NAME: [u16; 12] = [
+        b'J' as u16,
+        b'o' as u16,
+        b'b' as u16,
+        b'A' as u16,
+        b't' as u16,
+        b'o' as u16,
+        b'm' as u16,
+        b'P' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b'b' as u16,
+        b'e' as u16,
+    ];
+    let mut private_atom = 0u16;
+    unsafe {
+        if let Ok(byte_len) = stage_win32_job_atom_name(&ATOM_NAME) {
+            let add_status = dispatch_win32_job_atom_for_manager(
+                &mut pm,
+                job,
+                win32k_subsystem::WIN32_JOB_ATOM_ADD_NAME,
+                byte_len,
+                0,
+            );
+            private_atom = core::ptr::read_volatile(
+                win32k_subsystem::WIN32K_JOB_ATOM_VADDR as *const u16,
+            );
+            if add_status == 0
+                && private_atom >= 0xC000
+                && stage_win32_job_atom_name(&ATOM_NAME)
+                    .map(|find_len| {
+                        dispatch_win32_job_atom_for_manager(
+                            &mut pm,
+                            job,
+                            win32k_subsystem::WIN32_JOB_ATOM_FIND_NAME,
+                            find_len,
+                            0,
+                        ) == 0
+                            && core::ptr::read_volatile(
+                                win32k_subsystem::WIN32K_JOB_ATOM_VADDR as *const u16,
+                            ) == private_atom
+                    })
+                    .unwrap_or(false)
+            {
+                proof |= 0x80;
+            }
+
+            let stage = win32k_subsystem::WIN32K_JOB_ATOM_VADDR;
+            core::ptr::write_bytes(stage as *mut u8, 0, win32k_subsystem::WIN32K_JOB_ATOM_BYTES);
+            let query_status = dispatch_win32_job_atom_for_manager(
+                &mut pm,
+                job,
+                win32k_subsystem::WIN32_JOB_ATOM_QUERY,
+                private_atom as u64,
+                ((ATOM_NAME.len() + 1) * 2) as u64,
+            );
+            let query_name = core::slice::from_raw_parts(
+                (stage + win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF) as *const u16,
+                ATOM_NAME.len(),
+            );
+            let query_ok = query_status == 0
+                && core::ptr::read_volatile((stage + 4) as *const u32) == 1
+                && core::ptr::read_volatile((stage + 8) as *const u32) == 0
+                && core::ptr::read_volatile((stage + 12) as *const u32)
+                    == (ATOM_NAME.len() * 2) as u32
+                && query_name == ATOM_NAME;
+
+            core::ptr::write_bytes(stage as *mut u8, 0, win32k_subsystem::WIN32K_JOB_ATOM_BYTES);
+            let list_status = dispatch_win32_job_atom_for_manager(
+                &mut pm,
+                job,
+                win32k_subsystem::WIN32_JOB_ATOM_LIST,
+                0,
+                8,
+            );
+            let list_count = core::ptr::read_volatile((stage + 16) as *const u32) as usize;
+            let listed = core::slice::from_raw_parts(
+                (stage + win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF) as *const u16,
+                list_count.min(8),
+            );
+            if query_ok && list_status == 0 && listed.contains(&private_atom) {
+                proof |= 0x100;
+            }
+        }
+    }
     if let Ok(plan) = pm.prepare_job_ui_restrictions(job, 0) {
         if dispatch_win32_job_callout_for_manager(
             &mut pm,
@@ -2951,6 +3096,63 @@ pub(crate) fn win32_job_callout_selftest() -> u64 {
                 && pm.job_ui_restrictions(job) == Ok(0)
             {
                 proof |= 0x10;
+            }
+        }
+    }
+    if let Ok(plan) = pm.prepare_job_ui_restrictions(job, restrictions) {
+        if dispatch_win32_job_callout_for_manager(
+            &mut pm,
+            job,
+            win32k_subsystem::PS_W32_JOB_CALLOUT_SET_INFORMATION,
+            restrictions as u64,
+        )
+        .is_ok()
+            && pm.commit_job_ui_restrictions(plan).is_ok()
+        {
+            unsafe {
+                if stage_win32_job_atom_name(&ATOM_NAME)
+                    .map(|byte_len| {
+                        dispatch_win32_job_atom_for_manager(
+                            &mut pm,
+                            job,
+                            win32k_subsystem::WIN32_JOB_ATOM_FIND_NAME,
+                            byte_len,
+                            0,
+                        ) == 0
+                            && core::ptr::read_volatile(
+                                win32k_subsystem::WIN32K_JOB_ATOM_VADDR as *const u16,
+                            ) == private_atom
+                    })
+                    .unwrap_or(false)
+                {
+                    proof |= 0x200;
+                }
+            }
+        }
+    }
+    if private_atom != 0
+        && dispatch_win32_job_atom_for_manager(
+            &mut pm,
+            job,
+            win32k_subsystem::WIN32_JOB_ATOM_DELETE,
+            private_atom as u64,
+            0,
+        ) == 0
+    {
+        unsafe {
+            if stage_win32_job_atom_name(&ATOM_NAME)
+                .map(|byte_len| {
+                    dispatch_win32_job_atom_for_manager(
+                        &mut pm,
+                        job,
+                        win32k_subsystem::WIN32_JOB_ATOM_FIND_NAME,
+                        byte_len,
+                        0,
+                    ) == nt_kernel_exec::rtl_atom::status::OBJECT_NAME_NOT_FOUND
+                })
+                .unwrap_or(false)
+            {
+                proof |= 0x400;
             }
         }
     }
@@ -22948,6 +23150,140 @@ impl ExecNtHandler {
         dispatch_win32_job_callout_for_manager(&mut self.pm, id, callout_type, data)
     }
 
+    fn private_global_atom_job(&self) -> Result<Option<nt_process::job::JobId>, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let Some(job) = self.pm.process_job(pid) else {
+            return Ok(None);
+        };
+        let restrictions = self.pm.job_ui_restrictions(job)?;
+        Ok((restrictions & nt_win32k_job::JOB_OBJECT_UILIMIT_GLOBALATOMS != 0).then_some(job))
+    }
+
+    fn dispatch_win32_job_atom(
+        &mut self,
+        job: nt_process::job::JobId,
+        operation: u64,
+        value: u64,
+        capacity: u64,
+    ) -> u32 {
+        dispatch_win32_job_atom_for_manager(&mut self.pm, job, operation, value, capacity)
+    }
+
+    unsafe fn job_atom_add_or_find(
+        &mut self,
+        job: nt_process::job::JobId,
+        add: bool,
+        integer: Option<u16>,
+        name: &[u16],
+    ) -> Result<u16, u32> {
+        let stage = win32k_subsystem::WIN32K_JOB_ATOM_VADDR;
+        let (operation, value) = if let Some(atom) = integer {
+            core::ptr::write_bytes(
+                stage as *mut u8,
+                0,
+                win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF as usize,
+            );
+            (
+                if add {
+                    win32k_subsystem::WIN32_JOB_ATOM_ADD_INTEGER
+                } else {
+                    win32k_subsystem::WIN32_JOB_ATOM_FIND_INTEGER
+                },
+                atom as u64,
+            )
+        } else {
+            let byte_len = stage_win32_job_atom_name(name)?;
+            (
+                if add {
+                    win32k_subsystem::WIN32_JOB_ATOM_ADD_NAME
+                } else {
+                    win32k_subsystem::WIN32_JOB_ATOM_FIND_NAME
+                },
+                byte_len,
+            )
+        };
+        let status = self.dispatch_win32_job_atom(job, operation, value, 0);
+        if status == 0 {
+            Ok(core::ptr::read_volatile(stage as *const u16))
+        } else {
+            Err(status)
+        }
+    }
+
+    fn job_atom_delete(&mut self, job: nt_process::job::JobId, atom: u16) -> u32 {
+        self.dispatch_win32_job_atom(
+            job,
+            win32k_subsystem::WIN32_JOB_ATOM_DELETE,
+            atom as u64,
+            0,
+        )
+    }
+
+    unsafe fn job_atom_query(
+        &mut self,
+        job: nt_process::job::JobId,
+        atom: u16,
+        name: &mut [u16; nt_kernel_exec::rtl_atom::NAME_CAP + 1],
+        name_capacity_bytes: u32,
+    ) -> nt_kernel_exec::rtl_atom::AtomQueryResult {
+        let stage = win32k_subsystem::WIN32K_JOB_ATOM_VADDR;
+        core::ptr::write_bytes(
+            stage as *mut u8,
+            0,
+            win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF as usize,
+        );
+        let status = self.dispatch_win32_job_atom(
+            job,
+            win32k_subsystem::WIN32_JOB_ATOM_QUERY,
+            atom as u64,
+            name_capacity_bytes as u64,
+        );
+        let result = nt_kernel_exec::rtl_atom::AtomQueryResult {
+            status,
+            reference_count: core::ptr::read_volatile((stage + 4) as *const u32),
+            pin_count: core::ptr::read_volatile((stage + 8) as *const u32),
+            name_length: core::ptr::read_volatile((stage + 12) as *const u32),
+        };
+        if status == nt_kernel_exec::rtl_atom::status::SUCCESS {
+            let bytes = (result.name_length as usize).min(name.len() * 2);
+            core::ptr::copy_nonoverlapping(
+                (stage + win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF) as *const u8,
+                name.as_mut_ptr() as *mut u8,
+                bytes,
+            );
+        }
+        result
+    }
+
+    unsafe fn job_atom_list(
+        &mut self,
+        job: nt_process::job::JobId,
+        atoms: &mut [u16],
+    ) -> nt_kernel_exec::rtl_atom::AtomListResult {
+        let stage = win32k_subsystem::WIN32K_JOB_ATOM_VADDR;
+        core::ptr::write_bytes(
+            stage as *mut u8,
+            0,
+            win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF as usize + atoms.len() * 2,
+        );
+        let status = self.dispatch_win32_job_atom(
+            job,
+            win32k_subsystem::WIN32_JOB_ATOM_LIST,
+            0,
+            atoms.len() as u64,
+        );
+        let count = core::ptr::read_volatile((stage + 16) as *const u32) as usize;
+        let copied = count.min(atoms.len());
+        core::ptr::copy_nonoverlapping(
+            (stage + win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF) as *const u16,
+            atoms.as_mut_ptr(),
+            copied,
+        );
+        nt_kernel_exec::rtl_atom::AtomListResult { status, count }
+    }
+
     pub(crate) fn publish_process_win32_job_membership(
         &mut self,
         pid: nt_process::ProcessId,
@@ -30485,16 +30821,34 @@ impl ExecNtHandler {
                     Ok(integer) => integer,
                     Err(status) => return status,
                 };
-                let result = match (ctx.service, integer) {
-                    (NativeService::NtAddAtom, Some(atom)) => self.global_atoms.add_integer(atom),
-                    (NativeService::NtFindAtom, Some(atom)) => self.global_atoms.find_integer(atom),
-                    (NativeService::NtAddAtom, None) => {
-                        self.global_atoms.add_name(&name[..byte_len as usize / 2])
+                let private_job = match self.private_global_atom_job() {
+                    Ok(job) => job,
+                    Err(status) => return status,
+                };
+                let add = ctx.service == NativeService::NtAddAtom;
+                let result = if let Some(job) = private_job {
+                    self.job_atom_add_or_find(
+                        job,
+                        add,
+                        integer,
+                        &name[..byte_len as usize / 2],
+                    )
+                } else {
+                    match (ctx.service, integer) {
+                        (NativeService::NtAddAtom, Some(atom)) => {
+                            self.global_atoms.add_integer(atom)
+                        }
+                        (NativeService::NtFindAtom, Some(atom)) => {
+                            self.global_atoms.find_integer(atom)
+                        }
+                        (NativeService::NtAddAtom, None) => {
+                            self.global_atoms.add_name(&name[..byte_len as usize / 2])
+                        }
+                        (NativeService::NtFindAtom, None) => {
+                            self.global_atoms.find_name(&name[..byte_len as usize / 2])
+                        }
+                        _ => unreachable!(),
                     }
-                    (NativeService::NtFindAtom, None) => {
-                        self.global_atoms.find_name(&name[..byte_len as usize / 2])
-                    }
-                    _ => unreachable!(),
                 };
                 match result {
                     Ok(atom) => {
@@ -30506,7 +30860,11 @@ impl ExecNtHandler {
                     Err(status) => status,
                 }
             },
-            NativeService::NtDeleteAtom => self.global_atoms.delete(args[0] as u16),
+            NativeService::NtDeleteAtom => match self.private_global_atom_job() {
+                Ok(Some(job)) => self.job_atom_delete(job, args[0] as u16),
+                Ok(None) => self.global_atoms.delete(args[0] as u16),
+                Err(status) => status,
+            },
             NativeService::NtQueryInformationAtom => unsafe {
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
@@ -30518,6 +30876,10 @@ impl ExecNtHandler {
                 let info_va = args[2];
                 let info_len = nt_ulong_arg(args[3]) as usize;
                 let return_len_va = args[4];
+                let private_job = match self.private_global_atom_job() {
+                    Ok(job) => job,
+                    Err(status) => return status,
+                };
 
                 if return_len_va != 0 && !self.probe_atom_output(return_len_va, 4) {
                     return STATUS_ACCESS_VIOLATION;
@@ -30539,7 +30901,11 @@ impl ExecNtHandler {
                         } else {
                             let name_capacity = (info_len - BASIC_HEADER) as u32;
                             let mut name = [0u16; nt_kernel_exec::rtl_atom::NAME_CAP + 1];
-                            let query = self.global_atoms.query(atom, &mut name, name_capacity);
+                            let query = if let Some(job) = private_job {
+                                self.job_atom_query(job, atom, &mut name, name_capacity)
+                            } else {
+                                self.global_atoms.query(atom, &mut name, name_capacity)
+                            };
                             if query.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
                                 let copied = query.name_length as usize;
                                 let write_len = BASIC_HEADER + copied + 2;
@@ -30572,7 +30938,11 @@ impl ExecNtHandler {
                         } else {
                             let slots = ((info_len - TABLE_HEADER) / 2).min(GLOBAL_ATOM_CAPACITY);
                             let mut atoms = [0u16; GLOBAL_ATOM_CAPACITY];
-                            let list = self.global_atoms.list(&mut atoms[..slots]);
+                            let list = if let Some(job) = private_job {
+                                self.job_atom_list(job, &mut atoms[..slots])
+                            } else {
+                                self.global_atoms.list(&mut atoms[..slots])
+                            };
                             let copied = list.count.min(slots);
                             let write_len = TABLE_HEADER + copied * 2;
                             let mut output = [0u8; TABLE_HEADER + GLOBAL_ATOM_CAPACITY * 2];

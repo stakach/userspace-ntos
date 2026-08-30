@@ -116,6 +116,13 @@ impl OwnedAtomTable {
         self.arena.as_mut_ptr()
     }
 
+    /// Return the stable raw RTL table address for a provider that must pass the table through an
+    /// existing kernel ABI. The allocation does not move because atom operations never resize it;
+    /// the pointer remains valid only while this owner is alive.
+    pub fn raw_table_address(&mut self) -> u64 {
+        self.as_mut_ptr() as u64
+    }
+
     /// Add an explicit-length UTF-16 name. The slice need not contain a trailing null.
     pub fn add_name(&mut self, name: &[u16]) -> Result<u16, u32> {
         let mut terminated = [0u16; NAME_CAP + 1];

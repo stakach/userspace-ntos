@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use nt_kernel_exec::rtl_atom::{self, OwnedAtomTable};
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
@@ -21,6 +22,7 @@ pub const JOB_OBJECT_UILIMIT_GLOBALATOMS: u32 = 0x0000_0020;
 pub const JOB_OBJECT_UILIMIT_DESKTOP: u32 = 0x0000_0040;
 pub const JOB_OBJECT_UILIMIT_EXITWINDOWS: u32 = 0x0000_0080;
 pub const JOB_OBJECT_UI_VALID_FLAGS: u32 = 0x0000_00FF;
+const JOB_ATOM_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiOperation {
@@ -65,16 +67,16 @@ pub struct RemovedJob {
     pub members: Vec<u64>,
 }
 
-#[derive(Debug)]
 struct JobPolicy {
     job: u64,
     token: u64,
     restrictions: u32,
     members: Vec<u64>,
+    atoms: Option<OwnedAtomTable>,
 }
 
 /// Session-local policy installed by win32k's registered job callout.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct JobUiPolicyStore {
     jobs: Vec<JobPolicy>,
 }
@@ -127,11 +129,20 @@ impl JobUiPolicyStore {
         self.jobs
             .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let atoms = if restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS != 0 {
+            Some(
+                OwnedAtomTable::with_capacity(JOB_ATOM_CAPACITY)
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?,
+            )
+        } else {
+            None
+        };
         self.jobs.push(JobPolicy {
             job,
             token,
             restrictions,
             members: Vec::new(),
+            atoms,
         });
         Ok(())
     }
@@ -141,6 +152,12 @@ impl JobUiPolicyStore {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let index = self.job_index(job).ok_or(STATUS_INVALID_HANDLE)?;
+        if restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS != 0 && self.jobs[index].atoms.is_none() {
+            self.jobs[index].atoms = Some(
+                OwnedAtomTable::with_capacity(JOB_ATOM_CAPACITY)
+                    .ok_or(STATUS_INSUFFICIENT_RESOURCES)?,
+            );
+        }
         self.jobs[index].restrictions = restrictions;
         Ok(())
     }
@@ -193,6 +210,76 @@ impl JobUiPolicyStore {
         self.member_job_index(process)
             .map(|index| self.jobs[index].restrictions)
             .unwrap_or(0)
+    }
+
+    pub fn private_atom_table_for_process(&mut self, process: u64) -> Option<u64> {
+        let index = self.member_job_index(process)?;
+        if self.jobs[index].restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS == 0 {
+            return None;
+        }
+        self.jobs[index]
+            .atoms
+            .as_mut()
+            .map(OwnedAtomTable::raw_table_address)
+    }
+
+    fn atom_table_mut(&mut self, job: u64) -> Result<&mut OwnedAtomTable, u32> {
+        let index = self.job_index(job).ok_or(STATUS_INVALID_HANDLE)?;
+        if self.jobs[index].restrictions & JOB_OBJECT_UILIMIT_GLOBALATOMS == 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        self.jobs[index]
+            .atoms
+            .as_mut()
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)
+    }
+
+    pub fn add_atom_name(&mut self, job: u64, name: &[u16]) -> Result<u16, u32> {
+        self.atom_table_mut(job)?.add_name(name)
+    }
+
+    pub fn find_atom_name(&mut self, job: u64, name: &[u16]) -> Result<u16, u32> {
+        self.atom_table_mut(job)?.find_name(name)
+    }
+
+    pub fn add_integer_atom(&mut self, job: u64, atom: u16) -> Result<u16, u32> {
+        self.atom_table_mut(job)?.add_integer(atom)
+    }
+
+    pub fn find_integer_atom(&mut self, job: u64, atom: u16) -> Result<u16, u32> {
+        self.atom_table_mut(job)?.find_integer(atom)
+    }
+
+    pub fn delete_atom(&mut self, job: u64, atom: u16) -> u32 {
+        match self.atom_table_mut(job) {
+            Ok(table) => table.delete(atom),
+            Err(status) => status,
+        }
+    }
+
+    pub fn query_atom(
+        &mut self,
+        job: u64,
+        atom: u16,
+        name: &mut [u16; rtl_atom::NAME_CAP + 1],
+        name_capacity_bytes: u32,
+    ) -> rtl_atom::AtomQueryResult {
+        match self.atom_table_mut(job) {
+            Ok(table) => table.query(atom, name, name_capacity_bytes),
+            Err(status) => rtl_atom::AtomQueryResult {
+                status,
+                reference_count: 0,
+                pin_count: 0,
+                name_length: 0,
+            },
+        }
+    }
+
+    pub fn list_atoms(&mut self, job: u64, atoms: &mut [u16]) -> rtl_atom::AtomListResult {
+        match self.atom_table_mut(job) {
+            Ok(table) => table.list(atoms),
+            Err(status) => rtl_atom::AtomListResult { status, count: 0 },
+        }
     }
 
     pub fn operation_allowed(&self, process: u64, operation: UiOperation) -> bool {
@@ -402,5 +489,44 @@ mod tests {
         assert!(!is_system_parameter_write(0x0001));
         assert!(!is_system_parameter_write(0x0030));
         assert!(!is_system_parameter_write(0x2010));
+    }
+
+    #[test]
+    fn global_atom_restriction_owns_a_persistent_private_namespace_per_job() {
+        let mut store = JobUiPolicyStore::new();
+        store
+            .register_job(1, 0x1000, JOB_OBJECT_UILIMIT_GLOBALATOMS)
+            .unwrap();
+        store
+            .register_job(2, 0x2000, JOB_OBJECT_UILIMIT_GLOBALATOMS)
+            .unwrap();
+        store.add_process(1, 0x11).unwrap();
+        store.add_process(2, 0x22).unwrap();
+
+        let alpha = [
+            b'a' as u16,
+            b'l' as u16,
+            b'p' as u16,
+            b'h' as u16,
+            b'a' as u16,
+        ];
+        let atom = store.add_atom_name(1, &alpha).unwrap();
+        assert_eq!(store.find_atom_name(1, &alpha), Ok(atom));
+        assert_eq!(
+            store.find_atom_name(2, &alpha),
+            Err(rtl_atom::status::OBJECT_NAME_NOT_FOUND)
+        );
+        let first_address = store.private_atom_table_for_process(0x11).unwrap();
+
+        store.set_restrictions(1, 0).unwrap();
+        assert_eq!(store.private_atom_table_for_process(0x11), None);
+        store
+            .set_restrictions(1, JOB_OBJECT_UILIMIT_GLOBALATOMS)
+            .unwrap();
+        assert_eq!(
+            store.private_atom_table_for_process(0x11),
+            Some(first_address)
+        );
+        assert_eq!(store.find_atom_name(1, &alpha), Ok(atom));
     }
 }

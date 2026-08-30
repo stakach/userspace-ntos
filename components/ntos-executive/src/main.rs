@@ -29059,6 +29059,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for _ in 1..win32k_subsystem::WIN32K_LPC_FRAMES {
                 let _ = alloc_frame();
             }
+            // Pointer-free staging for native global-atom services redirected to win32k's
+            // job-private atom namespace.
+            let job_atom_base = alloc_frame();
+            for _ in 1..win32k_subsystem::WIN32K_JOB_ATOM_FRAMES {
+                let _ = alloc_frame();
+            }
             // Bulk provider argument staging for large GDI client buffers.
             let bulk_arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_BULK_ARG_FRAMES {
@@ -29139,6 +29145,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = page_map(
                     copy_cap(lpc_request_base + i),
                     win32k_subsystem::WIN32K_LPC_VADDR + i * 0x1000,
+                    RW_NX,
+                    CAP_INIT_THREAD_VSPACE,
+                );
+            }
+            for i in 0..win32k_subsystem::WIN32K_JOB_ATOM_FRAMES {
+                let _ = page_map(
+                    copy_cap(job_atom_base + i),
+                    win32k_subsystem::WIN32K_JOB_ATOM_VADDR + i * 0x1000,
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
@@ -29399,6 +29413,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     source: FrameSource::Alias(lpc_request_base),
                     base_va: win32k_subsystem::WIN32K_LPC_VADDR,
                     count: win32k_subsystem::WIN32K_LPC_FRAMES,
+                    rights: Rights::Uniform(RW_NX),
+                    pts: 0,
+                };
+                n += 1;
+                // Native job-private atom staging (aux PT window).
+                regions[n] = Region {
+                    source: FrameSource::Alias(job_atom_base),
+                    base_va: win32k_subsystem::WIN32K_JOB_ATOM_VADDR,
+                    count: win32k_subsystem::WIN32K_JOB_ATOM_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };
@@ -29735,11 +29758,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b"[ps-job] win32k UI callout selftest proof=0x");
             print_hex(job_ui_proof as u32);
             print_str(b"/0x");
-            print_hex(0x7f);
+            print_hex(0x7ff);
             print_str(b"\n");
             check(
                 b"exec_win32k_job_ui_callout_roundtrip",
-                job_ui_proof == 0x7f,
+                job_ui_proof == 0x7ff,
                 &mut passed,
             );
             // Phase-2b milestone: GreDriverEntry ran through init and registered its NtUser/NtGdi

@@ -172,6 +172,13 @@ pub const WIN32K_VIDEO_IOCTL_BYTES: usize = (WIN32K_VIDEO_IOCTL_FRAMES as usize)
 pub const WIN32K_LPC_VADDR: u64 = WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000;
 pub const WIN32K_LPC_FRAMES: u64 = 1;
 pub const WIN32K_LPC_BYTES: usize = (WIN32K_LPC_FRAMES as usize) * 0x1000;
+/// Dedicated pointer-free staging for native atom services redirected to a job-private win32k
+/// namespace. It cannot share the general argument or LPC windows because either may remain live
+/// while a nested hosted syscall is serviced.
+pub const WIN32K_JOB_ATOM_VADDR: u64 = WIN32K_LPC_VADDR + WIN32K_LPC_FRAMES * 0x1000;
+pub const WIN32K_JOB_ATOM_FRAMES: u64 = 1;
+pub const WIN32K_JOB_ATOM_BYTES: usize = (WIN32K_JOB_ATOM_FRAMES as usize) * 0x1000;
+pub const WIN32K_JOB_ATOM_PAYLOAD_OFF: u64 = 0x20;
 /// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
 /// scalar argument tails. `NtGdiStretchDIBitsInternal` can receive DIB payloads far larger than the
 /// generic ARG window, so it gets a dedicated shared 2 MiB PT window between AUX and the session heap.
@@ -180,7 +187,9 @@ pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
 const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
 const _: () =
     assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
-const _: () = assert!(WIN32K_LPC_VADDR + WIN32K_LPC_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
+const _: () = assert!(
+    WIN32K_JOB_ATOM_VADDR + WIN32K_JOB_ATOM_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR
+);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).
@@ -476,6 +485,15 @@ pub const SSN_GDI_BATCH_FLUSH_CALLOUT: u64 = 0x1FFD;
 /// Private executive selector for the provider registered in
 /// `WIN32_CALLOUTS_FPNS.JobCallout`.
 pub const SSN_WIN32_JOB_CALLOUT: u64 = 0x1FFC;
+/// Private pointer-free selector for native atom operations against win32k's job-owned namespace.
+pub const SSN_WIN32_JOB_ATOM: u64 = 0x1FFB;
+pub const WIN32_JOB_ATOM_ADD_NAME: u64 = 0;
+pub const WIN32_JOB_ATOM_FIND_NAME: u64 = 1;
+pub const WIN32_JOB_ATOM_ADD_INTEGER: u64 = 2;
+pub const WIN32_JOB_ATOM_FIND_INTEGER: u64 = 3;
+pub const WIN32_JOB_ATOM_DELETE: u64 = 4;
+pub const WIN32_JOB_ATOM_QUERY: u64 = 5;
+pub const WIN32_JOB_ATOM_LIST: u64 = 6;
 /// Un-demand-paged, demand-pageable probe VA: past the win32k image tail (0x06A2_0000, so NOT
 /// flagged `in_image`) yet inside the same PD as the image, so the executive maps it with no new
 /// page table. Zeroed on first touch.
@@ -510,6 +528,11 @@ const PROCESSINFO_HWINSTA_OFF: u64 = 0x228;
 const PROCESSINFO_AMWINSTA_OFF: u64 = 0x230;
 /// `PROCESSINFO.pW32Job`, immediately after `dwLpkEntryPoints` in the NT5/ReactOS layout.
 const PROCESSINFO_PW32JOB_OFF: u64 = 0x260;
+/// ReactOS 0.4.17 `gAtomTable` pointer cell. `NtUserRegisterWindowMessage`'s call to `IntAddAtom`
+/// loads this cell at image VA 0x21bfd8 (RVA 0x20bfd8); the job namespace wrapper substitutes only
+/// for the two global-atom user services and restores it before returning.
+const G_ATOM_TABLE_RVA: u64 = 0x20_BFD8;
+static WIN32K_SESSION_ATOM_TABLE: AtomicU64 = AtomicU64::new(0);
 /// PROCESSINFO->HeapMappings (`win32.h`). The first embedded entry is the global USER heap; its
 /// `Next` chain holds per-desktop heap mappings for DesktopHeapGetUserDelta/DesktopHeapAddressToUser.
 const PROCESSINFO_HEAP_MAPPINGS_OFF: u64 = 0x340;
@@ -10971,6 +10994,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         let result = dispatch_win32_job_callout(a0, a1 as u32, a2);
         return (result as u32 as i32, result);
     }
+    if ssn == SSN_WIN32_JOB_ATOM {
+        let result = dispatch_win32_job_atom(a0, a1, a2, a3);
+        return (result as u32 as i32, result);
+    }
     let output_stage_valid = a0 >= WIN32K_MESSAGE_STAGE_BASE
         && a0 < WIN32K_MESSAGE_STAGE_BASE + 0x1000
         && (a0 - WIN32K_MESSAGE_STAGE_BASE) % WIN32K_MESSAGE_STAGE_SLOT_BYTES == 0;
@@ -11132,6 +11159,8 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
     } else if let Some(denied_result) = enforce_win32_job_ui_policy(ssn, a0, a1) {
         denied_result
+    } else if matches!(ssn, 0x1036 | 0x10AD) {
+        dispatch_ssn_with_job_atom_namespace(process_index, ssn, a0, a1, a2, a3)
     } else {
         dispatch_ssn(ssn, a0, a1, a2, a3)
     };
@@ -11232,8 +11261,6 @@ fn restricted_ui_operation(ssn: u64, a0: u64, a1: u64) -> Option<nt_win32k_job::
             Some(UiOperation::ChangeSystemParameters)
         }
         0x122A => Some(UiOperation::ChangeDisplaySettings),
-        // Registered window messages and atom-name queries use the session global atom namespace.
-        0x1036 | 0x10AD => Some(UiOperation::AccessGlobalAtoms),
         // The NT contract restricts desktop creation and switching, not ordinary open/query use.
         SSN_NT_USER_CREATE_DESKTOP | SSN_NT_USER_SWITCH_DESKTOP => {
             Some(UiOperation::CreateOrSwitchDesktop)
@@ -11242,6 +11269,113 @@ fn restricted_ui_operation(ssn: u64, a0: u64, a1: u64) -> Option<nt_win32k_job::
         0x10E5 if a1 as u32 == 5 => Some(UiOperation::ExitWindows),
         _ => None,
     }
+}
+
+unsafe fn dispatch_win32_job_atom(job: u64, operation: u64, value: u64, capacity: u64) -> u64 {
+    let stage = WIN32K_JOB_ATOM_VADDR;
+    let payload = stage + WIN32K_JOB_ATOM_PAYLOAD_OFF;
+    let policy = win32_job_ui_policy();
+    match operation {
+        WIN32_JOB_ATOM_ADD_NAME | WIN32_JOB_ATOM_FIND_NAME => {
+            let byte_len = value as usize;
+            if byte_len > nt_kernel_exec::rtl_atom::NAME_CAP * 2 || byte_len & 1 != 0 {
+                return nt_win32k_job::STATUS_INVALID_PARAMETER as u64;
+            }
+            let name = core::slice::from_raw_parts(payload as *const u16, byte_len / 2);
+            let result = if operation == WIN32_JOB_ATOM_ADD_NAME {
+                policy.add_atom_name(job, name)
+            } else {
+                policy.find_atom_name(job, name)
+            };
+            match result {
+                Ok(atom) => {
+                    write_volatile(stage as *mut u16, atom);
+                    nt_win32k_job::STATUS_SUCCESS as u64
+                }
+                Err(status) => status as u64,
+            }
+        }
+        WIN32_JOB_ATOM_ADD_INTEGER | WIN32_JOB_ATOM_FIND_INTEGER => {
+            let result = if operation == WIN32_JOB_ATOM_ADD_INTEGER {
+                policy.add_integer_atom(job, value as u16)
+            } else {
+                policy.find_integer_atom(job, value as u16)
+            };
+            match result {
+                Ok(atom) => {
+                    write_volatile(stage as *mut u16, atom);
+                    nt_win32k_job::STATUS_SUCCESS as u64
+                }
+                Err(status) => status as u64,
+            }
+        }
+        WIN32_JOB_ATOM_DELETE => policy.delete_atom(job, value as u16) as u64,
+        WIN32_JOB_ATOM_QUERY => {
+            let name_capacity = (capacity as u32)
+                .min(((WIN32K_JOB_ATOM_BYTES as u64 - WIN32K_JOB_ATOM_PAYLOAD_OFF) / 2 * 2) as u32);
+            let mut name = [0u16; nt_kernel_exec::rtl_atom::NAME_CAP + 1];
+            let result = policy.query_atom(job, value as u16, &mut name, name_capacity);
+            write_volatile((stage + 4) as *mut u32, result.reference_count);
+            write_volatile((stage + 8) as *mut u32, result.pin_count);
+            write_volatile((stage + 12) as *mut u32, result.name_length);
+            if result.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
+                let bytes = (result.name_length as usize).min(name.len() * 2);
+                core::ptr::copy_nonoverlapping(name.as_ptr() as *const u8, payload as *mut u8, bytes);
+            }
+            result.status as u64
+        }
+        WIN32_JOB_ATOM_LIST => {
+            let slots = (capacity as usize).min(
+                (WIN32K_JOB_ATOM_BYTES - WIN32K_JOB_ATOM_PAYLOAD_OFF as usize) / 2,
+            );
+            let atoms = core::slice::from_raw_parts_mut(payload as *mut u16, slots);
+            let result = policy.list_atoms(job, atoms);
+            write_volatile((stage + 16) as *mut u32, result.count as u32);
+            result.status as u64
+        }
+        _ => nt_win32k_job::STATUS_INVALID_PARAMETER as u64,
+    }
+}
+
+unsafe fn dispatch_ssn_with_job_atom_namespace(
+    process_index: usize,
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> u64 {
+    let process = process_ctx_w32process(process_index);
+    let cell = (WIN32K_CODE_VA + G_ATOM_TABLE_RVA) as *mut u64;
+    let previous = read_volatile(cell);
+    let mut session = WIN32K_SESSION_ATOM_TABLE.load(Ordering::Acquire);
+    if session == 0 && previous != 0 {
+        let _ = WIN32K_SESSION_ATOM_TABLE.compare_exchange(
+            0,
+            previous,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        session = WIN32K_SESSION_ATOM_TABLE.load(Ordering::Acquire);
+    }
+    if session == 0 {
+        return nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES as u64;
+    }
+
+    let policy = win32_job_ui_policy();
+    let restrictions = policy.restrictions_for_process(process);
+    let selected = if restrictions & nt_win32k_job::JOB_OBJECT_UILIMIT_GLOBALATOMS != 0 {
+        let Some(table) = policy.private_atom_table_for_process(process) else {
+            return nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES as u64;
+        };
+        table
+    } else {
+        session
+    };
+    write_volatile(cell, selected);
+    let result = dispatch_ssn(ssn, a0, a1, a2, a3);
+    write_volatile(cell, previous);
+    result
 }
 
 /// Return the API-appropriate failure value when the current W32PROCESS is denied by its job.

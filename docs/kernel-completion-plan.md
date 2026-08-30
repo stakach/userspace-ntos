@@ -17403,3 +17403,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     provider-owned semantics next, including teardown and host tests, then connect token restrictions
     through the Security Manager. Working-set limits remain disabled until real resident trimming and
     pageout exist.
+
+    Per-job global-atom namespace checkpoint (2026-08-30, accepted; handle/broadcast/hook semantics
+    remain): `JOB_OBJECT_UILIMIT_GLOBALATOMS` now selects a persistent provider-owned atom namespace
+    for the job instead of denying atom operations. Each win32k job policy owns its exact RTL atom
+    table. Enabling the restriction allocates that table before publishing the mask, clearing and
+    re-enabling the flag preserves the namespace for the lifetime of the job, and successful EJOB
+    rundown destroys it with the rest of the provider policy. Allocation or provider failures leave
+    both Ps policy and the existing namespace unchanged.
+
+    Native `NtAddAtom`, `NtFindAtom`, `NtDeleteAtom`, and `NtQueryInformationAtom` calls select the
+    private namespace only when the current process is an active member of a job whose authoritative
+    provider policy enables global-atom isolation. Win32k's registered-message and atom-name paths use
+    the same selection: the provider temporarily installs the chosen table only around the real
+    `NtUserRegisterWindowMessage` or `NtUserGetAtomName` dispatch and restores the session table on
+    every return. Unrestricted callers continue through the original session namespace. The executive
+    passes only a pointer-free operation record through a dedicated shared staging page; no provider
+    address, raw RTL table pointer, executable identity, or synthetic atom result crosses the boundary.
+
+    Focused validation passes `nt-win32k-job` `7/7` and `nt-kernel-exec` `173/173`; formatting,
+    `git diff --check`, and the freestanding executive check pass at the established 209-warning
+    baseline. Serialized proof `.tmp/run-headless-job-atoms-final-20260830.log` records the complete
+    provider and atom lifecycle as `0x7ff/0x7ff`, dynamically launches userinit and Explorer, completes
+    668 real api0 redirects with zero callback failures, installs 18 client WndProcs without replay,
+    reaches Explorer paint begin/end `5/20` with 187 direct GDI returns and 135 batch flushes covering
+    184 records, paints `480000/480000` framebuffer pixels with at least 32 colours, passes all
+    `297/297` checks, and matches the sentinel.
+
+    Review adjustment: global-atom isolation is closed. The next UI slice is
+    `JOB_OBJECT_UILIMIT_HANDLES`: implement the real `NtUserUserHandleGrantAccess` exception against
+    provider-owned job identity, then enforce job-scoped broadcasts and hooks through the same
+    membership boundary and remove any superseded deny-only handling. Keep Ps authoritative for EJOB
+    identity and membership and keep USER object ownership/enforcement inside win32k. Once host tests
+    and a serialized desktop run close that slice, connect job token restrictions through the Security
+    Manager. The pinned ReactOS win32k image metadata used to locate its session atom-table cell remains
+    version-validated at load time; move it into generated image metadata when the existing RVA catalog
+    is replaced rather than creating a second runtime-discovery mechanism here.
