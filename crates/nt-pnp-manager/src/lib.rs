@@ -10,6 +10,10 @@
 
 extern crate alloc;
 
+mod bus_relations;
+
+pub use bus_relations::*;
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 

@@ -18361,3 +18361,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     proof remove the overlapping eager demand-start devnode launch plan and make historical
     `PlugPlayControlStartDevice` validate canonical lifecycle state instead of returning permissive
     success.
+
+    B3 bus-relations transaction foundation (2026-08-30): `nt-pnp-manager` now owns a separate
+    growable relation table for every bus object. A bus supplies one complete set of child PDOs only
+    after PnP has queried each child's device, instance, hardware, and compatible IDs; service
+    selection is intentionally absent from this bus-owned identity. Boot-discovered relation sets
+    can be seeded as a comparison baseline without manufacturing arrivals.
+
+    Live relation queries use an exact prepare/commit transaction. Preparation validates the
+    complete set, rejects duplicate PDOs/devnodes and unstable PDO-to-instance identity, reserves all
+    storage needed by commit, and produces stable ordered arrival/change/removal deltas while leaving
+    accepted relations unchanged. After the corresponding CM mutations and explicit actions are
+    durably published, committing that exact generation-fenced owner changes PnP relation state
+    without allocation. Different buses share the serialized PnP generation, so a concurrently
+    committed relation invalidates an older prepared owner instead of allowing it to overwrite
+    newer topology.
+
+    Focused `nt-pnp-manager` validation passes `25/25`, including boot seeding, abort-before-commit,
+    multi-bus isolation, stable change ordering, duplicate/conflicting identity rejection, and stale
+    transaction fencing. Review adjustment: this closes only the pure relation/diff ownership
+    primitive. Next add the hosted-driver `IoInvalidateDeviceRelations` import and a growable
+    executive-owned invalidation queue keyed by canonical bus PDO. The PnP worker must dispatch one
+    real `IRP_MN_QUERY_DEVICE_RELATIONS(BusRelations)`, query every returned PDO's IDs through the
+    driver stack, prepare the relation transaction, resolve installed function-driver policy, and
+    publish its complete Enum mutations plus explicit CM actions before committing the relation
+    owner. No milestone-triggered relation or executive-authored child identity is acceptable.
