@@ -1,6 +1,236 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// Exact ownership of one queued `IoInvalidateDeviceRelations` request. The PDO is represented by
+/// its canonical I/O Manager device ID rather than a hosted address, so queue ownership survives
+/// component-local projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceRelationInvalidation {
+    pub pdo_device_id: u64,
+    pub relation_type: u32,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRelationInvalidationDisposition {
+    Queued,
+    Coalesced,
+    Requeued,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnqueuedDeviceRelationInvalidation {
+    pub disposition: DeviceRelationInvalidationDisposition,
+    pub invalidation: DeviceRelationInvalidation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRelationInvalidationError {
+    InvalidPdo,
+    SequenceExhausted,
+    InsufficientResources,
+    StaleClaim,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceRelationInvalidationState {
+    Pending {
+        sequence: u64,
+    },
+    Claimed {
+        sequence: u64,
+        requeue_sequence: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceRelationInvalidationRow {
+    pdo_device_id: u64,
+    relation_type: u32,
+    state: DeviceRelationInvalidationState,
+}
+
+/// Lossless executive-facing invalidation queue.
+///
+/// Repeated invalidations coalesce while pending. Once a worker owns a query, the first new
+/// invalidation reserves a later sequence and therefore survives completion of the in-flight
+/// query. Claim, completion, and abort allocate nothing.
+#[derive(Default)]
+pub struct DeviceRelationInvalidationQueue {
+    next_sequence: u64,
+    rows: Vec<DeviceRelationInvalidationRow>,
+}
+
+impl DeviceRelationInvalidationQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn enqueue(
+        &mut self,
+        pdo_device_id: u64,
+        relation_type: u32,
+    ) -> Result<EnqueuedDeviceRelationInvalidation, DeviceRelationInvalidationError> {
+        if pdo_device_id == 0 {
+            return Err(DeviceRelationInvalidationError::InvalidPdo);
+        }
+        if let Some(index) = self.rows.iter().position(|row| {
+            row.pdo_device_id == pdo_device_id && row.relation_type == relation_type
+        }) {
+            return match self.rows[index].state {
+                DeviceRelationInvalidationState::Pending { sequence } => {
+                    Ok(EnqueuedDeviceRelationInvalidation {
+                        disposition: DeviceRelationInvalidationDisposition::Coalesced,
+                        invalidation: DeviceRelationInvalidation {
+                            pdo_device_id,
+                            relation_type,
+                            sequence,
+                        },
+                    })
+                }
+                DeviceRelationInvalidationState::Claimed {
+                    requeue_sequence: Some(sequence),
+                    ..
+                } => Ok(EnqueuedDeviceRelationInvalidation {
+                    disposition: DeviceRelationInvalidationDisposition::Coalesced,
+                    invalidation: DeviceRelationInvalidation {
+                        pdo_device_id,
+                        relation_type,
+                        sequence,
+                    },
+                }),
+                DeviceRelationInvalidationState::Claimed {
+                    sequence,
+                    requeue_sequence: None,
+                } => {
+                    let requeue_sequence = self.allocate_sequence()?;
+                    self.rows[index].state = DeviceRelationInvalidationState::Claimed {
+                        sequence,
+                        requeue_sequence: Some(requeue_sequence),
+                    };
+                    Ok(EnqueuedDeviceRelationInvalidation {
+                        disposition: DeviceRelationInvalidationDisposition::Requeued,
+                        invalidation: DeviceRelationInvalidation {
+                            pdo_device_id,
+                            relation_type,
+                            sequence: requeue_sequence,
+                        },
+                    })
+                }
+            };
+        }
+
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| DeviceRelationInvalidationError::InsufficientResources)?;
+        let sequence = self.allocate_sequence()?;
+        self.rows.push(DeviceRelationInvalidationRow {
+            pdo_device_id,
+            relation_type,
+            state: DeviceRelationInvalidationState::Pending { sequence },
+        });
+        Ok(EnqueuedDeviceRelationInvalidation {
+            disposition: DeviceRelationInvalidationDisposition::Queued,
+            invalidation: DeviceRelationInvalidation {
+                pdo_device_id,
+                relation_type,
+                sequence,
+            },
+        })
+    }
+
+    pub fn claim_front(&mut self) -> Option<DeviceRelationInvalidation> {
+        let (index, sequence) = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| match row.state {
+                DeviceRelationInvalidationState::Pending { sequence } => Some((index, sequence)),
+                DeviceRelationInvalidationState::Claimed { .. } => None,
+            })
+            .min_by_key(|(_, sequence)| *sequence)?;
+        let row = &mut self.rows[index];
+        row.state = DeviceRelationInvalidationState::Claimed {
+            sequence,
+            requeue_sequence: None,
+        };
+        Some(DeviceRelationInvalidation {
+            pdo_device_id: row.pdo_device_id,
+            relation_type: row.relation_type,
+            sequence,
+        })
+    }
+
+    pub fn complete(
+        &mut self,
+        claim: DeviceRelationInvalidation,
+    ) -> Result<(), DeviceRelationInvalidationError> {
+        let index = self.claimed_row_index(claim)?;
+        match self.rows[index].state {
+            DeviceRelationInvalidationState::Claimed {
+                requeue_sequence: Some(sequence),
+                ..
+            } => {
+                self.rows[index].state = DeviceRelationInvalidationState::Pending { sequence };
+            }
+            DeviceRelationInvalidationState::Claimed {
+                requeue_sequence: None,
+                ..
+            } => {
+                self.rows.remove(index);
+            }
+            DeviceRelationInvalidationState::Pending { .. } => unreachable!(),
+        }
+        Ok(())
+    }
+
+    pub fn abort(
+        &mut self,
+        claim: DeviceRelationInvalidation,
+    ) -> Result<(), DeviceRelationInvalidationError> {
+        let index = self.claimed_row_index(claim)?;
+        self.rows[index].state = DeviceRelationInvalidationState::Pending {
+            sequence: claim.sequence,
+        };
+        Ok(())
+    }
+
+    fn allocate_sequence(&mut self) -> Result<u64, DeviceRelationInvalidationError> {
+        let sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(DeviceRelationInvalidationError::SequenceExhausted)?;
+        self.next_sequence = sequence;
+        Ok(sequence)
+    }
+
+    fn claimed_row_index(
+        &self,
+        claim: DeviceRelationInvalidation,
+    ) -> Result<usize, DeviceRelationInvalidationError> {
+        self.rows
+            .iter()
+            .position(|row| {
+                row.pdo_device_id == claim.pdo_device_id
+                    && row.relation_type == claim.relation_type
+                    && matches!(
+                        row.state,
+                        DeviceRelationInvalidationState::Claimed { sequence, .. }
+                            if sequence == claim.sequence
+                    )
+            })
+            .ok_or(DeviceRelationInvalidationError::StaleClaim)
+    }
+}
+
 /// Identity returned by a bus for one child PDO after PnP has completed the child's QUERY_ID
 /// requests. Service selection is deliberately absent: buses describe hardware, while CM/setup
 /// policy binds that identity to a function driver.
@@ -508,5 +738,132 @@ mod tests {
             child(10, "0001", &["A"]).enum_instance_path(),
             r"ROOT\USERSPACE_NTOS_LIVE\0001"
         );
+    }
+
+    #[test]
+    fn pending_device_relation_invalidations_coalesce() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let first = queue.enqueue(10, 0).unwrap();
+        let duplicate = queue.enqueue(10, 0).unwrap();
+        assert_eq!(
+            first.disposition,
+            DeviceRelationInvalidationDisposition::Queued
+        );
+        assert_eq!(
+            duplicate.disposition,
+            DeviceRelationInvalidationDisposition::Coalesced
+        );
+        assert_eq!(duplicate.invalidation, first.invalidation);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.claim_front(), Some(first.invalidation));
+        assert_eq!(queue.claim_front(), None);
+        assert_eq!(queue.complete(first.invalidation), Ok(()));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn invalidation_during_claim_is_not_lost() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let first = queue.enqueue(10, 0).unwrap().invalidation;
+        let claim = queue.claim_front().unwrap();
+        assert_eq!(claim, first);
+
+        let follow_up = queue.enqueue(10, 0).unwrap();
+        assert_eq!(
+            follow_up.disposition,
+            DeviceRelationInvalidationDisposition::Requeued
+        );
+        assert!(follow_up.invalidation.sequence > claim.sequence);
+        let duplicate = queue.enqueue(10, 0).unwrap();
+        assert_eq!(
+            duplicate.disposition,
+            DeviceRelationInvalidationDisposition::Coalesced
+        );
+        assert_eq!(duplicate.invalidation, follow_up.invalidation);
+
+        queue.complete(claim).unwrap();
+        assert_eq!(queue.claim_front(), Some(follow_up.invalidation));
+        queue.complete(follow_up.invalidation).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn abort_retries_the_exact_claim_without_allocation() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let original = queue.enqueue(10, 0).unwrap().invalidation;
+        let claim = queue.claim_front().unwrap();
+        queue.abort(claim).unwrap();
+        assert_eq!(queue.claim_front(), Some(original));
+    }
+
+    #[test]
+    fn abort_absorbs_a_later_invalidation_into_the_retry() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let original = queue.enqueue(10, 0).unwrap().invalidation;
+        let claim = queue.claim_front().unwrap();
+        let later = queue.enqueue(10, 0).unwrap().invalidation;
+        assert!(later.sequence > original.sequence);
+        queue.abort(claim).unwrap();
+        assert_eq!(queue.claim_front(), Some(original));
+        queue.complete(original).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queue_orders_independent_pdos_and_relation_types_by_sequence() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let first = queue.enqueue(20, 1).unwrap().invalidation;
+        let second = queue.enqueue(10, 0).unwrap().invalidation;
+        let third = queue.enqueue(20, 0).unwrap().invalidation;
+        assert_eq!(queue.claim_front(), Some(first));
+        assert_eq!(queue.claim_front(), Some(second));
+        queue.complete(second).unwrap();
+        assert_eq!(queue.claim_front(), Some(third));
+        queue.complete(first).unwrap();
+        queue.complete(third).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn completion_and_abort_require_the_exact_live_claim() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let pending = queue.enqueue(10, 0).unwrap().invalidation;
+        assert_eq!(
+            queue.complete(pending),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        let claim = queue.claim_front().unwrap();
+        let wrong = DeviceRelationInvalidation {
+            sequence: claim.sequence + 1,
+            ..claim
+        };
+        assert_eq!(
+            queue.complete(wrong),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        assert_eq!(
+            queue.abort(wrong),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        queue.complete(claim).unwrap();
+        assert_eq!(
+            queue.complete(claim),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+    }
+
+    #[test]
+    fn invalid_pdo_and_sequence_exhaustion_fail_without_queueing() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        assert_eq!(
+            queue.enqueue(0, 0),
+            Err(DeviceRelationInvalidationError::InvalidPdo)
+        );
+        queue.next_sequence = u64::MAX;
+        assert_eq!(
+            queue.enqueue(10, 0),
+            Err(DeviceRelationInvalidationError::SequenceExhausted)
+        );
+        assert!(queue.is_empty());
     }
 }

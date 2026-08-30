@@ -18386,3 +18386,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     driver stack, prepare the relation transaction, resolve installed function-driver policy, and
     publish its complete Enum mutations plus explicit CM actions before committing the relation
     owner. No milestone-triggered relation or executive-authored child identity is acceptable.
+
+    B3 device-relations invalidation ingress (2026-08-30): hosted NT drivers now resolve the real
+    `IoInvalidateDeviceRelations` import through the existing component service transport. The
+    executive authenticates the caller's projected PDO against its hosted domain, resolves it to
+    the canonical I/O Manager device ID, and verifies that PnP owns a live devnode for that PDO.
+    No component address, driver name, service identity, or boot milestone becomes queue identity.
+
+    `nt-pnp-manager` now owns the growable invalidation queue keyed by canonical PDO and raw WDM
+    relation type. Pending duplicates coalesce. An invalidation received while a worker holds a
+    claim reserves a later sequence and survives completion of that query; abort retries the exact
+    original claim and absorbs any later edge into that retry. Claim, completion, and abort allocate
+    nothing and reject stale identities exactly. Because the NT import returns `void`, an invalid
+    PDO, exhausted sequence, or allocation failure fail-stops instead of silently losing topology
+    work.
+
+    Focused `nt-pnp-manager` validation passes `32/32`; formatting, `git diff --check`, and the
+    freestanding executive check pass at the unchanged 209-warning baseline. Review adjustment:
+    invalidation ingress is complete but no consumer is claimed yet. Next add a serialized PnP
+    worker that claims one invalidation, sends a real `IRP_MN_QUERY_DEVICE_RELATIONS` through the
+    canonical top-of-stack route, and retains or aborts that exact queue owner across pending,
+    malformed, and transport-failure paths. Only the returned PDO array may drive subsequent
+    `IRP_MN_QUERY_ID` requests and CM publication.

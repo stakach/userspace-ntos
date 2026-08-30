@@ -4593,6 +4593,7 @@ const HOSTED_DEVICE_OP_QUERY_PROPERTY_BEGIN: u64 = 1;
 const HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL: u64 = 2;
 const HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT: u64 = 3;
 const HOSTED_DEVICE_OP_CLAIM_PORT_RANGE: u64 = 4;
+const HOSTED_DEVICE_OP_INVALIDATE_RELATIONS: u64 = 5;
 const HOSTED_DEVICE_ARG_DATA_OFF: u64 = FSD_ARG_BYTES;
 const HOSTED_DEVICE_ARG_DATA_CAP: u64 = REP_DATA_LEN as u64;
 const _: () =
@@ -5460,6 +5461,16 @@ unsafe fn hosted_device_claim_port_range(pdo: u64, start: u64, length: u64) -> i
         length,
     );
     status as u32 as i32
+}
+
+unsafe fn hosted_device_invalidate_relations(pdo: u64, relation_type: u32) {
+    let _ = call_on4(
+        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
+        HOSTED_DEVICE_OP_INVALIDATE_RELATIONS,
+        pdo,
+        relation_type as u64,
+        0,
+    );
 }
 
 unsafe fn broker_query_registry_path_value(
@@ -6720,6 +6731,14 @@ extern "win64" fn s_io_get_device_property(
         };
         trace_io_get_device_property(pdo, property, buffer_len, status, value);
         status
+    }
+}
+
+/// `void IoInvalidateDeviceRelations(PDEVICE_OBJECT PhysicalDeviceObject,
+/// DEVICE_RELATION_TYPE Type)`.
+extern "win64" fn s_io_invalidate_device_relations(pdo: u64, relation_type: u32) {
+    unsafe {
+        hosted_device_invalidate_relations(pdo, relation_type);
     }
 }
 
@@ -28883,6 +28902,10 @@ fn register_fsd_trampolines() -> bool {
         s_io_get_device_property as *const () as usize as u64,
     );
     reg.bind(
+        "IoInvalidateDeviceRelations",
+        s_io_invalidate_device_relations as *const () as usize as u64,
+    );
+    reg.bind(
         "IoRegisterDeviceInterface",
         s_io_register_device_interface as *const () as usize as u64,
     );
@@ -35884,12 +35907,20 @@ pub(crate) struct HostedIoPortFaultGrant {
 static mut HOSTED_DEVICE_BINDINGS: Option<Vec<HostedDeviceBinding>> = None;
 static mut HOSTED_ROOT_BUS: Option<nt_root_bus::RootBus> = None;
 static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
+static mut HOSTED_DEVICE_RELATION_INVALIDATIONS: Option<
+    nt_pnp_manager::DeviceRelationInvalidationQueue,
+> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
+
+static HOSTED_DEVICE_RELATION_INVALIDATION_CALLS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DEVICE_RELATION_INVALIDATION_QUEUED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DEVICE_RELATION_INVALIDATION_COALESCED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DEVICE_RELATION_INVALIDATION_REQUEUED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum HostedPnpTransactionPhase {
@@ -36224,6 +36255,15 @@ unsafe fn hosted_pnp_manager_mut() -> &'static mut nt_pnp_manager::PnpManager {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PNP_MANAGER);
     if slot.is_none() {
         *slot = Some(nt_pnp_manager::PnpManager::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_device_relation_invalidations_mut(
+) -> &'static mut nt_pnp_manager::DeviceRelationInvalidationQueue {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_INVALIDATIONS);
+    if slot.is_none() {
+        *slot = Some(nt_pnp_manager::DeviceRelationInvalidationQueue::new());
     }
     slot.as_mut().unwrap()
 }
@@ -36634,7 +36674,7 @@ unsafe fn clear_hosted_resource_projection(
     Ok(())
 }
 
-fn authenticated_hosted_root_pdo(
+fn authenticated_hosted_pdo(
     ch: &crate::spawn_hosts::PumpChannel,
     pdo_object: u64,
     active_reply_cap: u64,
@@ -36651,6 +36691,18 @@ fn authenticated_hosted_root_pdo(
     let device_id = io_manager_mut()
         .hosted_device_by_identity(identity, pdo_object)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if unsafe { hosted_pnp_manager_mut().devnode_for_pdo(device_id.raw()) }.is_none() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok((instance, inst, device_id))
+}
+
+fn authenticated_hosted_root_pdo(
+    ch: &crate::spawn_hosts::PumpChannel,
+    pdo_object: u64,
+    active_reply_cap: u64,
+) -> Result<(usize, DriverInstance, nt_io_manager::DeviceId), nt_status::NtStatus> {
+    let (instance, inst, device_id) = authenticated_hosted_pdo(ch, pdo_object, active_reply_cap)?;
     unsafe { hosted_root_bus_mut().pdo(device_id) }
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     Ok((instance, inst, device_id))
@@ -36795,8 +36847,57 @@ pub(crate) fn service_hosted_device(
             | HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL
             | HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT
             | HOSTED_DEVICE_OP_CLAIM_PORT_RANGE
+            | HOSTED_DEVICE_OP_INVALIDATE_RELATIONS
     ) {
         return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
+    if op == HOSTED_DEVICE_OP_INVALIDATE_RELATIONS {
+        let call = HOSTED_DEVICE_RELATION_INVALIDATION_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let relation_type = u32::try_from(arg2)
+            .unwrap_or_else(|_| panic!("IoInvalidateDeviceRelations received an invalid type"));
+        let (_, _, pdo_device_id) = authenticated_hosted_pdo(ch, pdo_object, active_reply_cap)
+            .unwrap_or_else(|status| {
+                panic!(
+                    "IoInvalidateDeviceRelations received a non-PDO or unauthenticated object: {status:?}"
+                )
+            });
+        let enqueued = unsafe {
+            hosted_device_relation_invalidations_mut().enqueue(pdo_device_id.raw(), relation_type)
+        }
+        .unwrap_or_else(|error| {
+            panic!("IoInvalidateDeviceRelations could not retain its request: {error:?}")
+        });
+        let disposition = match enqueued.disposition {
+            nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued => {
+                HOSTED_DEVICE_RELATION_INVALIDATION_QUEUED.fetch_add(1, Ordering::Relaxed);
+                1
+            }
+            nt_pnp_manager::DeviceRelationInvalidationDisposition::Coalesced => {
+                HOSTED_DEVICE_RELATION_INVALIDATION_COALESCED.fetch_add(1, Ordering::Relaxed);
+                2
+            }
+            nt_pnp_manager::DeviceRelationInvalidationDisposition::Requeued => {
+                HOSTED_DEVICE_RELATION_INVALIDATION_REQUEUED.fetch_add(1, Ordering::Relaxed);
+                3
+            }
+        };
+        if call <= 32 {
+            print_str(b"[pnp-invalidate] pdo=");
+            print_u64(pdo_device_id.raw());
+            print_str(b" type=");
+            print_u64(relation_type as u64);
+            print_str(b" sequence=");
+            print_u64(enqueued.invalidation.sequence);
+            print_str(b" disposition=");
+            print_u64(disposition);
+            print_str(b"\n");
+        }
+        return (
+            STATUS_SUCCESS,
+            enqueued.invalidation.sequence,
+            disposition,
+            0,
+        );
     }
     if op == HOSTED_DEVICE_OP_CLAIM_PORT_RANGE {
         let (projection_instance, inst, pdo_device_id) =
