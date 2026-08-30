@@ -3340,8 +3340,8 @@ unsafe fn hosted_instance_pool_free_unlocked(inst: DriverInstance, p: u64) -> bo
         if FSD_POOL_INVALID_FREES.fetch_add(1, Ordering::Relaxed) == 0 {
             print_str(b"[fsd-pool-invalid] executive free pointer=");
             print_hex64(p);
-            print_str(b" device=");
-            print_hex64(inst.device_id);
+            print_str(b" driver=");
+            print_hex64(inst.driver_id);
             print_str(b"\n");
         }
         return false;
@@ -15055,6 +15055,7 @@ struct HostedProviderMiniportInterruptShadow {
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
+    device_id: u64,
     dependent_component_va: u64,
     provider_component_va: u64,
     provider_component_owned_by_bridge: bool,
@@ -15069,6 +15070,7 @@ impl HostedProviderMiniportInterruptShadow {
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
+            device_id: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
             provider_component_owned_by_bridge: false,
@@ -15084,6 +15086,7 @@ struct HostedProviderMiniportTimerShadow {
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
+    device_id: u64,
     dependent_component_va: u64,
     provider_component_va: u64,
     callback_target: u64,
@@ -15100,6 +15103,7 @@ impl HostedProviderMiniportTimerShadow {
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
+            device_id: 0,
             dependent_component_va: 0,
             provider_component_va: 0,
             callback_target: 0,
@@ -15157,6 +15161,7 @@ impl HostedProviderCallbackParent {
 #[derive(Clone, Copy)]
 struct HostedProviderNdisWorkItemInvocation {
     token: Option<HostedOneShotCallbackToken>,
+    device_id: u64,
     dependent_context: u64,
     dependent_routine: u64,
     provider_routine_thunk: u64,
@@ -15167,6 +15172,7 @@ impl HostedProviderNdisWorkItemInvocation {
     const fn empty() -> Self {
         Self {
             token: None,
+            device_id: 0,
             dependent_context: 0,
             dependent_routine: 0,
             provider_routine_thunk: 0,
@@ -15176,6 +15182,7 @@ impl HostedProviderNdisWorkItemInvocation {
 
     const fn is_empty(self) -> bool {
         self.token.is_none()
+            && self.device_id == 0
             && self.dependent_context == 0
             && self.dependent_routine == 0
             && self.provider_routine_thunk == 0
@@ -15227,6 +15234,7 @@ struct HostedProviderNdisMiniportBlockMirror {
     owner: HostedProviderObjectOwner,
     provider_instance: usize,
     dependent_instance: usize,
+    device_id: u64,
     provider_component_va: u64,
     dependent_component_va: u64,
     packet_indicate_thunk: u64,
@@ -15253,6 +15261,7 @@ impl HostedProviderNdisMiniportBlockMirror {
             owner: EMPTY_HOSTED_PROVIDER_OBJECT_OWNER,
             provider_instance: 0,
             dependent_instance: 0,
+            device_id: 0,
             provider_component_va: 0,
             dependent_component_va: 0,
             packet_indicate_thunk: 0,
@@ -20445,16 +20454,11 @@ unsafe fn complete_provider_unicode_string_init(state: &ProviderMarshalState) {
 
 unsafe fn complete_provider_ndis_device_properties(
     state: &ProviderMarshalState,
-    dependent_inst: DriverInstance,
+    binding: Option<HostedDeviceBinding>,
 ) {
     if state.ndis_device_property_output_count == 0 {
         return;
     }
-    let binding = if dependent_inst.device_id == 0 {
-        None
-    } else {
-        hosted_device_binding_by_device_id(dependent_inst.device_id)
-    };
     let mut index = 0usize;
     while index < state.ndis_device_property_output_count {
         let output = state.ndis_device_property_outputs[index];
@@ -20464,7 +20468,7 @@ unsafe fn complete_provider_ndis_device_properties(
             NDIS_DEVICE_PROPERTY_FDO => binding
                 .map(|slot| slot.device_object)
                 .filter(|value| *value != 0)
-                .unwrap_or(dependent_inst.device_object),
+                .unwrap_or(0),
             NDIS_DEVICE_PROPERTY_NEXT => binding.map(|slot| slot.pdo_object).unwrap_or(0),
             NDIS_DEVICE_PROPERTY_ALLOCATED_RESOURCES
             | NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES => 0,
@@ -20481,8 +20485,8 @@ unsafe fn complete_provider_ndis_device_properties(
             print_hex64(value);
             print_str(b" binding=");
             print_u64(binding.is_some() as u64);
-            print_str(b" dep-dev=0x");
-            print_hex64(dependent_inst.device_object);
+            print_str(b" device-id=");
+            print_u64(binding.map(|binding| binding.device_id).unwrap_or(0));
             print_str(b"\n");
         }
         index += 1;
@@ -21041,9 +21045,10 @@ unsafe fn complete_provider_ndis_object_shadows(
     provider_inst: DriverInstance,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
+    dependent_binding: Option<HostedDeviceBinding>,
 ) {
     complete_provider_unicode_string_init(state);
-    complete_provider_ndis_device_properties(state, dependent_inst);
+    complete_provider_ndis_device_properties(state, dependent_binding);
     complete_provider_ndis_configuration_parameter(
         state,
         provider_instance,
@@ -21106,6 +21111,12 @@ unsafe fn find_hosted_provider_miniport_interrupt_shadow(
             && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_device_binding(
+                record.provider_instance,
+                record.dependent_instance,
+                record.device_id,
+            )
+            .is_some()
             && hosted_provider_object_owner_is_live(
                 record.owner,
                 record.provider_instance,
@@ -21127,6 +21138,9 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
 ) -> Result<(usize, HostedProviderMiniportInterruptShadow), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let binding = current_hosted_device_dispatch_binding(dependent_instance)
+        .filter(|binding| binding.projection_instance == provider_instance)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     if dependent_component_va == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -21136,6 +21150,7 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
         owner,
         provider_instance,
         dependent_instance,
+        device_id: binding.device_id,
         dependent_component_va,
         provider_component_va: 0,
         provider_component_owned_by_bridge: false,
@@ -21147,6 +21162,7 @@ unsafe fn allocate_hosted_provider_miniport_interrupt_shadow(
             record.present
                 && record.provider_instance == provider_instance
                 && record.dependent_instance == dependent_instance
+                && record.device_id == binding.device_id
                 && record.dependent_component_va == dependent_component_va
         }) {
             if record.owner != owner
@@ -21416,6 +21432,12 @@ unsafe fn find_hosted_provider_miniport_timer_shadow(
             && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_device_binding(
+                record.provider_instance,
+                record.dependent_instance,
+                record.device_id,
+            )
+            .is_some()
             && hosted_provider_object_owner_is_live(
                 record.owner,
                 record.provider_instance,
@@ -21445,6 +21467,12 @@ unsafe fn find_hosted_provider_miniport_timer_shadow_by_provider(
             && record.construction_state == HostedProviderConstructionState::Published
             && record.provider_instance == provider_instance
             && record.dependent_instance == dependent_instance
+            && hosted_provider_device_binding(
+                record.provider_instance,
+                record.dependent_instance,
+                record.device_id,
+            )
+            .is_some()
             && hosted_provider_object_owner_is_live(
                 record.owner,
                 record.provider_instance,
@@ -21480,6 +21508,9 @@ unsafe fn allocate_hosted_provider_miniport_timer_shadow(
 ) -> Result<(usize, HostedProviderMiniportTimerShadow), i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let binding = current_hosted_device_dispatch_binding(dependent_instance)
+        .filter(|binding| binding.projection_instance == provider_instance)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     let records = hosted_provider_miniport_timer_shadows_mut();
     if records.iter().all(|record| record.present) && records.try_reserve(1).is_err() {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
@@ -21507,6 +21538,7 @@ unsafe fn allocate_hosted_provider_miniport_timer_shadow(
         owner,
         provider_instance,
         dependent_instance,
+        device_id: binding.device_id,
         dependent_component_va,
         provider_component_va,
         callback_target: 0,
@@ -21928,6 +21960,10 @@ unsafe fn hosted_provider_ndis_work_item_shadow(
     };
     shadow.preparing = HostedProviderNdisWorkItemInvocation {
         token: Some(schedule_token),
+        device_id: current_hosted_device_dispatch_binding(dependent_instance)
+            .filter(|binding| binding.projection_instance == provider_instance)
+            .map(|binding| binding.device_id)
+            .unwrap_or(0),
         dependent_context,
         dependent_routine,
         provider_routine_thunk: thunk.run_va,
@@ -22511,6 +22547,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider(
                 record.provider_instance,
                 record.dependent_instance,
             )
+            && hosted_provider_ndis_miniport_block_binding(record).is_some()
             && record.provider_component_va == provider_component_va
         {
             return Some((index, record));
@@ -22538,6 +22575,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_provider_component(
                 record.provider_instance,
                 record.dependent_instance,
             )
+            && hosted_provider_ndis_miniport_block_binding(record).is_some()
             && record.provider_component_va == provider_component_va
         {
             return Some(record);
@@ -22567,6 +22605,7 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
                 record.provider_instance,
                 record.dependent_instance,
             )
+            && hosted_provider_ndis_miniport_block_binding(record).is_some()
             && record.dependent_component_va == dependent_component_va
         {
             return Some(record);
@@ -22575,8 +22614,37 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent(
     None
 }
 
-unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(
+fn hosted_provider_device_binding(
+    provider_instance: usize,
     dependent_instance: usize,
+    device_id: u64,
+) -> Option<HostedDeviceBinding> {
+    hosted_resource_binding_by_device_id(device_id).filter(|binding| {
+        binding.instance == dependent_instance
+            && binding.projection_instance == provider_instance
+            && hosted_driver_device_route_by_device_id(device_id).is_some_and(
+                |(route_instance, route_inst, route_object)| {
+                    route_instance == dependent_instance
+                        && route_inst.driver_id == binding.driver_id
+                        && route_object == binding.device_object
+                },
+            )
+    })
+}
+
+fn hosted_provider_ndis_miniport_block_binding(
+    mirror: HostedProviderNdisMiniportBlockMirror,
+) -> Option<HostedDeviceBinding> {
+    hosted_provider_device_binding(
+        mirror.provider_instance,
+        mirror.dependent_instance,
+        mirror.device_id,
+    )
+}
+
+unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent_device(
+    dependent_instance: usize,
+    device_id: u64,
 ) -> Option<HostedProviderNdisMiniportBlockMirror> {
     let Some(records) = hosted_provider_ndis_miniport_block_mirrors() else {
         return None;
@@ -22585,11 +22653,13 @@ unsafe fn hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(
         if record.present
             && record.construction_state == HostedProviderConstructionState::Published
             && record.dependent_instance == dependent_instance
+            && record.device_id == device_id
             && hosted_provider_object_owner_is_live(
                 record.owner,
                 record.provider_instance,
                 record.dependent_instance,
             )
+            && hosted_provider_ndis_miniport_block_binding(record).is_some()
         {
             return Some(record);
         }
@@ -22635,6 +22705,7 @@ unsafe fn reserve_hosted_provider_ndis_miniport_block_mirror(
 ) -> Option<usize> {
     if mirror.provider_component_va == 0
         || mirror.dependent_component_va == 0
+        || mirror.device_id == 0
         || mirror.provider_instance == mirror.dependent_instance
         || mirror.construction_state != HostedProviderConstructionState::Constructing
         || mirror.thunk_binding_count != 0
@@ -22643,6 +22714,7 @@ unsafe fn reserve_hosted_provider_ndis_miniport_block_mirror(
             mirror.provider_instance,
             mirror.dependent_instance,
         )
+        || hosted_provider_ndis_miniport_block_binding(mirror).is_none()
     {
         return None;
     }
@@ -22671,6 +22743,7 @@ unsafe fn store_hosted_provider_ndis_miniport_block_mirror_construction(
         || record.owner != mirror.owner
         || record.provider_instance != mirror.provider_instance
         || record.dependent_instance != mirror.dependent_instance
+        || record.device_id != mirror.device_id
         || record.provider_component_va != mirror.provider_component_va
         || record.dependent_component_va != mirror.dependent_component_va
     {
@@ -22896,6 +22969,7 @@ unsafe fn refresh_hosted_provider_ndis_miniport_block_mirrors_for_pair(
             && mirror.construction_state == HostedProviderConstructionState::Published
             && mirror.provider_instance == provider_instance
             && mirror.dependent_instance == dependent_instance
+            && hosted_provider_ndis_miniport_block_binding(mirror).is_some()
             && hosted_provider_object_owner_is_live(
                 mirror.owner,
                 mirror.provider_instance,
@@ -22927,6 +23001,9 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
 ) -> Result<HostedProviderNdisMiniportBlockMirror, i32> {
     let owner = hosted_provider_object_owner_for_pair(provider_instance, dependent_instance)
         .ok_or(STATUS_DEVICE_NOT_READY)?;
+    let binding = current_hosted_device_dispatch_binding(dependent_instance)
+        .filter(|binding| binding.projection_instance == provider_instance)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     let mirror_records = hosted_provider_ndis_miniport_block_mirrors_mut();
     if mirror_records.iter().all(|record| record.present) && mirror_records.try_reserve(1).is_err()
     {
@@ -22973,6 +23050,7 @@ unsafe fn allocate_hosted_provider_ndis_miniport_block_mirror(
         owner,
         provider_instance,
         dependent_instance,
+        device_id: binding.device_id,
         provider_component_va,
         dependent_component_va,
         ..HostedProviderNdisMiniportBlockMirror::empty()
@@ -23580,7 +23658,6 @@ unsafe fn provider_marshal_input_buffer(
     else {
         trace_provider_input_buffer_marshal_rejection(
             dependent_index,
-            dependent_inst,
             arg_value,
             bytes,
         );
@@ -23597,7 +23674,6 @@ unsafe fn provider_marshal_input_buffer(
 
 unsafe fn trace_provider_input_buffer_marshal_rejection(
     dependent_index: usize,
-    dependent_inst: DriverInstance,
     component_va: u64,
     bytes: u64,
 ) {
@@ -23608,13 +23684,14 @@ unsafe fn trace_provider_input_buffer_marshal_rejection(
     print_str(b"[provider-buffer-reject] dependent-inst=");
     print_u64(dependent_index as u64);
     print_str(b" device-id=");
-    print_u64(dependent_inst.device_id);
+    let binding = current_hosted_device_dispatch_binding(dependent_index);
+    print_u64(binding.map(|binding| binding.device_id).unwrap_or(0));
     print_str(b" va=");
     print_hex64(component_va);
     print_str(b" bytes=");
     print_u64(bytes);
-    if dependent_inst.device_id != 0 {
-        if let Some(state) = hosted_device_resource_state_by_device_id(dependent_inst.device_id) {
+    if let Some(binding) = binding {
+        if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
             print_str(b" state-inst=");
             print_u64(state.instance as u64);
             print_str(b" dma-va=");
@@ -23638,11 +23715,8 @@ unsafe fn provider_marshal_input_buffer_exec_va(
 ) -> Option<u64> {
     component_to_exec_va_for_instance(dependent_index, dependent_inst, component_va, bytes).or_else(
         || {
-            let device_id = dependent_inst.device_id;
-            if device_id == 0 {
-                return None;
-            }
-            let state = hosted_device_resource_state_by_device_id(device_id)?;
+            let binding = current_hosted_device_dispatch_binding(dependent_index)?;
+            let state = hosted_device_resource_state_by_device_id(binding.device_id)?;
             if state.instance != dependent_index {
                 return None;
             }
@@ -24102,10 +24176,9 @@ unsafe fn dma_common_subrange_exec_va(
     component_va: u64,
     bytes: u64,
 ) -> Option<u64> {
-    if inst.device_id == 0 {
-        return None;
-    }
-    let state = hosted_device_resource_state_by_device_id(inst.device_id)?;
+    let (instance, _) = instance_by_driver_id(inst.driver_id)?;
+    let binding = current_hosted_device_dispatch_binding(instance)?;
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)?;
     dma_common_allocation_record_covers(inst.exec_shared_va, component_va, bytes)?;
     hosted_dma_alias_for_component_va(state, component_va, bytes)
 }
@@ -25009,7 +25082,7 @@ unsafe fn prepare_provider_export_marshal(
                     policy.side_effect == HostedProviderExportSideEffect::NdisPacketFree;
                 state.ndis_packet_free_on_success = free_on_success;
                 if !free_on_success
-                    && hosted_resource_binding_by_device_id(dependent_inst.device_id).is_some()
+                    && current_hosted_device_dispatch_binding(dependent_index).is_some()
                 {
                     state.dma_state_copyback = true;
                 }
@@ -25331,7 +25404,7 @@ unsafe fn prepare_provider_export_marshal(
                 let Some(provider_inst) = instance(provider_instance) else {
                     return Err(STATUS_DEVICE_NOT_READY);
                 };
-                if hosted_resource_binding_by_device_id(dependent_inst.device_id).is_some() {
+                if current_hosted_device_dispatch_binding(dependent_index).is_some() {
                     state.dma_state_copyback = true;
                 }
                 provider_marshal_ndis_packet_array(
@@ -26385,11 +26458,8 @@ pub(crate) unsafe fn service_hosted_provider_export(
         &args,
         0,
     );
-    let dependent_binding = if dependent_inst.device_id == 0 {
-        None
-    } else {
-        hosted_resource_binding_by_device_id(dependent_inst.device_id)
-    };
+    let dependent_binding = current_hosted_device_dispatch_binding(dependent_index)
+        .and_then(|binding| hosted_resource_binding_by_device_id(binding.device_id));
     let marshal_state = match prepare_provider_export_marshal(
         policy,
         singleton.instance,
@@ -26578,6 +26648,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         provider_inst,
         dependent_index,
         dependent_inst,
+        dependent_binding,
     );
     complete_provider_export_marshal(
         policy,
@@ -26759,11 +26830,8 @@ unsafe fn dispatch_dependent_provider_callback(
     stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
 ) -> Result<u64, i32> {
     let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_binding = if dependent_inst.device_id == 0 {
-        None
-    } else {
-        hosted_resource_binding_by_device_id(dependent_inst.device_id)
-    };
+    let dependent_binding = current_hosted_device_dispatch_binding(record.dependent_instance)
+        .and_then(|binding| hosted_resource_binding_by_device_id(binding.device_id));
     if let Some(binding) = dependent_binding {
         restore_hosted_device_resource_state(binding, dependent_shared, false)
             .map_err(|status| status.raw())?;
@@ -27363,7 +27431,9 @@ unsafe fn service_ndis_send_callback(
         refreshed,
         true,
     )?;
-    if let Some(binding) = hosted_resource_binding_by_device_id(dependent_inst.device_id) {
+    if let Some(binding) = current_hosted_device_dispatch_binding(record.dependent_instance)
+        .and_then(|binding| hosted_resource_binding_by_device_id(binding.device_id))
+    {
         copy_provider_dma_state_to_bound_dependent(
             binding,
             dependent_inst.exec_shared_va,
@@ -27458,7 +27528,9 @@ unsafe fn service_ndis_send_packets_callback(
         }
         index += 1;
     }
-    if let Some(binding) = hosted_resource_binding_by_device_id(dependent_inst.device_id) {
+    if let Some(binding) = current_hosted_device_dispatch_binding(record.dependent_instance)
+        .and_then(|binding| hosted_resource_binding_by_device_id(binding.device_id))
+    {
         copy_provider_dma_state_to_bound_dependent(
             binding,
             dependent_inst.exec_shared_va,
@@ -27754,12 +27826,7 @@ unsafe fn provider_miniport_mirror_for_device_name(
             )
             .unwrap_or(false)
             {
-                let dependent_device_id = instance(mirror.dependent_instance)
-                    .map(|inst| inst.device_id)
-                    .unwrap_or(0);
-                if dependent_device_id != 0 {
-                    if let Some(binding) = hosted_resource_binding_by_device_id(dependent_device_id)
-                    {
+                if let Some(binding) = hosted_provider_ndis_miniport_block_binding(mirror) {
                         let provider_domain = HostedDomainIdentity {
                             domain_id: nt_io_manager::HostedDomainId(
                                 mirror.owner.provider_domain_id,
@@ -27772,7 +27839,6 @@ unsafe fn provider_miniport_mirror_for_device_name(
                         {
                             return Some((mirror, binding));
                         }
-                    }
                 }
             }
         }
@@ -28391,6 +28457,148 @@ unsafe fn service_ndis_work_item_callback(
     )
 }
 
+unsafe fn hosted_provider_miniport_binding_by_adapter_context(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    dependent_instance: usize,
+    adapter_context: u64,
+) -> Option<HostedDeviceBinding> {
+    if adapter_context == 0 {
+        return None;
+    }
+    let records = hosted_provider_ndis_miniport_block_mirrors()?;
+    let mut matched = None;
+    for mirror in records.iter().copied() {
+        if !mirror.present
+            || mirror.construction_state != HostedProviderConstructionState::Published
+            || mirror.provider_instance != provider_instance
+            || mirror.dependent_instance != dependent_instance
+            || !hosted_provider_object_owner_is_live(
+                mirror.owner,
+                mirror.provider_instance,
+                mirror.dependent_instance,
+            )
+        {
+            continue;
+        }
+        let Some(binding) = hosted_provider_ndis_miniport_block_binding(mirror) else {
+            continue;
+        };
+        let Some(block_exec) = component_to_exec_va_for_instance(
+            provider_instance,
+            provider_inst,
+            mirror.provider_component_va,
+            NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64 + 8,
+        ) else {
+            continue;
+        };
+        if read_unaligned(
+            (block_exec + NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64) as *const u64,
+        ) != adapter_context
+        {
+            continue;
+        }
+        if matched.is_some_and(|previous: HostedDeviceBinding| {
+            previous.device_id != binding.device_id
+        }) {
+            return None;
+        }
+        matched = Some(binding);
+    }
+    matched
+}
+
+fn hosted_provider_miniport_callback_adapter_context(
+    callback_offset: u64,
+    args: [u64; 4],
+) -> Result<Option<u64>, i32> {
+    match callback_offset {
+        NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => Ok(None),
+        NDIS_MINIPORT_CHECK_FOR_HANG_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_DISABLE_INTERRUPT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_ENABLE_INTERRUPT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_RETURN_PACKET_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_SEND_PACKETS_CALLBACK_OFFSET_X64 => Ok(Some(args[0])),
+        NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => Ok(Some(args[1])),
+        NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64
+        | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Ok(Some(args[2])),
+        _ => Err(STATUS_NOT_SUPPORTED),
+    }
+}
+
+unsafe fn hosted_provider_callback_device_binding(
+    provider_instance: usize,
+    provider_inst: DriverInstance,
+    record: HostedProviderCallbackRecord,
+    args: [u64; 4],
+) -> Result<Option<HostedDeviceBinding>, i32> {
+    let inherited = current_hosted_device_dispatch_binding(record.dependent_instance);
+    let derived = match record.callback_kind {
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => {
+            match hosted_provider_miniport_callback_adapter_context(record.callback_offset, args)? {
+                Some(adapter_context) => Some(
+                    hosted_provider_miniport_binding_by_adapter_context(
+                        provider_instance,
+                        provider_inst,
+                        record.dependent_instance,
+                        adapter_context,
+                    )
+                    .ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
+                ),
+                None => Some(inherited.ok_or(STATUS_INVALID_DEVICE_REQUEST)?),
+            }
+        }
+        HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => Some(
+            find_hosted_provider_miniport_timer_shadow_by_provider_dpc(
+                provider_instance,
+                record.dependent_instance,
+                args[0],
+            )
+            .and_then(|shadow| {
+                hosted_provider_device_binding(
+                    shadow.provider_instance,
+                    shadow.dependent_instance,
+                    shadow.device_id,
+                )
+            })
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
+        ),
+        HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => {
+            let (_, shadow) = find_hosted_provider_ndis_work_item_shadow_by_provider(
+                provider_instance,
+                args[0],
+            )
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+            if shadow.active.device_id == 0 {
+                None
+            } else {
+                Some(
+                    hosted_provider_device_binding(
+                        shadow.provider_instance,
+                        shadow.dependent_instance,
+                        shadow.active.device_id,
+                    )
+                    .ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
+                )
+            }
+        }
+        HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => inherited,
+        _ => return Err(STATUS_INVALID_PARAMETER),
+    };
+    if inherited.is_some_and(|binding| {
+        derived.is_some_and(|derived| derived.device_id != binding.device_id)
+    }) {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    Ok(derived)
+}
+
 pub(crate) unsafe fn service_hosted_provider_callback(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
@@ -28452,6 +28660,25 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     };
     record_provider_protocol_receive_request(record);
     let callback_args = [arg0, arg1, arg2, arg3];
+    let callback_binding = match hosted_provider_callback_device_binding(
+        provider_instance,
+        provider_inst,
+        record,
+        callback_args,
+    ) {
+        Ok(binding) => binding,
+        Err(status) => return hosted_provider_callback_failure(status),
+    };
+    let _device_dispatch_context = match callback_binding {
+        Some(binding) => match HostedDeviceDispatchContextGuard::enter(
+            record.dependent_instance,
+            binding,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(status) => return hosted_provider_callback_failure(status.raw()),
+        },
+        None => None,
+    };
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
     let dependent_shared = dependent_inst.exec_shared_va;
@@ -37464,15 +37691,17 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let fsctl = projection_fsctl(irp);
         let request = hosted_irp_dispatch_request(self.instance, irp, input_len, output_len)?;
+        let (route_instance, route_inst, device_object) =
+            hosted_driver_device_route_by_device_id(irp.device_id.raw())
+                .filter(|(instance, _, _)| *instance == self.instance)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
-            .filter(|binding| binding.instance == self.instance)
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let device_object = binding.device_object;
+            .filter(|binding| binding.instance == route_instance);
         let result = unsafe {
-            if let Some((index, inst)) = instance_by_driver_id(binding.driver_id) {
+            if let Some(binding) = binding {
                 match dispatch_video_irp_for_binding(
-                    index,
-                    inst,
+                    route_instance,
+                    route_inst,
                     binding,
                     irp.major as u64,
                     irp.minor as u64,
@@ -37502,7 +37731,23 @@ impl DriverDispatchBackend for HostedDriverBackend {
                     Err(status) => Some((status.raw(), 0, 0, false)),
                 }
             } else {
-                None
+                dispatch_irp_for_instance(
+                    route_instance,
+                    irp.major as u64,
+                    irp.minor as u64,
+                    device_object,
+                    irp.irp_id.raw(),
+                    irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
+                    fsctl,
+                    irp.user_data,
+                    irp.requestor_tid,
+                    Some(request),
+                    &input,
+                    &mut ctx.system_buffer[output_offset..output_end],
+                )
+                .map(|(status, information, file_context)| {
+                    (status, information, file_context, true)
+                })
             }
         };
         match result {
@@ -38240,6 +38485,102 @@ struct HostedDeviceBinding {
     pdo_object: u64,
     registry_identity_id: HostedRegistryIdentityId,
     used: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HostedDeviceDispatchContext {
+    instance: usize,
+    binding: HostedDeviceBinding,
+}
+
+static mut HOSTED_DEVICE_DISPATCH_CONTEXTS: Option<Vec<HostedDeviceDispatchContext>> = None;
+
+struct HostedDeviceDispatchContextGuard {
+    instance: usize,
+    device_id: u64,
+}
+
+impl HostedDeviceDispatchContextGuard {
+    unsafe fn enter(
+        instance: usize,
+        binding: HostedDeviceBinding,
+    ) -> Result<Self, nt_status::NtStatus> {
+        if !binding.used
+            || binding.instance != instance
+            || hosted_device_binding_by_device_id(binding.device_id).is_none_or(|current| {
+                current.driver_id != binding.driver_id
+                    || current.instance != binding.instance
+                    || current.projection_domain != binding.projection_domain
+                    || current.device_object != binding.device_object
+                    || current.pdo_object != binding.pdo_object
+            })
+            || hosted_driver_device_route_by_device_id(binding.device_id).is_none_or(
+                |(route_instance, route_inst, route_object)| {
+                    route_instance != instance
+                        || route_inst.driver_id != binding.driver_id
+                        || route_object != binding.device_object
+                },
+            )
+        {
+            return Err(nt_status::NtStatus::INVALID_PARAMETER);
+        }
+        let contexts = hosted_device_dispatch_contexts_mut();
+        contexts
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        contexts.push(HostedDeviceDispatchContext { instance, binding });
+        Ok(Self {
+            instance,
+            device_id: binding.device_id,
+        })
+    }
+}
+
+impl Drop for HostedDeviceDispatchContextGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let contexts = hosted_device_dispatch_contexts_mut();
+            let context = contexts
+                .pop()
+                .expect("hosted device dispatch context stack underflow");
+            assert!(
+                context.instance == self.instance && context.binding.device_id == self.device_id,
+                "hosted device dispatch context stack lost LIFO ownership"
+            );
+        }
+    }
+}
+
+unsafe fn hosted_device_dispatch_contexts_mut(
+) -> &'static mut Vec<HostedDeviceDispatchContext> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_DISPATCH_CONTEXTS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn current_hosted_device_dispatch_binding(instance: usize) -> Option<HostedDeviceBinding> {
+    let contexts = unsafe { (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS)).as_ref()? };
+    let binding = contexts
+        .iter()
+        .rev()
+        .find(|context| context.instance == instance)?
+        .binding;
+    hosted_device_binding_by_device_id(binding.device_id).filter(|current| {
+        current.driver_id == binding.driver_id
+            && current.instance == binding.instance
+            && current.projection_domain == binding.projection_domain
+            && current.device_object == binding.device_object
+            && current.pdo_object == binding.pdo_object
+            && hosted_driver_device_route_by_device_id(binding.device_id).is_some_and(
+                |(route_instance, route_inst, route_object)| {
+                    route_instance == binding.instance
+                        && route_inst.driver_id == binding.driver_id
+                        && route_object == binding.device_object
+                },
+            )
+    })
 }
 
 const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
@@ -40611,6 +40952,48 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
         .find(|slot| slot.used && slot.pdo_object != 0 && slot.pdo_object == pdo_object)
 }
 
+fn hosted_driver_device_route_by_device_id(
+    device_id: u64,
+) -> Option<(usize, DriverInstance, u64)> {
+    if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
+        let inst = instance(binding.instance)?;
+        if inst.driver_id != binding.driver_id {
+            return None;
+        }
+        let domain = instance_domain_identity(inst)?;
+        let (delete_pending, driver_id, device_object) = {
+            let device = io_manager_mut().device(nt_io_manager::DeviceId(device_id))?;
+            (
+                device.delete_pending,
+                device.driver_id.raw(),
+                device.object_id.0,
+            )
+        };
+        if delete_pending
+            || driver_id != binding.driver_id
+            || device_object != binding.device_object
+            || io_manager_mut().hosted_device_by_identity(domain, binding.device_object)
+                != Some(nt_io_manager::DeviceId(device_id))
+        {
+            return None;
+        }
+        return Some((binding.instance, inst, binding.device_object));
+    }
+
+    let (driver_id, device_object) = {
+        let device = io_manager_mut().device(nt_io_manager::DeviceId(device_id))?;
+        if device.delete_pending || device.object_id == ObjectId::NULL {
+            return None;
+        }
+        (device.driver_id.raw(), device.object_id.0)
+    };
+    let (instance_index, inst) = instance_by_driver_id(driver_id)?;
+    let domain = instance_domain_identity(inst)?;
+    (io_manager_mut().hosted_device_by_identity(domain, device_object)
+        == Some(nt_io_manager::DeviceId(device_id)))
+    .then_some((instance_index, inst, device_object))
+}
+
 unsafe fn hosted_power_devnode_by_device_object(device_object: u64) -> Option<u64> {
     if let Some(binding) = hosted_device_binding_by_device_object(device_object)
         .or_else(|| hosted_device_binding_by_pdo_object(device_object))
@@ -42235,8 +42618,10 @@ unsafe fn write_hosted_e1000_rx_stimulus_frame(
 }
 
 unsafe fn hosted_dc21x4_adapter_context(binding: HostedDeviceBinding) -> Option<u64> {
-    let mirror =
-        hosted_provider_ndis_miniport_block_mirror_by_dependent_instance(binding.instance)?;
+    let mirror = hosted_provider_ndis_miniport_block_mirror_by_dependent_device(
+        binding.instance,
+        binding.device_id,
+    )?;
     let dependent_inst = instance(binding.instance)?;
     let block_exec = component_to_exec_va_for_instance(
         binding.instance,
@@ -43310,9 +43695,7 @@ pub(crate) struct DriverInstance {
     pub hosted_domain_id: u64,
     pub hosted_domain_cookie: u64,
     pub driver_id: u64,
-    pub device_id: u64,
     pub driver_object: u64,
-    pub device_object: u64,
     pub driver_unload: u64,
     pub add_device: u64,
     pub ready: bool,
@@ -43351,9 +43734,7 @@ const EMPTY_INSTANCE: DriverInstance = DriverInstance {
     hosted_domain_id: 0,
     hosted_domain_cookie: 0,
     driver_id: 0,
-    device_id: 0,
     driver_object: 0,
-    device_object: 0,
     driver_unload: 0,
     add_device: 0,
     ready: false,
@@ -44133,9 +44514,7 @@ fn register_instance(dc: &DriverComponent) {
         hosted_domain_id: dc.hosted_domain_id,
         hosted_domain_cookie: dc.hosted_domain_cookie,
         driver_id: dc.driver_id,
-        device_id: dc.device_id,
         driver_object: dc.drvobj,
-        device_object: dc.devobj,
         driver_unload: dc.driver_unload,
         add_device: dc.add_device,
         // Default readiness = npfs's historic rule (parked + a control device object). A
@@ -46623,10 +47002,7 @@ unsafe fn call_add_device_for_existing_pdo(
             pdo_address,
         )?;
 
-        let table = driver_instances_mut();
-        table[index].device_id = device_id.raw();
-        table[index].device_object = add_device.fdo_object;
-        table[index].ready = true;
+        driver_instances_mut()[index].ready = true;
         Ok(device_id.raw())
     })();
 
@@ -48726,6 +49102,34 @@ unsafe fn dispatch_irp_for_instance_exact(
     if !dependent_inst.ready {
         return None;
     }
+    let canonical_request_route = dispatch_request
+        .as_ref()
+        .and_then(|request| hosted_driver_device_route_by_device_id(request.device_id));
+    if dispatch_request.is_some()
+        && canonical_request_route.is_none_or(|(instance, route_inst, route_object)| {
+            instance != inst
+                || route_inst.driver_id != dependent_inst.driver_id
+                || route_object != device_object
+        })
+    {
+        return Some(HostedIrpTransportResult::NotDispatched {
+            status: nt_status::NtStatus(STATUS_INVALID_PARAMETER),
+        });
+    }
+    let dispatch_binding = dispatch_request
+        .as_ref()
+        .and_then(|request| hosted_device_binding_by_device_id(request.device_id))
+        .or_else(|| hosted_device_binding_by_device_object(device_object))
+        .filter(|binding| binding.instance == inst && binding.driver_id == dependent_inst.driver_id);
+    let _device_dispatch_context = match dispatch_binding {
+        Some(binding) => match HostedDeviceDispatchContextGuard::enter(inst, binding) {
+            Ok(guard) => Some(guard),
+            Err(status) => {
+                return Some(HostedIrpTransportResult::NotDispatched { status });
+            }
+        },
+        None => None,
+    };
     let mut dispatch_index = inst;
     let mut d = dependent_inst;
     let mut sh = d.exec_shared_va;
@@ -48749,7 +49153,7 @@ unsafe fn dispatch_irp_for_instance_exact(
                 });
             }
             let binding = if let Some(request) = dispatch_request.as_ref() {
-                let binding = hosted_device_binding_by_device_id(request.device_id)?;
+                let binding = dispatch_binding?;
                 if binding.driver_id != request.driver_id
                     || binding.instance != inst
                     || binding.projection_instance != route.provider_instance
@@ -48762,7 +49166,7 @@ unsafe fn dispatch_irp_for_instance_exact(
                 }
                 binding
             } else {
-                hosted_device_binding_by_device_object(device_object)?
+                dispatch_binding?
             };
             if provider_inst.fault_ep == 0
                 || provider_inst.pml4 == 0
@@ -49823,16 +50227,7 @@ fn hosted_device_ready_for_dispatch(device_id: u64) -> bool {
 fn hosted_dispatch_instance_for_device_id(
     device_id: u64,
 ) -> Result<(usize, DriverInstance, u64), u32> {
-    let Some(binding) = hosted_device_binding_by_device_id(device_id) else {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    };
-    let Some(inst) = instance(binding.instance) else {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    };
-    if inst.driver_id != binding.driver_id {
-        return Err(STATUS_DEVICE_NOT_READY as u32);
-    }
-    Ok((binding.instance, inst, binding.device_object))
+    hosted_driver_device_route_by_device_id(device_id).ok_or(STATUS_DEVICE_NOT_READY as u32)
 }
 
 fn require_hosted_device_ready_for_dispatch(device_id: u64) -> Result<(), u32> {

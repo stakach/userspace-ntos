@@ -18891,3 +18891,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     per-device handle/mirror into each nested call, then delete both fields and their AddDevice
     writes together. NDIS miniport mirrors in particular must retain the device identity captured
     during exact START/initialize so callbacks remain correct with multiple NICs.
+
+    B3 exact hosted-device context checkpoint (2026-08-31, implementation green):
+    `DriverInstance.device_id` and `DriverInstance.device_object` are deleted, including their
+    load-time copies and AddDevice writes. Ordinary dispatch now distinguishes two dynamic routes:
+    PnP FDOs resolve through their exact live `HostedDeviceBinding`, while non-PnP control devices
+    such as NPFS resolve through the canonical I/O Manager `DeviceRecord`, authenticated hosted
+    domain, and live object identity. Neither route uses a cached last-created device.
+
+    A re-entrant executive-owned dispatch-context stack carries the exact PnP binding over the
+    component pump and every nested provider export/callback. Its RAII guard validates the live
+    binding on entry and enforces LIFO restoration, so nested dispatch cannot overwrite an outer
+    device. Provider resource projection, DMA aliasing/copyback, NDIS device-property results, and
+    diagnostics now consume only that scoped binding. Miniport-block mirrors retain the canonical
+    `DeviceId` captured during exact START/initialize and reject a stale binding. Miniport timer and
+    interrupt shadows do the same. Reusable NDIS work items retain the optional `DeviceId` per
+    queued invocation rather than per object, allowing one work item and one loaded miniport driver
+    to serve multiple adapters correctly.
+
+    Asynchronous miniport callback entry derives its binding from the durable miniport block and
+    the handler's native adapter-context argument, checked against the ReactOS NDIS 5 typedefs.
+    Timer and work-item callback entry derive it from their exact durable shadow/invocation. The
+    callback gate pushes that binding before restoring device resources or servicing nested NDIS
+    exports; a mismatch with an inherited synchronous context fails closed. Protocol callbacks
+    retain an inherited binding only when they are synchronously nested and otherwise remain
+    correctly device-neutral.
+
+    Formatting, `git diff --check`, focused `nt-io-manager` validation (`238/238`), focused
+    `nt-pnp-manager` validation (`46/46`), and the freestanding executive check pass at the
+    unchanged 209-warning baseline. The pre-existing `-no-shutdown` QEMU desktop proof still owns
+    the serialized boot lane, so no second desktop run was started for this checkpoint.
+
+    Review adjustment: the per-loaded-driver dispatch cache is gone. `DriverComponent.device_id`
+    and `devobj` still describe the device created during initial DriverEntry/control-device
+    publication and must now be audited separately. Keep them only where load readiness or initial
+    control-device publication genuinely requires the result of that specific DriverEntry; move
+    all later routing and lookup to canonical I/O Manager records, then delete any remaining
+    snapshot fields and `resolve_io_device` machinery that no longer owns a real lifetime. After
+    that audit, resume B3 at dynamic removal/stop rebalance and driver unload across multiple
+    independently bound devices.
