@@ -18247,19 +18247,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     instance exists.
 
     `nt-config-manager` now provides a growable generation-exact device-action journal over complete
-    semantic devnode publications. Initial mounted state seeds the baseline without manufacturing
-    arrival events. Later generations atomically diff case-insensitive instance identity, retain the
-    new launch binding for arrival/change and the last published binding for removal, order all
-    records by a monotonic sequence, and permit acknowledgement of only the exact head. Duplicate
-    instances, stale/repeated generations, stale acknowledgements, sequence exhaustion, and table
-    reservation failure leave both the baseline and pending queue unchanged. Focused validation is
-    green at `nt-config-manager` `33/33`.
+    semantic devnode topology. Initial mounted state seeds the baseline without manufacturing
+    arrival events. Later arrival, change, and removal records require an explicit bus/PnP-owned
+    `{kind, instance}` intent; ordinary registry mutations and whole-hive replacement cannot
+    manufacture hardware presence. Topology identity carries only the service name, not mutable
+    launch metadata such as `ImagePath`; the action owner resolves current launch policy when it
+    executes the action. Duplicate instances/intents, invalid transitions, stale generations or
+    acknowledgements, sequence exhaustion, and table reservation failure leave both the baseline
+    and pending queue unchanged.
 
-    Review adjustment: the journal is closed as a host-tested primitive but has no production caller
-    yet. Put it behind isolated CM, seed it during the first SYSTEM mount, publish the post-mutation
-    topology only as part of the same generation commit, and expose a bounded immutable
-    BEGIN/PULL/ABORT plus exact ACK transport. Then replace the executive's enumeration-index event
-    cursor and eager demand PnP boot cohort with one-at-a-time live device action. A driver START is
-    acknowledged only after terminal lifecycle publication; pending or indeterminate ownership must
-    retain the exact event. Separately exercise a genuine user-mode `NtLoadDriver` caller across the
-    existing asynchronous fixture and prove exactly one terminal reply.
+    B3 isolated-CM device-action transport (2026-08-30, corrected crate acceptance): checkpoint
+    `52f86180` first placed the journal behind CM and added bounded streaming. Review rejected its
+    automatic post-registry diff because it conflated registry metadata with device presence and
+    allowed a service-only edit to manufacture lifecycle. Corrective checkpoint `de14e050` removes
+    that machinery. `SystemHiveMutation::PublishDeviceAction` is now a non-registry semantic marker
+    carried in the same generation-checked, durability-ordered transaction as its Enum changes. CM
+    validates the complete prospective topology and reserves the explicit journal transition before
+    publishing the otherwise infallible hive and semantic-registry transactions. Ordinary desktop
+    SYSTEM commits avoid both topology reconstruction and a CM action peek; COMMIT returns only a
+    boolean pending-action wake edge.
+
+    CM ABI opcode `CM_OP_DEVICE_ACTION` exposes one exclusive immutable claim through bounded
+    `BEGIN`/`PULL`/`ABORT` frames. BEGIN fails busy while another claim exists, the opaque token
+    remains live after the final frame, and ACK requires that completed token plus the exact
+    generation/sequence head. Process-lifetime claim tokens remain distinct across reconstructed CM
+    server objects, preventing an old retained event from acknowledging a new server's head. The
+    client bounds decoded ID counts by remaining frame bytes and reconstructs an unbounded
+    hardware/compatible-ID set.
+
+    Focused serialized validation passes `nt-config-abi` `4/4`, `nt-config-manager` `33/33`,
+    `nt-config-server` `25/25`, and `nt-config-client` `19/19`. The multi-frame client test publishes
+    a demand-start device with 96 long hardware IDs, proves generic `ImagePath` mutation emits no
+    action, rejects competing claims and stale ACK, and verifies explicit arrival, topology change,
+    and removal retirement. Raw server coverage rejects wrong ABORT, premature ACK, and stale claim
+    tokens after server reconstruction. Formatting, `git diff --check`, and the freestanding
+    executive check pass at the established 209-warning baseline.
+
+    Review adjustment: isolated CM publication and claim transport are closed. Next add an executive
+    one-action state machine that retains the exact CM event while driver ownership is pending and
+    acknowledges only after both the user notification response and terminal lifecycle completion.
+    Keep the boot launch plan as the historical discovery path until a genuine user-mode PnP producer
+    creates a live generation; do not reinterpret the seeded baseline as synthetic arrival. Change
+    of a live stack and removal remain explicit barriers until stop/remove teardown exists. Once
+    runtime production and terminal acknowledgement are accepted, remove the overlapping eager
+    demand-start PnP path. Then change the existing asynchronous fixture to SCM auto-start so real
+    `services.exe` exercises the native `NtLoadDriver` reply owner and proves exactly one terminal
+    reply without kernel injection.
