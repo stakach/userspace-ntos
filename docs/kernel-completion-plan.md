@@ -18424,3 +18424,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     IRP through the canonical top of stack, retain pending completion identity, and copy the returned
     `DEVICE_RELATIONS` allocation through the owning component's validated pool alias before that
     allocation is released. Malformed pointers/counts and indeterminate transport remain barriers.
+
+    B3 hosted relation-query owner checkpoint (2026-08-30): the executive now advances at most one
+    device-relation invalidation after the canonical I/O completion pump, and never recursively from
+    the driver's `IoInvalidateDeviceRelations` service call. It prepares and dispatches a real typed
+    `IRP_MN_QUERY_DEVICE_RELATIONS` to the invalidated canonical PDO, snapshots the exact origin and
+    top-of-stack completion identities, and validates those identities again for a pending driver
+    completion before any result is consumed. A live lifecycle PnP owner or an indeterminate
+    lifecycle barrier keeps relation dispatch serialized.
+
+    The native x64 `DEVICE_RELATIONS` decoder is host-tested in `nt-pnp-manager`. It derives the PDO
+    array extent from `Count`, accepts allocator capacity beyond the counted prefix, and rejects a
+    truncated header/array, null PDO, duplicate PDO, size overflow, or failed owned-copy allocation.
+    The executive resolves the actual hosted provider instance that executed the top driver, locks
+    that component's pool, requires the returned pointer to name an exact live allocation, copies the
+    validated PDO values, and only then frees the driver allocation. A transient copy allocation
+    failure retains the pointer for retry. Pending completion ACK is strict and retried without
+    redispatch; malformed results, failed driver status, invalid pointers, failed release, and
+    indeterminate transport retain the exact invalidation as a barrier. Even a successful copied
+    array remains owned by the transaction and does not complete the invalidation yet.
+
+    Focused `nt-pnp-manager` validation passes `35/35`; formatting, `git diff --check`, and the
+    freestanding executive check pass at the unchanged 209-warning baseline. Review adjustment: the
+    relation-query transport and allocation lifetime are closed. The next boundary is not yet
+    `QUERY_ID`: every child PDO returned by a real bus must first have a canonical I/O Manager device
+    identity. Replace the last-created `SH_DEVOBJ` reconstruction with dynamic executive publication
+    for every successful hosted `IoCreateDevice`, and remove the overlapping post-DriverEntry and
+    post-AddDevice device creation. Then resolve each copied raw PDO through that authenticated
+    hosted-domain mapping and issue the complete real `BusQueryDeviceID`, `BusQueryInstanceID`,
+    `BusQueryHardwareIDs`, and `BusQueryCompatibleIDs` sequence before preparing any CM mutation.

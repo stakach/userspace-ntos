@@ -1,6 +1,61 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+/// Bytes before the first pointer in the native x64 `DEVICE_RELATIONS` layout. `Count` occupies
+/// the first four bytes and the pointer array is naturally aligned at offset eight.
+pub const DEVICE_RELATIONS_X64_HEADER_BYTES: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRelationsCopyError {
+    TruncatedHeader,
+    SizeOverflow,
+    TruncatedObjects,
+    NullPdo,
+    DuplicatePdo,
+    InsufficientResources,
+}
+
+/// Validate and copy one driver-owned native x64 `DEVICE_RELATIONS` allocation.
+///
+/// The input may include allocator capacity after the native object, so only the count-derived
+/// prefix is consumed. Copying the PDO values into PnP-owned storage lets the caller release the
+/// driver's allocation before issuing any child queries.
+pub fn copy_device_relations_x64(bytes: &[u8]) -> Result<Vec<u64>, DeviceRelationsCopyError> {
+    if bytes.len() < DEVICE_RELATIONS_X64_HEADER_BYTES {
+        return Err(DeviceRelationsCopyError::TruncatedHeader);
+    }
+    let count = u32::from_le_bytes(
+        bytes[..4]
+            .try_into()
+            .expect("four-byte DEVICE_RELATIONS count slice"),
+    ) as usize;
+    let objects_bytes = count
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(DeviceRelationsCopyError::SizeOverflow)?;
+    let required = DEVICE_RELATIONS_X64_HEADER_BYTES
+        .checked_add(objects_bytes)
+        .ok_or(DeviceRelationsCopyError::SizeOverflow)?;
+    if required > bytes.len() {
+        return Err(DeviceRelationsCopyError::TruncatedObjects);
+    }
+
+    let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(count)
+        .map_err(|_| DeviceRelationsCopyError::InsufficientResources)?;
+    for encoded in bytes[DEVICE_RELATIONS_X64_HEADER_BYTES..required].chunks_exact(8) {
+        let object = u64::from_le_bytes(encoded.try_into().expect("eight-byte PDO slice"));
+        if object == 0 {
+            return Err(DeviceRelationsCopyError::NullPdo);
+        }
+        if objects.contains(&object) {
+            return Err(DeviceRelationsCopyError::DuplicatePdo);
+        }
+        objects.push(object);
+    }
+    Ok(objects)
+}
+
 /// Exact ownership of one queued `IoInvalidateDeviceRelations` request. The PDO is represented by
 /// its canonical I/O Manager device ID rather than a hosted address, so queue ownership survives
 /// component-local projections.
@@ -583,6 +638,19 @@ fn validate_stable_pdo_identities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+
+    fn native_relations(objects: &[u64], allocation_bytes: usize) -> Vec<u8> {
+        let required = DEVICE_RELATIONS_X64_HEADER_BYTES + objects.len() * 8;
+        let mut bytes = vec![0xa5; allocation_bytes.max(required)];
+        bytes[..4].copy_from_slice(&(objects.len() as u32).to_le_bytes());
+        bytes[4..8].fill(0);
+        for (index, object) in objects.iter().enumerate() {
+            let offset = DEVICE_RELATIONS_X64_HEADER_BYTES + index * 8;
+            bytes[offset..offset + 8].copy_from_slice(&object.to_le_bytes());
+        }
+        bytes
+    }
 
     fn child(pdo: u64, instance: &str, hardware: &[&str]) -> BusReportedChild {
         BusReportedChild::new(
@@ -592,6 +660,45 @@ mod tests {
             hardware,
             &[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"],
         )
+    }
+
+    #[test]
+    fn native_device_relations_are_copied_from_the_counted_prefix() {
+        let allocation = native_relations(&[0x1000, 0x2000, 0x3000], 96);
+        assert_eq!(
+            copy_device_relations_x64(&allocation),
+            Ok(vec![0x1000, 0x2000, 0x3000])
+        );
+        assert_eq!(
+            copy_device_relations_x64(&native_relations(&[], 32)),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn native_device_relations_reject_truncated_storage() {
+        assert_eq!(
+            copy_device_relations_x64(&[0; 7]),
+            Err(DeviceRelationsCopyError::TruncatedHeader)
+        );
+        let mut allocation = native_relations(&[0x1000], 16);
+        allocation[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            copy_device_relations_x64(&allocation),
+            Err(DeviceRelationsCopyError::TruncatedObjects)
+        );
+    }
+
+    #[test]
+    fn native_device_relations_reject_null_and_duplicate_pdos() {
+        assert_eq!(
+            copy_device_relations_x64(&native_relations(&[0], 16)),
+            Err(DeviceRelationsCopyError::NullPdo)
+        );
+        assert_eq!(
+            copy_device_relations_x64(&native_relations(&[0x1000, 0x1000], 24)),
+            Err(DeviceRelationsCopyError::DuplicatePdo)
+        );
     }
 
     #[test]

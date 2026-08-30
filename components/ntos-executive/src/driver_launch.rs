@@ -3069,11 +3069,10 @@ unsafe fn component_pool_allocation_capacity(component_va: u64) -> Option<u64> {
     Some(capacity)
 }
 
-unsafe fn hosted_pool_allocation_exec_va(
+unsafe fn hosted_pool_allocation_exec_range(
     exec_pool_va: u64,
     component_va: u64,
-    bytes: u64,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     if exec_pool_va == 0
         || component_va < FSD_POOL_VADDR + POOL_DATA_OFF + 16
         || component_va & 15 != 0
@@ -3085,10 +3084,19 @@ unsafe fn hosted_pool_allocation_exec_va(
     let bump = read_volatile(exec_pool_va as *const u64);
     let used_end = exec_pool_va.checked_add(bump.min(FSD_POOL_FRAMES * 0x1000))?;
     let capacity = read_volatile((exec_va - 16) as *const u64);
-    if capacity == 0 || bytes > capacity || exec_va.checked_add(capacity)? > used_end {
+    if capacity == 0 || exec_va.checked_add(capacity)? > used_end {
         return None;
     }
-    Some(exec_va)
+    Some((exec_va, capacity))
+}
+
+unsafe fn hosted_pool_allocation_exec_va(
+    exec_pool_va: u64,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    let (exec_va, capacity) = hosted_pool_allocation_exec_range(exec_pool_va, component_va)?;
+    (bytes <= capacity).then_some(exec_va)
 }
 
 fn component_pool_to_exec_va(exec_pool_va: u64, component_va: u64, bytes: u64) -> Option<u64> {
@@ -34594,9 +34602,315 @@ pub(crate) fn file_thread_io_drain_state(
     )
 }
 
+fn hosted_pnp_lifecycle_dispatch_active() -> bool {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_PNP_TRANSACTIONS))
+            .as_ref()
+            .is_some_and(|transactions| {
+                transactions.iter().any(|transaction| {
+                    !matches!(transaction.phase, HostedPnpTransactionPhase::Terminal)
+                })
+            })
+    }
+}
+
+unsafe fn hosted_relation_allocation_instance(driver_id: DriverId) -> Option<usize> {
+    let (instance_index, _) = instance_by_driver_id(driver_id.raw())?;
+    hosted_provider_dispatch_route_for_instance(instance_index)
+        .map(|route| route.provider_instance)
+        .or(Some(instance_index))
+}
+
+unsafe fn retain_hosted_relation_query_barrier(
+    claim: nt_pnp_manager::DeviceRelationInvalidation,
+    status: nt_status::NtStatus,
+) {
+    *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = Some(HostedDeviceRelationQuery {
+        claim,
+        irp_id: IrpId(0),
+        origin_driver_id: DriverId(0),
+        completion_driver_id: DriverId(0),
+        completion_device_id: nt_io_manager::DeviceId(0),
+        allocation_instance: 0,
+        phase: HostedDeviceRelationQueryPhase::Barrier,
+        driver_status: None,
+        barrier_status: Some(status),
+        child_pdo_objects: Vec::new(),
+    });
+}
+
+unsafe fn set_hosted_relation_query_disposition(
+    disposition: HostedDeviceRelationQueryDisposition,
+) {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .expect("hosted relation query disappeared while publishing its result");
+    match disposition {
+        HostedDeviceRelationQueryDisposition::Copied => {
+            query.phase = HostedDeviceRelationQueryPhase::RelationsCopied;
+            query.barrier_status = None;
+        }
+        HostedDeviceRelationQueryDisposition::Barrier(status) => {
+            query.phase = HostedDeviceRelationQueryPhase::Barrier;
+            query.barrier_status = Some(status);
+        }
+    }
+}
+
+unsafe fn drain_hosted_device_relation_query() -> usize {
+    let mut progress = 0usize;
+    loop {
+        let Some(phase) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_ref()
+            .map(|query| query.phase)
+        else {
+            return progress;
+        };
+        match phase {
+            HostedDeviceRelationQueryPhase::AwaitingCompletion => {
+                let (irp_id, claim, origin_driver_id, completion_driver_id, completion_device_id) = {
+                    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                        .as_ref()
+                        .unwrap();
+                    (
+                        query.irp_id,
+                        query.claim,
+                        query.origin_driver_id,
+                        query.completion_driver_id,
+                        query.completion_device_id,
+                    )
+                };
+                let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
+                    return progress;
+                };
+                let identity_valid = completion.id == irp_id
+                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+                    && completion.file_id.is_none()
+                    && completion.driver_id == origin_driver_id
+                    && completion.device_id
+                        == nt_io_manager::DeviceId(claim.pdo_device_id)
+                    && completion.major == major::IRP_MJ_PNP
+                    && completion.minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
+                    && completion.completion_driver_id == completion_driver_id
+                    && completion.completion_device_id == completion_device_id
+                    && completion.user_data == 0
+                    && completion.requestor_tid == 0
+                    && completion.completion_origin == IrpCompletionOrigin::Driver;
+                if !identity_valid {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        ),
+                    );
+                    return progress.saturating_add(1);
+                }
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap();
+                query.driver_status = Some(completion.status);
+                query.phase = if completion.status.is_success() {
+                    HostedDeviceRelationQueryPhase::AwaitingCopy {
+                        information: completion.information,
+                        pending_completion: true,
+                    }
+                } else {
+                    HostedDeviceRelationQueryPhase::AwaitingAck {
+                        disposition: HostedDeviceRelationQueryDisposition::Barrier(
+                            completion.status,
+                        ),
+                    }
+                };
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingCopy {
+                information,
+                pending_completion,
+            } => {
+                let allocation_instance = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .unwrap()
+                    .allocation_instance;
+                let disposition = match copy_hosted_device_relations_result(
+                    allocation_instance,
+                    information,
+                ) {
+                    Ok(objects) => {
+                        (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                            .as_mut()
+                            .unwrap()
+                            .child_pdo_objects = objects;
+                        HostedDeviceRelationQueryDisposition::Copied
+                    }
+                    Err(HostedDeviceRelationsCopyError::RetryResources) => return progress,
+                    Err(HostedDeviceRelationsCopyError::InvalidPointer)
+                    | Err(HostedDeviceRelationsCopyError::Malformed) => {
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        )
+                    }
+                    Err(HostedDeviceRelationsCopyError::ReleaseFailed) => {
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::UNSUCCESSFUL,
+                        )
+                    }
+                };
+                if pending_completion {
+                    (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                        .as_mut()
+                        .unwrap()
+                        .phase = HostedDeviceRelationQueryPhase::AwaitingAck { disposition };
+                } else {
+                    set_hosted_relation_query_disposition(disposition);
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingAck { disposition } => {
+                let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .unwrap()
+                    .irp_id;
+                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                    Ok(_) => {
+                        set_hosted_relation_query_disposition(disposition);
+                        progress = progress.saturating_add(1);
+                    }
+                    Err(status) => {
+                        (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                            .as_mut()
+                            .unwrap()
+                            .barrier_status = Some(status);
+                        return progress;
+                    }
+                }
+            }
+            HostedDeviceRelationQueryPhase::RelationsCopied
+            | HostedDeviceRelationQueryPhase::Barrier => return progress,
+        }
+    }
+}
+
+unsafe fn start_hosted_device_relation_query() -> usize {
+    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some()
+        || hosted_pnp_lifecycle_dispatch_active()
+    {
+        return 0;
+    }
+    if reserve_active_hosted_irp_transfer_slot().is_err() {
+        return 0;
+    }
+    let Some(claim) = hosted_device_relation_invalidations_mut().claim_front() else {
+        return 0;
+    };
+    let pdo_device_id = nt_io_manager::DeviceId(claim.pdo_device_id);
+    if hosted_pnp_manager_mut()
+        .devnode_for_pdo(claim.pdo_device_id)
+        .is_none()
+        || io_manager_mut().device(pdo_device_id).is_none()
+    {
+        retain_hosted_relation_query_barrier(
+            claim,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        );
+        return 1;
+    }
+
+    let prepared = match io_manager_mut().prepare_external_pnp_to_device(
+        ClientId(IO_MANAGER_COMPONENT_ID),
+        pdo_device_id,
+        0,
+        PnpParameters::query_device_relations(claim.relation_type),
+        &[],
+    ) {
+        Ok(prepared) => prepared,
+        Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => {
+            hosted_device_relation_invalidations_mut()
+                .abort(claim)
+                .expect("fresh hosted relation claim could not be aborted");
+            return 0;
+        }
+        Err(status) => {
+            retain_hosted_relation_query_barrier(claim, status);
+            return 1;
+        }
+    };
+    let irp_id = prepared.irp_id();
+    let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
+        let current = irp.current_stack()?;
+        let allocation_instance = hosted_relation_allocation_instance(current.driver_id)?;
+        Some((
+            irp.origin_driver_id,
+            current.driver_id,
+            current.device_id,
+            allocation_instance,
+        ))
+    });
+    let Some((origin_driver_id, completion_driver_id, completion_device_id, allocation_instance)) =
+        identities
+    else {
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("prepared hosted relation IRP could not be discarded");
+        retain_hosted_relation_query_barrier(
+            claim,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        );
+        return 1;
+    };
+
+    *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = Some(HostedDeviceRelationQuery {
+        claim,
+        irp_id,
+        origin_driver_id,
+        completion_driver_id,
+        completion_device_id,
+        allocation_instance,
+        phase: HostedDeviceRelationQueryPhase::AwaitingCompletion,
+        driver_status: None,
+        barrier_status: None,
+        child_pdo_objects: Vec::new(),
+    });
+    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+        ExternalPnpDispatchResult::Returned {
+            status,
+            information,
+        } => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_mut()
+                .unwrap();
+            query.driver_status = Some(status);
+            if status.is_success() {
+                query.phase = HostedDeviceRelationQueryPhase::AwaitingCopy {
+                    information,
+                    pending_completion: false,
+                };
+            } else {
+                set_hosted_relation_query_disposition(
+                    HostedDeviceRelationQueryDisposition::Barrier(status),
+                );
+            }
+        }
+        ExternalPnpDispatchResult::Pending { irp_id: pending_id } => {
+            assert_eq!(pending_id, irp_id);
+        }
+        ExternalPnpDispatchResult::Indeterminate {
+            irp_id: retained_id,
+            transport_status,
+        } => {
+            assert_eq!(retained_id, irp_id);
+            set_hosted_relation_query_disposition(
+                HostedDeviceRelationQueryDisposition::Barrier(transport_status),
+            );
+        }
+    }
+    1usize.saturating_add(drain_hosted_device_relation_query())
+}
+
 pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager(io_manager_mut());
-    pumped.saturating_add(unsafe { drain_hosted_pnp_completions() })
+    pumped
+        .saturating_add(unsafe { drain_hosted_pnp_completions() })
+        .saturating_add(unsafe { drain_hosted_device_relation_query() })
+        .saturating_add(unsafe { start_hosted_device_relation_query() })
 }
 
 unsafe fn drain_hosted_pnp_completions() -> usize {
@@ -35947,6 +36261,7 @@ static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
 static mut HOSTED_DEVICE_RELATION_INVALIDATIONS: Option<
     nt_pnp_manager::DeviceRelationInvalidationQueue,
 > = None;
+static mut HOSTED_DEVICE_RELATION_QUERY: Option<HostedDeviceRelationQuery> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
@@ -35958,6 +36273,47 @@ static HOSTED_DEVICE_RELATION_INVALIDATION_CALLS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DEVICE_RELATION_INVALIDATION_QUEUED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DEVICE_RELATION_INVALIDATION_COALESCED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DEVICE_RELATION_INVALIDATION_REQUEUED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedDeviceRelationQueryDisposition {
+    Copied,
+    Barrier(nt_status::NtStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedDeviceRelationQueryPhase {
+    AwaitingCompletion,
+    AwaitingCopy {
+        information: u64,
+        pending_completion: bool,
+    },
+    AwaitingAck {
+        disposition: HostedDeviceRelationQueryDisposition,
+    },
+    RelationsCopied,
+    Barrier,
+}
+
+struct HostedDeviceRelationQuery {
+    claim: nt_pnp_manager::DeviceRelationInvalidation,
+    irp_id: IrpId,
+    origin_driver_id: DriverId,
+    completion_driver_id: DriverId,
+    completion_device_id: nt_io_manager::DeviceId,
+    allocation_instance: usize,
+    phase: HostedDeviceRelationQueryPhase,
+    driver_status: Option<nt_status::NtStatus>,
+    barrier_status: Option<nt_status::NtStatus>,
+    child_pdo_objects: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedDeviceRelationsCopyError {
+    RetryResources,
+    InvalidPointer,
+    Malformed,
+    ReleaseFailed,
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum HostedPnpTransactionPhase {
@@ -36303,6 +36659,46 @@ unsafe fn hosted_device_relation_invalidations_mut(
         *slot = Some(nt_pnp_manager::DeviceRelationInvalidationQueue::new());
     }
     slot.as_mut().unwrap()
+}
+
+unsafe fn copy_hosted_device_relations_result(
+    instance_index: usize,
+    component_pointer: u64,
+) -> Result<Vec<u64>, HostedDeviceRelationsCopyError> {
+    if component_pointer == 0 {
+        return Err(HostedDeviceRelationsCopyError::InvalidPointer);
+    }
+    let inst = instance(instance_index).ok_or(HostedDeviceRelationsCopyError::InvalidPointer)?;
+    let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
+        .ok_or(HostedDeviceRelationsCopyError::InvalidPointer)?;
+    if hosted_instance_pool_allocation_is_free_unlocked(inst, component_pointer) != Some(false) {
+        return Err(HostedDeviceRelationsCopyError::InvalidPointer);
+    }
+    let (exec_pointer, capacity) =
+        hosted_pool_allocation_exec_range(inst.exec_pool_va, component_pointer)
+            .ok_or(HostedDeviceRelationsCopyError::InvalidPointer)?;
+    let capacity = usize::try_from(capacity)
+        .map_err(|_| HostedDeviceRelationsCopyError::InvalidPointer)?;
+    let allocation = core::slice::from_raw_parts(exec_pointer as *const u8, capacity);
+    match nt_pnp_manager::copy_device_relations_x64(allocation) {
+        Ok(objects) => {
+            if hosted_instance_pool_free_unlocked(inst, component_pointer) {
+                Ok(objects)
+            } else {
+                Err(HostedDeviceRelationsCopyError::ReleaseFailed)
+            }
+        }
+        Err(nt_pnp_manager::DeviceRelationsCopyError::InsufficientResources) => {
+            Err(HostedDeviceRelationsCopyError::RetryResources)
+        }
+        Err(_) => {
+            if hosted_instance_pool_free_unlocked(inst, component_pointer) {
+                Err(HostedDeviceRelationsCopyError::Malformed)
+            } else {
+                Err(HostedDeviceRelationsCopyError::ReleaseFailed)
+            }
+        }
+    }
 }
 
 unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction> {
