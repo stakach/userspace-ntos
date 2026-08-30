@@ -15733,6 +15733,7 @@ static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::nu
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_DEVICE_ACTION_PENDING: AtomicBool = AtomicBool::new(false);
 const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+const CONFIG_STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 
 unsafe fn install_config_manager_client(client: &mut ConfigClient<CmChan<'static>>) {
     CONFIG_CLIENT_PTR = client as *mut _;
@@ -15855,6 +15856,24 @@ pub(crate) unsafe fn config_manager_query_driver_service(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
         .query_driver_service(service_name)
+}
+
+pub(crate) unsafe fn config_manager_query_critical_device_binding(
+    bus_id: &str,
+) -> Result<Option<nt_config_client::CriticalDeviceBinding>, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    match client.query_critical_device_binding(bus_id) {
+        Ok(binding) if binding.mount_generation == expected_generation => Ok(Some(binding)),
+        Ok(_) => Err(CONFIG_STATUS_DEVICE_NOT_READY),
+        Err(CONFIG_STATUS_OBJECT_NAME_NOT_FOUND) => Ok(None),
+        Err(status) => Err(status),
+    }
 }
 
 pub(crate) fn config_manager_device_action_pending() -> bool {

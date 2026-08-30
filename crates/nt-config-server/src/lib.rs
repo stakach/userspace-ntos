@@ -53,10 +53,11 @@ use nt_config_abi::{
     CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 use nt_config_manager::{
-    device_property, ConfigManager, DeviceActionEvent, DeviceActionIntent, DeviceActionJournal,
-    DeviceActionJournalError, DeviceActionKind, DevicePropertySource, DriverServiceBinding,
-    DriverServiceClass, RegistryTransaction, RegistryValueType, Win32ServiceProcessKind,
-    Win32ServiceProcessLaunch, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
+    device_property, ConfigManager, CriticalDeviceBindingError, DeviceActionEvent,
+    DeviceActionIntent, DeviceActionJournal, DeviceActionJournalError, DeviceActionKind,
+    DevicePropertySource, DriverServiceBinding, DriverServiceClass, RegistryTransaction,
+    RegistryValueType, Win32ServiceProcessKind, Win32ServiceProcessLaunch, SERVICE_BOOT_START,
+    SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
     collect_reactos_network_adapter_bindings, decode_image, encode_log_record, try_encode_image,
@@ -112,6 +113,14 @@ fn device_action_journal_status(error: DeviceActionJournalError) -> i32 {
         | DeviceActionJournalError::DuplicateInstance
         | DeviceActionJournalError::InvalidTransition
         | DeviceActionJournalError::StaleAcknowledgement => STATUS_INVALID_PARAMETER,
+    }
+}
+
+fn critical_device_binding_status(error: CriticalDeviceBindingError) -> i32 {
+    match error {
+        CriticalDeviceBindingError::InvalidId => STATUS_INVALID_PARAMETER,
+        CriticalDeviceBindingError::MalformedBinding => STATUS_REGISTRY_CORRUPT,
+        CriticalDeviceBindingError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
     }
 }
 
@@ -3216,6 +3225,7 @@ impl CmServer {
                     | pnp_query_kind::RELATED_DEVICE
                     | pnp_query_kind::DEVICE_DEPTH
                     | pnp_query_kind::BUS_RELATIONS
+                    | pnp_query_kind::CRITICAL_DEVICE_BINDING
             )
         {
             return reply(STATUS_INVALID_PARAMETER, 0);
@@ -3245,7 +3255,8 @@ impl CmServer {
             }
             pnp_query_kind::DEVICE_EXISTS
             | pnp_query_kind::DEVICE_DEPTH
-            | pnp_query_kind::BUS_RELATIONS => {
+            | pnp_query_kind::BUS_RELATIONS
+            | pnp_query_kind::CRITICAL_DEVICE_BINDING => {
                 !instance.is_empty() && req.selector == 0 && auxiliary.is_empty()
             }
             _ => false,
@@ -3318,6 +3329,18 @@ impl CmServer {
                             return reply(STATUS_NO_SUCH_DEVICE, 0);
                         };
                         (relations, Vec::new())
+                    }
+                    pnp_query_kind::CRITICAL_DEVICE_BINDING => {
+                        let binding = match self.cm.resolve_critical_device_id(&instance) {
+                            Ok(Some(binding)) => binding,
+                            Ok(None) => return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0),
+                            Err(error) => return reply(critical_device_binding_status(error), 0),
+                        };
+                        let mut strings = alloc::vec![binding.matched_id, binding.class_guid];
+                        if let Some(service_name) = binding.service_name {
+                            strings.push(service_name);
+                        }
+                        (strings, Vec::new())
                     }
                     _ => return reply(STATUS_INVALID_PARAMETER, 0),
                 };

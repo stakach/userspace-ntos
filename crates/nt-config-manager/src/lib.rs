@@ -53,6 +53,8 @@ pub const DEVICE_CLASSES_PATH: &str =
 pub const CONTROL_CLASS_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Class";
 pub const CONTROL_NETWORK_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\Network";
+pub const CRITICAL_DEVICE_DATABASE_PATH: &str =
+    r"\Registry\Machine\System\CurrentControlSet\Control\CriticalDeviceDatabase";
 pub const SERVICE_GROUP_ORDER_PATH: &str =
     r"\Registry\Machine\System\CurrentControlSet\Control\ServiceGroupOrder";
 pub const NETWORK_WRAPPER_LOAD_ORDER_GROUP: &str = "NDIS Wrapper";
@@ -209,6 +211,22 @@ pub struct DeviceActionEvent {
     pub mount_generation: u64,
     pub kind: DeviceActionKind,
     pub publication: DevnodePublication,
+}
+
+/// Function-driver policy selected from the NT5 Critical Device Database for one bus-reported ID.
+/// The database key owns policy; the bus supplies identity only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CriticalDeviceBinding {
+    pub matched_id: String,
+    pub class_guid: String,
+    pub service_name: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CriticalDeviceBindingError {
+    InvalidId,
+    MalformedBinding,
+    InsufficientResources,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -809,6 +827,88 @@ impl ConfigManager {
     }
     pub fn registry_mut(&mut self) -> &mut Registry {
         &mut self.registry
+    }
+
+    /// Apply the NT5 critical-device policy lookup used before user-mode installation is available.
+    /// Hardware IDs are considered before compatible IDs and retain their bus-reported order. Each
+    /// native ID is mapped to the database subkey form by replacing `\` with `#`.
+    pub fn resolve_critical_device_binding(
+        &self,
+        hardware_ids: &[String],
+        compatible_ids: &[String],
+    ) -> Result<Option<CriticalDeviceBinding>, CriticalDeviceBindingError> {
+        if hardware_ids.is_empty() {
+            return Err(CriticalDeviceBindingError::InvalidId);
+        }
+        for id in hardware_ids.iter().chain(compatible_ids) {
+            if id.is_empty()
+                || !id.is_ascii()
+                || id.bytes().any(|byte| !(0x20..=0x7f).contains(&byte))
+            {
+                return Err(CriticalDeviceBindingError::InvalidId);
+            }
+        }
+
+        for id in hardware_ids.iter().chain(compatible_ids) {
+            if let Some(binding) = self.resolve_critical_device_id(id)? {
+                return Ok(Some(binding));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve one exact bus ID. This is the bounded service-transport primitive used while the PnP
+    /// owner walks the already ordered hardware/compatible lists.
+    pub fn resolve_critical_device_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<CriticalDeviceBinding>, CriticalDeviceBindingError> {
+        if id.is_empty() || !id.is_ascii() || id.bytes().any(|byte| !(0x20..=0x7f).contains(&byte))
+        {
+            return Err(CriticalDeviceBindingError::InvalidId);
+        }
+        let mut key_name = String::new();
+        key_name
+            .try_reserve_exact(id.len())
+            .map_err(|_| CriticalDeviceBindingError::InsufficientResources)?;
+        for byte in id.bytes() {
+            key_name.push(if byte == b'\\' { '#' } else { byte as char });
+        }
+        let mut path = String::new();
+        path.try_reserve_exact(
+            CRITICAL_DEVICE_DATABASE_PATH
+                .len()
+                .checked_add(1)
+                .and_then(|len| len.checked_add(key_name.len()))
+                .ok_or(CriticalDeviceBindingError::InsufficientResources)?,
+        )
+        .map_err(|_| CriticalDeviceBindingError::InsufficientResources)?;
+        path.push_str(CRITICAL_DEVICE_DATABASE_PATH);
+        path.push('\\');
+        path.push_str(&key_name);
+        let Some(key) = self.registry.open_key(&path) else {
+            return Ok(None);
+        };
+        let Some(class_guid) = self.registry.query_string(key, "ClassGUID") else {
+            return Ok(None);
+        };
+        if class_guid.is_empty() {
+            return Err(CriticalDeviceBindingError::MalformedBinding);
+        }
+        let service_name = self.registry.query_string(key, "Service");
+        if service_name.as_deref() == Some("") {
+            return Err(CriticalDeviceBindingError::MalformedBinding);
+        }
+        let mut matched_id = String::new();
+        matched_id
+            .try_reserve_exact(id.len())
+            .map_err(|_| CriticalDeviceBindingError::InsufficientResources)?;
+        matched_id.push_str(id);
+        Ok(Some(CriticalDeviceBinding {
+            matched_id,
+            class_guid,
+            service_name,
+        }))
     }
 
     // --- services (spec §9) ---------------------------------------------------
@@ -4310,5 +4410,70 @@ mod tests {
         assert_eq!(journal.last_mount_generation(), 11);
         assert_eq!(journal.pending_len(), 1);
         assert_eq!(journal.peek().unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn critical_device_policy_uses_native_id_order_and_key_normalization() {
+        let mut cm = ConfigManager::new();
+        let compatible = cm.registry_mut().create_key(&alloc::format!(
+            r"{}\PCI#CC_0200",
+            CRITICAL_DEVICE_DATABASE_PATH
+        ));
+        cm.registry_mut()
+            .set_string(compatible, "ClassGUID", "{COMPATIBLE}");
+        cm.registry_mut()
+            .set_string(compatible, "Service", "CompatibleDriver");
+        let hardware = cm.registry_mut().create_key(&alloc::format!(
+            r"{}\PCI#VEN_8086&DEV_100E",
+            CRITICAL_DEVICE_DATABASE_PATH
+        ));
+        cm.registry_mut()
+            .set_string(hardware, "ClassGUID", "{HARDWARE}");
+        cm.registry_mut()
+            .set_string(hardware, "Service", "HardwareDriver");
+
+        let binding = cm
+            .resolve_critical_device_binding(
+                &[String::from(r"PCI\VEN_8086&DEV_100E")],
+                &[String::from(r"PCI\CC_0200")],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.matched_id, r"PCI\VEN_8086&DEV_100E");
+        assert_eq!(binding.class_guid, "{HARDWARE}");
+        assert_eq!(binding.service_name.as_deref(), Some("HardwareDriver"));
+
+        let fallback = cm
+            .resolve_critical_device_binding(
+                &[String::from(r"PCI\VEN_1234&DEV_5678")],
+                &[String::from(r"PCI\CC_0200")],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.matched_id, r"PCI\CC_0200");
+        assert_eq!(fallback.service_name.as_deref(), Some("CompatibleDriver"));
+    }
+
+    #[test]
+    fn critical_device_policy_rejects_bad_input_and_malformed_entries() {
+        let mut cm = ConfigManager::new();
+        assert_eq!(
+            cm.resolve_critical_device_binding(&[], &[]),
+            Err(CriticalDeviceBindingError::InvalidId)
+        );
+        assert_eq!(
+            cm.resolve_critical_device_binding(&[String::new()], &[]),
+            Err(CriticalDeviceBindingError::InvalidId)
+        );
+
+        let malformed = cm.registry_mut().create_key(&alloc::format!(
+            r"{}\ROOT#BROKEN",
+            CRITICAL_DEVICE_DATABASE_PATH
+        ));
+        cm.registry_mut().set_string(malformed, "ClassGUID", "");
+        assert_eq!(
+            cm.resolve_critical_device_binding(&[String::from(r"ROOT\BROKEN")], &[]),
+            Err(CriticalDeviceBindingError::MalformedBinding)
+        );
     }
 }

@@ -242,6 +242,7 @@ pub mod pnp_query_kind {
     pub const RELATED_DEVICE: u16 = 5;
     pub const DEVICE_DEPTH: u16 = 6;
     pub const BUS_RELATIONS: u16 = 7;
+    pub const CRITICAL_DEVICE_BINDING: u16 = 8;
 }
 
 /// Operation carried by [`CmDeviceActionRequest::operation`].

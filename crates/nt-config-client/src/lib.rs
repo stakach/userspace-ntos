@@ -59,6 +59,8 @@ const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
+#[cfg(test)]
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_INSUFFICIENT_RESOURCES: i32 = 0xC000_009Au32 as i32;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -210,6 +212,14 @@ pub struct PnpQuerySnapshot {
     pub query_kind: u16,
     pub strings: Vec<String>,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CriticalDeviceBinding {
+    pub mount_generation: u64,
+    pub matched_id: String,
+    pub class_guid: String,
+    pub service_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -732,6 +742,7 @@ fn decode_pnp_query_snapshot(bytes: &[u8]) -> Option<PnpQuerySnapshot> {
             | pnp_query_kind::RELATED_DEVICE
             | pnp_query_kind::DEVICE_DEPTH
             | pnp_query_kind::BUS_RELATIONS
+            | pnp_query_kind::CRITICAL_DEVICE_BINDING
     ) {
         return None;
     }
@@ -2367,7 +2378,8 @@ impl<B: Backend> ConfigClient<B> {
             }
             pnp_query_kind::DEVICE_EXISTS
             | pnp_query_kind::DEVICE_DEPTH
-            | pnp_query_kind::BUS_RELATIONS => {
+            | pnp_query_kind::BUS_RELATIONS
+            | pnp_query_kind::CRITICAL_DEVICE_BINDING => {
                 !instance.is_empty() && selector == 0 && auxiliary.is_empty()
             }
             _ => false,
@@ -2457,6 +2469,28 @@ impl<B: Backend> ConfigClient<B> {
                 token = response.detail1;
             }
         }
+    }
+
+    pub fn query_critical_device_binding(
+        &mut self,
+        bus_id: &str,
+    ) -> Result<CriticalDeviceBinding, i32> {
+        let snapshot = self.query_pnp(pnp_query_kind::CRITICAL_DEVICE_BINDING, 0, bus_id, &[])?;
+        if snapshot.query_kind != pnp_query_kind::CRITICAL_DEVICE_BINDING
+            || !snapshot.payload.is_empty()
+            || !matches!(snapshot.strings.len(), 2 | 3)
+            || !snapshot.strings[0].eq_ignore_ascii_case(bus_id)
+            || snapshot.strings[1].is_empty()
+            || snapshot.strings.get(2).is_some_and(String::is_empty)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(CriticalDeviceBinding {
+            mount_generation: snapshot.mount_generation,
+            matched_id: snapshot.strings[0].clone(),
+            class_guid: snapshot.strings[1].clone(),
+            service_name: snapshot.strings.get(2).cloned(),
+        })
     }
 
     /// Peek and stream the next immutable CM-owned device action without acknowledging it.
@@ -3474,10 +3508,11 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
     use nt_config_manager::{
-        device_property, encode_multi_sz, encode_sz, ConfigManager, RegistryValueType, ENUM_PATH,
-        SERVICE_AUTO_START, SERVICE_BOOT_START, SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER,
-        SERVICE_INTERACTIVE_PROCESS, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
-        SERVICE_WIN32_OWN_PROCESS, SERVICE_WIN32_SHARE_PROCESS,
+        device_property, encode_multi_sz, encode_sz, ConfigManager, RegistryValueType,
+        CRITICAL_DEVICE_DATABASE_PATH, ENUM_PATH, SERVICE_AUTO_START, SERVICE_BOOT_START,
+        SERVICE_DEMAND_START, SERVICE_FILE_SYSTEM_DRIVER, SERVICE_INTERACTIVE_PROCESS,
+        SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START, SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_WIN32_SHARE_PROCESS,
     };
     use nt_config_server::CmServer;
     use nt_hive_core::{decode_image, encode_image, try_replay_log, Hive, HiveKind};
@@ -4201,6 +4236,38 @@ mod tests {
             .unwrap()
             .symbolic_link
             .clone();
+        let critical = client
+            .backend
+            .server
+            .config_mut()
+            .registry_mut()
+            .create_key(&format!(
+                r"{}\PCI#VEN_8086&DEV_100E",
+                CRITICAL_DEVICE_DATABASE_PATH
+            ));
+        client
+            .backend
+            .server
+            .config_mut()
+            .registry_mut()
+            .set_string(
+                critical,
+                "ClassGUID",
+                "{4d36e972-e325-11ce-bfc1-08002be10318}",
+            );
+        client
+            .backend
+            .server
+            .config_mut()
+            .registry_mut()
+            .set_string(critical, "Service", "BootDevice");
+        assert!(client
+            .backend
+            .server
+            .config()
+            .resolve_critical_device_id(r"PCI\VEN_8086&DEV_100E")
+            .unwrap()
+            .is_some());
         let boot = client
             .query_driver_launch_plan(launch_plan_kind::BOOT_SYSTEM_DRIVERS)
             .expect("boot driver plan");
@@ -4255,6 +4322,16 @@ mod tests {
             .expect("device exists");
         assert_eq!(exists.mount_generation, 1);
         assert!(exists.strings.is_empty() && exists.payload.is_empty());
+        let critical = client
+            .query_critical_device_binding(r"PCI\VEN_8086&DEV_100E")
+            .expect("critical device binding");
+        assert_eq!(critical.mount_generation, 1);
+        assert_eq!(critical.matched_id, r"PCI\VEN_8086&DEV_100E");
+        assert_eq!(critical.service_name.as_deref(), Some("BootDevice"));
+        assert_eq!(
+            client.query_critical_device_binding(r"PCI\VEN_1234&DEV_5678"),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        );
         let enumerated = client
             .query_pnp(pnp_query_kind::ENUMERATE_DEVNODE, 0, "", &[])
             .expect("enumerate devnode");

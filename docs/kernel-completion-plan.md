@@ -18561,3 +18561,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     arrival/change/removal through Config Manager policy, durably publish the resulting Enum and
     device-action changes, then commit the exact relation owner and complete the invalidation only
     after CM accepts the whole transaction.
+
+    B3 NT5 critical-device policy checkpoint (2026-08-30, implementation green): the isolated
+    Config Manager now owns `CriticalDeviceDatabase` lookup at
+    `CurrentControlSet\\Control\\CriticalDeviceDatabase`; the executive does not infer a function
+    driver from image identity, bus type, or an unrelated existing Enum entry. The policy resolver
+    preserves native priority by considering hardware IDs before compatible IDs and retaining the
+    bus-reported order within each list. It converts each native ID's `\\` separators to the `#`
+    subkey form, requires a nonempty `ClassGUID`, and returns the optional nonempty `Service` value
+    from the first matching key. Invalid bus IDs and malformed bindings are hard errors rather than
+    absent policy.
+
+    The Config Manager SURT ABI, server, and typed client expose this as a generation-bearing query.
+    The client sends one bus ID per request so the existing 4 KiB frame remains a fixed transport
+    bound; the retained relation owner will perform the ordered multi-ID search without truncating
+    or reordering it. The executive wrapper rejects a result from any mount generation other than
+    the currently published SYSTEM hive generation and distinguishes a truthful no-match from
+    service failure. Focused validation passes `35/35` `nt-config-manager`, `19/19`
+    `nt-config-client`, `25/25` `nt-config-server`, and `4/4` `nt-config-abi` tests. Formatting,
+    `git diff --check`, and the freestanding executive check pass; the current compiler-warning
+    baseline is 211.
+
+    Review adjustment: policy lookup is now at the correct isolated CM boundary, but it has not yet
+    changed live topology. Next prepare a `BusRelationTable` transaction from the retained child
+    descriptions, resolve each arrival/change in strict hardware-then-compatible order, and build
+    the complete Enum mutation plus explicit `PublishDeviceAction` operations. Commit that mutation
+    through the durable SYSTEM-hive journal path, then and only then commit the relation table and
+    complete the exact invalidation claim. Removal must delete the exact Enum instance and publish
+    the matching removal action in the same mutation. Any policy, allocation, persistence,
+    publication, or topology-generation failure retains the transaction as a barrier; no inferred
+    service and no partially published relation is acceptable.
