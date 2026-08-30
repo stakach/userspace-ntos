@@ -3004,6 +3004,24 @@ pub(crate) fn pipe_fid_name_hash(fid: u64) -> u64 {
 }
 const DELAY_WAITER_INITIAL_RESERVE: usize = HOSTED_THREAD_WAIT_INITIAL_RESERVE;
 pub(crate) const DELAY_TIMER_BADGE: u64 = 0x4000_0000_0000_0000;
+/// Bound-notification namespace for genuine hosted hardware IRQs. The low 32 bits are an IOAPIC
+/// line bitmap, allowing deliveries on several lines to coalesce without losing identity.
+pub(crate) const HOSTED_IRQ_EVENT_BADGE: u64 = 0x2000_0000_0000_0000;
+pub(crate) const HOSTED_IRQ_LINE_BADGE_MASK: u64 = u32::MAX as u64;
+
+#[inline]
+pub(crate) const fn hosted_irq_lines_from_badge(badge: u64) -> u32 {
+    if badge & HOSTED_IRQ_EVENT_BADGE != 0 {
+        (badge & HOSTED_IRQ_LINE_BADGE_MASK) as u32
+    } else {
+        0
+    }
+}
+
+#[inline]
+pub(crate) const fn badge_has_delay_timer(badge: u64) -> bool {
+    badge & DELAY_TIMER_BADGE != 0
+}
 /// ★ A bound-notification TICK that the COMPONENT PUMP absorbed, deferred to the main service loop.
 ///
 /// The executive's ROOT TCB has the HPET one-shot notification BOUND to it
@@ -3377,6 +3395,8 @@ const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
+const LBL_IRQ_SET_NOTIFICATION: u64 = 32;
+const LBL_IRQ_CLEAR_HANDLER: u64 = 33;
 /// System time is adjustable, while interrupt time remains monotonic. The executive service loop
 /// is the sole owner of this state, including nested dispatches, so all snapshots and adjustments
 /// are serialized through this one clock authority.
@@ -3443,7 +3463,10 @@ static PLATFORM_TSC_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
 static HPET_MONOTONIC_OFFSET_100NS: AtomicI64 = AtomicI64::new(0);
 static HPET_MONOTONIC_READY: AtomicBool = AtomicBool::new(false);
 static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
-static DELAY_TIMER_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+/// Notification bound to the executive root TCB. HPET timing and hosted hardware IRQ handlers mint
+/// distinct badges from this one object so every blocking executive receive remains interruptible.
+static EXEC_EVENT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static EXEC_EVENT_NOTIFICATION_BOUND: AtomicBool = AtomicBool::new(false);
 static DELAY_TIMER_BADGED_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static HPET_PROBE_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
 static DELAY_TIMER_IOAPIC_PIN: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_PIN_NONE);
@@ -7475,7 +7498,8 @@ pub(crate) static BADGE_LAST_T: [AtomicU64; BADGE_CENSUS_N] =
 /// index directly; the three non-thread deliveries the loop can see get their own named slots.
 pub(crate) fn census_slot(badge: u64) -> usize {
     match badge {
-        DELAY_TIMER_BADGE => 36,
+        b if badge_has_delay_timer(b) => 36,
+        b if hosted_irq_lines_from_badge(b) != 0 => 37,
         IRQ_BADGE => 37,
         ISR_DONE_BADGE | CN_GUARD_BADGE => 38,
         b if (b as usize) < 36 => b as usize,
@@ -14430,6 +14454,16 @@ unsafe fn grant_hosted_pci_devnode_resources(
     let interrupt = grant
         .assignment
         .interrupt_resource(nt_pnp::ResourceView::Translated);
+    let raw_interrupt = grant
+        .assignment
+        .interrupt_resource(nt_pnp::ResourceView::Raw);
+    if raw_interrupt.is_some() != interrupt.is_some() {
+        return Err(hosted_pci_grant_error(
+            device_id,
+            b"interrupt-pairing",
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
     let has_mmio = memory.is_some();
     let assigned_memory: Vec<_> = grant
         .assignment
@@ -14585,6 +14619,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
         ),
         &memory_grants,
         &port_grants,
+        raw_interrupt.map(|interrupt| interrupt.level).unwrap_or(0),
         interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
         interrupt
             .map(|interrupt| interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
@@ -14592,6 +14627,10 @@ unsafe fn grant_hosted_pci_devnode_resources(
         interrupt
             .map(|interrupt| interrupt.flags == nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
             .unwrap_or(false),
+        interrupt
+            .map(|interrupt| interrupt.flags != nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
+            .unwrap_or(false),
+        false,
         interrupt.map(|interrupt| interrupt.affinity).unwrap_or(0),
         window.dma_va,
         window.dma_seed_va,
@@ -14644,7 +14683,13 @@ unsafe fn grant_hosted_root_devnode_resources(
     let interrupt = grant
         .assignment
         .interrupt_resource(nt_pnp::ResourceView::Translated);
-    if raw_memory.is_some() != memory.is_some() || window.dma_frame_base == 0 {
+    let raw_interrupt = grant
+        .assignment
+        .interrupt_resource(nt_pnp::ResourceView::Raw);
+    if raw_memory.is_some() != memory.is_some()
+        || raw_interrupt.is_some() != interrupt.is_some()
+        || window.dma_frame_base == 0
+    {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let mmio_len = memory.map(|memory| memory.length as u64).unwrap_or(0);
@@ -14682,6 +14727,7 @@ unsafe fn grant_hosted_root_devnode_resources(
         driver_launch::HostedBusIdentity::root_bus(),
         &memory_grants,
         &[],
+        raw_interrupt.map(|interrupt| interrupt.level).unwrap_or(0),
         interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
         interrupt
             .map(|interrupt| interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
@@ -14689,6 +14735,8 @@ unsafe fn grant_hosted_root_devnode_resources(
         interrupt
             .map(|interrupt| interrupt.flags == nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
             .unwrap_or(false),
+        false,
+        false,
         interrupt.map(|interrupt| interrupt.affinity).unwrap_or(0),
         window.dma_va,
         0,
@@ -14857,9 +14905,12 @@ unsafe fn grant_hosted_platform_devnode_resources(
         driver_launch::HostedBusIdentity::root_bus(),
         &memory_grants,
         &port_grants,
+        raw_interrupt.level,
         interrupt.vector,
         window.interrupt_shared,
         window.interrupt_latched,
+        window.interrupt_active_low,
+        true,
         interrupt.affinity,
         0,
         0,
@@ -15751,14 +15802,16 @@ impl RingChannel<'_> {
 
     unsafe fn wait_completion_timer_aware(&self) {
         let (_rax, badge, _info, _payload) = ep_recv(self.wait_cptr);
+        let timer = badge_has_delay_timer(badge);
+        let irq_lines = driver_launch::latch_hosted_irq_badge(badge);
         if EXEC_DEADMAN_WATCHDOG {
-            if badge == DELAY_TIMER_BADGE {
+            if timer {
                 watchdog_on_tick();
-            } else {
+            } else if irq_lines == 0 {
                 WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if badge == DELAY_TIMER_BADGE {
+        if timer {
             let n = SURT_CLIENT_TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
             DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
             if drain_nested_pump_timer_delivery() {
@@ -15772,7 +15825,7 @@ impl RingChannel<'_> {
             if n < 8 {
                 print_str(b"[surt-client] HPET tick landed while waiting for completion\n");
             }
-        } else {
+        } else if irq_lines == 0 {
             let n = SURT_CLIENT_WAIT_WAKES.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
                 print_str(b"[surt-client] completion notification woke client wait\n");
@@ -16713,9 +16766,9 @@ unsafe fn recv_full_r12(ep: u64, reply_cptr: u64) -> (u64, u64, u64, u64, u64, u
     // it also covers nested rendezvous receives. Executive-side SURT client waits mirror this same
     // HPET-badge handling in `RingChannel::wait_completion_timer_aware`.
     if EXEC_DEADMAN_WATCHDOG {
-        if badge == DELAY_TIMER_BADGE {
+        if badge_has_delay_timer(badge) {
             watchdog_on_tick();
-        } else {
+        } else if hosted_irq_lines_from_badge(badge) == 0 {
             WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -16762,9 +16815,9 @@ unsafe fn client_reply_recv_badge(
     RECV_CALLS.fetch_add(1, Ordering::Relaxed);
     CLIENT_REPLY_BOUND.fetch_add(1, Ordering::Relaxed);
     if EXEC_DEADMAN_WATCHDOG {
-        if badge == DELAY_TIMER_BADGE {
+        if badge_has_delay_timer(badge) {
             watchdog_on_tick();
-        } else {
+        } else if hosted_irq_lines_from_badge(badge) == 0 {
             WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -17299,9 +17352,74 @@ fn select_delay_hpet_route_pin(route_cap: u32, used_mask: u32) -> Option<u64> {
     highest_ioapic_route_pin(route_cap & !used_mask & !HPET_SHARED_IOAPIC_ROUTE_MASK)
 }
 
+unsafe fn executive_event_notification() -> Result<u64, nt_status::NtStatus> {
+    let existing = EXEC_EVENT_NOTIFICATION.load(Ordering::Acquire);
+    if existing != 0 {
+        if !EXEC_EVENT_NOTIFICATION_BOUND.load(Ordering::Acquire) {
+            let bind = syscall5_call(1, LBL_TCB_BIND_NOTIFICATION << 12, existing, 0, 0);
+            if bind != 0 {
+                return Err(nt_status::NtStatus::UNSUCCESSFUL);
+            }
+            EXEC_EVENT_NOTIFICATION_BOUND.store(true, Ordering::Release);
+        }
+        return Ok(existing);
+    }
+    let Some(notification) = try_alloc_slot() else {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    };
+    let retype = untyped_retype_r(
+        CAP_INIT_UNTYPED,
+        OBJ_NOTIFICATION,
+        0,
+        1,
+        notification,
+    );
+    if retype != 0 {
+        recycle_deleted_root_slot(notification);
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    let bind = syscall5_call(1, LBL_TCB_BIND_NOTIFICATION << 12, notification, 0, 0);
+    if bind != 0 {
+        let _ = cnode_delete_recycle_r(notification);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    EXEC_EVENT_NOTIFICATION.store(notification, Ordering::Release);
+    EXEC_EVENT_NOTIFICATION_BOUND.store(true, Ordering::Release);
+    Ok(notification)
+}
+
+pub(crate) unsafe fn mint_executive_event_badge(
+    badge: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    if badge == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let notification = executive_event_notification()?;
+    let Some(badged) = try_alloc_slot() else {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    };
+    let mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, badged, notification, badge);
+    if mint != 0 {
+        recycle_deleted_root_slot(badged);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    Ok(badged)
+}
+
+pub(crate) unsafe fn delete_executive_event_badge(cap: u64) -> Result<(), nt_status::NtStatus> {
+    if cap == 0 {
+        return Ok(());
+    }
+    if cnode_delete_recycle_r(cap) == 0 {
+        Ok(())
+    } else {
+        Err(nt_status::NtStatus::UNSUCCESSFUL)
+    }
+}
+
 unsafe fn delay_timer_init() -> bool {
     if DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 {
-        let notification = DELAY_TIMER_NOTIFICATION.load(Ordering::Relaxed);
+        let notification = EXEC_EVENT_NOTIFICATION.load(Ordering::Relaxed);
         if notification != 0 {
             // `delay_timer_shutdown` may temporarily unbind the root TCB when no timed waits are
             // live. Re-establish the production binding whenever a later wait reuses the timer.
@@ -17331,7 +17449,8 @@ unsafe fn delay_timer_init() -> bool {
         initial_config & !HPET_TN_INT_ENB,
     );
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let used_mask = ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Relaxed));
+    let used_mask = ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Relaxed))
+        | driver_launch::hosted_irq_line_mask();
     let Some(pin) = select_delay_hpet_route_pin(route_cap, used_mask) else {
         print_str(b"[delay] HPET timer0 has no non-shared IOAPIC route route_cap=0x");
         print_hex(route_cap);
@@ -17342,29 +17461,23 @@ unsafe fn delay_timer_init() -> bool {
         print_str(b"\n");
         return false;
     };
-    let notification = make_object(OBJ_NOTIFICATION);
-    let badged = alloc_slot();
-    let _ = syscall5(
-        SYS_SEND,
-        CAP_INIT_THREAD_CNODE,
-        LBL_CNODE_MINT << 12,
-        badged,
-        notification,
-        DELAY_TIMER_BADGE,
-    );
-    let handler = alloc_slot();
-    ioapic_issue_irq_handler(handler, pin, DELAY_TIMER_IRQ, 1, 0);
-    let _ = irq_handler_set_notification(handler, badged);
-    // The initial root TCB cap is slot 1. Binding lets an HPET signal cancel the executive's
-    // blocking Recv on the hosted-process endpoint, returning DELAY_TIMER_BADGE with empty msginfo.
-    let _ = syscall5(
-        SYS_SEND,
-        1,
-        LBL_TCB_BIND_NOTIFICATION << 12,
-        notification,
-        0,
-        0,
-    );
+    if executive_event_notification().is_err() {
+        return false;
+    }
+    let Ok(badged) = mint_executive_event_badge(DELAY_TIMER_BADGE) else {
+        return false;
+    };
+    let Ok(handler) = issue_ioapic_irq_handler_checked(pin, DELAY_TIMER_IRQ, true, false) else {
+        let _ = delete_executive_event_badge(badged);
+        return false;
+    };
+    if irq_handler_set_notification_checked(handler, badged).is_err() {
+        let _ = clear_ioapic_irq_handler(handler);
+        let _ = delete_executive_event_badge(badged);
+        return false;
+    }
+    // The shared executive event notification is already bound to the root TCB, so an HPET signal
+    // cancels any blocking receive and returns DELAY_TIMER_BADGE with empty msginfo.
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     // LEVEL-triggered (matching the IOAPIC pin we just issued) and DISARMED: the timer delivers
     // only while `delay_timer_rearm` has a real deadline to arm it with. Init used to set
@@ -17375,7 +17488,6 @@ unsafe fn delay_timer_init() -> bool {
     initialize_hpet_monotonic_epoch(period);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
-    DELAY_TIMER_NOTIFICATION.store(notification, Ordering::Relaxed);
     DELAY_TIMER_BADGED_NOTIFICATION.store(badged, Ordering::Relaxed);
     DELAY_TIMER_IOAPIC_PIN.store(pin, Ordering::Relaxed);
     print_str(b"[delay] timer ready pin=");
@@ -18040,7 +18152,11 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue, handler: &Exec
     config &= !HPET_TN_INT_ENB;
     core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
     core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let _ = syscall5(SYS_SEND, 1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0);
+    if !driver_launch::hosted_irq_routes_active()
+        && syscall5_call(1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0) == 0
+    {
+        EXEC_EVENT_NOTIFICATION_BOUND.store(false, Ordering::Release);
+    }
 }
 
 unsafe fn delay_cancel_thread(
@@ -19211,13 +19327,13 @@ pub(crate) unsafe fn set_recv_mr(i: usize, v: u64) {
 /// a 7-word message (msg_regs[0..6]) + one extra cap (the dest CNode root). mr0..2 go
 /// in registers, mr3 (pin) in r15, mr4..6 in the IPC buffer, the extra cap at IPC
 /// word 122. The kernel also programs IOAPIC RTE[pin] → pin fires vector+0x20.
-unsafe fn ioapic_issue_irq_handler(
+unsafe fn ioapic_issue_irq_handler_r(
     dest_slot: u64,
     pin: u64,
     vector: u64,
     level: u64,
     polarity: u64,
-) {
+) -> u64 {
     let ipc = IPC_BUFFER.load(Ordering::Relaxed);
     core::ptr::write_volatile((ipc + 5 * 8) as *mut u64, level); // mr4 = level (0=edge, 1=level)
     core::ptr::write_volatile((ipc + 6 * 8) as *mut u64, polarity); // mr5 = polarity (1=active-low)
@@ -19226,11 +19342,12 @@ unsafe fn ioapic_issue_irq_handler(
     core::ptr::write_volatile((ipc + 122 * 8) as *mut u64, CAP_INIT_THREAD_CNODE);
     // msginfo: label=64, capsUnwrapped=1, extraCaps=1, length=7.
     let msginfo = (LBL_X86_IRQ_ISSUE_IOAPIC << 12) | (1 << 9) | (1 << 7) | 7;
+    let reply: u64;
     core::arch::asm!(
         "syscall",
-        in("rdx") SYS_SEND as u64,
+        in("rdx") SYS_CALL as u64,
         in("rdi") SLOT_IRQ_CONTROL,
-        in("rsi") msginfo,
+        inout("rsi") msginfo => reply,
         in("r10") dest_slot, // mr0 = index (dest slot)
         in("r8") 64u64,      // mr1 = depth (init CNode: guard=0, so depth 64 resolves the slot)
         in("r9") 0u64,       // mr2 = ioapic id (ignored)
@@ -19240,6 +19357,90 @@ unsafe fn ioapic_issue_irq_handler(
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
+    reply >> 12
+}
+
+unsafe fn ioapic_issue_irq_handler(
+    dest_slot: u64,
+    pin: u64,
+    vector: u64,
+    level: u64,
+    polarity: u64,
+) {
+    let _ = ioapic_issue_irq_handler_r(dest_slot, pin, vector, level, polarity);
+}
+
+pub(crate) unsafe fn issue_ioapic_irq_handler_checked(
+    pin: u64,
+    vector: u64,
+    level_sensitive: bool,
+    active_low: bool,
+) -> Result<u64, nt_status::NtStatus> {
+    if pin >= 32 || vector == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let Some(handler) = try_alloc_slot() else {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    };
+    let error = ioapic_issue_irq_handler_r(
+        handler,
+        pin,
+        vector,
+        u64::from(level_sensitive),
+        u64::from(active_low),
+    );
+    if error != 0 {
+        recycle_deleted_root_slot(handler);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    Ok(handler)
+}
+
+pub(crate) unsafe fn irq_handler_set_notification_checked(
+    handler: u64,
+    notification: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if handler == 0 || notification == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if syscall5_call(
+        handler,
+        LBL_IRQ_SET_NOTIFICATION << 12,
+        notification,
+        0,
+        0,
+    ) == 0
+    {
+        Ok(())
+    } else {
+        Err(nt_status::NtStatus::UNSUCCESSFUL)
+    }
+}
+
+pub(crate) unsafe fn acknowledge_ioapic_irq_handler(handler: u64) {
+    if handler != 0 {
+        let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+    }
+}
+
+pub(crate) unsafe fn clear_ioapic_irq_handler(
+    handler: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if handler == 0 {
+        return Ok(());
+    }
+    if syscall5_call(handler, LBL_IRQ_CLEAR_HANDLER << 12, 0, 0, 0) != 0 {
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    if cnode_delete_recycle_r(handler) != 0 {
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    Ok(())
+}
+
+pub(crate) fn executive_reserved_ioapic_line_mask() -> u32 {
+    ioapic_route_pin_mask(HPET_PROBE_IOAPIC_PIN.load(Ordering::Acquire))
+        | ioapic_route_pin_mask(DELAY_TIMER_IOAPIC_PIN.load(Ordering::Acquire))
 }
 
 /// The fixed object path for a syscall's directory index.
@@ -21092,6 +21293,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
         platform_ports,
         discovery.fixed.sci_interrupt as u32,
         false,
+        true,
         true,
     ) {
         platform_windows.push(window);

@@ -19571,3 +19571,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     this same mechanism; the driver's real ISR/DPC and bus invalidation remain the only source of
     subsequent PnP work. Do not reintroduce an executive packet model, polling loop, timer stimulus,
     device-name branch, or success fallback.
+
+    B3 genuine hosted-IRQ transport checkpoint (2026-08-31, implementation green): the canonical
+    resource manager now retains a physical interrupt line independently from its translated NT
+    vector and returns both only for a live, generation-owned connection. Raw line, vector, trigger
+    mode, sharing, polarity, and route-authority provenance survive the hosted PnP grant instead of
+    being reconstructed from a callback or service identity. Focused resource-manager validation
+    passes 14/14, including physical-line preservation and disconnect invalidation.
+
+    `IoConnectInterrupt` is now a synchronous component-to-executive broker operation. It validates
+    the current exact-device dispatch projection, commits the canonical connection, mints one
+    microkernel handler per physical IOAPIC line, and binds it to a line-bit badge on the executive's
+    shared bound notification. Any number of driver/device registrations may share a line when every
+    assigned resource is shared and their vector, trigger, and polarity agree; exclusive conflicts
+    fail closed. A genuine delivery invokes every live ISR registration in its owning component
+    VSpace through the retained interrupt dispatch, drains the component's queued DPC work, and
+    acknowledges the hardware handler once. Timer and IRQ badges can coalesce without losing line
+    identity, and every nested component receive recognizes them as executive events rather than
+    malformed component IPC.
+
+    Disconnect, STOP, REMOVE, rebalance, component retirement, and driver unload mask and clear the
+    hardware handler before revoking callback, resource, DMA, mapping, or VSpace state. The
+    microkernel issue path was corrected at the same boundary: an IOAPIC route is programmed masked,
+    successful `SetNotification` is its unmask commit point, and `ClearIRQHandler` masks before
+    clearing. Unsupported pins/modes fail the invocation. Both rust-micro freestanding feature
+    checks pass, its commit was pushed before advancing the parent submodule, and the executive
+    freestanding check remains green at the unchanged 209-warning baseline.
+
+    Review adjustment: FADT SCI is an authoritative GSI and can use this route now. A PCI config
+    `INTERRUPT_LINE` byte is only a legacy bus value on q35 and is explicitly not accepted as IOAPIC
+    authority; neither the old compiled q35 PIRQ table nor the config byte may become a production
+    fallback. Next extend the dynamically selected ACPI/PCI bus-provider contract so the hosted
+    `acpi.sys` `_PRT` result publishes the translated GSI, trigger, and polarity on the canonical PCI
+    devnode generation. Then perform one serialized desktop boot proving real ACPI DriverEntry,
+    AddDevice, START, `IoConnectInterrupt`, SCI ISR/DPC delivery, and driver-originated bus-relation
+    invalidation before enabling PCI INTx routes. The currently active older desktop VM remains
+    untouched, so runtime acceptance is intentionally still open.

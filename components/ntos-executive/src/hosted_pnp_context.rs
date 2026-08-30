@@ -202,6 +202,7 @@ pub(crate) struct HostedPnpPlatformResourceDescriptor {
     pub(crate) interrupt_vector: u32,
     pub(crate) interrupt_latched: bool,
     pub(crate) interrupt_shared: bool,
+    pub(crate) interrupt_active_low: bool,
 }
 
 impl HostedPnpPlatformResourceDescriptor {
@@ -215,6 +216,7 @@ impl HostedPnpPlatformResourceDescriptor {
         interrupt_vector: u32,
         interrupt_latched: bool,
         interrupt_shared: bool,
+        interrupt_active_low: bool,
     ) -> Option<Self> {
         if instance_path.is_empty()
             || hardware_id.is_empty()
@@ -261,6 +263,7 @@ impl HostedPnpPlatformResourceDescriptor {
             interrupt_vector,
             interrupt_latched,
             interrupt_shared,
+            interrupt_active_low,
         })
     }
 

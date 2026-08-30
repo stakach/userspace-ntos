@@ -644,6 +644,7 @@ pub const FSD_SERVICE_ROOT_PDO_PNP_LABEL: u64 = 0x781;
 pub const FSD_SERVICE_DEVICE_LABEL: u64 = 0x782;
 pub const FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL: u64 = 0x783;
 pub const FSD_SERVICE_PCI_CONFIG_LABEL: u64 = 0x784;
+pub const FSD_SERVICE_INTERRUPT_LABEL: u64 = 0x785;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -682,8 +683,12 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_DEVICE_LABEL
             | FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
             | FSD_SERVICE_PCI_CONFIG_LABEL
+            | FSD_SERVICE_INTERRUPT_LABEL
     )
 }
+
+const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
+const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const FILE_OPENED_INFORMATION: u64 = 1;
@@ -8725,6 +8730,52 @@ extern "win64" fn s_io_connect_interrupt(
             (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
             service_context,
         );
+        let (_label, broker_status, interrupt_id, _, _) = call_on4(
+            (FSD_SERVICE_INTERRUPT_LABEL << 12) | 2,
+            HOSTED_INTERRUPT_OP_CONNECT,
+            projection,
+            0,
+            0,
+        );
+        let broker_status = broker_status as u32 as i32;
+        if broker_status != STATUS_SUCCESS || interrupt_id == 0 {
+            if !interrupt_obj_out.is_null() {
+                write_unaligned(interrupt_obj_out, 0);
+            }
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *mut u64,
+                0,
+            );
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
+                0,
+            );
+            pool_free(projection);
+            trace_hosted_io_connect_interrupt(
+                interrupt_obj_out as u64,
+                service_routine,
+                service_context,
+                vector,
+                granted_vector,
+                affinity,
+                granted_affinity,
+                0,
+                broker_status,
+            );
+            return if broker_status == STATUS_SUCCESS {
+                STATUS_INVALID_DEVICE_REQUEST
+            } else {
+                broker_status
+            };
+        }
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
+            interrupt_id,
+        );
         trace_hosted_io_connect_interrupt(
             interrupt_obj_out as u64,
             service_routine,
@@ -8746,6 +8797,16 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
     unsafe {
         let active = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
         if pkinterrupt != 0 && pkinterrupt == active {
+            let (_label, status, _, _, _) = call_on4(
+                (FSD_SERVICE_INTERRUPT_LABEL << 12) | 2,
+                HOSTED_INTERRUPT_OP_DISCONNECT,
+                pkinterrupt,
+                0,
+                0,
+            );
+            if status as u32 as i32 != STATUS_SUCCESS {
+                return;
+            }
             write_volatile(
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
                 0,
@@ -8772,6 +8833,7 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 0,
             );
             clear_dpc_queue_projection(FSD_SHARED_VADDR);
+            pool_free(pkinterrupt);
         }
     }
 }
@@ -39257,6 +39319,27 @@ fn current_hosted_device_dispatch_binding(instance: usize) -> Option<HostedDevic
     })
 }
 
+fn current_hosted_device_dispatch_binding_for_projection(
+    projection_instance: usize,
+) -> Option<HostedDeviceBinding> {
+    let contexts = unsafe { (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS)).as_ref()? };
+    let binding = contexts
+        .iter()
+        .rev()
+        .find(|context| {
+            context.instance == projection_instance
+                || context.binding.projection_instance == projection_instance
+        })?
+        .binding;
+    let inst = instance_by_driver_id(binding.driver_id)?.1;
+    let projection = instance(binding.projection_instance)?;
+    (hosted_device_binding_by_device_id(binding.device_id) == Some(binding)
+        && inst.ready
+        && projection.ready
+        && instance_domain_identity(projection) == Some(binding.projection_domain))
+    .then_some(binding)
+}
+
 const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
     driver_id: 0,
     device_id: 0,
@@ -39380,7 +39463,12 @@ struct HostedDeviceResourceState {
     pdo_object: u64,
     address_resource_count: u8,
     address_resources: [SharedAddressResource; SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize],
+    interrupt_line: u32,
     interrupt_affinity: u64,
+    interrupt_shared: bool,
+    interrupt_latched: bool,
+    interrupt_active_low: bool,
+    interrupt_route_authoritative: bool,
     interface_type: u32,
     bus_number: u32,
     address: u32,
@@ -39397,6 +39485,24 @@ struct HostedDeviceResourceState {
     pci_interrupt_line: Option<crate::pnp::PciInterruptLineProgramming>,
     pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
     evidence: HostedHardwareEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedIrqConnection {
+    binding: HostedDeviceBinding,
+    interrupt_id: u64,
+    line: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostedIrqLine {
+    line: u32,
+    vector: u32,
+    level_sensitive: bool,
+    active_low: bool,
+    shared: bool,
+    handler_cap: u64,
+    notification_cap: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -39436,6 +39542,9 @@ static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
+static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
+static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
+static HOSTED_IRQ_PENDING_LINES: AtomicU32 = AtomicU32::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
 static mut HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS: Option<
@@ -41059,6 +41168,334 @@ unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_irq_connections_mut() -> &'static mut Vec<HostedIrqConnection> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_IRQ_CONNECTIONS);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_irq_lines_mut() -> &'static mut Vec<HostedIrqLine> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_IRQ_LINES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_irq_lines() -> Option<&'static Vec<HostedIrqLine>> {
+    (*core::ptr::addr_of!(HOSTED_IRQ_LINES)).as_ref()
+}
+
+unsafe fn hosted_irq_connections() -> Option<&'static Vec<HostedIrqConnection>> {
+    (*core::ptr::addr_of!(HOSTED_IRQ_CONNECTIONS)).as_ref()
+}
+
+pub(crate) fn hosted_irq_line_mask() -> u32 {
+    unsafe {
+        hosted_irq_lines()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .fold(0u32, |mask, route| mask | (1u32 << route.line))
+            })
+            .unwrap_or(0)
+    }
+}
+
+pub(crate) fn hosted_irq_routes_active() -> bool {
+    hosted_irq_line_mask() != 0
+}
+
+pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u32 {
+    let lines = crate::hosted_irq_lines_from_badge(badge);
+    if lines != 0 {
+        HOSTED_IRQ_PENDING_LINES.fetch_or(lines, Ordering::AcqRel);
+    }
+    lines
+}
+
+unsafe fn install_hosted_irq_connection(
+    binding: HostedDeviceBinding,
+    interrupt_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if hosted_irq_connections().is_some_and(|connections| {
+        connections
+            .iter()
+            .any(|connection| connection.interrupt_id == interrupt_id)
+    }) {
+        return Ok(());
+    }
+    let route = hosted_resource_manager_mut()
+        .connected_interrupt_route(interrupt_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if state.driver_id != binding.driver_id
+        || state.instance != binding.instance
+        || state.projection_domain != binding.projection_domain
+        || state.interrupt_line != route.line
+        || state.evidence.interrupt_vector != route.translated_vector
+        || route.tokens.vector != route.translated_vector
+        || route.tokens.service_routine_token != state.evidence.interrupt_routine
+        || route.tokens.service_context_token != state.evidence.interrupt_context
+        || state.interrupt_latched
+            != (route.mode == nt_hal_abi::INT_MODE_LATCHED)
+        || state.interrupt_shared != (route.share == nt_hal_abi::SHARE_SHARED)
+        || !state.interrupt_route_authoritative
+        || route.line >= 24
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+
+    if let Some(existing) = hosted_irq_lines().and_then(|lines| {
+        lines
+            .iter()
+            .copied()
+            .find(|existing| existing.line == route.line)
+    }) {
+        if existing.vector != route.translated_vector
+            || existing.level_sensitive != !state.interrupt_latched
+            || existing.active_low != state.interrupt_active_low
+            || !existing.shared
+            || route.share != nt_hal_abi::SHARE_SHARED
+        {
+            return Err(nt_status::NtStatus::ACCESS_DENIED);
+        }
+        hosted_irq_connections_mut()
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        hosted_irq_connections_mut().push(HostedIrqConnection {
+            binding,
+            interrupt_id,
+            line: route.line,
+        });
+        return Ok(());
+    }
+
+    if hosted_irq_lines().is_some_and(|lines| {
+        lines
+            .iter()
+            .any(|existing| existing.vector == route.translated_vector)
+    }) || crate::executive_reserved_ioapic_line_mask() & (1u32 << route.line) != 0
+    {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    hosted_irq_lines_mut()
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    hosted_irq_connections_mut()
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+
+    let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << route.line);
+    let notification_cap = crate::mint_executive_event_badge(badge)?;
+    let handler_cap = match crate::issue_ioapic_irq_handler_checked(
+        route.line as u64,
+        route.translated_vector as u64,
+        !state.interrupt_latched,
+        state.interrupt_active_low,
+    ) {
+        Ok(cap) => cap,
+        Err(status) => {
+            let _ = crate::delete_executive_event_badge(notification_cap);
+            return Err(status);
+        }
+    };
+    hosted_irq_lines_mut().push(HostedIrqLine {
+        line: route.line,
+        vector: route.translated_vector,
+        level_sensitive: !state.interrupt_latched,
+        active_low: state.interrupt_active_low,
+        shared: route.share == nt_hal_abi::SHARE_SHARED,
+        handler_cap,
+        notification_cap,
+    });
+    hosted_irq_connections_mut().push(HostedIrqConnection {
+        binding,
+        interrupt_id,
+        line: route.line,
+    });
+    if let Err(status) = crate::irq_handler_set_notification_checked(handler_cap, notification_cap)
+    {
+        hosted_irq_connections_mut().retain(|connection| connection.interrupt_id != interrupt_id);
+        hosted_irq_lines_mut().retain(|line| line.handler_cap != handler_cap);
+        let _ = crate::clear_ioapic_irq_handler(handler_cap);
+        let _ = crate::delete_executive_event_badge(notification_cap);
+        return Err(status);
+    }
+    Ok(())
+}
+
+unsafe fn retire_hosted_irq_connection(
+    binding: HostedDeviceBinding,
+    interrupt_id: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let connection = hosted_irq_connections()
+        .and_then(|connections| {
+            connections
+                .iter()
+                .copied()
+                .find(|connection| connection.interrupt_id == interrupt_id)
+        })
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if connection.binding != binding {
+        return Err(nt_status::NtStatus::ACCESS_DENIED);
+    }
+    let last_on_line = hosted_irq_connections().is_none_or(|connections| {
+        connections
+            .iter()
+            .filter(|candidate| candidate.line == connection.line)
+            .count()
+            == 1
+    });
+    let line = if last_on_line {
+        hosted_irq_lines().and_then(|lines| {
+            lines
+                .iter()
+                .copied()
+                .find(|line| line.line == connection.line)
+        })
+    } else {
+        None
+    };
+    if let Some(line) = line {
+        crate::clear_ioapic_irq_handler(line.handler_cap)?;
+        hosted_irq_lines_mut().retain(|candidate| candidate.line != line.line);
+        crate::delete_executive_event_badge(line.notification_cap)?;
+    }
+    hosted_irq_connections_mut().retain(|candidate| candidate.interrupt_id != interrupt_id);
+    Ok(())
+}
+
+unsafe fn retire_hosted_irq_connections_for_binding(
+    binding: HostedDeviceBinding,
+) -> Result<(), nt_status::NtStatus> {
+    loop {
+        let Some(interrupt_id) = hosted_irq_connections().and_then(|connections| {
+            connections
+                .iter()
+                .find(|connection| connection.binding == binding)
+                .map(|connection| connection.interrupt_id)
+        }) else {
+            return Ok(());
+        };
+        retire_hosted_irq_connection(binding, interrupt_id)?;
+        hosted_resource_manager_mut()
+            .disconnect_interrupt(hosted_resource_owner(binding), interrupt_id)
+            .map_err(hosted_hal_status)?;
+    }
+}
+
+unsafe fn dispatch_hosted_irq_connection(
+    connection: HostedIrqConnection,
+) -> Result<bool, nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(connection.binding.device_id)
+        .filter(|binding| *binding == connection.binding)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let route = hosted_resource_manager_mut()
+        .connected_interrupt_route(connection.interrupt_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if route.line != connection.line {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let (_, inst) = instance_by_driver_id(binding.driver_id)
+        .filter(|(_, inst)| inst.ready)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let sh = inst.exec_shared_va;
+    let state = restore_hosted_device_resource_state(binding, sh, true)?;
+    if state.interrupt_line != route.line
+        || state.evidence.interrupt_id != route.tokens.interrupt_id
+        || state.evidence.interrupt_vector != route.tokens.vector
+        || state.evidence.interrupt_routine != route.tokens.service_routine_token
+        || state.evidence.interrupt_context != route.tokens.service_context_token
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let mut output = [];
+    let (status, information, _) = dispatch_irp_for_instance(
+        binding.instance,
+        FSD_DISPATCH_INTERRUPT,
+        route.tokens.vector as u64,
+        binding.device_object,
+        0,
+        0,
+        0,
+        route.tokens.interrupt_id,
+        0,
+        None,
+        &[],
+        &mut output,
+    )
+    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    nt_status::NtStatus(status).to_result()?;
+    refresh_hosted_device_resource_state(binding, sh);
+    Ok(information != 0)
+}
+
+unsafe fn service_hosted_irq_line(line_number: u32) -> Result<u64, nt_status::NtStatus> {
+    let line = hosted_irq_lines()
+        .and_then(|lines| {
+            lines
+                .iter()
+                .copied()
+                .find(|line| line.line == line_number)
+        })
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let mut connections = Vec::new();
+    if let Some(live) = hosted_irq_connections() {
+        connections
+            .try_reserve_exact(live.len())
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        connections.extend(
+            live.iter()
+                .copied()
+                .filter(|connection| connection.line == line_number),
+        );
+    }
+    let mut claimed = 0u64;
+    let mut first_error = None;
+    for connection in connections {
+        match dispatch_hosted_irq_connection(connection) {
+            Ok(true) => claimed += 1,
+            Ok(false) => {}
+            Err(status) if first_error.is_none() => first_error = Some(status),
+            Err(_) => {}
+        }
+    }
+    crate::acknowledge_ioapic_irq_handler(line.handler_cap);
+    match first_error {
+        Some(status) => Err(status),
+        None => Ok(claimed),
+    }
+}
+
+pub(crate) unsafe fn drain_pending_hosted_irqs() -> u64 {
+    let mut serviced = 0u64;
+    loop {
+        let pending = HOSTED_IRQ_PENDING_LINES.swap(0, Ordering::AcqRel);
+        if pending == 0 {
+            return serviced;
+        }
+        let mut bits = pending;
+        while bits != 0 {
+            let line = bits.trailing_zeros();
+            bits &= !(1u32 << line);
+            match service_hosted_irq_line(line) {
+                Ok(_) => serviced += 1,
+                Err(status) => {
+                    print_str(b"[hosted-irq] dispatch failed line=");
+                    print_u64(line as u64);
+                    print_str(b" status=0x");
+                    print_hex(status.raw() as u32);
+                    print_str(b"\n");
+                }
+            }
+        }
+    }
+}
+
 unsafe fn hosted_dma_manager_mut() -> &'static mut HostedDmaManager {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DMA_MANAGER);
     if slot.is_none() {
@@ -41112,6 +41549,9 @@ unsafe fn clear_hosted_resource_projection(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
+    // Mask and retire the physical route before revoking the generation's resource assignment or
+    // component mappings. A live device must never target a stale ISR projection.
+    retire_hosted_irq_connections_for_binding(binding)?;
     if let Some((instance, inst)) = instance_by_driver_id(binding.driver_id) {
         let failures = clear_hosted_resource_map_caps_for_device(
             instance,
@@ -42431,7 +42871,20 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pdo_object: read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64),
         address_resource_count,
         address_resources,
+        interrupt_line: previous_state.map(|state| state.interrupt_line).unwrap_or(0),
         interrupt_affinity: read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64),
+        interrupt_shared: previous_state
+            .map(|state| state.interrupt_shared)
+            .unwrap_or(false),
+        interrupt_latched: previous_state
+            .map(|state| state.interrupt_latched)
+            .unwrap_or(false),
+        interrupt_active_low: previous_state
+            .map(|state| state.interrupt_active_low)
+            .unwrap_or(false),
+        interrupt_route_authoritative: previous_state
+            .map(|state| state.interrupt_route_authoritative)
+            .unwrap_or(false),
         interface_type: read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32),
         bus_number: read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32),
         address: read_volatile((sh + SH_RESOURCE_ADDRESS) as *const u32),
@@ -44908,6 +45361,71 @@ pub(crate) fn service_hosted_driver_pci_config(
     }
 }
 
+pub(crate) fn service_hosted_driver_interrupt(
+    ch: &crate::spawn_hosts::PumpChannel,
+    operation: u64,
+    interrupt_object: u64,
+    active_reply_cap: u64,
+) -> (i32, u64) {
+    let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_ACCESS_DENIED, 0);
+    };
+    let Some(binding) = current_hosted_device_dispatch_binding_for_projection(instance_index)
+    else {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    };
+    if instance_domain_identity(inst) != Some(binding.projection_domain)
+        || ch.shared_va != inst.exec_shared_va
+    {
+        return (STATUS_ACCESS_DENIED, 0);
+    }
+    let sh = ch.shared_va;
+    let active = unsafe {
+        read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64)
+    };
+    if interrupt_object == 0 || active != interrupt_object {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    match operation {
+        HOSTED_INTERRUPT_OP_CONNECT => unsafe {
+            match publish_hosted_interrupt_connection_from_shared(binding, sh) {
+                Ok(()) => {
+                    let interrupt_id =
+                        read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+                    if interrupt_id == 0 {
+                        (STATUS_INVALID_DEVICE_REQUEST, 0)
+                    } else {
+                        (STATUS_SUCCESS, interrupt_id)
+                    }
+                }
+                Err(status) => (status.raw(), 0),
+            }
+        },
+        HOSTED_INTERRUPT_OP_DISCONNECT => unsafe {
+            let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+            if interrupt_id == 0
+                || hosted_resource_manager_mut()
+                    .connected_interrupt(interrupt_id)
+                    .is_none()
+            {
+                return (STATUS_INVALID_DEVICE_REQUEST, 0);
+            }
+            if let Err(status) = retire_hosted_irq_connection(binding, interrupt_id) {
+                return (status.raw(), 0);
+            }
+            if let Err(error) = hosted_resource_manager_mut()
+                .disconnect_interrupt(hosted_resource_owner(binding), interrupt_id)
+            {
+                return (hosted_hal_status(error).raw(), 0);
+            }
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+            refresh_hosted_device_resource_state(binding, sh);
+            (STATUS_SUCCESS, 0)
+        },
+        _ => (STATUS_INVALID_PARAMETER, 0),
+    }
+}
+
 fn service_hosted_irp_bank_pull(
     ch: &crate::spawn_hosts::PumpChannel,
     transfer_id: u64,
@@ -47045,9 +47563,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     bus_identity: HostedBusIdentity,
     memory: &[HostedMemoryResourceGrant],
     ports: &[HostedPortResourceGrant],
+    interrupt_line: u32,
     interrupt_vector: u32,
     interrupt_shared: bool,
     interrupt_latched: bool,
+    interrupt_active_low: bool,
+    interrupt_route_authoritative: bool,
     interrupt_affinity: u64,
     dma_va: u64,
     dma_broker_va: u64,
@@ -47059,6 +47580,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
 ) -> Result<(), nt_status::NtStatus> {
     if memory.len() + ports.len() > SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize
         || memory.is_empty() && ports.is_empty() && interrupt_vector == 0
+        || (interrupt_line == 0) != (interrupt_vector == 0)
         || interrupt_affinity > u32::MAX as u64
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -47480,6 +48002,9 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 nt_hal_abi::SHARE_EXCLUSIVE
             },
             resource_id,
+            raw_start: interrupt_line as u64,
+            translated_start: interrupt_vector as u64,
+            length: 1,
             arg0,
             arg1,
             ..Default::default()
@@ -47573,6 +48098,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         state.address_resources =
             [SharedAddressResource::default(); SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize];
         state.address_resources[..resources.len()].copy_from_slice(&resources);
+        state.interrupt_line = interrupt_line;
+        state.interrupt_shared = interrupt_shared;
+        state.interrupt_latched = interrupt_latched;
+        state.interrupt_active_low = interrupt_active_low;
+        state.interrupt_route_authoritative = interrupt_route_authoritative;
         if let Some(memory) = resources
             .iter()
             .find(|resource| resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY)
@@ -47746,7 +48276,7 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     if existing != 0 {
         let tokens = hosted_resource_manager_mut()
-            .inject_interrupt(existing)
+            .connected_interrupt(existing)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         if tokens.vector != interrupt_vector
             || tokens.service_routine_token != service_routine
@@ -47754,7 +48284,8 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        return Ok(());
+        refresh_hosted_device_resource_state(binding, sh);
+        return install_hosted_irq_connection(binding, existing);
     }
 
     let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
@@ -47771,6 +48302,14 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
+    refresh_hosted_device_resource_state(binding, sh);
+    if let Err(status) = install_hosted_irq_connection(binding, connected) {
+        let _ = hosted_resource_manager_mut()
+            .disconnect_interrupt(hosted_resource_owner(binding), connected);
+        write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+        refresh_hosted_device_resource_state(binding, sh);
+        return Err(status);
+    }
     Ok(())
 }
 

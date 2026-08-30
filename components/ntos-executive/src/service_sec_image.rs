@@ -6255,6 +6255,33 @@ pub(crate) unsafe fn service_sec_image(
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
     loop {
+        // Hardware IRQs share the root TCB's bound notification with the HPET timer. Component
+        // pumps only latch these bits; the root loop is the sole dispatcher and therefore the sole
+        // owner of ISR ordering and handler acknowledgement.
+        let current_irq_lines = driver_launch::latch_hosted_irq_badge(badge);
+        let _ = driver_launch::drain_pending_hosted_irqs();
+        if current_irq_lines != 0 {
+            if badge_has_delay_timer(badge) {
+                badge = DELAY_TIMER_BADGE;
+            } else {
+                let irq_durable_status = finalize_service_loop_state(&mut nt_handler);
+                if irq_durable_status != nt_fs::STATUS_SUCCESS {
+                    print_str(b"[service-loop] IRQ checkpoint failure=0x");
+                    print_hex(irq_durable_status);
+                    print_str(b"\n");
+                    stop = irq_durable_status as u64;
+                    break;
+                }
+                let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                badge = received.0;
+                mi = received.1;
+                m0 = received.2;
+                m1 = received.3;
+                m2 = received.4;
+                m3 = received.5;
+                continue;
+            }
+        }
         if pending_driver_start_redrive_needed(&nt_handler)
             || driver_launch::hosted_driver_dpc_activation_pending()
         {

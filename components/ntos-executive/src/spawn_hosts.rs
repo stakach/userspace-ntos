@@ -1329,6 +1329,26 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
 
+unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool) {
+    let timer = crate::badge_has_delay_timer(badge);
+    let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
+    let event = timer || irq_lines != 0;
+    if crate::EXEC_DEADMAN_WATCHDOG {
+        if timer {
+            crate::watchdog_on_tick();
+        } else if !event {
+            crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if timer {
+        crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+        if !crate::drain_nested_pump_timer_delivery() {
+            crate::delay_timer_nested_ack();
+        }
+    }
+    (event, timer)
+}
+
 /// After a bound HPET notification interrupts a component endpoint receive, probe that endpoint
 /// once without blocking. This prevents a ready component Call from sitting behind a stream of timer
 /// badges on the root TCB's bound notification while preserving normal blocking behavior when the
@@ -1356,18 +1376,8 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    if crate::EXEC_DEADMAN_WATCHDOG {
-        if badge == crate::DELAY_TIMER_BADGE {
-            crate::watchdog_on_tick();
-        } else {
-            crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if badge == crate::DELAY_TIMER_BADGE {
-        crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-        if !crate::drain_nested_pump_timer_delivery() {
-            crate::delay_timer_nested_ack();
-        }
+    let (executive_event, _timer) = pump_handle_executive_event_badge(badge);
+    if executive_event {
         if pump_deadman_tripped() {
             return Some(PumpMessage::deadman_wall());
         }
@@ -1558,33 +1568,22 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
-        if crate::EXEC_DEADMAN_WATCHDOG {
-            if badge == crate::DELAY_TIMER_BADGE {
-                crate::watchdog_on_tick();
-            } else {
-                crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if badge == crate::DELAY_TIMER_BADGE {
-            crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-            // The main service loop owns the delay/wait queues; when that context is live, drain it
-            // here because this nested pump may be the thing preventing the loop top from running.
-            // Early component init has no such context, so it only needs the IRQ-line ack.
-            if !crate::drain_nested_pump_timer_delivery() {
-                crate::delay_timer_nested_ack();
-            }
+        let (executive_event, timer) = pump_handle_executive_event_badge(badge);
+        if executive_event {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
-            if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
-                crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-                return polled;
-            }
-            let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-            if n < 8 {
-                crate::print_str(
-                    b"[pump] HPET tick landed on a component recv -> deferred to the service loop (NOT a wall)\n",
-                );
+            if timer {
+                if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
+                    crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+                    return polled;
+                }
+                let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    crate::print_str(
+                        b"[pump] HPET tick landed on a component recv -> deferred to the service loop (NOT a wall)\n",
+                    );
+                }
             }
             continue;
         }
@@ -1647,30 +1646,22 @@ unsafe fn pump_reply_recv4(
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    if crate::EXEC_DEADMAN_WATCHDOG {
-        if badge == crate::DELAY_TIMER_BADGE {
-            crate::watchdog_on_tick();
-        } else {
-            crate::WATCHDOG_MSGS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if badge == crate::DELAY_TIMER_BADGE {
-        crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
-        if !crate::drain_nested_pump_timer_delivery() {
-            crate::delay_timer_nested_ack();
-        }
+    let (executive_event, timer) = pump_handle_executive_event_badge(badge);
+    if executive_event {
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
-        if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
-            crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-            return polled;
-        }
-        let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
-        if n < 8 {
-            crate::print_str(
-                b"[pump] HPET tick landed on a component replyrecv -> deferred to the service loop (NOT a wall)\n",
-            );
+        if timer {
+            if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
+                crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+                return polled;
+            }
+            let n = crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                crate::print_str(
+                    b"[pump] HPET tick landed on a component replyrecv -> deferred to the service loop (NOT a wall)\n",
+                );
+            }
         }
         return pump_recv(ch, reply_cap);
     }
@@ -1989,6 +1980,27 @@ unsafe fn component_pump_loop(
                 2,
                 status as u32 as u64,
                 transferred,
+                0,
+                0
+            );
+            continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_INTERRUPT_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, interrupt_id) =
+                crate::driver_launch::service_hosted_driver_interrupt(
+                    ch,
+                    msg.m0,
+                    msg.m1,
+                    *reply_cap,
+                );
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                interrupt_id,
                 0,
                 0
             );

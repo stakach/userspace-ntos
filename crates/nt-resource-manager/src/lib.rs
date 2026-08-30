@@ -82,6 +82,8 @@ struct MemoryResource {
 struct InterruptResource {
     resource_id: u64,
     owner: ResourceOwner,
+    line: u32,
+    translated_vector: u32,
     vector: u32,
     irql: u8,
     affinity: u32,
@@ -133,7 +135,7 @@ pub struct Granted {
     pub rights: u64,
 }
 
-/// A connected interrupt's Driver-Host callback tokens, returned on injection.
+/// A connected interrupt's Driver-Host callback tokens.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InterruptTokens {
     pub interrupt_id: u64,
@@ -141,6 +143,17 @@ pub struct InterruptTokens {
     pub service_context_token: u64,
     pub irql: u8,
     pub vector: u32,
+}
+
+/// Canonical hardware route and callback tokens for one live interrupt connection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ConnectedInterrupt {
+    pub tokens: InterruptTokens,
+    pub resource_id: u64,
+    pub line: u32,
+    pub translated_vector: u32,
+    pub mode: u8,
+    pub share: u16,
 }
 
 fn validate_range(start: u64, length: u64) -> Result<u64, HalError> {
@@ -252,6 +265,8 @@ impl ResourceManager {
         let resource = InterruptResource {
             resource_id,
             owner,
+            line: vector,
+            translated_vector: vector,
             vector,
             irql,
             affinity,
@@ -400,6 +415,12 @@ impl ResourceManager {
                 RES_KIND_INTERRUPT => {
                     let (vector, irql, affinity, mode) = descriptor.interrupt_fields();
                     if vector == 0
+                        || descriptor.raw_start > u32::MAX as u64
+                        || descriptor.translated_start > u32::MAX as u64
+                        || descriptor.raw_start == 0
+                        || descriptor.translated_start == 0
+                        || descriptor.translated_start as u32 != vector
+                        || descriptor.length != 1
                         || affinity == 0
                         || !matches!(mode, INT_MODE_LEVEL_SENSITIVE | INT_MODE_LATCHED)
                     {
@@ -408,6 +429,8 @@ impl ResourceManager {
                     let candidate = InterruptResource {
                         resource_id: descriptor.resource_id,
                         owner,
+                        line: descriptor.raw_start as u32,
+                        translated_vector: descriptor.translated_start as u32,
                         vector,
                         irql,
                         affinity,
@@ -419,11 +442,11 @@ impl ResourceManager {
                     if self.interrupts_res.iter().any(|existing| {
                         existing.owner != owner
                             && !existing.revoked
-                            && existing.vector == candidate.vector
+                            && existing.line == candidate.line
                             && (candidate.share == SHARE_EXCLUSIVE
                                 || existing.share == SHARE_EXCLUSIVE)
                     }) || interrupts.iter().any(|existing: &InterruptResource| {
-                        existing.vector == candidate.vector
+                        existing.line == candidate.line
                             && (candidate.share == SHARE_EXCLUSIVE
                                 || existing.share == SHARE_EXCLUSIVE)
                     }) {
@@ -643,6 +666,9 @@ impl ResourceManager {
                 flags: i.flags,
                 share: i.share,
                 resource_id: i.resource_id,
+                raw_start: i.line as u64,
+                translated_start: i.translated_vector as u64,
+                length: 1,
                 arg0,
                 arg1,
                 ..Default::default()
@@ -832,8 +858,11 @@ impl ResourceManager {
             })
     }
 
-    /// Resolve injection by canonical `interrupt_id` (spec §9.4, `HAL_OP_INJECT`).
-    pub fn inject_interrupt(&self, interrupt_id: u64) -> Option<InterruptTokens> {
+    /// Resolve a live connection by canonical `interrupt_id`.
+    ///
+    /// Hardware delivery and test stimulus share this ownership lookup, but the resource manager
+    /// does not manufacture either one. The caller must already possess the interrupt authority.
+    pub fn connected_interrupt(&self, interrupt_id: u64) -> Option<InterruptTokens> {
         self.connected
             .iter()
             .find(|c| c.connected && c.interrupt_id == interrupt_id)
@@ -844,6 +873,39 @@ impl ResourceManager {
                 irql: c.irql,
                 vector: c.vector,
             })
+    }
+
+    /// Resolve a live connection together with the exact hardware route retained by its assigned
+    /// PnP resource. This is the production delivery lookup; it never creates an interrupt.
+    pub fn connected_interrupt_route(&self, interrupt_id: u64) -> Option<ConnectedInterrupt> {
+        let connection = self
+            .connected
+            .iter()
+            .find(|connection| connection.connected && connection.interrupt_id == interrupt_id)?;
+        let resource = self.interrupts_res.iter().find(|resource| {
+            !resource.revoked
+                && resource.resource_id == connection.resource_id
+                && resource.owner == connection.owner
+        })?;
+        Some(ConnectedInterrupt {
+            tokens: InterruptTokens {
+                interrupt_id: connection.interrupt_id,
+                service_routine_token: connection.service_routine_token,
+                service_context_token: connection.service_context_token,
+                irql: connection.irql,
+                vector: connection.vector,
+            },
+            resource_id: resource.resource_id,
+            line: resource.line,
+            translated_vector: resource.translated_vector,
+            mode: resource.mode,
+            share: resource.share,
+        })
+    }
+
+    /// Fixture-only compatibility alias for the isolated HAL/component tests.
+    pub fn inject_interrupt(&self, interrupt_id: u64) -> Option<InterruptTokens> {
+        self.connected_interrupt(interrupt_id)
     }
 
     /// Device removal cleanup: revoke every assignment, mapping, and interrupt owned by one
@@ -1129,10 +1191,38 @@ mod tests {
             kind: RES_KIND_INTERRUPT,
             share: SHARE_SHARED,
             resource_id: id,
+            raw_start: vector as u64,
+            translated_start: vector as u64,
+            length: 1,
             arg0,
             arg1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn connected_interrupt_retains_physical_route() {
+        let owner = ResourceOwner::new(9, 900, 90);
+        let mut rm = ResourceManager::new();
+        let mut descriptor = batch_interrupt(0x990, 0x51);
+        descriptor.raw_start = 11;
+        rm.replace_owner_assignments(owner, &[descriptor]).unwrap();
+
+        let interrupt_id = rm
+            .connect_interrupt(owner, descriptor.resource_id, 0xAA, 0xBB)
+            .unwrap();
+        let route = rm.connected_interrupt_route(interrupt_id).unwrap();
+        assert_eq!(route.resource_id, descriptor.resource_id);
+        assert_eq!(route.line, 11);
+        assert_eq!(route.translated_vector, 0x51);
+        assert_eq!(route.tokens.vector, 0x51);
+        assert_eq!(route.tokens.service_routine_token, 0xAA);
+        assert_eq!(route.tokens.service_context_token, 0xBB);
+        assert_eq!(route.mode, INT_MODE_LEVEL_SENSITIVE);
+        assert_eq!(route.share, SHARE_SHARED);
+
+        rm.disconnect_interrupt(owner, interrupt_id).unwrap();
+        assert!(rm.connected_interrupt_route(interrupt_id).is_none());
     }
 
     #[test]
