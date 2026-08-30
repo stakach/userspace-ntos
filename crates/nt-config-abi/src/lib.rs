@@ -34,7 +34,7 @@ pub const CM_HIVE_KEY_SNAPSHOT_MAGIC: u32 = 0x4B48_4D43; // `CMHK`
 pub const CM_HIVE_KEY_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES: usize = 24;
 pub const CM_HIVE_KEY_RECORD_MAGIC: u32 = 0x524B_4D43; // `CMKR`
-pub const CM_HIVE_KEY_RECORD_VERSION: u16 = 1;
+pub const CM_HIVE_KEY_RECORD_VERSION: u16 = 2;
 pub const CM_HIVE_KEY_RECORD_HEADER_BYTES: usize = 24;
 pub const CM_MAX_HIVE_PATH_UNITS: usize = 512;
 /// Maximum payload carried by one immutable driver launch-plan completion frame.
@@ -592,6 +592,7 @@ mod tests {
         assert_eq!(opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE, 0x2157);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_KEY, 0x2158);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_RECORD, 0x2159);
+        assert_eq!(CM_HIVE_KEY_RECORD_VERSION, 2);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyLeaseRequest>(), 24);

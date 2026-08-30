@@ -230,6 +230,12 @@ pub struct LeasedHiveSubkey {
     pub index: u32,
     pub name: String,
     pub class_name: Option<String>,
+    pub subkey_count: u32,
+    pub max_subkey_name_bytes: u32,
+    pub max_subkey_class_bytes: u32,
+    pub value_count: u32,
+    pub max_value_name_bytes: u32,
+    pub max_value_data_bytes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,6 +416,12 @@ fn decode_leased_hive_record(bytes: &[u8]) -> Option<LeasedHiveRecord> {
             index,
             name: reader.string()?,
             class_name: reader.optional_string()?,
+            subkey_count: reader.u32()?,
+            max_subkey_name_bytes: reader.u32()?,
+            max_subkey_class_bytes: reader.u32()?,
+            value_count: reader.u32()?,
+            max_value_name_bytes: reader.u32()?,
+            max_value_data_bytes: reader.u32()?,
         }),
         leased_hive_record_kind::VALUE_BY_NAME | leased_hive_record_kind::VALUE_BY_INDEX => {
             LeasedHiveRecord::Value(LeasedHiveValue {
@@ -2623,6 +2635,9 @@ mod tests {
         assert!(hive.set_key_security_descriptor(first, b"stable-security"));
         let child = hive.create_key(r"ControlSet001\Services\Stable\Child");
         assert!(hive.set_key_class(child, Some("ChildClass")));
+        let grandchild = hive.create_subkey(child, "Grandchild");
+        assert!(hive.set_key_class(grandchild, Some("GrandchildClass")));
+        hive.set_dword(child, "ChildValue", 7);
         let second = hive.create_key(r"ControlSet002\Services\Stable");
         hive.set_dword(second, "Identity", 2);
         hive.finish_clean_import();
@@ -2669,6 +2684,12 @@ mod tests {
             .unwrap();
         assert_eq!(subkey.name, "Child");
         assert_eq!(subkey.class_name.as_deref(), Some("ChildClass"));
+        assert_eq!(subkey.subkey_count, 1);
+        assert_eq!(subkey.max_subkey_name_bytes, 20);
+        assert_eq!(subkey.max_subkey_class_bytes, 30);
+        assert_eq!(subkey.value_count, 1);
+        assert_eq!(subkey.max_value_name_bytes, 20);
+        assert_eq!(subkey.max_value_data_bytes, 4);
         assert_eq!(
             client.enumerate_leased_system_hive_subkey(lease, 1),
             Err(STATUS_NO_MORE_ENTRIES)

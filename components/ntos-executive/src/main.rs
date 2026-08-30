@@ -7374,9 +7374,6 @@ macro_rules! probe_seg {
         __probe_result
     }};
 }
-/// How many times the ordered-services cache has been rebuilt (each rebuild walks every service
-/// key in the SYSTEM hive), so a slow dispatch can be tied to a rebuild storm.
-pub(crate) static SERVICES_ORDER_REBUILDS: AtomicU64 = AtomicU64::new(0);
 /// Per-SSN dispatch ticks, bucketed exactly like the SSN count histograms.
 pub(crate) static NATIVE_SSN_TICKS: [AtomicU64; SSN_HIST_N] =
     [const { AtomicU64::new(0) }; SSN_HIST_N];
@@ -7400,8 +7397,6 @@ pub(crate) fn record_native_dispatch_ticks(ssn: u64, ticks: u64) {
             print_hex(ssn as u32);
             print_str(b" Mtick=");
             print_u64(ticks / 1_000_000);
-            print_str(b" services-order-rebuilds=");
-            print_u64(SERVICES_ORDER_REBUILDS.load(Ordering::Relaxed));
             probe_dump();
             print_str(b"\n");
         }
@@ -15988,6 +15983,42 @@ pub(crate) unsafe fn config_manager_query_leased_system_hive_value(
     Ok(value)
 }
 
+pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_subkey(
+    lease: nt_config_client::SystemHiveKeyLease,
+    index: u32,
+) -> Result<nt_config_client::LeasedHiveSubkey, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let subkey = client.enumerate_leased_system_hive_subkey(lease, index)?;
+    if subkey.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(subkey)
+}
+
+pub(crate) unsafe fn config_manager_enumerate_leased_system_hive_value(
+    lease: nt_config_client::SystemHiveKeyLease,
+    index: u32,
+) -> Result<nt_config_client::LeasedHiveValue, i32> {
+    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if expected_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let value = client.enumerate_leased_system_hive_value(lease, index)?;
+    if value.mount_generation != expected_generation {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    Ok(value)
+}
+
 pub(crate) unsafe fn config_manager_commit_system_hive_mutations(
     mutations: &[nt_config_client::SystemHiveMutation<'_>],
 ) -> Result<u64, i32> {
@@ -22531,11 +22562,6 @@ struct ExecNtHandler {
     /// checkpoint. This is one-shot per boot: later `NtFlushKey` calls update the same files, but CM
     /// must not repeatedly replace live hives while hosted processes are holding key handles.
     boot_hive_checkpoints_refreshed: bool,
-    /// Cached indexed view of `HKLM\SYSTEM\CurrentControlSet\Services` in the order ReactOS SCM uses
-    /// while building its service database. The mounted hive remains the authority; this is only the
-    /// kernel-side enumeration index, invalidated by any mutable hive write and rebuilt on demand.
-    registry_services_order_cache: alloc::vec::Vec<alloc::string::String>,
-    registry_services_order_cache_valid: bool,
     /// Last successful mutable-hive value copyout to a hosted process. ReactOS `RegCopyTreeW`
     /// enumerates a source value into a process heap buffer, then calls `NtSetValueKey` with a data
     /// pointer into that same buffer. Keeping the source value identity here lets the Configuration

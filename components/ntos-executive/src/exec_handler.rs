@@ -1763,6 +1763,28 @@ fn committed_mapping_effective_page_protection(info: nt_address_space::VmBasicIn
 }
 
 impl RegistryKeyStats {
+    fn from_leased_key(information: &nt_config_client::LeasedHiveKeyInformation) -> Self {
+        Self {
+            subkeys: information.subkey_count,
+            max_subkey_name_bytes: information.max_subkey_name_bytes,
+            max_subkey_class_bytes: information.max_subkey_class_bytes,
+            values: information.value_count,
+            max_value_name_bytes: information.max_value_name_bytes,
+            max_value_data_bytes: information.max_value_data_bytes,
+        }
+    }
+
+    fn from_leased_subkey(subkey: &nt_config_client::LeasedHiveSubkey) -> Self {
+        Self {
+            subkeys: subkey.subkey_count,
+            max_subkey_name_bytes: subkey.max_subkey_name_bytes,
+            max_subkey_class_bytes: subkey.max_subkey_class_bytes,
+            values: subkey.value_count,
+            max_value_name_bytes: subkey.max_value_name_bytes,
+            max_value_data_bytes: subkey.max_value_data_bytes,
+        }
+    }
+
     fn add_subkey(&mut self, name_bytes: usize, class_bytes: usize) {
         self.subkeys = self.subkeys.saturating_add(1);
         self.max_subkey_name_bytes = self
@@ -1900,18 +1922,24 @@ fn build_registry_key_query_info(
         1 => {
             // KEY_NODE_INFORMATION
             let header = 0x18usize;
-            let mut info = alloc::vec::Vec::with_capacity(header + leaf_bytes + class_bytes);
+            let class_start = header
+                .checked_add(leaf_bytes)
+                .and_then(|end| end.checked_add(3))
+                .map(|end| end & !3usize)
+                .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+            let mut info = alloc::vec::Vec::with_capacity(class_start + class_bytes);
             info.resize(header, 0);
             let class_offset = if class_bytes == 0 {
                 u32::MAX
             } else {
-                (header + leaf_bytes) as u32
+                class_start as u32
             };
             info[0x0c..0x10].copy_from_slice(&class_offset.to_le_bytes());
             info[0x10..0x14].copy_from_slice(&(class_bytes as u32).to_le_bytes());
             info[0x14..0x18].copy_from_slice(&(leaf_bytes as u32).to_le_bytes());
             append_utf16le(&mut info, leaf);
             if let Some(class_name) = class_name {
+                info.resize(class_start, 0);
                 append_utf16le(&mut info, class_name);
             }
             Ok((info, header))
@@ -3401,11 +3429,6 @@ impl ExecNtHandler {
         write_field!(mutable_hive_journal_dirty_boot_mask, 0);
         write_field!(boot_hive_checkpoints_refreshed, false);
         write_field!(
-            registry_services_order_cache,
-            alloc::vec::Vec::with_capacity(256)
-        );
-        write_field!(registry_services_order_cache_valid, false);
-        write_field!(
             registry_value_copy_provenance,
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
@@ -4026,7 +4049,7 @@ impl ExecNtHandler {
         };
         EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
         if changed {
-            self.note_mutable_hives_changed_preserving_services_order();
+            self.note_mutable_hives_changed();
             trace_setup_provision_phase(b"shell-com-changed", mask);
         }
         if failed {
@@ -4086,7 +4109,7 @@ impl ExecNtHandler {
                 return;
             }
         };
-        self.note_mutable_hives_changed_preserving_services_order();
+        self.note_mutable_hives_changed();
         print_str(b"[print-setup] HKLM\\SYSTEM committed through CM generation ");
         print_u64(generation);
         print_str(b": root=");
@@ -4138,7 +4161,7 @@ impl ExecNtHandler {
             }
             return;
         }
-        self.note_mutable_hives_changed_preserving_services_order();
+        self.note_mutable_hives_changed();
         print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
         print_u64(stats.shell_folder_values as u64);
         print_str(b" User Shell Folders=");
@@ -4382,7 +4405,7 @@ impl ExecNtHandler {
                 .commit_and_project_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
             {
                 Ok(generation) => {
-                    self.note_mutable_hives_changed_preserving_services_order();
+                    self.note_mutable_hives_changed();
                     Some(generation)
                 }
                 Err(status) => {
@@ -4502,7 +4525,7 @@ impl ExecNtHandler {
         let grows_buffer = self.mutable_key_handles.len() == self.mutable_key_handles.capacity();
         self.mutable_key_handles.push(Some(key));
         if grows_buffer {
-            self.note_mutable_hives_changed_preserving_services_order();
+            self.note_mutable_hives_changed();
         }
         Ok(MUTABLE_KEY_TAG | (self.mutable_key_handles.len() - 1) as u32)
     }
@@ -5846,7 +5869,6 @@ impl ExecNtHandler {
             mounted |= self.refresh_boot_hive_checkpoint_from_path(hive_sel, file_path);
         }
         if mounted {
-            self.registry_services_order_cache_valid = false;
             print_str(b"[cm-restore] boot hive checkpoints refreshed from writable config\n");
         }
         mounted
@@ -6524,7 +6546,7 @@ impl ExecNtHandler {
             }
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
-        self.note_mutable_hives_changed_preserving_services_order();
+        self.note_mutable_hives_changed();
         self.hive_mounts.push(HiveMount {
             sel: hive_sel,
             canon,
@@ -6880,7 +6902,7 @@ impl ExecNtHandler {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
         if self.mutable_hives.unmount(&mount.mount).is_some() {
-            self.note_mutable_hives_changed_preserving_services_order();
+            self.note_mutable_hives_changed();
         }
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {
@@ -7031,7 +7053,7 @@ impl ExecNtHandler {
             } else {
                 self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
             }
-            self.note_mutable_hives_changed_preserving_services_order();
+            self.note_mutable_hives_changed();
             return Ok(());
         }
         if self.base_hive(target).is_some() {
@@ -7196,9 +7218,7 @@ impl ExecNtHandler {
         {
             return false;
         }
-        self.note_mutable_hives_changed_for_services_order_change(
-            self.registry_services_order_value_write_may_reorder(full_path),
-        );
+        self.note_mutable_hives_changed();
         true
     }
 
@@ -7347,7 +7367,7 @@ impl ExecNtHandler {
                 }],
                 SystemHiveMutationOrigin::Runtime,
             )?;
-            self.note_mutable_hives_changed_preserving_services_order();
+            self.note_mutable_hives_changed();
             return Ok(());
         }
         self.ensure_mutable_registry_value_by_path(&path, value_name, REG_SZ, &data[..len])
@@ -7903,42 +7923,54 @@ impl ExecNtHandler {
         stats
     }
 
-    fn note_mutable_hives_changed(&mut self) {
-        self.invalidate_registry_services_order_cache();
-        bump_progress();
-    }
-
-    fn note_mutable_hives_changed_preserving_services_order(&mut self) {
-        bump_progress();
-    }
-
-    fn note_mutable_hives_changed_for_services_order_change(
-        &mut self,
-        services_order_may_change: bool,
-    ) {
-        if services_order_may_change {
-            self.invalidate_registry_services_order_cache();
+    fn registry_key_stats_by_path(&self, path: &str) -> RegistryKeyStats {
+        if let Some(index) = self.registry_overlay_index_for_path(path) {
+            return self.registry_key_stats(OVERLAY_KEY_TAG | index as u32);
         }
-        bump_progress();
+        if let Some(target) = self.resolve_key(path) {
+            return self.registry_key_stats(target);
+        }
+        let Some(key) = self.mutable_registry_key_by_path(path) else {
+            return RegistryKeyStats::default();
+        };
+        let Some(hive) = self.mutable_hives.hive(key.hive) else {
+            return RegistryKeyStats::default();
+        };
+        let mut stats = RegistryKeyStats::default();
+        for index in 0..hive.subkey_count(key.key) {
+            let Some(name) = hive.subkey_name_by_index(key.key, index) else {
+                continue;
+            };
+            let class_bytes = hive
+                .subkey_class_by_index(key.key, index)
+                .map(utf16le_byte_len)
+                .unwrap_or(0);
+            stats.add_subkey(utf16le_byte_len(name), class_bytes);
+        }
+        for index in 0..hive.value_count(key.key) {
+            let Some((name, _, data)) = hive.value_by_index(key.key, index) else {
+                continue;
+            };
+            stats.add_value(utf16le_byte_len(name), data.len());
+        }
+        for name in self.registry_mounted_hive_subkeys(path) {
+            if hive.open_subkey(key.key, &name).is_none() {
+                stats.add_subkey(utf16le_byte_len(&name), 0);
+            }
+        }
+        stats
     }
 
-    fn invalidate_registry_services_order_cache(&mut self) {
-        self.registry_services_order_cache_valid = false;
-        self.registry_services_order_cache.clear();
+    fn note_mutable_hives_changed(&mut self) {
+        bump_progress();
     }
 
     fn registry_subkey_by_index(
-        &mut self,
+        &self,
         target: KeyRef,
         requested_index: usize,
     ) -> Option<alloc::string::String> {
         let path = self.registry_target_path(target);
-        if path
-            .as_deref()
-            .is_some_and(|path| self.is_system_services_registry_path(path))
-        {
-            return self.registry_ordered_service_subkey_by_index(requested_index);
-        }
         let mutable_base = path
             .as_deref()
             .and_then(|path| self.mutable_registry_key_by_path(path));
@@ -8025,140 +8057,6 @@ impl ExecNtHandler {
             }
         }
         None
-    }
-
-    fn system_services_registry_canon(&self) -> alloc::string::String {
-        self.overlay_canon(nt_config_manager::SERVICES_PATH)
-    }
-
-    fn is_system_services_registry_path(&self, path: &str) -> bool {
-        nt_hive_core::canon_path(path) == self.system_services_registry_canon()
-    }
-
-    fn registry_services_descendant_depth_from_canon(&self, canon: &str) -> Option<usize> {
-        let services = self.system_services_registry_canon();
-        if canon == services {
-            return Some(0);
-        }
-        let rest = canon.strip_prefix(&services)?;
-        let rest = rest.strip_prefix('\\')?;
-        if rest.is_empty() {
-            return None;
-        }
-        Some(rest.split('\\').filter(|part| !part.is_empty()).count())
-    }
-
-    fn registry_services_order_key_membership_may_change(&self, path: &str) -> bool {
-        let canon = nt_hive_core::canon_path(path);
-        matches!(
-            self.registry_services_descendant_depth_from_canon(&canon),
-            Some(1)
-        )
-    }
-
-    fn registry_services_order_value_write_may_reorder(&self, path: &str) -> bool {
-        let canon = nt_hive_core::canon_path(path);
-        canon == self.overlay_canon(nt_config_manager::SERVICE_GROUP_ORDER_PATH)
-            || matches!(
-                self.registry_services_descendant_depth_from_canon(&canon),
-                Some(1)
-            )
-    }
-
-    fn registry_ordered_service_subkey_by_index(
-        &mut self,
-        requested_index: usize,
-    ) -> Option<alloc::string::String> {
-        if !self.registry_services_order_cache_valid
-            && !self.rebuild_registry_services_order_cache()
-        {
-            return None;
-        }
-        self.registry_services_order_cache
-            .get(requested_index)
-            .cloned()
-    }
-
-    fn rebuild_registry_services_order_cache(&mut self) -> bool {
-        crate::SERVICES_ORDER_REBUILDS.fetch_add(1, Ordering::Relaxed);
-        let Some(services_key) =
-            self.mutable_registry_key_by_path(nt_config_manager::SERVICES_PATH)
-        else {
-            self.registry_services_order_cache.clear();
-            self.registry_services_order_cache_valid = true;
-            return true;
-        };
-        let Some(hive) = self.mutable_hives.hive(services_key.hive) else {
-            self.registry_services_order_cache.clear();
-            self.registry_services_order_cache_valid = true;
-            return true;
-        };
-        let mut entries = alloc::vec::Vec::with_capacity(hive.subkey_count(services_key.key));
-        for index in 0..hive.subkey_count(services_key.key) {
-            let Some(name) = hive.subkey_name_by_index(services_key.key, index) else {
-                continue;
-            };
-            let Some(service_key) = hive.open_subkey(services_key.key, name) else {
-                continue;
-            };
-            entries.push(nt_config_manager::ServiceDatabaseOrderEntry {
-                name: alloc::string::String::from(name),
-                service_type: hive.query_dword(service_key, "Type"),
-                start_type: hive.query_dword(service_key, "Start"),
-                load_order_group: Self::hive_query_registry_string(hive, service_key, "Group"),
-                tag: hive.query_dword(service_key, "Tag"),
-            });
-        }
-        let group_order = Self::hive_service_group_order(hive);
-        nt_config_manager::sort_service_database_order_entries(&mut entries, &group_order);
-        self.registry_services_order_cache.clear();
-        for entry in entries {
-            self.registry_services_order_cache.push(entry.name);
-        }
-        self.registry_services_order_cache_valid = true;
-        true
-    }
-
-    fn hive_service_group_order(
-        hive: &nt_hive_core::Hive,
-    ) -> alloc::vec::Vec<alloc::string::String> {
-        let selected = hive
-            .current_control_set()
-            .expect("mounted SYSTEM hive has a validated selected control set");
-        let mut path = alloc::string::String::from(selected.as_str());
-        path.push_str("\\Control\\ServiceGroupOrder");
-        let Some(key) = hive.open_key(&path) else {
-            return alloc::vec::Vec::new();
-        };
-        Self::hive_query_registry_multi_string(hive, key, "List").unwrap_or_default()
-    }
-
-    fn hive_query_registry_string(
-        hive: &nt_hive_core::Hive,
-        key: nt_hive_core::CellId,
-        name: &str,
-    ) -> Option<alloc::string::String> {
-        let (value_type, data) = hive.query_value(key, name)?;
-        nt_config_manager::RegistryValue {
-            name: alloc::string::String::new(),
-            value_type,
-            data: alloc::vec::Vec::from(data),
-        }
-        .as_string()
-    }
-
-    fn hive_query_registry_multi_string(
-        hive: &nt_hive_core::Hive,
-        key: nt_hive_core::CellId,
-        name: &str,
-    ) -> Option<alloc::vec::Vec<alloc::string::String>> {
-        let (value_type, data) = hive.query_value(key, name)?;
-        nt_config_manager::RegistryValue {
-            name: alloc::string::String::new(),
-            value_type,
-            data: alloc::vec::Vec::from(data),
-        }
-        .as_multi_string()
     }
 
     /// Resolve a fault BADGE's process index (pi) to its EPROCESS pid (the badge↔pid convergence
@@ -22620,6 +22518,45 @@ impl ExecNtHandler {
         0
     }
 
+    unsafe fn registry_key_information_copyout_status(
+        &self,
+        information: &[u8],
+        minimum_length: usize,
+        output_va: u64,
+        output_length: usize,
+        result_length_va: u64,
+        use_xas_write: bool,
+    ) -> u32 {
+        let Ok(result_length) = u32::try_from(information.len()) else {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        };
+        let result_length = result_length.to_le_bytes();
+        let result_length_written = if use_xas_write {
+            self.xas_try_write_buf(result_length_va, &result_length)
+        } else {
+            smss_copyout(result_length_va, &result_length)
+        };
+        if !result_length_written {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if output_length < minimum_length {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        let copy_len = output_length.min(information.len());
+        if use_xas_write {
+            if !self.xas_try_write_buf(output_va, &information[..copy_len]) {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        } else {
+            self.xas_write_buf(output_va, &information[..copy_len]);
+        }
+        if output_length < information.len() {
+            STATUS_BUFFER_OVERFLOW
+        } else {
+            0
+        }
+    }
+
     fn registry_value_copy_provenance_for_copyout(
         &self,
         info_class: u64,
@@ -32240,12 +32177,7 @@ impl ExecNtHandler {
                         }
                         mutable_key
                     };
-                    crate::probe_seg!(
-                        8,
-                        self.note_mutable_hives_changed_for_services_order_change(
-                            self.registry_services_order_key_membership_may_change(canon),
-                        )
-                    );
+                    crate::probe_seg!(8, self.note_mutable_hives_changed());
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
                     // boot paths.
@@ -32479,8 +32411,6 @@ impl ExecNtHandler {
                     core::str::from_utf8(&key_path_trace_scratch[..key_path_trace_len])
                         .unwrap_or("")
                 });
-                let services_order_may_change = key_path_for_counters
-                    .is_some_and(|path| self.registry_services_order_value_write_may_reorder(path));
                 let mutable_target = if overlay_key_idx(key).is_none() && existing_overlay.is_none()
                 {
                     self.mutable_registry_key(key)
@@ -32589,9 +32519,7 @@ impl ExecNtHandler {
                         ) {
                             return status;
                         }
-                        self.note_mutable_hives_changed_for_services_order_change(
-                            services_order_may_change,
-                        );
+                        self.note_mutable_hives_changed();
                         return 0;
                     }
                     let copy_source =
@@ -32622,9 +32550,7 @@ impl ExecNtHandler {
                             false
                         };
                         if logged_copy {
-                            self.note_mutable_hives_changed_for_services_order_change(
-                                services_order_may_change,
-                            );
+                            self.note_mutable_hives_changed();
                             return 0;
                         }
                     }
@@ -32647,9 +32573,7 @@ impl ExecNtHandler {
                     ) {
                         return status;
                     }
-                    self.note_mutable_hives_changed_for_services_order_change(
-                        services_order_may_change,
-                    );
+                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 let Some(staged) = data_view else {
@@ -32779,9 +32703,6 @@ impl ExecNtHandler {
                 }
                 let key_path = self.registry_target_path(key);
                 if let Some(mutable_key) = self.mutable_registry_key(key) {
-                    let services_order_may_change = key_path.as_deref().is_some_and(|path| {
-                        self.registry_services_order_key_membership_may_change(path)
-                    });
                     let mutation_status = if mutable_key.hive == HIVE_SEL_SYSTEM {
                         let Some(path) = key_path.clone() else {
                             return STATUS_INVALID_HANDLE;
@@ -32799,9 +32720,7 @@ impl ExecNtHandler {
                             if let Some(path) = key_path.as_deref() {
                                 let _ = self.overlay.detach_subtree(path);
                             }
-                            self.note_mutable_hives_changed_for_services_order_change(
-                                services_order_may_change,
-                            );
+                            self.note_mutable_hives_changed();
                             return 0;
                         }
                         Err(status) => return status,
@@ -32830,13 +32749,6 @@ impl ExecNtHandler {
                     .is_none()
                     .then(|| self.mutable_registry_key(key))
                     .flatten();
-                let services_order_may_change = mutable_key.is_some_and(|_| {
-                    self.registry_target_path(key)
-                        .as_deref()
-                        .is_some_and(|path| {
-                            self.registry_services_order_value_write_may_reorder(path)
-                        })
-                });
                 drop(name);
                 drop(transient_scope);
                 let name = match core::str::from_utf8(&name_scratch[..name_len]) {
@@ -32869,9 +32781,7 @@ impl ExecNtHandler {
                     if let Err(status) = mutation_status {
                         return status;
                     }
-                    self.note_mutable_hives_changed_for_services_order_change(
-                        services_order_may_change,
-                    );
+                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 if overlay_key_idx(key).is_some() {
@@ -32883,43 +32793,72 @@ impl ExecNtHandler {
             // *ResultLength[5]). Enumerate the value at Index from the real hive + copy the
             // KEY_VALUE_*_INFORMATION out; SmpInit reads the Environment/DOS-Devices/etc. values.
             NativeService::NtEnumerateValueKey => unsafe {
+                let info_class = nt_ulong_arg(args[2]) as u64;
+                if info_class > 4 {
+                    return STATUS_INVALID_PARAMETER;
+                }
                 let key = match self.resolve_registry_key(args[0], 0x1) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
                 let _transient = allocator::enter_transient();
                 let use_xas_write = self.pi >= 2;
-                let index = nt_ulong_arg(args[1]) as usize;
-                let info_class = nt_ulong_arg(args[2]) as u64;
+                let index = nt_ulong_arg(args[1]);
                 let output_length = nt_ulong_arg(args[4]) as usize;
-                let (status, provenance) = self
-                    .registry_value_by_index_with(key, index, |name, ty, data, source| {
-                        let status = self.query_value_key_copyout_status(
-                            info_class,
-                            args[3],
-                            output_length,
-                            args[5],
-                            name,
-                            ty,
-                            data,
-                            use_xas_write,
-                        );
-                        if status != 0 {
-                            return (status, RegistryValueCopyProvenance::default());
-                        }
-                        (
-                            0,
-                            self.registry_value_copy_provenance_for_copyout(
+                let lease = self.cm_system_key_target(key).map(|target| target.lease);
+                let (status, provenance) = if let Some(lease) = lease {
+                    match crate::config_manager_enumerate_leased_system_hive_value(lease, index) {
+                        Ok(value) => (
+                            self.query_value_key_copyout_status(
                                 info_class,
                                 args[3],
+                                output_length,
+                                args[5],
+                                &value.name,
+                                value.value_type,
+                                &value.data,
+                                use_xas_write,
+                            ),
+                            RegistryValueCopyProvenance::default(),
+                        ),
+                        Err(status) => (status as u32, RegistryValueCopyProvenance::default()),
+                    }
+                } else {
+                    self.registry_value_by_index_with(
+                        key,
+                        index as usize,
+                        |name, ty, data, source| {
+                            let status = self.query_value_key_copyout_status(
+                                info_class,
+                                args[3],
+                                output_length,
+                                args[5],
                                 name,
                                 ty,
-                                data.len(),
-                                source,
-                            ),
-                        )
-                    })
-                    .unwrap_or((0x8000_001A, RegistryValueCopyProvenance::default()));
+                                data,
+                                use_xas_write,
+                            );
+                            if status != 0 {
+                                return (status, RegistryValueCopyProvenance::default());
+                            }
+                            (
+                                0,
+                                self.registry_value_copy_provenance_for_copyout(
+                                    info_class,
+                                    args[3],
+                                    name,
+                                    ty,
+                                    data.len(),
+                                    source,
+                                ),
+                            )
+                        },
+                    )
+                    .unwrap_or((
+                        STATUS_NO_MORE_ENTRIES,
+                        RegistryValueCopyProvenance::default(),
+                    ))
+                };
                 if status == 0 && provenance.is_valid() {
                     let _ = self.registry_value_copy_provenance.record(provenance);
                 } else {
@@ -32936,16 +32875,70 @@ impl ExecNtHandler {
             // keys here (for example, ScmCreateServiceDatabase walks
             // HKLM\SYSTEM\CurrentControlSet\Services).
             NativeService::NtEnumerateKey => unsafe {
+                let info_class = nt_ulong_arg(args[2]);
+                if info_class > 2 {
+                    return STATUS_INVALID_PARAMETER;
+                }
                 NT_ENUMERATE_KEY_CALLS.fetch_add(1, Ordering::Relaxed);
                 let key = match self.resolve_registry_key(args[0], 0x8) {
                     Ok(key) => key,
                     Err(status) => return status,
                 };
-                let idx = nt_ulong_arg(args[1]) as usize;
-                let info_class = nt_ulong_arg(args[2]);
+                let index = nt_ulong_arg(args[1]);
                 let output_length = nt_ulong_arg(args[4]) as usize;
                 let key_path = self.registry_target_path(key);
-                let Some(name) = self.registry_subkey_by_index(key, idx) else {
+                let lease = self.cm_system_key_target(key).map(|target| target.lease);
+                if let Some(lease) = lease {
+                    let subkey = match crate::config_manager_enumerate_leased_system_hive_subkey(
+                        lease, index,
+                    ) {
+                        Ok(subkey) => subkey,
+                        Err(status) => {
+                            trace_winlogon_post_lsa_registry(
+                                self,
+                                b"enum-key",
+                                key_path.as_deref(),
+                                "",
+                                status as u32,
+                                None,
+                                None,
+                            );
+                            return status as u32;
+                        }
+                    };
+                    let _transient = allocator::enter_transient();
+                    let (information, minimum_length) = match build_registry_key_query_info(
+                        info_class,
+                        &subkey.name,
+                        RegistryKeyStats::from_leased_subkey(&subkey),
+                        subkey.class_name.as_deref(),
+                    ) {
+                        Ok(information) => information,
+                        Err(status) => return status,
+                    };
+                    let status = self.registry_key_information_copyout_status(
+                        &information,
+                        minimum_length,
+                        args[3],
+                        output_length,
+                        args[5],
+                        self.pi >= 2,
+                    );
+                    if status == 0 {
+                        bump_progress();
+                    }
+                    trace_winlogon_post_lsa_registry(
+                        self,
+                        b"enum-key",
+                        key_path.as_deref(),
+                        &subkey.name,
+                        status,
+                        None,
+                        None,
+                    );
+                    return status;
+                }
+                let Some(name) = self.registry_subkey_by_index(key, index as usize) else {
                     trace_winlogon_post_lsa_registry(
                         self,
                         b"enum-key",
@@ -32957,71 +32950,49 @@ impl ExecNtHandler {
                     );
                     return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
                 };
-                // Service-order enumeration may rebuild its persistent cache above. Everything
-                // below is a synchronous caller-copy encoder and must not survive this dispatch.
+                // Everything below is a synchronous caller-copy encoder and must not survive this
+                // dispatch.
                 let _transient = allocator::enter_transient();
                 let class_name = self.registry_subkey_class(key, &name);
-                let name16: alloc::vec::Vec<u16> = name.encode_utf16().collect();
-                let name_bytes = name16.len() * 2;
-                let class_bytes = class_name.as_deref().map(utf16le_byte_len).unwrap_or(0);
-                // class 0 = KeyBasicInformation {LastWriteTime@0(8), TitleIndex@8(4), NameLength@0xc(4),
-                // Name@0x10}; class 1 = KeyNodeInformation {…, ClassOffset@0xc, ClassLength@0x10,
-                // NameLength@0x14, Name@0x18}. RegEnumKeyExW(lpClass=NULL) → basic; ScmCreateService-
-                // Database uses that. Build both; other classes → basic.
-                let node = info_class == 1;
-                let hdr = if node { 0x18usize } else { 0x10 };
-                let mut info = alloc::vec::Vec::with_capacity(hdr + name_bytes + class_bytes);
-                info.resize(hdr, 0); // LastWriteTime/TitleIndex/(ClassOffset/ClassLength) all 0
-                let nl_off = if node { 0x14 } else { 0x0c };
-                info[nl_off..nl_off + 4].copy_from_slice(&(name_bytes as u32).to_le_bytes());
-                if node {
-                    let class_off = if class_bytes == 0 {
-                        u32::MAX
-                    } else {
-                        (hdr + name_bytes) as u32
-                    };
-                    info[0x0c..0x10].copy_from_slice(&class_off.to_le_bytes());
-                    info[0x10..0x14].copy_from_slice(&(class_bytes as u32).to_le_bytes());
-                }
-                for w in &name16 {
-                    info.extend_from_slice(&w.to_le_bytes());
-                }
-                if let Some(class_name) = class_name.as_deref() {
-                    append_utf16le(&mut info, class_name);
-                }
-                let total = info.len() as u32;
-                let total_bytes = total.to_le_bytes();
-                if self.pi >= 2 {
-                    if !self.xas_try_write_buf(args[5], &total_bytes) {
-                        return 0xC000_0005; // STATUS_ACCESS_VIOLATION
-                    }
+                let stats = if info_class == 2 {
+                    key_path
+                        .as_deref()
+                        .map(|path| Self::registry_child_path(path, &name))
+                        .map(|path| self.registry_key_stats_by_path(&path))
+                        .unwrap_or_default()
                 } else {
-                    smss_copyout(args[5], &total_bytes); // *ResultLength (stack local)
+                    RegistryKeyStats::default()
+                };
+                let (information, minimum_length) = match build_registry_key_query_info(
+                    info_class,
+                    &name,
+                    stats,
+                    class_name.as_deref(),
+                ) {
+                    Ok(information) => information,
+                    Err(status) => return status,
+                };
+                let status = self.registry_key_information_copyout_status(
+                    &information,
+                    minimum_length,
+                    args[3],
+                    output_length,
+                    args[5],
+                    self.pi >= 2,
+                );
+                if status == 0 {
+                    bump_progress();
                 }
-                if output_length < info.len() {
-                    trace_winlogon_post_lsa_registry(
-                        self,
-                        b"enum-key",
-                        key_path.as_deref(),
-                        &name,
-                        0x8000_0005,
-                        None,
-                        None,
-                    );
-                    return 0x8000_0005; // STATUS_BUFFER_OVERFLOW
-                }
-                self.xas_write_buf(args[3], &info); // KeyInformation (heap buffer)
-                bump_progress();
                 trace_winlogon_post_lsa_registry(
                     self,
                     b"enum-key",
                     key_path.as_deref(),
                     &name,
-                    0,
+                    status,
                     None,
                     None,
                 );
-                0 // STATUS_SUCCESS
+                status
             },
             // NtQueryKey(KeyHandle[0], KeyInformationClass[1], KeyInformation[2], Length[3],
             // *ResultLength[4]). Registry consumers use the standard key-info classes for sizing,
@@ -33029,9 +33000,6 @@ impl ExecNtHandler {
             // key's owning authority: CM for leased SYSTEM identities, otherwise the executive's
             // mounted/overlay namespaces.
             NativeService::NtQueryKey => unsafe {
-                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-                const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
-                const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
                 let info_class = nt_ulong_arg(args[1]);
                 let required_access = if info_class == 3 { 0 } else { 0x1 };
                 let key = match self.resolve_registry_key(args[0], required_access) {
@@ -33055,14 +33023,7 @@ impl ExecNtHandler {
                     };
                 let stats = leased_information.as_ref().map_or_else(
                     || self.registry_key_stats(key),
-                    |information| RegistryKeyStats {
-                        subkeys: information.subkey_count,
-                        max_subkey_name_bytes: information.max_subkey_name_bytes,
-                        max_subkey_class_bytes: information.max_subkey_class_bytes,
-                        values: information.value_count,
-                        max_value_name_bytes: information.max_value_name_bytes,
-                        max_value_data_bytes: information.max_value_data_bytes,
-                    },
+                    RegistryKeyStats::from_leased_key,
                 );
                 let full_path = leased_information.as_ref().map_or_else(
                     || self.registry_target_path(key).unwrap_or_default(),
@@ -33091,30 +33052,14 @@ impl ExecNtHandler {
                     USER_VOLATILE_ENV_QUERY_VALUE_COUNT
                         .store(stats.values as u64, Ordering::Relaxed);
                 }
-                let total = (info.len() as u32).to_le_bytes();
-                if use_xas_write {
-                    if !self.xas_try_write_buf(args[4], &total) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                } else {
-                    smss_copyout(args[4], &total); // *ResultLength
-                }
-                if output_length < minimum_length {
-                    return STATUS_BUFFER_TOO_SMALL;
-                }
-                let copy_len = output_length.min(info.len());
-                if use_xas_write {
-                    if !self.xas_try_write_buf(args[2], &info[..copy_len]) {
-                        return STATUS_ACCESS_VIOLATION;
-                    }
-                } else {
-                    self.xas_write_buf(args[2], &info[..copy_len]);
-                }
-                if output_length < info.len() {
-                    STATUS_BUFFER_OVERFLOW
-                } else {
-                    0
-                }
+                self.registry_key_information_copyout_status(
+                    &info,
+                    minimum_length,
+                    args[2],
+                    output_length,
+                    args[4],
+                    use_xas_write,
+                )
             },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
             // IoStatusBlock[R9], ...). Server pipe creation must go through the live npfs FSD:
@@ -36554,12 +36499,15 @@ impl ExecNtHandler {
                 };
                 let current = match self.cm_system_key_target(key).map(|target| target.lease) {
                     Some(lease) => {
-                        match crate::config_manager_query_leased_system_hive_key_information(lease) {
-                            Ok(information) => information.security_descriptor.unwrap_or_else(|| {
-                                alloc::vec::Vec::from(
-                                    &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..],
-                                )
-                            }),
+                        match crate::config_manager_query_leased_system_hive_key_information(lease)
+                        {
+                            Ok(information) => {
+                                information.security_descriptor.unwrap_or_else(|| {
+                                    alloc::vec::Vec::from(
+                                        &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..],
+                                    )
+                                })
+                            }
                             Err(status) => return status as u32,
                         }
                     }
@@ -36567,9 +36515,7 @@ impl ExecNtHandler {
                         .registry_key_security_descriptor(key)
                         .map(alloc::vec::Vec::from)
                         .unwrap_or_else(|| {
-                            alloc::vec::Vec::from(
-                                &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..],
-                            )
+                            alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..])
                         }),
                 };
                 let descriptor = match nt_security::query_security_descriptor_bytes(

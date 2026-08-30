@@ -453,12 +453,17 @@ fn begin_hive_key_record(record_kind: u16, mount_generation: u64, index: u32) ->
     out
 }
 
-fn encode_hive_key_information_record(
-    hive: &Hive,
-    mount_generation: u64,
-    key: CellId,
-    path: &str,
-) -> Option<Vec<u8>> {
+#[derive(Copy, Clone)]
+struct HiveKeyInformationStats {
+    subkey_count: u32,
+    max_subkey_name_bytes: u32,
+    max_subkey_class_bytes: u32,
+    value_count: u32,
+    max_value_name_bytes: u32,
+    max_value_data_bytes: u32,
+}
+
+fn hive_key_information_stats(hive: &Hive, key: CellId) -> Option<HiveKeyInformationStats> {
     let subkey_count = hive.subkey_count(key);
     let value_count = hive.value_count(key);
     let mut max_subkey_name_bytes = 0u32;
@@ -477,17 +482,38 @@ fn encode_hive_key_information_record(
         max_value_name_bytes = max_value_name_bytes.max(utf16_byte_len(name)?);
         max_value_data_bytes = max_value_data_bytes.max(u32::try_from(data.len()).ok()?);
     }
+    Some(HiveKeyInformationStats {
+        subkey_count: u32::try_from(subkey_count).ok()?,
+        max_subkey_name_bytes,
+        max_subkey_class_bytes,
+        value_count: u32::try_from(value_count).ok()?,
+        max_value_name_bytes,
+        max_value_data_bytes,
+    })
+}
+
+fn push_hive_key_information_stats(out: &mut Vec<u8>, stats: HiveKeyInformationStats) {
+    push_u32(out, stats.subkey_count);
+    push_u32(out, stats.max_subkey_name_bytes);
+    push_u32(out, stats.max_subkey_class_bytes);
+    push_u32(out, stats.value_count);
+    push_u32(out, stats.max_value_name_bytes);
+    push_u32(out, stats.max_value_data_bytes);
+}
+
+fn encode_hive_key_information_record(
+    hive: &Hive,
+    mount_generation: u64,
+    key: CellId,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let stats = hive_key_information_stats(hive, key)?;
     let mut out = begin_hive_key_record(
         leased_hive_record_kind::KEY_INFORMATION,
         mount_generation,
         0,
     );
-    push_u32(&mut out, u32::try_from(subkey_count).ok()?);
-    push_u32(&mut out, max_subkey_name_bytes);
-    push_u32(&mut out, max_subkey_class_bytes);
-    push_u32(&mut out, u32::try_from(value_count).ok()?);
-    push_u32(&mut out, max_value_name_bytes);
-    push_u32(&mut out, max_value_data_bytes);
+    push_hive_key_information_stats(&mut out, stats);
     push_string(&mut out, path)?;
     push_optional_string(&mut out, hive.key_class(key))?;
     push_optional_blob(&mut out, hive.key_security_descriptor(key))?;
@@ -504,6 +530,10 @@ fn encode_hive_subkey_record(
     let name = hive
         .subkey_name_by_index(key, index_usize)
         .ok_or(STATUS_NO_MORE_ENTRIES)?;
+    let child = hive
+        .open_subkey(key, name)
+        .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let stats = hive_key_information_stats(hive, child).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     let mut out = begin_hive_key_record(
         leased_hive_record_kind::SUBKEY_BY_INDEX,
         mount_generation,
@@ -512,6 +542,7 @@ fn encode_hive_subkey_record(
     push_string(&mut out, name).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     push_optional_string(&mut out, hive.subkey_class_by_index(key, index_usize))
         .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    push_hive_key_information_stats(&mut out, stats);
     Ok(out)
 }
 

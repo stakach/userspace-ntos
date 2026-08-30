@@ -17763,3 +17763,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     SYSTEM journal/checkpoint ownership behind CM and delete the executive's post-CM mutation
     projection and duplicated SYSTEM read machinery. Do not broaden this into whole-key snapshots or
     keep a mirror fallback for convenience.
+
+    Native SYSTEM leased enumeration acceptance (2026-08-30): `NtEnumerateKey` and
+    `NtEnumerateValueKey` now consume the indexed CM records associated with the handle's existing
+    lease. Invalid information classes are rejected before handle lookup, CM's exact
+    `STATUS_NO_MORE_ENTRIES` and lease errors are preserved, and successful records implement native
+    minimum-header, exact result-length, partial-copy, `STATUS_BUFFER_TOO_SMALL`, and
+    `STATUS_BUFFER_OVERFLOW` semantics. Key Basic, Node, and Full information are all encoded from the
+    selected child. The version-2 subkey record therefore includes CM-computed child subkey/value
+    counts and maximum name, class, and data lengths without transferring a whole key or consulting an
+    executive mirror. Key Node class data is aligned to the native four-byte boundary.
+
+    The obsolete executive Services-order cache, storage, invalidation/rebuild path, service-group
+    sorting walker, registry string helpers, and rebuild instrumentation have been deleted. SCM now
+    observes the mounted hive's CM-owned enumeration order directly; the executive no longer applies
+    boot-policy ordering while answering a native registry syscall. Non-SYSTEM mounts retain their
+    existing namespace owner but share the corrected information-class encoder and copyout behavior.
+
+    Focused validation passes `nt-config-abi` `4/4`, `nt-config-server` `22/22`, and
+    `nt-config-client` `16/16`; the freestanding executive release check remains at the established
+    209-warning baseline. Serialized acceptance
+    `.tmp/run-headless-cm-native-enumeration-20260830.log` reaches the genuine Explorer desktop with
+    all `299/299` checks passing and the sentinel matched. CM accepts 2532 runtime SYSTEM transactions
+    with zero rejection or projection failures; lease accounting is `1337/1335/2/0`
+    acquire/close/live/failure. Explorer completes 715 real api0 redirects with zero callback or
+    dead-callback failures, installs 18 client WndProcs without replay, reaches paint begin/end `5/22`
+    with 187 direct GDI returns and 144 batch flushes covering 195 records, and paints all
+    `480000/480000` framebuffer pixels with at least 32 colours.
+
+    Review adjustment: native SYSTEM query and enumeration ownership is accepted. D5 is now narrowed
+    to durability and mirror retirement: move the mutable SYSTEM journal and checkpoint serialization
+    behind CM, make successful CM transactions the sole authoritative mutation result, then delete the
+    executive post-CM projection and any duplicated SYSTEM read structures that no longer own a
+    syscall path. Preserve atomic generation checks and exact failure propagation; do not retain a
+    best-effort projection, cache fallback, or second mutation authority.
