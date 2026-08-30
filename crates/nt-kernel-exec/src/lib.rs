@@ -34,6 +34,7 @@ mod semaphore;
 pub mod session_section;
 pub mod slist;
 mod spin;
+pub mod stall;
 mod timer;
 pub mod timezone;
 pub mod user_class;

@@ -3441,6 +3441,7 @@ fn delay_timer_min_arm_ticks(period_fs: u64) -> u64 {
     )
 }
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
+static PLATFORM_TSC_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
 static HPET_MONOTONIC_OFFSET_100NS: AtomicI64 = AtomicI64::new(0);
 static HPET_MONOTONIC_READY: AtomicBool = AtomicBool::new(false);
 static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
@@ -16927,6 +16928,10 @@ fn monotonic_time_100ns() -> u64 {
     }
 }
 
+pub(crate) fn platform_tsc_frequency_hz() -> u64 {
+    PLATFORM_TSC_FREQUENCY_HZ.load(Ordering::Acquire)
+}
+
 fn nt_time_snapshot_at(monotonic_100ns: u64) -> nt_delay_execution::TimeSnapshot {
     if !NT_SYSTEM_CLOCK_INITIALIZED.load(Ordering::Acquire) {
         panic!("system clock used before bootstrap authority was installed");
@@ -28329,6 +28334,11 @@ struct Fat32 {
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
+    let Some(tsc_frequency_hz) = bi.tsc_frequency_hz() else {
+        print_str(b"[boot] platform did not publish a calibrated TSC frequency\n");
+        park();
+    };
+    PLATFORM_TSC_FREQUENCY_HZ.store(tsc_frequency_hz, Ordering::Release);
     initialize_nt_system_clock(bi);
     NEXT_SLOT.store(bi.empty.start, Ordering::Relaxed);
     ROOT_CSPACE_START.store(bi.empty.start, Ordering::Relaxed);

@@ -19519,3 +19519,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     or device interrupt. Real SCI delivery must originate from the microkernel IRQ capability,
     invoke the driver-registered ISR, and reach the prepared PCI census only through the driver's
     genuine GPE/bus-relation invalidation path.
+
+    B3 calibrated hosted-timing checkpoint (2026-08-31, implementation green): rust-micro now
+    publishes the TSC frequency measured by its existing PIT/LAPIC calibration instead of the old
+    compiled-in 1 GHz value. The typed extern-rootserver BootInfo field and the legacy seL4 clock
+    extra-info record are derived from the same measurement after calibration; zero remains the
+    pre-calibration sentinel and cannot become a usable timing authority. The matching `sel4-rt`
+    ABI exposes the measured frequency as an optional typed value.
+
+    The executive requires that authority at entry and publishes it in every isolated kernel
+    component's generation-owned shared page. Hosted `KeStallExecutionProcessor` now converts the
+    complete requested microsecond interval to rounded-up TSC cycles, uses ordered counter reads,
+    and waits for actual elapsed cycles without the former 1000-microsecond cap or arbitrary loop
+    multiplier. Hosted `KeQueryPerformanceCounter` returns the same counter and measured frequency,
+    so drivers cannot observe conflicting clock authorities. Missing, zero, or overflowing timing
+    data fails closed. The arithmetic is isolated in host-tested no-std policy; focused
+    `nt-kernel-exec` validation passes 178/178, both rust-micro `extern-rootserver` feature checks
+    pass, and the freestanding executive check remains at the unchanged 209-warning baseline.
+
+    Review adjustment: calibrated hosted timing is closed at implementation level. Runtime ACPI
+    acceptance remains for the next serialized desktop boot because the active older VM still owns
+    the boot lane. Continue by deleting `hardware_proof` interrupt injection from the ordinary
+    registry-selected PnP cohort. The only production interrupt evidence must be a real IRQ
+    capability delivery to the ISR registered by the driver; any retained fixture stimulus must be
+    confined to an explicit test-only boundary and excluded from normal boot policy.

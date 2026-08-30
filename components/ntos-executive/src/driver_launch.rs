@@ -114,9 +114,8 @@ use nt_video_miniport::{
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the Subsystem (win32k) class.
 use crate::ntoskrnl_shared::{
     s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
-    s_ke_query_performance_counter, s_memcpy, s_memmove, s_memset, s_rtl_compare_memory,
-    s_rtl_integer_to_unicode_string, s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char,
-    s_wcsicmp, s_wcslen,
+    s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
+    s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_wcsicmp, s_wcslen,
 };
 
 use crate::*;
@@ -415,6 +414,7 @@ pub const SH_RESOURCE_IO_PORT_LAST_IN16_PORT: u64 = 0x728; // out: last port rea
 pub const SH_RESOURCE_IO_PORT_LAST_OUT16_PORT: u64 = 0x730; // out: last port write number
 pub const SH_RESOURCE_IO_PORT_LAST_IN16_VALUE: u64 = 0x738; // out: last port read value
 pub const SH_RESOURCE_IO_PORT_LAST_OUT16_VALUE: u64 = 0x740; // out: last port write value
+pub const SH_TSC_FREQUENCY_HZ: u64 = 0x748; // in: calibrated platform TSC frequency
 pub const SH_VIDEO_MEMORY_PHYS: u64 = 0x750; // in: caller-visible video memory physical base
 pub const SH_VIDEO_MEMORY_LEN: u64 = 0x758; // in: caller-visible video memory bytes
 pub const SH_VIDEO_MEMORY_CALLER_VA: u64 = 0x760; // in: VA mapped in the EngDeviceIoControl caller
@@ -513,6 +513,7 @@ const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
 const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
 const _: () = assert!(SH_VIDEO_MEMORY_MAPPED_VA + 8 <= SH_RESOURCE_IO_PORT_OUT32_FAULTS);
+const _: () = assert!(SH_TSC_FREQUENCY_HZ + 8 <= SH_VIDEO_MEMORY_PHYS);
 const _: () = assert!(SH_VIDEO_DISPI_SELECTED_INDEX + 8 <= SH_HANDOFF_ARENA_BASE);
 const _: () = assert!(
     SH_RESOURCE_ADDRESS_RECORDS
@@ -4261,13 +4262,59 @@ extern "win64" fn s_ke_set_timer_ex(timer: u64, due_time: u64, period: i32, dpc:
     active as u8
 }
 
-extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
-    let mut spins = 0u32;
-    let limit = microseconds.min(1000).saturating_mul(64);
-    while spins < limit {
-        core::hint::spin_loop();
-        spins += 1;
+#[inline]
+fn read_ordered_tsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags),
+        );
     }
+    ((high as u64) << 32) | low as u64
+}
+
+extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
+    if microseconds == 0 {
+        return;
+    }
+    let frequency_hz = unsafe {
+        read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64)
+    };
+    let Some(required_cycles) = nt_kernel_exec::stall::cycles_for_microseconds(
+        microseconds,
+        frequency_hz,
+    ) else {
+        panic!("hosted kernel timing authority is invalid");
+    };
+    let start = read_ordered_tsc();
+    loop {
+        let now = read_ordered_tsc();
+        if nt_kernel_exec::stall::interval_elapsed(start, now, required_cycles) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// `LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER Frequency)` for an isolated hosted
+/// kernel component. The measured TSC and its boot-calibrated frequency are one coherent counter
+/// authority and require no executive data/MMIO mapping in the component VSpace.
+extern "win64" fn s_hosted_ke_query_performance_counter(frequency: *mut u64) -> u64 {
+    let frequency_hz = unsafe {
+        read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64)
+    };
+    if frequency_hz == 0 {
+        panic!("hosted kernel timing authority is invalid");
+    }
+    if !frequency.is_null() {
+        unsafe { write_unaligned(frequency, frequency_hz) };
+    }
+    read_ordered_tsc()
 }
 
 extern "win64" fn s_probe_for_read(_address: u64, _length: u64, _alignment: u64) {}
@@ -30777,7 +30824,7 @@ fn register_fsd_trampolines() -> bool {
     );
     reg.bind(
         "KeQueryPerformanceCounter",
-        s_ke_query_performance_counter as *const () as usize as u64,
+        s_hosted_ke_query_performance_counter as *const () as usize as u64,
     );
 
     reg.stats().allocation_failures == 0
@@ -34696,6 +34743,15 @@ unsafe fn load_driver_reserved(
     write_volatile(
         (win.shared_va + SH_ENTRY_RVA) as *mut u64,
         primary_entry_rva,
+    );
+    let tsc_frequency_hz = crate::platform_tsc_frequency_hz();
+    if tsc_frequency_hz == 0 {
+        print_str(b"[driver-launch] calibrated TSC authority unavailable\n");
+        return None;
+    }
+    write_volatile(
+        (win.shared_va + SH_TSC_FREQUENCY_HZ) as *mut u64,
+        tsc_frequency_hz,
     );
     write_volatile((win.shared_va + SH_VERDICT) as *mut u32, 0);
     write_volatile((win.shared_va + SH_ADD_DEVICE) as *mut u64, 0);
