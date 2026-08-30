@@ -74,7 +74,8 @@ const EXCEPTION_RECORD_PARAMETERS_OFFSET: usize = 0x18;
 const EXCEPTION_RECORD_INFORMATION_OFFSET: usize = 0x20;
 const EXCEPTION_MAXIMUM_PARAMETERS: u32 = 15;
 const BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM: usize = 0x18_0000;
-const PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET: usize = 48;
+const PNP_EVENT_BLOCK_DATA_OFFSET: usize = 48;
+const PNP_EVENT_CATEGORY_TARGET_DEVICE_CHANGE: u32 = 1;
 const PNP_EVENT_CATEGORY_DEVICE_INSTALL: u32 = 4;
 const PNP_CONTROL_ENUMERATE_DEVICE_LEN: usize = 24;
 const PNP_CONTROL_DEVICE_CONTROL_LEN: usize = 16;
@@ -96,6 +97,12 @@ const FILE_BASIC_INFORMATION_LEN: usize = 40;
 const PNP_BUS_RELATIONS: u32 = 3;
 const GUID_DEVICE_ENUMERATED_BYTES: [u8; 16] = [
     0x0a, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3f,
+];
+const GUID_DEVICE_ENUMERATE_REQUEST_BYTES: [u8; 16] = [
+    0x0b, 0x40, 0x3a, 0xcb, 0xf0, 0x46, 0xd0, 0x11, 0xb0, 0x8f, 0x00, 0x60, 0x97, 0x13, 0x05, 0x3f,
+];
+const GUID_DEVICE_SURPRISE_REMOVAL_BYTES: [u8; 16] = [
+    0x00, 0xf0, 0x5a, 0xce, 0xdd, 0x80, 0xd2, 0x11, 0xa8, 0x8d, 0x00, 0xa0, 0xc9, 0x69, 0x6b, 0x4b,
 ];
 
 struct CapturedNamedObjectAttributes {
@@ -3786,16 +3793,17 @@ impl ExecNtHandler {
         write_field!(pending_file_io_transfer, None);
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
-        write_field!(pending_driver_loads, driver_starts.pending);
+        write_field!(pending_driver_starts, driver_starts.pending);
         write_field!(boot_driver_start_reports, driver_starts.reports);
-        write_field!(pending_driver_load_transfer, None);
+        write_field!(pending_driver_start_transfer, None);
         write_field!(pending_synchronous_file_wait, None);
         write_field!(pending_file_cleanup_wait, None);
         write_field!(pending_file_irp_drain, None);
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
         write_field!(anon_event_seq, 0);
-        write_field!(pnp_event_cursor, 0);
+        write_field!(pnp_boot_event_cursor, 0);
+        write_field!(pnp_live_action, None);
         write_field!(pnp_notify_event, 0);
         write_field!(pnp_status, PnpRuntimeStatusTable::new());
         write_field!(lpc_receive_park, None);
@@ -4270,7 +4278,7 @@ impl ExecNtHandler {
             }
             return Err(Self::mutable_hive_journal_status(err));
         }
-        let generation =
+        let (generation, wake_device_action) =
             match unsafe { crate::config_manager_publish_system_hive_mutation(&prepared) }
                 .map_err(|status| status as u32)
             {
@@ -4287,6 +4295,9 @@ impl ExecNtHandler {
                     return Err(status);
                 }
             };
+        if wake_device_action {
+            unsafe { self.pnp_signal_pending_action() };
+        }
         if !prepared.durable_journal.is_empty() {
             self.note_durable_hive_journal_records(
                 None,
@@ -7179,7 +7190,7 @@ impl ExecNtHandler {
                 if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
-                match self.pending_driver_loads.reserve() {
+                match self.pending_driver_starts.reserve() {
                     Ok(reservation) => Some(reservation),
                     Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
                 }
@@ -7189,7 +7200,7 @@ impl ExecNtHandler {
 
         let Some(fs) = exec_fs() else {
             if let Some(reservation) = start_reservation {
-                self.pending_driver_loads
+                self.pending_driver_starts
                     .cancel(reservation)
                     .expect("unused driver-load reservation became stale");
             }
@@ -7199,7 +7210,7 @@ impl ExecNtHandler {
             driver_launch::load_driver(&fs, &spec.image_path, spec.class, &spec.driver_object_path)
         else {
             if let Some(reservation) = start_reservation {
-                self.pending_driver_loads
+                self.pending_driver_starts
                     .cancel(reservation)
                     .expect("failed driver load lost its continuation reservation");
             }
@@ -7210,11 +7221,15 @@ impl ExecNtHandler {
                 OwnedHostedPnpStartBatch::new(&dc, spec, HostedPnpStartOptions::demand_start());
             match batch.drive() {
                 OwnedHostedPnpStartProgress::AwaitingCompletion => {
-                    self.pending_driver_load_transfer = Some((batch, reservation));
+                    self.pending_driver_start_transfer = Some(PendingDriverStartTransfer {
+                        batch,
+                        reservation,
+                        kind: PendingDriverStartTransferKind::Native,
+                    });
                     return nt_status::NtStatus::PENDING.raw() as u32;
                 }
                 OwnedHostedPnpStartProgress::Complete(result) => {
-                    self.pending_driver_loads
+                    self.pending_driver_starts
                         .cancel(reservation)
                         .expect("synchronous driver START lost its continuation reservation");
                     if let Err(failure) = result {
@@ -7226,7 +7241,7 @@ impl ExecNtHandler {
                     }
                 }
                 OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
-                    self.pending_driver_loads
+                    self.pending_driver_starts
                         .publish(
                             reservation,
                             PendingDriverStart {
@@ -7259,8 +7274,8 @@ impl ExecNtHandler {
             Ok(spec) => spec.driver_object_path,
             Err(status) => return status as u32,
         };
-        for slot in 0..self.pending_driver_loads.slot_count() {
-            if self.pending_driver_loads.get(slot).is_some_and(|pending| {
+        for slot in 0..self.pending_driver_starts.slot_count() {
+            if self.pending_driver_starts.get(slot).is_some_and(|pending| {
                 pending
                     .batch
                     .driver_object_path()
@@ -19444,16 +19459,48 @@ impl ExecNtHandler {
         out
     }
 
-    fn pnp_encode_device_install_event(instance: &str) -> alloc::vec::Vec<u8> {
-        let total = PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET
+    fn pnp_encode_named_event(
+        guid: [u8; 16],
+        category: u32,
+        instance: &str,
+    ) -> alloc::vec::Vec<u8> {
+        let total = PNP_EVENT_BLOCK_DATA_OFFSET
             .saturating_add(utf16le_byte_len(instance))
             .saturating_add(2);
-        let mut out = alloc::vec![0u8; PNP_EVENT_BLOCK_INSTALL_DEVICE_OFFSET];
-        out[..GUID_DEVICE_ENUMERATED_BYTES.len()].copy_from_slice(&GUID_DEVICE_ENUMERATED_BYTES);
-        out[16..20].copy_from_slice(&PNP_EVENT_CATEGORY_DEVICE_INSTALL.to_le_bytes());
+        let mut out = alloc::vec![0u8; PNP_EVENT_BLOCK_DATA_OFFSET];
+        out[..guid.len()].copy_from_slice(&guid);
+        out[16..20].copy_from_slice(&category.to_le_bytes());
         out[36..40].copy_from_slice(&(total as u32).to_le_bytes());
         Self::pnp_append_utf16_z(&mut out, instance);
         out
+    }
+
+    fn pnp_encode_device_install_event(instance: &str) -> alloc::vec::Vec<u8> {
+        Self::pnp_encode_named_event(
+            GUID_DEVICE_ENUMERATED_BYTES,
+            PNP_EVENT_CATEGORY_DEVICE_INSTALL,
+            instance,
+        )
+    }
+
+    fn pnp_encode_live_device_action(
+        event: &nt_config_client::DeviceActionEvent,
+    ) -> alloc::vec::Vec<u8> {
+        match event.kind {
+            nt_config_client::DeviceActionKind::Arrival => {
+                Self::pnp_encode_device_install_event(&event.publication.instance_id)
+            }
+            nt_config_client::DeviceActionKind::Change => Self::pnp_encode_named_event(
+                GUID_DEVICE_ENUMERATE_REQUEST_BYTES,
+                PNP_EVENT_CATEGORY_TARGET_DEVICE_CHANGE,
+                &event.publication.instance_id,
+            ),
+            nt_config_client::DeviceActionKind::Removal => Self::pnp_encode_named_event(
+                GUID_DEVICE_SURPRISE_REMOVAL_BYTES,
+                PNP_EVENT_CATEGORY_TARGET_DEVICE_CHANGE,
+                &event.publication.instance_id,
+            ),
+        }
     }
 
     fn pnp_event_wait_object(&mut self) -> Result<WaitObject, u32> {
@@ -19463,6 +19510,95 @@ impl ExecNtHandler {
                 .ok_or(STATUS_DEVICE_NOT_READY)?;
         }
         Ok(WaitObject::dispatcher(self.pnp_notify_event as usize))
+    }
+
+    unsafe fn pnp_signal_pending_action(&mut self) {
+        if self.pnp_notify_event == 0 {
+            return;
+        }
+        let _ = self.events.set_existing(self.pnp_notify_event);
+        let _ = wait_wake_dispatcher_set(self);
+    }
+
+    unsafe fn pnp_claim_live_action(&mut self) -> Result<bool, u32> {
+        if self.pnp_live_action.is_some() {
+            return Ok(true);
+        }
+        let Some(event) = crate::config_manager_next_device_action().map_err(|status| status as u32)?
+        else {
+            return Ok(false);
+        };
+        let mut state = LiveDeviceActionState::new(event).map_err(|()| STATUS_INVALID_PARAMETER)?;
+        if !matches!(state.event.kind, nt_config_client::DeviceActionKind::Arrival) {
+            state
+                .owner
+                .retain_barrier(STATUS_NOT_SUPPORTED)
+                .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        }
+        self.pnp_live_action = Some(state);
+        Ok(true)
+    }
+
+    pub(crate) unsafe fn pnp_try_acknowledge_live_action(&mut self) -> Result<bool, u32> {
+        let Some(state) = self.pnp_live_action.as_ref() else {
+            return Ok(false);
+        };
+        if !state.owner.ready_to_acknowledge() {
+            return Ok(false);
+        }
+        let identity = state
+            .owner
+            .clone()
+            .acknowledge()
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if !state.matches(identity) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let has_more = crate::config_manager_acknowledge_device_action(&state.event)
+            .map_err(|status| status as u32)?;
+        self.pnp_live_action = None;
+        if has_more {
+            self.pnp_signal_pending_action();
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn pnp_complete_live_start(
+        &mut self,
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        owner_slot: usize,
+        status: u32,
+    ) -> Result<(), u32> {
+        let state = self
+            .pnp_live_action
+            .as_mut()
+            .filter(|state| state.matches(identity))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        state
+            .owner
+            .complete_start(owner_slot, status)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn pnp_retain_live_start_barrier(
+        &mut self,
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        status: u32,
+    ) -> Result<(), u32> {
+        let state = self
+            .pnp_live_action
+            .as_mut()
+            .filter(|state| state.matches(identity))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if state.owner.lifecycle()
+            == (nt_pnp_manager::DeviceActionLifecycleState::Barrier { status })
+        {
+            return Ok(());
+        }
+        state
+            .owner
+            .retain_barrier(status)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
     unsafe fn pnp_read_u32(&self, va: u64) -> Result<u32, u32> {
@@ -19506,28 +19642,54 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let instance = match Self::pnp_query(
+        let boot_instance = match Self::pnp_query(
             nt_config_abi::pnp_query_kind::ENUMERATE_DEVNODE,
-            self.pnp_event_cursor.min(u32::MAX as usize) as u32,
+            self.pnp_boot_event_cursor.min(u32::MAX as usize) as u32,
             "",
             &[],
         ) {
             Ok(snapshot) if snapshot.strings.len() == 1 && snapshot.payload.is_empty() => {
-                snapshot.strings.into_iter().next().unwrap()
+                Some(snapshot.strings.into_iter().next().unwrap())
             }
             Err(STATUS_NO_MORE_ENTRIES) => {
-                let Ok(object) = self.pnp_event_wait_object() else {
-                    return STATUS_DEVICE_NOT_READY;
-                };
-                self.wait_park_event = object.raw() as i64;
-                self.wait_timeout = PendingWaitTimeout::none();
-                return 0x102;
+                if self.pnp_live_action.is_some() {
+                    let _ = self.pnp_try_acknowledge_live_action();
+                }
+                match self.pnp_claim_live_action() {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        let Ok(object) = self.pnp_event_wait_object() else {
+                            return STATUS_DEVICE_NOT_READY;
+                        };
+                        self.wait_park_event = object.raw() as i64;
+                        self.wait_timeout = PendingWaitTimeout::none();
+                        return nt_status::NtStatus::PENDING.raw() as u32;
+                    }
+                    Err(status) => return status,
+                }
             }
             Err(status) => return status,
             _ => return STATUS_INVALID_PARAMETER,
         };
 
-        let event = Self::pnp_encode_device_install_event(&instance);
+        let event = if let Some(instance) = boot_instance.as_deref() {
+            Self::pnp_encode_device_install_event(instance)
+        } else {
+            let Some(state) = self.pnp_live_action.as_ref() else {
+                return STATUS_DEVICE_NOT_READY;
+            };
+            if state.owner.notification()
+                == nt_pnp_manager::DeviceActionNotificationState::Responded
+            {
+                let Ok(object) = self.pnp_event_wait_object() else {
+                    return STATUS_DEVICE_NOT_READY;
+                };
+                self.wait_park_event = object.raw() as i64;
+                self.wait_timeout = PendingWaitTimeout::none();
+                return nt_status::NtStatus::PENDING.raw() as u32;
+            }
+            Self::pnp_encode_live_device_action(&state.event)
+        };
         if buffer_size < event.len() {
             return STATUS_BUFFER_TOO_SMALL;
         }
@@ -19536,6 +19698,12 @@ impl ExecNtHandler {
         }
         if self.pnp_notify_event != 0 {
             let _ = self.events.reset_existing(self.pnp_notify_event);
+        }
+        if boot_instance.is_none() {
+            self.pnp_live_action
+                .as_mut()
+                .expect("live PnP event disappeared during delivery")
+                .delivered = true;
         }
         0
     }
@@ -19557,11 +19725,12 @@ impl ExecNtHandler {
                 buffer_len,
                 PNP_CONTROL_ENUMERATE_DEVICE_LEN,
             ),
-            3 | 4 | 20 => self.pnp_control_known_device_action(
+            3 | 20 => self.pnp_control_known_device_action(
                 buffer,
                 buffer_len,
                 PNP_CONTROL_DEVICE_CONTROL_LEN,
             ),
+            4 => self.pnp_control_start_device(buffer, buffer_len),
             6 => self.pnp_control_query_remove(buffer, buffer_len),
             7 => self.pnp_control_user_response(buffer, buffer_len),
             9 => self.pnp_control_interface_device_list(buffer, buffer_len),
@@ -19594,6 +19763,149 @@ impl ExecNtHandler {
         }
     }
 
+    unsafe fn pnp_control_start_device(&mut self, buffer: u64, buffer_len: usize) -> u32 {
+        if buffer == 0 || buffer_len < PNP_CONTROL_DEVICE_CONTROL_LEN {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let instance = match self.pnp_read_device_instance(buffer) {
+            Ok(instance) => instance,
+            Err(status) => return status,
+        };
+        match Self::pnp_device_exists(&instance) {
+            Ok(true) => {}
+            Ok(false) => return STATUS_NO_SUCH_DEVICE,
+            Err(status) => return status,
+        }
+
+        let Some(state) = self.pnp_live_action.as_ref() else {
+            return 0;
+        };
+        if !state
+            .event
+            .publication
+            .instance_id
+            .eq_ignore_ascii_case(&instance)
+        {
+            return 0;
+        }
+        if state.event.kind != nt_config_client::DeviceActionKind::Arrival {
+            return STATUS_NOT_SUPPORTED;
+        }
+        match state.owner.lifecycle() {
+            nt_pnp_manager::DeviceActionLifecycleState::Starting { .. } => {
+                return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
+            }
+            nt_pnp_manager::DeviceActionLifecycleState::Terminal { status }
+            | nt_pnp_manager::DeviceActionLifecycleState::Barrier { status } => return status,
+            nt_pnp_manager::DeviceActionLifecycleState::AwaitingAction => {}
+        }
+
+        let event = state.event.clone();
+        let identity = state.owner.identity();
+        let spec = match live_config_device_action_launch_spec(&event, SERVICE_DEMAND_START) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => {
+                let Some(state) = self.pnp_live_action.as_mut() else {
+                    return STATUS_INVALID_PARAMETER;
+                };
+                if state.owner.complete_without_start(0).is_err() {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let _ = self.pnp_try_acknowledge_live_action();
+                return 0;
+            }
+            Err(status) => return status as u32,
+        };
+        if spec.class != driver_launch::DriverClass::Device || spec.devnodes.len() != 1 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some((driver_id, ready_for_pnp)) =
+            driver_launch::loaded_driver_pnp_start_context(&spec.driver_object_path)
+        else {
+            return STATUS_DEVICE_NOT_READY;
+        };
+        if !ready_for_pnp {
+            return STATUS_DEVICE_NOT_READY;
+        }
+        if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        let reservation = match self.pending_driver_starts.reserve() {
+            Ok(reservation) => reservation,
+            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+        };
+        let owner_slot = reservation.slot();
+        if self
+            .pnp_live_action
+            .as_mut()
+            .expect("live action disappeared before START")
+            .owner
+            .begin_start(owner_slot)
+            .is_err()
+        {
+            self.pending_driver_starts
+                .cancel(reservation)
+                .expect("rejected live START lost its reservation");
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut batch = OwnedHostedPnpStartBatch::new_for_driver(
+            driver_id,
+            ready_for_pnp,
+            spec,
+            HostedPnpStartOptions::demand_start(),
+        );
+        match batch.drive() {
+            OwnedHostedPnpStartProgress::AwaitingCompletion => {
+                self.pending_driver_start_transfer = Some(PendingDriverStartTransfer {
+                    batch,
+                    reservation,
+                    kind: PendingDriverStartTransferKind::DeviceAction(identity),
+                });
+                nt_status::NtStatus::PENDING.raw() as u32
+            }
+            OwnedHostedPnpStartProgress::Complete(result) => {
+                self.pending_driver_starts
+                    .cancel(reservation)
+                    .expect("synchronous live START lost its reservation");
+                let status = match result {
+                    Ok(_) => 0,
+                    Err(failure) => failure.status.raw() as u32,
+                };
+                if self
+                    .pnp_complete_live_start(identity, owner_slot, status)
+                    .is_err()
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                let _ = self.pnp_try_acknowledge_live_action();
+                status
+            }
+            OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
+                let status = failure.status.raw() as u32;
+                if self.pnp_retain_live_start_barrier(identity, status).is_err() {
+                    self.pending_driver_starts
+                        .cancel(reservation)
+                        .expect("invalid live START barrier lost its reservation");
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.pending_driver_starts
+                    .publish(
+                        reservation,
+                        PendingDriverStart {
+                            batch,
+                            owner: PendingDriverStartOwner::DeviceAction {
+                                identity,
+                                reply: None,
+                            },
+                        },
+                    )
+                    .expect("indeterminate live START rejected its barrier owner");
+                status
+            }
+        }
+    }
+
     unsafe fn pnp_control_query_remove(&self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_QUERY_REMOVE_LEN {
             return STATUS_INVALID_PARAMETER;
@@ -19613,10 +19925,20 @@ impl ExecNtHandler {
         if buffer == 0 || buffer_len < PNP_CONTROL_USER_RESPONSE_LEN {
             return STATUS_INVALID_PARAMETER;
         }
-        self.pnp_event_cursor = self.pnp_event_cursor.saturating_add(1);
+        if let Some(state) = self.pnp_live_action.as_mut() {
+            if !state.delivered {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if state.owner.respond().is_err() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let _ = self.pnp_try_acknowledge_live_action();
+            return 0;
+        }
+        self.pnp_boot_event_cursor = self.pnp_boot_event_cursor.saturating_add(1);
         if Self::pnp_query(
             nt_config_abi::pnp_query_kind::ENUMERATE_DEVNODE,
-            self.pnp_event_cursor.min(u32::MAX as usize) as u32,
+            self.pnp_boot_event_cursor.min(u32::MAX as usize) as u32,
             "",
             &[],
         )

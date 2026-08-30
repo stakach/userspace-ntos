@@ -205,13 +205,27 @@ impl OwnedHostedPnpStartBatch {
         spec: DriverServiceLaunchSpec,
         options: HostedPnpStartOptions,
     ) -> Self {
-        let report = HostedPnpStartReport {
-            driver_ready_for_pnp: (dc.verdict & V_ENTERED) != 0
+        Self::new_for_driver(
+            dc.driver_id,
+            (dc.verdict & V_ENTERED) != 0
                 && (dc.add_device != 0
                     || driver_launch::hosted_driver_video_port_initialized(dc.driver_id)),
+            spec,
+            options,
+        )
+    }
+
+    pub(crate) fn new_for_driver(
+        driver_id: u64,
+        driver_ready_for_pnp: bool,
+        spec: DriverServiceLaunchSpec,
+        options: HostedPnpStartOptions,
+    ) -> Self {
+        let report = HostedPnpStartReport {
+            driver_ready_for_pnp,
             ..HostedPnpStartReport::default()
         };
-        let coordinator = nt_driver_start::DriverStartBatch::new(dc.driver_id, spec.devnodes.len());
+        let coordinator = nt_driver_start::DriverStartBatch::new(driver_id, spec.devnodes.len());
         Self {
             spec,
             options,

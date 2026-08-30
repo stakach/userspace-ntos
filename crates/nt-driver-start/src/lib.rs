@@ -196,6 +196,14 @@ pub struct Reservation {
     generation: u64,
 }
 
+impl Reservation {
+    /// Stable table slot reserved for the continuation. The generation remains private so callers
+    /// can correlate external ownership without gaining the ability to forge a reservation.
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableError {
     Full,
@@ -321,6 +329,19 @@ impl<T> PendingDriverStartTable<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservation_exposes_only_its_stable_owner_slot() {
+        let mut table = PendingDriverStartTable::<u32>::with_capacity(2);
+        let first = table.reserve().unwrap();
+        let second = table.reserve().unwrap();
+        assert_eq!(first.slot(), 0);
+        assert_eq!(second.slot(), 1);
+        table.cancel(first).unwrap();
+        let replacement = table.reserve().unwrap();
+        assert_eq!(replacement.slot(), 0);
+        assert_ne!(replacement, first);
+    }
 
     #[test]
     fn serializes_multiple_pending_devnodes() {

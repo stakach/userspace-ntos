@@ -15845,6 +15845,65 @@ pub(crate) unsafe fn config_manager_query_driver_launch_plan(
     Ok(snapshot)
 }
 
+pub(crate) unsafe fn config_manager_query_driver_service(
+    service_name: &str,
+) -> Result<nt_config_client::DriverServiceBinding, i32> {
+    if LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire) == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
+        .query_driver_service(service_name)
+}
+
+pub(crate) fn config_manager_device_action_pending() -> bool {
+    CONFIG_DEVICE_ACTION_PENDING.load(Ordering::Acquire)
+}
+
+pub(crate) unsafe fn config_manager_next_device_action(
+) -> Result<Option<nt_config_client::DeviceActionEvent>, i32> {
+    if !config_manager_device_action_pending() {
+        return Ok(None);
+    }
+    let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if current_generation == 0 {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    let event = client.next_device_action()?;
+    match &event {
+        Some(event)
+            if event.mount_generation != 0
+                && event.mount_generation <= current_generation
+                && event.sequence != 0
+                && event.claim_token != 0 => {}
+        Some(_) => return Err(CONFIG_STATUS_DEVICE_NOT_READY),
+        None => CONFIG_DEVICE_ACTION_PENDING.store(false, Ordering::Release),
+    }
+    Ok(event)
+}
+
+pub(crate) unsafe fn config_manager_acknowledge_device_action(
+    event: &nt_config_client::DeviceActionEvent,
+) -> Result<bool, i32> {
+    let current_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
+    if current_generation == 0
+        || event.mount_generation == 0
+        || event.mount_generation > current_generation
+    {
+        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    }
+    let has_more = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?
+        .acknowledge_device_action(event)?;
+    CONFIG_DEVICE_ACTION_PENDING.store(has_more, Ordering::Release);
+    Ok(has_more)
+}
+
 unsafe fn config_manager_query_win32_service_launch_plan(
     plan_kind: u16,
 ) -> Result<nt_config_client::Win32ServiceLaunchPlanSnapshot, i32> {
@@ -16077,7 +16136,7 @@ pub(crate) unsafe fn config_manager_prepare_system_hive_mutation(
 
 pub(crate) unsafe fn config_manager_publish_system_hive_mutation(
     prepared: &nt_config_client::PreparedSystemHiveMutation,
-) -> Result<u64, i32> {
+) -> Result<(u64, bool), i32> {
     let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
     if expected_generation == 0 || prepared.expected_generation != expected_generation {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
@@ -16090,10 +16149,14 @@ pub(crate) unsafe fn config_manager_publish_system_hive_mutation(
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(outcome.generation, Ordering::Release);
-    if outcome.has_pending_device_action {
-        CONFIG_DEVICE_ACTION_PENDING.store(true, Ordering::Release);
-    }
-    Ok(outcome.generation)
+    let was_pending = CONFIG_DEVICE_ACTION_PENDING.swap(
+        outcome.has_pending_device_action,
+        Ordering::AcqRel,
+    );
+    Ok((
+        outcome.generation,
+        outcome.has_pending_device_action && !was_pending,
+    ))
 }
 
 pub(crate) unsafe fn config_manager_abort_system_hive_mutation(
@@ -18277,7 +18340,7 @@ pub(crate) unsafe fn release_unpublished_hosted_thread_runtime(runtime: HostedTh
 
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = power_manager::remove_thread_execution_state(tid);
-    let _ = crate::service_sec_image::pending_driver_load_abandon_thread(handler, tid);
+    let _ = crate::service_sec_image::pending_driver_start_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_receive_wait_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_connect_wait_abandon_thread(handler, tid);
     let _ = crate::service_sec_image::lpc_request_wait_abandon_thread(handler, tid);
@@ -19738,6 +19801,34 @@ impl PnpRuntimeStatusTable {
     }
 }
 
+struct LiveDeviceActionState {
+    event: nt_config_client::DeviceActionEvent,
+    owner: nt_pnp_manager::DeviceActionOwner,
+    delivered: bool,
+}
+
+impl LiveDeviceActionState {
+    fn new(event: nt_config_client::DeviceActionEvent) -> Result<Self, ()> {
+        let owner = nt_pnp_manager::DeviceActionOwner::new(
+            nt_pnp_manager::DeviceActionClaimIdentity {
+                mount_generation: event.mount_generation,
+                sequence: event.sequence,
+                claim_token: event.claim_token,
+            },
+        )
+        .map_err(|_| ())?;
+        Ok(Self {
+            event,
+            owner,
+            delivered: false,
+        })
+    }
+
+    fn matches(&self, identity: nt_pnp_manager::DeviceActionClaimIdentity) -> bool {
+        self.owner.identity() == identity
+    }
+}
+
 fn ascii_starts_with_ignore_case(text: &[u8], prefix: &[u8]) -> bool {
     if text.len() < prefix.len() {
         return false;
@@ -20899,6 +20990,37 @@ fn owned_driver_launch_spec_from_live_config_binding(
         class,
         devnodes,
     })
+}
+
+pub(crate) unsafe fn live_config_device_action_launch_spec(
+    event: &nt_config_client::DeviceActionEvent,
+    max_start: u32,
+) -> Result<Option<DriverServiceLaunchSpec>, i32> {
+    let Some(service_name) = event.publication.service_name.as_deref() else {
+        return Ok(None);
+    };
+    let binding = config_manager_query_driver_service(service_name)?;
+    if !binding.service_name.eq_ignore_ascii_case(service_name)
+        || !binding.devnodes.iter().any(|devnode| {
+            devnode
+                .instance_id
+                .eq_ignore_ascii_case(&event.publication.instance_id)
+        })
+    {
+        return Err(0xC000_0225u32 as i32);
+    }
+    let mut spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start)
+        .ok_or(0xC000_0034u32 as i32)?;
+    spec.devnodes.clear();
+    spec.devnodes.push(DriverServiceDevnodeSpec {
+        instance_id: event.publication.instance_id.clone(),
+        pdo_name: event.publication.pdo_name.clone(),
+        driver_key: event.publication.driver_key.clone(),
+        linkage_export: event.publication.linkage_export.clone(),
+        hardware_ids: event.publication.hardware_ids.clone(),
+        compatible_ids: event.publication.compatible_ids.clone(),
+    });
+    Ok(Some(spec))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -22842,12 +22964,12 @@ struct ExecNtHandler {
     pending_file_io_wait: bool,
     /// Exact pre-dispatch owner claim consumed only if the driver returns a pending IRP.
     pending_file_io_reservation: Option<nt_io_manager::PendingFileIoReservation>,
-    /// Demand-start `NtLoadDriver` batches. The handler reserves a generation-exact slot before
-    /// DriverEntry/AddDevice/START side effects, and the service loop attaches the live syscall
-    /// Reply object only when an exact START IRP remains pending.
-    pending_driver_loads: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
+    /// Driver START batches. The handler reserves a generation-exact slot before AddDevice/START
+    /// side effects, and the service loop attaches the live syscall Reply object only when an exact
+    /// START IRP remains pending.
+    pending_driver_starts: nt_driver_start::PendingDriverStartTable<PendingDriverStart>,
     boot_driver_start_reports: BootDriverStartReports,
-    pending_driver_load_transfer: Option<(OwnedHostedPnpStartBatch, nt_driver_start::Reservation)>,
+    pending_driver_start_transfer: Option<PendingDriverStartTransfer>,
     /// Contended synchronous File acquisition transferred into the FIFO owner at the reply site.
     pending_synchronous_file_wait: Option<nt_io_manager::SynchronousFileWaiter>,
     /// Final-handle `NtClose` continuation reserved before removing the process handle. File Busy
@@ -22873,9 +22995,12 @@ struct ExecNtHandler {
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,
-    /// Cursor over the CM-indexed PnP device-install event stream. `NtGetPlugPlayEvent` exposes the
-    /// current devnode until umpnpmgr acknowledges it through `PlugPlayControlUserResponse`.
-    pnp_event_cursor: usize,
+    /// Cursor over the historical CM-indexed boot device-install stream. The seeded baseline is
+    /// discovery history, not a runtime arrival journal.
+    pnp_boot_event_cursor: usize,
+    /// Exclusive live CM action claim retained across user notification, asynchronous START, and
+    /// CM acknowledgement retries.
+    pnp_live_action: Option<LiveDeviceActionState>,
     /// Dispatcher event used to park `NtGetPlugPlayEvent` callers once the CM-backed stream drains.
     /// Zero means the event has not been allocated yet.
     pnp_notify_event: u64,
@@ -23262,8 +23387,24 @@ struct NativeDriverStartReply {
     reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
+#[derive(Clone, Copy)]
+enum PendingDriverStartTransferKind {
+    Native,
+    DeviceAction(nt_pnp_manager::DeviceActionClaimIdentity),
+}
+
+struct PendingDriverStartTransfer {
+    batch: OwnedHostedPnpStartBatch,
+    reservation: nt_driver_start::Reservation,
+    kind: PendingDriverStartTransferKind,
+}
+
 enum PendingDriverStartOwner {
     Native(NativeDriverStartReply),
+    DeviceAction {
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        reply: Option<NativeDriverStartReply>,
+    },
     Boot {
         target: BootDriverStartReportTarget,
         report_published: bool,

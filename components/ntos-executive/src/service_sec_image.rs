@@ -9284,9 +9284,8 @@ pub(crate) unsafe fn service_sec_image(
                 bool,
                 nt_io_manager::PendingFileIoReservation,
             )> = None;
-            let mut transfer_pending_driver_load: Option<(
-                OwnedHostedPnpStartBatch,
-                nt_driver_start::Reservation,
+            let mut transfer_pending_driver_start: Option<(
+                PendingDriverStartTransfer,
                 nt_syscall_abi::ParkedSyscallReply,
             )> = None;
             let mut transfer_file_irp_drain: Option<(
@@ -9419,8 +9418,8 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler.pending_file_io_transfer = None;
                 nt_handler.pending_file_io_wait = false;
                 assert!(
-                    nt_handler.pending_driver_load_transfer.is_none(),
-                    "previous syscall leaked a driver-load continuation reservation"
+                    nt_handler.pending_driver_start_transfer.is_none(),
+                    "previous syscall leaked a driver START continuation reservation"
                 );
                 nt_handler.pending_synchronous_file_wait = None;
                 assert!(
@@ -9982,8 +9981,8 @@ pub(crate) unsafe fn service_sec_image(
                         "unused pending File reservation became stale"
                     );
                 }
-                if let Some((batch, reservation)) = nt_handler.pending_driver_load_transfer.take() {
-                    transfer_pending_driver_load = Some((batch, reservation, parked_syscall_reply));
+                if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
+                    transfer_pending_driver_start = Some((transfer, parked_syscall_reply));
                 }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
                     // Publish the exact FIFO owner before any post-dispatch completion can release
@@ -15716,10 +15715,10 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
-            // Demand driver loads retain the exact START cursor and live syscall reply until every
-            // devnode is terminal. Publication precedes Reply-object rotation.
-            if let Some((batch, reservation, reply)) = transfer_pending_driver_load.take() {
-                pending_driver_load_transfer(&mut nt_handler, batch, reservation, reply);
+            // Native driver loads and live PnP actions retain the exact START cursor and syscall
+            // reply until their devnode is terminal. Publication precedes Reply-object rotation.
+            if let Some((transfer, reply)) = transfer_pending_driver_start.take() {
+                pending_driver_start_transfer(&mut nt_handler, transfer, reply);
                 trace_indefinite_wait_park(
                     &nt_handler,
                     badge,
@@ -22407,39 +22406,53 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn pending_driver_load_transfer(
+unsafe fn pending_driver_start_transfer(
     nt_handler: &mut ExecNtHandler,
-    batch: OwnedHostedPnpStartBatch,
-    reservation: nt_driver_start::Reservation,
+    transfer: PendingDriverStartTransfer,
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
+    let PendingDriverStartTransfer {
+        batch,
+        reservation,
+        kind,
+    } = transfer;
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
         stolen, 0,
-        "pending driver-load Reply object disappeared after preflight"
+        "pending driver START Reply object disappeared after preflight"
     );
     let (fresh_index, fresh) = wait_reply_pool_find_free()
-        .expect("pending driver-load Reply-pool claim disappeared after preflight");
+        .expect("pending driver START Reply-pool claim disappeared after preflight");
+    let native_reply = NativeDriverStartReply {
+        tid: nt_handler.current_tid,
+        badge: nt_handler.current_badge,
+        reply_cap: stolen,
+        reply,
+    };
+    let owner = match kind {
+        PendingDriverStartTransferKind::Native => PendingDriverStartOwner::Native(native_reply),
+        PendingDriverStartTransferKind::DeviceAction(identity) => {
+            PendingDriverStartOwner::DeviceAction {
+                identity,
+                reply: Some(native_reply),
+            }
+        }
+    };
     nt_handler
-        .pending_driver_loads
+        .pending_driver_starts
         .publish(
             reservation,
             PendingDriverStart {
                 batch,
-                owner: PendingDriverStartOwner::Native(NativeDriverStartReply {
-                    tid: nt_handler.current_tid,
-                    badge: nt_handler.current_badge,
-                    reply_cap: stolen,
-                    reply,
-                }),
+                owner,
             },
         )
-        .expect("reserved driver-load continuation rejected its exact batch");
+        .expect("reserved driver START continuation rejected its exact batch");
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
 
-unsafe fn pending_driver_load_reply(
+unsafe fn pending_native_driver_start_reply(
     nt_handler: &mut ExecNtHandler,
     pending: &mut PendingDriverStart,
     status: u32,
@@ -22449,7 +22462,7 @@ unsafe fn pending_driver_load_reply(
     else {
         return;
     };
-    pending_driver_load_reply_owner(
+    pending_driver_start_reply_owner(
         nt_handler,
         reply.reply_cap,
         reply.reply,
@@ -22458,7 +22471,7 @@ unsafe fn pending_driver_load_reply(
     );
 }
 
-unsafe fn pending_driver_load_reply_owner(
+unsafe fn pending_driver_start_reply_owner(
     nt_handler: &mut ExecNtHandler,
     cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
@@ -22470,11 +22483,11 @@ unsafe fn pending_driver_load_reply_owner(
     thread_wait_state_clear_badge_ready(nt_handler, badge);
 }
 
-unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let mut completed = 0u64;
-    for slot in 0..nt_handler.pending_driver_loads.slot_count() {
+    for slot in 0..nt_handler.pending_driver_starts.slot_count() {
         let progress = {
-            let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
+            let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
                 continue;
             };
             pending.batch.drive_after_completion_pump()
@@ -22482,20 +22495,48 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
         match progress {
             OwnedHostedPnpStartProgress::AwaitingCompletion => {}
             OwnedHostedPnpStartProgress::Complete(result) => {
-                let mut pending = nt_handler
-                    .pending_driver_loads
-                    .take(slot)
-                    .expect("completed driver-load continuation disappeared");
                 let status = match result {
                     Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
                     Err(failure) => failure.status.raw() as u32,
                 };
+                let device_action_identity = nt_handler
+                    .pending_driver_starts
+                    .get(slot)
+                    .and_then(|pending| match &pending.owner {
+                        PendingDriverStartOwner::DeviceAction { identity, .. } => Some(*identity),
+                        _ => None,
+                    });
+                if let Some(identity) = device_action_identity {
+                    nt_handler
+                        .pnp_complete_live_start(identity, slot, status)
+                        .expect("terminal live START lost its exact action owner");
+                    let _ = nt_handler.pnp_try_acknowledge_live_action();
+                }
+                let mut pending = nt_handler
+                    .pending_driver_starts
+                    .take(slot)
+                    .expect("completed driver START continuation disappeared");
                 match &pending.owner {
                     PendingDriverStartOwner::Boot { target, .. } => nt_handler
                         .boot_driver_start_reports
                         .merge(*target, pending.batch.report()),
                     PendingDriverStartOwner::Native(_) => {
-                        pending_driver_load_reply(nt_handler, &mut pending, status)
+                        pending_native_driver_start_reply(nt_handler, &mut pending, status)
+                    }
+                    PendingDriverStartOwner::DeviceAction { .. } => {
+                        let reply = match &mut pending.owner {
+                            PendingDriverStartOwner::DeviceAction { reply, .. } => reply.take(),
+                            _ => unreachable!(),
+                        };
+                        if let Some(reply) = reply {
+                            pending_driver_start_reply_owner(
+                                nt_handler,
+                                reply.reply_cap,
+                                reply.reply,
+                                reply.badge,
+                                status,
+                            );
+                        }
                     }
                     PendingDriverStartOwner::Detached => {}
                 }
@@ -22504,8 +22545,9 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
                 let status = failure.status.raw() as u32;
                 let mut boot_report = None;
+                let mut device_action_identity = None;
                 let native_reply = {
-                    let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
+                    let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
                         continue;
                     };
                     match &mut pending.owner {
@@ -22528,14 +22570,23 @@ unsafe fn pending_driver_load_redrive_all(nt_handler: &mut ExecNtHandler) -> u64
                             };
                             Some(reply)
                         }
+                        PendingDriverStartOwner::DeviceAction { identity, reply } => {
+                            device_action_identity = Some(*identity);
+                            reply.take()
+                        }
                         PendingDriverStartOwner::Detached => None,
                     }
                 };
+                if let Some(identity) = device_action_identity {
+                    nt_handler
+                        .pnp_retain_live_start_barrier(identity, status)
+                        .expect("lost live START ownership lost its exact action claim");
+                }
                 if let Some((target, report)) = boot_report {
                     nt_handler.boot_driver_start_reports.merge(target, report);
                 }
                 if let Some(reply) = native_reply {
-                    pending_driver_load_reply_owner(
+                    pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
                         reply.reply,
@@ -22555,16 +22606,16 @@ unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandle
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
     activated
         .saturating_add(pumped)
-        .saturating_add(pending_driver_load_redrive_all(nt_handler))
+        .saturating_add(pending_driver_start_redrive_all(nt_handler))
 }
 
 fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
     nt_handler
-        .pending_driver_loads
+        .pending_driver_starts
         .occupied_slots()
         .any(|slot| {
             nt_handler
-                .pending_driver_loads
+                .pending_driver_starts
                 .get(slot)
                 .is_some_and(|pending| pending.batch.needs_completion_redrive())
         })
@@ -22572,8 +22623,8 @@ fn pending_driver_start_redrive_needed(nt_handler: &ExecNtHandler) -> bool {
 
 fn pending_driver_start_reports_snapshot(nt_handler: &ExecNtHandler) -> BootDriverStartReports {
     let mut reports = nt_handler.boot_driver_start_reports;
-    for slot in nt_handler.pending_driver_loads.occupied_slots() {
-        let Some(pending) = nt_handler.pending_driver_loads.get(slot) else {
+    for slot in nt_handler.pending_driver_starts.occupied_slots() {
+        let Some(pending) = nt_handler.pending_driver_starts.get(slot) else {
             continue;
         };
         let PendingDriverStartOwner::Boot {
@@ -22590,25 +22641,38 @@ fn pending_driver_start_reports_snapshot(nt_handler: &ExecNtHandler) -> BootDriv
     reports
 }
 
-pub(crate) unsafe fn pending_driver_load_abandon_thread(
+pub(crate) unsafe fn pending_driver_start_abandon_thread(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
 ) -> u64 {
     let mut abandoned = 0u64;
-    for slot in 0..nt_handler.pending_driver_loads.slot_count() {
-        let Some(pending) = nt_handler.pending_driver_loads.get_mut(slot) else {
+    for slot in 0..nt_handler.pending_driver_starts.slot_count() {
+        let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
             continue;
         };
-        let PendingDriverStartOwner::Native(reply) = &pending.owner else {
-            continue;
+        let reply = match &pending.owner {
+            PendingDriverStartOwner::Native(reply) => reply,
+            PendingDriverStartOwner::DeviceAction {
+                reply: Some(reply), ..
+            } => reply,
+            _ => continue,
         };
         if reply.tid != tid || reply.reply_cap == 0 {
             continue;
         }
-        let PendingDriverStartOwner::Native(reply) =
-            core::mem::replace(&mut pending.owner, PendingDriverStartOwner::Detached)
-        else {
-            unreachable!()
+        let reply = match &mut pending.owner {
+            PendingDriverStartOwner::Native(_) => {
+                let PendingDriverStartOwner::Native(reply) =
+                    core::mem::replace(&mut pending.owner, PendingDriverStartOwner::Detached)
+                else {
+                    unreachable!()
+                };
+                reply
+            }
+            PendingDriverStartOwner::DeviceAction { reply, .. } => {
+                reply.take().expect("live START reply disappeared during abandonment")
+            }
+            _ => unreachable!(),
         };
         let cap = reply.reply_cap;
         let deleted = cnode_delete_r(cap);

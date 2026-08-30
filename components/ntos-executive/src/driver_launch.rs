@@ -35563,6 +35563,14 @@ pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
         .map(|driver_id| driver_id.raw())
 }
 
+pub(crate) fn loaded_driver_pnp_start_context(path: &str) -> Option<(u64, bool)> {
+    let driver_id = driver_id_by_name(path)?;
+    let (_, inst) = instance_by_driver_id(driver_id)?;
+    let ready_for_pnp = inst.ready
+        && (inst.add_device != 0 || hosted_driver_video_port_initialized(driver_id));
+    Some((driver_id, ready_for_pnp))
+}
+
 #[inline(never)]
 pub(crate) fn open_io_device(
     device_path: &str,
