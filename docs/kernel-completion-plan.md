@@ -18667,3 +18667,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     pressure retries. Keep the resulting property records staged until capability query and an
     allocation-free PnP devnode publication owner exist; CM must not be published first and then
     discover that canonical PDO-property publication can fail.
+
+    B3 native bus-property transaction checkpoint (2026-08-30, implementation green): the retained
+    BusRelations owner now dispatches `QUERY_BUS_INFORMATION`, `QUERY_RESOURCES`, and
+    `QUERY_RESOURCE_REQUIREMENTS` sequentially for every authenticated child PDO after all four
+    native IDs have been copied. Each query reuses the canonical top-of-stack PnP transport and
+    snapshots the exact origin driver, completion driver/device, provider allocation owner, IRP,
+    and native minor. Pending results must reproduce that complete identity before any pointer is
+    consumed.
+
+    Nonzero results remain live in the provider pool until their fixed or counted native prefix has
+    been copied into the retained transaction and the exact provider allocation has been freed.
+    Allocation pressure retries the copy without redispatch or completion ACK; malformed extents,
+    stale/free pointers, release failure, identity drift, and indeterminate transport retain the
+    invalidation as a barrier. A zero result or a failed native query records an explicit
+    `KnownNone`; a failed query that nevertheless returned an allocation is validated and released
+    before its value is discarded. Durable relation publication now follows this complete query
+    prefix, so it cannot race ahead of resource discovery. Formatting, `git diff --check`, and the
+    freestanding executive check pass at the unchanged 209-warning baseline.
+
+    Review adjustment: these property records are transaction-owned and deliberately not yet
+    exposed through the PnP devnode table. Next model native x64 `DEVICE_CAPABILITIES` as an
+    initialized in/out PnP payload in `nt-io-manager`, copy the mutated buffer back through exact
+    completion ownership, and decode the validated capability result. Then add an allocation-free
+    prepared PnP devnode batch so capability/resource publication and the durable CM relation can
+    commit in the correct order without partial state.
