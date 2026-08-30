@@ -15732,6 +15732,7 @@ impl nt_config_client::Backend for CmChan<'_> {
 static mut CONFIG_CLIENT_PTR: *mut ConfigClient<CmChan<'static>> = core::ptr::null_mut();
 static LIVE_CONFIG_MANAGER_SYSTEM_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_DEVICE_ACTION_PENDING: AtomicBool = AtomicBool::new(false);
+static CONFIG_DEVICE_ACTION_WAKE_REQUESTED: AtomicBool = AtomicBool::new(false);
 const CONFIG_STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const CONFIG_STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 
@@ -15878,6 +15879,14 @@ pub(crate) unsafe fn config_manager_query_critical_device_binding(
 
 pub(crate) fn config_manager_device_action_pending() -> bool {
     CONFIG_DEVICE_ACTION_PENDING.load(Ordering::Acquire)
+}
+
+pub(crate) fn config_manager_request_device_action_wake() {
+    CONFIG_DEVICE_ACTION_WAKE_REQUESTED.store(true, Ordering::Release);
+}
+
+pub(crate) fn config_manager_take_device_action_wake() -> bool {
+    CONFIG_DEVICE_ACTION_WAKE_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
 pub(crate) unsafe fn config_manager_next_device_action(
@@ -16184,6 +16193,57 @@ pub(crate) unsafe fn config_manager_abort_system_hive_mutation(
     if let Some(client) = CONFIG_CLIENT_PTR.as_mut() {
         client.abort_prepared_system_hive_mutation(prepared);
     }
+}
+
+pub(crate) struct DurableSystemHiveMutationOutcome {
+    pub generation: u64,
+    pub wake_device_action: bool,
+    pub journaled: bool,
+}
+
+/// Persist one complete CM-validated SYSTEM mutation before publishing its semantic generation.
+/// All executive callers share this path so registry syscalls and PnP topology have identical
+/// append, flush, abort, and rollback ownership.
+pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
+    mutations: &[nt_config_client::SystemHiveMutation<'_>],
+) -> Result<DurableSystemHiveMutationOutcome, u32> {
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
+    let prepared = config_manager_prepare_system_hive_mutation(mutations)
+        .map_err(|status| status as u32)?;
+    let mut provider =
+        writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
+    let previous_log_len = provider.log_len();
+    let journaled = !prepared.durable_journal.is_empty();
+    let journal_result = if journaled {
+        nt_hive_core::HiveIoProvider::append_log_record(&mut provider, &prepared.durable_journal)
+            .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider))
+    } else {
+        Ok(())
+    };
+    if journal_result.is_err() {
+        let _ = provider.truncate_log_to(previous_log_len);
+        config_manager_abort_system_hive_mutation(&prepared);
+        return Err(STATUS_UNSUCCESSFUL);
+    }
+
+    let (generation, wake_device_action) =
+        match config_manager_publish_system_hive_mutation(&prepared) {
+            Ok(outcome) => outcome,
+            Err(status) => {
+                let rollback = provider.truncate_log_to(previous_log_len);
+                config_manager_abort_system_hive_mutation(&prepared);
+                if rollback.is_err() {
+                    return Err(STATUS_UNSUCCESSFUL);
+                }
+                return Err(status as u32);
+            }
+        };
+    Ok(DurableSystemHiveMutationOutcome {
+        generation,
+        wake_device_action,
+        journaled,
+    })
 }
 
 pub(crate) unsafe fn config_manager_prepare_system_hive_checkpoint(

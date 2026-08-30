@@ -34998,6 +34998,432 @@ unsafe fn dispatch_hosted_query_id(child_index: usize, id_type: u32) -> bool {
     true
 }
 
+fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError {
+    if status as u32 == nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32 {
+        HostedRelationPublishError::RetryResources
+    } else {
+        HostedRelationPublishError::Barrier(nt_status::NtStatus(status))
+    }
+}
+
+fn hosted_relation_error_from_pnp(
+    error: nt_pnp_manager::BusRelationError,
+) -> HostedRelationPublishError {
+    if error == nt_pnp_manager::BusRelationError::InsufficientResources {
+        HostedRelationPublishError::RetryResources
+    } else {
+        HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    }
+}
+
+fn hosted_relation_child_matches_instance(
+    child: &nt_pnp_manager::BusReportedChild,
+    instance: &str,
+) -> bool {
+    instance.rsplit_once('\\').is_some_and(|(device, id)| {
+        device.eq_ignore_ascii_case(&child.device_id)
+            && id.eq_ignore_ascii_case(&child.instance_id)
+    })
+}
+
+fn hosted_relation_instance_path(
+    child: &nt_pnp_manager::BusReportedChild,
+) -> Result<String, HostedRelationPublishError> {
+    let capacity = child
+        .device_id
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(child.instance_id.len()))
+        .ok_or(HostedRelationPublishError::RetryResources)?;
+    let mut path = String::new();
+    path.try_reserve_exact(capacity)
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    path.push_str(&child.device_id);
+    path.push('\\');
+    path.push_str(&child.instance_id);
+    Ok(path)
+}
+
+fn hosted_relation_enum_path(
+    child: &nt_pnp_manager::BusReportedChild,
+) -> Result<String, HostedRelationPublishError> {
+    const PREFIX: &str = r"\Registry\Machine\System\CurrentControlSet\Enum\";
+    let instance = hosted_relation_instance_path(child)?;
+    let capacity = PREFIX
+        .len()
+        .checked_add(instance.len())
+        .ok_or(HostedRelationPublishError::RetryResources)?;
+    let mut path = String::new();
+    path.try_reserve_exact(capacity)
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    path.push_str(PREFIX);
+    path.push_str(&instance);
+    Ok(path)
+}
+
+fn encode_hosted_relation_sz(value: &str) -> Result<Vec<u8>, HostedRelationPublishError> {
+    let capacity = value
+        .encode_utf16()
+        .count()
+        .checked_add(1)
+        .and_then(|units| units.checked_mul(2))
+        .ok_or(HostedRelationPublishError::RetryResources)?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    for unit in value.encode_utf16().chain(core::iter::once(0)) {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+fn encode_hosted_relation_multi_sz(
+    values: &[String],
+) -> Result<Vec<u8>, HostedRelationPublishError> {
+    let terminator_units = if values.is_empty() { 2usize } else { 1usize };
+    let units = values.iter().try_fold(terminator_units, |total, value| {
+        total
+            .checked_add(value.encode_utf16().count())
+            .and_then(|length| length.checked_add(1))
+    });
+    let capacity = units
+        .and_then(|units| units.checked_mul(2))
+        .ok_or(HostedRelationPublishError::RetryResources)?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    for value in values {
+        for unit in value.encode_utf16().chain(core::iter::once(0)) {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    if values.is_empty() {
+        encoded.extend_from_slice(&0u16.to_le_bytes());
+    }
+    encoded.extend_from_slice(&0u16.to_le_bytes());
+    Ok(encoded)
+}
+
+fn encode_hosted_relation_nt_path(
+    path: &NtPath,
+) -> Result<Vec<u8>, HostedRelationPublishError> {
+    let units = path.to_units();
+    let capacity = units
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_mul(2))
+        .ok_or(HostedRelationPublishError::RetryResources)?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    for unit in units.into_iter().chain(core::iter::once(0)) {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+unsafe fn seed_hosted_bus_relation_baseline(
+    bus_object_id: u64,
+    children: &[nt_pnp_manager::BusReportedChild],
+) -> Result<(), HostedRelationPublishError> {
+    if hosted_bus_relations_mut()
+        .accepted_children(bus_object_id)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let bus_devnode = hosted_pnp_manager_mut()
+        .devnode_for_pdo(bus_object_id)
+        .ok_or(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ))?;
+    let bus_instance = String::from(hosted_pnp_manager_mut().instance_id(bus_devnode).ok_or(
+        HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    )?);
+    let snapshot = crate::config_manager_query_pnp(
+        nt_config_abi::pnp_query_kind::BUS_RELATIONS,
+        0,
+        &bus_instance,
+        &[],
+    )
+    .map_err(hosted_relation_error_from_config)?;
+    if snapshot.query_kind != nt_config_abi::pnp_query_kind::BUS_RELATIONS
+        || !snapshot.payload.is_empty()
+    {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+
+    let mut baseline = Vec::new();
+    baseline
+        .try_reserve_exact(snapshot.strings.len())
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    for instance in &snapshot.strings {
+        let child = children
+            .iter()
+            .find(|child| hosted_relation_child_matches_instance(child, instance))
+            .ok_or(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ))?;
+        baseline.push(child.clone());
+    }
+    hosted_bus_relations_mut()
+        .seed_bus_relations(bus_object_id, &baseline)
+        .map_err(hosted_relation_error_from_pnp)?;
+    Ok(())
+}
+
+unsafe fn resolve_hosted_relation_policy(
+    child: &nt_pnp_manager::BusReportedChild,
+) -> Result<Option<nt_config_client::CriticalDeviceBinding>, HostedRelationPublishError> {
+    for id in child.hardware_ids.iter().chain(&child.compatible_ids) {
+        if let Some(binding) = crate::config_manager_query_critical_device_binding(id)
+            .map_err(hosted_relation_error_from_config)?
+        {
+            return Ok(Some(binding));
+        }
+    }
+    Ok(None)
+}
+
+unsafe fn existing_hosted_relation_values(
+    change: &nt_pnp_manager::BusRelationChange,
+    enum_path: &str,
+) -> Result<ExistingHostedRelationValues, HostedRelationPublishError> {
+    if change.kind != nt_pnp_manager::BusRelationChangeKind::Change {
+        return Ok(ExistingHostedRelationValues::default());
+    }
+    let snapshot = crate::config_manager_query_system_hive_key(enum_path)
+        .map_err(hosted_relation_error_from_config)?;
+    Ok(ExistingHostedRelationValues {
+        class_guid: snapshot
+            .values
+            .iter()
+            .any(|value| value.name.eq_ignore_ascii_case("ClassGUID")),
+        service: snapshot
+            .values
+            .iter()
+            .any(|value| value.name.eq_ignore_ascii_case("Service")),
+        pdo_name: snapshot
+            .values
+            .iter()
+            .any(|value| value.name.eq_ignore_ascii_case("PdoName")),
+    })
+}
+
+fn push_hosted_relation_value(
+    mutations: &mut Vec<HostedRelationRegistryMutation>,
+    path: &str,
+    name: &'static str,
+    value_type: nt_config_manager::RegistryValueType,
+    data: Vec<u8>,
+) {
+    mutations.push(HostedRelationRegistryMutation::SetValue {
+        path: String::from(path),
+        name,
+        value_type: value_type as u32,
+        data,
+    });
+}
+
+unsafe fn build_hosted_relation_mutations(
+    prepared: &nt_pnp_manager::PreparedBusRelations,
+    policies: &[Option<nt_config_client::CriticalDeviceBinding>],
+    existing: &[ExistingHostedRelationValues],
+) -> Result<Vec<HostedRelationRegistryMutation>, HostedRelationPublishError> {
+    if policies.len() != prepared.changes().len() || existing.len() != prepared.changes().len() {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let capacity = prepared
+        .changes()
+        .len()
+        .checked_mul(7)
+        .ok_or(HostedRelationPublishError::RetryResources)?;
+    let mut mutations = Vec::new();
+    mutations
+        .try_reserve_exact(capacity)
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+
+    for (index, change) in prepared.changes().iter().enumerate() {
+        let instance_id = hosted_relation_instance_path(&change.child)?;
+        let enum_path = hosted_relation_enum_path(&change.child)?;
+        if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
+            mutations.push(HostedRelationRegistryMutation::DeleteKey { path: enum_path });
+            mutations.push(HostedRelationRegistryMutation::PublishDeviceAction {
+                kind: nt_config_client::DeviceActionKind::Removal,
+                instance_id,
+            });
+            continue;
+        }
+
+        if change.kind == nt_pnp_manager::BusRelationChangeKind::Arrival {
+            mutations.push(HostedRelationRegistryMutation::CreateKey {
+                path: enum_path.clone(),
+            });
+        }
+        push_hosted_relation_value(
+            &mut mutations,
+            &enum_path,
+            "HardwareID",
+            nt_config_manager::RegistryValueType::MultiSz,
+            encode_hosted_relation_multi_sz(&change.child.hardware_ids)?,
+        );
+        push_hosted_relation_value(
+            &mut mutations,
+            &enum_path,
+            "CompatibleIDs",
+            nt_config_manager::RegistryValueType::MultiSz,
+            encode_hosted_relation_multi_sz(&change.child.compatible_ids)?,
+        );
+
+        let policy = policies[index].as_ref();
+        if let Some(policy) = policy {
+            push_hosted_relation_value(
+                &mut mutations,
+                &enum_path,
+                "ClassGUID",
+                nt_config_manager::RegistryValueType::Sz,
+                encode_hosted_relation_sz(&policy.class_guid)?,
+            );
+        } else if existing[index].class_guid {
+            mutations.push(HostedRelationRegistryMutation::DeleteValue {
+                path: enum_path.clone(),
+                name: "ClassGUID",
+            });
+        }
+        if let Some(service_name) = policy.and_then(|policy| policy.service_name.as_deref()) {
+            push_hosted_relation_value(
+                &mut mutations,
+                &enum_path,
+                "Service",
+                nt_config_manager::RegistryValueType::Sz,
+                encode_hosted_relation_sz(service_name)?,
+            );
+        } else if existing[index].service {
+            mutations.push(HostedRelationRegistryMutation::DeleteValue {
+                path: enum_path.clone(),
+                name: "Service",
+            });
+        }
+
+        let pdo_name = io_manager_mut()
+            .device(nt_io_manager::DeviceId(change.child.pdo_object_id))
+            .ok_or(HostedRelationPublishError::Barrier(
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ))?
+            .name
+            .as_ref()
+            .map(encode_hosted_relation_nt_path)
+            .transpose()?;
+        if let Some(pdo_name) = pdo_name {
+            push_hosted_relation_value(
+                &mut mutations,
+                &enum_path,
+                "PdoName",
+                nt_config_manager::RegistryValueType::Sz,
+                pdo_name,
+            );
+        } else if existing[index].pdo_name {
+            mutations.push(HostedRelationRegistryMutation::DeleteValue {
+                path: enum_path.clone(),
+                name: "PdoName",
+            });
+        }
+        mutations.push(HostedRelationRegistryMutation::PublishDeviceAction {
+            kind: if change.kind == nt_pnp_manager::BusRelationChangeKind::Arrival {
+                nt_config_client::DeviceActionKind::Arrival
+            } else {
+                nt_config_client::DeviceActionKind::Change
+            },
+            instance_id,
+        });
+    }
+    Ok(mutations)
+}
+
+unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishError> {
+    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .ok_or(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ))?;
+    let bus_object_id = query.claim.pdo_device_id;
+    let claim = query.claim;
+    let relation_domain = query
+        .relation_domain
+        .ok_or(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ))?;
+    if query.reported_children.len() != query.child_pdo_objects.len()
+        || query
+            .reported_children
+            .iter()
+            .zip(&query.child_pdo_objects)
+            .any(|(child, raw_pdo)| {
+                io_manager_mut().hosted_device_by_identity(relation_domain, *raw_pdo)
+                    != Some(nt_io_manager::DeviceId(child.pdo_object_id))
+                    || io_manager_mut()
+                        .device(nt_io_manager::DeviceId(child.pdo_object_id))
+                        .is_none_or(|device| device.delete_pending)
+            })
+    {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+
+    seed_hosted_bus_relation_baseline(bus_object_id, &query.reported_children)?;
+    let prepared = hosted_bus_relations_mut()
+        .prepare_bus_relations(bus_object_id, &query.reported_children)
+        .map_err(hosted_relation_error_from_pnp)?;
+
+    let mut policies = Vec::new();
+    let mut existing = Vec::new();
+    policies
+        .try_reserve_exact(prepared.changes().len())
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    existing
+        .try_reserve_exact(prepared.changes().len())
+        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+    for change in prepared.changes() {
+        let enum_path = hosted_relation_enum_path(&change.child)?;
+        policies.push(if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
+            None
+        } else {
+            resolve_hosted_relation_policy(&change.child)?
+        });
+        existing.push(existing_hosted_relation_values(change, &enum_path)?);
+    }
+
+    let mutations = build_hosted_relation_mutations(&prepared, &policies, &existing)?;
+    if !mutations.is_empty() {
+        let client_mutations: Vec<_> = mutations
+            .iter()
+            .map(HostedRelationRegistryMutation::as_client_mutation)
+            .collect();
+        let outcome = crate::persist_and_publish_system_hive_mutation(&client_mutations)
+            .map_err(|status| hosted_relation_error_from_config(status as i32))?;
+        if outcome.wake_device_action {
+            crate::config_manager_request_device_action_wake();
+        }
+    }
+
+    hosted_bus_relations_mut()
+        .commit_bus_relations(prepared)
+        .expect("published CM relation transaction became stale before PnP commit");
+    hosted_device_relation_invalidations_mut()
+        .complete(claim)
+        .expect("published relation transaction lost its exact invalidation claim");
+    *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
+    Ok(())
+}
+
 unsafe fn drain_hosted_device_relation_query() -> usize {
     let mut progress = 0usize;
     loop {
@@ -35274,8 +35700,17 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     }
                 }
             }
-            HostedDeviceRelationQueryPhase::IdsCopied
-            | HostedDeviceRelationQueryPhase::Barrier => return progress,
+            HostedDeviceRelationQueryPhase::IdsCopied => match publish_hosted_bus_relations() {
+                Ok(()) => return progress.saturating_add(1),
+                Err(HostedRelationPublishError::RetryResources) => return progress,
+                Err(HostedRelationPublishError::Barrier(status)) => {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(status),
+                    );
+                    return progress.saturating_add(1);
+                }
+            },
+            HostedDeviceRelationQueryPhase::Barrier => return progress,
         }
     }
 }
@@ -35405,6 +35840,15 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
+}
+
+pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_BUS_RELATIONS))
+            .as_ref()?
+            .accepted_child_by_instance(instance_id)
+            .map(|child| child.pdo_object_id)
+    }
 }
 
 unsafe fn drain_hosted_pnp_completions() -> usize {
@@ -36842,6 +37286,7 @@ static mut HOSTED_PNP_MANAGER: Option<nt_pnp_manager::PnpManager> = None;
 static mut HOSTED_DEVICE_RELATION_INVALIDATIONS: Option<
     nt_pnp_manager::DeviceRelationInvalidationQueue,
 > = None;
+static mut HOSTED_BUS_RELATIONS: Option<nt_pnp_manager::BusRelationTable> = None;
 static mut HOSTED_DEVICE_RELATION_QUERY: Option<HostedDeviceRelationQuery> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
@@ -36898,6 +37343,70 @@ enum HostedDeviceRelationQueryPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedQueryIdDisposition {
     Advance,
+    Barrier(nt_status::NtStatus),
+}
+
+enum HostedRelationRegistryMutation {
+    CreateKey {
+        path: String,
+    },
+    SetValue {
+        path: String,
+        name: &'static str,
+        value_type: u32,
+        data: Vec<u8>,
+    },
+    DeleteValue {
+        path: String,
+        name: &'static str,
+    },
+    DeleteKey {
+        path: String,
+    },
+    PublishDeviceAction {
+        kind: nt_config_client::DeviceActionKind,
+        instance_id: String,
+    },
+}
+
+impl HostedRelationRegistryMutation {
+    fn as_client_mutation(&self) -> nt_config_client::SystemHiveMutation<'_> {
+        match self {
+            Self::CreateKey { path } => nt_config_client::SystemHiveMutation::CreateKey { path },
+            Self::SetValue {
+                path,
+                name,
+                value_type,
+                data,
+            } => nt_config_client::SystemHiveMutation::SetValue {
+                path,
+                name,
+                value_type: *value_type,
+                data,
+            },
+            Self::DeleteValue { path, name } => {
+                nt_config_client::SystemHiveMutation::DeleteValue { path, name }
+            }
+            Self::DeleteKey { path } => nt_config_client::SystemHiveMutation::DeleteKey { path },
+            Self::PublishDeviceAction { kind, instance_id } => {
+                nt_config_client::SystemHiveMutation::PublishDeviceAction {
+                    kind: *kind,
+                    instance_id,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ExistingHostedRelationValues {
+    class_guid: bool,
+    service: bool,
+    pdo_name: bool,
+}
+
+enum HostedRelationPublishError {
+    RetryResources,
     Barrier(nt_status::NtStatus),
 }
 
@@ -37274,6 +37783,14 @@ unsafe fn hosted_device_relation_invalidations_mut(
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_INVALIDATIONS);
     if slot.is_none() {
         *slot = Some(nt_pnp_manager::DeviceRelationInvalidationQueue::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_bus_relations_mut() -> &'static mut nt_pnp_manager::BusRelationTable {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_BUS_RELATIONS);
+    if slot.is_none() {
+        *slot = Some(nt_pnp_manager::BusRelationTable::new());
     }
     slot.as_mut().unwrap()
 }

@@ -115,6 +115,9 @@ pub fn encode_multi_sz(strings: &[&str]) -> Vec<u8> {
         }
         out.extend_from_slice(&[0, 0]);
     }
+    if strings.is_empty() {
+        out.extend_from_slice(&[0, 0]);
+    }
     out.extend_from_slice(&[0, 0]);
     out
 }
@@ -684,6 +687,7 @@ mod tests {
             r.query_multi_string(k, "M"),
             Some(alloc::vec![String::from("RpcSs"), String::from("EventLog")])
         );
+        assert_eq!(encode_multi_sz(&[]), [0, 0, 0, 0]);
         // Overwrite + delete.
         r.set_dword(k, "D", 1);
         assert_eq!(r.query_dword(k, "D"), Some(1));

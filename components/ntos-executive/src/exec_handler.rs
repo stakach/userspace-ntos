@@ -4246,60 +4246,21 @@ impl ExecNtHandler {
             .iter()
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
-        let prepared =
-            match unsafe { crate::config_manager_prepare_system_hive_mutation(&client_mutations) }
-                .map_err(|status| status as u32)
-            {
-                Ok(prepared) => prepared,
-                Err(status) => {
-                    if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-                        CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(status);
+        let outcome = match unsafe {
+            crate::persist_and_publish_system_hive_mutation(&client_mutations)
+        } {
+            Ok(outcome) => outcome,
+            Err(status) => {
+                if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+                    CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
                 }
-            };
-        let mut provider = crate::writable_fs::WritableHiveIoProvider::new(
-            crate::writable_fs::CONFIG_SYSTEM_HIVE_PATH,
-        );
-        let previous_log_len = provider.log_len();
-        let journal_result = if prepared.durable_journal.is_empty() {
-            Ok(())
-        } else {
-            nt_hive_core::HiveIoProvider::append_log_record(
-                &mut provider,
-                &prepared.durable_journal,
-            )
-            .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider))
-        };
-        if let Err(err) = journal_result {
-            let _ = provider.truncate_log_to(previous_log_len);
-            unsafe { crate::config_manager_abort_system_hive_mutation(&prepared) };
-            if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-                CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                return Err(status);
             }
-            return Err(Self::mutable_hive_journal_status(err));
-        }
-        let (generation, wake_device_action) =
-            match unsafe { crate::config_manager_publish_system_hive_mutation(&prepared) }
-                .map_err(|status| status as u32)
-            {
-                Ok(generation) => generation,
-                Err(status) => {
-                    let rollback = provider.truncate_log_to(previous_log_len);
-                    unsafe { crate::config_manager_abort_system_hive_mutation(&prepared) };
-                    if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-                        CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if rollback.is_err() {
-                        return Err(STATUS_UNSUCCESSFUL);
-                    }
-                    return Err(status);
-                }
-            };
-        if wake_device_action {
+        };
+        if outcome.wake_device_action {
             unsafe { self.pnp_signal_pending_action() };
         }
-        if !prepared.durable_journal.is_empty() {
+        if outcome.journaled {
             self.note_durable_hive_journal_records(
                 None,
                 mutations.len().min(u32::MAX as usize) as u32,
@@ -4330,7 +4291,7 @@ impl ExecNtHandler {
                 }
             }
         }
-        Ok(generation)
+        Ok(outcome.generation)
     }
 
     /// Seed ReactOS network setup state that `hivesys.inf`, `nettcpip.inf`, and `afd_reg.inf`
@@ -19518,7 +19479,7 @@ impl ExecNtHandler {
         Ok(WaitObject::dispatcher(self.pnp_notify_event as usize))
     }
 
-    unsafe fn pnp_signal_pending_action(&mut self) {
+    pub(crate) unsafe fn pnp_signal_pending_action(&mut self) {
         if self.pnp_notify_event == 0 {
             return;
         }
@@ -19804,6 +19765,14 @@ impl ExecNtHandler {
             nt_pnp_manager::DeviceActionLifecycleState::Terminal { status }
             | nt_pnp_manager::DeviceActionLifecycleState::Barrier { status } => return status,
             nt_pnp_manager::DeviceActionLifecycleState::AwaitingAction => {}
+        }
+
+        // A bus-reported PDO already has canonical I/O identity. The historical root-device start
+        // path would create a second PDO for this instance. Keep the action live until the relation
+        // worker has populated the bus-owned capabilities/resources needed by the existing-PDO
+        // AddDevice path.
+        if driver_launch::hosted_bus_reported_device_id(&instance).is_some() {
+            return STATUS_DEVICE_NOT_READY;
         }
 
         let event = state.event.clone();

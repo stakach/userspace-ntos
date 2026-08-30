@@ -595,6 +595,24 @@ impl BusRelationTable {
             .map(|bus| bus.children.as_slice())
     }
 
+    /// Resolve one accepted Enum instance across all buses. Global instance identity is unique;
+    /// relation preparation rejects a second bus publishing the same devnode.
+    pub fn accepted_child_by_instance(&self, instance_id: &str) -> Option<&BusReportedChild> {
+        let parts = instance_id.rsplit_once('\\')?;
+        let mut found = None;
+        for child in self.buses.iter().flat_map(|bus| &bus.children) {
+            if parts.0.eq_ignore_ascii_case(&child.device_id)
+                && parts.1.eq_ignore_ascii_case(&child.instance_id)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(child);
+            }
+        }
+        found
+    }
+
     /// Install boot-discovered relations as the comparison baseline without manufacturing arrival
     /// actions. Each bus can be seeded exactly once.
     pub fn seed_bus_relations(
@@ -613,6 +631,14 @@ impl BusRelationTable {
             return Err(BusRelationError::AlreadySeeded);
         }
         validate_complete_relations(children)?;
+        if self.buses.iter().any(|bus| {
+            bus.bus_object_id != bus_object_id
+                && children
+                    .iter()
+                    .any(|child| bus.children.iter().any(|old| child.same_devnode(old)))
+        }) {
+            return Err(BusRelationError::DuplicateDevnode);
+        }
         let next_generation = self
             .generation
             .checked_add(1)
@@ -644,6 +670,14 @@ impl BusRelationTable {
             return Err(BusRelationError::InvalidBus);
         }
         validate_complete_relations(children)?;
+        if self.buses.iter().any(|bus| {
+            bus.bus_object_id != bus_object_id
+                && children
+                    .iter()
+                    .any(|child| bus.children.iter().any(|old| child.same_devnode(old)))
+        }) {
+            return Err(BusRelationError::DuplicateDevnode);
+        }
         let next_generation = self
             .generation
             .checked_add(1)
@@ -1029,6 +1063,25 @@ mod tests {
         table.commit_bus_relations(prepared).unwrap();
         assert_eq!(table.accepted_children(1).unwrap()[0].pdo_object_id, 10);
         assert_eq!(table.accepted_children(2).unwrap()[0].pdo_object_id, 20);
+    }
+
+    #[test]
+    fn accepted_instance_identity_is_unique_across_buses() {
+        let mut table = BusRelationTable::new();
+        let first = child(10, "0001", &["A"]);
+        table.seed_bus_relations(1, &[first.clone()]).unwrap();
+        table.seed_bus_relations(2, &[]).unwrap();
+        assert_eq!(
+            table
+                .accepted_child_by_instance(r"ROOT\USERSPACE_NTOS_LIVE\0001")
+                .map(|child| child.pdo_object_id),
+            Some(10)
+        );
+        assert_eq!(
+            table.prepare_bus_relations(2, &[child(20, "0001", &["B"])]),
+            Err(BusRelationError::DuplicateDevnode)
+        );
+        assert!(table.accepted_children(2).unwrap().is_empty());
     }
 
     #[test]

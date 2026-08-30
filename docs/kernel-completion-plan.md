@@ -18591,3 +18591,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the matching removal action in the same mutation. Any policy, allocation, persistence,
     publication, or topology-generation failure retains the transaction as a barrier; no inferred
     service and no partially published relation is acceptable.
+
+    B3 durable bus-relation publication checkpoint (2026-08-30, implementation green): the
+    retained relation owner now reconciles its first query with Config Manager's existing
+    generation-fenced `BusRelations` view instead of treating the first runtime invalidation as a
+    synthetic baseline. Every previously published child must be present in the bus result and
+    resolve to that result's complete device/instance identity; otherwise the exact claim remains a
+    barrier. The accepted relation table rejects the same Enum instance appearing under two buses
+    and exposes accepted canonical PDO identity without adding an executive identity table.
+
+    Each prepared arrival/change performs the ordered hardware-then-compatible CDDB lookup. The
+    executive builds one complete `CurrentControlSet\\Enum` transaction containing exact
+    `HardwareID` and `CompatibleIDs` `REG_MULTI_SZ` data, optional bus PDO name, CDDB `ClassGUID`
+    and optional `Service`, plus an explicit action. Change replaces those owned values and deletes
+    stale optional values only when the existing CM snapshot proves they are present. Removal
+    deletes the exact instance key and publishes removal in the same transaction. Empty
+    `CompatibleIDs` is encoded as a valid double-NUL `REG_MULTI_SZ`; the shared registry encoder is
+    corrected and covered as well.
+
+    SYSTEM-hive prepare, journal append/flush, CM publication, rollback, and abort now live in one
+    executive helper shared by native registry mutations and topology publication. Only after that
+    helper succeeds does PnP commit the allocation-free prepared relation owner and complete the
+    exact invalidation claim. A newly pending action is handed back to the service loop to wake its
+    real PnP notification event. Allocation pressure retries before publication; malformed policy,
+    stale identity, missing baseline children, persistence failure, and CM rejection retain the
+    owner as barriers. Focused validation passes `35/35` `nt-config-manager`, `19/19`
+    `nt-config-client`, `25/25` `nt-config-server`, and `40/40` `nt-pnp-manager` tests. Formatting,
+    `git diff --check`, and the freestanding executive check pass at the 209-warning baseline.
+
+    Review adjustment: Enum/action durability and relation ownership are closed, but a bus child
+    with a service is deliberately prevented from entering the historical root-PDO constructor.
+    Next extend the retained bus transaction with the native capability/resource query sequence
+    (`QUERY_CAPABILITIES`, `QUERY_BUS_INFORMATION`, `QUERY_RESOURCES`, and
+    `QUERY_RESOURCE_REQUIREMENTS` as applicable), publish those properties on the existing
+    canonical PDO, and add an AddDevice/START path that projects and reuses that PDO in the function
+    driver's exact hosted domain. Then implement real change/removal action lifecycles; do not
+    unblock either path by fabricating root-bus properties or a second PDO. Serialized desktop
+    acceptance remains pending because the independently running QEMU still owns the only boot
+    lane and was not interrupted.
