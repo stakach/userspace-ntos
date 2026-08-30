@@ -19280,3 +19280,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hotplug invalidation source; do not add an executive stimulus, periodic synthetic rescan, or
     QEMU-specific kernel path. After that boundary is green, release the existing serialized QEMU
     lane and perform the two-NIC remove/re-add desktop acceptance described above.
+
+    B3 live PCI inventory policy checkpoint (2026-08-31, implementation green): `nt-pnp` now owns
+    the accepted PCI inventory as a generation-fenced state machine. A complete scan is validated
+    and sorted by bus/device/function before it can become authoritative. Rescan preparation is
+    fallible and does not mutate accepted state; it produces exact departure, arrival, and
+    same-function resource-change sets so the executive can reserve PDOs, grants, and CM actions
+    before commit. A prepared transition commits only against its exact base generation. Duplicate
+    or invalid BDFs and stale transitions fail closed.
+
+    Hardware replacement at an occupied BDF is represented as departure followed by arrival, while
+    BAR or interrupt-pin changes on the same function are a rebalance. The programmable PCI
+    InterruptLine byte is deliberately snapshot state rather than a bus action, avoiding a false
+    change notification after the OS programs its assigned INTx line. Two-NIC tests prove that one
+    function can disappear and return while the sibling remains byte-for-byte accepted; additional
+    tests cover occupied-slot replacement, resource rebalance, stale commit rejection, and malformed
+    scans.
+
+    PCI discovery now walks the complete configured bridge hierarchy from bus 0. Every PCI-to-PCI
+    bridge must publish a coherent primary/secondary/subordinate window and every secondary bus must
+    have one parent; malformed and cyclic/duplicate ownership is rejected rather than yielding a
+    partial topology. The executive bootstrap uses this walk and preserves the full discovered BDF
+    for config reads, pre-storage grants, AHCI enablement, logging, and VT-d requester IDs. The old
+    bus-0-only enumeration entry point and downstream bus-0 substitutions are removed.
+
+    Focused `nt-pnp` validation passes 32/32 and the freestanding executive check passes at the
+    unchanged 209-warning baseline. Review adjustment: this closes the host-tested inventory and
+    bridge-discovery policy, but not live executive ownership. Next install the accepted inventory as
+    a retained executive authority, prepare all departure/arrival/rebalance publications and
+    resource reservations before committing a scan, and keep the prior context live across pending
+    CM/PnP actions. Trigger that transaction only from a real platform/ACPI PCI hotplug notification.
+    The current QEMU machine exposes no QMP control socket and its long-running desktop lane remains
+    undisturbed, so runtime hotplug acceptance remains open.

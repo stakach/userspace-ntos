@@ -29057,9 +29057,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
 
     // --- P1: PCI enumeration via real x86 port I/O. Get an I/O-port cap for the PCI
-    // config ports, walk bus 0, and read each device's vendor/device/class/BAR0/IRQ —
+    // config ports, walk the configured hierarchy, and read each function's identity/resources —
     // the discovery step that finds a real device (its BAR + IRQ) to hand to a host.
-    print_str(b"[ntos-exec] P1: enumerating PCI bus 0 via port I/O (0xCF8/0xCFC)\n");
+    print_str(b"[ntos-exec] P1: enumerating PCI hierarchy via port I/O (0xCF8/0xCFC)\n");
     let pci_io = alloc_slot();
     issue_ioport_cap(pci_io, PCI_CONFIG_ADDR, PCI_CONFIG_DATA + 3); // 0xCF8..=0xCFF
                                                                     // Host bridge 00:00.0 — reading its vendor id proves port I/O + config access work.
@@ -29079,20 +29079,24 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // PnP Manager bus walk — the enumeration is now the host-tested `nt-pnp` policy (parse
     // vendor/device/class + IRQ + decode each BAR with the write-all-ones size probe, restoring
     // it). The executive-side broker (`pnp.rs`) drives it over `pci_read32`/`pci_write32`.
-    let pci_devices = enumerate_pci_bus0(pci_io);
+    let pci_devices = enumerate_pci_hierarchy(pci_io)
+        .unwrap_or_else(|_| panic!("platform published an invalid PCI bridge topology"));
     let mut count = 0u64;
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
-    let (mut storage_dev, mut storage_func) = (0u8, 0u8);
+    let (mut storage_bus, mut storage_dev, mut storage_func) = (0u8, 0u8, 0u8);
     let mut network_device_count = 0u64;
-    let (mut pre_hive_nic_irq, mut pre_hive_nic_dev, mut pre_hive_nic_func) = (0u32, 0u8, 0u8);
+    let (mut pre_hive_nic_irq, mut pre_hive_nic_bus, mut pre_hive_nic_dev, mut pre_hive_nic_func) =
+        (0u32, 0u8, 0u8, 0u8);
     for d in &pci_devices {
         count += 1;
-        let (dev, func) = (d.dev, d.func);
-        let class = pci_read32(pci_io, 0, dev, func, 0x08); // [class][sub][progif][rev]
-        let bar0 = pci_read32(pci_io, 0, dev, func, 0x10); // raw BAR0 (flag bits intact for the log)
+        let (bus, dev, func) = (d.bus, d.dev, d.func);
+        let class = pci_read32(pci_io, bus, dev, func, 0x08); // [class][sub][progif][rev]
+        let bar0 = pci_read32(pci_io, bus, dev, func, 0x10); // raw BAR0 (flag bits intact for the log)
         let irq = d.irq_line as u32;
-        print_str(b"  pci 0:");
+        print_str(b"  pci ");
+        print_u64(bus as u64);
+        print_str(b":");
         print_u64(dev as u64);
         print_str(b".");
         print_u64(func as u64);
@@ -29110,8 +29114,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         // is empty — so first-wins picks the one with the disk. ABAR = BAR5.
         if (class >> 8) == 0x01_0601 && !found_storage {
             found_storage = true;
-            storage_bar5 = pci_read32(pci_io, 0, dev, func, 0x24);
+            storage_bar5 = pci_read32(pci_io, bus, dev, func, 0x24);
             storage_irq = irq;
+            storage_bus = bus;
             storage_dev = dev;
             storage_func = func;
         }
@@ -29121,12 +29126,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             network_device_count = network_device_count.saturating_add(1);
             if network_device_count == 1 {
                 pre_hive_nic_irq = irq;
+                pre_hive_nic_bus = bus;
                 pre_hive_nic_dev = dev;
                 pre_hive_nic_func = func;
             }
         }
     }
-    print_str(b"[ntos-exec] PCI devices on bus 0 = ");
+    print_str(b"[ntos-exec] PCI functions in configured hierarchy = ");
     print_u64(count);
     print_str(b"\n");
     check(b"exec_pci_found_multiple_devices", count >= 2, &mut passed);
@@ -29161,10 +29167,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
     if pre_hive_network_grant_required {
         if let Some(device) =
-            hosted_pci_device_by_location(&pci_devices, 0, pre_hive_nic_dev, pre_hive_nic_func)
+            hosted_pci_device_by_location(
+                &pci_devices,
+                pre_hive_nic_bus,
+                pre_hive_nic_dev,
+                pre_hive_nic_func,
+            )
         {
             if let Some(memory) = claim_hosted_pci_memory_grants(bi, device) {
-                print_str(b"[driver-launch] pre-storage hosted PCI grant bus=0 dev=");
+                print_str(b"[driver-launch] pre-storage hosted PCI grant bus=");
+                print_u64(pre_hive_nic_bus as u64);
+                print_str(b" dev=");
                 print_u64(pre_hive_nic_dev as u64);
                 print_str(b" func=");
                 print_u64(pre_hive_nic_func as u64);
@@ -29241,14 +29254,16 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let ahci_bar = (storage_bar5 & 0xFFFF_FFF0) as u64;
         print_str(b"[ntos-exec] P2: AHCI ABAR=");
         print_hex(ahci_bar as u32);
+        print_str(b" bus=");
+        print_u64(storage_bus as u64);
         print_str(b" dev=");
         print_u64(storage_dev as u64);
         print_str(b" -> isolated storage host (VT-d confined)\n");
         // Enable Bus Master (Command bit 2) + Memory Space (bit 1) so the HBA can DMA.
-        let cmd = pci_read32(pci_io, 0, storage_dev, storage_func, 0x04);
+        let cmd = pci_read32(pci_io, storage_bus, storage_dev, storage_func, 0x04);
         pci_write32(
             pci_io,
-            0,
+            storage_bus,
             storage_dev,
             storage_func,
             0x04,
@@ -29264,7 +29279,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // with the AHCI's PCI request-id (00:3.0 -> rid 0x18) + its own domain, build the
             // 4-level IO page-table hierarchy toward AHCI_IOVA, and map the DMA frame there.
             // The AHCI can then DMA to AHCI_IOVA only — VT-d faults anything else.
-            let ahci_rid = ((storage_dev as u64) << 3) | (storage_func as u64);
+            let ahci_rid = ((storage_bus as u64) << 8)
+                | ((storage_dev as u64) << 3)
+                | (storage_func as u64);
             let ahci_io_badge = (2u64 << 16) | ahci_rid; // storage proof domain
             let ahci_io_space = alloc_slot();
             let _ = syscall5(

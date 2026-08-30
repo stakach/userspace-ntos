@@ -26,6 +26,13 @@
 
 extern crate alloc;
 
+mod pci_inventory;
+
+pub use pci_inventory::{
+    CommittedPciInventoryUpdate, PciInventory, PciInventoryError, PciLocation, PciResourceChange,
+    PreparedPciInventoryUpdate,
+};
+
 use alloc::vec::Vec;
 
 pub use nt_cm_resources::{
@@ -48,6 +55,8 @@ pub const PCI_CFG_CLASS_REV: u8 = 0x08;
 pub const PCI_CFG_HEADER: u8 = 0x0C;
 /// BAR0..BAR5 live at 0x10, 0x14, … 0x24.
 pub const PCI_CFG_BAR0: u8 = 0x10;
+/// Primary/secondary/subordinate bus numbers for a PCI-to-PCI bridge.
+pub const PCI_CFG_BUS_NUMBERS: u8 = 0x18;
 /// Interrupt line (low byte) + interrupt pin (second byte) at 0x3C.
 pub const PCI_CFG_INTERRUPT: u8 = 0x3C;
 
@@ -73,6 +82,8 @@ const PCI_HEADER_TYPE_CARDBUS: u8 = 2;
 pub const PCI_CLASS_STORAGE: u8 = 0x01;
 pub const PCI_CLASS_NETWORK: u8 = 0x02;
 pub const PCI_CLASS_DISPLAY: u8 = 0x03;
+pub const PCI_CLASS_BRIDGE: u8 = 0x06;
+pub const PCI_SUBCLASS_PCI_TO_PCI: u8 = 0x04;
 
 /// One decoded Base Address Register.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -324,6 +335,78 @@ where
         }
     }
     out
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PciTopologyError {
+    InvalidBridgeWindow {
+        bridge: PciLocation,
+        primary: u8,
+        secondary: u8,
+        subordinate: u8,
+    },
+    DuplicateSecondaryBus {
+        bridge: PciLocation,
+        secondary: u8,
+    },
+}
+
+/// Enumerate a complete configured PCI hierarchy starting at `root_bus`.
+///
+/// Every discovered PCI-to-PCI bridge must publish a coherent primary/secondary/subordinate
+/// window. Each secondary bus has exactly one parent bridge. The walk rejects malformed or cyclic
+/// topology instead of silently publishing only part of the bus tree.
+pub fn enumerate_hierarchy<R, W>(
+    root_bus: u8,
+    read: R,
+    write: W,
+) -> Result<Vec<PciDevice>, PciTopologyError>
+where
+    R: Fn(u8, u8, u8, u8) -> u32,
+    W: Fn(u8, u8, u8, u8, u32),
+{
+    let mut scheduled = [false; 256];
+    let mut buses = Vec::new();
+    let mut devices = Vec::new();
+    scheduled[root_bus as usize] = true;
+    buses.push(root_bus);
+
+    let mut bus_index = 0;
+    while bus_index < buses.len() {
+        let bus = buses[bus_index];
+        bus_index += 1;
+        let bus_devices = enumerate_bus(
+            bus,
+            |device, function, offset| read(bus, device, function, offset),
+            |device, function, offset, value| write(bus, device, function, offset, value),
+        );
+        for device in &bus_devices {
+            let subclass = ((device.class >> 8) & 0xff) as u8;
+            if device.base_class() != PCI_CLASS_BRIDGE || subclass != PCI_SUBCLASS_PCI_TO_PCI {
+                continue;
+            }
+            let bridge = PciLocation::from(device);
+            let numbers = read(device.bus, device.dev, device.func, PCI_CFG_BUS_NUMBERS);
+            let primary = numbers as u8;
+            let secondary = (numbers >> 8) as u8;
+            let subordinate = (numbers >> 16) as u8;
+            if primary != bus || secondary == 0 || secondary > subordinate {
+                return Err(PciTopologyError::InvalidBridgeWindow {
+                    bridge,
+                    primary,
+                    secondary,
+                    subordinate,
+                });
+            }
+            if scheduled[secondary as usize] {
+                return Err(PciTopologyError::DuplicateSecondaryBus { bridge, secondary });
+            }
+            scheduled[secondary as usize] = true;
+            buses.push(secondary);
+        }
+        devices.extend(bus_devices);
+    }
+    Ok(devices)
 }
 
 /// A parsed PCI registry ID constraint, such as `PCI\VEN_8086&DEV_100E` or `PCI\CC_020000`.
@@ -1334,6 +1417,50 @@ mod tests {
         bar_masks: vec::Vec<((u8, u8, u8), u32)>,
     }
 
+    struct MockTopology {
+        regs: RefCell<vec::Vec<((u8, u8, u8, u8), u32)>>,
+    }
+
+    impl MockTopology {
+        fn get(&self, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+            self.regs
+                .borrow()
+                .iter()
+                .find(|(key, _)| *key == (bus, dev, func, off))
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| {
+                    if off == PCI_CFG_HEADER || off == PCI_CFG_COMMAND_STATUS {
+                        0
+                    } else {
+                        0xffff_ffff
+                    }
+                })
+        }
+
+        fn set(&self, bus: u8, dev: u8, func: u8, off: u8, value: u32) {
+            let mut regs = self.regs.borrow_mut();
+            if let Some(entry) = regs
+                .iter_mut()
+                .find(|(key, _)| *key == (bus, dev, func, off))
+            {
+                entry.1 = value;
+            } else {
+                regs.push(((bus, dev, func, off), value));
+            }
+        }
+
+        fn write(&self, bus: u8, dev: u8, func: u8, off: u8, value: u32) {
+            if value == 0xffff_ffff
+                && (PCI_CFG_BAR0..PCI_CFG_BAR0 + (PCI_NUM_BARS as u8) * 4).contains(&off)
+                && (off - PCI_CFG_BAR0) % 4 == 0
+            {
+                self.set(bus, dev, func, off, 0);
+            } else {
+                self.set(bus, dev, func, off, value);
+            }
+        }
+    }
+
     impl MockConfig {
         fn get(&self, dev: u8, func: u8, off: u8) -> u32 {
             self.regs
@@ -1425,6 +1552,71 @@ mod tests {
         assert!(port.is_io);
         assert_eq!(port.base, 0xC000);
         assert_eq!(port.size, 0x40);
+    }
+
+    #[test]
+    fn hierarchy_walk_follows_configured_bridge_secondary_bus() {
+        let topology = MockTopology {
+            regs: RefCell::new(vec![
+                ((0, 1, 0, PCI_CFG_VENDOR_DEVICE), 0x1111_8086),
+                ((0, 1, 0, PCI_CFG_CLASS_REV), 0x0604_0000),
+                (
+                    (0, 1, 0, PCI_CFG_HEADER),
+                    (PCI_HEADER_TYPE_BRIDGE as u32) << 16,
+                ),
+                ((0, 1, 0, PCI_CFG_BUS_NUMBERS), 0x0002_0200),
+                ((0, 1, 0, PCI_CFG_INTERRUPT), 0),
+                ((2, 4, 0, PCI_CFG_VENDOR_DEVICE), 0x100e_8086),
+                ((2, 4, 0, PCI_CFG_CLASS_REV), 0x0200_0000),
+                ((2, 4, 0, PCI_CFG_INTERRUPT), 0x0000_010b),
+            ]),
+        };
+
+        let devices = enumerate_hierarchy(
+            0,
+            |bus, dev, func, off| topology.get(bus, dev, func, off),
+            |bus, dev, func, off, value| topology.write(bus, dev, func, off, value),
+        )
+        .unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(PciLocation::from(&devices[0]), PciLocation::new(0, 1, 0));
+        assert_eq!(PciLocation::from(&devices[1]), PciLocation::new(2, 4, 0));
+    }
+
+    #[test]
+    fn hierarchy_walk_rejects_duplicate_secondary_bus_ownership() {
+        let topology = MockTopology {
+            regs: RefCell::new(vec![
+                ((0, 1, 0, PCI_CFG_VENDOR_DEVICE), 0x1111_8086),
+                ((0, 1, 0, PCI_CFG_CLASS_REV), 0x0604_0000),
+                (
+                    (0, 1, 0, PCI_CFG_HEADER),
+                    (PCI_HEADER_TYPE_BRIDGE as u32) << 16,
+                ),
+                ((0, 1, 0, PCI_CFG_BUS_NUMBERS), 0x0002_0200),
+                ((0, 1, 0, PCI_CFG_INTERRUPT), 0),
+                ((0, 2, 0, PCI_CFG_VENDOR_DEVICE), 0x2222_8086),
+                ((0, 2, 0, PCI_CFG_CLASS_REV), 0x0604_0000),
+                (
+                    (0, 2, 0, PCI_CFG_HEADER),
+                    (PCI_HEADER_TYPE_BRIDGE as u32) << 16,
+                ),
+                ((0, 2, 0, PCI_CFG_BUS_NUMBERS), 0x0002_0200),
+                ((0, 2, 0, PCI_CFG_INTERRUPT), 0),
+            ]),
+        };
+
+        assert_eq!(
+            enumerate_hierarchy(
+                0,
+                |bus, dev, func, off| topology.get(bus, dev, func, off),
+                |bus, dev, func, off, value| topology.write(bus, dev, func, off, value),
+            ),
+            Err(PciTopologyError::DuplicateSecondaryBus {
+                bridge: PciLocation::new(0, 2, 0),
+                secondary: 2,
+            })
+        );
     }
 
     #[test]

@@ -21,11 +21,11 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_bus,
+    assign_resources, assign_root_bus_resources, assignment_to_cm_list, enumerate_hierarchy,
     pci_boot_resources, pci_resource_requirements, root_bus_resource_requirements,
     select_resource_assignment, PciDevice, PciInterruptAssignment, ResourceAssignment, ResourceView,
-    RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
-    INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE, INTERFACE_TYPE_PCI_BUS,
+    INTERFACE_TYPE_PNP_BUS, ROOT_DMA_TEST_RESOURCE_PROFILE,
 };
 
 static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
@@ -40,17 +40,16 @@ pub(crate) struct PciInterruptLineProgramming {
     assigned_line: u8,
 }
 
-/// Enumerate PCI bus 0 through `nt-pnp` using the executive's port-I/O config access. The reader
-/// closures drive `pci_read32`/`pci_write32` (0xCF8/0xCFC via `pci_io`); the writer is used by
-/// `nt-pnp`'s BAR size-probe (write-all-ones then restore), so the caps must reach real config
-/// space. Returns every enumerated function on bus 0 (vendor/device/class, decoded BAR base+SIZE,
-/// IRQ line/pin) — the same bus walk the executive did inline, now the PnP Manager's job.
-pub(crate) unsafe fn enumerate_pci_bus0(pci_io: u64) -> alloc::vec::Vec<PciDevice> {
+/// Enumerate the complete configured PCI hierarchy through `nt-pnp` using the executive's
+/// port-I/O config access. The walk follows validated PCI-to-PCI bridge bus windows from bus 0.
+pub(crate) unsafe fn enumerate_pci_hierarchy(
+    pci_io: u64,
+) -> Result<alloc::vec::Vec<PciDevice>, nt_pnp::PciTopologyError> {
     PCI_CONFIG_IO_CAP = pci_io;
-    enumerate_bus(
+    enumerate_hierarchy(
         0,
-        |dev, func, off| pci_read32(pci_io, 0, dev, func, off),
-        |dev, func, off, v| pci_write32(pci_io, 0, dev, func, off, v),
+        |bus, dev, func, off| pci_read32(pci_io, bus, dev, func, off),
+        |bus, dev, func, off, v| pci_write32(pci_io, bus, dev, func, off, v),
     )
 }
 
