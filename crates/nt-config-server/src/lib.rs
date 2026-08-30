@@ -109,6 +109,7 @@ fn device_action_journal_status(error: DeviceActionJournalError) -> i32 {
     match error {
         DeviceActionJournalError::InvalidGeneration => STATUS_REVISION_MISMATCH,
         DeviceActionJournalError::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
+        DeviceActionJournalError::PendingInstance => STATUS_DEVICE_BUSY,
         DeviceActionJournalError::AlreadySeeded
         | DeviceActionJournalError::DuplicateInstance
         | DeviceActionJournalError::InvalidTransition

@@ -658,6 +658,12 @@ impl PnpManager {
             if !pdo_matches && !instance_matches {
                 continue;
             }
+            if devnode.state == DeviceState::Removed {
+                if pdo_matches {
+                    return Err(PnpError::ConflictingPdo);
+                }
+                continue;
+            }
             if matching.is_some_and(|prior: &Devnode| prior.id != devnode.id) {
                 return Err(PnpError::ConflictingPdo);
             }
@@ -666,8 +672,7 @@ impl PnpManager {
         let Some(devnode) = matching else {
             return Ok(None);
         };
-        if devnode.state == DeviceState::Removed
-            || devnode.pdo_object_id != record.pdo_object_id
+        if devnode.pdo_object_id != record.pdo_object_id
             || !devnode
                 .instance_id
                 .as_deref()
@@ -1907,6 +1912,70 @@ mod tests {
         assert!(!p.mapping_allowed(id));
         // Any further transition on a removed devnode is stale.
         assert_eq!(p.transition(id, Started), Err(PnpError::StaleId));
+    }
+
+    #[test]
+    fn removed_instance_can_reenumerate_with_a_new_canonical_pdo() {
+        let mut p = PnpManager::new();
+        let first_pdo = 0x9100;
+        let sibling_pdo = 0x9200;
+        let first = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", first_pdo, pci_properties())
+            .unwrap();
+        let sibling = p
+            .register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0002", sibling_pdo, pci_properties())
+            .unwrap();
+        p.commit_device_stack(first_pdo, first_pdo + 1, 0x55)
+            .unwrap();
+        p.commit_device_stack(sibling_pdo, sibling_pdo + 1, 0x55)
+            .unwrap();
+        p.commit_resource_assignment(first_pdo, vec![1], vec![2])
+            .unwrap();
+        p.commit_resource_assignment(sibling_pdo, vec![3], vec![4])
+            .unwrap();
+        let first_start = begin_pnp(&mut p, first_pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut p, &first_start, true).unwrap();
+        let sibling_start = begin_pnp(&mut p, sibling_pdo, PnpMinor::StartDevice).unwrap();
+        complete_pnp(&mut p, &sibling_start, true).unwrap();
+
+        let surprise = begin_pnp(&mut p, first_pdo, PnpMinor::SurpriseRemoval).unwrap();
+        complete_pnp(&mut p, &surprise, true).unwrap();
+        let remove = begin_pnp(&mut p, first_pdo, PnpMinor::RemoveDevice).unwrap();
+        complete_pnp(&mut p, &remove, true).unwrap();
+        let replacement = EnumeratedPdoRecord::new(
+            String::from(r"PCI\VEN_1234&DEV_5678\0001"),
+            0x9300,
+            pci_properties(),
+        );
+        assert_eq!(
+            p.prepare_enumerated_pdo_batch(vec![replacement.clone()])
+                .err(),
+            Some(PnpError::ConflictingPdo)
+        );
+
+        let removal = p.removal_token(first_pdo).unwrap();
+        p.finish_remove(removal).unwrap();
+        assert_eq!(p.state(first), Some(Removed));
+        assert_eq!(p.state(sibling), Some(Started));
+
+        let prepared = p.prepare_enumerated_pdo_batch(vec![replacement]).unwrap();
+        let replacement_id = prepared.devnode_id(0).unwrap();
+        assert_ne!(replacement_id, first);
+        assert!(p.generation(replacement_id).is_none());
+        p.commit_enumerated_pdo_batch(prepared).unwrap();
+        assert_eq!(p.state(replacement_id), Some(Enumerated));
+        assert_eq!(
+            p.devnode_for_instance(r"PCI\VEN_1234&DEV_5678\0001"),
+            Some(replacement_id)
+        );
+        assert_eq!(p.devnode_for_pdo(0x9300), Some(replacement_id));
+        assert_eq!(p.state(sibling), Some(Started));
+        assert!(p.mapping_allowed(sibling));
+
+        assert_eq!(
+            p.register_enumerated_pdo(r"PCI\VEN_1234&DEV_5678\0001", first_pdo, pci_properties(),),
+            Err(PnpError::ConflictingPdo)
+        );
     }
 
     fn assigned_pci_devnode(p: &mut PnpManager, pdo: u64) -> u64 {

@@ -1048,6 +1048,49 @@ mod tests {
     }
 
     #[test]
+    fn removed_child_can_return_with_a_new_pdo_without_disturbing_its_sibling() {
+        let mut table = BusRelationTable::new();
+        let first = child(10, "0001", &["A"]);
+        let sibling = child(20, "0002", &["B"]);
+        table
+            .seed_bus_relations(1, &[first.clone(), sibling.clone()])
+            .unwrap();
+
+        let removal = table
+            .prepare_bus_relations(1, core::slice::from_ref(&sibling))
+            .unwrap();
+        assert_eq!(
+            removal.changes(),
+            &[BusRelationChange {
+                kind: BusRelationChangeKind::Removal,
+                child: first,
+            }]
+        );
+        table.commit_bus_relations(removal).unwrap();
+        assert_eq!(
+            table.accepted_children(1),
+            Some(core::slice::from_ref(&sibling))
+        );
+
+        let replacement = child(30, "0001", &["A"]);
+        let arrival = table
+            .prepare_bus_relations(1, &[replacement.clone(), sibling.clone()])
+            .unwrap();
+        assert_eq!(
+            arrival.changes(),
+            &[BusRelationChange {
+                kind: BusRelationChangeKind::Arrival,
+                child: replacement.clone(),
+            }]
+        );
+        table.commit_bus_relations(arrival).unwrap();
+        assert_eq!(
+            table.accepted_children(1),
+            Some([replacement, sibling].as_slice())
+        );
+    }
+
+    #[test]
     fn different_buses_keep_independent_complete_relation_sets() {
         let mut table = BusRelationTable::new();
         table

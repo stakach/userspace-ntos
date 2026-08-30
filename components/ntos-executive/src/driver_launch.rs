@@ -36038,8 +36038,11 @@ unsafe fn dispatch_hosted_device_capabilities(child_index: usize) -> bool {
 }
 
 fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError {
-    if status as u32 == nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32 {
-        HostedRelationPublishError::RetryResources
+    let raw_status = status as u32;
+    if raw_status == nt_status::NtStatus::INSUFFICIENT_RESOURCES.raw() as u32
+        || raw_status == nt_status::NtStatus::DEVICE_BUSY.raw() as u32
+    {
+        HostedRelationPublishError::Retry
     } else {
         HostedRelationPublishError::Barrier(nt_status::NtStatus(status))
     }
@@ -36049,7 +36052,7 @@ fn hosted_relation_error_from_pnp(
     error: nt_pnp_manager::BusRelationError,
 ) -> HostedRelationPublishError {
     if error == nt_pnp_manager::BusRelationError::InsufficientResources {
-        HostedRelationPublishError::RetryResources
+        HostedRelationPublishError::Retry
     } else {
         HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
     }
@@ -36059,7 +36062,7 @@ fn hosted_relation_error_from_devnode_pnp(
     error: nt_pnp_manager::PnpError,
 ) -> HostedRelationPublishError {
     if error == nt_pnp_manager::PnpError::InsufficientResources {
-        HostedRelationPublishError::RetryResources
+        HostedRelationPublishError::Retry
     } else {
         HostedRelationPublishError::Barrier(hosted_pnp_status(error))
     }
@@ -36083,10 +36086,10 @@ fn hosted_relation_instance_path(
         .len()
         .checked_add(1)
         .and_then(|length| length.checked_add(child.instance_id.len()))
-        .ok_or(HostedRelationPublishError::RetryResources)?;
+        .ok_or(HostedRelationPublishError::Retry)?;
     let mut path = String::new();
     path.try_reserve_exact(capacity)
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     path.push_str(&child.device_id);
     path.push('\\');
     path.push_str(&child.instance_id);
@@ -36107,7 +36110,7 @@ fn copy_hosted_relation_property_blob(
             let mut copied = Vec::new();
             copied
                 .try_reserve_exact(bytes.len())
-                .map_err(|_| HostedRelationPublishError::RetryResources)?;
+                .map_err(|_| HostedRelationPublishError::Retry)?;
             copied.extend_from_slice(bytes);
             Ok(nt_pnp_manager::PropertyBlobState::Present(copied))
         }
@@ -36126,7 +36129,7 @@ unsafe fn prepare_hosted_relation_devnodes(
     let mut records = Vec::new();
     records
         .try_reserve_exact(children.len())
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     for (child, properties) in children.iter().zip(properties) {
         let bus_information = match &properties.bus_information {
             HostedBusInformationState::Unqueried => {
@@ -36172,10 +36175,10 @@ fn hosted_relation_enum_path(
     let capacity = PREFIX
         .len()
         .checked_add(instance.len())
-        .ok_or(HostedRelationPublishError::RetryResources)?;
+        .ok_or(HostedRelationPublishError::Retry)?;
     let mut path = String::new();
     path.try_reserve_exact(capacity)
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     path.push_str(PREFIX);
     path.push_str(&instance);
     Ok(path)
@@ -36187,11 +36190,11 @@ fn encode_hosted_relation_sz(value: &str) -> Result<Vec<u8>, HostedRelationPubli
         .count()
         .checked_add(1)
         .and_then(|units| units.checked_mul(2))
-        .ok_or(HostedRelationPublishError::RetryResources)?;
+        .ok_or(HostedRelationPublishError::Retry)?;
     let mut encoded = Vec::new();
     encoded
         .try_reserve_exact(capacity)
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     for unit in value.encode_utf16().chain(core::iter::once(0)) {
         encoded.extend_from_slice(&unit.to_le_bytes());
     }
@@ -36209,11 +36212,11 @@ fn encode_hosted_relation_multi_sz(
     });
     let capacity = units
         .and_then(|units| units.checked_mul(2))
-        .ok_or(HostedRelationPublishError::RetryResources)?;
+        .ok_or(HostedRelationPublishError::Retry)?;
     let mut encoded = Vec::new();
     encoded
         .try_reserve_exact(capacity)
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     for value in values {
         for unit in value.encode_utf16().chain(core::iter::once(0)) {
             encoded.extend_from_slice(&unit.to_le_bytes());
@@ -36234,11 +36237,11 @@ fn encode_hosted_relation_nt_path(
         .len()
         .checked_add(1)
         .and_then(|length| length.checked_mul(2))
-        .ok_or(HostedRelationPublishError::RetryResources)?;
+        .ok_or(HostedRelationPublishError::Retry)?;
     let mut encoded = Vec::new();
     encoded
         .try_reserve_exact(capacity)
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     for unit in units.into_iter().chain(core::iter::once(0)) {
         encoded.extend_from_slice(&unit.to_le_bytes());
     }
@@ -36281,7 +36284,7 @@ unsafe fn seed_hosted_bus_relation_baseline(
     let mut baseline = Vec::new();
     baseline
         .try_reserve_exact(snapshot.strings.len())
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     for instance in &snapshot.strings {
         let child = children
             .iter()
@@ -36364,11 +36367,11 @@ unsafe fn build_hosted_relation_mutations(
         .changes()
         .len()
         .checked_mul(7)
-        .ok_or(HostedRelationPublishError::RetryResources)?;
+        .ok_or(HostedRelationPublishError::Retry)?;
     let mut mutations = Vec::new();
     mutations
         .try_reserve_exact(capacity)
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
 
     for (index, change) in prepared.changes().iter().enumerate() {
         let instance_id = hosted_relation_instance_path(&change.child)?;
@@ -36510,10 +36513,10 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let mut existing = Vec::new();
     policies
         .try_reserve_exact(prepared.changes().len())
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     existing
         .try_reserve_exact(prepared.changes().len())
-        .map_err(|_| HostedRelationPublishError::RetryResources)?;
+        .map_err(|_| HostedRelationPublishError::Retry)?;
     for change in prepared.changes() {
         let enum_path = hosted_relation_enum_path(&change.child)?;
         policies.push(if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
@@ -37097,7 +37100,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
             }
             HostedDeviceRelationQueryPhase::IdsCopied => match publish_hosted_bus_relations() {
                 Ok(()) => return progress.saturating_add(1),
-                Err(HostedRelationPublishError::RetryResources) => return progress,
+                Err(HostedRelationPublishError::Retry) => return progress,
                 Err(HostedRelationPublishError::Barrier(status)) => {
                     set_hosted_relation_query_disposition(
                         HostedDeviceRelationQueryDisposition::Barrier(status),
@@ -37108,7 +37111,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
             HostedDeviceRelationQueryPhase::PropertiesCopied => {
                 match publish_hosted_bus_relations() {
                     Ok(()) => return progress.saturating_add(1),
-                    Err(HostedRelationPublishError::RetryResources) => return progress,
+                    Err(HostedRelationPublishError::Retry) => return progress,
                     Err(HostedRelationPublishError::Barrier(status)) => {
                         set_hosted_relation_query_disposition(
                             HostedDeviceRelationQueryDisposition::Barrier(status),
@@ -39405,7 +39408,7 @@ struct ExistingHostedRelationValues {
 }
 
 enum HostedRelationPublishError {
-    RetryResources,
+    Retry,
     Barrier(nt_status::NtStatus),
 }
 

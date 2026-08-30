@@ -234,6 +234,7 @@ pub enum DeviceActionJournalError {
     InvalidGeneration,
     AlreadySeeded,
     DuplicateInstance,
+    PendingInstance,
     InvalidTransition,
     StaleAcknowledgement,
     InsufficientResources,
@@ -309,6 +310,16 @@ impl DeviceActionJournal {
                 })
             {
                 return Err(DeviceActionJournalError::DuplicateInstance);
+            }
+        }
+        for action in actions {
+            if self.pending.iter().any(|pending| {
+                pending
+                    .publication
+                    .instance_id
+                    .eq_ignore_ascii_case(&action.instance_id)
+            }) {
+                return Err(DeviceActionJournalError::PendingInstance);
             }
         }
 
@@ -4332,6 +4343,38 @@ mod tests {
         assert_eq!(
             removal.publication.pdo_name.as_deref(),
             Some(r"\Device\LatePdoChanged")
+        );
+
+        cm.register_devnode(
+            r"ROOT\LATE\0000",
+            Some("LateDriver"),
+            Some(r"\Device\LatePdoReplacement"),
+            &["ROOT\\LATE"],
+            &[],
+        );
+        let replacement = [DeviceActionIntent {
+            kind: DeviceActionKind::Arrival,
+            instance_id: String::from(r"ROOT\LATE\0000"),
+        }];
+        assert_eq!(
+            journal.publish_actions(5, &cm.devnode_publications(), &replacement),
+            Err(DeviceActionJournalError::PendingInstance)
+        );
+        assert_eq!(journal.last_mount_generation(), 4);
+        assert_eq!(journal.pending_len(), 1);
+
+        journal.acknowledge(3).unwrap();
+        assert_eq!(
+            journal.publish_actions(5, &cm.devnode_publications(), &replacement),
+            Ok(1)
+        );
+        let replacement = journal.peek().unwrap();
+        assert_eq!(replacement.sequence, 4);
+        assert_eq!(replacement.kind, DeviceActionKind::Arrival);
+        assert_eq!(replacement.publication.instance_id, r"ROOT\LATE\0000");
+        assert_eq!(
+            replacement.publication.pdo_name.as_deref(),
+            Some(r"\Device\LatePdoReplacement")
         );
     }
 

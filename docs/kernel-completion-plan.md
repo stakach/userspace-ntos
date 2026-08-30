@@ -19213,3 +19213,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     power record, and CM removal action are fully retired. Stale relation claims and stale device
     actions must remain generation-fenced. Add a two-NIC host proof first, then run one serialized
     hotplug remove/re-add desktop acceptance when the existing QEMU lane is released.
+
+    B3 removed-instance re-enumeration checkpoint (2026-08-31, host acceptance green): removed PnP
+    devnodes remain immutable generation tombstones, but they no longer reserve their stable NT
+    instance forever. A complete later bus-relations generation may create a fresh devnode for that
+    instance only after the former devnode reaches `Removed` through its exact `finish_remove`
+    authority and only with a new canonical PDO identity. `RemovePending` and every earlier state
+    remain conflicts, and a retired canonical PDO identity can never be reused. The replacement gets
+    new devnode and lifecycle generations; stale IDs continue resolving only to the removed
+    tombstone.
+
+    The CM action journal now serializes actions per instance through terminal acknowledgement. A
+    removal updates prospective topology but a re-arrival for that instance returns
+    `STATUS_DEVICE_BUSY` without advancing mount generation, action sequence, or registry state
+    until the exact removal event is acknowledged. Actions for unrelated devices remain queueable.
+    The executive treats only this busy owner and genuine resource pressure as a retained
+    bus-relations publication retry; malformed identities, stale generations, and invalid
+    transitions remain permanent barriers. The retry disposition was renamed from the inaccurate
+    resource-only name rather than adding a parallel special case.
+
+    Two-device host tests prove both layers: the bus relation set removes one child and later emits
+    its fresh-PDO arrival without changing the accepted sibling, while the PnP lifecycle keeps that
+    sibling started and mapped across final removal and replacement publication. Focused validation
+    passes `nt-config-manager` 35/35, `nt-config-server` 25/25, `nt-config-client` 19/19, and
+    `nt-pnp-manager` 50/50. Formatting and `git diff --check` are clean, and the freestanding
+    executive check passes at the unchanged 209-warning baseline.
+
+    Review adjustment: the host-side remove/re-enumerate ownership prerequisite is closed. The next
+    B3 acceptance is one serialized runtime hotplug cycle with two NICs: reach the genuine Explorer
+    desktop, remove one QEMU device, observe QUERY_DEVICE_RELATIONS -> CM removal notification ->
+    SURPRISE_REMOVE/final REMOVE/ACK, add a replacement with the same stable instance, observe a new
+    canonical PDO and real AddDevice/START, and prove the sibling keeps its interface and data path.
+    Do not add an executive stimulus or synthetic completion to make this proof pass. The existing
+    long-running desktop QEMU still owns the boot lane and was not interrupted by this checkpoint.
