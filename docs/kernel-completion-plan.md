@@ -18789,3 +18789,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     completion ownership exactly as for the other native PnP queries. Then remove the remaining
     per-driver-instance `device_id`/`device_object` routing assumptions so one loaded function
     driver can own any number of independently bound devices without a last-device cache.
+
+    B3 filter-requirements transport checkpoint (2026-08-30, implementation green): the shared
+    PnP ABI and `nt-io-manager` now model `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` as its own typed
+    request rather than a lifecycle or empty-parameter IRP. It carries the complete native input
+    extent, projects the exact list pointer at the x64 stack-union offset, and keeps output length
+    zero because the result is a provider allocation returned through `IoStatus.Information`.
+    Driver-peer wire projection preserves that input extent and native minor.
+
+    The hosted WDM builder allocates/copies the request-owned native list, places the same pointer
+    in `Parameters.FilterResourceRequirements.IoResourceRequirementList`, and seeds it into
+    `IoStatus.Information` as NT does. A driver may leave that pointer unchanged, replace it with a
+    new provider-pool allocation, or explicitly return zero. Synchronous and pending completion
+    validate any nonzero returned pointer against the exact component pool. When the returned
+    pointer is the original request allocation, ownership is detached from the request graph before
+    publication so the later PnP copy/free and IRP ACK cannot double-free it. Replacement pointers
+    remain independently owned, while the request graph retains and reclaims its original input.
+    Invalid pointers become terminal access failures rather than escaping across the component
+    boundary.
+
+    Focused `nt-io-manager` validation passes `238/238`; formatting and the freestanding executive
+    check pass at the unchanged 209-warning baseline. Review adjustment: this checkpoint provides
+    the exact native transport and allocation ownership only; the start batch does not dispatch it
+    yet. Next add a retained filter transaction keyed by canonical IRP, PDO, origin/completion
+    driver/device, and provider domain. It must copy/validate/free a returned requirements list
+    before pending ACK, treat `STATUS_NOT_SUPPORTED` and a successful zero pointer as the original
+    PnP-owned list, commit `filtered_resource_requirements`, and expose only owned bytes to the
+    resource arbiter. Allocation pressure must retry without redispatch or ACK. Driver failure,
+    malformed replacement, stale topology, and indeterminate transport remain barriers.

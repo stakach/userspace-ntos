@@ -706,6 +706,8 @@ const IRP_MN_QUERY_ID: u64 = nt_pnp_abi::IRP_MN_QUERY_ID as u64;
 const IRP_MN_QUERY_RESOURCES: u64 = nt_pnp_abi::IRP_MN_QUERY_RESOURCES as u64;
 const IRP_MN_QUERY_RESOURCE_REQUIREMENTS: u64 =
     nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS as u64;
+const IRP_MN_FILTER_RESOURCE_REQUIREMENTS: u64 =
+    nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS as u64;
 const IRP_MN_QUERY_BUS_INFORMATION: u64 = nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION as u64;
 const FSCTL_PIPE_TRANSCEIVE: u64 = 0x0011_C017;
 /// `IRP_MJ_CLOSE` releases the FILE_OBJECT. Cleanup may disconnect the open first, but the same
@@ -766,6 +768,7 @@ struct PendingIrp {
     fid: u64,
     requestor_tid: u64,
     major: u8,
+    minor: u8,
     /// Selects the WDM output surface without conflating it with buffer ownership. Buffered pipe
     /// reads may replace SystemBuffer; direct and neither I/O always complete into `data`.
     completion_source_kind: u8,
@@ -775,7 +778,7 @@ struct PendingIrp {
     /// Whether THIS IRP owns the FILE_OBJECT block. Only a transient FILE_OBJECT may be freed on
     /// completion; registered per-open FILE_OBJECTs live until cleanup/close.
     owns_fo: bool,
-    _pad: [u8; 4],
+    _pad: [u8; 3],
     /// Completion is published in this owner record before any request buffer is reclaimed.
     completion: nt_io_manager::RetainedIrpCompletion,
 }
@@ -1379,6 +1382,7 @@ struct PendingIrpCompletionTarget {
     output_capacity: u64,
     completion_source_kind: u8,
     major: u8,
+    minor: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -1436,6 +1440,9 @@ unsafe fn claim_pending_irp_completion(irp: u64) -> Option<PendingIrpCompletionC
                         ),
                         major: read_volatile(
                             (entry + core::mem::offset_of!(PendingIrp, major) as u64) as *const u8,
+                        ),
+                        minor: read_volatile(
+                            (entry + core::mem::offset_of!(PendingIrp, minor) as u64) as *const u8,
                         ),
                     },
                 });
@@ -9893,7 +9900,22 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         let reclaim_valid = reclaim == 0 || component_pool_allocation_capacity(reclaim).is_some();
         let information_within_output =
             target.output_capacity == 0 || information <= target.output_capacity;
-        let completion_valid = source_valid && reclaim_valid && information_within_output;
+        let filter_requirements = target.major as u64 == IRP_MJ_PNP
+            && target.minor as u64 == IRP_MN_FILTER_RESOURCE_REQUIREMENTS;
+        let returned_allocation_valid = !filter_requirements
+            || information == 0
+            || component_pool_allocation_capacity(information).is_some();
+        let completion_valid = source_valid
+            && reclaim_valid
+            && information_within_output
+            && returned_allocation_valid;
+        if completion_valid && filter_requirements && information == target.data {
+            write_volatile(
+                (pending_irp_entry_address(node) + core::mem::offset_of!(PendingIrp, data) as u64)
+                    as *mut u64,
+                0,
+            );
+        }
         let sequence = next_completion_seq(FSD_DATA_VADDR);
         let mut completion = nt_io_manager::RetainedIrpCompletion::pending();
         if completion
@@ -31831,6 +31853,23 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             }
             WdmIoStackParameters::PnpQueryCapabilities { capabilities: data }
         }
+        IRP_MJ_PNP if minor == IRP_MN_FILTER_RESOURCE_REQUIREMENTS => {
+            if inlen == 0
+                || outlen != 0
+                || fsctl != 0
+                || request.parameter_offset != 0
+                || request.parameter_len != 0
+                || data == 0
+            {
+                pool_free(irp);
+                pool_free_request_buffers(data, aux_data, mdl);
+                if owns_fo {
+                    pool_free(fo);
+                }
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            WdmIoStackParameters::PnpFilterResourceRequirements { requirements: data }
+        }
         IRP_MJ_PNP
             if matches!(
                 minor,
@@ -31941,6 +31980,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
             STATUS_NOT_SUPPORTED,
         );
+        if minor == IRP_MN_FILTER_RESOURCE_REQUIREMENTS {
+            write_unaligned(
+                (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
+                data,
+            );
+        }
     }
     let read_completion = pending_irp_returns_read_bytes(major, minor, fsctl, outlen);
     let completion_source_kind = if !(major == IRP_MJ_FILE_SYSTEM_CONTROL
@@ -31967,10 +32012,11 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         fid: file_id,
         requestor_tid,
         major: major as u8,
+        minor: minor as u8,
         completion_source_kind,
         read_completion,
         owns_fo,
-        _pad: [0; 4],
+        _pad: [0; 3],
         completion: nt_io_manager::RetainedIrpCompletion::pending(),
     };
     let Some(owner_node) = insert_pending_irp(canonical_irp_id, initial_owner) else {
@@ -32212,6 +32258,15 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         );
     }
     if let Some(consuming_state) = consuming_state {
+        let mut completed = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+        if major == IRP_MJ_PNP && minor == IRP_MN_FILTER_RESOURCE_REQUIREMENTS && info != 0 {
+            if component_pool_allocation_capacity(info).is_none() {
+                st = 0xC000_0005u32 as i32; // STATUS_ACCESS_VIOLATION
+                info = 0;
+            } else if completed.data == info {
+                completed.data = 0;
+            }
+        }
         if read_completion {
             let copy_len = pending_irp_completion_output_len(major, minor, outlen, info);
             let source = retained_completion
@@ -32223,7 +32278,6 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
                 info = 0;
             }
         }
-        let completed = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
         release_pending_irp_graph_component(completed);
         if uses_file_object && (major == IRP_MJ_CLOSE || is_create && st < 0) {
             fo_release(canonical_file_id);

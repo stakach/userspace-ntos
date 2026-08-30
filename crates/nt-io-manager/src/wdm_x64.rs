@@ -167,6 +167,9 @@ pub enum WdmIoStackParameters {
     PnpQueryCapabilities {
         capabilities: u64,
     },
+    PnpFilterResourceRequirements {
+        requirements: u64,
+    },
 }
 
 impl Default for WdmIoStackParameters {
@@ -455,6 +458,9 @@ pub fn write_wdm_io_stack_location(
         }
         WdmIoStackParameters::PnpQueryCapabilities { capabilities } => {
             put_u64(bytes, 0x08, capabilities);
+        }
+        WdmIoStackParameters::PnpFilterResourceRequirements { requirements } => {
+            put_u64(bytes, 0x08, requirements);
         }
     }
     Ok(())

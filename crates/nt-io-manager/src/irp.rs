@@ -146,6 +146,7 @@ enum PnpParameterKind {
     QueryId { id_type: u32 },
     QueryInformation,
     QueryCapabilities,
+    FilterResourceRequirements { input_len: u32 },
 }
 
 impl PnpParameters {
@@ -219,6 +220,18 @@ impl PnpParameters {
         }
     }
 
+    /// Construct `IRP_MN_FILTER_RESOURCE_REQUIREMENTS`. The input extent is the complete native
+    /// requirements list referenced by both the stack location and the initial IoStatus pointer.
+    pub fn filter_resource_requirements(input_len: u32) -> Result<Self, NtStatus> {
+        if input_len == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(Self {
+            minor: nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+            kind: PnpParameterKind::FilterResourceRequirements { input_len },
+        })
+    }
+
     pub const fn start_parameters(self) -> Option<PnpStartParameters> {
         match self.kind {
             PnpParameterKind::Start(start) => Some(start),
@@ -240,6 +253,13 @@ impl PnpParameters {
         }
     }
 
+    pub const fn filter_resource_requirements_len(self) -> Option<u32> {
+        match self.kind {
+            PnpParameterKind::FilterResourceRequirements { input_len } => Some(input_len),
+            _ => None,
+        }
+    }
+
     pub const fn wire_argument(self) -> Option<u32> {
         match self.kind {
             PnpParameterKind::QueryDeviceRelations { relation_type } => Some(relation_type),
@@ -255,6 +275,7 @@ impl PnpParameters {
                 .checked_add(start.translated_resource_list_len)
                 .expect("validated PnP START extents overflowed"),
             PnpParameterKind::QueryCapabilities => nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE as u32,
+            PnpParameterKind::FilterResourceRequirements { input_len } => input_len,
             _ => 0,
         }
     }

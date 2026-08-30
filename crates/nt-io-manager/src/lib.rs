@@ -2087,6 +2087,18 @@ mod tests {
         assert_eq!(capabilities.input_len(), 64);
         assert_eq!(capabilities.output_len(), 64);
         assert_eq!(capabilities.payload_len(), 64);
+        let filter = PnpParameters::filter_resource_requirements(112).unwrap();
+        assert_eq!(
+            filter.minor,
+            nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+        );
+        assert_eq!(filter.input_len(), 112);
+        assert_eq!(filter.output_len(), 0);
+        assert_eq!(filter.filter_resource_requirements_len(), Some(112));
+        assert_eq!(
+            PnpParameters::filter_resource_requirements(0),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
         assert_eq!(
             PnpParameters::start(24, 0),
             Err(NtStatus::INVALID_PARAMETER)
@@ -2642,6 +2654,31 @@ mod tests {
         assert_eq!(request.minor, nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES);
         assert_eq!(request.input_len, 64);
         assert_eq!(request.output_len, 64);
+        assert_eq!(request.ioctl_code, 0);
+
+        let filter = PnpParameters::filter_resource_requirements(48).unwrap();
+        let mut requirements = [0x33u8; 48];
+        let _ = io
+            .build_and_dispatch_external_to_device(
+                client,
+                device,
+                None,
+                0,
+                0,
+                major::IRP_MJ_PNP,
+                IoParameters::Pnp(filter),
+                48,
+                0,
+                &mut requirements,
+            )
+            .unwrap();
+        let request = control.last_request().unwrap();
+        assert_eq!(
+            request.minor,
+            nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+        );
+        assert_eq!(request.input_len, 48);
+        assert_eq!(request.output_len, 0);
         assert_eq!(request.ioctl_code, 0);
     }
 
@@ -7023,6 +7060,23 @@ mod tests {
         assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_QUERY_CAPABILITIES);
         assert_eq!(le_u64(&stack, 0x08), 0x7777);
         assert_eq!(le_u64(&stack, 0x28), 0x6666);
+
+        write_wdm_io_stack_location(
+            &mut stack,
+            WdmIoStackLocationInit {
+                major: major::IRP_MJ_PNP,
+                minor: nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS,
+                device_object: 0x8888,
+                parameters: WdmIoStackParameters::PnpFilterResourceRequirements {
+                    requirements: 0x9999,
+                },
+                ..WdmIoStackLocationInit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stack[0x01], nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS);
+        assert_eq!(le_u64(&stack, 0x08), 0x9999);
+        assert_eq!(le_u64(&stack, 0x28), 0x8888);
     }
 
     #[test]
