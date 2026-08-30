@@ -18652,7 +18652,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     self-described `IO_RESOURCE_REQUIREMENTS_LIST` allocations. It cross-checks every full-resource
     and alternative-list count, rejects truncation, overflow, invalid descriptor layout, and an
     inconsistent `ListSize`, while deliberately ignoring allocator capacity after the native
-    prefix. Device-specific resource data is accepted only in its native trailing position.
+    prefix. Device-specific resource data is accepted only in its native trailing position, and
+    structural validation recognizes the full NT5 resource-type space including memory-large,
+    config-data, device-private, and card-configuration descriptors rather than limiting buses to
+    the current memory/port/interrupt fixtures.
 
     A focused `nt-pnp-manager::bus_properties` module copies those validated prefixes into
     PnP-owned storage and decodes the fixed 24-byte x64 `PNP_BUS_INFORMATION` value without retaining

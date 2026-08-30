@@ -33,6 +33,11 @@ pub const CM_RESOURCE_TYPE_MEMORY: u8 = 3;
 pub const CM_RESOURCE_TYPE_DMA: u8 = 4;
 pub const CM_RESOURCE_TYPE_DEVICE_SPECIFIC: u8 = 5;
 pub const CM_RESOURCE_TYPE_BUS_NUMBER: u8 = 6;
+pub const CM_RESOURCE_TYPE_MEMORY_LARGE: u8 = 7;
+pub const CM_RESOURCE_TYPE_CONFIG_DATA: u8 = 128;
+pub const CM_RESOURCE_TYPE_DEVICE_PRIVATE: u8 = 129;
+pub const CM_RESOURCE_TYPE_PC_CARD_CONFIG: u8 = 130;
+pub const CM_RESOURCE_TYPE_MF_CARD_CONFIG: u8 = 131;
 
 /// Interrupt `Flags` bits.
 pub const CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE: u16 = 0;
@@ -142,7 +147,21 @@ pub fn validate_cm_resource_list_extent(buf: &[u8]) -> Result<usize, NativeResou
         for index in 0..descriptor_count {
             let descriptor = header_end + index * PARTIAL_DESCRIPTOR_SIZE;
             let resource_type = buf[descriptor];
-            if resource_type > CM_RESOURCE_TYPE_BUS_NUMBER {
+            if !matches!(
+                resource_type,
+                CM_RESOURCE_TYPE_NULL
+                    | CM_RESOURCE_TYPE_PORT
+                    | CM_RESOURCE_TYPE_INTERRUPT
+                    | CM_RESOURCE_TYPE_MEMORY
+                    | CM_RESOURCE_TYPE_DMA
+                    | CM_RESOURCE_TYPE_DEVICE_SPECIFIC
+                    | CM_RESOURCE_TYPE_BUS_NUMBER
+                    | CM_RESOURCE_TYPE_MEMORY_LARGE
+                    | CM_RESOURCE_TYPE_CONFIG_DATA
+                    | CM_RESOURCE_TYPE_DEVICE_PRIVATE
+                    | CM_RESOURCE_TYPE_PC_CARD_CONFIG
+                    | CM_RESOURCE_TYPE_MF_CARD_CONFIG
+            ) {
                 return Err(NativeResourceListError::InvalidDescriptor);
             }
             if resource_type == CM_RESOURCE_TYPE_DEVICE_SPECIFIC {
@@ -1237,6 +1256,14 @@ mod tests {
             validate_cm_resource_list_extent(&buf[..59]),
             Err(NativeResourceListError::Truncated)
         );
+        buf[40] = CM_RESOURCE_TYPE_DEVICE_PRIVATE;
+        assert_eq!(validate_cm_resource_list_extent(&buf), Ok(60));
+        buf[40] = 42;
+        assert_eq!(
+            validate_cm_resource_list_extent(&buf),
+            Err(NativeResourceListError::InvalidDescriptor)
+        );
+        buf[40] = CM_RESOURCE_TYPE_INTERRUPT;
         buf[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
             validate_cm_resource_list_extent(&buf),
