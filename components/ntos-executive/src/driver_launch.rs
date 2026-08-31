@@ -8258,18 +8258,30 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             return dispatch(device, irp);
         }
 
-        let status = if major == IRP_MJ_PNP {
-            let (_, result, _, _, _) = call_on4(
+        let (status, root_pdo_handled) = if major == IRP_MJ_PNP {
+            let (_, result, handled, _, _) = call_on4(
                 (FSD_SERVICE_ROOT_PDO_PNP_LABEL << 12) | 2,
                 device,
                 forwarded_minor,
                 0,
                 0,
             );
-            result as u32 as i32
+            (result as u32 as i32, handled != 0)
         } else {
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw()
+            (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), true)
         };
+        if root_pdo_handled {
+            write_unaligned(
+                (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
+                status,
+            );
+            write_unaligned(
+                (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
+                0,
+            );
+        }
+        let completion_status =
+            read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const i32);
         trace_wdm_forward_call(
             device,
             irp,
@@ -8277,18 +8289,10 @@ extern "win64" fn s_iof_call_driver(device: u64, irp: u64) -> i32 {
             current_location_after_forward,
             next,
             forwarded_minor,
-            status,
-        );
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *mut i32,
-            status,
-        );
-        write_unaligned(
-            (irp + WDM_X64_IRP_IO_STATUS_INFORMATION_OFFSET) as *mut u64,
-            0,
+            completion_status,
         );
         s_io_complete_request(irp, 0);
-        status
+        completion_status
     }
 }
 
@@ -43775,11 +43779,11 @@ pub(crate) fn service_hosted_root_pdo_pnp(
     pdo_object: u64,
     minor: u8,
     active_reply_cap: u64,
-) -> i32 {
+) -> (i32, bool) {
     let (instance, inst, device_id) =
         match authenticated_hosted_root_pdo(ch, pdo_object, active_reply_cap) {
             Ok(resolved) => resolved,
-            Err(status) => return status.raw(),
+            Err(status) => return (status.raw(), true),
         };
     let identity = HostedDomainIdentity {
         domain_id: nt_io_manager::HostedDomainId(inst.hosted_domain_id),
@@ -43797,9 +43801,12 @@ pub(crate) fn service_hosted_root_pdo_pnp(
         })
     };
     if !authorized {
-        return nt_status::NtStatus::ACCESS_DENIED.raw();
+        return (nt_status::NtStatus::ACCESS_DENIED.raw(), true);
     }
-    unsafe { hosted_root_bus_mut().dispatch_pnp(device_id, minor) }
+    match unsafe { hosted_root_bus_mut().dispatch_pnp_outcome(device_id, minor) } {
+        nt_root_bus::RootPdoPnpDispatch::Handled(status) => (status, true),
+        nt_root_bus::RootPdoPnpDispatch::Unhandled => (0, false),
+    }
 }
 
 fn hosted_device_property_transfer_status(error: HostedDevicePropertyTransferError) -> i32 {
@@ -50588,12 +50595,16 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
 
         // VideoPort forwards this IRP to the PDO first. A PnP miniport without legacy access
         // ranges (including bochsmp) leaves the returned requirements list unchanged.
-        return PnpBackendDispatch::Returned {
-            status: nt_status::NtStatus(
-                hosted_root_bus_mut()
-                    .dispatch_pnp(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor),
-            ),
-            information: 0,
+        return match hosted_root_bus_mut()
+            .dispatch_pnp_outcome(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor)
+        {
+            nt_root_bus::RootPdoPnpDispatch::Handled(status) => PnpBackendDispatch::Returned {
+                status: nt_status::NtStatus(status),
+                information: 0,
+            },
+            nt_root_bus::RootPdoPnpDispatch::Unhandled => PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            },
         };
     }
     let Some(start) = parameters.start_parameters() else {
@@ -50621,10 +50632,17 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
         };
     }
 
-    let root_status = nt_status::NtStatus(hosted_root_bus_mut().dispatch_pnp(
+    let root_status = match hosted_root_bus_mut().dispatch_pnp_outcome(
         nt_io_manager::DeviceId(binding.pdo_device_id),
         IRP_MN_START_DEVICE as u8,
-    ));
+    ) {
+        nt_root_bus::RootPdoPnpDispatch::Handled(status) => nt_status::NtStatus(status),
+        nt_root_bus::RootPdoPnpDispatch::Unhandled => {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            };
+        }
+    };
     if !root_status.is_success() {
         return PnpBackendDispatch::Returned {
             status: root_status,

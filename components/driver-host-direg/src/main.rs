@@ -190,12 +190,14 @@ unsafe fn complete_irp(irp: u64, status: i32) -> i32 {
 const STATUS_PENDING: i32 = 0x0000_0103;
 
 /// `IoCallDriver(device, irp)` — dispatch to the device's PnP handler. The bottom of the stack is
-/// the synthetic root-bus PDO; every other device dispatches through its owning
+/// the native root-bus PDO; every other device dispatches through its owning
 /// `DriverObject->MajorFunction[IRP_MJ_PNP]` (installed by `WdfDriverCreate`).
 unsafe fn io_call_driver(device: u64, irp: u64) -> i32 {
     if device == PDO_OBJECT_ID {
         let minor = core::ptr::read_unaligned((irp + IRP_MINOR) as *const u8);
-        let st = root_bus().dispatch_pnp(PDO_CANONICAL_ID, minor);
+        let st = root_bus()
+            .dispatch_pnp_outcome(PDO_CANONICAL_ID, minor)
+            .status_or(irp_status(irp));
         return complete_irp(irp, st);
     }
     let drv = DRV_OBJECT.load(Ordering::Relaxed);

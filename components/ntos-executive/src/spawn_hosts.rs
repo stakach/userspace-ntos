@@ -2110,13 +2110,22 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_ROOT_PDO_PNP_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let status = crate::driver_launch::service_hosted_root_pdo_pnp(
+            let (status, handled) = crate::driver_launch::service_hosted_root_pdo_pnp(
                 ch,
                 msg.m0,
                 msg.m1 as u8,
                 *reply_cap,
             );
-            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                2,
+                status as u32 as u64,
+                handled as u64,
+                0,
+                0
+            );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_LABEL
             && ch.caps.kind == ReqKind::Irp

@@ -33,6 +33,32 @@ pub enum BusQueryId {
     InstanceId,
 }
 
+/// Result of presenting a PnP IRP to a root PDO.
+///
+/// A native driver that does not handle a PnP minor leaves the incoming `IO_STATUS_BLOCK`
+/// unchanged. The hosted boundary must retain that distinction rather than replacing an upper
+/// driver's result with a synthetic failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootPdoPnpDispatch {
+    /// The PDO handled the minor and owns the returned status.
+    Handled(i32),
+    /// The PDO did not handle the minor; preserve the IRP's existing status and information.
+    Unhandled,
+}
+
+impl RootPdoPnpDispatch {
+    pub const fn status_or(self, existing_status: i32) -> i32 {
+        match self {
+            Self::Handled(status) => status,
+            Self::Unhandled => existing_status,
+        }
+    }
+
+    pub const fn is_handled(self) -> bool {
+        matches!(self, Self::Handled(_))
+    }
+}
+
 /// A subset of `DEVICE_CAPABILITIES` (the fields the PnP Manager consults for a root-enumerated
 /// fixture device). `device_state[i]` maps system power state `S(i)` to the deepest supported
 /// device power state: `1` = `D0`, `4` = `D3`.
@@ -191,6 +217,7 @@ pub enum RootBusPdoError {
 /// `NTSTATUS` the PDO's PnP dispatch returns.
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
+#[cfg(test)]
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
 
 /// `IRP_MN_START_DEVICE` — the bus PDO's start minor.
@@ -207,6 +234,8 @@ pub const IRP_MN_STOP_DEVICE: u8 = 0x04;
 pub const IRP_MN_QUERY_STOP_DEVICE: u8 = 0x05;
 /// `IRP_MN_CANCEL_STOP_DEVICE` — a proposed stop was cancelled.
 pub const IRP_MN_CANCEL_STOP_DEVICE: u8 = 0x06;
+/// `IRP_MN_QUERY_DEVICE_RELATIONS` — report a relation set owned by the addressed stack.
+pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 0x07;
 /// `IRP_MN_SURPRISE_REMOVAL` — the device was removed unexpectedly.
 pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
 
@@ -474,14 +503,19 @@ impl RootBus {
 
     /// The PDO's PnP dispatch — the bottom of the device stack. A function driver's framework PnP
     /// handler forwards `IRP_MN_START_DEVICE` / `IRP_MN_REMOVE_DEVICE` down to here; the bus starts
-    /// or stops the PDO and completes the IRP. Returns the `NTSTATUS`.
-    pub fn dispatch_pnp(&mut self, canonical_id: DeviceId, minor: u8) -> i32 {
+    /// or stops the PDO and completes the IRP. Unhandled minors preserve the status and information
+    /// already carried by the IRP.
+    pub fn dispatch_pnp_outcome(
+        &mut self,
+        canonical_id: DeviceId,
+        minor: u8,
+    ) -> RootPdoPnpDispatch {
         let Some(pdo) = self
             .pdos
             .iter_mut()
             .find(|pdo| pdo.canonical_id == canonical_id)
         else {
-            return STATUS_NO_SUCH_DEVICE;
+            return RootPdoPnpDispatch::Handled(STATUS_NO_SUCH_DEVICE);
         };
         match minor {
             IRP_MN_START_DEVICE => pdo.started = true,
@@ -495,9 +529,9 @@ impl RootBus {
             | IRP_MN_CANCEL_STOP_DEVICE
             | IRP_MN_QUERY_REMOVE_DEVICE
             | IRP_MN_CANCEL_REMOVE_DEVICE => {}
-            _ => return STATUS_NOT_SUPPORTED,
+            _ => return RootPdoPnpDispatch::Unhandled,
         }
-        STATUS_SUCCESS
+        RootPdoPnpDispatch::Handled(STATUS_SUCCESS)
     }
 
     /// Whether the bus has started this PDO.
@@ -554,6 +588,11 @@ mod tests {
         )
         .unwrap();
         b
+    }
+
+    fn dispatch_status(bus: &mut RootBus, device: DeviceId, minor: u8) -> i32 {
+        bus.dispatch_pnp_outcome(device, minor)
+            .status_or(STATUS_NOT_SUPPORTED)
     }
 
     #[test]
@@ -664,35 +703,73 @@ mod tests {
     fn pdo_start_remove_dispatch() {
         let mut b = bus();
         assert!(!b.pdo_started(PRIMARY_PDO));
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE), 0);
+        assert_eq!(dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_START_DEVICE), 0);
         assert!(b.pdo_started(PRIMARY_PDO));
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_REMOVE_DEVICE), 0);
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_REMOVE_DEVICE),
+            0
+        );
         assert!(!b.pdo_started(PRIMARY_PDO));
-        assert_ne!(b.dispatch_pnp(DeviceId::new(1, 99), IRP_MN_START_DEVICE), 0);
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, 0x0b), STATUS_NOT_SUPPORTED);
+        assert_ne!(
+            dispatch_status(&mut b, DeviceId::new(1, 99), IRP_MN_START_DEVICE),
+            0
+        );
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, 0x0b),
+            STATUS_NOT_SUPPORTED
+        );
     }
 
     #[test]
     fn pdo_stop_and_surprise_dispatch() {
         let mut b = bus();
-        b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE);
+        dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_START_DEVICE);
         // query-stop + cancel-stop are pure negotiation: still started.
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_QUERY_STOP_DEVICE), 0);
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_CANCEL_STOP_DEVICE), 0);
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_QUERY_STOP_DEVICE),
+            0
+        );
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_CANCEL_STOP_DEVICE),
+            0
+        );
         assert!(b.pdo_started(PRIMARY_PDO));
         // stop quiesces; restart resumes.
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_STOP_DEVICE), 0);
+        assert_eq!(dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_STOP_DEVICE), 0);
         assert!(!b.pdo_started(PRIMARY_PDO));
-        b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE);
+        dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_START_DEVICE);
         assert!(b.pdo_started(PRIMARY_PDO));
         // query-remove + cancel-remove are pure negotiation: still started.
-        b.dispatch_pnp(PRIMARY_PDO, IRP_MN_START_DEVICE);
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_QUERY_REMOVE_DEVICE), 0);
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_CANCEL_REMOVE_DEVICE), 0);
+        dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_START_DEVICE);
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_QUERY_REMOVE_DEVICE),
+            0
+        );
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_CANCEL_REMOVE_DEVICE),
+            0
+        );
         assert!(b.pdo_started(PRIMARY_PDO));
         // surprise removal quiesces.
-        assert_eq!(b.dispatch_pnp(PRIMARY_PDO, IRP_MN_SURPRISE_REMOVAL), 0);
+        assert_eq!(
+            dispatch_status(&mut b, PRIMARY_PDO, IRP_MN_SURPRISE_REMOVAL),
+            0
+        );
         assert!(!b.pdo_started(PRIMARY_PDO));
+    }
+
+    #[test]
+    fn unhandled_pnp_minor_preserves_the_existing_irp_status() {
+        let mut b = bus();
+        let dispatch = b.dispatch_pnp_outcome(PRIMARY_PDO, IRP_MN_QUERY_DEVICE_RELATIONS);
+
+        assert_eq!(dispatch, RootPdoPnpDispatch::Unhandled);
+        assert!(!dispatch.is_handled());
+        assert_eq!(dispatch.status_or(STATUS_SUCCESS), STATUS_SUCCESS);
+        assert_eq!(
+            dispatch.status_or(STATUS_NOT_SUPPORTED),
+            STATUS_NOT_SUPPORTED
+        );
     }
 
     #[test]
@@ -787,7 +864,7 @@ mod tests {
             .unwrap();
         b.try_create_pdo(sibling, r"ROOT\B", &[r"ROOT\B"], &empty, "0001")
             .unwrap();
-        assert_eq!(b.dispatch_pnp(sibling, IRP_MN_START_DEVICE), 0);
+        assert_eq!(dispatch_status(&mut b, sibling, IRP_MN_START_DEVICE), 0);
 
         assert!(b.remove_pdo(PRIMARY_PDO));
         assert_eq!(b.query_device_relations(), alloc::vec![sibling]);

@@ -406,17 +406,23 @@ extern "win64" fn ntos_io_detach_device(_lower: u64) {
 
 /// `IofCallDriver(DeviceObject, Irp)` — pass the IRP down the device stack. When the FDO forwards a
 /// PnP IRP to the lower device (the root-bus PDO returned by `IoAttachDeviceToDeviceStack`), it is
-/// dispatched to the synthetic bus, which starts/stops the PDO and completes it (spec §12.3).
+/// dispatched to the native root bus, which starts/stops the PDO and completes it (spec §12.3).
 extern "win64" fn ntos_iof_call_driver(device: u64, irp: u64) -> i32 {
     // SAFETY: `irp` is an IRP we built (IoStatus.Status@48); `device` is a device-object pointer.
     unsafe {
-        let status = if device != 0 && device == dh().pdo {
-            // Bottom of the stack: the synthetic root bus handles this PnP minor for this device.
-            root_bus().dispatch_pnp(dh().canonical_device_id, dh().pnp_minor)
+        let existing_status = if irp != 0 {
+            core::ptr::read_unaligned((irp + 48) as *const i32)
         } else {
-            0
+            STATUS_UNSUCCESSFUL
         };
-        if irp != 0 {
+        let outcome = if device != 0 && device == dh().pdo {
+            // Bottom of the stack: the native root bus handles this PnP minor for this device.
+            root_bus().dispatch_pnp_outcome(dh().canonical_device_id, dh().pnp_minor)
+        } else {
+            nt_root_bus::RootPdoPnpDispatch::Unhandled
+        };
+        let status = outcome.status_or(existing_status);
+        if irp != 0 && outcome.is_handled() {
             core::ptr::write_unaligned((irp + 48) as *mut i32, status);
         }
         status

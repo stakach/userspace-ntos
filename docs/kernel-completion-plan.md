@@ -20857,6 +20857,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     readiness or the first deterministic barrier. If routing succeeds, classify the remaining root
     DMA START rejection independently instead of coupling it to PCI policy.
 
+    B3 root-PDO pass-through checkpoint (2026-09-01, implementation and runtime green): the initial
+    ACPI `BusRelations` IRP was reaching the real FDO with relation type zero, but the hosted
+    bottom-of-stack root PDO converted its unhandled minor into `STATUS_NOT_SUPPORTED`, overwrote
+    the success already published by ACPI, and cleared `IoStatus.Information`. `nt-root-bus` now
+    exposes an explicit handled/unhandled disposition. The component IPC preserves that bit, and
+    `IofCallDriver` changes status/information only for a handled result; an unhandled root-PDO minor
+    completes with the upper driver's existing `IO_STATUS_BLOCK`, matching native pass-through
+    semantics. The temporary object-layout diagnostic is removed.
+
+    `nt-root-bus` passes 15/15, including a focused `QUERY_DEVICE_RELATIONS` status-preservation
+    test; the freestanding executive check remains green at the established 209-warning baseline.
+    Serialized graphical run `.tmp/run-desktop-root-pdo-passthrough-20260901.log` proves ACPI START
+    followed by `IRP_MN_QUERY_DEVICE_RELATIONS`, lower-stack forwarding, completion, and FSD return
+    all at `STATUS_SUCCESS`. The run completed in minutes and QEMU was terminated after its gate.
+
+    Review adjustment: the returned relation transaction publishes no usable ACPI child PDOs, so
+    the serialized hardware batch correctly withholds E1000, the root DMA fixture, and bochsmp.
+    Consequently this run has no PDEV and ends at 250/299 without Explorer; that regression is a
+    causal result of real hardware admission, not a GUI fallback to restore. The next B3 slice is to
+    prove why the successfully initialized ACPICA namespace creates no child `DEVICE_OBJECT`s,
+    repair the real ACPI namespace/PDO enumeration boundary, and then require non-empty
+    `DEVICE_RELATIONS` before `_ADR`, `_PRT`, link-resource discovery, and hardware START admission.
+    Do not repopulate children from the registry or PCI inventory.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
