@@ -20095,8 +20095,8 @@ move the target.
 The initial x86-64 inventory contains 1,477 unique applicable Wine spec rows. Sixteen explicit
 `__wine_*`/`wine_*` host-runtime extensions are not Windows ntdll ABI and are excluded, leaving
 1,461 Windows-visible names. The current built `.tmp/nt-ntdll.dll` exports 1,372 names and covers
-1,089 of that Wine surface, leaving 372 names to classify and implement: 75 `Nt*`, 71 `Zw*`, 109
-`Rtl*`, 35 `Tp*`, 9 `Ldr*`, 5 `Csr*`, 2 `ApiSet*`, 4 `Ntdll*`, 3 `WinSqm*`, and 59 CRT/data names.
+1,089 of that Wine surface, leaving 372 names to classify and implement: 71 `Nt*`, 71 `Zw*`, 109
+`Rtl*`, 35 `Tp*`, 9 `Ldr*`, 5 `Csr*`, 2 `ApiSet*`, 4 `Ntdll*`, 3 `WinSqm*`, and 63 CRT/data names.
 These are export-directory measurements, not source grep counts. Wine marks 101 applicable rows as
 stubs; those rows identify compatibility names only and do not license stub behavior here.
 
