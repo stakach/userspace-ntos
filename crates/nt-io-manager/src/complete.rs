@@ -362,20 +362,22 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 irp.current_stack()
                     .ok_or(NtStatus::INVALID_PARAMETER)?
                     .driver_id,
-                usize::try_from(irp.information).map_err(|_| NtStatus::INVALID_PARAMETER)?,
+                irp.information,
                 irp.buffer
                     .map(|buffer| buffer.output_len as usize)
                     .unwrap_or(0),
             )
         };
-        if information > output_capacity {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
+        let transfer_len = usize::try_from(crate::completion_output_transfer_len(
+            information,
+            output_capacity as u64,
+        ))
+        .map_err(|_| NtStatus::INVALID_PARAMETER)?;
         let offset = usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?;
-        if offset > information {
+        if offset > transfer_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let copy_capacity = output.len().min(information - offset);
+        let copy_capacity = output.len().min(transfer_len - offset);
         if copy_capacity == 0 {
             return Ok(0);
         }

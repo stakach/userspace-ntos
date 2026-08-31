@@ -858,6 +858,9 @@ static FSD_ACTIVE_DISPATCH_OUT: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_STARTED_100NS: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_WRITE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_COMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Bounded failure provenance for device-control requests crossing a hosted driver boundary.
+static FSD_DEVICE_CONTROL_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+const FSD_DEVICE_CONTROL_FAILURE_TRACE_CAP: u64 = 64;
 /// Narrow NPFS read/write queue-state trace for message-mode RPC over named pipes.
 static mut PIPE_RW_TRACE_COUNT: u32 = 0;
 /// Narrow NPFS transceive queue-state trace for RPC request/reply pipe transactions.
@@ -10609,7 +10612,11 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // original buffered-I/O allocation while completing a queued read.
         let sysbuf = read_unaligned((irp + 0x18) as *const u64);
         let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-        let length = information.min(target.output_capacity).min(u32::MAX as u64) as usize;
+        let length = nt_io_manager::completion_output_transfer_len(
+            information,
+            target.output_capacity,
+        )
+        .min(u32::MAX as u64) as usize;
         let source = if length == 0 {
             0
         } else if target.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
@@ -10628,15 +10635,12 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
             0
         };
         let reclaim_valid = reclaim == 0 || component_pool_allocation_capacity(reclaim).is_some();
-        let information_within_output =
-            target.output_capacity == 0 || information <= target.output_capacity;
         let filter_requirements = target.major as u64 == IRP_MJ_PNP
             && target.minor as u64 == IRP_MN_FILTER_RESOURCE_REQUIREMENTS;
         let returned_allocation_valid = !filter_requirements
             || information == 0
             || component_pool_allocation_capacity(information).is_some();
-        let completion_valid =
-            source_valid && reclaim_valid && information_within_output && returned_allocation_valid;
+        let completion_valid = source_valid && reclaim_valid && returned_allocation_valid;
         if completion_valid && filter_requirements && information == target.data {
             write_volatile(
                 (pending_irp_entry_address(node) + core::mem::offset_of!(PendingIrp, data) as u64)
@@ -33214,6 +33218,12 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     jb[1] = 0;
     jb[2] = 0;
     let ret = fsd_guarded_call(handler, devobj, irp, jb.as_mut_ptr());
+    let post_call_irp_status =
+        read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32);
+    let post_call_irp_information = read_unaligned((irp + 0x38) as *const u64);
+    let post_call_owner_kind = hosted_irp_state_kind(
+        pending_irp_owner_state(owner_node).load(Ordering::Acquire),
+    );
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, 0);
@@ -33362,6 +33372,33 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
             other => panic!("invalid hosted IRP post-dispatch owner state {other}"),
         }
     };
+    if major == IRP_MJ_DEVICE_CONTROL
+        && st < 0
+        && FSD_DEVICE_CONTROL_FAILURE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+            < FSD_DEVICE_CONTROL_FAILURE_TRACE_CAP
+    {
+        print_str(b"[fsd-control-failure] ioctl=0x");
+        print_hex(fsctl as u32);
+        print_str(b" handler=0x");
+        print_hex64(handler);
+        print_str(b" device=0x");
+        print_hex64(devobj);
+        print_str(b" return=0x");
+        print_hex(ret as u32);
+        print_str(b" irp-status=0x");
+        print_hex(post_call_irp_status);
+        print_str(b" irp-information=");
+        print_u64(post_call_irp_information);
+        print_str(b" owner-kind=");
+        print_u64(post_call_owner_kind);
+        print_str(b" final=0x");
+        print_hex(st as u32);
+        print_str(b" information=");
+        print_u64(info);
+        print_str(b" retained-completion=");
+        print_u64(retained_completion.is_some() as u64);
+        print_str(b"\n");
+    }
     if (major == IRP_MJ_READ || major == IRP_MJ_WRITE) && DATA_TRACE_COUNT < 12 {
         DATA_TRACE_COUNT += 1;
         print_str(b"[fsd-data-result] major=");
@@ -37024,7 +37061,7 @@ unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) 
     }
     output.resize(output_len, 0);
     let input = nt_acpi::immediate_namespace_children_input();
-    let result = match io_manager_mut().buffered_device_control_device_payload(
+    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         pdo_device_id,
         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
@@ -37319,7 +37356,7 @@ unsafe fn dispatch_hosted_acpi_pci_root_method(
     let input = nt_acpi::eval_method_input(method.name())
         .expect("fixed ACPI PCI root method name was invalid");
     let mut output = [0u8; HOSTED_ACPI_EVAL_INTEGER_LEN];
-    let result = match io_manager_mut().buffered_device_control_device_payload(
+    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         pdo_device_id,
         nt_acpi::IOCTL_ACPI_EVAL_METHOD,

@@ -106,6 +106,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             output,
             internal,
             false,
+            false,
         )?;
         match completion {
             ExternalDispatchResult::Completed {
@@ -128,7 +129,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         internal: bool,
     ) -> Result<ExternalDispatchResult, NtStatus> {
         self.ioctl_target(
-            client, device_id, None, ioctl_code, input, output, internal, false,
+            client, device_id, None, ioctl_code, input, output, internal, false, false,
         )
     }
 
@@ -151,7 +152,28 @@ impl<P: ObjectManagerPort> IoManager<P> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         self.ioctl_target(
-            client, device_id, None, ioctl_code, input, output, false, true,
+            client, device_id, None, ioctl_code, input, output, false, true, false,
+        )
+    }
+
+    /// Dispatch a File-less METHOD_BUFFERED control to the exact supplied device object.
+    ///
+    /// This models `IoCallDriver(DeviceObject, Irp)`: attached devices above `device_id` are not
+    /// entered. It is intended for kernel subsystems that retain authenticated provider-object
+    /// authority, such as ACPI PDO method evaluation.
+    pub fn buffered_device_control_exact_device_payload(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        ioctl_code: u32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ExternalDispatchResult, NtStatus> {
+        if ioctl::method(ioctl_code) != ioctl::METHOD_BUFFERED {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        self.ioctl_target(
+            client, device_id, None, ioctl_code, input, output, false, true, true,
         )
     }
 
@@ -166,6 +188,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         output: &mut [u8],
         internal: bool,
         copy_full_buffered_output: bool,
+        exact_device: bool,
     ) -> Result<ExternalDispatchResult, NtStatus> {
         validate_transfer(input.len())?;
         validate_transfer(output.len())?;
@@ -218,19 +241,35 @@ impl<P: ObjectManagerPort> IoManager<P> {
             .then_some(direct.as_mut_slice());
         let type3_input_buffer = (method == ioctl::METHOD_NEITHER).then_some(type3.as_mut_slice());
         let user_buffer = (method == ioctl::METHOD_NEITHER).then_some(user.as_mut_slice());
-        let completion = self.build_and_dispatch_external_with_transfer_buffers(
-            client,
-            device_id,
-            file_id,
-            fn_major,
-            params,
-            input.len().min(u32::MAX as usize) as u32,
-            output.len().min(u32::MAX as usize) as u32,
-            &mut sysbuf,
-            direct_buffer,
-            type3_input_buffer,
-            user_buffer,
-        )?;
+        let completion = if exact_device {
+            self.build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+                client,
+                device_id,
+                file_id,
+                fn_major,
+                params,
+                input.len().min(u32::MAX as usize) as u32,
+                output.len().min(u32::MAX as usize) as u32,
+                &mut sysbuf,
+                direct_buffer,
+                type3_input_buffer,
+                user_buffer,
+            )?
+        } else {
+            self.build_and_dispatch_external_with_transfer_buffers(
+                client,
+                device_id,
+                file_id,
+                fn_major,
+                params,
+                input.len().min(u32::MAX as usize) as u32,
+                output.len().min(u32::MAX as usize) as u32,
+                &mut sysbuf,
+                direct_buffer,
+                type3_input_buffer,
+                user_buffer,
+            )?
+        };
         if let ExternalDispatchResult::Completed { information, .. } = completion {
             let n = if copy_full_buffered_output {
                 debug_assert_eq!(method, ioctl::METHOD_BUFFERED);

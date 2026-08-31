@@ -66,6 +66,41 @@ enum HostedAcpiPciRoutePhase {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedAcpiPciRouteOperation {
+    Begin,
+    Prt,
+    PrtPdoRelative,
+    PrtProviderAbsolute,
+    AcceptTables,
+    CrsFilter,
+    PrepareLinkDiscovery,
+    Link,
+    PreparePublication,
+    CommitPublication,
+}
+
+enum HostedAcpiPciRouteInput {
+    PdoRelative([u8; nt_acpi::ACPI_EVAL_INPUT_BUFFER_LEN]),
+    ProviderAbsolute([u8; nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN]),
+}
+
+impl HostedAcpiPciRouteInput {
+    fn ioctl_code(&self) -> u32 {
+        match self {
+            Self::PdoRelative(_) => nt_acpi::IOCTL_ACPI_EVAL_METHOD,
+            Self::ProviderAbsolute(_) => nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::PdoRelative(input) => input,
+            Self::ProviderAbsolute(input) => input,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedAcpiPciPrtDisposition {
     RetryResources,
     RetryExact(usize),
@@ -104,6 +139,10 @@ struct HostedAcpiPciRouteQuery {
     origin_driver_id: DriverId,
     completion_driver_id: DriverId,
     completion_device_id: nt_io_manager::DeviceId,
+    last_operation: HostedAcpiPciRouteOperation,
+    last_operation_index: usize,
+    last_output_len: usize,
+    last_driver_result: Option<(nt_status::NtStatus, u64)>,
     barrier_status: Option<nt_status::NtStatus>,
 }
 
@@ -147,8 +186,68 @@ unsafe fn retry_and_clear_hosted_acpi_pci_route_query() {
     crate::hosted_pci_topology::retry_hosted_pci_route_reconciliation();
 }
 
+unsafe fn record_hosted_acpi_pci_route_operation(
+    operation: HostedAcpiPciRouteOperation,
+    index: usize,
+    output_len: usize,
+) {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
+        .as_mut()
+        .expect("ACPI PCI route operation lost its query");
+    query.last_operation = operation;
+    query.last_operation_index = index;
+    query.last_output_len = output_len;
+    query.last_driver_result = None;
+}
+
+unsafe fn record_hosted_acpi_pci_route_driver_result(
+    status: nt_status::NtStatus,
+    information: u64,
+) {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
+        .as_mut()
+        .expect("ACPI PCI route completion lost its query");
+    query.last_driver_result = Some((status, information));
+}
+
+fn print_hosted_acpi_pci_route_operation(operation: HostedAcpiPciRouteOperation) {
+    print_str(match operation {
+        HostedAcpiPciRouteOperation::Begin => b"begin",
+        HostedAcpiPciRouteOperation::Prt => b"_PRT",
+        HostedAcpiPciRouteOperation::PrtPdoRelative => b"pdo-relative-_PRT",
+        HostedAcpiPciRouteOperation::PrtProviderAbsolute => b"absolute-_PRT",
+        HostedAcpiPciRouteOperation::AcceptTables => b"accept-tables",
+        HostedAcpiPciRouteOperation::CrsFilter => b"_CRS-filter",
+        HostedAcpiPciRouteOperation::PrepareLinkDiscovery => b"prepare-links",
+        HostedAcpiPciRouteOperation::Link => b"link-_CRS",
+        HostedAcpiPciRouteOperation::PreparePublication => b"prepare-publication",
+        HostedAcpiPciRouteOperation::CommitPublication => b"commit-publication",
+    });
+}
+
+fn hosted_acpi_pci_prt_input(
+    query: &nt_pnp::AcpiPciRoutingMethodQuery,
+) -> Result<HostedAcpiPciRouteInput, nt_acpi::AcpiEvalError> {
+    match query.invocation {
+        nt_pnp::AcpiPciRoutingMethodInvocation::PdoRelative => nt_acpi::eval_method_input(*b"_PRT")
+            .map(HostedAcpiPciRouteInput::PdoRelative),
+        nt_pnp::AcpiPciRoutingMethodInvocation::ProviderAbsolute => {
+            nt_acpi::eval_method_input_ex(query.method_path.as_str())
+                .map(HostedAcpiPciRouteInput::ProviderAbsolute)
+        }
+    }
+}
+
 unsafe fn finish_hosted_acpi_pci_route_barrier(status: nt_status::NtStatus) {
-    let Some((catalog_generation, inventory_generation, route_owner_generation)) =
+    let Some((
+        catalog_generation,
+        inventory_generation,
+        route_owner_generation,
+        last_operation,
+        last_operation_index,
+        last_output_len,
+        last_driver_result,
+    )) =
         (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
             .as_ref()
             .map(|query| {
@@ -156,6 +255,10 @@ unsafe fn finish_hosted_acpi_pci_route_barrier(status: nt_status::NtStatus) {
                     query.catalog_generation,
                     query.inventory_generation,
                     query.route_owner_generation,
+                    query.last_operation,
+                    query.last_operation_index,
+                    query.last_output_len,
+                    query.last_driver_result,
                 )
             })
     else {
@@ -176,6 +279,20 @@ unsafe fn finish_hosted_acpi_pci_route_barrier(status: nt_status::NtStatus) {
             print_u64(route_owner_generation);
             print_str(b" status=");
             print_hex(status.raw() as u32);
+            print_str(b" operation=");
+            print_hosted_acpi_pci_route_operation(last_operation);
+            print_str(b" index/output=");
+            print_u64(last_operation_index as u64);
+            print_str(b"/");
+            print_u64(last_output_len as u64);
+            print_str(b" driver-status/information=");
+            if let Some((driver_status, information)) = last_driver_result {
+                print_hex(driver_status.raw() as u32);
+                print_str(b"/");
+                print_u64(information);
+            } else {
+                print_str(b"none");
+            }
             print_str(b"\n");
             *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
         }
@@ -542,7 +659,7 @@ unsafe fn dispatch_hosted_acpi_pci_prt(query_index: usize, output_len: usize) ->
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
     };
-    let input = match nt_acpi::eval_method_input_ex(method_query.method_path.as_str()) {
+    let input = match hosted_acpi_pci_prt_input(method_query) {
         Ok(input) => input,
         Err(_) => {
             let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
@@ -553,16 +670,28 @@ unsafe fn dispatch_hosted_acpi_pci_prt(query_index: usize, output_len: usize) ->
             return true;
         }
     };
+    record_hosted_acpi_pci_route_operation(
+        match method_query.invocation {
+            nt_pnp::AcpiPciRoutingMethodInvocation::PdoRelative => {
+                HostedAcpiPciRouteOperation::PrtPdoRelative
+            }
+            nt_pnp::AcpiPciRoutingMethodInvocation::ProviderAbsolute => {
+                HostedAcpiPciRouteOperation::PrtProviderAbsolute
+            }
+        },
+        query_index,
+        output_len,
+    );
     let mut output = Vec::new();
     if output.try_reserve_exact(output_len).is_err() {
         return false;
     }
     output.resize(output_len, 0);
-    let result = match io_manager_mut().buffered_device_control_device_payload(
+    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         device_id,
-        nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX,
-        &input,
+        input.ioctl_code(),
+        input.as_bytes(),
         &mut output,
     ) {
         Ok(result) => result,
@@ -582,6 +711,7 @@ unsafe fn dispatch_hosted_acpi_pci_prt(query_index: usize, output_len: usize) ->
             information,
             ..
         } => {
+            record_hosted_acpi_pci_route_driver_result(status, information);
             let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
                 .as_mut()
                 .unwrap();
@@ -594,14 +724,15 @@ unsafe fn dispatch_hosted_acpi_pci_prt(query_index: usize, output_len: usize) ->
             };
         }
         ExternalDispatchResult::Pending { irp_id } => {
+            let ioctl_code = input.ioctl_code();
+            let input_len = input.as_bytes().len();
             let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
                 let current = irp.current_stack()?;
                 matches!(
                     &current.parameters,
                     IoParameters::DeviceControl(parameters)
-                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
-                            && parameters.input_len as usize
-                                == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
+                        if parameters.ioctl_code == ioctl_code
+                            && parameters.input_len as usize == input_len
                             && parameters.output_len as usize == output_len
                 )
                 .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
@@ -716,6 +847,10 @@ unsafe fn start_hosted_acpi_pci_route_query() -> usize {
         origin_driver_id: DriverId(0),
         completion_driver_id: DriverId(0),
         completion_device_id: nt_io_manager::DeviceId(0),
+        last_operation: HostedAcpiPciRouteOperation::Begin,
+        last_operation_index: 0,
+        last_output_len: 0,
+        last_driver_result: None,
         barrier_status: None,
     });
     1usize.saturating_add(drain_hosted_acpi_pci_route_query())
@@ -757,6 +892,11 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 query_index,
                 output_len,
             } => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::Prt,
+                    query_index,
+                    output_len,
+                );
                 if !dispatch_hosted_acpi_pci_prt(query_index, output_len) {
                     return progress;
                 }
@@ -788,9 +928,12 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 let method_query = hosted_acpi_pci_prt_query(query_index);
                 let expected_device_id = method_query
                     .and_then(|method| hosted_acpi_pci_route_endpoint_device(method.endpoint));
-                let request_fingerprint_valid = method_query
-                    .and_then(|method| nt_acpi::eval_method_input_ex(method.method_path.as_str()).ok())
-                    .is_some_and(|input| hosted_acpi_route_request_input_is(query.irp_id, &input));
+                let input = method_query.and_then(|method| hosted_acpi_pci_prt_input(method).ok());
+                let request_fingerprint_valid = input.as_ref().is_some_and(|input| {
+                    hosted_acpi_route_request_input_is(query.irp_id, input.as_bytes())
+                });
+                let expected_ioctl_code = input.as_ref().map(HostedAcpiPciRouteInput::ioctl_code);
+                let expected_input_len = input.as_ref().map(|input| input.as_bytes().len());
                 let Some(completion) = io_manager_mut().completed_irp(query.irp_id) else {
                     return progress;
                 };
@@ -801,10 +944,9 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                             && matches!(
                                 &stack.parameters,
                                 IoParameters::DeviceControl(parameters)
-                                    if parameters.ioctl_code
-                                        == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
-                                        && parameters.input_len as usize
-                                            == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
+                                    if Some(parameters.ioctl_code) == expected_ioctl_code
+                                        && Some(parameters.input_len as usize)
+                                            == expected_input_len
                                         && parameters.output_len as usize == output_len
                             )
                     })
@@ -823,6 +965,12 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                     && completion.completion_origin == IrpCompletionOrigin::Driver
                     && request_valid
                     && request_fingerprint_valid;
+                let completion_status = completion.status;
+                let completion_information = completion.information;
+                record_hosted_acpi_pci_route_driver_result(
+                    completion_status,
+                    completion_information,
+                );
                 let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
                     .as_mut()
                     .unwrap();
@@ -837,8 +985,8 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                     query.phase = HostedAcpiPciRoutePhase::AwaitingPrtCopy {
                         query_index,
                         output_len,
-                        status: completion.status,
-                        information: completion.information,
+                        status: completion_status,
+                        information: completion_information,
                     };
                 }
                 progress = progress.saturating_add(1);
@@ -922,6 +1070,11 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 }
             }
             HostedAcpiPciRoutePhase::AcceptTables => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::AcceptTables,
+                    0,
+                    0,
+                );
                 let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
                     .as_mut()
                     .unwrap();
@@ -969,6 +1122,11 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 endpoint_index,
                 output_len,
             } => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::CrsFilter,
+                    endpoint_index,
+                    output_len,
+                );
                 if !dispatch_hosted_acpi_pci_crs_filter(endpoint_index, output_len) {
                     return progress;
                 }
@@ -1025,6 +1183,11 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 progress = progress.saturating_add(1);
             }
             HostedAcpiPciRoutePhase::PrepareLinkDiscovery => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::PrepareLinkDiscovery,
+                    0,
+                    0,
+                );
                 if !prepare_hosted_acpi_pci_interrupt_link_discovery() {
                     return progress;
                 }
@@ -1034,6 +1197,11 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 request_index,
                 output_len,
             } => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::Link,
+                    request_index,
+                    output_len,
+                );
                 if !dispatch_hosted_acpi_pci_link(request_index, output_len) {
                     return progress;
                 }
@@ -1090,12 +1258,22 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 progress = progress.saturating_add(1);
             }
             HostedAcpiPciRoutePhase::PreparePublication => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::PreparePublication,
+                    0,
+                    0,
+                );
                 if !prepare_hosted_acpi_pci_route_publication() {
                     return progress;
                 }
                 progress = progress.saturating_add(1);
             }
             HostedAcpiPciRoutePhase::CommitPublication => {
+                record_hosted_acpi_pci_route_operation(
+                    HostedAcpiPciRouteOperation::CommitPublication,
+                    0,
+                    0,
+                );
                 if !commit_hosted_acpi_pci_route_publication() {
                     return progress;
                 }

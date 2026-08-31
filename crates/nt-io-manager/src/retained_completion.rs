@@ -3,6 +3,19 @@
 //! The request graph remains the authoritative owner until the executive consumes this record.
 //! Completing in place avoids transferring the only completion edge into a second bounded table.
 
+/// Bytes that may be transferred from a completed IRP's retained output buffer.
+///
+/// `IoStatus.Information` is result metadata, not universally a byte count. In particular, buffer
+/// sizing responses preserve the required length even when it exceeds the supplied output buffer.
+/// The metadata must remain unchanged while the actual transfer stays bounded by the request.
+pub const fn completion_output_transfer_len(information: u64, output_capacity: u64) -> u64 {
+    if information < output_capacity {
+        information
+    } else {
+        output_capacity
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetainedIrpCompletion {
@@ -153,5 +166,12 @@ mod tests {
     fn retained_completion_abi_is_stable() {
         assert_eq!(core::mem::size_of::<RetainedIrpCompletion>(), 48);
         assert_eq!(core::mem::align_of::<RetainedIrpCompletion>(), 8);
+    }
+
+    #[test]
+    fn required_length_metadata_does_not_expand_the_output_transfer() {
+        assert_eq!(completion_output_transfer_len(4_748, 20), 20);
+        assert_eq!(completion_output_transfer_len(12, 20), 12);
+        assert_eq!(completion_output_transfer_len(0, 20), 0);
     }
 }

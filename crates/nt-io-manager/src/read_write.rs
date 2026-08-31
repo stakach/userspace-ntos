@@ -268,6 +268,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             direct_buffer,
             type3_input_buffer,
             user_buffer,
+            false,
         )?;
         self.complete_sync(irp_id, outcome)
     }
@@ -298,6 +299,39 @@ impl<P: ObjectManagerPort> IoManager<P> {
             direct_buffer,
             type3_input_buffer,
             user_buffer,
+            false,
+        )?;
+        Ok(self.complete_external_dispatch(irp_id, outcome))
+    }
+
+    /// Dispatch a kernel-built request beginning at the exact supplied device object.
+    pub(crate) fn build_and_dispatch_external_to_exact_device_with_transfer_buffers(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        file_id: Option<FileId>,
+        major: u8,
+        params: IoParameters,
+        input_len: u32,
+        output_len: u32,
+        system_buffer: &mut [u8],
+        direct_buffer: Option<&mut [u8]>,
+        type3_input_buffer: Option<&mut [u8]>,
+        user_buffer: Option<&mut [u8]>,
+    ) -> Result<crate::ExternalDispatchResult, NtStatus> {
+        let (irp_id, outcome) = self.build_and_dispatch_with_transfer_buffers(
+            client,
+            device_id,
+            file_id,
+            major,
+            params,
+            input_len,
+            output_len,
+            system_buffer,
+            direct_buffer,
+            type3_input_buffer,
+            user_buffer,
+            true,
         )?;
         Ok(self.complete_external_dispatch(irp_id, outcome))
     }
@@ -315,13 +349,17 @@ impl<P: ObjectManagerPort> IoManager<P> {
         direct_buffer: Option<&mut [u8]>,
         type3_input_buffer: Option<&mut [u8]>,
         user_buffer: Option<&mut [u8]>,
+        exact_device: bool,
     ) -> Result<(IrpId, Result<DispatchOutcome, NtStatus>), NtStatus> {
         let driver_id = self
             .device(device_id)
             .ok_or(NtStatus::INVALID_PARAMETER)?
             .driver_id;
-        let mut irp =
-            self.build_irp_record(client, driver_id, device_id, file_id, major, params)?;
+        let mut irp = if exact_device {
+            self.build_irp_record_at_device(client, device_id, file_id, major, params)?
+        } else {
+            self.build_irp_record(client, driver_id, device_id, file_id, major, params)?
+        };
         let buffer_len = [
             system_buffer.len(),
             direct_buffer.as_ref().map(|b| b.len()).unwrap_or(0),

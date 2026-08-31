@@ -1177,12 +1177,20 @@ mod tests {
         assert_eq!(discovery.queries()[0].endpoint, provider(44));
         assert_eq!(discovery.queries()[0].scope, path("\\_SB_.PCI0"));
         assert_eq!(discovery.queries()[0].method_path, path("\\_SB_.PCI0._PRT"));
+        assert_eq!(
+            discovery.queries()[0].invocation,
+            crate::AcpiPciRoutingMethodInvocation::PdoRelative
+        );
         assert_eq!(discovery.queries()[0].bus, 0);
         assert_eq!(discovery.queries()[0].bridge, None);
         assert_eq!(discovery.queries()[1].scope, path("\\_SB_.PCI0.BRG0"));
         assert_eq!(
             discovery.queries()[1].method_path,
             path("\\_SB_.PCI0.BRG0._PRT")
+        );
+        assert_eq!(
+            discovery.queries()[1].invocation,
+            crate::AcpiPciRoutingMethodInvocation::ProviderAbsolute
         );
         assert_eq!(discovery.queries()[1].bus, 2);
         assert_eq!(

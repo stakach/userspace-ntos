@@ -11,13 +11,23 @@ use crate::{
     PciInventory, PciLocation, PciRouteFunction, PreparedPciInterruptRoutePublication,
 };
 
-/// One exact full-path `_PRT` evaluation derived from accepted ACPI and PCI topology facts.
+/// Provider invocation required for one exact `_PRT` scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpiPciRoutingMethodInvocation {
+    /// Evaluate `_PRT` relative to the exact ACPI PDO that owns the PCI root scope.
+    PdoRelative,
+    /// Evaluate the retained absolute method path through the authenticated root PDO endpoint.
+    ProviderAbsolute,
+}
+
+/// One exact `_PRT` evaluation derived from accepted ACPI and PCI topology facts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciRoutingMethodQuery {
     pub relation_owner: AcpiPciProviderEndpoint,
     pub endpoint: AcpiPciProviderEndpoint,
     pub scope: AcpiNamespacePath,
     pub method_path: AcpiNamespacePath,
+    pub invocation: AcpiPciRoutingMethodInvocation,
     pub segment: u16,
     pub bus: u8,
     pub bridge: Option<PciLocation>,
@@ -611,6 +621,11 @@ impl AcpiPciScopeCatalog {
                 endpoint: scope.endpoint,
                 scope: owner,
                 method_path,
+                invocation: if scope.bridge.is_none() {
+                    AcpiPciRoutingMethodInvocation::PdoRelative
+                } else {
+                    AcpiPciRoutingMethodInvocation::ProviderAbsolute
+                },
                 segment: scope.segment,
                 bus: scope.bus,
                 bridge: scope.bridge,

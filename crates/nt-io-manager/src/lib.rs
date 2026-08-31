@@ -149,7 +149,10 @@ pub use read_write::{
     resolve_regular_file_read_offset, resolve_regular_file_write_offset, ResolvedFileOffset,
     FILE_USE_FILE_POINTER_POSITION, FILE_WRITE_TO_END_OF_FILE,
 };
-pub use retained_completion::{RetainedCompletion, RetainedCompletionError, RetainedIrpCompletion};
+pub use retained_completion::{
+    completion_output_transfer_len, RetainedCompletion, RetainedCompletionError,
+    RetainedIrpCompletion,
+};
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
@@ -547,7 +550,23 @@ impl<P> IoManager<P> {
         major: u8,
         parameters: &IoParameters,
     ) -> Result<Vec<IoStackLocation>, NtStatus> {
-        let mut current = self.top_of_device_stack(origin)?;
+        let top = self.top_of_device_stack(origin)?;
+        let stack = self.snapshot_device_stack_from(top, file, major, parameters)?;
+        if !stack.iter().any(|location| location.device_id == origin) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok(stack)
+    }
+
+    /// Snapshot a device stack beginning at the exact object supplied to `IoCallDriver`.
+    fn snapshot_device_stack_from(
+        &self,
+        entry: DeviceId,
+        file: Option<FileId>,
+        major: u8,
+        parameters: &IoParameters,
+    ) -> Result<Vec<IoStackLocation>, NtStatus> {
+        let mut current = entry;
         let mut stack = Vec::new();
         let stack_size = self
             .device(current)
@@ -584,9 +603,6 @@ impl<P> IoManager<P> {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             current = lower;
-        }
-        if !stack.iter().any(|location| location.device_id == origin) {
-            return Err(NtStatus::INVALID_PARAMETER);
         }
         Ok(stack)
     }
@@ -635,6 +651,30 @@ impl<P> IoManager<P> {
         if stack.is_empty() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
+        let mut irp = IrpRecord::new(client, device, file, major);
+        irp.origin_driver_id = driver;
+        irp.origin_minor = stack[0].minor;
+        if major == nt_io_abi::major::IRP_MJ_PNP {
+            irp.status = NtStatus::NOT_SUPPORTED;
+        }
+        irp.stack = stack;
+        Ok(irp)
+    }
+
+    /// Build an IRP whose first stack location is the exact supplied device object.
+    pub(crate) fn build_irp_record_at_device(
+        &self,
+        client: ClientId,
+        device: DeviceId,
+        file: Option<FileId>,
+        major: u8,
+        parameters: IoParameters,
+    ) -> Result<IrpRecord, NtStatus> {
+        let driver = self
+            .device(device)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .driver_id;
+        let stack = self.snapshot_device_stack_from(device, file, major, &parameters)?;
         let mut irp = IrpRecord::new(client, device, file, major);
         irp.origin_driver_id = driver;
         irp.origin_minor = stack[0].minor;
@@ -906,7 +946,16 @@ impl<P> IoManager<P> {
             if record.current_location != 0 {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            let mut expected = self.top_of_device_stack(record.origin_device_id)?;
+            let stack_entry = record
+                .stack
+                .first()
+                .map(|location| location.device_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            let mut expected = if stack_entry == record.origin_device_id {
+                record.origin_device_id
+            } else {
+                self.top_of_device_stack(record.origin_device_id)?
+            };
             let mut contains_origin = false;
             for (index, location) in record.stack.iter().enumerate() {
                 let device = self.device(expected).ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -3437,6 +3486,75 @@ mod tests {
     }
 
     #[test]
+    fn exact_device_ioctl_bypasses_attached_devices_without_changing_normal_routing() {
+        let mut om = io();
+        let client = om.register_client();
+        let (pdo_driver, pdo_seen) =
+            external_recording_driver(&mut om, "\\Driver\\Acpi", NtStatus::SUCCESS, 0, &[]);
+        let (function_driver, function_seen) =
+            external_recording_driver(&mut om, "\\Driver\\Pci", NtStatus::SUCCESS, 0, &[]);
+        let pdo = om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            pdo_driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ));
+        let function = om.add_device(DeviceRecord::new(
+            ObjectId::NULL,
+            function_driver,
+            None,
+            DeviceType::UNKNOWN,
+            DeviceCharacteristics::empty(),
+            DeviceFlags::BUFFERED_IO,
+            0,
+        ));
+        assert_eq!(om.attach_device_to_stack(function, pdo), Ok(pdo));
+        let code = any_ioctl(0x821, ioctl::METHOD_BUFFERED);
+        let mut output = [];
+
+        assert_eq!(
+            om.buffered_device_control_exact_device_payload(
+                client,
+                pdo,
+                code,
+                b"request",
+                &mut output,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        assert_eq!(pdo_seen.borrow().len(), 1);
+        assert_eq!(pdo_seen.borrow()[0].device_id, pdo);
+        assert_eq!(pdo_seen.borrow()[0].stack_count, 1);
+        assert!(function_seen.borrow().is_empty());
+
+        assert_eq!(
+            om.buffered_device_control_device_payload(
+                client,
+                pdo,
+                code,
+                b"request",
+                &mut output,
+            ),
+            Ok(ExternalDispatchResult::Completed {
+                status: NtStatus::SUCCESS,
+                information: 0,
+                file_context: None,
+            })
+        );
+        assert_eq!(pdo_seen.borrow().len(), 1);
+        assert_eq!(function_seen.borrow().len(), 1);
+        assert_eq!(function_seen.borrow()[0].device_id, function);
+        assert_eq!(function_seen.borrow()[0].stack_count, 2);
+    }
+
+    #[test]
     fn device_object_internal_ioctl_selects_internal_major() {
         let mut om = io();
         let client = om.register_client();
@@ -5448,6 +5566,62 @@ mod tests {
         assert!(om.completed_irp(irp_id).is_none());
         assert_eq!(
             om.copy_completed_irp_output(irp_id, 0, &mut output),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn retained_output_preserves_required_length_larger_than_transfer_buffer() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(RetainedOutputState {
+            output: b"size".to_vec(),
+            completion_status: NtStatus(0x8000_0005u32 as i32),
+            completion_information: Some(4_748),
+            ..RetainedOutputState::default()
+        }));
+        let mut om = io();
+        let client = om.register_client();
+        let driver = om
+            .create_driver(
+                &path("\\Driver\\SizingResponse"),
+                Box::new(RetainedOutputBackend {
+                    state: state.clone(),
+                }),
+            )
+            .unwrap();
+        let mut dispatch_output = [0u8; 4];
+        let irp_id = match om
+            .build_and_dispatch_external_to_driver(
+                client,
+                driver,
+                None,
+                0,
+                0,
+                major::IRP_MJ_READ,
+                IoParameters::Read(ReadWriteParameters {
+                    length: 4,
+                    key: 0,
+                    offset: 0,
+                }),
+                0,
+                4,
+                &mut dispatch_output,
+            )
+            .unwrap()
+        {
+            ExternalDispatchResult::Pending { irp_id } => irp_id,
+            other => panic!("expected pending sizing response, got {other:?}"),
+        };
+
+        assert_eq!(om.pump(), 1);
+        let completion = om.completed_irp(irp_id).unwrap();
+        assert_eq!(completion.status, NtStatus(0x8000_0005u32 as i32));
+        assert_eq!(completion.information, 4_748);
+        let mut output = [0u8; 4];
+        assert_eq!(om.copy_completed_irp_output(irp_id, 0, &mut output), Ok(4));
+        assert_eq!(&output, b"size");
+        assert_eq!(om.copy_completed_irp_output(irp_id, 4, &mut output), Ok(0));
+        assert_eq!(
+            om.copy_completed_irp_output(irp_id, 5, &mut output),
             Err(NtStatus::INVALID_PARAMETER)
         );
     }

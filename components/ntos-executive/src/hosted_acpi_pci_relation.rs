@@ -269,7 +269,7 @@ unsafe fn dispatch_hosted_acpi_pci_namespace_filter(
     output.resize(output_len, 0);
     let input = nt_acpi::multilevel_namespace_filter_input(method.name())
         .expect("fixed ACPI PCI namespace filter was invalid");
-    let result = match io_manager_mut().buffered_device_control_device_payload(
+    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         pdo_device_id,
         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
@@ -586,7 +586,7 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
         }
     };
     let mut output = [0u8; HOSTED_ACPI_EVAL_INTEGER_LEN];
-    let result = match io_manager_mut().buffered_device_control_device_payload(
+    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         pdo_device_id,
         nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX,

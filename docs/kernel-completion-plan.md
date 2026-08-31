@@ -20924,6 +20924,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     producing that status, publish a current interrupt route, and only then admit PCI START. Do not
     bypass the route owner or manufacture an IRQ.
 
+    B3 exact provider dispatch and completion-metadata checkpoint (2026-09-01, implementation and
+    runtime green): route discovery now records the exact provider operation, output extent, and
+    raw driver completion. Root `_PRT` evaluation uses the native PDO-relative
+    `IOCTL_ACPI_EVAL_METHOD` contract; descendant bridge paths use the absolute METHOD_EX contract.
+    The distinction is explicit in the host-testable `nt-pnp` discovery plan instead of being
+    inferred or retried as a fallback.
+
+    Kernel-built requests now also preserve native `IoCallDriver(DeviceObject, Irp)` semantics:
+    authenticated code holding a provider PDO can dispatch to that exact object without being
+    retargeted to an attached upper device. Normal handle/device requests continue to enter at the
+    live top of stack. A focused two-driver I/O Manager test proves both routes and all ACPI
+    provider PDO operations use the exact-device API.
+
+    Live provenance showed that the real ACPI driver returned `STATUS_BUFFER_OVERFLOW` with
+    `IoStatus.Information = 4748` for the 20-byte `_PRT` probe, while hosted completion capture
+    changed it to `STATUS_ACCESS_VIOLATION`. The I/O Manager now treats `Information` as result
+    metadata rather than universally as a transferable byte count: it preserves the required size
+    and independently clamps retained output transfer to the request's output capacity. This is
+    covered for both the retained completion primitive and a pending backend completion whose
+    required length exceeds its output buffer.
+
+    `nt-io-manager` passes 249/249 tests, `nt-pnp-manager` passes 51/51, `git diff --check` passes,
+    and the freestanding executive check remains green at the established 209-warning baseline.
+    Serialized run `.tmp/run-headless-acpi-sizing-completion-fix-20260901.log` completed in well
+    under the hard one-hour deadline and proves `_PRT` resizing advanced to interrupt-link `_CRS`.
+    The new current barrier is later: the real link `_CRS` request succeeds with 27 bytes, but its
+    resource-template payload is rejected as `STATUS_INVALID_DEVICE_REQUEST`. The next slice is to
+    validate that exact ACPICA payload against the ACPI resource-template contract, repair the
+    parser or transport without accepting malformed descriptors, publish the route owner, and only
+    then admit PCI START.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

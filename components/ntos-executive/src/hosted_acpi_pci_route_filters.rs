@@ -185,7 +185,7 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
         return false;
     }
     output.resize(output_len, 0);
-    let result = match io_manager_mut().buffered_device_control_device_payload(
+    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         device_id,
         nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
@@ -209,6 +209,7 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
             information,
             ..
         } => {
+            record_hosted_acpi_pci_route_driver_result(status, information);
             let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
                 .as_mut()
                 .unwrap();
@@ -338,6 +339,7 @@ unsafe fn advance_hosted_acpi_pci_crs_filter_completion(
     } else {
         (nt_status::NtStatus::INVALID_DEVICE_REQUEST, 0)
     };
+    record_hosted_acpi_pci_route_driver_result(completion.status, completion.information);
     (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_mut()
         .unwrap()
