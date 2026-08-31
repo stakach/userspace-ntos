@@ -10,6 +10,14 @@ pub const WINE_SPEC_BLOB: &str = "10d42eeb1387204518711814923e19b6bbed25cf";
 pub const WINE_SPEC_SHA256: &str =
     "25fafa3c7f9c2f981f1dcd70ee4315d8dedb13a695a20528a80843df86fff15c";
 const TRACKED_MANIFEST: &str = include_str!("../fixtures/wine-ntdll-x86_64-2ecc2f84.tsv");
+const TRACKED_MANIFEST_SHA256: &str =
+    "bea27b141201215aebc8bc82b2ab6a75913f3a348ec0146690d5cea273627177";
+const TRACKED_RECONCILIATION: &str =
+    include_str!("../fixtures/wine-ntdll-reconciliation-2ecc2f84.tsv");
+const EXPECTED_BASELINE_GAP_SHA256: &str =
+    "a42e5d3ab87a3d9538e1451c109ceb06f3c7bd4dbf131ac48f017ab002e206e6";
+const EXPECTED_CLASSIFICATION_SHA256: &str =
+    "dfe7d4e030b44e7da62020a10b1820895513cc16d9f783e12fd05a973d8573f6";
 
 const EXPECTED_ACTIVE_ROWS: usize = 1_536;
 const EXPECTED_X64_ROWS: usize = 1_477;
@@ -499,11 +507,16 @@ pub fn generate_manifest(path: &Path) -> Result<String, String> {
 struct ManifestRow {
     name: String,
     kind: ExportKind,
+    args: String,
+    flags: String,
     alias: Option<String>,
     wine_extension: bool,
 }
 
 fn parse_manifest(manifest: &str) -> Result<Vec<ManifestRow>, String> {
+    if sha256_hex(manifest.as_bytes()) != TRACKED_MANIFEST_SHA256 {
+        return Err("tracked Wine manifest content changed".to_string());
+    }
     for (key, value) in [
         ("wine-commit", WINE_COMMIT),
         ("wine-spec-blob", WINE_SPEC_BLOB),
@@ -583,6 +596,8 @@ fn parse_manifest(manifest: &str) -> Result<Vec<ManifestRow>, String> {
         rows.push(ManifestRow {
             name: fields[1].to_string(),
             kind,
+            args: fields[3].to_string(),
+            flags: fields[4].to_string(),
             alias,
             wine_extension,
         });
@@ -602,6 +617,257 @@ fn parse_manifest(manifest: &str) -> Result<Vec<ManifestRow>, String> {
         rows.iter().map(|row| (row.kind, row.alias.is_some())),
         "tracked Wine manifest",
     )?;
+    Ok(rows)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationState {
+    Planned,
+    BlockedAbi,
+    Implemented,
+}
+
+#[derive(Debug)]
+struct ReconciliationRow {
+    name: String,
+    alias: Option<String>,
+    group: String,
+    owner: String,
+    abi_authority: String,
+    effective_args: String,
+    return_class: String,
+    state: ReconciliationState,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn is_exact_export_alias(pe: &PeFile<'_>, alias_rva: u32, target_rva: u32) -> bool {
+    if alias_rva == target_rva {
+        return true;
+    }
+    let Some(jump) = pe.bytes_at_rva(alias_rva, 5) else {
+        return false;
+    };
+    if jump[0] != 0xe9 {
+        return false;
+    }
+    let displacement = i32::from_le_bytes(jump[1..5].try_into().unwrap());
+    i64::from(alias_rva) + 5 + i64::from(displacement) == i64::from(target_rva)
+}
+
+fn parse_reconciliation(
+    manifest: &[ManifestRow],
+    reconciliation: &str,
+) -> Result<Vec<ReconciliationRow>, String> {
+    for (key, value) in [
+        ("wine-commit", WINE_COMMIT),
+        ("baseline-gap-sha256", EXPECTED_BASELINE_GAP_SHA256),
+        ("architecture", "x86_64"),
+    ] {
+        let expected = format!("# {key}\t{value}");
+        if !reconciliation.lines().any(|line| line == expected) {
+            return Err(format!(
+                "tracked Wine reconciliation is missing {expected:?}"
+            ));
+        }
+    }
+
+    let manifest_by_name: BTreeMap<_, _> = manifest
+        .iter()
+        .map(|row| (row.name.as_str(), row))
+        .collect();
+    let mut rows = Vec::new();
+    let mut previous_name: Option<&str> = None;
+    let mut names = String::new();
+    let mut classification = String::new();
+    for (index, line) in reconciliation.lines().enumerate() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != 11 {
+            return Err(format!(
+                "reconciliation line {} has {} fields",
+                index + 1,
+                fields.len()
+            ));
+        }
+        let name = fields[0];
+        if previous_name.is_some_and(|previous| previous >= name) {
+            return Err(format!(
+                "reconciliation export {name:?} is duplicated or out of order"
+            ));
+        }
+        previous_name = Some(name);
+        let source = manifest_by_name.get(name).ok_or_else(|| {
+            format!("reconciliation export {name:?} is absent from the pinned Wine manifest")
+        })?;
+        if source.wine_extension {
+            return Err(format!(
+                "reconciliation export {name:?} is a Wine host extension"
+            ));
+        }
+        let expected_alias = source.alias.as_deref().unwrap_or("-");
+        if fields[1] != source.kind.as_str()
+            || fields[2] != source.args
+            || fields[3] != source.flags
+            || fields[4] != expected_alias
+        {
+            return Err(format!(
+                "reconciliation export {name:?} disagrees with the pinned kind/ABI/alias row"
+            ));
+        }
+        if fields[5].is_empty()
+            || !fields[5]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!(
+                "reconciliation export {name:?} has invalid group {:?}",
+                fields[5]
+            ));
+        }
+        if !matches!(fields[6], "kernel" | "alias" | "ntdll" | "ntdll-data") {
+            return Err(format!(
+                "reconciliation export {name:?} has invalid owner {:?}",
+                fields[6]
+            ));
+        }
+        if !matches!(
+            fields[7],
+            "wine-spec"
+                | "nt5-source"
+                | "reactos-source"
+                | "reactos-sysfuncs"
+                | "source-override"
+                | "unknown"
+        ) {
+            return Err(format!(
+                "reconciliation export {name:?} has invalid ABI authority {:?}",
+                fields[7]
+            ));
+        }
+        if fields[8] != "unresolved"
+            && fields[8] != "-"
+            && !fields[8].split(',').all(|argument| {
+                valid_argument(argument) || matches!(argument, "u32" | "usize" | "isize")
+            })
+        {
+            return Err(format!(
+                "reconciliation export {name:?} has invalid effective arguments {:?}",
+                fields[8]
+            ));
+        }
+        if !matches!(
+            fields[9],
+            "ntstatus"
+                | "i32"
+                | "i64"
+                | "u32"
+                | "u64"
+                | "isize"
+                | "usize"
+                | "ptr"
+                | "bool"
+                | "void"
+                | "noreturn"
+                | "f64"
+                | "data-i32"
+                | "data-block"
+                | "unresolved"
+        ) {
+            return Err(format!(
+                "reconciliation export {name:?} has invalid return class {:?}",
+                fields[9]
+            ));
+        }
+        let state = match fields[10] {
+            "planned" => ReconciliationState::Planned,
+            "blocked-abi" => ReconciliationState::BlockedAbi,
+            "implemented" => ReconciliationState::Implemented,
+            value => {
+                return Err(format!(
+                    "reconciliation export {name:?} has invalid state {value:?}"
+                ))
+            }
+        };
+        let unresolved =
+            fields[7] == "unknown" || fields[8] == "unresolved" || fields[9] == "unresolved";
+        if unresolved != (state == ReconciliationState::BlockedAbi)
+            || (state == ReconciliationState::BlockedAbi
+                && !(fields[7] == "unknown"
+                    && fields[8] == "unresolved"
+                    && fields[9] == "unresolved"))
+        {
+            return Err(format!(
+                "reconciliation export {name:?} has inconsistent ABI/state classification"
+            ));
+        }
+        let data_export = matches!(fields[9], "data-i32" | "data-block");
+        if data_export && fields[6] != "ntdll-data" {
+            return Err(format!(
+                "reconciliation export {name:?} classifies data under a non-data owner"
+            ));
+        }
+        if name.starts_with("Zw")
+            && (fields[5] != "A-native"
+                || fields[6] != "alias"
+                || expected_alias != format!("Nt{}", &name[2..]))
+        {
+            return Err(format!(
+                "reconciliation export {name:?} is not a canonical native alias"
+            ));
+        }
+        writeln!(names, "{name}").unwrap();
+        writeln!(
+            classification,
+            "{name}\t{}\t{}\t{}\t{}\t{}",
+            fields[5], fields[6], fields[7], fields[8], fields[9]
+        )
+        .unwrap();
+        rows.push(ReconciliationRow {
+            name: name.to_string(),
+            alias: (fields[4] != "-").then(|| fields[4].to_string()),
+            group: fields[5].to_string(),
+            owner: fields[6].to_string(),
+            abi_authority: fields[7].to_string(),
+            effective_args: fields[8].to_string(),
+            return_class: fields[9].to_string(),
+            state,
+        });
+    }
+    if rows.len() != 372 || sha256_hex(names.as_bytes()) != EXPECTED_BASELINE_GAP_SHA256 {
+        return Err(format!(
+            "tracked Wine reconciliation does not cover the exact 372-name baseline gap"
+        ));
+    }
+    if sha256_hex(classification.as_bytes()) != EXPECTED_CLASSIFICATION_SHA256 {
+        return Err("tracked Wine reconciliation classification changed".to_string());
+    }
+    let reconciliation_by_name: BTreeMap<_, _> =
+        rows.iter().map(|row| (row.name.as_str(), row)).collect();
+    for row in rows.iter().filter(|row| row.name.starts_with("Zw")) {
+        let nt_name = format!("Nt{}", &row.name[2..]);
+        let nt_row = reconciliation_by_name
+            .get(nt_name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "native alias {} has no matching reconciliation row {nt_name}",
+                    row.name
+                )
+            })?;
+        if row.state != nt_row.state
+            || row.effective_args != nt_row.effective_args
+            || row.return_class != nt_row.return_class
+        {
+            return Err(format!(
+                "native service {nt_name} and alias {} have different effective ABI or states",
+                row.name
+            ));
+        }
+    }
     Ok(rows)
 }
 
@@ -626,6 +892,7 @@ fn category(name: &str) -> &'static str {
 
 pub fn report(path: &Path) -> Result<String, String> {
     let rows = parse_manifest(TRACKED_MANIFEST)?;
+    let reconciliation = parse_reconciliation(&rows, TRACKED_RECONCILIATION)?;
     let bytes = std::fs::read(path)
         .map_err(|error| format!("cannot read ntdll DLL {}: {error}", path.display()))?;
     let pe = PeFile::parse(&bytes).map_err(|error| format!("cannot parse ntdll DLL: {error:?}"))?;
@@ -633,12 +900,82 @@ pub fn report(path: &Path) -> Result<String, String> {
         .exports()
         .map_err(|error| format!("cannot parse ntdll exports: {error:?}"))?;
     let exported: BTreeSet<_> = exports.iter().map(|export| export.name.as_str()).collect();
+    let exported_by_name: BTreeMap<_, _> = exports
+        .iter()
+        .map(|export| (export.name.as_str(), export))
+        .collect();
+    let export_directory = pe
+        .headers()
+        .data_directory(nt_pe_loader::DIRECTORY_ENTRY_EXPORT);
+    let export_directory_end = export_directory
+        .virtual_address
+        .checked_add(export_directory.size)
+        .ok_or_else(|| "ntdll export directory overflows its RVA range".to_string())?;
+    for row in reconciliation
+        .iter()
+        .filter(|row| row.state == ReconciliationState::Implemented)
+    {
+        let export = exported_by_name.get(row.name.as_str()).ok_or_else(|| {
+            format!(
+                "implemented reconciliation export {} is absent from the DLL",
+                row.name
+            )
+        })?;
+        if export.rva >= export_directory.virtual_address && export.rva < export_directory_end {
+            return Err(format!(
+                "implemented reconciliation export {} is a forwarder",
+                row.name
+            ));
+        }
+        let data_export = matches!(row.return_class.as_str(), "data-i32" | "data-block");
+        let protection = pe.protection_at(export.rva);
+        if data_export && (!protection.writable() || protection.executable()) {
+            return Err(format!(
+                "implemented reconciliation data export {} is not writable non-executable data",
+                row.name
+            ));
+        }
+        if !data_export && !protection.executable() {
+            return Err(format!(
+                "implemented reconciliation function export {} is not executable code",
+                row.name
+            ));
+        }
+        if let Some(alias) = row.alias.as_deref() {
+            if let Some(target) = exported_by_name.get(alias) {
+                if !is_exact_export_alias(&pe, export.rva, target.rva) {
+                    return Err(format!(
+                        "implemented reconciliation alias {} neither shares nor tail-jumps to {alias}'s RVA",
+                        row.name
+                    ));
+                }
+            } else if row.name.starts_with("Zw") {
+                return Err(format!(
+                    "implemented native alias {} has no target export {alias}",
+                    row.name
+                ));
+            }
+        }
+    }
     let windows: Vec<_> = rows.iter().filter(|row| !row.wine_extension).collect();
     let missing: Vec<_> = windows
         .iter()
         .copied()
         .filter(|row| !exported.contains(row.name.as_str()))
         .collect();
+    let current_missing: BTreeSet<_> = missing.iter().map(|row| row.name.as_str()).collect();
+    let catalog_open: BTreeSet<_> = reconciliation
+        .iter()
+        .filter(|row| row.state != ReconciliationState::Implemented)
+        .map(|row| row.name.as_str())
+        .collect();
+    if current_missing != catalog_open {
+        let unclassified: Vec<_> = current_missing.difference(&catalog_open).copied().collect();
+        let stale: Vec<_> = catalog_open.difference(&current_missing).copied().collect();
+        return Err(format!(
+            "Wine reconciliation drift: unclassified missing={unclassified:?}, stale open={stale:?}"
+        ));
+    }
     let mut categories: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for row in &missing {
         categories
@@ -689,6 +1026,61 @@ pub fn report(path: &Path) -> Result<String, String> {
     )
     .unwrap();
     writeln!(output, "missing wine names: {}", missing.len()).unwrap();
+    for state in [
+        ReconciliationState::Planned,
+        ReconciliationState::BlockedAbi,
+        ReconciliationState::Implemented,
+    ] {
+        let label = match state {
+            ReconciliationState::Planned => "planned",
+            ReconciliationState::BlockedAbi => "blocked-abi",
+            ReconciliationState::Implemented => "implemented",
+        };
+        writeln!(
+            output,
+            "reconciliation {label}: {}",
+            reconciliation
+                .iter()
+                .filter(|row| row.state == state)
+                .count()
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "reconciliation groups/owners/abi-authorities: {}/{}/{}",
+        reconciliation
+            .iter()
+            .map(|row| row.group.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        reconciliation
+            .iter()
+            .map(|row| row.owner.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        reconciliation
+            .iter()
+            .map(|row| row.abi_authority.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "reconciliation effective-argument/return shapes: {}/{}",
+        reconciliation
+            .iter()
+            .map(|row| row.effective_args.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        reconciliation
+            .iter()
+            .map(|row| row.return_class.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+    )
+    .unwrap();
     for (category, names) in categories {
         writeln!(
             output,
@@ -816,5 +1208,73 @@ mod tests {
             EXPECTED_HANDLER_ALIASES
         );
         assert_eq!(rows.iter().filter(|row| !row.wine_extension).count(), 1_461);
+    }
+
+    #[test]
+    fn tracked_manifest_rows_are_cryptographically_bound() {
+        let tampered = TRACKED_MANIFEST.replacen("NtClose\tstdcall", "NtClose\tcdecl", 1);
+        assert!(parse_manifest(&tampered).is_err());
+    }
+
+    #[test]
+    fn reconciliation_catalog_covers_and_classifies_the_exact_baseline_gap() {
+        let manifest = parse_manifest(TRACKED_MANIFEST).unwrap();
+        let rows = parse_reconciliation(&manifest, TRACKED_RECONCILIATION).unwrap();
+        assert_eq!(rows.len(), 372);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.state == ReconciliationState::Planned)
+                .count(),
+            366
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.state == ReconciliationState::BlockedAbi)
+                .count(),
+            6
+        );
+        assert_eq!(rows.iter().filter(|row| row.owner == "kernel").count(), 71);
+        assert_eq!(rows.iter().filter(|row| row.owner == "alias").count(), 71);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.group.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            49
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.name == "_vsnprintf_s")
+                .map(|row| {
+                    (
+                        row.abi_authority.as_str(),
+                        row.effective_args.as_str(),
+                        row.return_class.as_str(),
+                    )
+                }),
+            Some(("source-override", "ptr,usize,usize,str,ptr", "i32"))
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.name == "_fltused").map(|row| {
+                (
+                    row.owner.as_str(),
+                    row.abi_authority.as_str(),
+                    row.return_class.as_str(),
+                )
+            }),
+            Some(("ntdll-data", "source-override", "data-i32"))
+        );
+    }
+
+    #[test]
+    fn native_service_and_alias_states_cannot_diverge() {
+        let manifest = parse_manifest(TRACKED_MANIFEST).unwrap();
+        let tampered = TRACKED_RECONCILIATION.replacen(
+            "NtAccessCheckByTypeAndAuditAlarm\tstdcall\tptr,long,ptr,ptr,ptr,ptr,long,long,long,ptr,long,ptr,long,ptr,ptr,ptr\tsyscall=0x0059\t-\tK-security\tkernel\twine-spec\tptr,long,ptr,ptr,ptr,ptr,long,long,long,ptr,long,ptr,long,ptr,ptr,ptr\tntstatus\tplanned",
+            "NtAccessCheckByTypeAndAuditAlarm\tstdcall\tptr,long,ptr,ptr,ptr,ptr,long,long,long,ptr,long,ptr,long,ptr,ptr,ptr\tsyscall=0x0059\t-\tK-security\tkernel\twine-spec\tptr,long,ptr,ptr,ptr,ptr,long,long,long,ptr,long,ptr,long,ptr,ptr,ptr\tntstatus\timplemented",
+            1,
+        );
+        assert_ne!(tampered, TRACKED_RECONCILIATION);
+        assert!(parse_reconciliation(&manifest, &tampered).is_err());
     }
 }

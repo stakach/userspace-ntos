@@ -20432,10 +20432,32 @@ stubs; those rows identify compatibility names only and do not license stub beha
   `cargo test -p ntdll-dll-verify`; manifest regeneration is byte-for-byte reproducible. The later
   strict export-kind and calling-convention gate remains open until the classified names have real
   implementations.
-- [ ] Reconcile each missing name against NT5, ReactOS, Wine, and the Windows-visible caller ABI.
+- [x] Reconcile each missing name against NT5, ReactOS, Wine, and the Windows-visible caller ABI.
   Record ABI, ownership, supported information classes, observable failures, and whether the body is
   a user-mode ntdll routine or requires a real kernel mechanism. A Wine stub is an implementation
   gap to close, not behavior to copy.
+
+  Wine reconciliation checkpoint (2026-08-31): the checked
+  `tools/ntdll-dll-verify/fixtures/wine-ntdll-reconciliation-2ecc2f84.tsv` catalog assigns every
+  one of the 372 baseline gaps to exactly one of 49 implementation slices and records its frozen
+  kind/arguments/flags/alias, effective arguments and return/data class, owner, ABI authority, and
+  implementation state. The verifier checks the exact tracked-manifest, baseline-name, and
+  classification hashes, joins every row back to the pinned manifest, rejects Wine extensions, and
+  makes `--wine-report` fail if the current PE frontier and catalog states drift. An implemented
+  transition also rejects forwarders, enforces executable-function versus writable-data shape,
+  validates exported handler aliases, and couples every native Nt/Zw pair's state. Ownership
+  resolves to 71 real native services, the corresponding 71 `Zw` aliases, 227 user-mode routines,
+  and 3 ntdll data/TLS exports.
+
+  `docs/ntdll-wine-reconciliation.md` records the group contracts, supported information classes,
+  observable failure boundaries, fixed ReactOS SSNs, project-owned extension constraints,
+  source-specific ABI overrides, prerequisites, and implementation order. Wine host syscall
+  ordinals are explicitly excluded. Six names remain intentionally `blocked-abi`: the five bare
+  legacy CSR stub rows plus `RtlSetPropertyClassId` lack a defensible callable prototype across the
+  three references. They remain absent until a native symbol/caller oracle resolves them; this is a
+  fail-closed reconciliation result, not an implementation fallback. Local validation passes the
+  nine `ntdll-dll-verify` tests and the exact current Wine report with 366 planned, 6 ABI-blocked,
+  and 0 implemented frontier rows.
 - [ ] Complete missing `Nt*` services only through the shared `nt-syscall-abi` table and genuine
   executive/object/VM/I/O/security/IPC semantics. Add the corresponding `Zw*` alias in the same
   slice. Do not allocate new syscall numbers from Wine's host-specific numbering and do not add
