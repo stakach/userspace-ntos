@@ -888,7 +888,8 @@ static HOSTED_HAL_TRANSLATE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_HAL_TRANSLATE_TRACE_CAP: u64 = 32;
 static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_MMIO_MAP_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_MMIO_MAP_SUCCESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_MMIO_MAP_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
 const HOSTED_MMIO_MAP_TRACE_CAP: u64 = 32;
 static HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3683,7 +3684,12 @@ fn print_hex64(value: u64) {
 }
 
 fn trace_hosted_mm_map_io_space(phys: u64, length: u64, cache: u32, result: u64, decision: &[u8]) {
-    let trace = HOSTED_MMIO_MAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    let counter = if result == 0 {
+        &HOSTED_MMIO_MAP_FAILURE_TRACE_COUNT
+    } else {
+        &HOSTED_MMIO_MAP_SUCCESS_TRACE_COUNT
+    };
+    let trace = counter.fetch_add(1, Ordering::Relaxed);
     if trace >= HOSTED_MMIO_MAP_TRACE_CAP {
         return;
     }

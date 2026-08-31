@@ -20723,6 +20723,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     extend the appropriate bus/provider contract. Five unrelated generic-hardware/NDIS gates remain
     open; Mup `IoCheckShareAccess` remains queued behind this causal ACPI mapping slice.
 
+    Diagnostic review adjustment: `.tmp/run-headless-acpi-mmio-diagnostic-20260901.log` proved the
+    first 32 mappings were legitimate assigned table/component ranges, but those successes consumed
+    the original shared trace budget before the later null result. Successful and failed map calls
+    now have independent bounded counters, so ordinary firmware-table traffic cannot suppress the
+    first denied request. No authority or mapping behavior changed in this diagnostic correction.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
