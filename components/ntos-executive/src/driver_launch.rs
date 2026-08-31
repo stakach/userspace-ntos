@@ -51110,16 +51110,12 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
 
         // VideoPort forwards this IRP to the PDO first. A PnP miniport without legacy access
         // ranges (including bochsmp) leaves the returned requirements list unchanged.
-        return match hosted_root_bus_mut()
+        let (status, information) = hosted_root_bus_mut()
             .dispatch_pnp_outcome(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor)
-        {
-            nt_root_bus::RootPdoPnpDispatch::Handled(status) => PnpBackendDispatch::Returned {
-                status: nt_status::NtStatus(status),
-                information: 0,
-            },
-            nt_root_bus::RootPdoPnpDispatch::Unhandled => PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            },
+            .completion_or(irp.status.raw(), irp.information);
+        return PnpBackendDispatch::Returned {
+            status: nt_status::NtStatus(status),
+            information,
         };
     }
     let Some(start) = parameters.start_parameters() else {

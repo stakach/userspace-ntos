@@ -2036,6 +2036,8 @@ mod tests {
             minor: 0,
             flags: StackFlags::empty(),
             control: StackControl::empty(),
+            status: NtStatus::PENDING,
+            information: 0,
             parameters,
             buffer: None,
             user_data: 0,
@@ -2057,6 +2059,8 @@ mod tests {
         record.id = IrpId::new(3, 1);
         record.origin_driver_id = origin_driver;
         record.origin_minor = 0xee;
+        record.status = NtStatus::NOT_SUPPORTED;
+        record.information = 0x1234;
         let mut current =
             IoStackLocation::new(current_driver, major::IRP_MJ_WRITE, current_device, None);
         current.minor = 9;
@@ -2076,6 +2080,8 @@ mod tests {
         assert_eq!(projection.minor, 9);
         assert_eq!(projection.flags, StackFlags::CASE_SENSITIVE);
         assert_eq!(projection.control, StackControl::INVOKE_ON_ERROR);
+        assert_eq!(projection.status, NtStatus::NOT_SUPPORTED);
+        assert_eq!(projection.information, 0x1234);
         assert_eq!(projection.parameters, current.parameters);
         assert_eq!((projection.stack_location, projection.stack_count), (0, 1));
 
@@ -2469,6 +2475,34 @@ mod tests {
         }
     }
 
+    struct PreservePnpIoStatusBackend;
+
+    impl DriverDispatchBackend for PreservePnpIoStatusBackend {
+        fn dispatch_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            _irp: &IrpProjection,
+        ) -> Result<DispatchOutcome, NtStatus> {
+            panic!("canonical PnP dispatch bypassed the specialized backend method")
+        }
+
+        fn dispatch_pnp_irp(
+            &mut self,
+            _ctx: DispatchContext<'_>,
+            irp: &IrpProjection,
+        ) -> PnpBackendDispatch {
+            assert_eq!(irp.minor, nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS);
+            PnpBackendDispatch::Returned {
+                status: irp.status,
+                information: irp.information,
+            }
+        }
+
+        fn cancel_irp(&mut self, _irp_id: IrpId) -> Result<(), NtStatus> {
+            Err(NtStatus::NOT_SUPPORTED)
+        }
+    }
+
     struct ReturnedFailurePnpBackend;
 
     impl DriverDispatchBackend for ReturnedFailurePnpBackend {
@@ -2789,6 +2823,26 @@ mod tests {
             not_dispatched_io.irp(not_dispatched_id).unwrap().state,
             IrpState::Indeterminate
         );
+    }
+
+    #[test]
+    fn prepared_filter_can_return_the_preserved_pnp_io_status() {
+        let mut io = io();
+        let (client, root, _, _) = pnp_test_stack(&mut io, Box::new(PreservePnpIoStatusBackend));
+        let parameters = PnpParameters::filter_resource_requirements(4).unwrap();
+        let prepared = io
+            .prepare_external_pnp_to_device(client, root, 0, parameters, &[1, 2, 3, 4])
+            .unwrap();
+        let irp_id = prepared.irp_id();
+
+        assert_eq!(
+            io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Returned {
+                status: NtStatus::NOT_SUPPORTED,
+                information: 0,
+            }
+        );
+        assert!(io.irp(irp_id).is_none());
     }
 
     #[test]

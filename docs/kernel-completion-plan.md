@@ -21079,6 +21079,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     gate. Desktop restoration remains a separate acceptance requirement after the B3 driver batch is
     terminal.
 
+    B3 VideoPort lower-PDO pass-through correction (2026-09-01, implementation green; runtime
+    pending): the missing bochsmp continuation was an ownership regression introduced when native
+    root-PDO pass-through became explicit. `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` enters the hosted
+    VideoPort FDO, forwards to the lower PDO, and legitimately receives an unhandled optional minor.
+    Classifying that lower result as outer `PnpBackendDispatch::NotDispatched` incorrectly retained
+    the IRP as indeterminate, so the driver batch could never grant resources or issue START.
+
+    `IrpProjection` now carries the canonical current `IO_STATUS_BLOCK` status and information.
+    `RootPdoPnpDispatch::completion_or` preserves both fields for an unhandled lower minor and
+    supplies the bus-owned result for a handled minor. The VideoPort FDO always returns that
+    trustworthy outer completion, leaving the requirements payload unchanged; it neither fabricates
+    success nor loses transport ownership. This restores ReactOS's `STATUS_NOT_SUPPORTED` unchanged-
+    requirements path and also retains the NT5-compatible incoming-status contract.
+
+    Focused acceptance is green: `nt-root-bus` passes 15/15, including the exact filter-minor and
+    status/information preservation case; `nt-io-manager` passes 250/250, including projection and
+    terminal filter-return coverage; `git diff --check` passes; and the freestanding executive check
+    remains green at 209 warnings. Review adjustment: run one serialized graphical boot under the
+    hard one-hour deadline. Require bochsmp filter/grant/START, hosted `Video0`, PDEV creation, real
+    login/profile/userinit/Explorer paint, and retained E1000 ISR/DPC evidence before closing desktop
+    restoration. Terminate QEMU after the sentinel rather than leaving the validation VM running.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

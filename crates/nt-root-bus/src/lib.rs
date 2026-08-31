@@ -57,6 +57,20 @@ impl RootPdoPnpDispatch {
     pub const fn is_handled(self) -> bool {
         matches!(self, Self::Handled(_))
     }
+
+    /// Resolve the lower PDO result into the `IO_STATUS_BLOCK` observed by its caller.
+    /// Handled minors complete with no information; unhandled minors leave both incoming fields
+    /// untouched, as a native PDO does when it declines an optional PnP request.
+    pub const fn completion_or(
+        self,
+        existing_status: i32,
+        existing_information: u64,
+    ) -> (i32, u64) {
+        match self {
+            Self::Handled(status) => (status, 0),
+            Self::Unhandled => (existing_status, existing_information),
+        }
+    }
 }
 
 /// A subset of `DEVICE_CAPABILITIES` (the fields the PnP Manager consults for a root-enumerated
@@ -236,6 +250,8 @@ pub const IRP_MN_QUERY_STOP_DEVICE: u8 = 0x05;
 pub const IRP_MN_CANCEL_STOP_DEVICE: u8 = 0x06;
 /// `IRP_MN_QUERY_DEVICE_RELATIONS` — report a relation set owned by the addressed stack.
 pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 0x07;
+/// `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` — let a stack refine its bus requirements.
+pub const IRP_MN_FILTER_RESOURCE_REQUIREMENTS: u8 = 0x0D;
 /// `IRP_MN_SURPRISE_REMOVAL` — the device was removed unexpectedly.
 pub const IRP_MN_SURPRISE_REMOVAL: u8 = 0x17;
 
@@ -761,7 +777,7 @@ mod tests {
     #[test]
     fn unhandled_pnp_minor_preserves_the_existing_irp_status() {
         let mut b = bus();
-        let dispatch = b.dispatch_pnp_outcome(PRIMARY_PDO, IRP_MN_QUERY_DEVICE_RELATIONS);
+        let dispatch = b.dispatch_pnp_outcome(PRIMARY_PDO, IRP_MN_FILTER_RESOURCE_REQUIREMENTS);
 
         assert_eq!(dispatch, RootPdoPnpDispatch::Unhandled);
         assert!(!dispatch.is_handled());
@@ -769,6 +785,14 @@ mod tests {
         assert_eq!(
             dispatch.status_or(STATUS_NOT_SUPPORTED),
             STATUS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            dispatch.completion_or(STATUS_NOT_SUPPORTED, 0x1234),
+            (STATUS_NOT_SUPPORTED, 0x1234)
+        );
+        assert_eq!(
+            RootPdoPnpDispatch::Handled(STATUS_SUCCESS).completion_or(STATUS_NOT_SUPPORTED, 0x1234),
+            (STATUS_SUCCESS, 0)
         );
     }
 

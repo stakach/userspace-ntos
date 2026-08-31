@@ -94,6 +94,11 @@ pub struct IrpProjection {
     pub minor: u8,
     pub flags: StackFlags,
     pub control: StackControl,
+    /// The current `IRP.IoStatus.Status`. PnP stacks use this to preserve the incoming
+    /// `STATUS_NOT_SUPPORTED` result when a lower driver does not handle an optional minor.
+    pub status: NtStatus,
+    /// The current `IRP.IoStatus.Information`, preserved alongside `status` on pass-through.
+    pub information: u64,
     pub parameters: IoParameters,
     pub buffer: Option<IoBufferRef>,
     pub user_data: u64,
@@ -118,6 +123,8 @@ impl IrpProjection {
             minor: stack.minor,
             flags: stack.flags,
             control: stack.control,
+            status: record.status,
+            information: record.information,
             parameters: stack.parameters.clone(),
             buffer: record.buffer,
             user_data: record.user_data,
