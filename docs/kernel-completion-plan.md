@@ -20389,7 +20389,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     B3 runtime acceptance remains open. The stale desktop QEMU that had run for more than 20 hours
     was terminated; it was not useful boot-progress evidence. `run.sh` now owns every desktop and
     headless validation through `scripts/run_with_timeout.py`, preserves the log, returns 124 on
-    timeout, and imposes a hard 3,600-second boot-validation limit. The next acceptance run must prove
+    timeout, and imposes a hard 3,600-second boot-validation limit. Desktop validation monitors only
+    bytes appended to its freshly truncated serial log and disarms that deadline after the real
+    `exec_explorer_shell_chrome_painted` pass marker, so the limit governs boot progress rather than
+    healthy system uptime. Interrupt, termination, hangup, and quit signals are forwarded to the
+    exact child process group; cleanup escalates from TERM to KILL after five seconds and never uses
+    a broad QEMU process-name kill. Four focused runner tests cover timeout status, fresh and stale
+    readiness evidence, and a marker split across serial writes. The next acceptance run must prove
     real route publication, then remove and re-add one of two NICs without disturbing its sibling,
     with no PCI config-line or synthetic interrupt fallback. Multi-segment PCI remains a later
     ownership extension: the live boot authority currently installs the discovered segment-zero

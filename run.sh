@@ -51,6 +51,15 @@ run_boot_lane() {
     -- "$@"
 }
 
+run_desktop_boot_lane() {
+  python3 "$ROOT/scripts/run_with_timeout.py" \
+    --seconds "$BOOT_TIMEOUT_SECONDS" \
+    --cwd "$RM" \
+    --ready-file "$RUN_LOG" \
+    --ready-text 'PASS exec_explorer_shell_chrome_painted' \
+    -- "$@"
+}
+
 BOOT_IMAGE="$RM/.tmp/disk.img"
 
 ensure_no_qemu_lane_running() {
@@ -211,16 +220,17 @@ if [ "$GRAPHICS" = 1 ]; then
   say "      Watch for the ReactOS desktop background (a blue-grey field, 0x003a6ea5)."
   mkdir -p "$ROOT/.tmp"
   RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-desktop-$(date +%Y%m%d-%H%M%S).log}"
+  : > "$RUN_LOG"
   say "      Serial log streams here and to: $RUN_LOG"
-  say "      Boot validation timeout: ${BOOT_TIMEOUT_SECONDS}s (hard maximum: 3600s)."
+  say "      Boot readiness timeout: ${BOOT_TIMEOUT_SECONDS}s (disarmed after Explorer paint)."
   say "      Close the QEMU window to quit."
   # In graphics mode run_specs drops isa-debug-exit, so QEMU stays alive with the
   # painted desktop until the user closes the window (exit status is the window's).
   set +e
   if [ "${#PASSTHRU[@]}" -gt 0 ]; then
-    run_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee "$RUN_LOG"
+    run_desktop_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee -a "$RUN_LOG"
   else
-    run_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh 2>&1 | tee "$RUN_LOG"
+    run_desktop_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
   fi
   rc=${PIPESTATUS[0]}
   set -e
@@ -235,15 +245,21 @@ say "      Boot validation timeout: ${BOOT_TIMEOUT_SECONDS}s (hard maximum: 3600
 #   host exit 3 = kernel qemu_exit(0) = PASS ((0<<1|1)<<1|1),  255 = panic.
 mkdir -p "$ROOT/.tmp"
 RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-headless-$(date +%Y%m%d-%H%M%S).log}"
+: > "$RUN_LOG"
 set +e
 if [ "${#PASSTHRU[@]}" -gt 0 ]; then
-  run_boot_lane ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee "$RUN_LOG"
+  run_boot_lane ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee -a "$RUN_LOG"
 else
-  run_boot_lane ./scripts/run_specs.sh 2>&1 | tee "$RUN_LOG"
+  run_boot_lane ./scripts/run_specs.sh 2>&1 | tee -a "$RUN_LOG"
 fi
 rc=${PIPESTATUS[0]}
 set -e
 echo
+if [ "$rc" = 124 ]; then
+  err "FAILED — boot validation exceeded ${BOOT_TIMEOUT_SECONDS}s; QEMU was terminated."
+  err "         Log: $RUN_LOG"
+  exit 124
+fi
 summary="$(sed -n \
   's/.*\[ntos-exec summary: \([0-9][0-9]*\)\/\([0-9][0-9]*\) executive->isolated-service checks passed\].*/\1 \2/p' \
   "$RUN_LOG" | tail -n 1)"
