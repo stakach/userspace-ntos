@@ -17,6 +17,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
 - Do not add fallback success paths. Missing behavior should return the real failure and get tracked.
 - Prefer host-testable crates for registry, VAD, cache, security, and service metadata before wiring
   behavior into the executive.
+- Use `references/nt5`, `references/reactos`, and `references/wine` as complementary implementation
+  evidence. NT object, syscall, and kernel ownership semantics remain the boundary; ReactOS supplies
+  the hosted client contract, while Wine broadens user-mode ABI and behavioral coverage without
+  moving compatibility policy into the kernel.
 - Replace old machinery when a dynamic path supersedes it. Do not leave parallel special cases behind.
 - Validate one build/spec path at a time; do not run kernel builds or boot specs in parallel.
 - Commit each green, meaningful slice.
@@ -20080,3 +20084,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     through full-path METHOD_EX, and only then prepare the authenticated catalog source. Move the
     new relation helper block into a focused same-namespace source file while extending these phases
     so `driver_launch.rs` does not continue absorbing ACPI-specific transport code.
+
+## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
+
+Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
+reference is Wine `master` commit `2ecc2f84b45ec42afbf1725d756181180a8204b1`; future coverage
+measurements must record the exact Wine commit so changes in `dlls/ntdll/ntdll.spec` cannot silently
+move the target.
+
+The initial x86-64 inventory contains 1,477 unique applicable Wine spec rows. Sixteen explicit
+`__wine_*`/`wine_*` host-runtime extensions are not Windows ntdll ABI and are excluded, leaving
+1,461 Windows-visible names. The current built `.tmp/nt-ntdll.dll` exports 1,372 names and covers
+1,089 of that Wine surface, leaving 372 names to classify and implement: 75 `Nt*`, 71 `Zw*`, 109
+`Rtl*`, 35 `Tp*`, 9 `Ldr*`, 5 `Csr*`, 2 `ApiSet*`, 4 `Ntdll*`, 3 `WinSqm*`, and 59 CRT/data names.
+These are export-directory measurements, not source grep counts. Wine marks 101 applicable rows as
+stubs; those rows identify compatibility names only and do not license stub behavior here.
+
+- [ ] Add a checked parser and reproducible verifier mode for Wine's spec grammar, x86-64
+  architecture predicates, aliases, calling conventions, data exports, and the explicit Wine
+  extension exclusion. Freeze the Wine commit and categorized missing-name report in verifier
+  output; never make the ignored local reference tree a build prerequisite.
+- [ ] Reconcile each missing name against NT5, ReactOS, Wine, and the Windows-visible caller ABI.
+  Record ABI, ownership, supported information classes, observable failures, and whether the body is
+  a user-mode ntdll routine or requires a real kernel mechanism. A Wine stub is an implementation
+  gap to close, not behavior to copy.
+- [ ] Complete missing `Nt*` services only through the shared `nt-syscall-abi` table and genuine
+  executive/object/VM/I/O/security/IPC semantics. Add the corresponding `Zw*` alias in the same
+  slice. Do not allocate new syscall numbers from Wine's host-specific numbering and do not add
+  success fallbacks.
+- [ ] Complete `Rtl*`, `Ldr*`, `Tp*`, `Csr*`, API-set, CRT, and data exports in the host-testable
+  ntdll crates wherever kernel authority is unnecessary. Keep loader, thread-pool, synchronization,
+  and process-start policy in user mode; add kernel support only for an actual NT primitive.
+- [ ] Gate the built PE export table against all 1,461 Windows-visible Wine names, with exact ABI
+  checks for data/function kind, aliases, x86-64 calling convention, and dispatcher entry points.
+  Retain the existing zero-missing ReactOS staged-tree gate throughout the expansion.
+- [ ] Add behavior tests by subsystem before wiring each group into the target DLL, then run the
+  serialized ntdll verifier and genuine ReactOS desktop boot. Completion requires real semantics,
+  a clean repository, and no Wine extensions, kernel policy, synthetic results, or fallback paths.
