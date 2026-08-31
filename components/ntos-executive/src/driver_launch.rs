@@ -44117,41 +44117,43 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
 fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, DriverInstance, u64)> {
     if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
         let inst = instance(binding.instance)?;
-        if inst.driver_id != binding.driver_id {
+        let projection_inst = instance(binding.projection_instance)?;
+        if inst.driver_id != binding.driver_id
+            || instance_domain_identity(projection_inst) != Some(binding.projection_domain)
+            || io_manager_mut().hosted_domain_identity(binding.projection_domain.domain_id)
+                != Some(binding.projection_domain)
+        {
             return None;
         }
-        let domain = instance_domain_identity(inst)?;
-        let (delete_pending, driver_id, device_object) = {
+        let (delete_pending, driver_id) = {
             let device = io_manager_mut().device(nt_io_manager::DeviceId(device_id))?;
-            (
-                device.delete_pending,
-                device.driver_id.raw(),
-                device.object_id.0,
-            )
+            (device.delete_pending, device.driver_id.raw())
         };
+        let device_object = io_manager_mut().hosted_device_address_by_identity(
+            binding.projection_domain,
+            nt_io_manager::DeviceId(device_id),
+        )?;
         if delete_pending
             || driver_id != binding.driver_id
             || device_object != binding.device_object
-            || io_manager_mut().hosted_device_by_identity(domain, binding.device_object)
-                != Some(nt_io_manager::DeviceId(device_id))
         {
             return None;
         }
         return Some((binding.instance, inst, binding.device_object));
     }
 
-    let (driver_id, device_object) = {
+    let driver_id = {
         let device = io_manager_mut().device(nt_io_manager::DeviceId(device_id))?;
-        if device.delete_pending || device.object_id == ObjectId::NULL {
+        if device.delete_pending {
             return None;
         }
-        (device.driver_id.raw(), device.object_id.0)
+        device.driver_id.raw()
     };
     let (instance_index, inst) = instance_by_driver_id(driver_id)?;
     let domain = instance_domain_identity(inst)?;
-    (io_manager_mut().hosted_device_by_identity(domain, device_object)
-        == Some(nt_io_manager::DeviceId(device_id)))
-    .then_some((instance_index, inst, device_object))
+    let device_object = io_manager_mut()
+        .hosted_device_address_by_identity(domain, nt_io_manager::DeviceId(device_id))?;
+    Some((instance_index, inst, device_object))
 }
 
 unsafe fn hosted_power_devnode_by_device_object(device_object: u64) -> Option<u64> {

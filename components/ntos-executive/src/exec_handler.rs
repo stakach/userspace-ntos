@@ -35008,16 +35008,10 @@ impl ExecNtHandler {
                 }
                 // Throttle repeated server-pipe diagnostics. RPC servers legitimately create many
                 // instances; a few samples are enough to prove the FCB route without dominating the log.
-                {
+                let trace_create = {
                     let n = NAMED_PIPE_LOG_COUNT[self.pi & 7].fetch_add(1, Ordering::Relaxed);
-                    if n < 3 {
-                        print_str(b"[nt-create-named-pipe] pi=");
-                        print_u64(self.pi as u64);
-                        print_str(b" leaf=");
-                        print_str(&nm_ascii);
-                        print_str(b"\n");
-                    }
-                }
+                    n < 3
+                };
 
                 let name_hash = nt_io_manager::pipe_name_hash(leaf);
                 let dispatch = self.npfs_create_file(
@@ -35051,6 +35045,20 @@ impl ExecNtHandler {
                 let Some(publication) = publication else {
                     return STATUS_PENDING;
                 };
+
+                if trace_create {
+                    print_str(b"[nt-create-named-pipe] pi=");
+                    print_u64(self.pi as u64);
+                    print_str(b" leaf=");
+                    print_str(&nm_ascii);
+                    print_str(b" status=0x");
+                    print_hex(publication.status);
+                    print_str(b" info=");
+                    print_u64(publication.information);
+                    print_str(b" handle=0x");
+                    print_hex(publication.handle as u32);
+                    print_str(b"\n");
+                }
 
                 if self.pi >= 2 {
                     self.queue_write(file_handle_out, publication.handle);
