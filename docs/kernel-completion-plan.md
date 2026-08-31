@@ -20085,6 +20085,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     new relation helper block into a focused same-namespace source file while extending these phases
     so `driver_launch.rs` does not continue absorbing ACPI-specific transport code.
 
+    B3 filtered ACPI PCI namespace transport checkpoint (2026-08-31, implementation green): every
+    accepted PCI-root PDO now runs exact multilevel NameSeg-filtered `_ADR` followed by `_PRT`
+    enumeration before its BusRelations transaction can publish. The resumable state machine uses
+    the standard 17-byte filtered input, accepts an exact successful empty eight-byte result, and
+    retries only a strictly larger bounded size from a valid overflow header with zero Information.
+    Exact successful retries require Information to equal the retained output length and parse a
+    canonical, unique, bounded match set. Allocation failures remain retryable; malformed results,
+    duplicate phases, changed endpoints, and noncanonical paths are hard barriers.
+
+    Synchronous and pending dispatch share the same classifier. Pending completion revalidates the
+    live authenticated hosted PDO endpoint plus IRP/client/origin/completion-driver/completion-device
+    identity, File-less device-control shape, IOCTL, 17-byte input, and exact retained output length;
+    it copies the complete system buffer and acknowledges the IRP before advancing. The resulting
+    `_ADR`/`_PRT` sets feed the host-tested `plan_acpi_pci_scope_methods` policy and remain private to
+    the relation transaction. No catalog or route fact publishes from a partial discovery. New
+    transport helpers live in focused same-namespace `hosted_acpi_pci_relation.rs` rather than
+    further growing `driver_launch.rs`.
+
+    Validation is green for the freestanding executive at the unchanged 209-warning baseline,
+    `nt-acpi` 31/31, `nt-pnp` 56/56, formatting, and `git diff --check`. Review adjustment: evaluate
+    every planned `_ADR` through exact full-path `IOCTL_ACPI_EVAL_METHOD_EX`, retain its integer
+    against the matching canonical scope, and assemble one complete authenticated
+    `AcpiPciScopeSource`. Prepare catalog replacement before durable Configuration Manager mutation
+    and commit it only at the existing relation transaction boundary; `_PRT` and link `_CRS`
+    evaluation follows after scope resolution.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
