@@ -893,6 +893,7 @@ static HOSTED_HAL_TRANSLATE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_HAL_TRANSLATE_TRACE_CAP: u64 = 32;
 static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_INTERRUPT_BROKER_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_MMIO_MAP_SUCCESS_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_MMIO_MAP_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
@@ -10612,11 +10613,9 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         // original buffered-I/O allocation while completing a queued read.
         let sysbuf = read_unaligned((irp + 0x18) as *const u64);
         let irp_flags = read_unaligned((irp + 0x10) as *const u32);
-        let length = nt_io_manager::completion_output_transfer_len(
-            information,
-            target.output_capacity,
-        )
-        .min(u32::MAX as u64) as usize;
+        let length =
+            nt_io_manager::completion_output_transfer_len(information, target.output_capacity)
+                .min(u32::MAX as u64) as usize;
         let source = if length == 0 {
             0
         } else if target.completion_source_kind == COMPLETION_SOURCE_REQUEST_DATA {
@@ -33221,9 +33220,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let post_call_irp_status =
         read_unaligned((irp + WDM_X64_IRP_IO_STATUS_STATUS_OFFSET) as *const u32);
     let post_call_irp_information = read_unaligned((irp + 0x38) as *const u64);
-    let post_call_owner_kind = hosted_irp_state_kind(
-        pending_irp_owner_state(owner_node).load(Ordering::Acquire),
-    );
+    let post_call_owner_kind =
+        hosted_irp_state_kind(pending_irp_owner_state(owner_node).load(Ordering::Acquire));
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IRP) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_IOSL) as *mut u64, 0);
     write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DATA) as *mut u64, 0);
@@ -36940,9 +36938,9 @@ unsafe fn classify_hosted_acpi_namespace_result(
             .flatten()
         {
             Some(required) => HostedNamespaceDisposition::RetryExact(required),
-            None => HostedNamespaceDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ),
+            None => {
+                HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+            }
         };
     }
     if !status.is_success() {
@@ -36954,9 +36952,7 @@ unsafe fn classify_hosted_acpi_namespace_result(
     }
     let Some(payload) = hosted_acpi_namespace_success_payload(output_len, information, payload)
     else {
-        return HostedNamespaceDisposition::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        );
+        return HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     match nt_acpi::parse_namespace_children(payload, HOSTED_ACPI_NAMESPACE_MAX_CHILDREN)
         .map(HostedAcpiNamespaceState::Present)
@@ -41152,25 +41148,65 @@ fn current_hosted_device_dispatch_binding(instance: usize) -> Option<HostedDevic
     })
 }
 
+#[derive(Clone, Copy)]
+enum HostedProjectionBindingRejection {
+    ContextTable,
+    Context,
+    DriverInstance,
+    ProjectionInstance,
+    CanonicalBinding,
+    DriverNotReady,
+    ProjectionDomain,
+}
+
+impl HostedProjectionBindingRejection {
+    fn name(self) -> &'static [u8] {
+        match self {
+            Self::ContextTable => b"binding-context-table",
+            Self::Context => b"binding-context",
+            Self::DriverInstance => b"binding-driver-instance",
+            Self::ProjectionInstance => b"binding-projection-instance",
+            Self::CanonicalBinding => b"binding-canonical",
+            Self::DriverNotReady => b"binding-driver-ready",
+            Self::ProjectionDomain => b"binding-projection-domain",
+        }
+    }
+}
+
 fn current_hosted_device_dispatch_binding_for_projection(
     projection_instance: usize,
-) -> Option<HostedDeviceBinding> {
-    let contexts = unsafe { (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS)).as_ref()? };
+) -> Result<HostedDeviceBinding, HostedProjectionBindingRejection> {
+    let contexts = unsafe {
+        (*core::ptr::addr_of!(HOSTED_DEVICE_DISPATCH_CONTEXTS))
+            .as_ref()
+            .ok_or(HostedProjectionBindingRejection::ContextTable)?
+    };
     let binding = contexts
         .iter()
         .rev()
         .find(|context| {
             context.instance == projection_instance
                 || context.binding.projection_instance == projection_instance
-        })?
+        })
+        .ok_or(HostedProjectionBindingRejection::Context)?
         .binding;
-    let inst = instance_by_driver_id(binding.driver_id)?.1;
-    let projection = instance(binding.projection_instance)?;
-    (hosted_device_binding_by_device_id(binding.device_id) == Some(binding)
-        && inst.ready
-        && projection.ready
-        && instance_domain_identity(projection) == Some(binding.projection_domain))
-    .then_some(binding)
+    let inst = instance_by_driver_id(binding.driver_id)
+        .ok_or(HostedProjectionBindingRejection::DriverInstance)?
+        .1;
+    let projection = instance(binding.projection_instance)
+        .ok_or(HostedProjectionBindingRejection::ProjectionInstance)?;
+    if hosted_device_binding_by_device_id(binding.device_id) != Some(binding) {
+        return Err(HostedProjectionBindingRejection::CanonicalBinding);
+    }
+    if !inst.ready {
+        return Err(HostedProjectionBindingRejection::DriverNotReady);
+    }
+    // A shared provider need not be independently dispatch-ready while it is servicing this
+    // authenticated nested channel; its live instance and domain identity are the authority here.
+    if instance_domain_identity(projection) != Some(binding.projection_domain) {
+        return Err(HostedProjectionBindingRejection::ProjectionDomain);
+    }
+    Ok(binding)
 }
 
 const EMPTY_HOSTED_DEVICE_BINDING: HostedDeviceBinding = HostedDeviceBinding {
@@ -41338,6 +41374,104 @@ struct HostedIrqLine {
     shared: bool,
     handler_cap: u64,
     notification_cap: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum HostedInterruptConnectionRejection {
+    Driver = 1,
+    Instance = 2,
+    ProjectionDomain = 3,
+    Line = 4,
+    Vector = 5,
+    ResourceVector = 6,
+    ServiceRoutine = 7,
+    ServiceContext = 8,
+    TriggerMode = 9,
+    Sharing = 10,
+    RouteAuthority = 11,
+}
+
+impl HostedInterruptConnectionRejection {
+    fn name(self) -> &'static [u8] {
+        match self {
+            Self::Driver => b"driver",
+            Self::Instance => b"instance",
+            Self::ProjectionDomain => b"projection-domain",
+            Self::Line => b"line",
+            Self::Vector => b"vector",
+            Self::ResourceVector => b"resource-vector",
+            Self::ServiceRoutine => b"service-routine",
+            Self::ServiceContext => b"service-context",
+            Self::TriggerMode => b"trigger-mode",
+            Self::Sharing => b"sharing",
+            Self::RouteAuthority => b"route-authority",
+        }
+    }
+}
+
+fn validate_hosted_interrupt_connection(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    route: nt_resource_manager::ConnectedInterrupt,
+) -> Result<(), HostedInterruptConnectionRejection> {
+    if state.driver_id != binding.driver_id {
+        return Err(HostedInterruptConnectionRejection::Driver);
+    }
+    if state.instance != binding.instance {
+        return Err(HostedInterruptConnectionRejection::Instance);
+    }
+    if state.projection_domain != binding.projection_domain {
+        return Err(HostedInterruptConnectionRejection::ProjectionDomain);
+    }
+    if state.interrupt_line != route.line {
+        return Err(HostedInterruptConnectionRejection::Line);
+    }
+    if state.evidence.interrupt_vector != route.translated_vector {
+        return Err(HostedInterruptConnectionRejection::Vector);
+    }
+    if route.tokens.vector != route.translated_vector {
+        return Err(HostedInterruptConnectionRejection::ResourceVector);
+    }
+    if route.tokens.service_routine_token != state.evidence.interrupt_routine {
+        return Err(HostedInterruptConnectionRejection::ServiceRoutine);
+    }
+    if route.tokens.service_context_token != state.evidence.interrupt_context {
+        return Err(HostedInterruptConnectionRejection::ServiceContext);
+    }
+    if state.interrupt_latched != (route.mode == nt_hal_abi::INT_MODE_LATCHED) {
+        return Err(HostedInterruptConnectionRejection::TriggerMode);
+    }
+    if state.interrupt_shared != (route.share == nt_hal_abi::SHARE_SHARED) {
+        return Err(HostedInterruptConnectionRejection::Sharing);
+    }
+    if !state.interrupt_route_authoritative {
+        return Err(HostedInterruptConnectionRejection::RouteAuthority);
+    }
+    Ok(())
+}
+
+unsafe fn trace_hosted_interrupt_broker_rejection(
+    reason: &'static [u8],
+    binding: Option<HostedDeviceBinding>,
+    instance_index: Option<usize>,
+) {
+    if HOSTED_INTERRUPT_BROKER_REJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_INTERRUPT_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[hosted-interrupt-broker] reject reason=");
+    print_str(reason);
+    print_str(b" instance=");
+    print_u64(instance_index.map(|index| index as u64).unwrap_or(u64::MAX));
+    if let Some(binding) = binding {
+        print_str(b" device=");
+        print_u64(binding.device_id);
+        print_str(b" projection=");
+        print_u64(binding.projection_instance as u64);
+    }
+    print_str(b"\n");
 }
 
 #[derive(Clone, Copy)]
@@ -43623,18 +43757,12 @@ unsafe fn install_hosted_irq_connection(
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let state = hosted_device_resource_state_by_device_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if state.driver_id != binding.driver_id
-        || state.instance != binding.instance
-        || state.projection_domain != binding.projection_domain
-        || state.interrupt_line != route.line
-        || state.evidence.interrupt_vector != route.translated_vector
-        || route.tokens.vector != route.translated_vector
-        || route.tokens.service_routine_token != state.evidence.interrupt_routine
-        || route.tokens.service_context_token != state.evidence.interrupt_context
-        || state.interrupt_latched != (route.mode == nt_hal_abi::INT_MODE_LATCHED)
-        || state.interrupt_shared != (route.share == nt_hal_abi::SHARE_SHARED)
-        || !state.interrupt_route_authoritative
-    {
+    if let Err(rejection) = validate_hosted_interrupt_connection(binding, state, route) {
+        trace_hosted_interrupt_broker_rejection(
+            rejection.name(),
+            Some(binding),
+            Some(binding.projection_instance),
+        );
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let hardware_route = crate::resolve_platform_ioapic_gsi(route.line)
@@ -47755,15 +47883,30 @@ pub(crate) fn service_hosted_driver_interrupt(
     active_reply_cap: u64,
 ) -> (i32, u64) {
     let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        unsafe {
+            trace_hosted_interrupt_broker_rejection(b"channel", None, None);
+        }
         return (STATUS_ACCESS_DENIED, 0);
     };
-    let Some(binding) = current_hosted_device_dispatch_binding_for_projection(instance_index)
-    else {
-        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
+        Ok(binding) => binding,
+        Err(rejection) => {
+            unsafe {
+                trace_hosted_interrupt_broker_rejection(
+                    rejection.name(),
+                    None,
+                    Some(instance_index),
+                );
+            }
+            return (STATUS_INVALID_DEVICE_REQUEST, 0);
+        }
     };
     if instance_domain_identity(inst) != Some(binding.projection_domain)
         || ch.shared_va != inst.exec_shared_va
     {
+        unsafe {
+            trace_hosted_interrupt_broker_rejection(b"domain", Some(binding), Some(instance_index));
+        }
         return (STATUS_ACCESS_DENIED, 0);
     }
     let sh = ch.shared_va;
@@ -50858,13 +51001,9 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
 
     let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let owner = hosted_resource_owner(binding);
     let connected = hosted_resource_manager_mut()
-        .connect_interrupt(
-            hosted_resource_owner(binding),
-            interrupt_id,
-            service_routine,
-            service_context,
-        )
+        .connect_interrupt(owner, interrupt_id, service_routine, service_context)
         .map_err(hosted_hal_status)?;
     if connected == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);

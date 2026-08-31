@@ -20986,6 +20986,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     manager as authority. Do not manufacture a hardware route, weaken connection ownership, or add
     a driver-specific exception.
 
+    B3 re-entrant provider interrupt-connection checkpoint (2026-09-01, implementation and runtime
+    green): interrupt admission now reports typed, bounded rejection reasons for binding and route
+    authority failures. The common connection validator still requires the canonical driver/device
+    binding, live dependent driver, matching projection domain, exact resource-manager line/vector
+    and service tokens, compatible trigger/share semantics, and an authoritative route.
+
+    The rejected E1000 request exposed one invalid extra precondition: a shared provider projection
+    was required to be independently dispatch-ready even while that same authenticated projection
+    was actively servicing the dependent driver's nested provider call. Provider `ready` describes
+    availability for a new dispatch, not liveness or ownership during an active dispatch. The
+    lookup now admits that active channel while retaining channel-cap authentication, canonical
+    binding identity, dependent-driver readiness, live provider instance/domain identity, the
+    current temporal dispatch owner, and the later resource-manager route checks. No driver,
+    service, or image identity is consulted.
+
+    The freestanding executive check remains green at the established 209-warning baseline and
+    `git diff --check` passes. Serialized proof
+    `.tmp/run-headless-interrupt-provider-active-20260901.log` reached the sentinel in about 90
+    seconds, exited QEMU, and completed under the hard one-hour deadline. E1000's real
+    `IoConnectInterrupt` succeeded, TCP/IP opened `\\Device\\E1000_0000`, and config PnP completed
+    E1000 `StartDevice` successfully. The readiness count remains 253/299 because no real E1000
+    hardware interrupt/ISR/DPC delivery occurred during this workload. The root DMA fixture is
+    separately and correctly rejected as `route-authority`: its interrupt descriptor has no live
+    platform or firmware route owner. The next B3 slices are to drive and verify a genuine E1000
+    hardware interrupt through the installed IOAPIC route, and either connect the root device to
+    real platform routing authority or remove the non-hardware fixture from production boot proof.
+    Do not toggle the authority bit, synthesize an interrupt, or count driver callbacks without a
+    hardware event.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
