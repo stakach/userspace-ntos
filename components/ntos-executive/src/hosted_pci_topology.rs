@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
 use nt_pnp::{
-    AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError, AcpiPciScopeSource,
-    PciDevice, PciInterruptRouteOwner, PciInventory, PciInventoryError,
+    AcpiPciLinkCandidateFact, AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError,
+    AcpiPciScopeSource, PciDevice, PciInterruptRouteOwner, PciInventory, PciInventoryError,
     PreparedAcpiPciScopeCatalogUpdate,
 };
 
@@ -95,16 +95,17 @@ pub(crate) unsafe fn invalidate_hosted_pci_routes_for_relation(
     Ok(true)
 }
 
-pub(crate) unsafe fn prepare_hosted_acpi_pci_relation_sources(
+pub(crate) unsafe fn prepare_hosted_acpi_pci_relation_facts(
     relation_owner: AcpiPciProviderEndpoint,
     sources: &[AcpiPciScopeSource],
+    link_candidates: &[AcpiPciLinkCandidateFact],
 ) -> Result<PreparedAcpiPciScopeCatalogUpdate, nt_status::NtStatus> {
     let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     authority
         .scopes
-        .prepare_replace_relation_sources(relation_owner, sources)
+        .prepare_replace_relation_facts(relation_owner, sources, link_candidates)
         .map_err(scope_status)
 }
 

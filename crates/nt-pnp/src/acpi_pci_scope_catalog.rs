@@ -75,9 +75,19 @@ pub struct AcpiPciScopeSource {
     pub addresses: Vec<AcpiPciAddressScopeFact>,
 }
 
+/// Canonical ACPI object path observed in the same authoritative BusRelations transaction as its
+/// PCI root sources. It carries no PDO or capability identity; METHOD_EX remains rooted at an
+/// authenticated PCI-root endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpiPciLinkCandidateFact {
+    pub relation_owner: AcpiPciProviderEndpoint,
+    pub path: AcpiNamespacePath,
+}
+
 /// One ACPI routing scope correlated to an exact live PCI bus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciResolvedScope {
+    pub relation_owner: AcpiPciProviderEndpoint,
     pub endpoint: AcpiPciProviderEndpoint,
     pub path: AcpiNamespacePath,
     pub segment: u16,
@@ -247,7 +257,8 @@ pub struct PreparedAcpiPciScopeCatalogUpdate {
     base_generation: u64,
     target_generation: u64,
     changed: bool,
-    next: Vec<AcpiPciScopeSource>,
+    next_sources: Vec<AcpiPciScopeSource>,
+    next_link_candidates: Vec<AcpiPciLinkCandidateFact>,
 }
 
 impl PreparedAcpiPciScopeCatalogUpdate {
@@ -264,7 +275,11 @@ impl PreparedAcpiPciScopeCatalogUpdate {
     }
 
     pub fn sources(&self) -> &[AcpiPciScopeSource] {
-        &self.next
+        &self.next_sources
+    }
+
+    pub fn link_candidates(&self) -> &[AcpiPciLinkCandidateFact] {
+        &self.next_link_candidates
     }
 }
 
@@ -301,6 +316,7 @@ impl PreparedAcpiPciScopeResolution {
 pub struct AcpiPciScopeCatalog {
     generation: u64,
     sources: Vec<AcpiPciScopeSource>,
+    link_candidates: Vec<AcpiPciLinkCandidateFact>,
 }
 
 impl AcpiPciScopeCatalog {
@@ -310,6 +326,19 @@ impl AcpiPciScopeCatalog {
 
     pub fn sources(&self) -> &[AcpiPciScopeSource] {
         &self.sources
+    }
+
+    pub fn link_candidates(&self) -> &[AcpiPciLinkCandidateFact] {
+        &self.link_candidates
+    }
+
+    pub fn relation_link_candidates(
+        &self,
+        relation_owner: AcpiPciProviderEndpoint,
+    ) -> impl Iterator<Item = &AcpiPciLinkCandidateFact> {
+        self.link_candidates
+            .iter()
+            .filter(move |candidate| candidate.relation_owner == relation_owner)
     }
 
     pub fn prepare_replace_source(
@@ -328,38 +357,61 @@ impl AcpiPciScopeCatalog {
             next.push(try_clone_source(accepted)?);
         }
         next.push(source);
-        self.prepare_complete(next)
+        self.prepare_complete(next, try_clone_link_candidates(&self.link_candidates)?)
     }
 
-    /// Atomically replace every root source owned by one exact BusRelations publisher. This is the
-    /// relation transaction boundary: omitted endpoints depart, while sources owned by other bus
-    /// endpoints remain untouched.
-    pub fn prepare_replace_relation_sources(
+    /// Atomically replace every PCI root source and link-resolution candidate owned by one exact
+    /// BusRelations publisher. Omitted facts depart, while other publishers remain untouched.
+    pub fn prepare_replace_relation_facts(
         &self,
         relation_owner: AcpiPciProviderEndpoint,
         sources: &[AcpiPciScopeSource],
+        link_candidates: &[AcpiPciLinkCandidateFact],
     ) -> Result<PreparedAcpiPciScopeCatalogUpdate, AcpiPciScopeError> {
         if !relation_owner.is_valid()
             || sources
                 .iter()
                 .any(|source| source.relation_owner != relation_owner)
+            || link_candidates
+                .iter()
+                .any(|candidate| candidate.relation_owner != relation_owner)
+            || (sources.is_empty() && !link_candidates.is_empty())
         {
             return Err(AcpiPciScopeError::InvalidProviderEndpoint);
         }
-        let mut next = Vec::new();
-        next.try_reserve_exact(self.sources.len().saturating_add(sources.len()))
+        let mut next_sources = Vec::new();
+        next_sources
+            .try_reserve_exact(self.sources.len().saturating_add(sources.len()))
             .map_err(|_| AcpiPciScopeError::Allocation)?;
         for accepted in self
             .sources
             .iter()
             .filter(|source| source.relation_owner != relation_owner)
         {
-            next.push(try_clone_source(accepted)?);
+            next_sources.push(try_clone_source(accepted)?);
         }
         for source in sources {
-            next.push(try_clone_source(source)?);
+            next_sources.push(try_clone_source(source)?);
         }
-        self.prepare_complete(next)
+        let mut next_link_candidates = Vec::new();
+        next_link_candidates
+            .try_reserve_exact(
+                self.link_candidates
+                    .len()
+                    .saturating_add(link_candidates.len()),
+            )
+            .map_err(|_| AcpiPciScopeError::Allocation)?;
+        for candidate in self
+            .link_candidates
+            .iter()
+            .filter(|candidate| candidate.relation_owner != relation_owner)
+        {
+            next_link_candidates.push(try_clone_link_candidate(candidate)?);
+        }
+        for candidate in link_candidates {
+            next_link_candidates.push(try_clone_link_candidate(candidate)?);
+        }
+        self.prepare_complete(next_sources, next_link_candidates)
     }
 
     pub fn relation_has_sources(&self, relation_owner: AcpiPciProviderEndpoint) -> bool {
@@ -387,15 +439,17 @@ impl AcpiPciScopeCatalog {
         {
             next.push(try_clone_source(source)?);
         }
-        self.prepare_complete(next)
+        self.prepare_complete(next, try_clone_link_candidates(&self.link_candidates)?)
     }
 
     fn prepare_complete(
         &self,
-        mut next: Vec<AcpiPciScopeSource>,
+        mut next_sources: Vec<AcpiPciScopeSource>,
+        mut next_link_candidates: Vec<AcpiPciLinkCandidateFact>,
     ) -> Result<PreparedAcpiPciScopeCatalogUpdate, AcpiPciScopeError> {
-        canonicalize_catalog(&mut next)?;
-        let changed = next != self.sources;
+        canonicalize_catalog(&mut next_sources)?;
+        canonicalize_link_candidates(&mut next_link_candidates)?;
+        let changed = next_sources != self.sources || next_link_candidates != self.link_candidates;
         let target_generation = if changed {
             self.generation
                 .checked_add(1)
@@ -407,7 +461,8 @@ impl AcpiPciScopeCatalog {
             base_generation: self.generation,
             target_generation,
             changed,
-            next,
+            next_sources,
+            next_link_candidates,
         })
     }
 
@@ -426,7 +481,8 @@ impl AcpiPciScopeCatalog {
             return Err(AcpiPciScopeError::StaleCatalog);
         }
         self.generation = prepared.target_generation;
-        self.sources = prepared.next;
+        self.sources = prepared.next_sources;
+        self.link_candidates = prepared.next_link_candidates;
         Ok(self.generation)
     }
 
@@ -458,8 +514,13 @@ impl AcpiPciScopeCatalog {
             push_resolved_scope(
                 &mut scopes,
                 AcpiPciResolvedScope {
+                    relation_owner: source.relation_owner,
                     endpoint: source.endpoint,
-                    path: source.root.path.clone(),
+                    path: source
+                        .root
+                        .path
+                        .try_clone()
+                        .map_err(|_| AcpiPciScopeError::Allocation)?,
                     segment: source.root.segment,
                     bus: source.root.base_bus,
                     bridge: None,
@@ -502,8 +563,12 @@ impl AcpiPciScopeCatalog {
                 push_resolved_scope(
                     &mut scopes,
                     AcpiPciResolvedScope {
+                        relation_owner: source.relation_owner,
                         endpoint: source.endpoint,
-                        path: address_fact.path.clone(),
+                        path: address_fact
+                            .path
+                            .try_clone()
+                            .map_err(|_| AcpiPciScopeError::Allocation)?,
                         segment: source.root.segment,
                         bus: buses.secondary,
                         bridge: Some(location),
@@ -595,6 +660,31 @@ fn try_clone_source(source: &AcpiPciScopeSource) -> Result<AcpiPciScopeSource, A
     })
 }
 
+fn try_clone_link_candidate(
+    candidate: &AcpiPciLinkCandidateFact,
+) -> Result<AcpiPciLinkCandidateFact, AcpiPciScopeError> {
+    Ok(AcpiPciLinkCandidateFact {
+        relation_owner: candidate.relation_owner,
+        path: candidate
+            .path
+            .try_clone()
+            .map_err(|_| AcpiPciScopeError::Allocation)?,
+    })
+}
+
+fn try_clone_link_candidates(
+    candidates: &[AcpiPciLinkCandidateFact],
+) -> Result<Vec<AcpiPciLinkCandidateFact>, AcpiPciScopeError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(candidates.len())
+        .map_err(|_| AcpiPciScopeError::Allocation)?;
+    for candidate in candidates {
+        cloned.push(try_clone_link_candidate(candidate)?);
+    }
+    Ok(cloned)
+}
+
 fn canonicalize_catalog(sources: &mut [AcpiPciScopeSource]) -> Result<(), AcpiPciScopeError> {
     for source in sources.iter_mut() {
         canonicalize_source(source)?;
@@ -611,6 +701,28 @@ fn canonicalize_catalog(sources: &mut [AcpiPciScopeSource]) -> Result<(), AcpiPc
                 return Err(AcpiPciScopeError::DuplicateNamespacePath);
             }
         }
+    }
+    Ok(())
+}
+
+fn canonicalize_link_candidates(
+    candidates: &mut [AcpiPciLinkCandidateFact],
+) -> Result<(), AcpiPciScopeError> {
+    if candidates
+        .iter()
+        .any(|candidate| !candidate.relation_owner.is_valid())
+    {
+        return Err(AcpiPciScopeError::InvalidProviderEndpoint);
+    }
+    candidates.sort_unstable_by(|left, right| {
+        left.relation_owner
+            .cmp(&right.relation_owner)
+            .then_with(|| left.path.as_str().cmp(right.path.as_str()))
+    });
+    if candidates.windows(2).any(|pair| {
+        pair[0].relation_owner == pair[1].relation_owner && pair[0].path == pair[1].path
+    }) {
+        return Err(AcpiPciScopeError::DuplicateNamespacePath);
     }
     Ok(())
 }
@@ -855,6 +967,14 @@ mod tests {
     fn relation_replacement_is_atomic_and_removes_only_its_departed_roots() {
         let mut catalog = AcpiPciScopeCatalog::default();
         let owner = provider(1);
+        let first_candidate = AcpiPciLinkCandidateFact {
+            relation_owner: owner,
+            path: path("\\_SB_.LNKA"),
+        };
+        let second_candidate = AcpiPciLinkCandidateFact {
+            relation_owner: owner,
+            path: path("\\_SB_.LNKB"),
+        };
         let mut first = source(44);
         first.addresses.clear();
         let mut second = source(45);
@@ -863,12 +983,17 @@ mod tests {
         second.addresses.clear();
 
         let prepared = catalog
-            .prepare_replace_relation_sources(owner, &[first.clone(), second.clone()])
+            .prepare_replace_relation_facts(
+                owner,
+                &[first.clone(), second.clone()],
+                &[first_candidate.clone(), second_candidate.clone()],
+            )
             .unwrap();
         assert!(prepared.changed());
         assert!(catalog.sources().is_empty());
         catalog.commit(prepared).unwrap();
         assert_eq!(catalog.sources().len(), 2);
+        assert_eq!(catalog.link_candidates().len(), 2);
         assert!(catalog.relation_has_sources(owner));
 
         let mut other = source(77);
@@ -880,7 +1005,11 @@ mod tests {
         catalog.commit(prepared).unwrap();
 
         let prepared = catalog
-            .prepare_replace_relation_sources(owner, &[second.clone()])
+            .prepare_replace_relation_facts(
+                owner,
+                &[second.clone()],
+                core::slice::from_ref(&second_candidate),
+            )
             .unwrap();
         assert_eq!(prepared.sources().len(), 2);
         catalog.commit(prepared).unwrap();
@@ -890,13 +1019,88 @@ mod tests {
             .sources()
             .iter()
             .any(|source| source.endpoint == first.endpoint));
+        assert_eq!(
+            catalog.relation_link_candidates(owner).collect::<Vec<_>>(),
+            vec![&second_candidate]
+        );
 
         let prepared = catalog
-            .prepare_replace_relation_sources(owner, &[])
+            .prepare_replace_relation_facts(owner, &[], &[])
             .unwrap();
         catalog.commit(prepared).unwrap();
         assert_eq!(catalog.sources(), &[other]);
+        assert!(catalog.relation_link_candidates(owner).next().is_none());
         assert!(!catalog.relation_has_sources(owner));
+    }
+
+    #[test]
+    fn link_candidates_share_the_relation_transaction_and_catalog_generation() {
+        let owner = provider(1);
+        let mut facts = source(44);
+        facts.addresses.clear();
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let first = AcpiPciLinkCandidateFact {
+            relation_owner: owner,
+            path: path("\\_SB_.LNKA"),
+        };
+        let prepared = catalog
+            .prepare_replace_relation_facts(
+                owner,
+                core::slice::from_ref(&facts),
+                core::slice::from_ref(&first),
+            )
+            .unwrap();
+        catalog.commit(prepared).unwrap();
+        assert_eq!(catalog.generation(), 1);
+
+        let same = catalog
+            .prepare_replace_relation_facts(
+                owner,
+                core::slice::from_ref(&facts),
+                core::slice::from_ref(&first),
+            )
+            .unwrap();
+        assert!(!same.changed());
+        catalog.commit(same).unwrap();
+        assert_eq!(catalog.generation(), 1);
+
+        let replacement = AcpiPciLinkCandidateFact {
+            relation_owner: owner,
+            path: path("\\_SB_.LNKB"),
+        };
+        let changed = catalog
+            .prepare_replace_relation_facts(
+                owner,
+                core::slice::from_ref(&facts),
+                core::slice::from_ref(&replacement),
+            )
+            .unwrap();
+        assert!(changed.changed());
+        catalog.commit(changed).unwrap();
+        assert_eq!(catalog.generation(), 2);
+        assert_eq!(catalog.link_candidates(), &[replacement.clone()]);
+
+        let duplicate = [replacement.clone(), replacement];
+        assert_eq!(
+            catalog.prepare_replace_relation_facts(
+                owner,
+                core::slice::from_ref(&facts),
+                &duplicate,
+            ),
+            Err(AcpiPciScopeError::DuplicateNamespacePath)
+        );
+        let cross_relation = AcpiPciLinkCandidateFact {
+            relation_owner: provider(2),
+            path: path("\\_SB_.LNKC"),
+        };
+        assert_eq!(
+            catalog.prepare_replace_relation_facts(
+                owner,
+                core::slice::from_ref(&facts),
+                &[cross_relation],
+            ),
+            Err(AcpiPciScopeError::InvalidProviderEndpoint)
+        );
     }
 
     #[test]

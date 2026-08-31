@@ -9,6 +9,7 @@ use crate::{
 /// One exact full-path `_PRT` evaluation derived from accepted ACPI and PCI topology facts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciRoutingMethodQuery {
+    pub relation_owner: AcpiPciProviderEndpoint,
     pub endpoint: AcpiPciProviderEndpoint,
     pub scope: AcpiNamespacePath,
     pub method_path: AcpiNamespacePath,
@@ -170,6 +171,7 @@ impl AcpiPciScopeCatalog {
                         _ => AcpiPciScopeError::InvalidFilteredMethod,
                     })?;
             queries.push(AcpiPciRoutingMethodQuery {
+                relation_owner: scope.relation_owner,
                 endpoint: scope.endpoint,
                 scope: owner,
                 method_path,

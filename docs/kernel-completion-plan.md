@@ -20197,6 +20197,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     input, and retained output identity remains exact. Second overflow, BUFFER_TOO_SMALL,
     zero-Information success, missing method, or any other terminal status is a hard barrier.
 
+    B3 relation-scoped ACPI link-candidate checkpoint (2026-08-31, implementation green): the
+    source-only catalog transaction has been removed. The same inert relation replacement now owns
+    both PCI root/scope sources and canonical ACPI object paths observed from each accepted child in
+    that BusRelations transaction. Candidate facts retain only relation owner plus namespace path;
+    no sibling PDO, stale capability, or synthetic link endpoint enters route authority. Omitted
+    candidates depart atomically with omitted roots, candidate-only semantic changes advance the
+    catalog generation, other relation publishers remain untouched, and duplicate or cross-relation
+    facts fail closed.
+
+    Resolved scopes and `_PRT` queries now retain the exact relation owner so a link name can resolve
+    only against objects published by its own ACPI relation. Full-path `_CRS` evaluation will still
+    run through the authenticated PCI-root endpoint. The executive assembles candidates fallibly
+    from already validated relation-local namespace self paths before Configuration Manager
+    mutation, retains them in the prepared catalog update, and commits them at the existing
+    devnode/BusRelations/catalog transaction boundary. Scope resolution also uses fallible path
+    copies throughout. Focused `nt-pnp` validation passes 60/60; the freestanding executive check
+    remains green at 209 warnings.
+
+    Review adjustment: route reconciliation must union these relation-wide object candidates with
+    filtered `_CRS` owners discovered below each root endpoint. This covers ordinary ACPI link PDOs
+    outside a PCI subtree without weakening exact scope-up resolution, while still allowing
+    namespace-only descendant methods. Resolve each `_PRT` source against candidates from its exact
+    relation owner, deduplicate transport by root endpoint plus canonical method path, and retain
+    separate per-table bindings so coincident device/pin/name tuples on different buses never become
+    false duplicates.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

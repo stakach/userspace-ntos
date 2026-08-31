@@ -35552,6 +35552,7 @@ unsafe fn retain_hosted_relation_query_barrier(
         reported_children: Vec::new(),
         child_properties: Vec::new(),
         acpi_pci_scope_sources: Vec::new(),
+        acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
     });
 }
@@ -37419,6 +37420,8 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             .any(|properties| properties.acpi_namespace == HostedAcpiNamespaceState::Unqueried)
         || (!query.acpi_pci_scope_sources.is_empty()
             && query.acpi_pci_catalog_update.is_none())
+        || (!query.acpi_pci_link_candidates.is_empty()
+            && query.acpi_pci_catalog_update.is_none())
         || query
             .reported_children
             .iter()
@@ -38799,7 +38802,8 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                             )
                         });
                         sources_staged
-                            && (query.acpi_pci_scope_sources.is_empty()
+                            && ((query.acpi_pci_scope_sources.is_empty()
+                                && query.acpi_pci_link_candidates.is_empty())
                                 || query.acpi_pci_catalog_update.is_some())
                     });
                 if !ready {
@@ -38909,6 +38913,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         reported_children: Vec::new(),
         child_properties: Vec::new(),
         acpi_pci_scope_sources: Vec::new(),
+        acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
     });
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
@@ -41343,6 +41348,7 @@ struct HostedDeviceRelationQuery {
     reported_children: Vec<nt_pnp_manager::BusReportedChild>,
     child_properties: Vec<HostedBusChildProperties>,
     acpi_pci_scope_sources: Vec<nt_pnp::AcpiPciScopeSource>,
+    acpi_pci_link_candidates: Vec<nt_pnp::AcpiPciLinkCandidateFact>,
     acpi_pci_catalog_update: Option<nt_pnp::PreparedAcpiPciScopeCatalogUpdate>,
 }
 

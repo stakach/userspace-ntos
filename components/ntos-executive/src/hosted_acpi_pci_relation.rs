@@ -775,6 +775,7 @@ unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
             .as_mut()
             .unwrap();
         if !query.acpi_pci_scope_sources.is_empty()
+            || !query.acpi_pci_link_candidates.is_empty()
             || query.acpi_pci_catalog_update.is_some()
             || query.child_properties.iter().any(|properties| {
                 properties.acpi_pci_scope_discovery
@@ -793,10 +794,49 @@ unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
     if sources.try_reserve_exact(source_count).is_err() {
         return false;
     }
+    let candidate_count = if source_count == 0 {
+        0
+    } else {
+        (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_ref()
+            .map(|query| {
+                query
+                    .child_properties
+                    .iter()
+                    .filter(|properties| {
+                        matches!(properties.acpi_namespace, HostedAcpiNamespaceState::Present(_))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let mut link_candidates = Vec::new();
+    if link_candidates.try_reserve_exact(candidate_count).is_err() {
+        return false;
+    }
+    if source_count != 0 {
+        let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_ref()
+            .unwrap();
+        for properties in &query.child_properties {
+            if let HostedAcpiNamespaceState::Present(namespace) = &properties.acpi_namespace {
+                let Ok(path) = namespace.self_path().try_clone() else {
+                    return false;
+                };
+                link_candidates.push(nt_pnp::AcpiPciLinkCandidateFact {
+                    relation_owner,
+                    path,
+                });
+            }
+        }
+    }
     let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()
         .unwrap();
-    if !query.acpi_pci_scope_sources.is_empty() || query.acpi_pci_catalog_update.is_some() {
+    if !query.acpi_pci_scope_sources.is_empty()
+        || !query.acpi_pci_link_candidates.is_empty()
+        || query.acpi_pci_catalog_update.is_some()
+    {
         query.phase = HostedDeviceRelationQueryPhase::Barrier;
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
@@ -830,6 +870,7 @@ unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
         return true;
     }
     query.acpi_pci_scope_sources = sources;
+    query.acpi_pci_link_candidates = link_candidates;
     query.phase = HostedDeviceRelationQueryPhase::PrepareAcpiPciCatalogUpdate;
     true
 }
@@ -845,9 +886,14 @@ unsafe fn prepare_hosted_acpi_pci_catalog_update() -> bool {
         .as_ref()
         .map(|query| query.acpi_pci_scope_sources.as_slice())
         .unwrap_or(&[]);
-    let prepared = match crate::hosted_pci_topology::prepare_hosted_acpi_pci_relation_sources(
+    let link_candidates = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .map(|query| query.acpi_pci_link_candidates.as_slice())
+        .unwrap_or(&[]);
+    let prepared = match crate::hosted_pci_topology::prepare_hosted_acpi_pci_relation_facts(
         relation_owner,
         sources,
+        link_candidates,
     ) {
         Ok(prepared) => prepared,
         Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => return false,
