@@ -387,6 +387,7 @@ pub(crate) struct AcpiPortAuthority {
     pub(crate) resource_index: u8,
     pub(crate) base: u64,
     pub(crate) length: u32,
+    pub(crate) platform_reset: bool,
 }
 
 pub(crate) struct PreparedAcpiPlatformAuthority {
@@ -570,7 +571,7 @@ unsafe fn discover_acpi_platform_authority_inner(
     }
     let mut ports = Vec::new();
     ports
-        .try_reserve_exact(discovery.fixed_registers.len())
+        .try_reserve_exact(discovery.fixed_registers.len().saturating_add(1))
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for block in &discovery.fixed_registers {
         match block.address_space {
@@ -585,6 +586,32 @@ unsafe fn discover_acpi_platform_authority_inner(
                     resource_index: ports.len() as u8,
                     base: block.address,
                     length: block.length as u32,
+                    platform_reset: false,
+                });
+            }
+            _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
+        }
+    }
+    if let Some(reset) = discovery.fixed.reset_register {
+        match reset.address_space {
+            nt_acpi::ADDRESS_SPACE_SYSTEM_MEMORY => {
+                writable_ranges.push(nt_acpi::PhysicalRange {
+                    start: reset.address,
+                    length: reset.length as u64,
+                });
+            }
+            nt_acpi::ADDRESS_SPACE_SYSTEM_IO => {
+                if ports.iter().any(|port| {
+                    port.base < reset.address + reset.length as u64
+                        && reset.address < port.base + port.length as u64
+                }) {
+                    return Err(nt_status::NtStatus::CONFLICTING_ADDRESSES);
+                }
+                ports.push(AcpiPortAuthority {
+                    resource_index: ports.len() as u8,
+                    base: reset.address,
+                    length: reset.length as u32,
+                    platform_reset: true,
                 });
             }
             _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),

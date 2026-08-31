@@ -20663,6 +20663,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ACPI START result. Do not grant the ACPI domain arbitrary ports or skip the privileged
     instruction. Mup `IoCheckShareAccess` remains queued behind this causal ACPI slice.
 
+    B3 FADT reset-authority checkpoint (2026-09-01, implementation green): serialized proof
+    `.tmp/run-headless-acpi-fadt-fixed-20260901.log` completed in about 104 seconds, rendered the
+    genuine Explorer desktop, and exited through the sentinel at 294/299 checks. The expanded ACPI
+    START resource list grew from 264 to 360 bytes, but admission failed before dispatch with
+    `STATUS_INVALID_DEVICE_REQUEST`. The exact conflict was the firmware FADT reset byte at
+    `0xCF9` overlapping the executive's exclusive legacy PCI configuration reservation
+    `[0xCF8,0xD00)`. Dropping the reset register would make ACPICA `AcpiReset` incomplete, while
+    making either range generally shared would weaken the hardware boundary.
+
+    `nt-acpi` now keeps the flag-gated reset register distinct from coalesced runtime fixed-register
+    blocks. The ACPI platform context preserves that semantic provenance through PnP selection, and
+    the generic resource manager accepts an overlap only through an explicit child resource-id
+    delegation from a live containing parent resource. Both raw and translated child ranges must be
+    contained, unrelated overlap still fails, replay verifies the same provenance, and releasing or
+    revoking the parent recursively revokes its delegated port assignments. The executive requests
+    that delegation only for the exact firmware-described reset register; all other FADT ports use
+    ordinary exclusive resource admission and exact component caps. `nt-resource-manager` passes
+    15/15, `nt-acpi` passes 34/34, the freestanding executive check is green at the unchanged
+    209-warning baseline, and `git diff --check` passes. Runtime acceptance remains open until the
+    next serialized boot proves both the delegated reset admission and the real PM1a `in ax,dx`
+    fault at `0x604` complete through the bounded port broker.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

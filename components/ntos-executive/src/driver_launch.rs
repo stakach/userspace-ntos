@@ -95,7 +95,7 @@ use nt_kernel_exec::{
     SEMAPHORE_OBJECT,
 };
 use nt_mdl::MdlRegistry;
-use nt_resource_manager::{HalError, ResourceManager, ResourceOwner};
+use nt_resource_manager::{HalError, PortResourceDelegation, ResourceManager, ResourceOwner};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 use nt_video_miniport::{
@@ -49519,6 +49519,9 @@ pub(crate) struct HostedPortResourceGrant {
     pub flags: u16,
     pub share: u8,
     pub pci_flags: u32,
+    /// The exact firmware FADT reset register, which may require a bounded sublease from a
+    /// platform-owned legacy port range.
+    pub platform_reset: bool,
 }
 
 unsafe fn rollback_staged_hosted_resource_grant(
@@ -49615,6 +49618,8 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 .any(|prior| prior.resource_index == grant.resource_index)
             || grant.length == 0
             || last > u16::MAX as u64
+            || grant.platform_reset && grant.pci_flags != 0
+            || grant.platform_reset && ports[..index].iter().any(|prior| prior.platform_reset)
             || !matches!(
                 grant.share,
                 nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
@@ -49662,6 +49667,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     let mut assignments = Vec::new();
     assignments
         .try_reserve_exact(memory.len() + ports.len() + usize::from(interrupt_vector != 0))
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let mut port_delegations = Vec::new();
+    port_delegations
+        .try_reserve_exact(ports.len())
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let map_cap_count = memory
         .iter()
@@ -49917,6 +49926,61 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             );
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         };
+        if resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT {
+            let Some(grant) = ports
+                .iter()
+                .find(|grant| grant.resource_index == resource.resource_index)
+            else {
+                rollback_staged_hosted_resource_grant(
+                    binding,
+                    instance_index,
+                    inst,
+                    &mut issued_port_caps,
+                );
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            };
+            let Some(resource_end) = resource.translated_start.checked_add(resource.len) else {
+                rollback_staged_hosted_resource_grant(
+                    binding,
+                    instance_index,
+                    inst,
+                    &mut issued_port_caps,
+                );
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            };
+            let platform_end = PLATFORM_PCI_CONFIG_PORT_BASE + PLATFORM_PCI_CONFIG_PORT_LEN;
+            let overlaps_platform = resource.translated_start < platform_end
+                && PLATFORM_PCI_CONFIG_PORT_BASE < resource_end;
+            if grant.platform_reset && overlaps_platform {
+                let Some(raw_end) = resource.raw_start.checked_add(resource.len) else {
+                    rollback_staged_hosted_resource_grant(
+                        binding,
+                        instance_index,
+                        inst,
+                        &mut issued_port_caps,
+                    );
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                };
+                if resource.raw_start < PLATFORM_PCI_CONFIG_PORT_BASE
+                    || resource.translated_start < PLATFORM_PCI_CONFIG_PORT_BASE
+                    || raw_end > platform_end
+                    || resource_end > platform_end
+                {
+                    rollback_staged_hosted_resource_grant(
+                        binding,
+                        instance_index,
+                        inst,
+                        &mut issued_port_caps,
+                    );
+                    return Err(nt_status::NtStatus::CONFLICTING_ADDRESSES);
+                }
+                port_delegations.push(PortResourceDelegation {
+                    parent_owner: PLATFORM_RESOURCE_OWNER,
+                    parent_resource_id: PLATFORM_PCI_CONFIG_PORT_RESOURCE_ID,
+                    resource_id,
+                });
+            }
+        }
         assignments.push(nt_hal_abi::HalResourceDescriptor {
             kind: if resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY {
                 nt_hal_abi::RES_KIND_MEMORY
@@ -49987,7 +50051,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         });
     }
     if let Err(error) = hosted_resource_manager_mut()
-        .replace_owner_assignments(hosted_resource_owner(binding), &assignments)
+        .replace_owner_assignments_with_port_delegations(
+            hosted_resource_owner(binding),
+            &assignments,
+            &port_delegations,
+        )
     {
         rollback_staged_hosted_resource_grant(binding, instance_index, inst, &mut issued_port_caps);
         return Err(hosted_hal_status(error));

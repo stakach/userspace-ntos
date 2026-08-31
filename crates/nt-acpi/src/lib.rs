@@ -362,7 +362,9 @@ pub struct AcpiPlatformResources {
     pub interrupt_overrides: Vec<LegacyIrqOverride>,
     /// Page-normalized, sorted, non-overlapping extents containing every discovered table.
     pub firmware_memory: Vec<PhysicalRange>,
-    /// Sorted, coalesced SystemMemory/SystemIO blocks described by the FADT fixed-hardware fields.
+    /// Sorted, coalesced SystemMemory/SystemIO blocks used by the ACPI runtime. The reset register
+    /// remains separate in [`FixedAcpiDescription`] because it is a platform-control authority and
+    /// must not be widened by coalescing it with ordinary fixed-register access.
     pub fixed_registers: Vec<RegisterBlock>,
 }
 
@@ -544,7 +546,6 @@ fn normalized_fixed_registers(
         fixed.pm1b_control,
         fixed.pm2_control,
         fixed.pm_timer,
-        fixed.reset_register,
         fixed.sleep_control,
         fixed.sleep_status,
     ]
@@ -976,6 +977,12 @@ mod tests {
         assert_eq!(parsed.gpe0.unwrap().enable.address, 0xfed8_0004);
         assert_eq!(parsed.gpe1.unwrap().base_event, 32);
         assert_eq!(parsed.reset_register.unwrap().address, 0xcf9);
+        assert!(normalized_fixed_registers(&parsed)
+            .unwrap()
+            .iter()
+            .all(|block| !(block.address_space == ADDRESS_SPACE_SYSTEM_IO
+                && block.address <= 0xcf9
+                && 0xcf9 < block.address + block.length as u64)));
     }
 
     #[test]

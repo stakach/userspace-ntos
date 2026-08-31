@@ -14597,6 +14597,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             flags: translated.flags,
             share: translated.share,
             pci_flags: 1,
+            platform_reset: false,
         });
     }
     let resource_grant = driver_launch::grant_hosted_device_resources(
@@ -14876,6 +14877,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
             flags: translated.flags,
             share: translated.share,
             pci_flags: 0,
+            platform_reset: resource.platform_reset,
         });
     }
     driver_launch::grant_hosted_device_resources(
@@ -21340,6 +21342,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
             resource_index: resource.resource_index,
             base: resource.base,
             len: resource.length,
+            platform_reset: resource.platform_reset,
         });
     }
     if let Some(window) = HostedPnpPlatformResourceDescriptor::new(

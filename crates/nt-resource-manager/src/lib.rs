@@ -39,6 +39,16 @@ impl ResourceOwner {
     }
 }
 
+/// Explicit authority for one device-owned port resource to occupy a subrange of a live platform
+/// reservation. This is intentionally resource-id based: address overlap alone never delegates
+/// authority.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PortResourceDelegation {
+    pub parent_owner: ResourceOwner,
+    pub parent_resource_id: u64,
+    pub resource_id: u64,
+}
+
 /// Why a resource operation was rejected (spec §6.1, §15.2, §22).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HalError {
@@ -103,6 +113,7 @@ struct PortResource {
     flags: u16,
     share: u16,
     revoked: bool,
+    delegated_from: Option<(ResourceOwner, u64)>,
 }
 
 struct Mapping {
@@ -174,6 +185,21 @@ fn ranges_overlap(first_start: u64, first_len: u64, second_start: u64, second_le
 
 fn range_contains_address(start: u64, length: u64, address: u64) -> bool {
     length != 0 && address >= start && address - start < length
+}
+
+fn range_contains_range(
+    outer_start: u64,
+    outer_len: u64,
+    inner_start: u64,
+    inner_len: u64,
+) -> bool {
+    let Some(outer_end) = outer_start.checked_add(outer_len) else {
+        return false;
+    };
+    let Some(inner_end) = inner_start.checked_add(inner_len) else {
+        return false;
+    };
+    inner_len != 0 && inner_start >= outer_start && inner_end <= outer_end
 }
 
 /// The canonical resource assignment store.
@@ -296,8 +322,39 @@ impl ResourceManager {
         owner: ResourceOwner,
         assignments: &[HalResourceDescriptor],
     ) -> Result<(), HalError> {
-        if self.query_resources(owner) == assignments {
+        self.replace_owner_assignments_with_port_delegations(owner, assignments, &[])
+    }
+
+    /// Atomically replace one device's assignments while admitting only the listed port subleases.
+    ///
+    /// Each delegation must name a live parent port resource, and the child's raw and translated
+    /// ranges must both be contained by that resource. Any unlisted overlap remains a conflict.
+    pub fn replace_owner_assignments_with_port_delegations(
+        &mut self,
+        owner: ResourceOwner,
+        assignments: &[HalResourceDescriptor],
+        port_delegations: &[PortResourceDelegation],
+    ) -> Result<(), HalError> {
+        if self.query_resources(owner) == assignments
+            && self.port_delegations_match(owner, assignments, port_delegations)
+        {
             return Ok(());
+        }
+
+        for (index, delegation) in port_delegations.iter().enumerate() {
+            if delegation.parent_owner == owner
+                || delegation.parent_resource_id == 0
+                || delegation.resource_id == 0
+                || port_delegations[..index]
+                    .iter()
+                    .any(|prior| prior.resource_id == delegation.resource_id)
+                || !assignments.iter().any(|assignment| {
+                    assignment.kind == RES_KIND_PORT
+                        && assignment.resource_id == delegation.resource_id
+                })
+            {
+                return Err(HalError::ConflictingAddress);
+            }
         }
 
         let mut memory = Vec::new();
@@ -378,6 +435,36 @@ impl ResourceManager {
                     if raw_end > u16::MAX as u64 || translated_end > u16::MAX as u64 {
                         return Err(HalError::InvalidRange);
                     }
+                    let delegated_from = if let Some(delegation) = port_delegations
+                        .iter()
+                        .find(|delegation| delegation.resource_id == descriptor.resource_id)
+                    {
+                        let parent = self
+                            .ports
+                            .iter()
+                            .find(|parent| {
+                                !parent.revoked
+                                    && parent.owner == delegation.parent_owner
+                                    && parent.resource_id == delegation.parent_resource_id
+                            })
+                            .ok_or(HalError::NotAssigned)?;
+                        if !range_contains_range(
+                            parent.raw_start,
+                            parent.length,
+                            descriptor.raw_start,
+                            descriptor.length,
+                        ) || !range_contains_range(
+                            parent.translated_start,
+                            parent.length,
+                            descriptor.translated_start,
+                            descriptor.length,
+                        ) {
+                            return Err(HalError::OutOfRange);
+                        }
+                        Some((parent.owner, parent.resource_id))
+                    } else {
+                        None
+                    };
                     let candidate = PortResource {
                         resource_id: descriptor.resource_id,
                         owner,
@@ -387,8 +474,15 @@ impl ResourceManager {
                         flags: descriptor.flags,
                         share: descriptor.share,
                         revoked: false,
+                        delegated_from,
                     };
                     if self.ports.iter().any(|existing| {
+                        let delegated_parent = candidate.delegated_from.is_some_and(
+                            |(parent_owner, parent_resource_id)| {
+                                existing.owner == parent_owner
+                                    && existing.resource_id == parent_resource_id
+                            },
+                        );
                         existing.owner != owner
                             && !existing.revoked
                             && ranges_overlap(
@@ -399,6 +493,7 @@ impl ResourceManager {
                             )
                             && (candidate.share == SHARE_EXCLUSIVE
                                 || existing.share == SHARE_EXCLUSIVE)
+                            && !delegated_parent
                     }) || ports.iter().any(|existing: &PortResource| {
                         ranges_overlap(
                             candidate.translated_start,
@@ -505,6 +600,45 @@ impl ResourceManager {
         Ok(())
     }
 
+    fn port_delegations_match(
+        &self,
+        owner: ResourceOwner,
+        assignments: &[HalResourceDescriptor],
+        delegations: &[PortResourceDelegation],
+    ) -> bool {
+        if delegations.iter().enumerate().any(|(index, delegation)| {
+            delegation.parent_owner == owner
+                || delegation.parent_resource_id == 0
+                || delegation.resource_id == 0
+                || delegations[..index]
+                    .iter()
+                    .any(|prior| prior.resource_id == delegation.resource_id)
+        }) {
+            return false;
+        }
+        assignments
+            .iter()
+            .filter(|assignment| assignment.kind == RES_KIND_PORT)
+            .all(|assignment| {
+                let expected = delegations
+                    .iter()
+                    .find(|delegation| delegation.resource_id == assignment.resource_id)
+                    .map(|delegation| (delegation.parent_owner, delegation.parent_resource_id));
+                self.ports.iter().any(|port| {
+                    port.owner == owner
+                        && port.resource_id == assignment.resource_id
+                        && !port.revoked
+                        && port.delegated_from == expected
+                })
+            })
+            && delegations.iter().all(|delegation| {
+                assignments.iter().any(|assignment| {
+                    assignment.kind == RES_KIND_PORT
+                        && assignment.resource_id == delegation.resource_id
+                })
+            })
+    }
+
     fn live_resource_id_owned_by_other(&self, owner: ResourceOwner, resource_id: u64) -> bool {
         self.memory.iter().any(|resource| {
             !resource.revoked && resource.resource_id == resource_id && resource.owner != owner
@@ -569,6 +703,7 @@ impl ResourceManager {
             flags: 0,
             share: SHARE_EXCLUSIVE,
             revoked: false,
+            delegated_from: None,
         };
         if let Some(existing) = self
             .ports
@@ -597,7 +732,37 @@ impl ResourceManager {
             return Err(HalError::WrongOwner);
         }
         port.revoked = true;
+        self.revoke_orphaned_port_delegations();
         Ok(())
+    }
+
+    fn revoke_orphaned_port_delegations(&mut self) -> usize {
+        let mut revoked = 0;
+        loop {
+            let mut changed = false;
+            for index in 0..self.ports.len() {
+                let Some((parent_owner, parent_resource_id)) = self.ports[index].delegated_from
+                else {
+                    continue;
+                };
+                if self.ports[index].revoked {
+                    continue;
+                }
+                let parent_live = self.ports.iter().any(|parent| {
+                    !parent.revoked
+                        && parent.owner == parent_owner
+                        && parent.resource_id == parent_resource_id
+                });
+                if !parent_live {
+                    self.ports[index].revoked = true;
+                    revoked += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return revoked;
+            }
+        }
     }
 
     fn revoke_memory_resource_usage(&mut self, resource_id: u64) {
@@ -926,6 +1091,7 @@ impl ResourceManager {
                 port_resources += 1;
             }
         }
+        port_resources += self.revoke_orphaned_port_delegations();
         let mut interrupt_resources = 0;
         for i in self.interrupts_res.iter_mut() {
             if i.owner == owner && !i.revoked {
@@ -1063,6 +1229,53 @@ mod tests {
         assert_eq!(port.length, 2);
         assert_eq!(rm.release_port(owner, 300), Ok(()));
         assert_eq!(rm.claim_port(other, 301, 0x1cf, 2), Ok(()));
+    }
+
+    #[test]
+    fn port_delegation_requires_a_live_containing_parent_and_revokes_with_it() {
+        let mut rm = ResourceManager::new();
+        let platform = ResourceOwner::new(1, 10, 100);
+        let acpi = ResourceOwner::new(2, 20, 200);
+        rm.claim_port(platform, 300, 0xcf8, 8).unwrap();
+        let reset = HalResourceDescriptor {
+            kind: RES_KIND_PORT,
+            share: SHARE_EXCLUSIVE,
+            resource_id: 301,
+            raw_start: 0xcf9,
+            translated_start: 0xcf9,
+            length: 1,
+            arg0: RIGHT_READ | RIGHT_WRITE,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            rm.replace_owner_assignments(acpi, &[reset]),
+            Err(HalError::ConflictingAddress)
+        );
+        let delegation = PortResourceDelegation {
+            parent_owner: platform,
+            parent_resource_id: 300,
+            resource_id: 301,
+        };
+        assert_eq!(
+            rm.replace_owner_assignments_with_port_delegations(acpi, &[reset], &[delegation]),
+            Ok(())
+        );
+        assert_eq!(rm.query_resources(acpi), alloc::vec![reset]);
+
+        let outside = HalResourceDescriptor {
+            raw_start: 0xd00,
+            translated_start: 0xd00,
+            ..reset
+        };
+        assert_eq!(
+            rm.replace_owner_assignments_with_port_delegations(acpi, &[outside], &[delegation]),
+            Err(HalError::OutOfRange)
+        );
+        assert_eq!(rm.query_resources(acpi), alloc::vec![reset]);
+
+        assert_eq!(rm.release_port(platform, 300), Ok(()));
+        assert!(rm.query_resources(acpi).is_empty());
     }
 
     #[test]

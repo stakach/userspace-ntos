@@ -179,6 +179,7 @@ pub(crate) struct HostedPnpPlatformPortDescriptor {
     pub(crate) resource_index: u8,
     pub(crate) base: u64,
     pub(crate) len: u32,
+    pub(crate) platform_reset: bool,
 }
 
 #[derive(Clone)]
@@ -233,6 +234,10 @@ impl HostedPnpPlatformResourceDescriptor {
                     || ports[..index]
                         .iter()
                         .any(|previous| previous.resource_index == resource.resource_index)
+                    || resource.platform_reset
+                        && ports[..index]
+                            .iter()
+                            .any(|previous| previous.platform_reset)
                     || resource.len == 0
                     || resource
                         .base
