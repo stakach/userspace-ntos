@@ -41344,6 +41344,7 @@ struct HostedDeviceResourceState {
     pci_vendor_device: u32,
     pci_class_rev: u32,
     pci_irq: u32,
+    pci_command_owned_bits: u16,
     io_port_supplemental: bool,
     dma_broker_va: u64,
     dma_frame_base: u64,
@@ -44079,6 +44080,25 @@ unsafe fn clear_hosted_resource_projection(
     // Mask and retire the physical route before revoking the generation's resource assignment or
     // component mappings. A live device must never target a stale ISR projection.
     retire_hosted_irq_connections_for_binding(binding)?;
+    if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
+        if state.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS && state.pci_command_owned_bits != 0
+        {
+            crate::pnp::release_pci_command_for_resources(
+                state.bus_number,
+                state.address,
+                state.pci_command_owned_bits,
+            )?;
+            if let Some(current) = hosted_device_resource_states_mut()
+                .iter_mut()
+                .find(|current| {
+                    current.device_id == binding.device_id
+                        && current.projection_domain == binding.projection_domain
+                })
+            {
+                current.pci_command_owned_bits = 0;
+            }
+        }
+    }
     if let Some((instance, inst)) = instance_by_driver_id(binding.driver_id) {
         let failures = clear_hosted_resource_map_caps_for_device(
             instance,
@@ -45410,6 +45430,9 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pci_vendor_device: read_volatile((sh + SH_RESOURCE_PCI_VENDOR_DEVICE) as *const u32),
         pci_class_rev: read_volatile((sh + SH_RESOURCE_PCI_CLASS_REV) as *const u32),
         pci_irq: read_volatile((sh + SH_RESOURCE_PCI_IRQ) as *const u32),
+        pci_command_owned_bits: previous_state
+            .map(|state| state.pci_command_owned_bits)
+            .unwrap_or(0),
         io_port_supplemental: previous_state
             .map(|state| state.io_port_supplemental)
             .unwrap_or(false),
@@ -50902,6 +50925,47 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         state.pnp_context_lease = Some(pnp_context_lease);
     } else {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if bus_identity.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS {
+        let owned_bits = match crate::pnp::acquire_pci_command_for_resources(
+            bus_identity.bus_number,
+            bus_identity.address,
+            !memory.is_empty(),
+            !ports.is_empty(),
+            mapped_dma_len != 0,
+        ) {
+            Ok(owned_bits) => owned_bits,
+            Err(status) => {
+                rollback_staged_hosted_resource_grant(
+                    binding,
+                    instance_index,
+                    inst,
+                    &mut issued_port_caps,
+                );
+                return Err(status);
+            }
+        };
+        let Some(state) = hosted_device_resource_states_mut()
+            .iter_mut()
+            .find(|state| {
+                state.device_id == binding.device_id
+                    && state.projection_domain == binding.projection_domain
+            })
+        else {
+            let _ = crate::pnp::release_pci_command_for_resources(
+                bus_identity.bus_number,
+                bus_identity.address,
+                owned_bits,
+            );
+            rollback_staged_hosted_resource_grant(
+                binding,
+                instance_index,
+                inst,
+                &mut issued_port_caps,
+            );
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
+        state.pci_command_owned_bits = owned_bits;
     }
     trace_hosted_resource_grant(b"done", device_id, 0, 0);
     Ok(())

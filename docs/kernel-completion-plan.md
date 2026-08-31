@@ -21145,6 +21145,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     receive indication first, because the live NIC already produces ARP traffic but the provider's
     protocol indication counters remain zero.
 
+    B3 PCI command ownership checkpoint (2026-09-01, implementation green; runtime pending): a
+    passive QEMU netdev capture of the accepted image is only the 24-byte pcap header, with no
+    transmitted frames. The ReactOS TCP/IP stack reaches real `NdisSend`, E1000 posts a transmit
+    descriptor backed by the committed IOMMU mapping, but the device never DMA-fetches it. The PCI
+    bus boundary granted memory and DMA resources without enabling the command-register bus-master
+    bit. This is a generic bus resource lifecycle defect, not an NDIS receive-marshalling defect.
+
+    `nt-pnp` now derives the I/O-space, memory-space, and bus-master command bits from a committed
+    assignment and records only bits newly acquired by that assignment. The executive PCI bus
+    mechanism applies those bits after the exact resource generation is published and releases only
+    its owned bits after masking interrupts but before revoking DMA and address mappings. Command
+    writes keep the status half of the shared dword zero so write-one-to-clear PCI status is not
+    replayed. Existing firmware or driver-owned command bits survive teardown, and no device or
+    image identity is consulted. Focused `nt-pnp` validation passes 70/70; the freestanding
+    executive check remains green at the established 209-warning baseline; `git diff --check`
+    passes. Review adjustment: run one serialized graphical boot with a passive QEMU netdev capture
+    under a short operational timeout (and the hard one-hour ceiling), require real E1000 transmit
+    frames plus protocol receive indication, retain desktop paint, and terminate QEMU immediately
+    after the sentinel. If receive becomes live, move its proof from process-global counters to the
+    exact current NDIS miniport/open-binding generation before closing the frontier.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

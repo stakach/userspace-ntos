@@ -96,8 +96,9 @@ const BAR_TYPE_64BIT: u32 = 0x4; // bits[2:1] == 10b => 64-bit memory BAR
 const BAR_PREFETCHABLE: u32 = 0x8;
 const BAR_MEM_ADDR_MASK: u32 = 0xFFFF_FFF0; // memory BAR base = value & ~0xF
 const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC; // I/O BAR base = value & ~0x3
-const PCI_COMMAND_IO_SPACE: u16 = 0x0001;
-const PCI_COMMAND_MEMORY_SPACE: u16 = 0x0002;
+pub const PCI_COMMAND_IO_SPACE: u16 = 0x0001;
+pub const PCI_COMMAND_MEMORY_SPACE: u16 = 0x0002;
+pub const PCI_COMMAND_BUS_MASTER: u16 = 0x0004;
 const PCI_HEADER_TYPE_MASK: u8 = 0x7f;
 const PCI_HEADER_TYPE_DEVICE: u8 = 0;
 const PCI_HEADER_TYPE_BRIDGE: u8 = 1;
@@ -109,6 +110,44 @@ pub const PCI_CLASS_NETWORK: u8 = 0x02;
 pub const PCI_CLASS_DISPLAY: u8 = 0x03;
 pub const PCI_CLASS_BRIDGE: u8 = 0x06;
 pub const PCI_SUBCLASS_PCI_TO_PCI: u8 = 0x04;
+
+/// PCI command-register ownership acquired by one bus resource assignment.
+///
+/// `owned_bits` excludes decodes that were already enabled. Teardown can therefore clear exactly
+/// the bits introduced by this assignment without disturbing firmware or another bus owner.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PciCommandOwnership {
+    pub command: u16,
+    pub owned_bits: u16,
+}
+
+/// Derive and acquire the PCI command bits implied by a committed resource assignment.
+pub fn acquire_pci_command_ownership(
+    current: u16,
+    has_memory: bool,
+    has_ports: bool,
+    has_bus_master_dma: bool,
+) -> PciCommandOwnership {
+    let required = if has_memory {
+        PCI_COMMAND_MEMORY_SPACE
+    } else {
+        0
+    } | if has_ports { PCI_COMMAND_IO_SPACE } else { 0 }
+        | if has_bus_master_dma {
+            PCI_COMMAND_BUS_MASTER
+        } else {
+            0
+        };
+    PciCommandOwnership {
+        command: current | required,
+        owned_bits: required & !current,
+    }
+}
+
+/// Release only the PCI command bits acquired by the corresponding resource assignment.
+pub fn release_pci_command_ownership(current: u16, owned_bits: u16) -> u16 {
+    current & !owned_bits
+}
 
 /// One decoded Base Address Register.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -3162,6 +3201,31 @@ mod tests {
             validate_pci_config_access(0, 0, u32::MAX, 2),
             Err(PciConfigAccessError::InvalidRange)
         );
+    }
+
+    #[test]
+    fn pci_command_ownership_tracks_only_resource_assignment_changes() {
+        let ownership = acquire_pci_command_ownership(0x0142, true, true, true);
+        assert_eq!(ownership.command, 0x0147);
+        assert_eq!(
+            ownership.owned_bits,
+            PCI_COMMAND_IO_SPACE | PCI_COMMAND_BUS_MASTER
+        );
+
+        let driver_updated = ownership.command | 0x0100;
+        assert_eq!(
+            release_pci_command_ownership(driver_updated, ownership.owned_bits),
+            0x0142
+        );
+    }
+
+    #[test]
+    fn pci_command_ownership_does_not_claim_preexisting_decodes() {
+        let current = PCI_COMMAND_IO_SPACE | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER;
+        let ownership = acquire_pci_command_ownership(current, true, true, true);
+        assert_eq!(ownership.command, current);
+        assert_eq!(ownership.owned_bits, 0);
+        assert_eq!(release_pci_command_ownership(current, 0), current);
     }
 
     #[test]

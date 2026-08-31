@@ -122,6 +122,86 @@ pub(crate) unsafe fn write_pci_config(
     Ok(())
 }
 
+fn hosted_pci_location(bus: u32, address: u32) -> Option<(u8, u8, u8)> {
+    if bus > u8::MAX as u32 || address & !0x001F_0007 != 0 {
+        return None;
+    }
+    Some((bus as u8, (address >> 16) as u8, address as u8))
+}
+
+/// Enable the PCI command bits implied by one committed bus resource assignment.
+///
+/// The command register shares a dword with write-one-to-clear status bits. Write only the lower
+/// command half here so acquiring resources cannot replay and clear observed device status.
+pub(crate) unsafe fn acquire_pci_command_for_resources(
+    bus: u32,
+    address: u32,
+    has_memory: bool,
+    has_ports: bool,
+    has_bus_master_dma: bool,
+) -> Result<u16, nt_status::NtStatus> {
+    if PCI_CONFIG_IO_CAP == 0 {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    let (bus, device, function) =
+        hosted_pci_location(bus, address).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let current = pci_read32(
+        PCI_CONFIG_IO_CAP,
+        bus,
+        device,
+        function,
+        nt_pnp::PCI_CFG_COMMAND_STATUS,
+    ) as u16;
+    let ownership =
+        nt_pnp::acquire_pci_command_ownership(current, has_memory, has_ports, has_bus_master_dma);
+    if ownership.command != current {
+        pci_write32(
+            PCI_CONFIG_IO_CAP,
+            bus,
+            device,
+            function,
+            nt_pnp::PCI_CFG_COMMAND_STATUS,
+            ownership.command as u32,
+        );
+    }
+    Ok(ownership.owned_bits)
+}
+
+/// Release only PCI command bits acquired by the matching resource assignment generation.
+pub(crate) unsafe fn release_pci_command_for_resources(
+    bus: u32,
+    address: u32,
+    owned_bits: u16,
+) -> Result<(), nt_status::NtStatus> {
+    if owned_bits == 0 {
+        return Ok(());
+    }
+    if PCI_CONFIG_IO_CAP == 0 {
+        return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+    }
+    let (bus, device, function) =
+        hosted_pci_location(bus, address).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let current = pci_read32(
+        PCI_CONFIG_IO_CAP,
+        bus,
+        device,
+        function,
+        nt_pnp::PCI_CFG_COMMAND_STATUS,
+    ) as u16;
+    let command = nt_pnp::release_pci_command_ownership(current, owned_bits);
+    if command != current {
+        pci_write32(
+            PCI_CONFIG_IO_CAP,
+            bus,
+            device,
+            function,
+            nt_pnp::PCI_CFG_COMMAND_STATUS,
+            command as u32,
+        );
+    }
+    Ok(())
+}
+
 /// The PCI function and raw/translated START resource bytes selected for one registry devnode.
 pub(crate) struct DevnodePciResourceGrant {
     pub device: PciDevice,
