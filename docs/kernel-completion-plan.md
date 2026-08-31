@@ -20223,6 +20223,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     separate per-table bindings so coincident device/pin/name tuples on different buses never become
     false duplicates.
 
+    B3 complete routing-generation fence checkpoint (2026-08-31, crate accepted): `_PRT`
+    discovery and exact table acceptance now retain the route-owner generation in addition to the
+    scope-catalog and PCI-inventory generations. A relevant invalidation therefore makes an
+    otherwise byte-identical in-flight plan stale and forces a fresh complete replacement. Both
+    pure stages expose and check all three generations. `PciInterruptRouteOwner::invalidate` now
+    computes its next generation before clearing accepted authority, so generation exhaustion is
+    failure-atomic rather than revoking live claims and then returning an error. Focused `nt-pnp`
+    validation passes 61/61, including stale-owner and exhaustion preservation coverage.
+
+    Review adjustment: carry this same fence through the indexed link-query and final publication
+    stages. Add exact ParentPrefix (`^`) resolution before consuming real `_PRT` source strings; the
+    routing parser already admits that ACPI syntax, so rejecting it later would be an internal
+    contract mismatch. Then produce deduplicated `_CRS` method queries plus private per-table entry
+    bindings from the union of exact relation candidates and filtered per-root `_CRS` owners.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

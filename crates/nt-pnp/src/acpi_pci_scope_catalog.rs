@@ -771,7 +771,7 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::{PciBridgeBusNumbers, PciDevice};
+    use crate::{PciBridgeBusNumbers, PciDevice, PciInterruptRouteOwner};
 
     fn path(value: &str) -> AcpiNamespacePath {
         AcpiNamespacePath::parse(value).unwrap()
@@ -1158,6 +1158,7 @@ mod tests {
             PciInventory::try_from_initial(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 4, 1)])
                 .unwrap();
         let mut catalog = AcpiPciScopeCatalog::default();
+        let mut routes = PciInterruptRouteOwner::default();
         let mut facts = source(44);
         facts.addresses.push(AcpiPciAddressScopeFact {
             path: path("\\_SB_.PCI0.DEV0"),
@@ -1167,7 +1168,9 @@ mod tests {
         let update = catalog.prepare_replace_source(facts).unwrap();
         catalog.commit(update).unwrap();
 
-        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
         assert_eq!(discovery.catalog_generation(), 1);
         assert_eq!(discovery.inventory_generation(), 1);
         assert_eq!(discovery.queries().len(), 2);
@@ -1186,21 +1189,25 @@ mod tests {
             discovery.queries()[1].bridge,
             Some(PciLocation::new(0, 1, 0))
         );
-        assert!(discovery.is_current(&catalog, &inventory));
+        assert_eq!(discovery.route_owner_generation(), 0);
+        assert!(discovery.is_current(&catalog, &inventory, &routes));
 
         let inventory_update = inventory
             .prepare_rescan(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 5, 1)])
             .unwrap();
         let mut newer_inventory = inventory.clone();
         newer_inventory.commit(inventory_update).unwrap();
-        assert!(!discovery.is_current(&catalog, &newer_inventory));
+        assert!(!discovery.is_current(&catalog, &newer_inventory, &routes));
+
+        routes.invalidate().unwrap();
+        assert!(!discovery.is_current(&catalog, &inventory, &routes));
 
         let mut replacement = source(44);
         replacement.root.routing_table = false;
         replacement.addresses[0].routing_table = false;
         let update = catalog.prepare_replace_source(replacement).unwrap();
         catalog.commit(update).unwrap();
-        assert!(!discovery.is_current(&catalog, &inventory));
+        assert!(!discovery.is_current(&catalog, &inventory, &routes));
     }
 
     #[test]
@@ -1209,9 +1216,12 @@ mod tests {
             PciInventory::try_from_initial(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 4, 1)])
                 .unwrap();
         let mut catalog = AcpiPciScopeCatalog::default();
+        let routes = PciInterruptRouteOwner::default();
         let update = catalog.prepare_replace_source(source(44)).unwrap();
         catalog.commit(update).unwrap();
-        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
         let tables = vec![
             nt_acpi::PciRoutingTable {
                 segment: 0,
@@ -1238,21 +1248,26 @@ mod tests {
             },
         ];
         let accepted = discovery
-            .accept_routing_tables(&catalog, &inventory, tables)
+            .accept_routing_tables(&catalog, &inventory, &routes, tables)
             .unwrap();
         assert_eq!(accepted.catalog_generation(), 1);
         assert_eq!(accepted.inventory_generation(), 1);
+        assert_eq!(accepted.route_owner_generation(), 0);
         assert_eq!(accepted.tables().len(), 2);
         assert_eq!(accepted.queries().len(), 2);
         assert_eq!(accepted.link_candidate_endpoints(), &[provider(44)]);
-        assert!(accepted.is_current(&catalog, &inventory));
+        assert!(accepted.is_current(&catalog, &inventory, &routes));
 
-        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
         assert_eq!(
-            discovery.accept_routing_tables(&catalog, &inventory, vec![]),
+            discovery.accept_routing_tables(&catalog, &inventory, &routes, vec![]),
             Err(crate::AcpiPciRoutingDiscoveryError::IncompleteRoutingTables)
         );
-        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
         let mismatched = vec![
             nt_acpi::PciRoutingTable {
                 segment: 0,
@@ -1266,7 +1281,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            discovery.accept_routing_tables(&catalog, &inventory, mismatched),
+            discovery.accept_routing_tables(&catalog, &inventory, &routes, mismatched),
             Err(crate::AcpiPciRoutingDiscoveryError::MismatchedRoutingTable(
                 0
             ))

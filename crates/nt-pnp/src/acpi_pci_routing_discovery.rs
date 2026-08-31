@@ -3,7 +3,8 @@ use alloc::vec::Vec;
 use nt_acpi::{AcpiNamespacePath, PciRouteSource, PciRoutingTable};
 
 use crate::{
-    AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError, PciInventory, PciLocation,
+    AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError, PciInterruptRouteOwner,
+    PciInventory, PciLocation,
 };
 
 /// One exact full-path `_PRT` evaluation derived from accepted ACPI and PCI topology facts.
@@ -23,6 +24,7 @@ pub struct AcpiPciRoutingMethodQuery {
 pub struct PreparedAcpiPciRoutingDiscovery {
     catalog_generation: u64,
     inventory_generation: u64,
+    route_owner_generation: u64,
     queries: Vec<AcpiPciRoutingMethodQuery>,
 }
 
@@ -40,6 +42,7 @@ pub enum AcpiPciRoutingDiscoveryError {
 pub struct PreparedAcpiPciRoutingTables {
     catalog_generation: u64,
     inventory_generation: u64,
+    route_owner_generation: u64,
     queries: Vec<AcpiPciRoutingMethodQuery>,
     tables: Vec<PciRoutingTable>,
     link_candidate_endpoints: Vec<AcpiPciProviderEndpoint>,
@@ -54,13 +57,23 @@ impl PreparedAcpiPciRoutingDiscovery {
         self.inventory_generation
     }
 
+    pub fn route_owner_generation(&self) -> u64 {
+        self.route_owner_generation
+    }
+
     pub fn queries(&self) -> &[AcpiPciRoutingMethodQuery] {
         &self.queries
     }
 
-    pub fn is_current(&self, catalog: &AcpiPciScopeCatalog, inventory: &PciInventory) -> bool {
+    pub fn is_current(
+        &self,
+        catalog: &AcpiPciScopeCatalog,
+        inventory: &PciInventory,
+        routes: &PciInterruptRouteOwner,
+    ) -> bool {
         self.catalog_generation == catalog.generation()
             && self.inventory_generation == inventory.generation()
+            && self.route_owner_generation == routes.generation()
     }
 
     /// Accept one parser-validated table for every exact `_PRT` query. No missing or reordered
@@ -69,9 +82,10 @@ impl PreparedAcpiPciRoutingDiscovery {
         self,
         catalog: &AcpiPciScopeCatalog,
         inventory: &PciInventory,
+        routes: &PciInterruptRouteOwner,
         tables: Vec<PciRoutingTable>,
     ) -> Result<PreparedAcpiPciRoutingTables, AcpiPciRoutingDiscoveryError> {
-        if !self.is_current(catalog, inventory) {
+        if !self.is_current(catalog, inventory, routes) {
             return Err(AcpiPciRoutingDiscoveryError::StaleTopology);
         }
         if tables.len() != self.queries.len() {
@@ -101,6 +115,7 @@ impl PreparedAcpiPciRoutingDiscovery {
         Ok(PreparedAcpiPciRoutingTables {
             catalog_generation: self.catalog_generation,
             inventory_generation: self.inventory_generation,
+            route_owner_generation: self.route_owner_generation,
             queries: self.queries,
             tables,
             link_candidate_endpoints,
@@ -117,6 +132,10 @@ impl PreparedAcpiPciRoutingTables {
         self.inventory_generation
     }
 
+    pub fn route_owner_generation(&self) -> u64 {
+        self.route_owner_generation
+    }
+
     pub fn queries(&self) -> &[AcpiPciRoutingMethodQuery] {
         &self.queries
     }
@@ -129,9 +148,15 @@ impl PreparedAcpiPciRoutingTables {
         &self.link_candidate_endpoints
     }
 
-    pub fn is_current(&self, catalog: &AcpiPciScopeCatalog, inventory: &PciInventory) -> bool {
+    pub fn is_current(
+        &self,
+        catalog: &AcpiPciScopeCatalog,
+        inventory: &PciInventory,
+        routes: &PciInterruptRouteOwner,
+    ) -> bool {
         self.catalog_generation == catalog.generation()
             && self.inventory_generation == inventory.generation()
+            && self.route_owner_generation == routes.generation()
     }
 }
 
@@ -142,6 +167,7 @@ impl AcpiPciScopeCatalog {
     pub fn prepare_routing_discovery(
         &self,
         inventory: &PciInventory,
+        routes: &PciInterruptRouteOwner,
     ) -> Result<PreparedAcpiPciRoutingDiscovery, AcpiPciScopeError> {
         let resolution = self.prepare_resolution(inventory)?;
         let routing_count = resolution
@@ -183,6 +209,7 @@ impl AcpiPciScopeCatalog {
         Ok(PreparedAcpiPciRoutingDiscovery {
             catalog_generation: resolution.catalog_generation(),
             inventory_generation: resolution.inventory_generation(),
+            route_owner_generation: routes.generation(),
             queries,
         })
     }

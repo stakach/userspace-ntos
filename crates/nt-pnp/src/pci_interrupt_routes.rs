@@ -184,15 +184,15 @@ impl PciInterruptRouteOwner {
     /// Fence every accepted route and retained claim immediately when a relevant ACPI or PCI
     /// relation is invalidated. Replacement remains a separate fallible prepare/commit operation.
     pub fn invalidate(&mut self) -> Result<u64, PciInterruptRouteError> {
+        let next = self
+            .generation
+            .checked_add(1)
+            .ok_or(PciInterruptRouteError::GenerationExhausted)?;
         self.accepted = false;
         self.inventory_generation = None;
         self.provider_scope_generation = None;
         self.segment = None;
         self.routes.clear();
-        let next = self
-            .generation
-            .checked_add(1)
-            .ok_or(PciInterruptRouteError::GenerationExhausted)?;
         self.generation = next;
         Ok(next)
     }
@@ -979,6 +979,30 @@ mod tests {
                 .gsi,
             18
         );
+    }
+
+    #[test]
+    fn invalidation_generation_exhaustion_leaves_authority_unchanged() {
+        let inventory = PciInventory::try_from_initial(vec![device(0, 3, 0, 1)]).unwrap();
+        let mut owner = PciInterruptRouteOwner::default();
+        let publication = owner
+            .prepare_replace(
+                PROVIDER_RELATION_GENERATION,
+                0,
+                &inventory,
+                vec![route(0, 3, PciRouteFunction::Any, 0, 17)],
+            )
+            .unwrap();
+        owner
+            .commit(publication, &inventory, PROVIDER_RELATION_GENERATION)
+            .unwrap();
+        owner.generation = u64::MAX;
+        let unchanged = owner.clone();
+        assert_eq!(
+            owner.invalidate(),
+            Err(PciInterruptRouteError::GenerationExhausted)
+        );
+        assert_eq!(owner, unchanged);
     }
 
     #[test]
