@@ -2835,9 +2835,9 @@ than add ACPI service-name handling.
   miniport that reaches the internal NDIS helper. The current B3 packet-array frontier is closed;
   B3 remains open for broader repeated driver/device scaling, additional NDIS protocol surfaces, and
   removal of any remaining synthetic device-identity publication.
-  Root-bus proof resource
-  profiles now live in a growable `nt-pnp` catalog seeded by the executive instead of a one-entry
-  static table. Boot/system driver launch-plan snapshots now reserve persistent growable plan-entry
+  Root-bus proof resource profiles and their growable `nt-pnp` catalog are retained only in
+  host-testable fixture coverage; the executive no longer seeds that catalog or publishes synthetic
+  hardware in production. Boot/system driver launch-plan snapshots reserve persistent growable plan-entry
   storage from the number of registry-selected candidates instead of truncating at an eight-entry
   inline array. Runtime PnP device-status overlays now use a growable cache rather than a 64-entry
   table. Provider-domain DMA adapters now retain the devnode-granted common-buffer window inside the
@@ -2852,8 +2852,10 @@ than add ACPI service-name handling.
   records and the NDIS packet/buffer shadow stores now grow on demand instead of imposing fixed
   executive-side table caps; the subsequent provider runtime/publication cleanups and win32k GUI
   context registry cleanup remove the next fixed runtime ceilings from the current desktop path.
-  Remaining B3 cleanup should continue by subsystem ownership, with priority on real SEC_IMAGE/fault
-  scratch ceilings and any device/runtime publication state that still encodes a one-boot fixture.
+  Remaining B3 cleanup should continue by subsystem ownership, with priority on the real bochsmp
+  START continuation, production-driver evidence scoped to the hardware traits each device actually
+  consumes, real SEC_IMAGE/fault scratch ceilings, and any device/runtime publication state that
+  still encodes a one-boot fixture.
 - `[x]` B4: Replace fixture-specific driver proof paths with generic driver lifecycle gates:
   load, `DriverEntry`, isolated runtime, stop, unload, and object teardown. Dispatch is proven only
   on real DEVICE_OBJECT-bound NPFS/PnP traffic; a loaded driver with no device is no longer sent a
@@ -21041,6 +21043,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The next B3 slice is to remove the synthetic root DMA fixture from production boot selection and
     retain its DMA/resource-manager semantics in host-testable coverage, unless a real enumerated
     platform device with firmware routing authority replaces it.
+
+    B3 synthetic root-hardware removal checkpoint (2026-09-01, implementation green): the
+    production SYSTEM hive no longer installs `DmaPnpPowerTest` or
+    `ROOT\USERSPACE_NTOS_DMA\0001`. A focused generator test now asserts both records remain absent.
+    The executive no longer installs the fixture's compiled-in root resource profile, allocates its
+    fabricated MMIO/IRQ/DMA window, prepares a synthetic root START grant, or reports fixture-only
+    root-window and root-START gates. The obsolete fixture logical-address allocator and grant
+    ownership path were deleted with that authority. Firmware-derived ACPI platform frame ownership
+    and the generic platform resource path remain intact.
+
+    Reusable root-profile matching, resource-list encoding, and DMA assignment semantics remain in
+    the host-tested `nt-pnp` crate and explicit driver fixture harnesses; they no longer influence a
+    production boot. `cargo test -p nt-hive-core --bin gen_hive` passes 14/14, `git diff --check`
+    passes, and the freestanding executive check remains green at the established 209-warning
+    baseline. Review adjustment: run the serialized desktop lane next and require the generated
+    launch inventory to contain no synthetic DMA devnode, real E1000 START plus ISR/DPC to remain
+    green, and Explorer paint to complete before accepting desktop restoration.
+
+    Serialized graphical run `.tmp/run-desktop-no-synthetic-root-dma-20260901.log` reached the
+    sentinel at guest time 98 seconds and QEMU was terminated immediately afterwards. The launch
+    inventory contains only registry-selected ACPI, E1000, and bochsmp devnodes. Resource-context
+    publication is `pci-selected/published=2/2` and `platform-selected/published=1/1`, with zero
+    missing grants and no root fixture fields. No `DmaPnpPowerTest` service, devnode, or launch
+    appears. E1000 still starts through the real ACPI-owned route and final canonical evidence is
+    `live-irq/dpc=1/2`, keeping both hardware interrupt gates green. The suite now reports 253/297;
+    the denominator fell by exactly the two deleted synthetic root gates.
+
+    This lane is not desktop acceptance: bochsmp reaches `AddDevice` but not terminal START, the
+    aggregate hardware gate still expects WDM DMA evidence previously supplied only by the removed
+    fixture, and winlogon later stops before the LSA logon/profile path completes. Review adjustment:
+    keep B3 focused first on the missing bochsmp START continuation and replace the obsolete aggregate
+    MMIO/interrupt/DMA proof with independently owned evidence for production PCI resource access and
+    host-tested WDM DMA semantics. Do not reintroduce a synthetic production device to satisfy either
+    gate. Desktop restoration remains a separate acceptance requirement after the B3 driver batch is
+    terminal.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 

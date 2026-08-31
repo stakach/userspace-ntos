@@ -1119,11 +1119,6 @@ pub(crate) enum PreparedHostedResourcePlan {
         window: HostedPnpPciResourceDescriptor,
         lease: nt_pnp_context::ContextLease,
     },
-    Root {
-        grant: DevnodeRootResourceGrant,
-        window: HostedPnpRootResourceDescriptor,
-        lease: nt_pnp_context::ContextLease,
-    },
     Platform {
         grant: DevnodeRootResourceGrant,
         window: HostedPnpPlatformResourceDescriptor,
@@ -1139,7 +1134,7 @@ impl PreparedHostedResourcePlan {
                 Some(&bus_resources.raw_boot_resources),
                 Some(&bus_resources.resource_requirements),
             ),
-            Self::Root { grant, .. } | Self::Platform { grant, .. } => (
+            Self::Platform { grant, .. } => (
                 Some(&grant.raw_boot_resources),
                 Some(&grant.resource_requirements),
             ),
@@ -1149,9 +1144,7 @@ impl PreparedHostedResourcePlan {
 
     unsafe fn release_context_lease(self) -> Result<(), nt_status::NtStatus> {
         let lease = match self {
-            Self::Pci { lease, .. } | Self::Root { lease, .. } | Self::Platform { lease, .. } => {
-                lease
-            }
+            Self::Pci { lease, .. } | Self::Platform { lease, .. } => lease,
             Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1239,67 +1232,6 @@ where
             },
             resource_plan: PreparedHostedResourcePlan::Pci {
                 bus_resources,
-                window,
-                lease,
-            },
-        });
-    }
-
-    if let Some(profile) =
-        root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)
-    {
-        let window = context
-            .root_windows
-            .iter()
-            .find(|window| window.matches_profile(&profile))
-            .cloned();
-        let Some(window) = window else {
-            return Err(release_context_lease_after_error(
-                lease,
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-        };
-        let Some(grant) = assign_devnode_root_dma_resources(
-            instance_id,
-            hardware_ids,
-            compatible_ids,
-            window.interrupt_vector,
-            window.interrupt_latched,
-            window.dma_len,
-        ) else {
-            return Err(release_context_lease_after_error(
-                lease,
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-        };
-        let resource_publication = nt_root_bus::PdoResourcePublication {
-            raw_boot_resources: nt_root_bus::BusResourceState::Present(
-                grant.raw_boot_resources.clone(),
-            ),
-            resource_requirements: nt_root_bus::BusResourceState::Present(
-                grant.resource_requirements.clone(),
-            ),
-        };
-        return Ok(PreparedHostedDevnode {
-            pdo_description: driver_launch::HostedPdoDescription {
-                bus_information: nt_pnp_manager::PnpBusInformation {
-                    bus_type_guid: nt_pnp_manager::GUID_BUS_TYPE_INTERNAL,
-                    legacy_bus_type: nt_pnp_manager::INTERFACE_TYPE_PNP_BUS,
-                    bus_number: 0,
-                },
-                capabilities: nt_pnp_manager::PdoCapabilities {
-                    removable: false,
-                    eject_supported: false,
-                    surprise_removal_ok: false,
-                    address: nt_pnp_manager::DEVICE_ADDRESS_UNAVAILABLE,
-                },
-                resource_publication,
-                translated_boot_resources: nt_pnp_manager::PropertyBlobState::Present(
-                    grant.translated_boot_resources.clone(),
-                ),
-            },
-            resource_plan: PreparedHostedResourcePlan::Root {
-                grant,
                 window,
                 lease,
             },

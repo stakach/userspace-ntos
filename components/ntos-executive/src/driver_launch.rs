@@ -46007,9 +46007,9 @@ pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvi
         {
             continue;
         }
-        let Some(state) = (unsafe {
-            hosted_device_resource_state_by_device_id(connection.binding.device_id)
-        }) else {
+        let Some(state) =
+            (unsafe { hosted_device_resource_state_by_device_id(connection.binding.device_id) })
+        else {
             continue;
         };
         let evidence = state.evidence;

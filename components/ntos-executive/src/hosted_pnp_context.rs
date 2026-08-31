@@ -8,12 +8,9 @@ use nt_pnp_context::{
 const HOSTED_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
 const HOSTED_RESOURCE_COMPONENT_VA_BASE: u64 = 0x0000_0100_1600_0000;
 const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = crate::allocator::HEAP_BASE as u64;
-const HOSTED_ROOT_DMA_LOGICAL_BASE: u64 = 0x0010_0000;
-const HOSTED_ROOT_DMA_LOGICAL_LIMIT: u64 = u32::MAX as u64 + 1;
 
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE & 0x1F_FFFF == 0);
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE < HOSTED_RESOURCE_COMPONENT_VA_LIMIT);
-const _: () = assert!(HOSTED_ROOT_DMA_LOGICAL_BASE < HOSTED_ROOT_DMA_LOGICAL_LIMIT);
 
 #[derive(Clone)]
 pub(crate) struct HostedPnpPciMemoryDescriptor {
@@ -134,23 +131,6 @@ impl HostedPnpPciResourceDescriptor {
                 && self.dma_logical != 0
                 && self.dma_len != 0)
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct HostedPnpRootResourceDescriptor {
-    pub(crate) device_id: &'static str,
-    pub(crate) mmio_phys: u64,
-    pub(crate) mmio_frame_base: u64,
-    pub(crate) mmio_pages: u64,
-    pub(crate) mmio_va: u64,
-    pub(crate) mmio_seed_va: u64,
-    pub(crate) interrupt_vector: u32,
-    pub(crate) interrupt_latched: bool,
-    pub(crate) dma_frame_base: u64,
-    pub(crate) dma_pages: u64,
-    pub(crate) dma_va: u64,
-    pub(crate) dma_logical: u64,
-    pub(crate) dma_len: u64,
 }
 
 #[derive(Clone)]
@@ -275,60 +255,9 @@ impl HostedPnpPlatformResourceDescriptor {
     }
 }
 
-impl HostedPnpRootResourceDescriptor {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        profile: &nt_pnp::RootBusResourceProfile,
-        mmio_frame_base: u64,
-        mmio_pages: u64,
-        mmio_va: u64,
-        mmio_seed_va: u64,
-        interrupt_vector: u32,
-        interrupt_latched: bool,
-        dma_frame_base: u64,
-        dma_pages: u64,
-        dma_va: u64,
-        dma_logical: u64,
-        dma_len: u64,
-    ) -> Option<Self> {
-        if mmio_frame_base == 0
-            || mmio_pages == 0
-            || mmio_va == 0
-            || mmio_seed_va == 0
-            || dma_frame_base == 0
-            || dma_pages == 0
-            || dma_va == 0
-            || dma_logical == 0
-            || dma_len == 0
-        {
-            return None;
-        }
-        Some(Self {
-            device_id: profile.device_id,
-            mmio_phys: profile.mmio_phys,
-            mmio_frame_base,
-            mmio_pages,
-            mmio_va,
-            mmio_seed_va,
-            interrupt_vector,
-            interrupt_latched,
-            dma_frame_base,
-            dma_pages,
-            dma_va,
-            dma_logical,
-            dma_len,
-        })
-    }
-
-    pub(crate) fn matches_profile(&self, profile: &nt_pnp::RootBusResourceProfile) -> bool {
-        self.device_id.eq_ignore_ascii_case(profile.device_id)
-    }
-}
-
 pub(crate) struct HostedPnpContextDescription {
     pub(crate) pci_devices: Vec<nt_pnp::PciDevice>,
     pub(crate) pci_windows: Vec<HostedPnpPciResourceDescriptor>,
-    pub(crate) root_windows: Vec<HostedPnpRootResourceDescriptor>,
     pub(crate) platform_windows: Vec<HostedPnpPlatformResourceDescriptor>,
 }
 
@@ -336,7 +265,6 @@ impl HostedPnpContextDescription {
     fn new(
         pci_devices: Vec<nt_pnp::PciDevice>,
         pci_windows: Vec<HostedPnpPciResourceDescriptor>,
-        root_windows: Vec<HostedPnpRootResourceDescriptor>,
         platform_windows: Vec<HostedPnpPlatformResourceDescriptor>,
     ) -> Option<Self> {
         if pci_windows.iter().enumerate().any(|(index, window)| {
@@ -345,10 +273,6 @@ impl HostedPnpContextDescription {
                     && previous.dev == window.dev
                     && previous.func == window.func
             }) || !pci_devices.iter().any(|device| window.matches(device))
-        }) || root_windows.iter().enumerate().any(|(index, window)| {
-            root_windows[..index]
-                .iter()
-                .any(|previous| previous.device_id.eq_ignore_ascii_case(window.device_id))
         }) || platform_windows.iter().enumerate().any(|(index, window)| {
             window.instance_path.is_empty()
                 || window.hardware_id.is_empty()
@@ -364,7 +288,6 @@ impl HostedPnpContextDescription {
         Some(Self {
             pci_devices,
             pci_windows,
-            root_windows,
             platform_windows,
         })
     }
@@ -374,7 +297,6 @@ impl HostedPnpContextDescription {
 enum HostedPnpVaPool {
     Component,
     RootSeed,
-    RootDmaLogical,
 }
 
 struct HostedPnpVaReservation {
@@ -443,19 +365,6 @@ impl HostedPnpContextOwner {
             .push(HostedPnpOwnedRootFrame { cap, mapped });
     }
 
-    pub(crate) fn mark_root_frame_mapped(&mut self, cap: u64) -> bool {
-        let Some(frame) = self
-            .root_frames
-            .iter_mut()
-            .rev()
-            .find(|frame| frame.cap == cap)
-        else {
-            return false;
-        };
-        frame.mapped = true;
-        true
-    }
-
     pub(crate) unsafe fn rollback_to(&mut self, checkpoint: HostedPnpOwnerCheckpoint) -> bool {
         let mut ok = true;
         while self.alias_caps.len() > checkpoint.alias_caps {
@@ -517,7 +426,6 @@ impl HostedPnpContextOwner {
 struct HostedPnpContextAuthority {
     registry: ContextRegistry<HostedPnpContextDescription, HostedPnpContextOwner>,
     component_slots: AddressSlotAllocator,
-    root_dma_logical_slots: AddressSlotAllocator,
     pending_retirements: Vec<HostedPnpContextOwner>,
 }
 
@@ -528,11 +436,6 @@ impl HostedPnpContextAuthority {
             component_slots: AddressSlotAllocator::new(
                 HOSTED_RESOURCE_COMPONENT_VA_BASE,
                 HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
-                HOSTED_RESOURCE_WINDOW_STRIDE,
-            ),
-            root_dma_logical_slots: AddressSlotAllocator::new(
-                HOSTED_ROOT_DMA_LOGICAL_BASE,
-                HOSTED_ROOT_DMA_LOGICAL_LIMIT,
                 HOSTED_RESOURCE_WINDOW_STRIDE,
             ),
             pending_retirements: Vec::new(),
@@ -554,9 +457,6 @@ impl HostedPnpContextAuthority {
                     pool,
                     span: error.into_reservation(),
                 });
-            }
-            HostedPnpVaPool::RootDmaLogical => {
-                self.root_dma_logical_slots.release(reservation.span)
             }
         };
         result.map_err(|error| HostedPnpVaReservation {
@@ -583,7 +483,6 @@ unsafe fn reserve_hosted_pnp_slots(
     let reservation = match pool {
         HostedPnpVaPool::Component => authority.component_slots.allocate(bytes),
         HostedPnpVaPool::RootSeed => crate::executive_va::reserve_executive_device_mapping(bytes),
-        HostedPnpVaPool::RootDmaLogical => authority.root_dma_logical_slots.allocate(bytes),
     }
     .ok()?;
     let value = reservation.address();
@@ -606,16 +505,6 @@ pub(crate) unsafe fn reserve_hosted_pnp_root_seed_span(
     bytes: u64,
 ) -> Option<u64> {
     reserve_hosted_pnp_slots(owner, HostedPnpVaPool::RootSeed, bytes)
-}
-
-pub(crate) unsafe fn reserve_hosted_pnp_root_dma_logical(
-    owner: &mut HostedPnpContextOwner,
-) -> Option<u64> {
-    reserve_hosted_pnp_slots(
-        owner,
-        HostedPnpVaPool::RootDmaLogical,
-        HOSTED_RESOURCE_WINDOW_STRIDE,
-    )
 }
 
 unsafe fn retain_failed_owner(owner: HostedPnpContextOwner) -> Result<(), nt_status::NtStatus> {
@@ -656,7 +545,6 @@ pub(crate) unsafe fn retry_hosted_pnp_context_retirements() -> usize {
 pub(crate) unsafe fn publish_hosted_pnp_resource_context(
     pci_devices: Vec<nt_pnp::PciDevice>,
     pci_windows: Vec<HostedPnpPciResourceDescriptor>,
-    root_windows: Vec<HostedPnpRootResourceDescriptor>,
     platform_windows: Vec<HostedPnpPlatformResourceDescriptor>,
     owner: HostedPnpContextOwner,
 ) -> Result<ContextId, nt_status::NtStatus> {
@@ -666,7 +554,7 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let Some(description) =
-        HostedPnpContextDescription::new(pci_devices, pci_windows, root_windows, platform_windows)
+        HostedPnpContextDescription::new(pci_devices, pci_windows, platform_windows)
     else {
         retire_or_retain(owner)?;
         return Err(nt_status::NtStatus::INVALID_PARAMETER);

@@ -21,15 +21,13 @@ use alloc::vec::Vec;
 
 use crate::*;
 use nt_pnp::{
-    assign_platform_resources, assign_resources, assign_root_bus_resources, assignment_to_cm_list,
-    enumerate_hierarchy, pci_boot_resources, pci_resource_requirements,
-    platform_resource_requirements, root_bus_resource_requirements, select_resource_assignment,
-    PciDevice, PciInterruptAssignment, PlatformResourceProfile, ResourceAssignment, ResourceView,
-    RootBusResourceCatalog, RootBusResourceProfile, ASSIGNMENT_CM_LIST_MAX_SIZE,
-    INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS, ROOT_DMA_TEST_RESOURCE_PROFILE,
+    assign_platform_resources, assign_resources, assignment_to_cm_list, enumerate_hierarchy,
+    pci_boot_resources, pci_resource_requirements, platform_resource_requirements,
+    select_resource_assignment, PciDevice, PciInterruptAssignment, PlatformResourceProfile,
+    ResourceAssignment, ResourceView, ASSIGNMENT_CM_LIST_MAX_SIZE, INTERFACE_TYPE_PCI_BUS,
+    INTERFACE_TYPE_PNP_BUS,
 };
 
-static mut ROOT_BUS_RESOURCE_CATALOG: Option<RootBusResourceCatalog> = None;
 static mut PCI_CONFIG_IO_CAP: u64 = 0;
 
 /// Enumerate the complete configured PCI hierarchy through `nt-pnp` using the executive's
@@ -150,41 +148,6 @@ pub(crate) struct DevnodeRootResourceGrant {
     pub translated_resource_list: Vec<u8>,
 }
 
-pub(crate) fn root_bus_resource_profile_for_devnode<H, C>(
-    instance_id: &str,
-    hardware_ids: &[H],
-    compatible_ids: &[C],
-) -> Option<RootBusResourceProfile>
-where
-    H: AsRef<str>,
-    C: AsRef<str>,
-{
-    unsafe {
-        root_bus_resource_catalog_mut()?.find_for_devnode(instance_id, hardware_ids, compatible_ids)
-    }
-}
-
-unsafe fn root_bus_resource_catalog_mut() -> Option<&'static mut RootBusResourceCatalog> {
-    let slot = &mut *core::ptr::addr_of_mut!(ROOT_BUS_RESOURCE_CATALOG);
-    if slot.is_none() {
-        let mut catalog = RootBusResourceCatalog::new();
-        if catalog.register(ROOT_DMA_TEST_RESOURCE_PROFILE).is_err() {
-            return None;
-        }
-        *slot = Some(catalog);
-    }
-    slot.as_mut()
-}
-
-#[allow(dead_code)]
-pub(crate) fn register_root_bus_resource_profile(profile: RootBusResourceProfile) -> bool {
-    unsafe {
-        root_bus_resource_catalog_mut()
-            .and_then(|catalog| catalog.register(profile).ok())
-            .is_some()
-    }
-}
-
 /// Build the bus-owned BootResources and initial requirements before `AddDevice`.
 pub(crate) fn build_devnode_pci_bus_resources(
     device: &PciDevice,
@@ -282,62 +245,6 @@ pub(crate) fn filter_devnode_root_resource_grant(
     grant.raw_resource_list = raw_resource_list;
     grant.translated_resource_list = translated_resource_list;
     Ok(grant)
-}
-
-/// Resolve a registry-selected root-bus devnode against broker-backed resource profiles and build
-/// the physical `CM_RESOURCE_LIST` that will be passed to the hosted driver's START IRP.
-pub(crate) fn assign_devnode_root_dma_resources<H, C>(
-    instance_id: &str,
-    hardware_ids: &[H],
-    compatible_ids: &[C],
-    int_vector: u32,
-    int_latched: bool,
-    dma_len: u64,
-) -> Option<DevnodeRootResourceGrant>
-where
-    H: AsRef<str>,
-    C: AsRef<str>,
-{
-    let profile = root_bus_resource_profile_for_devnode(instance_id, hardware_ids, compatible_ids)?;
-    let assignment = assign_root_bus_resources(
-        instance_id,
-        hardware_ids,
-        compatible_ids,
-        &profile,
-        int_vector,
-        int_latched,
-        /*affinity=*/ 1,
-        dma_len,
-    )?;
-    let resource_requirements = root_bus_resource_requirements(&profile).ok()?;
-    let mut translated_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-    let n = assignment_to_cm_list(
-        &mut translated_resource_list,
-        nt_pnp::INTERFACE_TYPE_PNP_BUS,
-        0,
-        &assignment,
-        ResourceView::Translated,
-    )
-    .ok()?;
-    translated_resource_list.truncate(n);
-    let mut raw_resource_list = vec![0u8; ASSIGNMENT_CM_LIST_MAX_SIZE];
-    let raw_len = assignment_to_cm_list(
-        &mut raw_resource_list,
-        nt_pnp::INTERFACE_TYPE_PNP_BUS,
-        0,
-        &assignment,
-        ResourceView::Raw,
-    )
-    .ok()?;
-    raw_resource_list.truncate(raw_len);
-    Some(DevnodeRootResourceGrant {
-        assignment,
-        resource_requirements,
-        raw_boot_resources: raw_resource_list.clone(),
-        translated_boot_resources: translated_resource_list.clone(),
-        raw_resource_list,
-        translated_resource_list,
-    })
 }
 
 /// Build boot/requirements/START snapshots for a firmware-derived platform resource profile.

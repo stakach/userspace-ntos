@@ -1088,20 +1088,9 @@ fn build_hive_with_configuration(
     hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
     hive.set_dword(key, "ErrorControl", 0x1);
 
-    // Driver fixtures are registry data, not executive policy. The kernel discovers the same
-    // service/devnode records used for real hardware and imposes no per-driver instance ceiling.
-    install_root_pnp_fixture(
-        &mut hive,
-        GeneratedRootPnpFixture {
-            service_name: "DmaPnpPowerTest",
-            image_path: r"system32\drivers\DmaPnpPowerTest.sys",
-            start: SERVICE_SYSTEM_START,
-            hardware_id: r"ROOT\USERSPACE_NTOS_DMA",
-            compatible_ids: &[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"],
-            pdo_name_prefix: "NTPNP_ROOT",
-            instance_count: 1,
-        },
-    );
+    // PendingStartTest is an explicit lifecycle test lane. Synthetic hardware fixtures do not
+    // belong in the production boot hive; real device services are installed from enumerated bus
+    // identities and their driver metadata.
     install_root_pnp_fixture(
         &mut hive,
         GeneratedRootPnpFixture {
@@ -1183,31 +1172,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_hive_declares_registry_selected_dma_pnp_driver() {
+    fn generated_hive_omits_synthetic_dma_pnp_driver() {
         let hive = build_hive();
-        let key = hive
+        assert!(hive
             .open_key(r"ControlSet001\Services\DmaPnpPowerTest")
-            .expect("service key");
-        assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_KERNEL_DRIVER));
-        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_SYSTEM_START));
-        assert_eq!(
-            hive.query_value(key, "ImagePath"),
-            Some((
-                RegistryValueType::ExpandSz,
-                utf16le_sz(r"system32\drivers\DmaPnpPowerTest.sys").as_slice()
-            ))
-        );
-
-        let dn = hive
+            .is_none());
+        assert!(hive
             .open_key(r"ControlSet001\Enum\ROOT\USERSPACE_NTOS_DMA\0001")
-            .expect("devnode key");
-        assert_eq!(
-            hive.query_value(dn, "Service"),
-            Some((
-                RegistryValueType::Sz,
-                utf16le_sz("DmaPnpPowerTest").as_slice()
-            ))
-        );
+            .is_none());
     }
 
     #[test]

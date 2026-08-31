@@ -2060,7 +2060,6 @@ pub const AHCI_IOVA: u64 = 0x1000;
 pub const IPCBUF_VADDR: u64 = 0x0000_0100_105F_B000;
 const _: () =
     assert!(STORAGE_SHARED_END <= IPCBUF_VADDR || IPCBUF_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
-const ROOT_DMA_PROOF_ID_VALUE: u32 = 0x444d_4131; // "DMA1"
 
 pub const STACK_FRAMES: u64 = 4; // 16 KiB
 pub const RING_LEN: usize = 4096;
@@ -14224,31 +14223,6 @@ unsafe fn alloc_frame_r() -> (u64, u64) {
     (s, e)
 }
 
-unsafe fn alloc_seeded_root_dma_mmio_frame(owner: &mut HostedPnpContextOwner, seed_va: u64) -> u64 {
-    let (frame, frame_err) = alloc_frame_r();
-    if frame_err != 0 {
-        recycle_deleted_root_slot(frame);
-        return 0;
-    }
-    owner.adopt_root_frame(frame, false);
-    if !ensure_executive_paging(seed_va) {
-        return 0;
-    }
-    if page_map_r(frame, seed_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        return 0;
-    }
-    if !owner.mark_root_frame_mapped(frame) {
-        return 0;
-    }
-    let mut offset = 0u64;
-    while offset < 0x1000 {
-        core::ptr::write_volatile((seed_va + offset) as *mut u8, 0);
-        offset += 1;
-    }
-    core::ptr::write_volatile(seed_va as *mut u32, ROOT_DMA_PROOF_ID_VALUE);
-    frame
-}
-
 unsafe fn map_hosted_pci_resource_root_alias(
     owner: &mut HostedPnpContextOwner,
     frame_base: u64,
@@ -14707,103 +14681,6 @@ unsafe fn grant_hosted_pci_devnode_resources(
     }))
 }
 
-unsafe fn grant_hosted_root_devnode_resources(
-    device_id: u64,
-    grant: DevnodeRootResourceGrant,
-    window: HostedPnpRootResourceDescriptor,
-    context_lease: nt_pnp_context::ContextLeaseIdentity,
-    filtered_resource_requirements: alloc::vec::Vec<u8>,
-) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
-    let grant = filter_devnode_root_resource_grant(grant, filtered_resource_requirements)
-        .map_err(hosted_resource_requirements_status)?;
-    let raw_memory = grant
-        .assignment
-        .memory_resources(nt_pnp::ResourceView::Raw)
-        .next();
-    let memory = grant
-        .assignment
-        .memory_resources(nt_pnp::ResourceView::Translated)
-        .next();
-    let interrupt = grant
-        .assignment
-        .interrupt_resource(nt_pnp::ResourceView::Translated);
-    let raw_interrupt = grant
-        .assignment
-        .interrupt_resource(nt_pnp::ResourceView::Raw);
-    if raw_memory.is_some() != memory.is_some()
-        || raw_interrupt.is_some() != interrupt.is_some()
-        || window.dma_frame_base == 0
-    {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    let mmio_len = memory.map(|memory| memory.length as u64).unwrap_or(0);
-    if memory.is_some_and(|memory| {
-        memory.start != window.mmio_phys
-            || window.mmio_frame_base == 0
-            || mmio_len == 0
-            || mmio_len > window.mmio_pages * 0x1000
-    }) {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    let mut memory_grants = Vec::new();
-    memory_grants
-        .try_reserve_exact(memory.is_some() as usize)
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    if let (Some(raw_memory), Some(memory)) = (raw_memory, memory) {
-        memory_grants.push(driver_launch::HostedMemoryResourceGrant {
-            resource_index: 0,
-            raw_start: raw_memory.start,
-            translated_start: memory.start,
-            length: mmio_len,
-            flags: memory.flags,
-            writable: true,
-            share: memory.share,
-            pci_flags: 0,
-            component_va: window.mmio_va,
-            broker_va: window.mmio_seed_va,
-            frame_base: window.mmio_frame_base,
-            map_pages: window.mmio_pages,
-            video_memory_caller_va: 0,
-            platform_hpet: false,
-        });
-    }
-    driver_launch::grant_hosted_device_resources(
-        device_id,
-        driver_launch::HostedBusIdentity::root_bus(),
-        &memory_grants,
-        &[],
-        raw_interrupt.map(|interrupt| interrupt.level).unwrap_or(0),
-        interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
-        interrupt
-            .map(|interrupt| interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
-            .unwrap_or(false),
-        interrupt
-            .map(|interrupt| interrupt.flags == nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
-            .unwrap_or(false),
-        false,
-        false,
-        interrupt.map(|interrupt| interrupt.affinity).unwrap_or(0),
-        window.dma_va,
-        0,
-        window.dma_frame_base,
-        window.dma_pages,
-        window.dma_logical,
-        grant.assignment.dma_len,
-        context_lease,
-    )?;
-    Ok(Some(HostedDevnodeGrant {
-        kind: HostedDevnodeGrantKind::RootBus,
-        raw_resource_list: grant.raw_resource_list,
-        translated_resource_list: grant.translated_resource_list,
-        mmio_phys: memory.map(|memory| memory.start).unwrap_or(0),
-        mmio_len,
-        io_port_base: 0,
-        io_port_len: 0,
-        vector: interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
-        dma_len: grant.assignment.dma_len,
-    }))
-}
-
 unsafe fn grant_hosted_platform_devnode_resources(
     device_id: u64,
     grant: DevnodeRootResourceGrant,
@@ -14992,21 +14869,6 @@ unsafe fn grant_hosted_devnode_resources(
             let result = grant_hosted_pci_devnode_resources(
                 device_id,
                 bus_resources,
-                window,
-                context_lease,
-                filtered_resource_requirements,
-            );
-            settle_hosted_pnp_context_grant(device_id, context_lease, result)
-        }
-        PreparedHostedResourcePlan::Root {
-            grant,
-            window,
-            lease,
-        } => {
-            let context_lease = lease.into_identity();
-            let result = grant_hosted_root_devnode_resources(
-                device_id,
-                grant,
                 window,
                 context_lease,
                 filtered_resource_requirements,
@@ -21330,10 +21192,6 @@ struct HostedPciWindowPublishReport {
     published_windows: u64,
     missing_grants: u64,
     pci_va_exhausted: bool,
-    selected_root_devnodes: u64,
-    published_root_windows: u64,
-    missing_root_grants: u64,
-    root_va_exhausted: bool,
     selected_platform_devnodes: u64,
     published_platform_windows: u64,
     missing_platform_grants: u64,
@@ -21363,7 +21221,6 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     }
     devices.extend_from_slice(pci_devices);
     let mut windows: Vec<HostedPnpPciResourceDescriptor> = Vec::new();
-    let mut root_windows: Vec<HostedPnpRootResourceDescriptor> = Vec::new();
     let mut platform_windows = Vec::new();
     let mut platform_memory = Vec::new();
     if platform_memory
@@ -21576,96 +21433,13 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                     report.selected_platform_devnodes += 1;
                     continue;
                 }
-
-                let Some(profile) = root_bus_resource_profile_for_devnode(
-                    devnode.instance_id.as_str(),
-                    hardware_refs,
-                    compatible_refs,
-                ) else {
-                    continue;
-                };
-                report.selected_root_devnodes += 1;
-                if root_windows
-                    .iter()
-                    .any(|window| window.matches_profile(&profile))
-                {
-                    continue;
-                }
-                let owner_checkpoint = context_owner.checkpoint();
-                if !context_owner.reserve_root_frames(2) {
-                    report.missing_root_grants += 1;
-                    continue;
-                }
-                let Some(mmio_va) =
-                    reserve_hosted_pnp_component_span(&mut context_owner, profile.mmio_len.max(1))
-                else {
-                    report.root_va_exhausted = true;
-                    continue;
-                };
-                let Some(dma_va) = reserve_hosted_pnp_component_span(&mut context_owner, 0x1000)
-                else {
-                    let _ = context_owner.rollback_to(owner_checkpoint);
-                    report.root_va_exhausted = true;
-                    continue;
-                };
-                let Some(seed_va) = reserve_hosted_pnp_root_seed_span(&mut context_owner, 0x1000)
-                else {
-                    let _ = context_owner.rollback_to(owner_checkpoint);
-                    report.root_va_exhausted = true;
-                    continue;
-                };
-                let Some(dma_logical) = reserve_hosted_pnp_root_dma_logical(&mut context_owner)
-                else {
-                    let _ = context_owner.rollback_to(owner_checkpoint);
-                    report.root_va_exhausted = true;
-                    continue;
-                };
-                let mmio_frame = alloc_seeded_root_dma_mmio_frame(&mut context_owner, seed_va);
-                let (dma_frame, dma_frame_err) = alloc_frame_r();
-                if mmio_frame == 0 || dma_frame_err != 0 {
-                    if dma_frame_err == 0 {
-                        context_owner.adopt_root_frame(dma_frame, false);
-                    } else {
-                        recycle_deleted_root_slot(dma_frame);
-                    }
-                    let _ = context_owner.rollback_to(owner_checkpoint);
-                    report.missing_root_grants += 1;
-                    continue;
-                }
-                context_owner.adopt_root_frame(dma_frame, false);
-                let Some(window) = HostedPnpRootResourceDescriptor::new(
-                    &profile,
-                    mmio_frame,
-                    profile.mmio_len.div_ceil(0x1000).max(1),
-                    mmio_va,
-                    seed_va,
-                    profile.interrupt_vector,
-                    profile.interrupt_latched,
-                    dma_frame,
-                    1,
-                    dma_va,
-                    dma_logical,
-                    0x1000,
-                ) else {
-                    let _ = context_owner.rollback_to(owner_checkpoint);
-                    report.missing_root_grants += 1;
-                    continue;
-                };
-                root_windows.push(window);
             }
         }
     }
     report.published_windows = windows.len() as u64;
-    report.published_root_windows = root_windows.len() as u64;
     report.published_platform_windows = platform_windows.len() as u64;
-    if publish_hosted_pnp_resource_context(
-        devices,
-        windows,
-        root_windows,
-        platform_windows,
-        context_owner,
-    )
-    .is_err()
+    if publish_hosted_pnp_resource_context(devices, windows, platform_windows, context_owner)
+        .is_err()
     {
         report.missing_grants += 1;
         report.missing_platform_grants += 1;
@@ -23978,7 +23752,6 @@ fn report_deferred_generic_hardware_checks(
     mut pci_report: HostedPnpStartReport,
     registry_selected: bool,
     selected: u64,
-    root_selected: u64,
     pci_registry_selected: bool,
     pci_selected: u64,
     provider: driver_launch::HostedProviderSharingEvidence,
@@ -24022,10 +23795,6 @@ fn report_deferred_generic_hardware_checks(
     print_u64(pci_report.attempted);
     print_str(b"/");
     print_u64(pci_report.started);
-    print_str(b" root_selected/started=");
-    print_u64(root_selected);
-    print_str(b"/");
-    print_u64(report.root_started_count);
     print_str(b" live-irq/dpc=");
     print_u64(live_interrupts.deliveries);
     print_str(b"/");
@@ -24062,14 +23831,6 @@ fn report_deferred_generic_hardware_checks(
             && report.interrupt_connected
             && report.dma_adapter
             && report.dma_common,
-        passed,
-    );
-    check(
-        b"exec_generic_hw_root_pdo_started",
-        root_selected != 0
-            && report.root_started_count == root_selected
-            && report.start_ok
-            && report.root_started,
         passed,
     );
     check(
@@ -31677,14 +31438,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(hosted_pci_window_publish.missing_grants);
     print_str(b" pci-va-exhausted=");
     print_u64(hosted_pci_window_publish.pci_va_exhausted as u64);
-    print_str(b" root-selected=");
-    print_u64(hosted_pci_window_publish.selected_root_devnodes);
-    print_str(b" root-published=");
-    print_u64(hosted_pci_window_publish.published_root_windows);
-    print_str(b" root-missing-grants=");
-    print_u64(hosted_pci_window_publish.missing_root_grants);
-    print_str(b" root-va-exhausted=");
-    print_u64(hosted_pci_window_publish.root_va_exhausted as u64);
     print_str(b" platform-selected=");
     print_u64(hosted_pci_window_publish.selected_platform_devnodes);
     print_str(b" platform-published=");
@@ -31697,14 +31450,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         hosted_pci_window_publish.published_windows != 0
             && hosted_pci_window_publish.missing_grants == 0
             && !hosted_pci_window_publish.pci_va_exhausted,
-        &mut passed,
-    );
-    check(
-        b"exec_hosted_root_windows_selected_from_registry",
-        hosted_pci_window_publish.selected_root_devnodes == 0
-            || (hosted_pci_window_publish.published_root_windows != 0
-                && hosted_pci_window_publish.missing_root_grants == 0
-                && !hosted_pci_window_publish.root_va_exhausted),
         &mut passed,
     );
     check(
@@ -32506,8 +32251,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     }
 
     // --- B3: start registry-selected PnP drivers against their discovered devnodes and
-    // generation-owned resources. The fixture device remains an independent compatibility lane and
-    // does not participate in normal config-selected driver startup.
+    // generation-owned resources.
     let mut generic_hw_registry_selected = false;
     let mut generic_hw_io_out32 = false;
     let mut generic_hw_video_route_published = false;
@@ -32524,9 +32268,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_hw_video_route_published_count = 0u64;
     let mut generic_hw_first_error = 0u32;
     let mut generic_hw_first_indeterminate = 0u32;
-    let mut generic_root_attempted = 0u64;
-    let mut generic_root_started = 0u64;
-    let mut generic_root_selected = 0u64;
     let mut generic_pci_registry_selected = false;
     let mut generic_pci_provider_domain_bound = false;
     let mut generic_pci_selected = 0u64;
@@ -32557,8 +32298,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     generic_pci_registry_selected |= spec_has_pci_devnode;
                     if spec_has_pci_devnode {
                         generic_pci_selected += spec_devnodes;
-                    } else {
-                        generic_root_selected += spec_devnodes;
                     }
                     print_str(b"[driver-launch] launching PnP service ");
                     print_str(config_spec.service_name.as_bytes());
@@ -32626,9 +32365,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             if generic_pci_first_error == 0 && start_report.first_error != 0 {
                                 generic_pci_first_error = start_report.first_error;
                             }
-                        } else {
-                            generic_root_attempted += start_report.attempted;
-                            generic_root_started += start_report.started;
                         }
                         generic_hw_io_out32 |= start_report.io_port_out32;
                         generic_hw_video_route_published |= start_report.video_route_published;
@@ -32697,10 +32433,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(generic_pci_resource_accessed as u64);
         print_str(b" pci_first_error=0x");
         print_hex(generic_pci_first_error);
-        print_str(b" root_attempted=");
-        print_u64(generic_root_attempted);
-        print_str(b" root_started=");
-        print_u64(generic_root_started);
         print_str(b" io_out32=");
         print_u64(generic_hw_io_out32 as u64);
         print_str(b" video_route=");
@@ -33043,7 +32775,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             final_driver_start_reports.config_pci,
                             generic_hw_registry_selected,
                             generic_hw_selected,
-                            generic_root_selected,
                             generic_pci_registry_selected,
                             generic_pci_selected,
                             driver_launch::hosted_provider_sharing_evidence(),
