@@ -20729,6 +20729,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     now have independent bounded counters, so ordinary firmware-table traffic cannot suppress the
     first denied request. No authority or mapping behavior changed in this diagnostic correction.
 
+    B3 HPET firmware-description checkpoint (2026-09-01, crate accepted): serialized proof
+    `.tmp/run-headless-acpi-mmio-denial-20260901.log` completed through the genuine Explorer
+    sentinel in about 85 seconds at 294/299 checks and left no QEMU running. The independent denial
+    trace identified the exact post-START request as `MmMapIoSpace(0xFED00000, 1024, MmNonCached)`.
+    This is the HPET register block, not an undiscovered ACPI table page and not justification for
+    widening generic physical-memory access.
+
+    `nt-acpi` now validates the optional HPET SDT and publishes its typed firmware description. The
+    parser requires the exact table shape, SystemMemory GAS, 64-bit zero-offset register address,
+    defined access-size encodings, a nonzero non-overflowing address, and a defined page-protection
+    value. It derives the architecture-defined exact 1 KiB register extent and rejects duplicate or
+    malformed HPET authority. Focused tests pass 36/36. Review adjustment: the executive already
+    owns the canonical HPET frame and timer channel, so the next mechanism slice must reuse that
+    retained cap and publish only the firmware-described extent to ACPI. It must not retype the same
+    device untyped, invent a second timer owner, or allow a general `MmMapIoSpace` fallback. Boot
+    validation remains serialized and has a hard one-hour launch deadline; uptime after successful
+    launch is not part of that deadline.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

@@ -41,9 +41,12 @@ pub use pci_routing::{
 pub const SDT_HEADER_LEN: usize = 36;
 pub const FADT_SIGNATURE: [u8; 4] = *b"FACP";
 pub const MADT_SIGNATURE: [u8; 4] = *b"APIC";
+pub const HPET_SIGNATURE: [u8; 4] = *b"HPET";
 pub const DSDT_SIGNATURE: [u8; 4] = *b"DSDT";
 pub const FACS_SIGNATURE: [u8; 4] = *b"FACS";
 pub const FACS_MIN_LEN: usize = 64;
+pub const HPET_TABLE_LEN: usize = 56;
+pub const HPET_REGISTER_BLOCK_LEN: u64 = 1024;
 pub const ACPI_PAGE_SIZE: u64 = 0x1000;
 
 pub const ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
@@ -62,12 +65,14 @@ pub enum AcpiError {
     DuplicateTableAddress,
     DuplicateFadt,
     DuplicateMadt,
+    DuplicateHpet,
     MissingMadt,
     Allocation,
     PhysicalRead,
     DiscoveryLimit,
     MissingFadt,
     InvalidMadt,
+    InvalidHpet,
     MissingSciInterrupt,
     InvalidRegisterBlock,
     UnsupportedAddressSpace(u8),
@@ -347,6 +352,57 @@ pub struct PhysicalRange {
     pub length: u64,
 }
 
+/// Firmware-described HPET register authority.
+///
+/// The HPET architecture defines one 1 KiB register block at the GAS address. Page mapping and
+/// timer ownership remain executive policy; this value only authenticates the physical extent.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HpetDescription {
+    pub hardware_id: u32,
+    pub register_block: PhysicalRange,
+    pub sequence: u8,
+    pub minimum_tick: u16,
+    pub page_protection: u8,
+}
+
+impl HpetDescription {
+    pub fn parse(bytes: &[u8]) -> Result<Self, AcpiError> {
+        let header = validate_sdt(bytes)?;
+        if header.signature != HPET_SIGNATURE || header.length as usize != HPET_TABLE_LEN {
+            return Err(AcpiError::InvalidHpet);
+        }
+        let table = &bytes[..header.length as usize];
+        let address = GenericAddress::parse(table, 40)?;
+        if address.address_space != ADDRESS_SPACE_SYSTEM_MEMORY
+            || address.bit_width != 64
+            || address.bit_offset != 0
+            || !matches!(address.access_size, 0 | 4)
+            || address.address == 0
+            || address
+                .address
+                .checked_add(HPET_REGISTER_BLOCK_LEN)
+                .is_none()
+        {
+            return Err(AcpiError::InvalidHpet);
+        }
+        let flags = read_u8(table, 55)?;
+        let page_protection = flags & 3;
+        if flags != page_protection || page_protection == 3 {
+            return Err(AcpiError::InvalidHpet);
+        }
+        Ok(Self {
+            hardware_id: read_u32(table, 36)?,
+            register_block: PhysicalRange {
+                start: address.address,
+                length: HPET_REGISTER_BLOCK_LEN,
+            },
+            sequence: read_u8(table, 52)?,
+            minimum_tick: read_u16(table, 53)?,
+            page_protection,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPlatformResources {
     pub root: PhysicalTable,
@@ -354,6 +410,9 @@ pub struct AcpiPlatformResources {
     pub tables: Vec<PhysicalTable>,
     /// The FACS is not an SDT and therefore has no checksum.
     pub facs: Option<PhysicalRange>,
+    /// Optional HPET table data. This authenticates the register extent but does not delegate the
+    /// executive's timer channel or confer write access on a hosted ACPI component.
+    pub hpet: Option<HpetDescription>,
     pub fixed: FixedAcpiDescription,
     /// IOAPICs in firmware MADT order. Hardware route extents are supplied separately by the
     /// microkernel after it validates each controller's version register.
@@ -398,6 +457,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         .map_err(|_| AcpiError::Allocation)?;
     let mut fadt_bytes = None;
     let mut madt_topology = None;
+    let mut hpet = None;
     for address in root.entries {
         let (table, bytes) = read_sdt(reader, address, limits.max_table_length)?;
         if table.signature == FADT_SIGNATURE {
@@ -411,6 +471,11 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
             }
             madt_topology =
                 Some(parse_madt_interrupt_topology(&bytes).map_err(|_| AcpiError::InvalidMadt)?);
+        } else if table.signature == HPET_SIGNATURE {
+            if hpet.is_some() {
+                return Err(AcpiError::DuplicateHpet);
+            }
+            hpet = Some(HpetDescription::parse(&bytes)?);
         }
         tables.push(table);
     }
@@ -456,6 +521,7 @@ pub fn discover_platform_resources<R: PhysicalMemoryReader>(
         root: root_table,
         tables,
         facs,
+        hpet,
         fixed_registers: normalized_fixed_registers(&fixed)?,
         firmware_memory: normalize_physical_ranges(&firmware_extents)?,
         io_apics: madt_topology.io_apics,
@@ -986,6 +1052,49 @@ mod tests {
     }
 
     #[test]
+    fn hpet_table_authenticates_exact_register_extent() {
+        let mut hpet = vec![0; HPET_TABLE_LEN];
+        write_u32(&mut hpet, 36, 0x8086_a201);
+        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed0_0000);
+        hpet[43] = 0;
+        hpet[52] = 2;
+        write_u16(&mut hpet, 53, 0x80);
+        hpet[55] = 1;
+        let parsed = HpetDescription::parse(&finish_table(hpet, b"HPET")).unwrap();
+        assert_eq!(parsed.hardware_id, 0x8086_a201);
+        assert_eq!(
+            parsed.register_block,
+            PhysicalRange {
+                start: 0xfed0_0000,
+                length: HPET_REGISTER_BLOCK_LEN,
+            }
+        );
+        assert_eq!(parsed.sequence, 2);
+        assert_eq!(parsed.minimum_tick, 0x80);
+        assert_eq!(parsed.page_protection, 1);
+    }
+
+    #[test]
+    fn hpet_table_rejects_non_memory_and_reserved_page_protection() {
+        let mut hpet = vec![0; HPET_TABLE_LEN];
+        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_IO, 64, 0xfed0_0000);
+        hpet[43] = 0;
+        assert_eq!(
+            HpetDescription::parse(&finish_table(hpet, b"HPET")),
+            Err(AcpiError::InvalidHpet)
+        );
+
+        let mut hpet = vec![0; HPET_TABLE_LEN];
+        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed0_0000);
+        hpet[43] = 0;
+        hpet[55] = 3;
+        assert_eq!(
+            HpetDescription::parse(&finish_table(hpet, b"HPET")),
+            Err(AcpiError::InvalidHpet)
+        );
+    }
+
+    #[test]
     fn fadt_uses_legacy_io_blocks_when_extended_addresses_are_absent() {
         let mut fadt = vec![0; 116];
         write_u16(&mut fadt, 46, 9);
@@ -1079,13 +1188,15 @@ mod tests {
         const FADT: u64 = 0x7ffe_2000;
         const SSDT: u64 = 0x7ffe_2800;
         const MADT: u64 = 0x7ffe_2c00;
+        const HPET: u64 = 0x7ffe_2d00;
         const DSDT: u64 = 0x7ffe_3000;
         const FACS: u64 = 0x7ffe_3f80;
 
-        let mut xsdt = vec![0; SDT_HEADER_LEN + 24];
+        let mut xsdt = vec![0; SDT_HEADER_LEN + 32];
         write_u64(&mut xsdt, SDT_HEADER_LEN, FADT);
         write_u64(&mut xsdt, SDT_HEADER_LEN + 8, SSDT);
         write_u64(&mut xsdt, SDT_HEADER_LEN + 16, MADT);
+        write_u64(&mut xsdt, SDT_HEADER_LEN + 24, HPET);
         let xsdt = finish_table(xsdt, b"XSDT");
 
         let mut fadt = vec![0; 244];
@@ -1113,11 +1224,18 @@ mod tests {
         madt.extend_from_slice(&20u32.to_le_bytes());
         madt.extend_from_slice(&0x000fu16.to_le_bytes());
 
+        let mut hpet = vec![0; HPET_TABLE_LEN];
+        write_u32(&mut hpet, 36, 0x8086_a201);
+        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed0_0000);
+        hpet[43] = 0;
+        write_u16(&mut hpet, 53, 0x80);
+
         let regions = vec![
             (ROOT, xsdt.clone()),
             (FADT, finish_table(fadt, b"FACP")),
             (SSDT, finish_table(vec![0; 80], b"SSDT")),
             (MADT, finish_table(madt, b"APIC")),
+            (HPET, finish_table(hpet, b"HPET")),
             (DSDT, finish_table(vec![0; 0x900], b"DSDT")),
             (FACS, facs(FACS_MIN_LEN)),
         ];
@@ -1133,7 +1251,14 @@ mod tests {
         assert_eq!(resources.root.signature, *b"XSDT");
         assert_eq!(resources.fixed.sci_interrupt, 9);
         assert_eq!(resources.fixed.facs_address, Some(FACS));
-        assert_eq!(resources.tables.len(), 4);
+        assert_eq!(
+            resources.hpet.unwrap().register_block,
+            PhysicalRange {
+                start: 0xfed0_0000,
+                length: HPET_REGISTER_BLOCK_LEN,
+            }
+        );
+        assert_eq!(resources.tables.len(), 5);
         assert_eq!(resources.tables.last().unwrap().signature, *b"DSDT");
         assert_eq!(
             resources.io_apics,
