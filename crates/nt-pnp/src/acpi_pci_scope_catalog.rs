@@ -69,6 +69,7 @@ pub struct AcpiPciScopeMethodPlan {
 /// Complete provider-owned scope facts for one ACPI PCI-root PDO endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcpiPciScopeSource {
+    pub relation_owner: AcpiPciProviderEndpoint,
     pub endpoint: AcpiPciProviderEndpoint,
     pub root: AcpiPciRootScopeFact,
     pub addresses: Vec<AcpiPciAddressScopeFact>,
@@ -319,14 +320,54 @@ impl AcpiPciScopeCatalog {
         let mut next = Vec::new();
         next.try_reserve_exact(self.sources.len().saturating_add(1))
             .map_err(|_| AcpiPciScopeError::Allocation)?;
-        next.extend(
-            self.sources
-                .iter()
-                .filter(|accepted| accepted.endpoint != source.endpoint)
-                .cloned(),
-        );
+        for accepted in self
+            .sources
+            .iter()
+            .filter(|accepted| accepted.endpoint != source.endpoint)
+        {
+            next.push(try_clone_source(accepted)?);
+        }
         next.push(source);
         self.prepare_complete(next)
+    }
+
+    /// Atomically replace every root source owned by one exact BusRelations publisher. This is the
+    /// relation transaction boundary: omitted endpoints depart, while sources owned by other bus
+    /// endpoints remain untouched.
+    pub fn prepare_replace_relation_sources(
+        &self,
+        relation_owner: AcpiPciProviderEndpoint,
+        sources: &[AcpiPciScopeSource],
+    ) -> Result<PreparedAcpiPciScopeCatalogUpdate, AcpiPciScopeError> {
+        if !relation_owner.is_valid()
+            || sources
+                .iter()
+                .any(|source| source.relation_owner != relation_owner)
+        {
+            return Err(AcpiPciScopeError::InvalidProviderEndpoint);
+        }
+        let mut next = Vec::new();
+        next.try_reserve_exact(self.sources.len().saturating_add(sources.len()))
+            .map_err(|_| AcpiPciScopeError::Allocation)?;
+        for accepted in self
+            .sources
+            .iter()
+            .filter(|source| source.relation_owner != relation_owner)
+        {
+            next.push(try_clone_source(accepted)?);
+        }
+        for source in sources {
+            next.push(try_clone_source(source)?);
+        }
+        self.prepare_complete(next)
+    }
+
+    pub fn relation_has_sources(&self, relation_owner: AcpiPciProviderEndpoint) -> bool {
+        relation_owner.is_valid()
+            && self
+                .sources
+                .iter()
+                .any(|source| source.relation_owner == relation_owner)
     }
 
     pub fn prepare_remove_source(
@@ -339,12 +380,13 @@ impl AcpiPciScopeCatalog {
         let mut next = Vec::new();
         next.try_reserve_exact(self.sources.len())
             .map_err(|_| AcpiPciScopeError::Allocation)?;
-        next.extend(
-            self.sources
-                .iter()
-                .filter(|source| source.endpoint != endpoint)
-                .cloned(),
-        );
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.endpoint != endpoint)
+        {
+            next.push(try_clone_source(source)?);
+        }
         self.prepare_complete(next)
     }
 
@@ -490,7 +532,11 @@ impl AcpiPciScopeCatalog {
 }
 
 fn canonicalize_source(source: &mut AcpiPciScopeSource) -> Result<(), AcpiPciScopeError> {
-    if !source.endpoint.is_valid() {
+    if !source.relation_owner.is_valid()
+        || !source.endpoint.is_valid()
+        || source.relation_owner.hosted_domain_id != source.endpoint.hosted_domain_id
+        || source.relation_owner.hosted_domain_cookie != source.endpoint.hosted_domain_cookie
+    {
         return Err(AcpiPciScopeError::InvalidProviderEndpoint);
     }
     source.addresses.sort_unstable_by(|left, right| {
@@ -514,6 +560,39 @@ fn canonicalize_source(source: &mut AcpiPciScopeSource) -> Result<(), AcpiPciSco
         previous_path = Some(address.path.as_str());
     }
     Ok(())
+}
+
+fn try_clone_source(source: &AcpiPciScopeSource) -> Result<AcpiPciScopeSource, AcpiPciScopeError> {
+    let mut addresses = Vec::new();
+    addresses
+        .try_reserve_exact(source.addresses.len())
+        .map_err(|_| AcpiPciScopeError::Allocation)?;
+    for address in &source.addresses {
+        addresses.push(AcpiPciAddressScopeFact {
+            path: address
+                .path
+                .try_clone()
+                .map_err(|_| AcpiPciScopeError::Allocation)?,
+            adr: address.adr,
+            routing_table: address.routing_table,
+        });
+    }
+    Ok(AcpiPciScopeSource {
+        relation_owner: source.relation_owner,
+        endpoint: source.endpoint,
+        root: AcpiPciRootScopeFact {
+            hardware_id: source.root.hardware_id,
+            path: source
+                .root
+                .path
+                .try_clone()
+                .map_err(|_| AcpiPciScopeError::Allocation)?,
+            segment: source.root.segment,
+            base_bus: source.root.base_bus,
+            routing_table: source.root.routing_table,
+        },
+        addresses,
+    })
 }
 
 fn canonicalize_catalog(sources: &mut [AcpiPciScopeSource]) -> Result<(), AcpiPciScopeError> {
@@ -596,6 +675,7 @@ mod tests {
 
     fn source(provider: u64) -> AcpiPciScopeSource {
         AcpiPciScopeSource {
+            relation_owner: self::provider(1),
             endpoint: self::provider(provider),
             root: AcpiPciRootScopeFact {
                 hardware_id: AcpiPciRootHardwareId::PciExpress,
@@ -771,6 +851,54 @@ mod tests {
     }
 
     #[test]
+    fn relation_replacement_is_atomic_and_removes_only_its_departed_roots() {
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let owner = provider(1);
+        let mut first = source(44);
+        first.addresses.clear();
+        let mut second = source(45);
+        second.root.path = path("\\_SB_.PCI1");
+        second.root.base_bus = 1;
+        second.addresses.clear();
+
+        let prepared = catalog
+            .prepare_replace_relation_sources(owner, &[first.clone(), second.clone()])
+            .unwrap();
+        assert!(prepared.changed());
+        assert!(catalog.sources().is_empty());
+        catalog.commit(prepared).unwrap();
+        assert_eq!(catalog.sources().len(), 2);
+        assert!(catalog.relation_has_sources(owner));
+
+        let mut other = source(77);
+        other.relation_owner = provider(2);
+        other.root.path = path("\\_SB_.PCI2");
+        other.root.base_bus = 2;
+        other.addresses.clear();
+        let prepared = catalog.prepare_replace_source(other.clone()).unwrap();
+        catalog.commit(prepared).unwrap();
+
+        let prepared = catalog
+            .prepare_replace_relation_sources(owner, &[second.clone()])
+            .unwrap();
+        assert_eq!(prepared.sources().len(), 2);
+        catalog.commit(prepared).unwrap();
+        assert!(catalog.sources().iter().any(|source| source == &second));
+        assert!(catalog.sources().iter().any(|source| source == &other));
+        assert!(!catalog
+            .sources()
+            .iter()
+            .any(|source| source.endpoint == first.endpoint));
+
+        let prepared = catalog
+            .prepare_replace_relation_sources(owner, &[])
+            .unwrap();
+        catalog.commit(prepared).unwrap();
+        assert_eq!(catalog.sources(), &[other]);
+        assert!(!catalog.relation_has_sources(owner));
+    }
+
+    #[test]
     fn source_identity_requires_the_complete_authenticated_pdo_endpoint() {
         let catalog = AcpiPciScopeCatalog::default();
         let mut invalid = source(44);
@@ -783,6 +911,7 @@ mod tests {
         let mut first = source(44);
         first.addresses.clear();
         let mut second = first.clone();
+        second.relation_owner.hosted_domain_cookie += 1;
         second.endpoint.hosted_domain_cookie += 1;
         second.root.path = path("\\_SB_.PCI1");
         let mut accepted = AcpiPciScopeCatalog::default();

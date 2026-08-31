@@ -454,7 +454,8 @@ unsafe fn begin_hosted_acpi_pci_address_methods(child_index: usize) -> bool {
             HostedAcpiPciScopeDiscoveryState::Unqueried
             | HostedAcpiPciScopeDiscoveryState::Discovering { .. }
             | HostedAcpiPciScopeDiscoveryState::EvaluatingAddresses { .. }
-            | HostedAcpiPciScopeDiscoveryState::Complete(_),
+            | HostedAcpiPciScopeDiscoveryState::Complete(_)
+            | HostedAcpiPciScopeDiscoveryState::Staged,
         )
         | None => {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
@@ -643,6 +644,12 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
 }
 
 unsafe fn complete_hosted_acpi_pci_scope_source(child_index: usize) -> bool {
+    let Some(relation_owner) = hosted_acpi_pci_relation_owner_endpoint() else {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+        return true;
+    };
     let Some((pdo_device_id, domain, pdo_object)) = hosted_relation_child_identity(child_index)
     else {
         set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
@@ -711,6 +718,7 @@ unsafe fn complete_hosted_acpi_pci_scope_source(child_index: usize) -> bool {
     }
     properties.acpi_pci_scope_discovery = HostedAcpiPciScopeDiscoveryState::Complete(
         nt_pnp::AcpiPciScopeSource {
+            relation_owner,
             endpoint: nt_pnp::AcpiPciProviderEndpoint {
                 device_id: pdo_device_id.raw(),
                 hosted_domain_id: domain.domain_id.raw(),
@@ -722,5 +730,143 @@ unsafe fn complete_hosted_acpi_pci_scope_source(child_index: usize) -> bool {
         },
     );
     advance_hosted_acpi_pci_scope_source(child_index);
+    true
+}
+
+unsafe fn hosted_acpi_pci_relation_owner_endpoint() -> Option<nt_pnp::AcpiPciProviderEndpoint> {
+    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref()?;
+    let domain = query.relation_domain?;
+    let device_id = nt_io_manager::DeviceId(query.claim.pdo_device_id);
+    let pdo_object = io_manager_mut().hosted_device_address_by_identity(domain, device_id)?;
+    Some(nt_pnp::AcpiPciProviderEndpoint {
+        device_id: device_id.raw(),
+        hosted_domain_id: domain.domain_id.raw(),
+        hosted_domain_cookie: domain.cookie,
+        pdo_object,
+    })
+}
+
+unsafe fn stage_hosted_acpi_pci_scope_sources() -> bool {
+    let Some(relation_owner) = hosted_acpi_pci_relation_owner_endpoint() else {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+        return true;
+    };
+    let source_count = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .map(|query| {
+            query
+                .child_properties
+                .iter()
+                .filter(|properties| {
+                    matches!(
+                        properties.acpi_pci_scope_discovery,
+                        HostedAcpiPciScopeDiscoveryState::Complete(_)
+                    )
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let relevant = source_count != 0
+        || crate::hosted_pci_topology::hosted_acpi_pci_relation_has_sources(relation_owner);
+    if !relevant {
+        let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+            .as_mut()
+            .unwrap();
+        if !query.acpi_pci_scope_sources.is_empty()
+            || query.acpi_pci_catalog_update.is_some()
+            || query.child_properties.iter().any(|properties| {
+                properties.acpi_pci_scope_discovery
+                    != HostedAcpiPciScopeDiscoveryState::NotApplicable
+            })
+        {
+            query.phase = HostedDeviceRelationQueryPhase::Barrier;
+            query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        } else {
+            query.phase = HostedDeviceRelationQueryPhase::AcpiPciCatalogPrepared;
+        }
+        return true;
+    }
+
+    let mut sources = Vec::new();
+    if sources.try_reserve_exact(source_count).is_err() {
+        return false;
+    }
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .unwrap();
+    if !query.acpi_pci_scope_sources.is_empty() || query.acpi_pci_catalog_update.is_some() {
+        query.phase = HostedDeviceRelationQueryPhase::Barrier;
+        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        return true;
+    }
+    for properties in &mut query.child_properties {
+        let state = core::mem::replace(
+            &mut properties.acpi_pci_scope_discovery,
+            HostedAcpiPciScopeDiscoveryState::Unqueried,
+        );
+        match state {
+            HostedAcpiPciScopeDiscoveryState::NotApplicable => {
+                properties.acpi_pci_scope_discovery =
+                    HostedAcpiPciScopeDiscoveryState::NotApplicable;
+            }
+            HostedAcpiPciScopeDiscoveryState::Complete(source)
+                if source.relation_owner == relation_owner =>
+            {
+                sources.push(source);
+                properties.acpi_pci_scope_discovery = HostedAcpiPciScopeDiscoveryState::Staged;
+            }
+            _ => {
+                query.phase = HostedDeviceRelationQueryPhase::Barrier;
+                query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                return true;
+            }
+        }
+    }
+    if sources.len() != source_count {
+        query.phase = HostedDeviceRelationQueryPhase::Barrier;
+        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        return true;
+    }
+    query.acpi_pci_scope_sources = sources;
+    query.phase = HostedDeviceRelationQueryPhase::PrepareAcpiPciCatalogUpdate;
+    true
+}
+
+unsafe fn prepare_hosted_acpi_pci_catalog_update() -> bool {
+    let Some(relation_owner) = hosted_acpi_pci_relation_owner_endpoint() else {
+        set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+        return true;
+    };
+    let sources = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .map(|query| query.acpi_pci_scope_sources.as_slice())
+        .unwrap_or(&[]);
+    let prepared = match crate::hosted_pci_topology::prepare_hosted_acpi_pci_relation_sources(
+        relation_owner,
+        sources,
+    ) {
+        Ok(prepared) => prepared,
+        Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => return false,
+        Err(status) => {
+            set_hosted_relation_query_disposition(
+                HostedDeviceRelationQueryDisposition::Barrier(status),
+            );
+            return true;
+        }
+    };
+    let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .unwrap();
+    if query.acpi_pci_catalog_update.is_some() {
+        query.phase = HostedDeviceRelationQueryPhase::Barrier;
+        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        return true;
+    }
+    query.acpi_pci_catalog_update = Some(prepared);
+    query.phase = HostedDeviceRelationQueryPhase::AcpiPciCatalogPrepared;
     true
 }

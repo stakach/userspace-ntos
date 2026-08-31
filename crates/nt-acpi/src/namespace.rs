@@ -50,6 +50,15 @@ impl AcpiNamespacePath {
         &self.0
     }
 
+    pub fn try_clone(&self) -> Result<Self, AcpiNamespaceError> {
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(self.0.len())
+            .map_err(|_| AcpiNamespaceError::Allocation)?;
+        owned.push_str(&self.0);
+        Ok(Self(owned))
+    }
+
     pub fn name_seg(&self) -> Option<&str> {
         (self.0 != "\\").then(|| self.0.rsplit('.').next().unwrap_or(&self.0[1..]))
     }

@@ -35551,6 +35551,8 @@ unsafe fn retain_hosted_relation_query_barrier(
         relation_domain: None,
         reported_children: Vec::new(),
         child_properties: Vec::new(),
+        acpi_pci_scope_sources: Vec::new(),
+        acpi_pci_catalog_update: None,
     });
 }
 
@@ -37415,6 +37417,8 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             .child_properties
             .iter()
             .any(|properties| properties.acpi_namespace == HostedAcpiNamespaceState::Unqueried)
+        || (!query.acpi_pci_scope_sources.is_empty()
+            && query.acpi_pci_catalog_update.is_none())
         || query
             .reported_children
             .iter()
@@ -37476,6 +37480,13 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     hosted_bus_relations_mut()
         .commit_bus_relations(prepared)
         .expect("published CM relation transaction became stale before PnP commit");
+    let catalog_update = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_mut()
+        .and_then(|query| query.acpi_pci_catalog_update.take());
+    if let Some(catalog_update) = catalog_update {
+        crate::hosted_pci_topology::commit_hosted_acpi_pci_relation_sources(catalog_update)
+            .expect("serialized ACPI PCI catalog preparation became stale before relation commit");
+    }
     hosted_device_relation_invalidations_mut()
         .complete(claim)
         .expect("published relation transaction lost its exact invalidation claim");
@@ -38765,6 +38776,40 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     );
                     return progress.saturating_add(1);
                 }
+                if !stage_hosted_acpi_pci_scope_sources() {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::PrepareAcpiPciCatalogUpdate => {
+                if !prepare_hosted_acpi_pci_catalog_update() {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AcpiPciCatalogPrepared => {
+                let ready = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .is_some_and(|query| {
+                        let sources_staged = query.child_properties.iter().all(|properties| {
+                            matches!(
+                                properties.acpi_pci_scope_discovery,
+                                HostedAcpiPciScopeDiscoveryState::NotApplicable
+                                    | HostedAcpiPciScopeDiscoveryState::Staged
+                            )
+                        });
+                        sources_staged
+                            && (query.acpi_pci_scope_sources.is_empty()
+                                || query.acpi_pci_catalog_update.is_some())
+                    });
+                if !ready {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        ),
+                    );
+                    return progress.saturating_add(1);
+                }
                 match publish_hosted_bus_relations() {
                     Ok(()) => return progress.saturating_add(1),
                     Err(HostedRelationPublishError::Retry) => return progress,
@@ -38863,6 +38908,8 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         relation_domain: None,
         reported_children: Vec::new(),
         child_properties: Vec::new(),
+        acpi_pci_scope_sources: Vec::new(),
+        acpi_pci_catalog_update: None,
     });
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
         ExternalPnpDispatchResult::Returned {
@@ -41063,6 +41110,8 @@ enum HostedDeviceRelationQueryPhase {
         child_index: usize,
     },
     AcpiPciScopeSourcesReady,
+    PrepareAcpiPciCatalogUpdate,
+    AcpiPciCatalogPrepared,
     Barrier,
 }
 
@@ -41152,6 +41201,7 @@ enum HostedAcpiPciScopeDiscoveryState {
         values: Vec<u32>,
     },
     Complete(nt_pnp::AcpiPciScopeSource),
+    Staged,
 }
 
 impl Default for HostedDeviceCapabilitiesState {
@@ -41292,6 +41342,8 @@ struct HostedDeviceRelationQuery {
     relation_domain: Option<HostedDomainIdentity>,
     reported_children: Vec<nt_pnp_manager::BusReportedChild>,
     child_properties: Vec<HostedBusChildProperties>,
+    acpi_pci_scope_sources: Vec<nt_pnp::AcpiPciScopeSource>,
+    acpi_pci_catalog_update: Option<nt_pnp::PreparedAcpiPciScopeCatalogUpdate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43756,7 +43808,7 @@ pub(crate) fn service_hosted_device(
         let call = HOSTED_DEVICE_RELATION_INVALIDATION_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let relation_type = u32::try_from(arg2)
             .unwrap_or_else(|_| panic!("IoInvalidateDeviceRelations received an invalid type"));
-        let (_, _, pdo_device_id) = authenticated_hosted_pdo(ch, pdo_object, active_reply_cap)
+        let (_, inst, pdo_device_id) = authenticated_hosted_pdo(ch, pdo_object, active_reply_cap)
             .unwrap_or_else(|status| {
                 panic!(
                     "IoInvalidateDeviceRelations received a non-PDO or unauthenticated object: {status:?}"
@@ -43782,6 +43834,22 @@ pub(crate) fn service_hosted_device(
                 3
             }
         };
+        if relation_type == nt_pnp_abi::BUS_RELATIONS && disposition != 2 {
+            let relation_owner = nt_pnp::AcpiPciProviderEndpoint {
+                device_id: pdo_device_id.raw(),
+                hosted_domain_id: inst.hosted_domain_id,
+                hosted_domain_cookie: inst.hosted_domain_cookie,
+                pdo_object,
+            };
+            unsafe {
+                crate::hosted_pci_topology::invalidate_hosted_pci_routes_for_relation(
+                    relation_owner,
+                )
+            }
+            .unwrap_or_else(|status| {
+                panic!("ACPI PCI route invalidation fence failed: {status:?}")
+            });
+        }
         if call <= 32 {
             print_str(b"[pnp-invalidate] pdo=");
             print_u64(pdo_device_id.raw());

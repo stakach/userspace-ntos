@@ -20134,6 +20134,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     generation-checked scope reconciler; route-table and link-resource evaluation remains the next
     fact layer and must not be replaced by swizzling or partial coverage.
 
+    B3 atomic ACPI PCI catalog-publication checkpoint (2026-08-31, implementation green): every
+    scope source now retains the exact BusRelations publisher endpoint separately from its root-PDO
+    evaluation endpoint. `AcpiPciScopeCatalog` can prepare one fallible atomic replacement of all
+    sources owned by that publisher, so omitted roots depart without touching sources from another
+    bus endpoint. Publisher/root endpoints must share the exact nonzero hosted-domain id and cookie.
+    The catalog uses checked fallible namespace-path/source copies during prepare; dropping a
+    prepared replacement remains inert. Focused tests cover multiple roots, semantic replacement,
+    departure, unrelated publisher preservation, and an authoritative empty replacement.
+
+    The executive consolidates complete root sources, prepares the catalog replacement before any
+    Configuration Manager mutation, and retains that inert update across retryable CM publication.
+    After durable CM success it commits devnodes, then BusRelations, then the allocation-free catalog
+    update, and only then completes the exact invalidation claim. Unrelated relations with neither
+    current nor previously accepted sources perform no catalog transaction. An invalidation queued
+    or requeued for an already accepted exact relation publisher immediately fences retained PCI
+    route claims; a coalesced request does not churn the fence generation again.
+
+    Validation is green for `nt-acpi` 31/31, `nt-pnp` 57/57, the freestanding executive at the
+    unchanged 209-warning baseline, formatting, and `git diff --check`. Review adjustment: source
+    catalog publication is complete, but route authority intentionally remains absent. Add full-path
+    `_PRT` evaluation with bounded output retry, exact interrupt-link reference resolution and
+    full-path `_CRS`, then prepare a complete route set against the exact catalog/inventory
+    generations. The serialized reconciler must also observe invalidations requeued before initial
+    catalog acceptance so it cannot restore routes across a pending newer relation transaction.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
