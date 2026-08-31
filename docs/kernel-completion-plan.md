@@ -21118,6 +21118,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     preserving the independent real PCI resource, ISR, and DPC gates; then continue the genuine NDIS
     receive and native demand-loaded pending-START frontiers.
 
+    B3 production hardware-evidence separation checkpoint (2026-09-01, implementation green): the
+    obsolete `exec_generic_hw_mmio_interrupt_dma` gate is removed with the synthetic root DMA
+    fixture. It incorrectly required the aggregate boot report to combine unrelated capabilities
+    from different devices and made production readiness depend on an explicit test driver. The
+    real PCI resource gate is tightened instead: a registry-selected PCI device must have a
+    committed resource grant and must actually access MMIO or port I/O. Genuine interrupt delivery
+    and DPC execution remain independently required by `exec_generic_hw_interrupt_delivered` and
+    `exec_generic_hw_dpc_delivered`; neither gate accepts synthetic injection.
+
+    WDM DMA is not removed or stubbed. The canonical `nt-dma-manager`, `nt-wdf-dma`, hosted
+    `DMA_OPERATIONS` projection, and explicit `driver-host-dma` fixture remain the testable semantic
+    boundary for adapter registration, common buffers, map registers, bounce mappings, scatter/
+    gather lists, flush, and teardown. Production boot will acquire DMA evidence when a genuine
+    enumerated device needs that contract; it no longer loads a fabricated device solely to make a
+    readiness boolean true. Review adjustment: validate the DMA crates and freestanding executive,
+    then continue the two remaining real runtime frontiers: provider NDIS receive indication and a
+    demand-loaded native driver whose pending START completion is replied exactly once.
+
+    Focused validation is green: `nt-dma-manager` passes 21/21, `nt-wdf-dma` passes 3/3, and
+    `nt-dma-abi` passes 3/3. The freestanding executive check remains green at the established
+    209-warning baseline and `git diff --check` passes. The immediately preceding accepted runtime
+    already proves the tightened gate inputs directly: E1000 and bochsmp both receive committed PCI
+    grants, E1000 exercises MMIO and port I/O, bochsmp exercises MMIO, and genuine ISR/DPC evidence
+    remains `1/2`. No second VM is required for this reporting-only separation. Continue with NDIS
+    receive indication first, because the live NIC already produces ARP traffic but the provider's
+    protocol indication counters remain zero.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

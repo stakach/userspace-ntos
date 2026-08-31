@@ -23825,15 +23825,6 @@ fn report_deferred_generic_hardware_checks(
         passed,
     );
     check(
-        b"exec_generic_hw_mmio_interrupt_dma",
-        report.resource_granted
-            && report.mmio_mapped
-            && report.interrupt_connected
-            && report.dma_adapter
-            && report.dma_common,
-        passed,
-    );
-    check(
         b"exec_generic_pci_registry_selected",
         pci_registry_selected && pci_selected != 0,
         passed,
@@ -23877,10 +23868,8 @@ fn report_deferred_generic_hardware_checks(
     check(
         b"exec_generic_pci_resource_accessed",
         pci_registry_selected
-            && (pci_report.mmio_mapped
-                || pci_report.io_port_out32
-                || pci_report.interrupt_delivered
-                || pci_report.dma_common),
+            && pci_report.resource_granted
+            && (pci_report.mmio_mapped || pci_report.io_port_out32),
         passed,
     );
     check(
