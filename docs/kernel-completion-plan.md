@@ -21079,8 +21079,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     gate. Desktop restoration remains a separate acceptance requirement after the B3 driver batch is
     terminal.
 
-    B3 VideoPort lower-PDO pass-through correction (2026-09-01, implementation green; runtime
-    pending): the missing bochsmp continuation was an ownership regression introduced when native
+    B3 VideoPort lower-PDO pass-through correction (2026-09-01, implementation and runtime green):
+    the missing bochsmp continuation was an ownership regression introduced when native
     root-PDO pass-through became explicit. `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` enters the hosted
     VideoPort FDO, forwards to the lower PDO, and legitimately receives an unhandled optional minor.
     Classifying that lower result as outer `PnpBackendDispatch::NotDispatched` incorrectly retained
@@ -21100,6 +21100,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hard one-hour deadline. Require bochsmp filter/grant/START, hosted `Video0`, PDEV creation, real
     login/profile/userinit/Explorer paint, and retained E1000 ISR/DPC evidence before closing desktop
     restoration. Terminate QEMU after the sentinel rather than leaving the validation VM running.
+
+    Serialized graphical proof `.tmp/run-desktop-video-filter-pass-through-20260901.log` reached the
+    sentinel at guest time 115 seconds, well inside the hard one-hour deadline. Bochsmp completed
+    AddDevice, retained its unchanged filtered requirements, received its 16 MiB PCI display BAR,
+    completed canonical START, published `Video0`, and let win32k create a non-null PDEV. The real
+    IDD_LOGON path painted twelve times, LSA logon and profile loading completed, and genuine
+    userinit/Explorer launch rendered shell chrome. Final framebuffer evidence is 786432/786432
+    non-background pixels with at least 32 colors; the captured display is
+    `.tmp/screenshots/desktop-video-filter-pass-through-20260901.png`.
+
+    The same run retains genuine E1000 evidence (`live-irq/dpc=1/2`,
+    `pci-live-irq/dpc=1/2`) and all three config-selected devices reach terminal START with no
+    pending or indeterminate ownership. The final readiness result is 294/297. QEMU was terminated
+    immediately after capture. Review adjustment: desktop restoration is closed. Next remove the
+    obsolete aggregate MMIO/interrupt/DMA gate that depended on the deleted synthetic fixture while
+    preserving the independent real PCI resource, ISR, and DPC gates; then continue the genuine NDIS
+    receive and native demand-loaded pending-START frontiers.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
