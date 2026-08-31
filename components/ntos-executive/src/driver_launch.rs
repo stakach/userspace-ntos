@@ -49787,6 +49787,26 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
             status: nt_status::NtStatus::INVALID_PARAMETER,
         };
     };
+    if irp.minor == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS {
+        let expected_len = parameters
+            .filter_resource_requirements_len()
+            .and_then(|len| usize::try_from(len).ok());
+        if parameters.minor != irp.minor || expected_len != Some(system_buffer.len()) {
+            return PnpBackendDispatch::NotDispatched {
+                status: nt_status::NtStatus::INVALID_PARAMETER,
+            };
+        }
+
+        // VideoPort forwards this IRP to the PDO first. A PnP miniport without legacy access
+        // ranges (including bochsmp) leaves the returned requirements list unchanged.
+        return PnpBackendDispatch::Returned {
+            status: nt_status::NtStatus(hosted_root_bus_mut().dispatch_pnp(
+                nt_io_manager::DeviceId(binding.pdo_device_id),
+                irp.minor,
+            )),
+            information: 0,
+        };
+    }
     let Some(start) = parameters.start_parameters() else {
         return PnpBackendDispatch::NotDispatched {
             status: nt_status::NtStatus::INVALID_DEVICE_REQUEST,
