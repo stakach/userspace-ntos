@@ -20260,6 +20260,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     publish table-by-table. Then wire the three pure stages into one focused serialized executive
     reconciler using the exact variable METHOD_EX transport contract above.
 
+    B3 complete pure ACPI PCI route pipeline checkpoint (2026-08-31, crate accepted): interrupt-link
+    method results now carry explicit request indices, may arrive out of order, and must form one
+    complete unique set. Each parsed `_CRS` resource list is reused through the private per-table
+    bindings without conflating entries on other buses. Every routing table is resolved separately
+    with immutable MADT legacy-IRQ overrides, then all direct and link-backed results are converted
+    into one complete `PciInterruptRoute` vector and handed to the existing generation-fenced
+    `prepare_replace`. No route-owner mutation occurs in discovery, table acceptance, link planning,
+    resource resolution, or publication preparation.
+
+    Focused `nt-pnp` validation passes 64/64. Coverage includes out-of-order link results, exact
+    descriptor-index selection, preserved level/active-low/shared attributes, legacy IRQ override
+    translation, complete inventory coverage, and direct GSI zero. Review adjustment: the remaining
+    B3 work is executive mechanism and invalidation serialization. Add a focused
+    `hosted_acpi_pci_routes.rs` owner for filtered `_CRS`, `_PRT`, and link `_CRS` dispatch; retain
+    the pure stage objects rather than duplicating policy in `driver_launch.rs`; transfer install-once
+    MADT overrides into the topology authority; and make relation completion expose Drained versus
+    Requeued so reconciliation cannot start across a reserved newer invalidation.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

@@ -1461,6 +1461,126 @@ mod tests {
     }
 
     #[test]
+    fn link_evaluations_prepare_one_complete_route_publication_out_of_order() {
+        let inventory = PciInventory::try_from_initial(vec![
+            endpoint(0, 3, 1),
+            endpoint(0, 4, 1),
+            endpoint(0, 5, 1),
+        ])
+        .unwrap();
+        let routes = PciInterruptRouteOwner::default();
+        let owner = provider(1);
+        let mut facts = source(44);
+        facts.addresses.clear();
+        let candidates = [
+            AcpiPciLinkCandidateFact {
+                relation_owner: owner,
+                path: path("\\_SB_.PCI0.LNKA"),
+            },
+            AcpiPciLinkCandidateFact {
+                relation_owner: owner,
+                path: path("\\_SB_.PCI0.LNKB"),
+            },
+        ];
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let update = catalog
+            .prepare_replace_relation_facts(owner, &[facts], &candidates)
+            .unwrap();
+        catalog.commit(update).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
+        let tables = vec![nt_acpi::PciRoutingTable {
+            segment: 0,
+            bus: 0,
+            entries: vec![
+                nt_acpi::PciRoutingEntry {
+                    device: 3,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::InterruptLink {
+                        name: String::from("LNKA"),
+                        resource_index: 0,
+                    },
+                },
+                nt_acpi::PciRoutingEntry {
+                    device: 4,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::InterruptLink {
+                        name: String::from("LNKB"),
+                        resource_index: 0,
+                    },
+                },
+                nt_acpi::PciRoutingEntry {
+                    device: 5,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::GlobalSystemInterrupt(0),
+                },
+            ],
+        }];
+        let accepted = discovery
+            .accept_routing_tables(&catalog, &inventory, &routes, tables)
+            .unwrap();
+        let links = accepted
+            .prepare_interrupt_link_discovery(
+                &catalog,
+                &inventory,
+                &routes,
+                vec![crate::AcpiPciCrsMethodSource {
+                    endpoint: provider(44),
+                    methods: namespace_matches(&[]),
+                }],
+            )
+            .unwrap();
+        assert_eq!(links.link_queries().len(), 2);
+        let evaluations = vec![
+            crate::AcpiPciInterruptLinkEvaluation {
+                request_index: 1,
+                resources: vec![nt_acpi::InterruptResource {
+                    descriptor_index: 0,
+                    interrupt: nt_acpi::InterruptSource::LegacyIrq(5),
+                    level_sensitive: true,
+                    active_low: true,
+                    shared: true,
+                }],
+            },
+            crate::AcpiPciInterruptLinkEvaluation {
+                request_index: 0,
+                resources: vec![nt_acpi::InterruptResource {
+                    descriptor_index: 0,
+                    interrupt: nt_acpi::InterruptSource::GlobalSystemInterrupt(19),
+                    level_sensitive: true,
+                    active_low: true,
+                    shared: true,
+                }],
+            },
+        ];
+        let publication = links
+            .prepare_route_publication(
+                &catalog,
+                &inventory,
+                &routes,
+                &[nt_acpi::LegacyIrqOverride {
+                    irq: 5,
+                    gsi: 21,
+                    level_sensitive: Some(true),
+                    active_low: Some(true),
+                }],
+                evaluations,
+            )
+            .unwrap();
+        assert_eq!(publication.provider_scope_generation(), 1);
+        assert_eq!(publication.inventory_generation(), 1);
+        assert_eq!(publication.base_generation(), 0);
+        assert_eq!(publication.routes().len(), 3);
+        assert_eq!(publication.routes()[0].gsi, 19);
+        assert_eq!(publication.routes()[1].gsi, 21);
+        assert_eq!(publication.routes()[2].gsi, 0);
+    }
+
+    #[test]
     fn ordinary_address_scopes_are_ignored_but_prt_owners_must_be_bridges() {
         let inventory = PciInventory::try_from_initial(vec![endpoint(0, 3, 0)]).unwrap();
         let mut facts = source(44);

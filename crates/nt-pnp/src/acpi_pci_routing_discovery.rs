@@ -1,13 +1,14 @@
 use alloc::vec::Vec;
 
 use nt_acpi::{
-    resolve_namespace_reference, AcpiNamespaceMatches, AcpiNamespacePath, PciRouteSource,
-    PciRoutingTable,
+    resolve_namespace_reference, resolve_pci_routing_table, AcpiNamespaceMatches,
+    AcpiNamespacePath, InterruptResource, LegacyIrqOverride, PciInterruptLink, PciRouteSource,
+    PciRoutingError, PciRoutingTable,
 };
 
 use crate::{
     AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError, PciInterruptRouteOwner,
-    PciInventory, PciLocation,
+    PciInventory, PciLocation, PciRouteFunction, PreparedPciInterruptRoutePublication,
 };
 
 /// One exact full-path `_PRT` evaluation derived from accepted ACPI and PCI topology facts.
@@ -45,6 +46,10 @@ pub enum AcpiPciRoutingDiscoveryError {
         table_index: usize,
         entry_index: usize,
     },
+    IncompleteLinkEvaluations,
+    DuplicateLinkEvaluation(usize),
+    RouteResolutionFailed(usize),
+    RoutePublication(crate::PciInterruptRouteError),
 }
 
 /// Complete filtered `_CRS` method result from one authenticated PCI-root endpoint.
@@ -62,6 +67,14 @@ pub struct AcpiPciInterruptLinkMethodQuery {
     pub relation_owner: AcpiPciProviderEndpoint,
     pub object_path: AcpiNamespacePath,
     pub method_path: AcpiNamespacePath,
+}
+
+/// One parsed exact `_CRS` result, explicitly indexed so asynchronous completion order cannot
+/// change its binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpiPciInterruptLinkEvaluation {
+    pub request_index: usize,
+    pub resources: Vec<InterruptResource>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +414,121 @@ impl PreparedAcpiPciInterruptLinkDiscovery {
         self.catalog_generation == catalog.generation()
             && self.inventory_generation == inventory.generation()
             && self.route_owner_generation == routes.generation()
+    }
+
+    /// Resolve every direct and link-backed table, then prepare one complete generation-fenced
+    /// publication. Dropping the result leaves route authority unchanged.
+    pub fn prepare_route_publication(
+        self,
+        catalog: &AcpiPciScopeCatalog,
+        inventory: &PciInventory,
+        routes: &PciInterruptRouteOwner,
+        legacy_irq_overrides: &[LegacyIrqOverride],
+        mut evaluations: Vec<AcpiPciInterruptLinkEvaluation>,
+    ) -> Result<PreparedPciInterruptRoutePublication, AcpiPciRoutingDiscoveryError> {
+        if !self.is_current(catalog, inventory, routes) {
+            return Err(AcpiPciRoutingDiscoveryError::StaleTopology);
+        }
+        if evaluations.len() != self.link_queries.len() {
+            return Err(AcpiPciRoutingDiscoveryError::IncompleteLinkEvaluations);
+        }
+        evaluations.sort_unstable_by_key(|evaluation| evaluation.request_index);
+        for (expected, evaluation) in evaluations.iter().enumerate() {
+            if evaluation.request_index != expected {
+                return Err(
+                    if evaluations
+                        .windows(2)
+                        .any(|pair| pair[0].request_index == pair[1].request_index)
+                    {
+                        AcpiPciRoutingDiscoveryError::DuplicateLinkEvaluation(
+                            evaluation.request_index,
+                        )
+                    } else {
+                        AcpiPciRoutingDiscoveryError::IncompleteLinkEvaluations
+                    },
+                );
+            }
+        }
+
+        let route_capacity = self
+            .tables
+            .iter()
+            .try_fold(0usize, |count, table| {
+                count.checked_add(table.entries.len())
+            })
+            .ok_or(AcpiPciRoutingDiscoveryError::Allocation)?;
+        let mut resolved_routes = Vec::new();
+        resolved_routes
+            .try_reserve_exact(route_capacity)
+            .map_err(|_| AcpiPciRoutingDiscoveryError::Allocation)?;
+        for (table_index, table) in self.tables.iter().enumerate() {
+            let binding_count = self
+                .bindings
+                .iter()
+                .filter(|binding| binding.table_index == table_index)
+                .count();
+            let mut links = Vec::new();
+            links
+                .try_reserve_exact(binding_count)
+                .map_err(|_| AcpiPciRoutingDiscoveryError::Allocation)?;
+            for binding in self
+                .bindings
+                .iter()
+                .filter(|binding| binding.table_index == table_index)
+            {
+                let entry = table.entries.get(binding.entry_index).ok_or(
+                    AcpiPciRoutingDiscoveryError::RouteResolutionFailed(table_index),
+                )?;
+                let PciRouteSource::InterruptLink { name, .. } = &entry.source else {
+                    return Err(AcpiPciRoutingDiscoveryError::RouteResolutionFailed(
+                        table_index,
+                    ));
+                };
+                let resources = evaluations
+                    .get(binding.query_index)
+                    .ok_or(AcpiPciRoutingDiscoveryError::IncompleteLinkEvaluations)?;
+                let mut retained_name = alloc::string::String::new();
+                retained_name
+                    .try_reserve_exact(name.len())
+                    .map_err(|_| AcpiPciRoutingDiscoveryError::Allocation)?;
+                retained_name.push_str(name);
+                let mut retained_resources = Vec::new();
+                retained_resources
+                    .try_reserve_exact(resources.resources.len())
+                    .map_err(|_| AcpiPciRoutingDiscoveryError::Allocation)?;
+                retained_resources.extend_from_slice(&resources.resources);
+                links.push(PciInterruptLink {
+                    device: entry.device,
+                    pin: entry.pin,
+                    name: retained_name,
+                    resources: retained_resources,
+                });
+            }
+            let resolved = resolve_pci_routing_table(table, &links, legacy_irq_overrides).map_err(
+                |error| match error {
+                    PciRoutingError::Allocation => AcpiPciRoutingDiscoveryError::Allocation,
+                    _ => AcpiPciRoutingDiscoveryError::RouteResolutionFailed(table_index),
+                },
+            )?;
+            for route in resolved {
+                resolved_routes.push(crate::PciInterruptRoute {
+                    segment: route.segment,
+                    bus: route.bus,
+                    device: route.device,
+                    function: route
+                        .function
+                        .map_or(PciRouteFunction::Any, PciRouteFunction::Exact),
+                    pin: route.pin,
+                    gsi: route.gsi,
+                    level_sensitive: route.level_sensitive,
+                    active_low: route.active_low,
+                    shared: route.shared,
+                });
+            }
+        }
+        routes
+            .prepare_replace(self.catalog_generation, 0, inventory, resolved_routes)
+            .map_err(AcpiPciRoutingDiscoveryError::RoutePublication)
     }
 }
 

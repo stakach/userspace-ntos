@@ -32,8 +32,8 @@ mod pci_interrupt_routes;
 mod pci_inventory;
 
 pub use acpi_pci_routing_discovery::{
-    AcpiPciCrsMethodSource, AcpiPciInterruptLinkMethodQuery, AcpiPciRoutingDiscoveryError,
-    AcpiPciRoutingMethodQuery, PreparedAcpiPciInterruptLinkDiscovery,
+    AcpiPciCrsMethodSource, AcpiPciInterruptLinkEvaluation, AcpiPciInterruptLinkMethodQuery,
+    AcpiPciRoutingDiscoveryError, AcpiPciRoutingMethodQuery, PreparedAcpiPciInterruptLinkDiscovery,
     PreparedAcpiPciRoutingDiscovery, PreparedAcpiPciRoutingTables,
 };
 pub use acpi_pci_scope_catalog::{
