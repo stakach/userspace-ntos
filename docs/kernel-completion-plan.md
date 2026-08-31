@@ -20278,6 +20278,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     MADT overrides into the topology authority; and make relation completion expose Drained versus
     Requeued so reconciliation cannot start across a reserved newer invalidation.
 
+    B3 lossless invalidation-completion checkpoint (2026-08-31, crate accepted): the generic
+    `DeviceRelationInvalidationQueue::complete` API no longer hides a reserved follow-up. It returns
+    `Drained` only when the exact PDO/relation row leaves the queue, or `Requeued` with the exact
+    later sequence that became pending. Completion remains allocation-free and exact-claim fenced.
+    Focused `nt-pnp-manager` validation passes 50/50, including
+    Queued -> Claimed -> Requeued -> complete(Requeued) -> claim -> complete(Drained).
+
+    Review adjustment: consume this result after the durable devnode/BusRelations/catalog commit.
+    Keep the exact relation dirty across abort and `Requeued`; clear it only on `Drained`. Only the
+    first `Queued` disposition should invoke the route-owner invalidation transition, because
+    Coalesced and Requeued requests are already covered by the same dirty interval. Start the route
+    reconciler only after no accepted PCI-scope relation remains dirty.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

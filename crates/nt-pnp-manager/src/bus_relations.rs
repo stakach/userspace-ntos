@@ -224,6 +224,12 @@ pub enum DeviceRelationInvalidationError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRelationInvalidationCompletion {
+    Drained,
+    Requeued(DeviceRelationInvalidation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceRelationInvalidationState {
     Pending {
         sequence: u64,
@@ -363,7 +369,7 @@ impl DeviceRelationInvalidationQueue {
     pub fn complete(
         &mut self,
         claim: DeviceRelationInvalidation,
-    ) -> Result<(), DeviceRelationInvalidationError> {
+    ) -> Result<DeviceRelationInvalidationCompletion, DeviceRelationInvalidationError> {
         let index = self.claimed_row_index(claim)?;
         match self.rows[index].state {
             DeviceRelationInvalidationState::Claimed {
@@ -371,16 +377,23 @@ impl DeviceRelationInvalidationQueue {
                 ..
             } => {
                 self.rows[index].state = DeviceRelationInvalidationState::Pending { sequence };
+                Ok(DeviceRelationInvalidationCompletion::Requeued(
+                    DeviceRelationInvalidation {
+                        pdo_device_id: self.rows[index].pdo_device_id,
+                        relation_type: self.rows[index].relation_type,
+                        sequence,
+                    },
+                ))
             }
             DeviceRelationInvalidationState::Claimed {
                 requeue_sequence: None,
                 ..
             } => {
                 self.rows.remove(index);
+                Ok(DeviceRelationInvalidationCompletion::Drained)
             }
             DeviceRelationInvalidationState::Pending { .. } => unreachable!(),
         }
-        Ok(())
     }
 
     pub fn abort(
@@ -1210,7 +1223,10 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.claim_front(), Some(first.invalidation));
         assert_eq!(queue.claim_front(), None);
-        assert_eq!(queue.complete(first.invalidation), Ok(()));
+        assert_eq!(
+            queue.complete(first.invalidation),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
         assert!(queue.is_empty());
     }
 
@@ -1234,9 +1250,17 @@ mod tests {
         );
         assert_eq!(duplicate.invalidation, follow_up.invalidation);
 
-        queue.complete(claim).unwrap();
+        assert_eq!(
+            queue.complete(claim),
+            Ok(DeviceRelationInvalidationCompletion::Requeued(
+                follow_up.invalidation
+            ))
+        );
         assert_eq!(queue.claim_front(), Some(follow_up.invalidation));
-        queue.complete(follow_up.invalidation).unwrap();
+        assert_eq!(
+            queue.complete(follow_up.invalidation),
+            Ok(DeviceRelationInvalidationCompletion::Drained)
+        );
         assert!(queue.is_empty());
     }
 
