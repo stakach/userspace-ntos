@@ -222,13 +222,15 @@ impl HostedPnpPlatformResourceDescriptor {
                     || resource.len == 0
                     || resource.frame_base == 0
                     || resource.pages == 0
-                    || resource.len > resource.pages.saturating_mul(0x1000)
-                    || resource.phys & 0xfff != 0
-                    || resource.len & 0xfff != 0
-                    || resource.va & 0xfff != 0
-                    || resource.seed_va & 0xfff != 0
                     || resource.va == 0
                     || resource.seed_va == 0
+                    || resource.phys.checked_add(resource.len).is_none()
+                    || resource.frame_base.checked_add(resource.pages).is_none()
+                    || resource.phys & 0xfff != resource.va & 0xfff
+                    || resource.phys & 0xfff != resource.seed_va & 0xfff
+                    || (resource.phys & 0xfff)
+                        .checked_add(resource.len)
+                        .is_none_or(|bytes| bytes > resource.pages.saturating_mul(0x1000))
             })
             || ports.iter().enumerate().any(|(index, resource)| {
                 resource.resource_index >= driver_launch::SH_RESOURCE_KIND_CAPACITY

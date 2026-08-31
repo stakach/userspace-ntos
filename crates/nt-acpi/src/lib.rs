@@ -72,7 +72,8 @@ pub enum AcpiError {
     DiscoveryLimit,
     MissingFadt,
     InvalidMadt,
-    InvalidHpet,
+    InvalidHpetAddress(GenericAddress),
+    InvalidHpetFlags(u8),
     MissingSciInterrupt,
     InvalidRegisterBlock,
     UnsupportedAddressSpace(u8),
@@ -368,13 +369,16 @@ pub struct HpetDescription {
 impl HpetDescription {
     pub fn parse(bytes: &[u8]) -> Result<Self, AcpiError> {
         let header = validate_sdt(bytes)?;
-        if header.signature != HPET_SIGNATURE || header.length as usize != HPET_TABLE_LEN {
-            return Err(AcpiError::InvalidHpet);
+        if header.signature != HPET_SIGNATURE {
+            return Err(AcpiError::InvalidSignature);
+        }
+        if header.length as usize != HPET_TABLE_LEN {
+            return Err(AcpiError::InvalidLength);
         }
         let table = &bytes[..header.length as usize];
         let address = GenericAddress::parse(table, 40)?;
         if address.address_space != ADDRESS_SPACE_SYSTEM_MEMORY
-            || address.bit_width != 64
+            || !matches!(address.bit_width, 0 | 64)
             || address.bit_offset != 0
             || !matches!(address.access_size, 0 | 4)
             || address.address == 0
@@ -383,12 +387,12 @@ impl HpetDescription {
                 .checked_add(HPET_REGISTER_BLOCK_LEN)
                 .is_none()
         {
-            return Err(AcpiError::InvalidHpet);
+            return Err(AcpiError::InvalidHpetAddress(address));
         }
         let flags = read_u8(table, 55)?;
         let page_protection = flags & 3;
         if flags != page_protection || page_protection == 3 {
-            return Err(AcpiError::InvalidHpet);
+            return Err(AcpiError::InvalidHpetFlags(flags));
         }
         Ok(Self {
             hardware_id: read_u32(table, 36)?,
@@ -1055,7 +1059,7 @@ mod tests {
     fn hpet_table_authenticates_exact_register_extent() {
         let mut hpet = vec![0; HPET_TABLE_LEN];
         write_u32(&mut hpet, 36, 0x8086_a201);
-        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed0_0000);
+        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 0, 0xfed0_0000);
         hpet[43] = 0;
         hpet[52] = 2;
         write_u16(&mut hpet, 53, 0x80);
@@ -1079,10 +1083,18 @@ mod tests {
         let mut hpet = vec![0; HPET_TABLE_LEN];
         write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_IO, 64, 0xfed0_0000);
         hpet[43] = 0;
-        assert_eq!(
+        assert!(matches!(
             HpetDescription::parse(&finish_table(hpet, b"HPET")),
-            Err(AcpiError::InvalidHpet)
-        );
+            Err(AcpiError::InvalidHpetAddress(_))
+        ));
+
+        let mut hpet = vec![0; HPET_TABLE_LEN];
+        write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 32, 0xfed0_0000);
+        hpet[43] = 0;
+        assert!(matches!(
+            HpetDescription::parse(&finish_table(hpet, b"HPET")),
+            Err(AcpiError::InvalidHpetAddress(_))
+        ));
 
         let mut hpet = vec![0; HPET_TABLE_LEN];
         write_gas(&mut hpet, 40, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed0_0000);
@@ -1090,7 +1102,7 @@ mod tests {
         hpet[55] = 3;
         assert_eq!(
             HpetDescription::parse(&finish_table(hpet, b"HPET")),
-            Err(AcpiError::InvalidHpet)
+            Err(AcpiError::InvalidHpetFlags(3))
         );
     }
 

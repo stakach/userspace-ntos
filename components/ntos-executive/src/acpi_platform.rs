@@ -255,14 +255,20 @@ impl<'a> AcpiPhysicalReader<'a> {
         let mut page = 0;
         while page < region.pages {
             let frame = frame_base + page;
+            let expected_paddr = region.paddr + page * PAGE_SIZE;
             let error = untyped_retype_from_r(region.cap, OBJ_X86_4K_PAGE, PAGING_BITS, 1, frame);
             if error != 0 {
+                print_str(b"[acpi-platform] canonical frame retype failed paddr/label=");
+                print_hex((expected_paddr >> 32) as u32);
+                print_hex(expected_paddr as u32);
+                print_str(b"/");
+                print_u64(error);
+                print_str(b"\n");
                 recycle_unoccupied_run(frame, region.pages - page);
                 let _ = self.owner.rollback_to(checkpoint);
                 return Err(self.fail(nt_status::NtStatus::UNSUCCESSFUL));
             }
             self.owner.adopt_root_frame(frame, false);
-            let expected_paddr = region.paddr + page * PAGE_SIZE;
             let actual_paddr = get_frame_paddr(frame);
             if actual_paddr != expected_paddr {
                 print_str(b"[acpi-platform] canonical frame address mismatch expected/actual=");
@@ -284,11 +290,24 @@ impl<'a> AcpiPhysicalReader<'a> {
             }
             let (alias, copy_error) = copy_cap_r(frame);
             if copy_error != 0 {
+                print_str(b"[acpi-platform] validation cap copy failed paddr/label=");
+                print_hex((expected_paddr >> 32) as u32);
+                print_hex(expected_paddr as u32);
+                print_str(b"/");
+                print_u64(copy_error);
+                print_str(b"\n");
                 recycle_unoccupied_run(frame + 1, region.pages - page - 1);
                 let _ = self.owner.rollback_to(checkpoint);
                 return Err(self.fail(nt_status::NtStatus::UNSUCCESSFUL));
             }
-            if page_map_r(alias, va, RO_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            let map_error = page_map_r(alias, va, RO_NX, CAP_INIT_THREAD_VSPACE);
+            if map_error != 0 {
+                print_str(b"[acpi-platform] validation alias map failed paddr/label=");
+                print_hex((expected_paddr >> 32) as u32);
+                print_hex(expected_paddr as u32);
+                print_str(b"/");
+                print_u64(map_error);
+                print_str(b"\n");
                 self.owner.adopt_alias_cap(alias, false);
                 recycle_unoccupied_run(frame + 1, region.pages - page - 1);
                 let _ = self.owner.rollback_to(checkpoint);
@@ -432,25 +451,34 @@ pub(crate) unsafe fn map_executive_hpet(
     }
     let pages =
         usize::try_from(resource.pages).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    if !authority.owner.reserve_alias_caps(pages) {
-        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
-    }
-    let checkpoint = authority.owner.checkpoint();
+    let mut aliases = Vec::new();
+    aliases
+        .try_reserve_exact(pages)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for page in 0..resource.pages {
         let va = mapping_page_va + page * PAGE_SIZE;
         if !ensure_executive_paging(va) {
-            let _ = authority.owner.rollback_to(checkpoint);
+            for alias in aliases {
+                let _ = page_unmap_r(alias);
+                let _ = cnode_delete_recycle_r(alias);
+            }
             return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
         }
         let (alias, copy_error) = copy_cap_r(resource.frame_base + page);
         if copy_error != 0 || page_map_r(alias, va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
             if copy_error == 0 {
-                authority.owner.adopt_alias_cap(alias, false);
+                let _ = cnode_delete_recycle_r(alias);
             }
-            let _ = authority.owner.rollback_to(checkpoint);
+            for prior in aliases {
+                let _ = page_unmap_r(prior);
+                let _ = cnode_delete_recycle_r(prior);
+            }
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
-        authority.owner.adopt_alias_cap(alias, true);
+        aliases.push(alias);
+    }
+    for alias in aliases {
+        root_slot_pin(alias);
     }
     Ok((mapping_page_va + offset, range))
 }
@@ -529,6 +557,10 @@ unsafe fn prepare_memory_authority(
         };
         let source = frame_base + page;
         if copy_cap_into_r(canonical, source) != 0 {
+            print_str(b"[acpi-platform] component cap copy failed paddr=");
+            print_hex((paddr >> 32) as u32);
+            print_hex(paddr as u32);
+            print_str(b"\n");
             recycle_unoccupied_run(source, pages - page);
             let _ = owner.rollback_to(checkpoint);
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
@@ -547,7 +579,14 @@ unsafe fn prepare_memory_authority(
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         let rights = if writable { RW_NX } else { RO_NX };
-        if page_map_r(alias, va, rights, CAP_INIT_THREAD_VSPACE) != 0 {
+        let map_error = page_map_r(alias, va, rights, CAP_INIT_THREAD_VSPACE);
+        if map_error != 0 {
+            print_str(b"[acpi-platform] broker alias map failed paddr/label=");
+            print_hex((paddr >> 32) as u32);
+            print_hex(paddr as u32);
+            print_str(b"/");
+            print_u64(map_error);
+            print_str(b"\n");
             owner.adopt_alias_cap(alias, false);
             recycle_unoccupied_run(source + 1, pages - page - 1);
             let _ = owner.rollback_to(checkpoint);
@@ -584,7 +623,36 @@ unsafe fn discover_acpi_platform_authority_inner(
         nt_acpi::DiscoveryLimits::default(),
     ) {
         Ok(discovery) => discovery,
-        Err(_) => return Err(reader.failure.unwrap_or(nt_status::NtStatus::UNSUCCESSFUL)),
+        Err(error) => {
+            print_str(b"[acpi-platform] table validation failed class=");
+            let class = match error {
+                nt_acpi::AcpiError::InvalidHpetAddress(address) => {
+                    print_str(b"hpet-address space/width/offset/access/address=");
+                    print_u64(address.address_space as u64);
+                    print_str(b"/");
+                    print_u64(address.bit_width as u64);
+                    print_str(b"/");
+                    print_u64(address.bit_offset as u64);
+                    print_str(b"/");
+                    print_u64(address.access_size as u64);
+                    print_str(b"/0x");
+                    print_hex((address.address >> 32) as u32);
+                    print_hex(address.address as u32);
+                    1
+                }
+                nt_acpi::AcpiError::InvalidHpetFlags(flags) => {
+                    print_str(b"hpet-flags=");
+                    print_u64(flags as u64);
+                    4
+                }
+                nt_acpi::AcpiError::DuplicateHpet => 2,
+                nt_acpi::AcpiError::PhysicalRead => 3,
+                _ => 0,
+            };
+            print_u64(class);
+            print_str(b"\n");
+            return Err(reader.failure.unwrap_or(nt_status::NtStatus::UNSUCCESSFUL));
+        }
     };
     let expected_root_signature = match root.kind {
         BootAcpiRootKind::Rsdt => *b"RSDT",

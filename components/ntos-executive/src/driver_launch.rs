@@ -50069,7 +50069,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             if grant.platform_hpet {
                 if grant.writable
                     || resource.raw_start != resource.translated_start
-                    || bus_identity.interface_type != HOSTED_INTERFACE_TYPE_INTERNAL
+                    || bus_identity.interface_type != HOSTED_INTERFACE_TYPE_PNPBUS
                 {
                     rollback_staged_hosted_resource_grant(
                         binding,

@@ -20737,11 +20737,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     widening generic physical-memory access.
 
     `nt-acpi` now validates the optional HPET SDT and publishes its typed firmware description. The
-    parser requires the exact table shape, SystemMemory GAS, 64-bit zero-offset register address,
-    defined access-size encodings, a nonzero non-overflowing address, and a defined page-protection
-    value. It derives the architecture-defined exact 1 KiB register extent and rejects duplicate or
-    malformed HPET authority. Focused tests pass 36/36. Review adjustment: the executive already
-    owns the canonical HPET frame and timer channel, so the next mechanism slice must reuse that
+    parser requires the exact table shape, SystemMemory GAS, a firmware-compatible zero-or-64-bit
+    zero-offset register address, defined access-size encodings, a nonzero non-overflowing address,
+    and a defined page-protection value. It derives the architecture-defined exact 1 KiB register
+    extent and rejects duplicate or malformed HPET authority. Focused tests pass 36/36. Review
+    adjustment: the executive already owns the canonical HPET frame and timer channel, so the next
+    mechanism slice must reuse that
     retained cap and publish only the firmware-described extent to ACPI. It must not retype the same
     device untyped, invent a second timer owner, or allow a general `MmMapIoSpace` fallback. Boot
     validation remains serialized and has a hard one-hour launch deadline; uptime after successful
@@ -20761,9 +20762,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     usage, and parent release/revocation recursively invalidates child assignments and mappings.
     The executive registers its containing HPET page as a read/write platform parent and delegates
     only the firmware-described read-only child to ACPI. `nt-resource-manager` passes 16/16 and the
-    freestanding executive check remains green at the established 209-warning baseline. The next
-    serialized boot must prove the former `MmMapIoSpace(HPET, 1024)` denial resolves through this
-    exact grant without disturbing the executive timer or the Explorer desktop.
+    freestanding executive check remains green at the established 209-warning baseline.
+
+    B3 HPET delegated-mapping runtime checkpoint (2026-09-01, ACPI path accepted): QEMU reports the
+    HPET GAS with width zero, so the checked parser now accepts only the ACPI-defined unspecified
+    width or the explicit 64-bit width. The executive's writable alias is copied independently and
+    pinned for its timer lifetime instead of being retired with the hosted PnP context. Platform
+    resource descriptors now validate exact sub-page offsets and backing coverage rather than
+    requiring page-sized NT resources. The final provenance correction distinguishes the ACPI PDO's
+    real `PNPBus` identity from the `Internal` alias accepted only by `HalGetInterruptVector`.
+
+    Serialized run `.tmp/run-headless-acpi-hpet-runtime-green-20260901.log` publishes one platform
+    window with zero missing grants, commits the five-memory ACPI assignment including the exact
+    `0xFED00000/1024` read-only child, returns SCI vector 9, connects the canonical interrupt, and
+    completes `acpi.sys` START with `STATUS_SUCCESS`. The former ACPICA `Mapping failed` diagnostic
+    and the independent MMIO-denial trace are absent while the executive HPET vendor, route, and real
+    ISR gates remain green. This closes the HPET capability-delegation slice without a physical-map
+    fallback.
+
+    Review adjustment: the same run did not reach Explorer. Its first later causal boundary is
+    winlogon failing to return from the logon action, so profile creation, userinit, and Explorer are
+    never attempted; the final result is 253/299. The next serialized frontier is to compare this
+    path with `.tmp/run-headless-acpi-sci-translation-20260901.log`, restore the genuine profile and
+    shell sequence, and retain the accepted HPET/SCI behavior. Do not weaken the hardware authority
+    or treat the downstream gate cascade as separate failures.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
