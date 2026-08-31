@@ -33,6 +33,18 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("RtlInitUnicodeString", Implemented, ""),
     e("RtlCopyUnicodeString", Implemented, ""),
     e("RtlCompareUnicodeString", Implemented, ""),
+    e("_stricmp", Implemented, "allocation-free ASCII CRT compare"),
+    e("wcschr", Implemented, "bounded UTF-16 CRT search"),
+    e(
+        "KeFindConfigurationNextEntry",
+        Implemented,
+        "bounded traversal of the NT loader configuration tree",
+    ),
+    e(
+        "KeLoaderBlock",
+        Implemented,
+        "NT 5.2 loader projection backed by the boot ACPI root",
+    ),
     e(
         "_wcsicmp",
         Implemented,
@@ -101,9 +113,21 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     // --- fail-fast: hardware / DMA / interrupts / stacking (spec §7.3, §19.4) ---
     e("IoConnectInterrupt", Unsupported, ""),
     e("IoDisconnectInterrupt", Unsupported, ""),
-    e("MmMapIoSpace", Unsupported, ""),
-    e("MmUnmapIoSpace", Unsupported, ""),
-    e("MmGetPhysicalAddress", Unsupported, ""),
+    e(
+        "MmMapIoSpace",
+        Implemented,
+        "assigned physical resources and existing nonpaged frame aliases",
+    ),
+    e(
+        "MmUnmapIoSpace",
+        Implemented,
+        "mapping lifetime is owned by the isolated driver VSpace",
+    ),
+    e(
+        "MmGetPhysicalAddress",
+        Implemented,
+        "isolated VSpace mappings and assigned MMIO projections",
+    ),
     e("IoAllocateMdl", Unsupported, ""),
     e("MmProbeAndLockPages", Unsupported, ""),
     e("MmUnlockPages", Unsupported, ""),

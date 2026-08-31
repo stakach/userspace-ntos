@@ -13,7 +13,9 @@
 extern crate alloc;
 
 pub mod driver_resolve;
+pub mod configuration;
 mod hal;
+pub mod memory;
 mod ntoskrnl;
 mod registry;
 pub mod rtl;

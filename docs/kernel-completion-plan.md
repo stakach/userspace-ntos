@@ -20553,6 +20553,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     NDIS receive, plus root DMA interrupt connection, delivery, and DPC execution. The next B3 slice
     is canonical resource and interrupt projection across hosted driver domains.
 
+    B3 hosted firmware-loader checkpoint (2026-09-01, host tests, freestanding build, and desktop
+    runtime green): hosted drivers now receive a per-instance NT 5.2 loader block and configuration
+    tree. Its `ACPI BIOS` node carries the RSDT/XSDT physical address validated from BOOTBOOT rather
+    than a compiled platform address. `KeFindConfigurationNextEntry` performs bounded traversal of
+    that real tree. The physical-memory boundary now publishes each driver's mapped frame runs before
+    its component starts, translates mapped image/pool/data/shared/argument/stack/IPC virtual
+    addresses through one bidirectional table, and lets `MmMapIoSpace` recover an existing nonpaged
+    mapping by physical address or map only firmware-assigned MMIO. Component construction remains
+    suspended until those contracts are complete; the previous start-before-publication race is
+    removed.
+
+    `nt-compat-exports` passes 40/40 tests and the freestanding executive build is green at the
+    unchanged 209-warning baseline. Serialized proof
+    `.tmp/run-headless-acpi-loader-20260901.log` reached genuine Explorer shell-chrome paint in about
+    106 seconds with a fully non-background framebuffer, then exited through the normal sentinel.
+    Real `acpi.sys` resolved the new loader and memory imports and entered `DriverEntry`. Its next
+    failure is an honest missing Config Manager key:
+    `HARDWARE\DESCRIPTION\System\CentralProcessor\0`. The executive already derives that data from
+    CPUID, but an older native-only registry overlay hides it from hosted drivers. Consolidate this
+    volatile hardware description under isolated Config Manager ownership and remove the overlay;
+    then continue through ACPI AddDevice/START and the generic interrupt/DPC gates. A separately
+    exposed Mup import gap, `_wcsnicmp`, belongs in the next compatibility-export slice.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
@@ -20588,8 +20611,8 @@ stubs; those rows identify compatibility names only and do not license stub beha
   known implementation frontier. The frozen 1,477 applicable rows comprise 1,178 `stdcall`, 178
   `cdecl`, 13 `varargs`, 101 `stub`, and 7 `extern` rows with 282 handler aliases. The current DLL
   has 1,372 exports and covers 1,089 of the 1,461 Windows-visible Wine names. The exact 372-name gap
-  is categorized as 71 `Nt`, 71 `Zw`, 109 `Rtl`, 35 `Tp`, 9 `Ldr`, 5 `Csr`, 2 `ApiSet`, 4
-  `Ntdll`, 3 `WinSqm`, and 63 CRT/data/other. Focused validation passes
+    is categorized as 71 `Nt`, 71 `Zw`, 109 `Rtl`, 35 `Tp`, 9 `Ldr`, 5 `Csr`, 2 `ApiSet`, 4
+    `Ntdll`, 3 `WinSqm`, and 63 CRT/data/other. Focused validation passes
   `cargo test -p ntdll-dll-verify`; manifest regeneration is byte-for-byte reproducible. The later
   strict export-kind and calling-convention gate remains open until the classified names have real
   implementations.

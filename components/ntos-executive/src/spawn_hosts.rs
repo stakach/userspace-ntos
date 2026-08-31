@@ -201,6 +201,8 @@ pub(crate) struct SpawnedComponent {
     /// meaningful when the stack uses `FreshZeroed`.
     pub stack_frame_base: u64,
     pub stack_frame_count: u64,
+    /// Fresh IPC-buffer frame retained by the root CSpace for address-translation publication.
+    pub ipc_buffer_frame: u64,
 }
 
 static COMPONENT_HANDOFF_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -531,6 +533,31 @@ unsafe fn component_map_image_skeleton(pml4: u64, img_count: u64, bank: &mut Com
 /// declarative [`ComponentDescriptor`], granting exactly the frames/VAs/rights/caps it names, and
 /// resume it. This is the seL4 dance written ONCE; every `spawn_*` below is a descriptor-builder.
 pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponent {
+    spawn_component_inner(d, true)
+}
+
+/// Build a component completely but leave its TCB suspended so the owner can publish derived
+/// mapping metadata before any component instruction executes.
+pub(crate) unsafe fn spawn_component_suspended(d: &ComponentDescriptor) -> SpawnedComponent {
+    spawn_component_inner(d, false)
+}
+
+pub(crate) unsafe fn resume_spawned_component(component: &SpawnedComponent) -> u64 {
+    trace_component_spawn_stage(
+        b"resume-begin",
+        component.tcb,
+        component.sched_context,
+    );
+    let error = tcb_resume_r(component.tcb);
+    trace_component_spawn_stage(b"resume-end", component.tcb, error);
+    trace_component_handoff(b"component-resume", component.tcb, 0, error);
+    error
+}
+
+unsafe fn spawn_component_inner(
+    d: &ComponentDescriptor,
+    resume: bool,
+) -> SpawnedComponent {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let heap_frames = component_allocator_heap_frames(d);
@@ -654,12 +681,7 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
         }
     };
     trace_component_spawn_stage(b"sc-attached", tcb, sched_context);
-    trace_component_spawn_stage(b"resume-begin", tcb, sched_context);
-    let error = tcb_resume_r(tcb);
-    trace_component_spawn_stage(b"resume-end", tcb, error);
-    component_expect(b"tcb-resume", tcb, error);
-    trace_component_handoff(b"component-resume", tcb, 0, error);
-    SpawnedComponent {
+    let component = SpawnedComponent {
         pml4,
         tcb,
         cnode,
@@ -668,7 +690,13 @@ pub(crate) unsafe fn spawn_component(d: &ComponentDescriptor) -> SpawnedComponen
         map_cap_bank,
         stack_frame_base,
         stack_frame_count: d.stack_frames,
+        ipc_buffer_frame: ipcbuf,
+    };
+    if resume {
+        let error = resume_spawned_component(&component);
+        component_expect(b"tcb-resume", tcb, error);
     }
+    component
 }
 
 /// Resolve the rights for frame `i` of a region/image.

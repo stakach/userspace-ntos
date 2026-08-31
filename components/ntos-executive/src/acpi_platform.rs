@@ -6,7 +6,7 @@
 
 use crate::*;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const PAGE_SIZE: u64 = nt_acpi::ACPI_PAGE_SIZE;
 const MAX_CANONICAL_PAGES: u64 = 4096;
@@ -23,6 +23,33 @@ const EMPTY_IOAPIC_EXTENT: nt_acpi::IoApicRouteExtent = nt_acpi::IoApicRouteExte
 static PLATFORM_IOAPIC_COUNT: AtomicU32 = AtomicU32::new(0);
 static mut PLATFORM_IOAPICS: [nt_acpi::IoApicRouteExtent; sel4_rt::MAX_BOOT_IOAPICS] =
     [EMPTY_IOAPIC_EXTENT; sel4_rt::MAX_BOOT_IOAPICS];
+static LOADER_ACPI_ROOT_PADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Retain the boot adapter's checksum-validated RSDT/XSDT identity for the NT loader-block
+/// projection. The physical table bytes remain owned by [`PreparedAcpiPlatformAuthority`]; this is
+/// only the immutable loader identity consumed by ReactOS `acpi.sys`.
+pub(crate) fn initialize_loader_acpi_root(
+    boot_info: &BootInfo,
+) -> Result<(), nt_status::NtStatus> {
+    let root = boot_info
+        .acpi_root_table()
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    match LOADER_ACPI_ROOT_PADDR.compare_exchange(
+        0,
+        root.paddr,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(existing) if existing == root.paddr => Ok(()),
+        Err(_) => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    }
+}
+
+pub(crate) fn loader_acpi_root_paddr() -> Option<u64> {
+    let paddr = LOADER_ACPI_ROOT_PADDR.load(Ordering::Acquire);
+    (paddr != 0).then_some(paddr)
+}
 
 pub(crate) unsafe fn initialize_platform_ioapic_topology(
     boot_info: &BootInfo,

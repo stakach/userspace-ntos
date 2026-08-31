@@ -28517,6 +28517,10 @@ struct Fat32 {
 #[link_section = ".text._start"]
 unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let bi = &*bootinfo;
+    if initialize_loader_acpi_root(bi).is_err() {
+        print_str(b"[boot] platform did not publish a valid ACPI loader root\n");
+        park();
+    }
     if initialize_platform_ioapic_topology(bi).is_err() {
         print_str(b"[boot] platform did not publish a valid IOAPIC topology\n");
         park();

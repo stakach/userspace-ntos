@@ -218,11 +218,57 @@ pub extern "win64" fn s_wcslen(s: u64) -> u64 {
     }
     let mut n = 0u64;
     unsafe {
-        while core::ptr::read_unaligned((s + n * 2) as *const u16) != 0 && n < 32768 {
+        while n < 32768 && core::ptr::read_unaligned((s + n * 2) as *const u16) != 0 {
             n += 1;
         }
     }
     n
+}
+
+fn bounded_strlen(string: u64) -> usize {
+    if string == 0 {
+        return 0;
+    }
+    let mut length = 0usize;
+    unsafe {
+        while length < 32768
+            && core::ptr::read_unaligned((string + length as u64) as *const u8) != 0
+        {
+            length += 1;
+        }
+    }
+    length
+}
+
+/// `_stricmp(const char*, const char*)` — allocation-free ASCII case-insensitive comparison.
+pub extern "win64" fn s_stricmp(left: u64, right: u64) -> i32 {
+    if left == 0 || right == 0 {
+        return i32::from(left != 0) - i32::from(right != 0);
+    }
+    let left_len = bounded_strlen(left);
+    let right_len = bounded_strlen(right);
+    unsafe {
+        nt_compat_exports::rtl::compare_ascii_case_insensitive(
+            core::slice::from_raw_parts(left as *const u8, left_len),
+            core::slice::from_raw_parts(right as *const u8, right_len),
+        )
+    }
+}
+
+/// `wcschr(const wchar_t*, wchar_t)` — return the matching code-unit address, including the
+/// terminating NUL when `unit` is zero.
+pub extern "win64" fn s_wcschr(string: u64, unit: u16) -> u64 {
+    if string == 0 {
+        return 0;
+    }
+    let length = s_wcslen(string) as usize;
+    if unit == 0 {
+        return string + length as u64 * 2;
+    }
+    let units = unsafe { core::slice::from_raw_parts(string as *const u16, length) };
+    nt_compat_exports::rtl::find_utf16_unit(units, unit)
+        .map(|index| string + index as u64 * 2)
+        .unwrap_or(0)
 }
 
 fn downcase_utf16(unit: u16) -> u16 {

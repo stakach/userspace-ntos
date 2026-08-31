@@ -138,6 +138,27 @@ pub fn compare_memory(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// `_stricmp`: compare two complete narrow strings with ASCII case folding.
+///
+/// The return value is the difference between the first distinct folded bytes. A missing byte is
+/// treated as the terminating NUL, matching the NT CRT contract without allocating folded copies.
+pub fn compare_ascii_case_insensitive(a: &[u8], b: &[u8]) -> i32 {
+    let mut index = 0usize;
+    loop {
+        let left = a.get(index).copied().unwrap_or(0).to_ascii_lowercase();
+        let right = b.get(index).copied().unwrap_or(0).to_ascii_lowercase();
+        if left != right || left == 0 {
+            return left as i32 - right as i32;
+        }
+        index += 1;
+    }
+}
+
+/// `wcschr`: locate one UTF-16 code unit in a string that excludes its trailing NUL.
+pub fn find_utf16_unit(string: &[u16], unit: u16) -> Option<usize> {
+    string.iter().position(|candidate| *candidate == unit)
+}
+
 /// `RtlInitAnsiString`: byte length of a NUL-terminated ANSI string (the counted
 /// `ANSI_STRING.Length`, excluding the terminator).
 pub fn init_ansi_len(bytes_until_nul: &[u8]) -> u16 {
@@ -337,6 +358,18 @@ mod tests {
         assert_eq!(compare_memory(b"hello", b"help"), 3);
         assert_eq!(compare_memory(b"abc", b"abc"), 3);
         assert_eq!(compare_memory(b"", b"x"), 0);
+    }
+
+    #[test]
+    fn kernel_crt_string_primitives_match_nt_contract() {
+        assert_eq!(compare_ascii_case_insensitive(b"AcPi", b"aCpI"), 0);
+        assert!(compare_ascii_case_insensitive(b"Alpha", b"Alpine") < 0);
+        assert_eq!(compare_ascii_case_insensitive(b"a", b"ab"), -(b'b' as i32));
+        assert_eq!(compare_ascii_case_insensitive(&[0xff], &[0xfe]), 1);
+
+        let path = u("System32\\drivers");
+        assert_eq!(find_utf16_unit(&path, b'\\' as u16), Some(8));
+        assert_eq!(find_utf16_unit(&path, b'%' as u16), None);
     }
 
     #[test]

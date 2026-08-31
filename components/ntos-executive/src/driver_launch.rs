@@ -110,7 +110,8 @@ use nt_video_miniport::{
 use crate::ntoskrnl_shared::{
     s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
     s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
-    s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_wcsicmp, s_wcslen,
+    s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_stricmp, s_wcschr, s_wcsicmp,
+    s_wcslen,
 };
 
 use crate::*;
@@ -205,6 +206,21 @@ const FSD_DATA_SE_EXPORTS_CELL_OFF: u64 = 0x400;
 const FSD_DATA_SE_EXPORTS_STRUCT_OFF: u64 = 0x500;
 const FSD_DATA_SE_SID_POOL_OFF: u64 =
     FSD_DATA_SE_EXPORTS_STRUCT_OFF + nt_security::se_exports::se_exports_offset::STRUCT_SIZE as u64;
+const FSD_DATA_KE_LOADER_BLOCK_CELL_OFF: u64 = 0x800;
+const FSD_DATA_LOADER_BLOCK_OFF: u64 = 0x810;
+const FSD_DATA_LOADER_CONFIG_ROOT_OFF: u64 = 0x910;
+const FSD_DATA_LOADER_ACPI_NODE_OFF: u64 = 0x958;
+const FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF: u64 = 0x9A0;
+const FSD_DATA_LOADER_ACPI_CONFIG_OFF: u64 = 0x9B0;
+const FSD_DATA_LOADER_CONFIG_BYTES: u64 = 40;
+const FSD_DATA_PHYSICAL_MAP_OFF: u64 = 0x70000;
+const FSD_DATA_PHYSICAL_MAP_HEADER_BYTES: u64 = 16;
+const FSD_DATA_PHYSICAL_MAP_MAGIC: u64 = u64::from_le_bytes(*b"NTPHYS01");
+const FSD_DATA_PHYSICAL_MAP_CAPACITY: usize = ((FSD_DATA_FRAMES * 0x1000
+    - FSD_DATA_PHYSICAL_MAP_OFF
+    - FSD_DATA_PHYSICAL_MAP_HEADER_BYTES)
+    / core::mem::size_of::<nt_compat_exports::memory::PhysicalMapping>() as u64)
+    as usize;
 const FSD_DATA_MM_SYSTEM_RANGE_START_VA: u64 = FSD_DATA_VADDR + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
@@ -217,9 +233,20 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
 const FSD_DATA_SE_EXPORTS_CELL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_CELL_OFF;
 const FSD_DATA_SE_EXPORTS_STRUCT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
 const FSD_DATA_SE_SID_POOL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_SID_POOL_OFF;
+const FSD_DATA_KE_LOADER_BLOCK_CELL_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_KE_LOADER_BLOCK_CELL_OFF;
+const FSD_DATA_LOADER_BLOCK_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_BLOCK_OFF;
+const FSD_DATA_LOADER_CONFIG_ROOT_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_LOADER_CONFIG_ROOT_OFF;
+const FSD_DATA_LOADER_ACPI_NODE_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_NODE_OFF;
+const FSD_DATA_LOADER_ACPI_IDENTIFIER_VA: u64 =
+    FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF;
+const FSD_DATA_LOADER_ACPI_CONFIG_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_CONFIG_OFF;
 const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = 0x1000;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
+const _: () = assert!(FSD_DATA_LOADER_ACPI_CONFIG_OFF + FSD_DATA_LOADER_CONFIG_BYTES <= 0x1000);
+const _: () = assert!(FSD_DATA_PHYSICAL_MAP_CAPACITY > 0);
 const _: () = assert!(
     FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64 <= 0x2000
 );
@@ -1254,7 +1281,7 @@ const FSD_PENDING_IRPS_OFF: u64 = align_up_u64(FSD_RUNTIME_TABLES_OFF + 0x10, 8)
 const _: () = assert!(
     FSD_PENDING_IRPS_OFF
         + core::mem::size_of::<PendingIrpNode>() as u64 * FSD_PENDING_IRP_CAP as u64
-        <= FSD_DATA_FRAMES * 0x1000
+        <= FSD_DATA_PHYSICAL_MAP_OFF
 );
 
 const fn align_up_u64(value: u64, align: u64) -> u64 {
@@ -4395,6 +4422,81 @@ const VALID_INHERIT_FLAGS: u64 = 0x1F;
 
 static mut KE_NUMBER_PROCESSORS_VALUE: u8 = 1;
 
+unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
+    let cell = exec_data_va + FSD_DATA_KE_LOADER_BLOCK_CELL_OFF;
+    let Some(root_paddr) = crate::loader_acpi_root_paddr() else {
+        write_volatile(cell as *mut u64, 0);
+        return;
+    };
+    let block = exec_data_va + FSD_DATA_LOADER_BLOCK_OFF;
+    let root = exec_data_va + FSD_DATA_LOADER_CONFIG_ROOT_OFF;
+    let acpi = exec_data_va + FSD_DATA_LOADER_ACPI_NODE_OFF;
+    let identifier = exec_data_va + FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF;
+    let config = exec_data_va + FSD_DATA_LOADER_ACPI_CONFIG_OFF;
+    core::ptr::write_bytes(block as *mut u8, 0, 0x100);
+    core::ptr::write_bytes(root as *mut u8, 0, 0x48);
+    core::ptr::write_bytes(acpi as *mut u8, 0, 0x48);
+    core::ptr::write_bytes(
+        config as *mut u8,
+        0,
+        FSD_DATA_LOADER_CONFIG_BYTES as usize,
+    );
+
+    // NT 5.2 LOADER_PARAMETER_BLOCK: initialize the three list heads and publish the real ARC
+    // configuration root at offset 0x60.
+    for list_off in [0u64, 0x10, 0x20] {
+        write_unaligned(
+            (block + list_off) as *mut u64,
+            FSD_DATA_LOADER_BLOCK_VA + list_off,
+        );
+        write_unaligned(
+            (block + list_off + 8) as *mut u64,
+            FSD_DATA_LOADER_BLOCK_VA + list_off,
+        );
+    }
+    write_unaligned(
+        (block + 0x60) as *mut u64,
+        FSD_DATA_LOADER_CONFIG_ROOT_VA,
+    );
+
+    // CONFIGURATION_COMPONENT_DATA root: SystemClass / MaximumType, with the firmware ACPI node as
+    // its child. CONFIGURATION_COMPONENT_DATA is 0x48 bytes on NT amd64.
+    write_unaligned((root + 0x08) as *mut u64, FSD_DATA_LOADER_ACPI_NODE_VA);
+    write_unaligned((root + 0x18) as *mut u32, 0); // SystemClass
+    write_unaligned((root + 0x1C) as *mut u32, 40); // MaximumType
+    write_unaligned((root + 0x2C) as *mut u32, u32::MAX); // AffinityMask
+
+    // Firmware child: AdapterClass / MultiFunctionAdapter, matching the FreeLdr ACPI BIOS node.
+    write_unaligned((acpi + 0x00) as *mut u64, FSD_DATA_LOADER_CONFIG_ROOT_VA);
+    write_unaligned((acpi + 0x18) as *mut u32, 3); // AdapterClass
+    write_unaligned((acpi + 0x1C) as *mut u32, 12); // MultiFunctionAdapter
+    write_unaligned((acpi + 0x2C) as *mut u32, u32::MAX); // AffinityMask
+    write_unaligned(
+        (acpi + 0x30) as *mut u32,
+        FSD_DATA_LOADER_CONFIG_BYTES as u32,
+    );
+    write_unaligned((acpi + 0x34) as *mut u32, 10);
+    write_unaligned(
+        (acpi + 0x38) as *mut u64,
+        FSD_DATA_LOADER_ACPI_IDENTIFIER_VA,
+    );
+    write_unaligned(
+        (acpi + 0x40) as *mut u64,
+        FSD_DATA_LOADER_ACPI_CONFIG_VA,
+    );
+    core::ptr::copy_nonoverlapping(b"ACPI BIOS\0".as_ptr(), identifier as *mut u8, 10);
+
+    // CM_PARTIAL_RESOURCE_LIST + one DeviceSpecific descriptor, followed by the loader's
+    // ACPI_BIOS_MULTI_NODE prefix. BOOTBOOT already consumed the RSDP and published the validated
+    // RSDT/XSDT physical address, which is precisely the loader datum acpi.sys reconstructs.
+    write_unaligned((config + 0x04) as *mut u32, 1);
+    write_unaligned((config + 0x08) as *mut u8, 5); // CmResourceTypeDeviceSpecific
+    write_unaligned((config + 0x0C) as *mut u32, 16); // ACPI_BIOS_MULTI_NODE prefix bytes
+    write_unaligned((config + 0x18) as *mut u64, root_paddr);
+    write_unaligned((config + 0x20) as *mut u64, 0); // no loader E820 projection
+    write_volatile(cell as *mut u64, FSD_DATA_LOADER_BLOCK_VA);
+}
+
 unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
     let mm_system_range_start = exec_data_va + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
     write_volatile(
@@ -4436,6 +4538,7 @@ unsafe fn initialize_hosted_driver_data_exports(exec_data_va: u64) {
         se_sid_pool as *mut u8,
         FSD_DATA_SE_SID_POOL_VA,
     );
+    initialize_hosted_loader_block(exec_data_va);
 }
 
 fn fsd_data_export_addr(name: &str) -> Option<u64> {
@@ -4444,8 +4547,104 @@ fn fsd_data_export_addr(name: &str) -> Option<u64> {
         "IoFileObjectType" => FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA,
         "ExEventObjectType" => FSD_DATA_EX_EVENT_OBJECT_TYPE_CELL_VA,
         "SeExports" => FSD_DATA_SE_EXPORTS_CELL_VA,
+        "KeLoaderBlock" => FSD_DATA_KE_LOADER_BLOCK_CELL_VA,
         _ => return None,
     })
+}
+
+unsafe fn hosted_configuration_entry_matches(
+    entry: u64,
+    class: u32,
+    kind: u32,
+    component_key: u64,
+) -> bool {
+    let key = (component_key != 0).then(|| read_unaligned(component_key as *const u32));
+    nt_compat_exports::configuration::component_matches(
+        read_unaligned((entry + 0x18) as *const u32),
+        read_unaligned((entry + 0x1C) as *const u32),
+        read_unaligned((entry + 0x28) as *const u32),
+        class,
+        kind,
+        key,
+    )
+}
+
+unsafe fn find_hosted_configuration_next_entry(
+    child: u64,
+    class: u32,
+    kind: u32,
+    component_key: u64,
+    next_link: u64,
+    depth: usize,
+) -> u64 {
+    if child == 0 || next_link == 0 || depth >= 64 {
+        return 0;
+    }
+    let mut current = child;
+    let mut visited = 0usize;
+    while current != 0 && visited < 4096 {
+        let resume = read_unaligned(next_link as *const u64);
+        if resume != 0 {
+            if current == resume {
+                write_unaligned(next_link as *mut u64, 0);
+            }
+        } else if hosted_configuration_entry_matches(current, class, kind, component_key) {
+            return current;
+        }
+
+        let mut sibling = read_unaligned((current + 0x10) as *const u64);
+        let mut sibling_count = 0usize;
+        while sibling != 0 && sibling_count < 4096 {
+            let resume = read_unaligned(next_link as *const u64);
+            if resume != 0 {
+                if sibling == resume {
+                    write_unaligned(next_link as *mut u64, 0);
+                }
+            } else if hosted_configuration_entry_matches(sibling, class, kind, component_key) {
+                return sibling;
+            }
+            let sibling_child = read_unaligned((sibling + 0x08) as *const u64);
+            if sibling_child != 0 {
+                let found = find_hosted_configuration_next_entry(
+                    sibling_child,
+                    class,
+                    kind,
+                    component_key,
+                    next_link,
+                    depth + 1,
+                );
+                if found != 0 {
+                    return found;
+                }
+            }
+            sibling = read_unaligned((sibling + 0x10) as *const u64);
+            sibling_count += 1;
+        }
+        current = read_unaligned((current + 0x08) as *const u64);
+        visited += 1;
+    }
+    0
+}
+
+/// `KeFindConfigurationNextEntry` traverses the loader's ARC configuration tree, resuming after
+/// `*NextLink` when the caller enumerates repeated class/type matches.
+extern "win64" fn s_ke_find_configuration_next_entry(
+    child: u64,
+    class: u32,
+    kind: u32,
+    component_key: u64,
+    next_link: u64,
+) -> u64 {
+    unsafe {
+        find_hosted_configuration_next_entry(
+            child,
+            class,
+            kind,
+            component_key,
+            next_link,
+            0,
+        )
+    }
 }
 
 extern "win64" fn s_strlen(src: u64) -> u64 {
@@ -8578,11 +8777,161 @@ extern "win64" fn s_mm_free_non_cached_memory(base: u64, _number_of_bytes: u64) 
     }
 }
 
+unsafe fn hosted_physical_mapping_slice_mut(
+    exec_data_va: u64,
+) -> &'static mut [nt_compat_exports::memory::PhysicalMapping] {
+    core::slice::from_raw_parts_mut(
+        (exec_data_va + FSD_DATA_PHYSICAL_MAP_OFF + FSD_DATA_PHYSICAL_MAP_HEADER_BYTES)
+            as *mut nt_compat_exports::memory::PhysicalMapping,
+        FSD_DATA_PHYSICAL_MAP_CAPACITY,
+    )
+}
+
+unsafe fn append_hosted_physical_frame(
+    exec_data_va: u64,
+    count: usize,
+    virtual_address: u64,
+    frame_cap: u64,
+) -> Option<usize> {
+    let physical_address = get_frame_paddr(frame_cap);
+    nt_compat_exports::memory::append_physical_page(
+        hosted_physical_mapping_slice_mut(exec_data_va),
+        count,
+        virtual_address,
+        physical_address,
+        0x1000,
+    )
+}
+
+unsafe fn append_hosted_physical_cap_run(
+    exec_data_va: u64,
+    mut count: usize,
+    virtual_base: u64,
+    frame_base: u64,
+    frames: u64,
+) -> Option<usize> {
+    let mut frame = 0u64;
+    while frame < frames {
+        count = append_hosted_physical_frame(
+            exec_data_va,
+            count,
+            virtual_base.checked_add(frame.checked_mul(0x1000)?)?,
+            frame_base.checked_add(frame)?,
+        )?;
+        frame += 1;
+    }
+    Some(count)
+}
+
+unsafe fn initialize_hosted_physical_map(
+    exec_data_va: u64,
+    image_frames: &[u64],
+    pool_frame_base: u64,
+    data_frame_base: u64,
+    shared_frame_base: u64,
+    arg_frame_base: u64,
+    stack_frame_base: u64,
+    stack_frame_count: u64,
+    ipc_buffer_frame: u64,
+) -> bool {
+    let header = exec_data_va + FSD_DATA_PHYSICAL_MAP_OFF;
+    write_volatile(header as *mut u64, 0);
+    let count_cell = &*((header + 8) as *const AtomicU32);
+    count_cell.store(0, Ordering::Relaxed);
+    write_volatile(
+        (header + 12) as *mut u32,
+        FSD_DATA_PHYSICAL_MAP_CAPACITY as u32,
+    );
+    let mappings = hosted_physical_mapping_slice_mut(exec_data_va);
+    mappings.fill(nt_compat_exports::memory::PhysicalMapping::default());
+
+    let mut count = 0usize;
+    for (index, frame_cap) in image_frames.iter().copied().enumerate() {
+        let Some(next) = append_hosted_physical_frame(
+            exec_data_va,
+            count,
+            FSD_CODE_VA + index as u64 * 0x1000,
+            frame_cap,
+        ) else {
+            return false;
+        };
+        count = next;
+    }
+    for (virtual_base, frame_base, frames) in [
+        (FSD_POOL_VADDR, pool_frame_base, FSD_POOL_FRAMES),
+        (FSD_DATA_VADDR, data_frame_base, FSD_DATA_FRAMES),
+        (FSD_SHARED_VADDR, shared_frame_base, FSD_SHARED_FRAMES),
+        (FSD_ARG_VADDR, arg_frame_base, FSD_ARG_FRAMES),
+        (FSD_STACK_VADDR, stack_frame_base, stack_frame_count),
+        (IPCBUF_VADDR, ipc_buffer_frame, 1),
+    ] {
+        let Some(next) = append_hosted_physical_cap_run(
+            exec_data_va,
+            count,
+            virtual_base,
+            frame_base,
+            frames,
+        ) else {
+            return false;
+        };
+        count = next;
+    }
+    count_cell.store(count as u32, Ordering::Release);
+    write_volatile(header as *mut u64, FSD_DATA_PHYSICAL_MAP_MAGIC);
+    true
+}
+
+unsafe fn hosted_component_physical_mappings(
+) -> Option<&'static [nt_compat_exports::memory::PhysicalMapping]> {
+    let header = FSD_DATA_VADDR + FSD_DATA_PHYSICAL_MAP_OFF;
+    if read_volatile(header as *const u64) != FSD_DATA_PHYSICAL_MAP_MAGIC {
+        return None;
+    }
+    let count = (&*((header + 8) as *const AtomicU32))
+        .load(Ordering::Acquire)
+        .min(FSD_DATA_PHYSICAL_MAP_CAPACITY as u32) as usize;
+    Some(core::slice::from_raw_parts(
+        (header + FSD_DATA_PHYSICAL_MAP_HEADER_BYTES)
+            as *const nt_compat_exports::memory::PhysicalMapping,
+        count,
+    ))
+}
+
+unsafe fn hosted_component_physical_address(virtual_address: u64) -> Option<u64> {
+    if let Some(resource) = find_shared_address_resource_by_va(FSD_SHARED_VADDR, virtual_address, 1)
+    {
+        return resource
+            .translated_start
+            .checked_add(virtual_address.checked_sub(resource.va)?);
+    }
+    nt_compat_exports::memory::physical_address(
+        hosted_component_physical_mappings()?,
+        virtual_address,
+    )
+}
+
+unsafe fn hosted_component_virtual_address(physical_address: u64, length: u64) -> Option<u64> {
+    nt_compat_exports::memory::virtual_address(
+        hosted_component_physical_mappings()?,
+        physical_address,
+        length,
+    )
+}
+
+/// `PHYSICAL_ADDRESS MmGetPhysicalAddress(PVOID)` — translate only live mappings published for
+/// this isolated driver VSpace. Unknown or unmapped addresses return zero, as NT does on failure.
+extern "win64" fn s_mm_get_physical_address(virtual_address: u64) -> u64 {
+    unsafe { hosted_component_physical_address(virtual_address).unwrap_or(0) }
+}
+
 /// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)` — return the component VA
 /// for a BAR range the executive already granted to this hosted driver. Requests outside the active
 /// grant fail with NULL; there is no success fallback.
 extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 {
     unsafe {
+        if let Some(existing) = hosted_component_virtual_address(phys, length) {
+            return existing;
+        }
         let Some(resource) = find_shared_address_resource_by_range(
             FSD_SHARED_VADDR,
             SH_RESOURCE_ADDRESS_KIND_MEMORY,
@@ -29815,6 +30164,10 @@ fn register_fsd_trampolines() -> bool {
         s_mm_map_io_space as *const () as usize as u64,
     );
     reg.bind(
+        "MmGetPhysicalAddress",
+        s_mm_get_physical_address as *const () as usize as u64,
+    );
+    reg.bind(
         "MmUnmapIoSpace",
         s_mm_unmap_io_space as *const () as usize as u64,
     );
@@ -30002,6 +30355,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("strncpy", s_strncpy as *const () as usize as u64);
     reg.bind("strcat", s_strcat as *const () as usize as u64);
     reg.bind("strstr", s_strstr as *const () as usize as u64);
+    reg.bind("_stricmp", s_stricmp as *const () as usize as u64);
     reg.bind("tolower", s_tolower as *const () as usize as u64);
     reg.bind("sprintf", hosted_sprintf_gate as *const () as usize as u64);
     reg.bind(
@@ -30015,6 +30369,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("_vsnwprintf", s_vsnwprintf as *const () as usize as u64);
     reg.bind("wcslen", s_wcslen as *const () as usize as u64);
     reg.bind("wcsstr", s_wcsstr as *const () as usize as u64);
+    reg.bind("wcschr", s_wcschr as *const () as usize as u64);
     reg.bind("_wcsicmp", s_wcsicmp as *const () as usize as u64);
     reg.bind("wcsicmp", s_wcsicmp as *const () as usize as u64);
     reg.bind("wcsncmp", s_wcsncmp as *const () as usize as u64);
@@ -30183,6 +30538,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "KeWaitForSingleObject",
         s_ke_wait_for_single_object as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeFindConfigurationNextEntry",
+        s_ke_find_configuration_next_entry as *const () as usize as u64,
     );
     reg.bind(
         "KeWaitForMultipleObjects",
@@ -34517,6 +34876,22 @@ unsafe fn load_driver_reserved(
         print_str(b"\n");
         return None;
     }
+    if !initialize_hosted_physical_map(
+        win.data_va,
+        image_frame_caps,
+        pool_base,
+        data_base,
+        shared_base,
+        arg_base,
+        stack_frame_base,
+        sc.stack_frame_count,
+        sc.ipc_buffer_frame,
+    ) {
+        print_str(b"[driver-launch] physical mapping publication failed inst=");
+        print_u64(instance as u64);
+        print_str(b"\n");
+        return None;
+    }
     // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
     // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
     let reply_cap = crate::ensure_fsd_reply_slot(instance);
@@ -34569,6 +34944,15 @@ unsafe fn load_driver_reserved(
             ..EMPTY_INSTANCE
         },
     );
+    let resume_error = crate::spawn_hosts::resume_spawned_component(&sc);
+    if resume_error != 0 {
+        print_str(b"[driver-launch] component resume failed inst=");
+        print_u64(instance as u64);
+        print_str(b" label=");
+        print_u64(resume_error);
+        print_str(b"\n");
+        return None;
+    }
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
     //    signal (FSD_DISPATCH_LABEL). Faults report addresses in the COMPONENT's VSpace (image runs at
@@ -34836,7 +35220,7 @@ unsafe fn spawn_fsd_component(
         gs_base: Some(FSD_KPCR_VA),
         caps: HostCaps::default(),
     };
-    spawn_component(&d)
+    crate::spawn_hosts::spawn_component_suspended(&d)
 }
 
 const HOSTED_PAGING_LEVEL_PDPT: u8 = 1;
