@@ -20872,14 +20872,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     followed by `IRP_MN_QUERY_DEVICE_RELATIONS`, lower-stack forwarding, completion, and FSD return
     all at `STATUS_SUCCESS`. The run completed in minutes and QEMU was terminated after its gate.
 
-    Review adjustment: the returned relation transaction publishes no usable ACPI child PDOs, so
-    the serialized hardware batch correctly withholds E1000, the root DMA fixture, and bochsmp.
-    Consequently this run has no PDEV and ends at 250/299 without Explorer; that regression is a
-    causal result of real hardware admission, not a GUI fallback to restore. The next B3 slice is to
-    prove why the successfully initialized ACPICA namespace creates no child `DEVICE_OBJECT`s,
-    repair the real ACPI namespace/PDO enumeration boundary, and then require non-empty
-    `DEVICE_RELATIONS` before `_ADR`, `_PRT`, link-resource discovery, and hardware START admission.
-    Do not repopulate children from the registry or PCI inventory.
+    Follow-up correction: ACPICA did create child PDOs. A bounded create trace proved 33 retained
+    unnamed `DEVICE_OBJECT`s, and the returned `DEVICE_RELATIONS` allocation projected all 33 into
+    canonical I/O Manager identities. The first child `QUERY_ID` then failed before entering
+    `acpi.sys` because hosted PnP dispatch incorrectly required every target to have an `AddDevice`
+    FDO binding. Bus-owned child PDOs have an authenticated hosted-domain device identity and driver
+    route, but intentionally have no FDO/lower-PDO binding.
+
+    B3 bus-owned PDO dispatch checkpoint (2026-09-01, runtime green): hosted PnP dispatch now
+    resolves every target through its canonical driver/device route. An optional FDO binding is
+    consulted only for the lower-PDO token and VideoPort path; a direct bus-owned PDO is dispatched
+    to its own authenticated component `DEVICE_OBJECT` and carries that same PDO as the native
+    no-file-object context. No binding is synthesized and no status fallback is added. A focused
+    I/O Manager test proves preparation and terminal dispatch of a direct peer-owned PDO, all 246
+    `nt-io-manager` tests pass, and the freestanding executive check remains green at 209 warnings.
+
+    Serialized run `.tmp/run-desktop-acpi-direct-pdo-20260901.log` completed in well under the
+    one-hour launch limit and reached the sentinel at 250/299. It dispatched the real ACPI child
+    `QUERY_ID` and property IRPs across the hosted driver boundary for the 33 returned PDOs; the old
+    `STATUS_INVALID_PARAMETER` relation barrier is absent. QEMU was terminated after proof. E1000,
+    the root DMA fixture, and bochs remain withheld, so this is not accepted desktop restoration:
+    the next B3 slice is to complete and observe ACPI child-property publication, then require the
+    firmware/provider-owned `_ADR`, `_PRT`, and interrupt-link catalog to produce a current PCI
+    route before hardware START admission. Do not repopulate children or routes from registry/PCI
+    inventory, and do not weaken the existing topology fence.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 

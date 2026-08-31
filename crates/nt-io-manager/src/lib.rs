@@ -2572,6 +2572,62 @@ mod tests {
     }
 
     #[test]
+    fn prepared_pnp_routes_a_direct_peer_owned_pdo() {
+        let mut io = io();
+        let client = io.register_client();
+        let backend = RecordingBackend {
+            seen: std::rc::Rc::new(std::cell::RefCell::new(std::vec::Vec::new())),
+            status: NtStatus::SUCCESS,
+            information: 0,
+            file_context: None,
+            output: std::vec::Vec::new(),
+        };
+        let mut dispatch = MajorFunctionTable::new();
+        dispatch.set(
+            major::IRP_MJ_PNP,
+            DispatchTarget::DriverPeer(DriverPeerId(0)),
+        );
+        let driver = io
+            .create_driver_peer_with_major_table(
+                &path("\\Driver\\DirectPdo"),
+                Box::new(backend),
+                dispatch,
+            )
+            .unwrap();
+        let pdo = io
+            .create_device(
+                driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::empty(),
+                112,
+            )
+            .unwrap();
+
+        let prepared = io
+            .prepare_external_pnp_to_device(
+                client,
+                pdo,
+                0,
+                PnpParameters::query_id(nt_pnp_abi::BUS_QUERY_DEVICE_ID),
+                &[],
+            )
+            .unwrap();
+        let irp = io.irp(prepared.irp_id()).unwrap();
+        assert_eq!(irp.origin_device_id, pdo);
+        assert_eq!(irp.current_stack().unwrap().device_id, pdo);
+        assert_eq!(irp.current_stack().unwrap().driver_id, driver);
+        assert_eq!(
+            io.dispatch_prepared_external_pnp(prepared),
+            ExternalPnpDispatchResult::Returned {
+                status: NtStatus::SUCCESS,
+                information: 0,
+            }
+        );
+    }
+
+    #[test]
     fn prepared_pnp_preserves_return_pending_and_indeterminate_outcomes() {
         let parameters = PnpParameters::lifecycle(nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE).unwrap();
 

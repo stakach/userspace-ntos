@@ -40135,26 +40135,28 @@ impl DriverDispatchBackend for HostedDriverBackend {
             Ok(request) => request,
             Err(status) => return PnpBackendDispatch::NotDispatched { status },
         };
-        let Some(binding) = hosted_device_binding_by_device_id(irp.device_id.raw()) else {
+        let Some((route_instance, route_inst, device_object)) =
+            hosted_driver_device_route_by_device_id(irp.device_id.raw())
+                .filter(|(instance, _, _)| *instance == self.instance)
+        else {
             return PnpBackendDispatch::NotDispatched {
                 status: nt_status::NtStatus::INVALID_PARAMETER,
             };
         };
-        let Some(binding_instance) = instance(binding.instance) else {
-            return PnpBackendDispatch::NotDispatched {
-                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-            };
-        };
-        if unsafe { hosted_instance_video_port_initialized(binding_instance) } {
-            return unsafe {
-                dispatch_video_pnp_irp_for_instance(
-                    binding.instance,
-                    binding_instance,
-                    binding,
-                    irp,
-                    ctx.system_buffer,
-                )
-            };
+        let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
+            .filter(|binding| binding.instance == route_instance);
+        if let Some(binding) = binding {
+            if unsafe { hosted_instance_video_port_initialized(route_inst) } {
+                return unsafe {
+                    dispatch_video_pnp_irp_for_instance(
+                        route_instance,
+                        route_inst,
+                        binding,
+                        irp,
+                        ctx.system_buffer,
+                    )
+                };
+            }
         }
         let input = Vec::from(&ctx.system_buffer[..input_len]);
         let output = if output_len == 0 {
@@ -40164,14 +40166,16 @@ impl DriverDispatchBackend for HostedDriverBackend {
         };
         let result = unsafe {
             dispatch_irp_for_instance_exact(
-                self.instance,
+                route_instance,
                 irp.major as u64,
                 irp.minor as u64,
-                binding.device_object,
+                device_object,
                 irp.irp_id.raw(),
                 0,
                 projection_fsctl(irp),
-                binding.pdo_object,
+                binding
+                    .map(|binding| binding.pdo_object)
+                    .unwrap_or(device_object),
                 irp.requestor_tid,
                 Some(request),
                 &input,
