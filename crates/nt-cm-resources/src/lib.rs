@@ -243,6 +243,8 @@ pub fn decode_single_bus_number_resource(
 
 /// Return the exact self-described prefix of a native `IO_RESOURCE_REQUIREMENTS_LIST` allocation.
 /// The top-level `ListSize`, alternative count, and every descriptor count must agree exactly.
+/// A present alternative may contain zero descriptors; bus drivers use that native 40-byte form
+/// to report that a PDO currently has no resource requirements.
 pub fn validate_io_resource_requirements_list_extent(
     buf: &[u8],
 ) -> Result<usize, NativeResourceListError> {
@@ -264,9 +266,6 @@ pub fn validate_io_resource_requirements_list_extent(
             return Err(NativeResourceListError::InconsistentSize);
         }
         let descriptor_count = read_u32(buf, cursor + 4)? as usize;
-        if descriptor_count == 0 {
-            return Err(NativeResourceListError::Empty);
-        }
         let descriptor_bytes = descriptor_count
             .checked_mul(IO_RESOURCE_DESCRIPTOR_SIZE)
             .ok_or(NativeResourceListError::SizeOverflow)?;
@@ -1941,6 +1940,27 @@ mod tests {
         assert_eq!(
             validate_io_resource_requirements_list_extent(&buf),
             Err(NativeResourceListError::InconsistentSize)
+        );
+    }
+
+    #[test]
+    fn native_requirements_extent_accepts_an_empty_alternative() {
+        let mut buf = [0xa5; 88];
+        buf[0..4].copy_from_slice(&(IO_RESOURCE_REQUIREMENTS_HEADER_SIZE as u32).to_le_bytes());
+        buf[28..32].copy_from_slice(&1u32.to_le_bytes());
+        buf[32..34].copy_from_slice(&1u16.to_le_bytes());
+        buf[34..36].copy_from_slice(&1u16.to_le_bytes());
+        buf[36..40].copy_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(
+            validate_io_resource_requirements_list_extent(&buf),
+            Ok(IO_RESOURCE_REQUIREMENTS_HEADER_SIZE)
+        );
+        assert_eq!(
+            validate_io_resource_requirements_list_extent(
+                &buf[..IO_RESOURCE_REQUIREMENTS_HEADER_SIZE - 1]
+            ),
+            Err(NativeResourceListError::Truncated)
         );
     }
 

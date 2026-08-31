@@ -22512,13 +22512,7 @@ unsafe fn pending_driver_start_transfer(
     };
     nt_handler
         .pending_driver_starts
-        .publish(
-            reservation,
-            PendingDriverStart {
-                batch,
-                owner,
-            },
-        )
+        .publish(reservation, PendingDriverStart { batch, owner })
         .expect("reserved driver START continuation rejected its exact batch");
     if native_pending {
         nt_handler.native_driver_start_report.pending_batches = nt_handler
@@ -22566,10 +22560,7 @@ unsafe fn pending_pnp_operation_transfer(
     };
     nt_handler
         .pending_pnp_operations
-        .publish(
-            reservation,
-            PendingPnpOperation { operation, owner },
-        )
+        .publish(reservation, PendingPnpOperation { operation, owner })
         .expect("reserved PnP continuation rejected its exact operation");
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
@@ -22634,13 +22625,16 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
                     Err(failure) => failure.status.raw() as u32,
                 };
-                let device_action_identity = nt_handler
-                    .pending_driver_starts
-                    .get(slot)
-                    .and_then(|pending| match &pending.owner {
-                        PendingDriverStartOwner::DeviceAction { identity, .. } => Some(*identity),
-                        _ => None,
-                    });
+                let device_action_identity =
+                    nt_handler
+                        .pending_driver_starts
+                        .get(slot)
+                        .and_then(|pending| match &pending.owner {
+                            PendingDriverStartOwner::DeviceAction { identity, .. } => {
+                                Some(*identity)
+                            }
+                            _ => None,
+                        });
                 if let Some(identity) = device_action_identity {
                     nt_handler
                         .pnp_complete_live_start(identity, slot, status)
@@ -22882,9 +22876,9 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
                 };
                 reply
             }
-            PendingDriverStartOwner::DeviceAction { reply, .. } => {
-                reply.take().expect("live START reply disappeared during abandonment")
-            }
+            PendingDriverStartOwner::DeviceAction { reply, .. } => reply
+                .take()
+                .expect("live START reply disappeared during abandonment"),
             _ => unreachable!(),
         };
         let cap = reply.reply_cap;

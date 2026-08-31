@@ -27,10 +27,11 @@ pub use madt::{
 };
 pub use namespace::{
     immediate_namespace_children_input, multilevel_namespace_filter_input,
-    namespace_children_required_len, parse_namespace_children, parse_namespace_matches,
-    resolve_namespace_reference, AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError,
-    AcpiNamespaceMatches, AcpiNamespacePath, ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN,
-    ACPI_ENUM_CHILDREN_INPUT_LEN, IOCTL_ACPI_ENUM_CHILDREN,
+    namespace_children_overflow_retry_len, namespace_children_required_len,
+    parse_namespace_children, parse_namespace_matches, resolve_namespace_reference,
+    AcpiNamespaceChild, AcpiNamespaceChildren, AcpiNamespaceError, AcpiNamespaceMatches,
+    AcpiNamespacePath, ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN, ACPI_ENUM_CHILDREN_INPUT_LEN,
+    IOCTL_ACPI_ENUM_CHILDREN,
 };
 pub use pci_routing::{
     parse_interrupt_resource_template, parse_pci_routing_table, resolve_pci_routing_table,

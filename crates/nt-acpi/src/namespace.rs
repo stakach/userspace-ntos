@@ -162,6 +162,33 @@ pub fn namespace_children_required_len(
     Ok(required)
 }
 
+/// Choose the next output extent after `IOCTL_ACPI_ENUM_CHILDREN` reports buffer overflow.
+/// Providers that publish the standard required-length header get an exact retry. Providers that
+/// leave the METHOD_BUFFERED input header in place get one bounded maximum-sized retry; another
+/// opaque overflow at that maximum is rejected.
+pub fn namespace_children_overflow_retry_len(
+    header: &[u8],
+    current: usize,
+    maximum: usize,
+) -> Result<usize, AcpiNamespaceError> {
+    if header.len() != current
+        || current < ENUM_OUTPUT_HEADER_LEN
+        || maximum < ENUM_OUTPUT_HEADER_LEN
+        || current > maximum
+    {
+        return Err(AcpiNamespaceError::InvalidRequiredLength);
+    }
+    if read_u32(header, 0)? == ENUM_OUTPUT_SIGNATURE {
+        let required = namespace_children_required_len(header, maximum)?;
+        return (required > current)
+            .then_some(required)
+            .ok_or(AcpiNamespaceError::InvalidRequiredLength);
+    }
+    (current < maximum)
+        .then_some(maximum)
+        .ok_or(AcpiNamespaceError::InvalidRequiredLength)
+}
+
 /// Decode one exact successful `IOCTL_ACPI_ENUM_CHILDREN` result. The provider returns the queried
 /// PDO itself as record zero, followed by the requested namespace descendants.
 pub fn parse_namespace_children(
@@ -495,6 +522,27 @@ mod tests {
         assert_eq!(
             namespace_children_required_len(&header, 4096),
             Err(AcpiNamespaceError::InvalidRequiredLength)
+        );
+    }
+
+    #[test]
+    fn opaque_overflow_gets_one_bounded_maximum_retry() {
+        let input_header = immediate_namespace_children_input();
+        assert_eq!(
+            namespace_children_overflow_retry_len(&input_header[..8], 8, 4096),
+            Ok(4096)
+        );
+        assert_eq!(
+            namespace_children_overflow_retry_len(&input_header[..8], 8, 8),
+            Err(AcpiNamespaceError::InvalidRequiredLength)
+        );
+
+        let mut required_header = [0u8; 8];
+        required_header[..4].copy_from_slice(&ENUM_OUTPUT_SIGNATURE.to_le_bytes());
+        required_header[4..].copy_from_slice(&1234u32.to_le_bytes());
+        assert_eq!(
+            namespace_children_overflow_retry_len(&required_header, 8, 4096),
+            Ok(1234)
         );
     }
 

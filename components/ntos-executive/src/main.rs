@@ -23933,6 +23933,9 @@ fn report_deferred_generic_hardware_checks(
     provider: driver_launch::HostedProviderSharingEvidence,
     passed: &mut u64,
 ) {
+    unsafe {
+        driver_launch::print_hosted_pnp_enumeration_evidence();
+    }
     print_str(b"[driver-launch] final config PnP summary selected=");
     print_u64(selected);
     print_str(b" attempted=");

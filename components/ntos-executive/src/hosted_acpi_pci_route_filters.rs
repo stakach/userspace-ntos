@@ -28,12 +28,11 @@ fn classify_hosted_acpi_pci_crs_filter_result(
     Option<nt_acpi::AcpiNamespaceMatches>,
 ) {
     if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
-        let required = (output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN
-            && information == 0
-            && payload.len() == output_len)
+        let required = (information == 0)
             .then(|| {
-                nt_acpi::namespace_children_required_len(
+                nt_acpi::namespace_children_overflow_retry_len(
                     payload,
+                    output_len,
                     HOSTED_ACPI_NAMESPACE_MAX_BYTES,
                 )
                 .ok()
@@ -41,7 +40,6 @@ fn classify_hosted_acpi_pci_crs_filter_result(
             .flatten();
         return (
             required
-                .filter(|required| *required > output_len)
                 .map_or(
                     HostedAcpiPciCrsFilterDisposition::Barrier(
                         nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -54,18 +52,15 @@ fn classify_hosted_acpi_pci_crs_filter_result(
     if status.raw() != STATUS_SUCCESS {
         return (HostedAcpiPciCrsFilterDisposition::Barrier(status), None);
     }
-    if information != output_len as u64
-        || payload.len() != output_len
-        || !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
-            .contains(&output_len)
-    {
+    let Some(payload) = hosted_acpi_namespace_success_payload(output_len, information, payload)
+    else {
         return (
             HostedAcpiPciCrsFilterDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ),
             None,
         );
-    }
+    };
     match nt_acpi::parse_namespace_matches(payload, HOSTED_ACPI_NAMESPACE_MAX_CHILDREN) {
         Ok(matches) => (
             HostedAcpiPciCrsFilterDisposition::SourceReady,

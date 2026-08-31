@@ -543,21 +543,14 @@ pub(crate) unsafe fn spawn_component_suspended(d: &ComponentDescriptor) -> Spawn
 }
 
 pub(crate) unsafe fn resume_spawned_component(component: &SpawnedComponent) -> u64 {
-    trace_component_spawn_stage(
-        b"resume-begin",
-        component.tcb,
-        component.sched_context,
-    );
+    trace_component_spawn_stage(b"resume-begin", component.tcb, component.sched_context);
     let error = tcb_resume_r(component.tcb);
     trace_component_spawn_stage(b"resume-end", component.tcb, error);
     trace_component_handoff(b"component-resume", component.tcb, 0, error);
     error
 }
 
-unsafe fn spawn_component_inner(
-    d: &ComponentDescriptor,
-    resume: bool,
-) -> SpawnedComponent {
+unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> SpawnedComponent {
     let img_start = IMAGE_FRAMES_START.load(Ordering::Relaxed);
     let img_count = IMAGE_FRAMES_COUNT.load(Ordering::Relaxed);
     let heap_frames = component_allocator_heap_frames(d);
@@ -1948,16 +1941,7 @@ unsafe fn component_pump_loop(
         {
             let (status, out1, out2) =
                 crate::win32k_subsystem::service_registry_request(msg.m0, msg.m1);
-            pump_reply_recv4_into!(
-                ch,
-                *reply_cap,
-                msg,
-                3,
-                status as u32 as u64,
-                out1,
-                out2,
-                0
-            );
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 3, status as u32 as u64, out1, out2, 0);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp
@@ -1973,9 +1957,7 @@ unsafe fn component_pump_loop(
         {
             let (status, thread_id) =
                 crate::driver_launch::service_hosted_driver_ps_get_current_thread_id(
-                    ch,
-                    msg.badge,
-                    *reply_cap,
+                    ch, msg.badge, *reply_cap,
                 );
             pump_reply_recv4_into!(
                 ch,
@@ -1991,16 +1973,9 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_PCI_CONFIG_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, transferred) =
-                crate::driver_launch::service_hosted_driver_pci_config(
-                    ch,
-                    msg.m0,
-                    msg.m1,
-                    msg.m2,
-                    msg.m3,
-                    msg.badge,
-                    *reply_cap,
-                );
+            let (status, transferred) = crate::driver_launch::service_hosted_driver_pci_config(
+                ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
+            );
             pump_reply_recv4_into!(
                 ch,
                 *reply_cap,
@@ -2015,13 +1990,9 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_INTERRUPT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, interrupt_id) =
-                crate::driver_launch::service_hosted_driver_interrupt(
-                    ch,
-                    msg.m0,
-                    msg.m1,
-                    *reply_cap,
-                );
+            let (status, interrupt_id) = crate::driver_launch::service_hosted_driver_interrupt(
+                ch, msg.m0, msg.m1, *reply_cap,
+            );
             pump_reply_recv4_into!(
                 ch,
                 *reply_cap,
@@ -2626,14 +2597,16 @@ unsafe fn pump_service_io_port_fault(
             }
             (fault_ip, crate::IMAGE_BASE.checked_add(executive_len)?)
         };
-    let available = usize::try_from(exec_limit.checked_sub(exec_ip)?).ok()?.min(4);
+    let available = usize::try_from(exec_limit.checked_sub(exec_ip)?)
+        .ok()?
+        .min(4);
     let mut instruction_bytes = [0u8; 4];
     for (index, byte) in instruction_bytes[..available].iter_mut().enumerate() {
         *byte = core::ptr::read_volatile((exec_ip + index as u64) as *const u8);
     }
-    let Some(instruction) = nt_kernel_exec::x86_io::decode_port_io_instruction(
-        &instruction_bytes[..available],
-    ) else {
+    let Some(instruction) =
+        nt_kernel_exec::x86_io::decode_port_io_instruction(&instruction_bytes[..available])
+    else {
         let count = HOSTED_IO_PORT_UNHANDLED_GPS.fetch_add(1, Ordering::Relaxed);
         if count < 8 {
             crate::print_str(b"[pump] unhandled IOPort GP ip=0x");

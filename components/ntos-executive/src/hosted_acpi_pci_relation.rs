@@ -78,19 +78,19 @@ unsafe fn classify_hosted_acpi_pci_namespace_filter_result(
     payload: &[u8],
 ) -> HostedAcpiPciNamespaceDisposition {
     if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
-        if information != 0 {
-            return HostedAcpiPciNamespaceDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            );
-        }
-        return match nt_acpi::namespace_children_required_len(
-            payload,
-            HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-        ) {
-            Ok(required) if required > output_len => {
-                HostedAcpiPciNamespaceDisposition::RetryExact(required)
-            }
-            Ok(_) | Err(_) => HostedAcpiPciNamespaceDisposition::Barrier(
+        return match (information == 0)
+            .then(|| {
+                nt_acpi::namespace_children_overflow_retry_len(
+                    payload,
+                    output_len,
+                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
+                )
+                .ok()
+            })
+            .flatten()
+        {
+            Some(required) => HostedAcpiPciNamespaceDisposition::RetryExact(required),
+            None => HostedAcpiPciNamespaceDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
             ),
         };
@@ -98,15 +98,12 @@ unsafe fn classify_hosted_acpi_pci_namespace_filter_result(
     if !status.is_success() {
         return HostedAcpiPciNamespaceDisposition::Barrier(status);
     }
-    if information != output_len as u64
-        || payload.len() != output_len
-        || !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
-            .contains(&output_len)
-    {
+    let Some(payload) = hosted_acpi_namespace_success_payload(output_len, information, payload)
+    else {
         return HostedAcpiPciNamespaceDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         );
-    }
+    };
     let matches = match nt_acpi::parse_namespace_matches(
         payload,
         HOSTED_ACPI_NAMESPACE_MAX_CHILDREN,
@@ -172,6 +169,12 @@ unsafe fn dispatch_hosted_acpi_pci_namespace_filter(
     method: HostedAcpiPciNamespaceMethod,
     output_len: usize,
 ) -> bool {
+    note_hosted_relation_query_operation(
+        HostedRelationQueryOperation::AcpiPciNamespace,
+        child_index,
+        (u64::from(method == HostedAcpiPciNamespaceMethod::RoutingTable) << 32)
+            | output_len as u64,
+    );
     if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
         .contains(&output_len)
     {
@@ -542,6 +545,11 @@ unsafe fn dispatch_hosted_acpi_pci_address_method(
     child_index: usize,
     address_index: usize,
 ) -> bool {
+    note_hosted_relation_query_operation(
+        HostedRelationQueryOperation::AcpiPciAddress,
+        child_index,
+        address_index as u64,
+    );
     let method_path = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
         .as_ref()
         .and_then(|query| query.child_properties.get(child_index))

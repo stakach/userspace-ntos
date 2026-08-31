@@ -181,8 +181,7 @@ pub const WIN32K_JOB_ATOM_BYTES: usize = (WIN32K_JOB_ATOM_FRAMES as usize) * 0x1
 pub const WIN32K_JOB_ATOM_PAYLOAD_OFF: u64 = 0x20;
 /// Dedicated pointer-free registry staging. Registry imports execute in the win32k component, but
 /// the isolated Configuration Manager transport and all CM key leases remain executive-owned.
-pub const WIN32K_REGISTRY_VADDR: u64 =
-    WIN32K_JOB_ATOM_VADDR + WIN32K_JOB_ATOM_FRAMES * 0x1000;
+pub const WIN32K_REGISTRY_VADDR: u64 = WIN32K_JOB_ATOM_VADDR + WIN32K_JOB_ATOM_FRAMES * 0x1000;
 pub const WIN32K_REGISTRY_FRAMES: u64 = 16;
 pub const WIN32K_REGISTRY_BYTES: usize = (WIN32K_REGISTRY_FRAMES as usize) * 0x1000;
 /// Bulk client-buffer staging for provider-dispatched win32k calls whose input is data, not just
@@ -193,9 +192,8 @@ pub const WIN32K_BULK_ARG_FRAMES: u64 = 512;
 const _: () = assert!(WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000 <= WIN32K_VIDEO_IOCTL_VADDR);
 const _: () =
     assert!(WIN32K_VIDEO_IOCTL_VADDR + WIN32K_VIDEO_IOCTL_FRAMES * 0x1000 <= WIN32K_LPC_VADDR);
-const _: () = assert!(
-    WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR
-);
+const _: () =
+    assert!(WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_FRAMES * 0x1000 <= WIN32K_BULK_ARG_VADDR);
 /// Kernel-mode KUSER_SHARED_DATA mapping used by win32k's direct `SharedUserData` reads. User
 /// processes also see the low 0x7FFE0000 alias; win32k, as a kernel driver, reads the canonical
 /// high VA directly (for example TickCount at +0x320).
@@ -347,7 +345,9 @@ pub const SH_CALLOUT_THREAD: u64 = 0xFE0;
 pub const SH_CALLOUT_GLOBAL_ATOM: u64 = 0xFE8;
 pub const SH_CALLOUT_JOB: u64 = 0xFF0;
 pub const SH_CALLOUT_BATCH_FLUSH: u64 = 0xFF8;
-const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= SH_CALLOUT_TABLE as usize);
+const _: () = assert!(
+    SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= SH_CALLOUT_TABLE as usize
+);
 const _: () = assert!(SH_CALLOUT_BATCH_FLUSH + 8 == 0x1000);
 
 pub const HOSTED_PROCESS_ROLE_NONE: u64 = 0;
@@ -388,9 +388,7 @@ pub fn registered_win32k_callouts() -> Option<nt_process::Win32Callouts> {
             process_callout: read_volatile(
                 (WIN32K_SHARED_VADDR + SH_CALLOUT_PROCESS) as *const u64,
             ),
-            thread_callout: read_volatile(
-                (WIN32K_SHARED_VADDR + SH_CALLOUT_THREAD) as *const u64,
-            ),
+            thread_callout: read_volatile((WIN32K_SHARED_VADDR + SH_CALLOUT_THREAD) as *const u64),
             global_atom_callout: read_volatile(
                 (WIN32K_SHARED_VADDR + SH_CALLOUT_GLOBAL_ATOM) as *const u64,
             ),
@@ -2277,10 +2275,9 @@ static mut WIN32_JOB_UI_POLICY_INITIALIZED: bool = false;
 
 unsafe fn win32_job_ui_policy() -> &'static mut nt_win32k_job::JobUiPolicyStore {
     if !WIN32_JOB_UI_POLICY_INITIALIZED {
-        core::ptr::addr_of_mut!(WIN32_JOB_UI_POLICY)
-            .write(core::mem::MaybeUninit::new(
-                nt_win32k_job::JobUiPolicyStore::new(),
-            ));
+        core::ptr::addr_of_mut!(WIN32_JOB_UI_POLICY).write(core::mem::MaybeUninit::new(
+            nt_win32k_job::JobUiPolicyStore::new(),
+        ));
         WIN32_JOB_UI_POLICY_INITIALIZED = true;
     }
     (&mut *core::ptr::addr_of_mut!(WIN32_JOB_UI_POLICY)).assume_init_mut()
@@ -2348,10 +2345,7 @@ unsafe fn add_process_to_win32_job(job: u64, process: u64) -> u32 {
                 Ok(restrictions) => restrictions,
                 Err(status) => return status,
             };
-            write_volatile(
-                slot,
-                nt_win32k_job::process_job_token(restrictions, token),
-            );
+            write_volatile(slot, nt_win32k_job::process_job_token(restrictions, token));
             nt_win32k_job::STATUS_SUCCESS
         }
         Err(status) => status,
@@ -6431,8 +6425,7 @@ unsafe fn resolve_user_handle_entry(handle: u64) -> Option<UserHandleEntry> {
         return None;
     }
     let low = handle & 0xFFFF;
-    if !(FIRST_USER_HANDLE..=LAST_USER_HANDLE).contains(&low)
-        || (low - FIRST_USER_HANDLE) & 1 != 0
+    if !(FIRST_USER_HANDLE..=LAST_USER_HANDLE).contains(&low) || (low - FIRST_USER_HANDLE) & 1 != 0
     {
         return None;
     }
@@ -6451,8 +6444,7 @@ unsafe fn resolve_user_handle_entry(handle: u64) -> Option<UserHandleEntry> {
     if object_type == 0 {
         return None;
     }
-    let actual_generation =
-        read_volatile((entry + USER_HANDLE_ENTRY_GENERATION_OFF) as *const u16);
+    let actual_generation = read_volatile((entry + USER_HANDLE_ENTRY_GENERATION_OFF) as *const u16);
     let supplied_generation = ((handle >> 16) & 0xFFFF) as u16;
     if supplied_generation != 0
         && supplied_generation != u16::MAX
@@ -8808,12 +8800,9 @@ const WIN32K_REGISTRY_VALUE_LEN: u64 = 4;
 const WIN32K_REGISTRY_VALUE_TYPE: u64 = 8;
 const WIN32K_REGISTRY_DATA_LEN: u64 = 12;
 const WIN32K_REGISTRY_KEY_OFF: u64 = 16;
-const WIN32K_REGISTRY_VALUE_OFF: u64 =
-    WIN32K_REGISTRY_KEY_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
-const WIN32K_REGISTRY_DATA_OFF: u64 =
-    WIN32K_REGISTRY_VALUE_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
-const WIN32K_REGISTRY_VALUE_CAP: usize =
-    WIN32K_REGISTRY_BYTES - WIN32K_REGISTRY_DATA_OFF as usize;
+const WIN32K_REGISTRY_VALUE_OFF: u64 = WIN32K_REGISTRY_KEY_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
+const WIN32K_REGISTRY_DATA_OFF: u64 = WIN32K_REGISTRY_VALUE_OFF + WIN32K_REGISTRY_PATH_MAX as u64;
+const WIN32K_REGISTRY_VALUE_CAP: usize = WIN32K_REGISTRY_BYTES - WIN32K_REGISTRY_DATA_OFF as usize;
 const WIN32K_REGISTRY_OP_OPEN: u64 = 1;
 const WIN32K_REGISTRY_OP_CLOSE: u64 = 2;
 const WIN32K_REGISTRY_OP_QUERY_VALUE: u64 = 3;
@@ -8870,9 +8859,7 @@ fn win32k_reg_handles() -> Option<&'static Vec<Win32kRegHandle>> {
     unsafe { (&*core::ptr::addr_of!(WIN32K_REG_HANDLES)).as_ref() }
 }
 
-fn register_win32k_reg_handle(
-    target: Win32kRegHandleTarget,
-) -> Result<u64, Win32kRegHandleTarget> {
+fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Result<u64, Win32kRegHandleTarget> {
     if matches!(&target, Win32kRegHandleTarget::Empty) {
         return Err(target);
     }
@@ -8947,7 +8934,12 @@ fn system_hive_absolute_path(path: &[u8]) -> Result<alloc::string::String, i32> 
     let prefix = r"\Registry\Machine\System";
     let mut absolute = alloc::string::String::new();
     absolute
-        .try_reserve_exact(prefix.len().saturating_add(usize::from(!tail.is_empty())).saturating_add(tail.len()))
+        .try_reserve_exact(
+            prefix
+                .len()
+                .saturating_add(usize::from(!tail.is_empty()))
+                .saturating_add(tail.len()),
+        )
         .map_err(|_| STATUS_NO_MEMORY)?;
     absolute.push_str(prefix);
     if !tail.is_empty() {
@@ -9050,8 +9042,7 @@ unsafe fn object_attributes_name_ascii_lower(obj_attr: u64) -> Option<Vec<u8>> {
 }
 
 unsafe fn write_win32k_registry_ascii(len_off: u64, data_off: u64, value: &[u8]) -> bool {
-    if value.len() > WIN32K_REGISTRY_PATH_MAX
-        || value.iter().any(|byte| *byte == 0 || *byte > 0x7f)
+    if value.len() > WIN32K_REGISTRY_PATH_MAX || value.iter().any(|byte| *byte == 0 || *byte > 0x7f)
     {
         return false;
     }
@@ -9076,9 +9067,7 @@ unsafe fn read_win32k_registry_ascii(len_off: u64, data_off: u64) -> Option<Vec<
     let mut value = Vec::new();
     value.try_reserve_exact(len).ok()?;
     for index in 0..len {
-        let byte = read_volatile(
-            (WIN32K_REGISTRY_VADDR + data_off + index as u64) as *const u8,
-        );
+        let byte = read_volatile((WIN32K_REGISTRY_VADDR + data_off + index as u64) as *const u8);
         if byte == 0 || byte > 0x7f {
             return None;
         }
@@ -9088,13 +9077,8 @@ unsafe fn read_win32k_registry_ascii(len_off: u64, data_off: u64) -> Option<Vec<
 }
 
 unsafe fn win32k_registry_broker_call(op: u64, arg: u64) -> (i32, u64, u64) {
-    let (_label, status, out1, out2, _) = crate::driver_launch::call_on4(
-        (W32_REGISTRY_LABEL << 12) | 2,
-        op,
-        arg,
-        0,
-        0,
-    );
+    let (_label, status, out1, out2, _) =
+        crate::driver_launch::call_on4((W32_REGISTRY_LABEL << 12) | 2, op, arg, 0, 0);
     (status as u32 as i32, out1, out2)
 }
 
@@ -9194,10 +9178,9 @@ pub(crate) unsafe fn service_registry_request(op: u64, arg: u64) -> (i32, u64, u
     );
     match op {
         WIN32K_REGISTRY_OP_OPEN => {
-            let Some(path) = read_win32k_registry_ascii(
-                WIN32K_REGISTRY_KEY_LEN,
-                WIN32K_REGISTRY_KEY_OFF,
-            ) else {
+            let Some(path) =
+                read_win32k_registry_ascii(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF)
+            else {
                 return (STATUS_INVALID_PARAMETER_I32, 0, 0);
             };
             match service_win32k_registry_open(arg, &path) {
@@ -9210,10 +9193,9 @@ pub(crate) unsafe fn service_registry_request(op: u64, arg: u64) -> (i32, u64, u
             None => (STATUS_INVALID_HANDLE_I32, 0, 0),
         },
         WIN32K_REGISTRY_OP_QUERY_VALUE => {
-            let Some(name) = read_win32k_registry_ascii(
-                WIN32K_REGISTRY_VALUE_LEN,
-                WIN32K_REGISTRY_VALUE_OFF,
-            ) else {
+            let Some(name) =
+                read_win32k_registry_ascii(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF)
+            else {
                 return (STATUS_INVALID_PARAMETER_I32, 0, 0);
             };
             match service_win32k_registry_query(arg, &name) {
@@ -9227,13 +9209,16 @@ pub(crate) unsafe fn service_registry_request(op: u64, arg: u64) -> (i32, u64, u
                         data.len().min(u32::MAX as usize) as u32,
                     );
                     if data.len() > WIN32K_REGISTRY_VALUE_CAP {
-                        return (STATUS_BUFFER_TOO_SMALL_I32, value_type as u64, data.len() as u64);
+                        return (
+                            STATUS_BUFFER_TOO_SMALL_I32,
+                            value_type as u64,
+                            data.len() as u64,
+                        );
                     }
                     for (index, byte) in data.iter().copied().enumerate() {
                         write_volatile(
-                            (WIN32K_REGISTRY_VADDR
-                                + WIN32K_REGISTRY_DATA_OFF
-                                + index as u64) as *mut u8,
+                            (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF + index as u64)
+                                as *mut u8,
                             byte,
                         );
                     }
@@ -9271,15 +9256,10 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
         let root_dir = read_unaligned((obj_attr + 0x8) as *const u64);
-        if !write_win32k_registry_ascii(
-            WIN32K_REGISTRY_KEY_LEN,
-            WIN32K_REGISTRY_KEY_OFF,
-            &path,
-        ) {
+        if !write_win32k_registry_ascii(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF, &path) {
             return STATUS_INVALID_PARAMETER_I32;
         }
-        let (status, hkey, _) =
-            win32k_registry_broker_call(WIN32K_REGISTRY_OP_OPEN, root_dir);
+        let (status, hkey, _) = win32k_registry_broker_call(WIN32K_REGISTRY_OP_OPEN, root_dir);
         if status != 0 {
             return status;
         }
@@ -9319,11 +9299,7 @@ unsafe fn query_win32k_registry_value(
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    if !write_win32k_registry_ascii(
-        WIN32K_REGISTRY_VALUE_LEN,
-        WIN32K_REGISTRY_VALUE_OFF,
-        name,
-    ) {
+    if !write_win32k_registry_ascii(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF, name) {
         return STATUS_INVALID_PARAMETER_I32;
     }
     let (status, value_type, data_len) =
@@ -9363,16 +9339,10 @@ extern "win64" fn s_zw_query_value_key(
     }
 }
 
-fn win32k_registry_value_owned(
-    handle: u64,
-    name: &[u8],
-) -> Result<Option<(u32, Vec<u8>)>, i32> {
+fn win32k_registry_value_owned(handle: u64, name: &[u8]) -> Result<Option<(u32, Vec<u8>)>, i32> {
     unsafe {
-        if !write_win32k_registry_ascii(
-            WIN32K_REGISTRY_VALUE_LEN,
-            WIN32K_REGISTRY_VALUE_OFF,
-            name,
-        ) {
+        if !write_win32k_registry_ascii(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF, name)
+        {
             return Err(STATUS_INVALID_PARAMETER_I32);
         }
         let (status, value_type, data_len) =
@@ -11564,8 +11534,9 @@ fn restricted_ui_operation(ssn: u64, a0: u64, a1: u64) -> Option<nt_win32k_job::
 
     match ssn {
         // Clipboard data and observable clipboard state.
-        0x102E | 0x1055 | 0x10CD | 0x10DC | 0x10ED | 0x10FD | 0x1115 | 0x1241
-        | 0x124F => Some(UiOperation::ReadClipboard),
+        0x102E | 0x1055 | 0x10CD | 0x10DC | 0x10ED | 0x10FD | 0x1115 | 0x1241 | 0x124F => {
+            Some(UiOperation::ReadClipboard)
+        }
         // Clipboard mutations. Open/CloseClipboard remain available so a process restricted in
         // only one direction can still use the permitted direction.
         0x10D5 | 0x10FC | 0x111F | 0x1121 => Some(UiOperation::WriteClipboard),
@@ -11633,14 +11604,17 @@ unsafe fn dispatch_win32_job_atom(job: u64, operation: u64, value: u64, capacity
             write_volatile((stage + 12) as *mut u32, result.name_length);
             if result.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
                 let bytes = (result.name_length as usize).min(name.len() * 2);
-                core::ptr::copy_nonoverlapping(name.as_ptr() as *const u8, payload as *mut u8, bytes);
+                core::ptr::copy_nonoverlapping(
+                    name.as_ptr() as *const u8,
+                    payload as *mut u8,
+                    bytes,
+                );
             }
             result.status as u64
         }
         WIN32_JOB_ATOM_LIST => {
-            let slots = (capacity as usize).min(
-                (WIN32K_JOB_ATOM_BYTES - WIN32K_JOB_ATOM_PAYLOAD_OFF as usize) / 2,
-            );
+            let slots = (capacity as usize)
+                .min((WIN32K_JOB_ATOM_BYTES - WIN32K_JOB_ATOM_PAYLOAD_OFF as usize) / 2);
             let atoms = core::slice::from_raw_parts_mut(payload as *mut u16, slots);
             let result = policy.list_atoms(job, atoms);
             write_volatile((stage + 16) as *mut u32, result.count as u32);
@@ -11712,8 +11686,7 @@ unsafe fn dispatch_win32_job_user_handle(
     );
     match result {
         Ok(()) => {
-            let flags =
-                (resolved.entry_address + USER_HANDLE_ENTRY_FLAGS_OFF) as *mut u8;
+            let flags = (resolved.entry_address + USER_HANDLE_ENTRY_FLAGS_OFF) as *mut u8;
             write_volatile(flags, read_volatile(flags) | USER_HANDLE_FLAG_GRANTED);
             1
         }
@@ -11814,15 +11787,7 @@ unsafe fn dispatch_message_call_direct(
     }
     let call: extern "win64" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
         core::mem::transmute(handler as *const ());
-    call(
-        hwnd,
-        message,
-        wparam,
-        lparam,
-        result_info,
-        fnid,
-        ansi,
-    )
+    call(hwnd, message, wparam, lparam, result_info, fnid, ansi)
 }
 
 /// Snapshot the real top-level windows visible to a handle-restricted job. Explicit handle grants
@@ -11878,16 +11843,16 @@ unsafe fn collect_job_broadcast_targets(
             continue;
         }
         let owner_process = read_volatile((owner + THREADINFO_PPI_OFF) as *const u64);
-        if !win32_job_ui_policy()
-            .same_job_target_allowed(caller_process, (owner_process != 0).then_some(owner_process))
-        {
+        if !win32_job_ui_policy().same_job_target_allowed(
+            caller_process,
+            (owner_process != 0).then_some(owner_process),
+        ) {
             continue;
         }
         targets
             .try_reserve(1)
             .map_err(|_| nt_win32k_job::STATUS_INSUFFICIENT_RESOURCES)?;
-        let generation =
-            read_volatile((address + USER_HANDLE_ENTRY_GENERATION_OFF) as *const u16);
+        let generation = read_volatile((address + USER_HANDLE_ENTRY_GENERATION_OFF) as *const u16);
         targets.push(BroadcastTarget {
             hwnd: FIRST_USER_HANDLE + index * 2 + (u64::from(generation) << 16),
             desktop: read_volatile(parent as *const u64),
@@ -11903,10 +11868,7 @@ unsafe fn dispatch_broadcast_system_message(
     result_info: u64,
     ansi: u64,
 ) -> u64 {
-    if !user_pointer_range_valid(
-        result_info,
-        core::mem::size_of::<BroadcastParm>() as u64,
-    ) {
+    if !user_pointer_range_valid(result_info, core::mem::size_of::<BroadcastParm>() as u64) {
         set_current_client_last_error(998);
         return 0;
     }
@@ -11917,16 +11879,14 @@ unsafe fn dispatch_broadcast_system_message(
     if !all_desktops && recipients & BSM_APPLICATIONS == 0 {
         return 0;
     }
-    let targets = match collect_job_broadcast_targets(
-        all_desktops,
-        flags & BSF_IGNORECURRENTTASK != 0,
-    ) {
-        Ok(targets) => targets,
-        Err(status) => {
-            set_current_client_last_error(user_handle_status_to_error(status));
-            return 0;
-        }
-    };
+    let targets =
+        match collect_job_broadcast_targets(all_desktops, flags & BSF_IGNORECURRENTTASK != 0) {
+            Ok(targets) => targets,
+            Err(status) => {
+                set_current_client_last_error(user_handle_status_to_error(status));
+                return 0;
+            }
+        };
 
     if flags & BSF_QUERY != 0 {
         write_unaligned((result_info + 8) as *mut u64, 0);
@@ -12019,7 +11979,8 @@ unsafe fn unicode_string_equals_ignore_ascii_case(address: u64, expected: &[u8])
     }
     for (index, expected) in expected.iter().enumerate() {
         let unit = read_volatile((address + index as u64 * 2) as *const u16);
-        if unit > u8::MAX as u16 || (unit as u8).to_ascii_lowercase() != expected.to_ascii_lowercase()
+        if unit > u8::MAX as u16
+            || (unit as u8).to_ascii_lowercase() != expected.to_ascii_lowercase()
         {
             return false;
         }
@@ -12060,13 +12021,7 @@ unsafe fn dispatch_job_scoped_broadcast(
             }
         };
         for target in targets {
-            let _ = dispatch_ssn(
-                SSN_NT_USER_POST_MESSAGE,
-                target.hwnd,
-                a1,
-                a2,
-                a3,
-            );
+            let _ = dispatch_ssn(SSN_NT_USER_POST_MESSAGE, target.hwnd, a1, a2, a3);
         }
         return Some(1);
     }
@@ -12116,15 +12071,8 @@ unsafe fn dispatch_job_scoped_broadcast(
     };
     let mut delivered = true;
     for target in targets {
-        delivered &= dispatch_message_call_direct(
-            target.hwnd,
-            a1,
-            a2,
-            a3,
-            result_info,
-            fnid,
-            ansi,
-        ) != 0;
+        delivered &=
+            dispatch_message_call_direct(target.hwnd, a1, a2, a3, result_info, fnid, ansi) != 0;
     }
     Some(u64::from(delivered))
 }
@@ -12159,9 +12107,7 @@ unsafe fn enforce_job_handle_target_policy(ssn: u64, a0: u64, a2: u64) -> Option
                 (process != 0).then_some(process)
             })
         };
-        if !win32_job_ui_policy()
-            .same_job_target_allowed(current_w32process(), target_process)
-        {
+        if !win32_job_ui_policy().same_job_target_allowed(current_w32process(), target_process) {
             set_current_client_last_error(5);
             return Some(0);
         }
@@ -12258,9 +12204,7 @@ unsafe fn enforce_win32_job_ui_policy(ssn: u64, a0: u64, a1: u64) -> Option<u64>
     }
     Some(match operation {
         nt_win32k_job::UiOperation::ChangeDisplaySettings => u32::MAX as u64,
-        nt_win32k_job::UiOperation::ExitWindows => {
-            nt_win32k_job::STATUS_ACCESS_DENIED as u64
-        }
+        nt_win32k_job::UiOperation::ExitWindows => nt_win32k_job::STATUS_ACCESS_DENIED as u64,
         _ => 0,
     })
 }

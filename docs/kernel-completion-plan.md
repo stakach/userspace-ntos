@@ -20897,6 +20897,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     route before hardware START admission. Do not repopulate children or routes from registry/PCI
     inventory, and do not weaken the existing topology fence.
 
+    B3 ACPI child-property and namespace checkpoint (2026-09-01, implementation and runtime
+    green): terminal enumeration evidence first isolated the next barrier at the final native
+    `IO_RESOURCE_REQUIREMENTS_LIST`. ReactOS ACPICA legitimately returns the 40-byte representation
+    with one `IO_RESOURCE_LIST` and zero descriptors when a PDO has no consumer requirements.
+    `nt-cm-resources` now accepts that counted empty alternative while preserving nonzero top-level
+    alternative, exact `ListSize`, overflow, and truncation checks. The exact native fixture is
+    covered and `nt-cm-resources` passes 18/18; downstream `nt-pnp-manager` passes 51/51.
+
+    ACPICA's `IOCTL_ACPI_ENUM_CHILDREN` then reported `STATUS_BUFFER_OVERFLOW` for the 8-byte probe
+    while leaving the METHOD_BUFFERED input header intact and publishing no required length. The
+    reusable `nt-acpi` contract now makes one bounded maximum-sized retry for such an opaque
+    overflow, retains exact retry when a valid required-length header is returned, and rejects a
+    second opaque overflow at the maximum. Successful namespace consumers parse only the exact
+    `IoStatus.Information` prefix. Immediate child discovery, PCI namespace filters, and interrupt
+    link `_CRS` filters share the same policy; `nt-acpi` passes 37/37.
+
+    Serialized graphical run `.tmp/run-desktop-acpi-opaque-overflow-fix-20260901.log` completed in
+    well under the hard one-hour deadline. All 33 real ACPICA child PDO identities, properties,
+    capabilities, namespace queries, and PCI scope facts committed; terminal evidence is
+    `[pnp-enumeration] relation=none`, proving no retained relation transaction or synthetic child
+    publication. QEMU was terminated after the sentinel. The catalog and PCI inventory both reach
+    generation 1, then real route reconciliation blocks at generation `1/1/0` with
+    `STATUS_ACCESS_VIOLATION`. E1000 and root hardware START remain correctly withheld. The next B3
+    slice is to preserve route-phase provenance, repair the real `_PRT` or interrupt-link operation
+    producing that status, publish a current interrupt route, and only then admit PCI START. Do not
+    bypass the route owner or manufacture an IRQ.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
