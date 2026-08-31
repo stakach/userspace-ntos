@@ -11,6 +11,38 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 
+pub const RESOURCE_MAPPING_PAGE_BYTES: u64 = 0x1000;
+
+/// Return the exact resource prefix covered by a page-backed projection.
+///
+/// `map_pages` describes the pages made directly accessible to the hosted driver, not the size of
+/// the assigned NT resource. Large BARs may therefore expose a bounded eager prefix while retaining
+/// their complete `CM_RESOURCE_LIST` extent. A sub-page resource starts at its physical page offset,
+/// so that offset consumes part of the first mapped page.
+pub const fn mapped_resource_prefix_len(
+    physical_start: u64,
+    resource_len: u64,
+    map_pages: u64,
+) -> Option<u64> {
+    if resource_len == 0 || physical_start.checked_add(resource_len).is_none() {
+        return None;
+    }
+    let mapped_bytes = match map_pages.checked_mul(RESOURCE_MAPPING_PAGE_BYTES) {
+        Some(bytes) => bytes,
+        None => return None,
+    };
+    let capacity =
+        match mapped_bytes.checked_sub(physical_start & (RESOURCE_MAPPING_PAGE_BYTES - 1)) {
+            Some(capacity) if capacity != 0 => capacity,
+            _ => return None,
+        };
+    Some(if resource_len < capacity {
+        resource_len
+    } else {
+        capacity
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContextId(NonZeroU64);
 
@@ -643,5 +675,33 @@ mod tests {
         assert_eq!(allocator.allocate(1), Err(SlotError::InsufficientResources));
         allocator.release(reservation).unwrap();
         assert_eq!(allocator.occupied_slots(), 0);
+    }
+
+    #[test]
+    fn mapped_resource_prefix_preserves_large_bar_extent() {
+        assert_eq!(
+            mapped_resource_prefix_len(0x8000_0000, 0x0100_0000, 32),
+            Some(0x0002_0000)
+        );
+    }
+
+    #[test]
+    fn mapped_resource_prefix_accounts_for_sub_page_offset() {
+        assert_eq!(
+            mapped_resource_prefix_len(0xFED0_0080, 0x400, 1),
+            Some(0x400)
+        );
+        assert_eq!(
+            mapped_resource_prefix_len(0xFED0_0F80, 0x400, 1),
+            Some(0x80)
+        );
+    }
+
+    #[test]
+    fn mapped_resource_prefix_rejects_invalid_ranges() {
+        assert_eq!(mapped_resource_prefix_len(0x1000, 0, 1), None);
+        assert_eq!(mapped_resource_prefix_len(u64::MAX, 2, 1), None);
+        assert_eq!(mapped_resource_prefix_len(0x1000, 1, 0), None);
+        assert_eq!(mapped_resource_prefix_len(0x1000, 1, u64::MAX), None);
     }
 }

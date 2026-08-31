@@ -49645,10 +49645,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             || grant.raw_start & 0xFFF != grant.translated_start & 0xFFF
             || grant.component_va & 0xFFF != grant.translated_start & 0xFFF
             || grant.broker_va & 0xFFF != grant.translated_start & 0xFFF
-            || grant.translated_start.checked_add(grant.length).is_none()
-            || (grant.translated_start & 0xFFF)
-                .checked_add(grant.length)
-                .is_none_or(|bytes| bytes > grant.map_pages.saturating_mul(0x1000))
+            || nt_pnp_context::mapped_resource_prefix_len(
+                grant.translated_start,
+                grant.length,
+                grant.map_pages,
+            )
+            .is_none()
             || !matches!(
                 grant.share,
                 nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
@@ -49754,12 +49756,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     trace_hosted_resource_grant(b"begin", device_id, 0, 0);
 
     for (resource_index, grant) in memory.iter().enumerate() {
-        let mapped_capacity = grant
-            .map_pages
-            .saturating_mul(0x1000)
-            .saturating_sub(grant.translated_start & 0xFFF);
-        let mapped_len = grant.length.min(mapped_capacity);
-        if mapped_len == 0 {
+        let Some(mapped_len) = nt_pnp_context::mapped_resource_prefix_len(
+            grant.translated_start,
+            grant.length,
+            grant.map_pages,
+        ) else {
             rollback_staged_hosted_resource_grant(
                 binding,
                 instance_index,
@@ -49767,7 +49768,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 &mut issued_port_caps,
             );
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
-        }
+        };
         trace_hosted_resource_grant_detail(
             device_id,
             grant.translated_start,

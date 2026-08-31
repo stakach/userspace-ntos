@@ -20787,6 +20787,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     shell sequence, and retain the accepted HPET/SCI behavior. Do not weaken the hardware authority
     or treat the downstream gate cascade as separate failures.
 
+    B3 desktop-regression root-cause checkpoint (2026-09-01, implementation green; runtime
+    pending): the failing HPET run retrieves the second SAS, but its earlier hardware boundary is
+    bochsmp's `STATUS_INVALID_PARAMETER` resource grant. The missing video route leaves win32k
+    without a PDEV; the real logon dialog then fails while constructing its domain ComboBox because
+    `CreateCompatibleDC` cannot create a display DC. ReactOS destroys the incomplete dialog before
+    entering the modal message pump, so the later profile and Explorer failures are consequences,
+    not independent compatibility gaps.
+
+    The regression came from conflating an assigned NT resource's complete extent with its bounded
+    eager component mapping. The display BAR is correctly described as 16 MiB while only a
+    32-page prefix is mapped during START. HPET sub-page validation had incorrectly required that
+    prefix to cover the whole BAR. `nt-pnp-context::mapped_resource_prefix_len` now defines the
+    shared contract: validate the complete resource for overflow, account for the physical page
+    offset, require nonzero page backing, and return the exact accessible prefix without shortening
+    the `CM_RESOURCE_LIST` descriptor. The executive uses that result for both admission and
+    publication. Focused tests cover the 16 MiB/32-page video case, exact and truncated sub-page
+    resources, and invalid ranges; `nt-pnp-context` passes 14/14 and the freestanding executive
+    check remains green at 209 warnings.
+
+    Review adjustment: run one serialized desktop acceptance with the hard one-hour launch
+    deadline. It must prove bochsmp grant/START, hosted video publication, PDEV creation, the real
+    IDD_LOGON modal/credential path, profile loading, and Explorer paint while preserving the
+    accepted HPET child mapping and SCI interrupt connection. No dialog, GDI, or resource fallback
+    is permitted.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
