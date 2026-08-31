@@ -2078,10 +2078,11 @@ pub const CT_N_COMP: u64 = 4;
 pub const CT_FAULT: u64 = 6; // a user thread's own cap to its fault endpoint
 pub const CT_WAIT_NTFN: u64 = 7; // a waiter thread's cap to the wait notification it parks on
 pub const CT_IO_PORT_BASE: u64 = 8; // first hosted hardware-driver I/O-port cap slot
-pub const CT_IO_PORT_CAPACITY: u64 = nt_pnp::PCI_NUM_BARS as u64 + 1;
+pub const CT_IO_PORT_CAPACITY: u64 = driver_launch::SH_RESOURCE_KIND_CAPACITY as u64;
 pub const CT_IRQ_NTFN: u64 = 3; // the ISR host's cap to the IRQ notification
 pub const CT_RESULT_NTFN: u64 = 4; // the ISR host's cap to the result notification
 const CN_RADIX: u32 = 5;
+const _: () = assert!(CT_IO_PORT_BASE + CT_IO_PORT_CAPACITY <= 1 << CN_RADIX);
 const CN_GUARD_BADGE: u64 = 59;
 /// Badge the isolated ISR host signals after it handles the interrupt.
 const ISR_DONE_BADGE: u64 = 0x80;

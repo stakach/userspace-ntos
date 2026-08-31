@@ -20637,9 +20637,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     commit failure issues an abort rather than truncating the value or manufacturing success.
     `nt-config-client` passes 21/21, including a 9,137-byte framed set/query round trip, the
     freestanding executive check is green at the established 209-warning baseline, and
-    `git diff --check` passes. Runtime acceptance remains open: run one serialized desktop proof
-    with a hard one-hour boot deadline, require the ACPI DSDT `ZwSetValueKey` failure to disappear,
-    and classify the next real `acpi.sys` START boundary before moving to Mup `IoCheckShareAccess`.
+    `git diff --check` passes. Serialized proof
+    `.tmp/run-headless-acpi-registry-stream-20260901.log` completed in about 104 seconds, reached
+    genuine Explorer shell chrome with a fully non-background framebuffer, and exited through the
+    sentinel at 293/299 checks. The old ACPI DSDT `ZwSetValueKey`/
+    `STATUS_INVALID_BUFFER_SIZE` and table-publication errors are absent, accepting the large-value
+    transport. The launcher correctly remains nonzero because six unrelated generic-hardware/LSA
+    gates are open; it did not time out, and no QEMU remains.
+
+    B3 FADT fixed-register authority checkpoint (2026-09-01, implementation green): the next real
+    `acpi.sys` START fault disassembles exactly to `in ax, dx` at `acpi.sys+0xAEDB`, reading PM1a
+    control port `0x604`. The existing fault decoder rejected it because Configuration Manager had
+    published only the FADT PM1 event block `[0x600,0x604)`. `nt-acpi` now parses, validates, and
+    normalizes the complete FADT fixed-hardware register surface: SMI command, PM1 event and control,
+    PM2 control, PM timer, GPE, flag-gated reset, and hardware-reduced sleep control/status blocks,
+    preferring valid extended GAS descriptors over legacy ports. SystemMemory and SystemIO remain
+    separate authorities, adjacent blocks coalesce, and unsupported address spaces or malformed
+    widths fail closed.
+
+    Isolated driver I/O-port cap banks now match the generic hosted resource-kind capacity instead
+    of the historical PCI-BAR-count-plus-one assumption; a compile-time assertion keeps the bank
+    within the component CNode. `nt-acpi` passes 34/34 and the freestanding executive check is green
+    at the unchanged 209-warning baseline. Runtime acceptance is next: require FADT-derived grants
+    to service the `0x604` read through the existing decoded-port fault path, then classify the next
+    ACPI START result. Do not grant the ACPI domain arbitrary ports or skip the privileged
+    instruction. Mup `IoCheckShareAccess` remains queued behind this causal ACPI slice.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 

@@ -48,6 +48,8 @@ pub const ACPI_PAGE_SIZE: u64 = 0x1000;
 
 pub const ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
 pub const ADDRESS_SPACE_SYSTEM_IO: u8 = 1;
+const FADT_FLAG_RESET_REGISTER: u32 = 1 << 10;
+const FADT_FLAG_HW_REDUCED: u32 = 1 << 20;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AcpiError {
@@ -211,10 +213,18 @@ pub struct FixedAcpiDescription {
     pub sci_interrupt: u16,
     pub facs_address: Option<u64>,
     pub dsdt_address: u64,
+    pub smi_command: Option<RegisterBlock>,
     pub pm1a_event: Option<EventRegisterPair>,
     pub pm1b_event: Option<EventRegisterPair>,
+    pub pm1a_control: Option<RegisterBlock>,
+    pub pm1b_control: Option<RegisterBlock>,
+    pub pm2_control: Option<RegisterBlock>,
+    pub pm_timer: Option<RegisterBlock>,
     pub gpe0: Option<EventRegisterPair>,
     pub gpe1: Option<EventRegisterPair>,
+    pub reset_register: Option<RegisterBlock>,
+    pub sleep_control: Option<RegisterBlock>,
+    pub sleep_status: Option<RegisterBlock>,
 }
 
 impl FixedAcpiDescription {
@@ -246,24 +256,59 @@ impl FixedAcpiDescription {
             return Err(AcpiError::NullTableAddress);
         }
 
+        let smi_command_address = read_u32(table, 48)? as u64;
+        let smi_command = (smi_command_address != 0).then_some(RegisterBlock {
+            address_space: ADDRESS_SPACE_SYSTEM_IO,
+            address: smi_command_address,
+            length: 1,
+        });
         let pm1_event_len = read_u8(table, 88)?;
+        let pm1_control_len = read_u8(table, 89)?;
+        let pm2_control_len = read_u8(table, 90)?;
+        let pm_timer_len = read_u8(table, 91)?;
         let gpe0_len = read_u8(table, 92)?;
         let gpe1_len = read_u8(table, 93)?;
         let gpe1_base = read_u8(table, 94)?;
         let pm1a_event = parse_event_pair(table, 56, 148, pm1_event_len, 0)?;
         let pm1b_event = parse_event_pair(table, 60, 160, pm1_event_len, 0)?;
+        let pm1a_control = parse_register_block(table, 64, 172, pm1_control_len)?;
+        let pm1b_control = parse_register_block(table, 68, 184, pm1_control_len)?;
+        let pm2_control = parse_register_block(table, 72, 196, pm2_control_len)?;
+        let pm_timer = parse_register_block(table, 76, 208, pm_timer_len)?;
         let gpe0 = parse_event_pair(table, 80, 220, gpe0_len, 0)?;
         let gpe1 = parse_event_pair(table, 84, 232, gpe1_len, gpe1_base)?;
+        let flags = read_u32(table, 112)?;
+        let reset_register = if flags & FADT_FLAG_RESET_REGISTER != 0 {
+            parse_gas_register(table, 116)?
+        } else {
+            None
+        };
+        let (sleep_control, sleep_status) = if flags & FADT_FLAG_HW_REDUCED != 0 {
+            (
+                parse_gas_register(table, 244)?,
+                parse_gas_register(table, 256)?,
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             revision: header.revision,
             sci_interrupt,
             facs_address,
             dsdt_address,
+            smi_command,
             pm1a_event,
             pm1b_event,
+            pm1a_control,
+            pm1b_control,
+            pm2_control,
+            pm_timer,
             gpe0,
             gpe1,
+            reset_register,
+            sleep_control,
+            sleep_status,
         })
     }
 }
@@ -317,7 +362,7 @@ pub struct AcpiPlatformResources {
     pub interrupt_overrides: Vec<LegacyIrqOverride>,
     /// Page-normalized, sorted, non-overlapping extents containing every discovered table.
     pub firmware_memory: Vec<PhysicalRange>,
-    /// Sorted, coalesced SystemMemory/SystemIO blocks needed for fixed ACPI events.
+    /// Sorted, coalesced SystemMemory/SystemIO blocks described by the FADT fixed-hardware fields.
     pub fixed_registers: Vec<RegisterBlock>,
 }
 
@@ -482,28 +527,31 @@ fn normalized_fixed_registers(
 ) -> Result<Vec<RegisterBlock>, AcpiError> {
     let mut blocks = Vec::new();
     blocks
-        .try_reserve_exact(4)
+        .try_reserve_exact(16)
         .map_err(|_| AcpiError::Allocation)?;
+    if let Some(block) = fixed.smi_command {
+        blocks.push(block);
+    }
     for pair in [fixed.pm1a_event, fixed.pm1b_event, fixed.gpe0, fixed.gpe1]
         .into_iter()
         .flatten()
     {
-        let length = pair
-            .status
-            .length
-            .checked_add(pair.enable.length)
-            .ok_or(AcpiError::InvalidRegisterBlock)?;
-        if pair.status.address_space != pair.enable.address_space
-            || pair.status.address.checked_add(pair.status.length as u64)
-                != Some(pair.enable.address)
-        {
-            return Err(AcpiError::InvalidRegisterBlock);
-        }
-        blocks.push(RegisterBlock {
-            address_space: pair.status.address_space,
-            address: pair.status.address,
-            length,
-        });
+        blocks.push(pair.status);
+        blocks.push(pair.enable);
+    }
+    for block in [
+        fixed.pm1a_control,
+        fixed.pm1b_control,
+        fixed.pm2_control,
+        fixed.pm_timer,
+        fixed.reset_register,
+        fixed.sleep_control,
+        fixed.sleep_status,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        blocks.push(block);
     }
     blocks.sort_unstable_by_key(|block| (block.address_space, block.address));
     let mut normalized: Vec<RegisterBlock> = Vec::new();
@@ -643,6 +691,23 @@ fn parse_event_pair(
     length: u8,
     base_event: u8,
 ) -> Result<Option<EventRegisterPair>, AcpiError> {
+    let Some(block) = parse_register_block(table, legacy_offset, extended_offset, length)? else {
+        return Ok(None);
+    };
+    let (status, enable) = block.split_status_enable()?;
+    Ok(Some(EventRegisterPair {
+        status,
+        enable,
+        base_event,
+    }))
+}
+
+fn parse_register_block(
+    table: &[u8],
+    legacy_offset: usize,
+    extended_offset: usize,
+    length: u8,
+) -> Result<Option<RegisterBlock>, AcpiError> {
     if length == 0 {
         return Ok(None);
     }
@@ -650,13 +715,10 @@ fn parse_event_pair(
         .then(|| GenericAddress::parse(table, extended_offset))
         .transpose()?;
     let block = if let Some(address) = extended.filter(|address| address.address != 0) {
-        if !matches!(
-            address.address_space,
-            ADDRESS_SPACE_SYSTEM_MEMORY | ADDRESS_SPACE_SYSTEM_IO
-        ) {
-            return Err(AcpiError::UnsupportedAddressSpace(address.address_space));
-        }
-        if address.bit_offset != 0 || address.bit_width != 0 && address.bit_width != length * 8 {
+        validate_address_space(address.address_space)?;
+        if address.bit_offset != 0
+            || address.bit_width != 0 && u16::from(address.bit_width) != u16::from(length) * 8
+        {
             return Err(AcpiError::InvalidRegisterBlock);
         }
         RegisterBlock {
@@ -675,12 +737,58 @@ fn parse_event_pair(
             length,
         }
     };
-    let (status, enable) = block.split_status_enable()?;
-    Ok(Some(EventRegisterPair {
-        status,
-        enable,
-        base_event,
+    block
+        .address
+        .checked_add(block.length as u64)
+        .ok_or(AcpiError::InvalidRegisterBlock)?;
+    Ok(Some(block))
+}
+
+fn parse_gas_register(table: &[u8], offset: usize) -> Result<Option<RegisterBlock>, AcpiError> {
+    if offset + 12 > table.len() {
+        return Ok(None);
+    }
+    let address = GenericAddress::parse(table, offset)?;
+    if address.address == 0 {
+        return Ok(None);
+    }
+    validate_address_space(address.address_space)?;
+    let covered_bits = u16::from(address.bit_offset)
+        .checked_add(u16::from(address.bit_width))
+        .ok_or(AcpiError::InvalidRegisterBlock)?;
+    let natural_len = usize::from(covered_bits).div_ceil(8);
+    let access_len = match address.access_size {
+        0 => natural_len,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 8,
+        _ => return Err(AcpiError::InvalidRegisterBlock),
+    };
+    if access_len == 0 || access_len * 8 < usize::from(covered_bits) {
+        return Err(AcpiError::InvalidRegisterBlock);
+    }
+    let length = u8::try_from(access_len).map_err(|_| AcpiError::InvalidRegisterBlock)?;
+    address
+        .address
+        .checked_add(length as u64)
+        .ok_or(AcpiError::InvalidRegisterBlock)?;
+    Ok(Some(RegisterBlock {
+        address_space: address.address_space,
+        address: address.address,
+        length,
     }))
+}
+
+fn validate_address_space(address_space: u8) -> Result<(), AcpiError> {
+    if matches!(
+        address_space,
+        ADDRESS_SPACE_SYSTEM_MEMORY | ADDRESS_SPACE_SYSTEM_IO
+    ) {
+        Ok(())
+    } else {
+        Err(AcpiError::UnsupportedAddressSpace(address_space))
+    }
 }
 
 pub fn active_event_bits(status: &[u8], enable: &[u8]) -> Result<Vec<u16>, AcpiError> {
@@ -834,26 +942,40 @@ mod tests {
     fn fadt_prefers_extended_blocks_and_splits_status_from_enable() {
         let mut fadt = vec![0; 244];
         write_u16(&mut fadt, 46, 9);
+        write_u32(&mut fadt, 48, 0xb2);
         write_u32(&mut fadt, 40, 0x1234_5000);
         write_u64(&mut fadt, 140, 0x1_2345_6000);
         fadt[88] = 4;
+        fadt[89] = 2;
+        fadt[90] = 1;
+        fadt[91] = 4;
         fadt[92] = 8;
         fadt[93] = 4;
         fadt[94] = 32;
+        write_u32(&mut fadt, 112, FADT_FLAG_RESET_REGISTER);
+        write_gas(&mut fadt, 116, ADDRESS_SPACE_SYSTEM_IO, 8, 0xcf9);
         write_gas(&mut fadt, 148, ADDRESS_SPACE_SYSTEM_IO, 32, 0x600);
+        write_gas(&mut fadt, 172, ADDRESS_SPACE_SYSTEM_IO, 16, 0x604);
+        write_gas(&mut fadt, 196, ADDRESS_SPACE_SYSTEM_IO, 8, 0x610);
+        write_gas(&mut fadt, 208, ADDRESS_SPACE_SYSTEM_IO, 32, 0x608);
         write_gas(&mut fadt, 220, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed8_0000);
         write_gas(&mut fadt, 232, ADDRESS_SPACE_SYSTEM_IO, 32, 0x620);
         let parsed = FixedAcpiDescription::parse(&finish_table(fadt, b"FACP")).unwrap();
         assert_eq!(parsed.sci_interrupt, 9);
         assert_eq!(parsed.dsdt_address, 0x1_2345_6000);
+        assert_eq!(parsed.smi_command.unwrap().address, 0xb2);
         assert_eq!(parsed.pm1a_event.unwrap().status.length, 2);
         assert_eq!(parsed.pm1a_event.unwrap().enable.address, 0x602);
+        assert_eq!(parsed.pm1a_control.unwrap().address, 0x604);
+        assert_eq!(parsed.pm2_control.unwrap().address, 0x610);
+        assert_eq!(parsed.pm_timer.unwrap().address, 0x608);
         assert_eq!(
             parsed.gpe0.unwrap().status.address_space,
             ADDRESS_SPACE_SYSTEM_MEMORY
         );
         assert_eq!(parsed.gpe0.unwrap().enable.address, 0xfed8_0004);
         assert_eq!(parsed.gpe1.unwrap().base_event, 32);
+        assert_eq!(parsed.reset_register.unwrap().address, 0xcf9);
     }
 
     #[test]
@@ -862,13 +984,32 @@ mod tests {
         write_u16(&mut fadt, 46, 9);
         write_u32(&mut fadt, 40, 0x7ffe_4000);
         write_u32(&mut fadt, 56, 0x600);
+        write_u32(&mut fadt, 64, 0x604);
+        write_u32(&mut fadt, 76, 0x608);
         write_u32(&mut fadt, 80, 0x620);
         fadt[88] = 4;
+        fadt[89] = 2;
+        fadt[91] = 4;
         fadt[92] = 8;
         let parsed = FixedAcpiDescription::parse(&finish_table(fadt, b"FACP")).unwrap();
         assert_eq!(parsed.pm1a_event.unwrap().enable.address, 0x602);
+        assert_eq!(parsed.pm1a_control.unwrap().address, 0x604);
+        assert_eq!(parsed.pm_timer.unwrap().address, 0x608);
         assert_eq!(parsed.gpe0.unwrap().enable.address, 0x624);
         assert!(parsed.gpe1.is_none());
+    }
+
+    #[test]
+    fn hardware_reduced_sleep_registers_require_the_fadt_flag() {
+        let mut fadt = vec![0; 268];
+        write_u16(&mut fadt, 46, 9);
+        write_u32(&mut fadt, 40, 0x7ffe_4000);
+        write_u32(&mut fadt, 112, FADT_FLAG_HW_REDUCED);
+        write_gas(&mut fadt, 244, ADDRESS_SPACE_SYSTEM_MEMORY, 8, 0xfed8_1000);
+        write_gas(&mut fadt, 256, ADDRESS_SPACE_SYSTEM_MEMORY, 8, 0xfed8_1001);
+        let parsed = FixedAcpiDescription::parse(&finish_table(fadt, b"FACP")).unwrap();
+        assert_eq!(parsed.sleep_control.unwrap().address, 0xfed8_1000);
+        assert_eq!(parsed.sleep_status.unwrap().address, 0xfed8_1001);
     }
 
     #[test]
@@ -946,9 +1087,14 @@ mod tests {
         write_u64(&mut fadt, 132, FACS);
         write_u64(&mut fadt, 140, DSDT);
         write_u16(&mut fadt, 46, 9);
+        write_u32(&mut fadt, 48, 0xb2);
         fadt[88] = 4;
+        fadt[89] = 2;
+        fadt[91] = 4;
         fadt[92] = 8;
         write_gas(&mut fadt, 148, ADDRESS_SPACE_SYSTEM_IO, 32, 0x600);
+        write_gas(&mut fadt, 172, ADDRESS_SPACE_SYSTEM_IO, 16, 0x604);
+        write_gas(&mut fadt, 208, ADDRESS_SPACE_SYSTEM_IO, 32, 0x608);
         write_gas(&mut fadt, 220, ADDRESS_SPACE_SYSTEM_MEMORY, 64, 0xfed8_0000);
 
         let mut madt = vec![0; SDT_HEADER_LEN + 8];
@@ -1016,7 +1162,17 @@ mod tests {
                 },
                 RegisterBlock {
                     address_space: ADDRESS_SPACE_SYSTEM_IO,
+                    address: 0xb2,
+                    length: 1,
+                },
+                RegisterBlock {
+                    address_space: ADDRESS_SPACE_SYSTEM_IO,
                     address: 0x600,
+                    length: 6,
+                },
+                RegisterBlock {
+                    address_space: ADDRESS_SPACE_SYSTEM_IO,
+                    address: 0x608,
                     length: 4,
                 },
             ]
