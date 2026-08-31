@@ -1289,6 +1289,178 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_link_planning_resolves_relation_candidates_and_deduplicates_transport() {
+        let inventory =
+            PciInventory::try_from_initial(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 4, 1)])
+                .unwrap();
+        let routes = PciInterruptRouteOwner::default();
+        let owner = provider(1);
+        let facts = source(44);
+        let candidate = AcpiPciLinkCandidateFact {
+            relation_owner: owner,
+            path: path("\\_SB_.PCI0.LNKA"),
+        };
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let update = catalog
+            .prepare_replace_relation_facts(owner, &[facts], &[candidate])
+            .unwrap();
+        catalog.commit(update).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
+        let tables = vec![
+            nt_acpi::PciRoutingTable {
+                segment: 0,
+                bus: 0,
+                entries: vec![nt_acpi::PciRoutingEntry {
+                    device: 3,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::InterruptLink {
+                        name: String::from("LNKA"),
+                        resource_index: 0,
+                    },
+                }],
+            },
+            nt_acpi::PciRoutingTable {
+                segment: 0,
+                bus: 2,
+                entries: vec![nt_acpi::PciRoutingEntry {
+                    device: 4,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::InterruptLink {
+                        name: String::from("^LNKA"),
+                        resource_index: 0,
+                    },
+                }],
+            },
+        ];
+        let accepted = discovery
+            .accept_routing_tables(&catalog, &inventory, &routes, tables)
+            .unwrap();
+        let missing = accepted.clone().prepare_interrupt_link_discovery(
+            &catalog,
+            &inventory,
+            &routes,
+            vec![],
+        );
+        assert_eq!(
+            missing,
+            Err(crate::AcpiPciRoutingDiscoveryError::IncompleteLinkCandidateSets)
+        );
+        let links = accepted
+            .prepare_interrupt_link_discovery(
+                &catalog,
+                &inventory,
+                &routes,
+                vec![crate::AcpiPciCrsMethodSource {
+                    endpoint: provider(44),
+                    methods: namespace_matches(&[]),
+                }],
+            )
+            .unwrap();
+        assert_eq!(links.catalog_generation(), 1);
+        assert_eq!(links.inventory_generation(), 1);
+        assert_eq!(links.route_owner_generation(), 0);
+        assert_eq!(links.tables().len(), 2);
+        assert_eq!(links.routing_queries().len(), 2);
+        assert_eq!(links.link_queries().len(), 1);
+        assert_eq!(links.binding_count(), 2);
+        assert_eq!(links.link_queries()[0].endpoint, provider(44));
+        assert_eq!(
+            links.link_queries()[0].object_path,
+            path("\\_SB_.PCI0.LNKA")
+        );
+        assert_eq!(
+            links.link_queries()[0].method_path,
+            path("\\_SB_.PCI0.LNKA._CRS")
+        );
+        assert!(links.is_current(&catalog, &inventory, &routes));
+    }
+
+    #[test]
+    fn filtered_crs_owners_are_endpoint_scoped_and_canonical() {
+        let inventory = PciInventory::try_from_initial(vec![endpoint(0, 3, 1)]).unwrap();
+        let routes = PciInterruptRouteOwner::default();
+        let owner = provider(1);
+        let mut facts = source(44);
+        facts.addresses.clear();
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let update = catalog
+            .prepare_replace_relation_facts(owner, &[facts], &[])
+            .unwrap();
+        catalog.commit(update).unwrap();
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
+        let tables = vec![nt_acpi::PciRoutingTable {
+            segment: 0,
+            bus: 0,
+            entries: vec![nt_acpi::PciRoutingEntry {
+                device: 3,
+                function: None,
+                pin: 0,
+                source: nt_acpi::PciRouteSource::InterruptLink {
+                    name: String::from("LNKX"),
+                    resource_index: 0,
+                },
+            }],
+        }];
+        let accepted = discovery
+            .accept_routing_tables(&catalog, &inventory, &routes, tables)
+            .unwrap();
+        let links = accepted
+            .prepare_interrupt_link_discovery(
+                &catalog,
+                &inventory,
+                &routes,
+                vec![crate::AcpiPciCrsMethodSource {
+                    endpoint: provider(44),
+                    methods: namespace_matches(&["\\_SB_.PCI0.LNKX._CRS"]),
+                }],
+            )
+            .unwrap();
+        assert_eq!(links.link_queries().len(), 1);
+        assert_eq!(
+            links.link_queries()[0].method_path,
+            path("\\_SB_.PCI0.LNKX._CRS")
+        );
+
+        let discovery = catalog
+            .prepare_routing_discovery(&inventory, &routes)
+            .unwrap();
+        let tables = vec![nt_acpi::PciRoutingTable {
+            segment: 0,
+            bus: 0,
+            entries: vec![nt_acpi::PciRoutingEntry {
+                device: 3,
+                function: None,
+                pin: 0,
+                source: nt_acpi::PciRouteSource::InterruptLink {
+                    name: String::from("LNKX"),
+                    resource_index: 0,
+                },
+            }],
+        }];
+        let accepted = discovery
+            .accept_routing_tables(&catalog, &inventory, &routes, tables)
+            .unwrap();
+        assert_eq!(
+            accepted.prepare_interrupt_link_discovery(
+                &catalog,
+                &inventory,
+                &routes,
+                vec![crate::AcpiPciCrsMethodSource {
+                    endpoint: provider(44),
+                    methods: namespace_matches(&["\\_SB_.OUT0.LNKX._CRS"]),
+                }],
+            ),
+            Err(crate::AcpiPciRoutingDiscoveryError::LinkCandidateOutsideEndpoint)
+        );
+    }
+
+    #[test]
     fn ordinary_address_scopes_are_ignored_but_prt_owners_must_be_bridges() {
         let inventory = PciInventory::try_from_initial(vec![endpoint(0, 3, 0)]).unwrap();
         let mut facts = source(44);

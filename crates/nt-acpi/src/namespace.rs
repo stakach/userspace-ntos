@@ -76,6 +76,14 @@ impl AcpiNamespacePath {
     pub fn name_seg(&self) -> Option<&str> {
         (self.0 != "\\").then(|| self.0.rsplit('.').next().unwrap_or(&self.0[1..]))
     }
+
+    pub fn try_parent(&self) -> Result<Option<Self>, AcpiNamespaceError> {
+        if self.0 == "\\" {
+            return Ok(None);
+        }
+        let parent = self.0.rsplit_once('.').map_or("\\", |(parent, _)| parent);
+        Self::parse(parent).map(Some)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,14 +254,26 @@ pub fn resolve_namespace_reference(
         validate_absolute_path(reference.as_bytes())?;
         return unique_path_index(reference, candidates);
     }
-    validate_relative_path(reference.as_bytes())?;
+    let parent_prefixes = reference.bytes().take_while(|byte| *byte == b'^').count();
+    let relative = &reference[parent_prefixes..];
+    validate_relative_path(relative.as_bytes())?;
 
     let mut scope_len = scope.as_str().len();
+    if parent_prefixes != 0 {
+        for _ in 0..parent_prefixes {
+            let current = &scope.as_str()[..scope_len];
+            if current == "\\" {
+                return Err(AcpiNamespaceError::MissingReference);
+            }
+            scope_len = current.rfind('.').unwrap_or(0).max(1);
+        }
+        return unique_joined_path_index(&scope.as_str()[..scope_len], relative, candidates);
+    }
     loop {
         let current = &scope.as_str()[..scope_len];
         let mut match_index = None;
         for (index, candidate) in candidates.iter().enumerate() {
-            if joined_path_eq(candidate.as_str(), current, reference) {
+            if joined_path_eq(candidate.as_str(), current, relative) {
                 if match_index.is_some() {
                     return Err(AcpiNamespaceError::AmbiguousReference);
                 }
@@ -269,6 +289,23 @@ pub fn resolve_namespace_reference(
         scope_len = current.rfind('.').unwrap_or(0).max(1);
     }
     Err(AcpiNamespaceError::MissingReference)
+}
+
+fn unique_joined_path_index(
+    scope: &str,
+    relative: &str,
+    candidates: &[AcpiNamespacePath],
+) -> Result<usize, AcpiNamespaceError> {
+    let mut found = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if joined_path_eq(candidate.as_str(), scope, relative) {
+            if found.is_some() {
+                return Err(AcpiNamespaceError::AmbiguousReference);
+            }
+            found = Some(index);
+        }
+    }
+    found.ok_or(AcpiNamespaceError::MissingReference)
 }
 
 fn unique_path_index(
@@ -406,6 +443,28 @@ mod tests {
                 .try_join_name_seg(*b"bad!"),
             Err(AcpiNamespaceError::InvalidPath)
         );
+        assert_eq!(
+            AcpiNamespacePath::parse("\\_SB_.PCI0._PRT")
+                .unwrap()
+                .try_parent()
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "\\_SB_.PCI0"
+        );
+        assert_eq!(
+            AcpiNamespacePath::parse("\\_SB_")
+                .unwrap()
+                .try_parent()
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "\\"
+        );
+        assert_eq!(
+            AcpiNamespacePath::parse("\\").unwrap().try_parent(),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -515,6 +574,38 @@ mod tests {
         assert_eq!(
             resolve_namespace_reference(&scope, "LNKA", &duplicate),
             Err(AcpiNamespaceError::AmbiguousReference)
+        );
+    }
+
+    #[test]
+    fn parent_prefix_resolves_exactly_without_implicit_second_search() {
+        let scope = AcpiNamespacePath::parse("\\_SB_.PCI0.BRG0.DEV0").unwrap();
+        let candidates = vec![
+            AcpiNamespacePath::parse("\\_SB_.PCI0.BRG0.LNKA").unwrap(),
+            AcpiNamespacePath::parse("\\_SB_.PCI0.LNKA").unwrap(),
+            AcpiNamespacePath::parse("\\_SB_.LNKA").unwrap(),
+        ];
+        assert_eq!(
+            resolve_namespace_reference(&scope, "^LNKA", &candidates),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_namespace_reference(&scope, "^^LNKA", &candidates),
+            Ok(1)
+        );
+        assert_eq!(
+            resolve_namespace_reference(&scope, "^^^LNKA", &candidates),
+            Ok(2)
+        );
+        assert_eq!(
+            resolve_namespace_reference(&scope, "^^^^^LNKA", &candidates),
+            Err(AcpiNamespaceError::MissingReference)
+        );
+
+        let only_grandparent = vec![AcpiNamespacePath::parse("\\_SB_.PCI0.LNKA").unwrap()];
+        assert_eq!(
+            resolve_namespace_reference(&scope, "^LNKA", &only_grandparent),
+            Err(AcpiNamespaceError::MissingReference)
         );
     }
 }

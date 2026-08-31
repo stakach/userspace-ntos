@@ -20238,6 +20238,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     contract mismatch. Then produce deduplicated `_CRS` method queries plus private per-table entry
     bindings from the union of exact relation candidates and filtered per-root `_CRS` owners.
 
+    B3 interrupt-link discovery-plan checkpoint (2026-08-31, crate accepted): ACPI namespace
+    resolution now implements explicit ParentPrefix (`^`) traversal and stops at the named parent;
+    it does not perform a second implicit up-search after an explicit prefix. Root, repeated-parent,
+    missing, ambiguity, and no-tail-fallback cases are covered, closing the parser/resolver syntax
+    mismatch.
+
+    The accepted `_PRT` table set now consumes exactly one filtered `_CRS` match set for each root
+    endpoint that actually has a link-backed entry. It unions canonical method owners below that
+    authenticated endpoint with canonical object paths from the query's exact relation publisher,
+    rejects wrong filters and out-of-endpoint filtered paths, then resolves each source string in
+    its owning `_PRT` scope. METHOD_EX transport is deduplicated by exact root endpoint plus resolved
+    object path; private table/entry bindings remain distinct, so identical link names and slot/pin
+    tuples on separate buses cannot alias. The resulting workset retains all three generations and
+    remains inert. Focused validation passes `nt-acpi` 33/33 and `nt-pnp` 63/63.
+
+    Review adjustment: accept indexed `_CRS` outputs one-for-one against this method workset, parse
+    each exact resource template once, rebuild route-specific link bindings per table, and resolve
+    every table with immutable MADT legacy overrides. Convert the complete result into
+    `PciInterruptRoute` facts and call the existing generation-fenced `prepare_replace`; do not
+    publish table-by-table. Then wire the three pure stages into one focused serialized executive
+    reconciler using the exact variable METHOD_EX transport contract above.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
