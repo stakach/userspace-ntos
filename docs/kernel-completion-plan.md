@@ -20178,6 +20178,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     set per evaluation endpoint, resolve every link reference in its `_PRT` owner scope with ACPI
     up-search, and evaluate each unique resolved link path through full-path `_CRS`.
 
+    B3 exact `_PRT` result-acceptance checkpoint (2026-08-31, crate accepted): a routing workset
+    now accepts only one parser-validated `PciRoutingTable` for every planned query in exact order.
+    Each table's segment and bus must match the generation-owned query; missing, extra, reordered,
+    or mismatched results are rejected before link discovery. Accepted tables remain bundled with
+    their originating queries and both topology generations. The next transport phase can therefore
+    expose a deduplicated, sorted list of authenticated provider endpoints that actually contain
+    link-backed entries, while direct-GSI-only providers perform no `_CRS` enumeration.
+
+    Focused `nt-pnp` validation passes 59/59. Provider-contract review fixes the live METHOD_EX
+    rules for the next slice: issue one exact 20-byte probe; accept success only for a parser-valid
+    exact `Information` in 12..=20; accept overflow only on that initial probe when Information is a
+    strictly larger, bounded required length that agrees with the overflow header; retry exactly
+    once at that size; and require retry success Information to equal the requested length. Pending
+    completion must copy the full retained output capacity before acknowledging the IRP so an
+    overflow header whose required length exceeds capacity is not truncated by an ordinary
+    Information-bounded copy. Every endpoint, IRP, client, origin, completion stack, IOCTL, 260-byte
+    input, and retained output identity remains exact. Second overflow, BUFFER_TOO_SMALL,
+    zero-Information success, missing method, or any other terminal status is a hard barrier.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

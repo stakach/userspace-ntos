@@ -655,6 +655,7 @@ fn push_resolved_scope(
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
     use alloc::vec;
 
     use super::*;
@@ -996,6 +997,76 @@ mod tests {
         let update = catalog.prepare_replace_source(replacement).unwrap();
         catalog.commit(update).unwrap();
         assert!(!discovery.is_current(&catalog, &inventory));
+    }
+
+    #[test]
+    fn routing_table_acceptance_is_exact_and_identifies_link_endpoints() {
+        let inventory =
+            PciInventory::try_from_initial(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 4, 1)])
+                .unwrap();
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let update = catalog.prepare_replace_source(source(44)).unwrap();
+        catalog.commit(update).unwrap();
+        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        let tables = vec![
+            nt_acpi::PciRoutingTable {
+                segment: 0,
+                bus: 0,
+                entries: vec![nt_acpi::PciRoutingEntry {
+                    device: 3,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::InterruptLink {
+                        name: String::from("LNKA"),
+                        resource_index: 0,
+                    },
+                }],
+            },
+            nt_acpi::PciRoutingTable {
+                segment: 0,
+                bus: 2,
+                entries: vec![nt_acpi::PciRoutingEntry {
+                    device: 4,
+                    function: None,
+                    pin: 0,
+                    source: nt_acpi::PciRouteSource::GlobalSystemInterrupt(19),
+                }],
+            },
+        ];
+        let accepted = discovery
+            .accept_routing_tables(&catalog, &inventory, tables)
+            .unwrap();
+        assert_eq!(accepted.catalog_generation(), 1);
+        assert_eq!(accepted.inventory_generation(), 1);
+        assert_eq!(accepted.tables().len(), 2);
+        assert_eq!(accepted.queries().len(), 2);
+        assert_eq!(accepted.link_candidate_endpoints(), &[provider(44)]);
+        assert!(accepted.is_current(&catalog, &inventory));
+
+        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        assert_eq!(
+            discovery.accept_routing_tables(&catalog, &inventory, vec![]),
+            Err(crate::AcpiPciRoutingDiscoveryError::IncompleteRoutingTables)
+        );
+        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        let mismatched = vec![
+            nt_acpi::PciRoutingTable {
+                segment: 0,
+                bus: 2,
+                entries: vec![],
+            },
+            nt_acpi::PciRoutingTable {
+                segment: 0,
+                bus: 0,
+                entries: vec![],
+            },
+        ];
+        assert_eq!(
+            discovery.accept_routing_tables(&catalog, &inventory, mismatched),
+            Err(crate::AcpiPciRoutingDiscoveryError::MismatchedRoutingTable(
+                0
+            ))
+        );
     }
 
     #[test]
