@@ -20833,6 +20833,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     root-device START boundary. Do not restore a compiled PIRQ table or manufacture an interrupt
     assignment when provider discovery is incomplete.
 
+    B3 initial BusRelations ordering checkpoint (2026-09-01, implementation green; runtime
+    pending): every successful hosted `IRP_MN_START_DEVICE` now queues the devnode's initial
+    `BusRelations` query before its START batch can complete. The same authenticated enqueue path
+    serves kernel enumeration and driver `IoInvalidateDeviceRelations`; a newly queued request can
+    be rolled back exactly if the composed topology fence cannot be retained. PnP START admission
+    remains closed while any relation transaction or generation-fenced PCI route reconciliation is
+    pending, so a later E1000 or root-device batch becomes an owned continuation instead of racing
+    resource assignment against an empty route table. A current-generation route barrier terminates
+    the waiting batch with its real status rather than falling back or spinning.
+
+    A valid driver-returned failure from `IRP_MN_QUERY_DEVICE_RELATIONS` now commits an empty child
+    set after acknowledging an asynchronous completion, matching NT/ReactOS enumeration semantics;
+    malformed payloads, completion-identity mismatches, and transport failures remain retained hard
+    barriers. Boot hardware gates also defer whenever any START continuation is live, including a
+    batch waiting before its first START. `nt-pnp-manager` passes 51/51 tests, including exact
+    unclaimed-request rollback, `git diff --check` passes, and the freestanding executive check is
+    green at the unchanged 209-warning baseline.
+
+    Review adjustment: the next serialized run must show ACPI START followed by its initial
+    BusRelations query, durable `_PRT`/interrupt-link route publication, and only then E1000
+    resource filtering/START. Keep the one-hour launch deadline and terminate QEMU after collecting
+    readiness or the first deterministic barrier. If routing succeeds, classify the remaining root
+    DMA START rejection independently instead of coupling it to PCI policy.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

@@ -366,6 +366,31 @@ impl DeviceRelationInvalidationQueue {
         })
     }
 
+    /// Remove an exact request that has not yet been claimed.
+    ///
+    /// This is the rollback half of composing the queue with another prepared authority. Once a
+    /// worker has claimed the row, completion or abort owns it and rollback is no longer legal.
+    pub fn discard_pending(
+        &mut self,
+        invalidation: DeviceRelationInvalidation,
+    ) -> Result<(), DeviceRelationInvalidationError> {
+        let index = self
+            .rows
+            .iter()
+            .position(|row| {
+                row.pdo_device_id == invalidation.pdo_device_id
+                    && row.relation_type == invalidation.relation_type
+                    && matches!(
+                        row.state,
+                        DeviceRelationInvalidationState::Pending { sequence }
+                            if sequence == invalidation.sequence
+                    )
+            })
+            .ok_or(DeviceRelationInvalidationError::StaleClaim)?;
+        self.rows.remove(index);
+        Ok(())
+    }
+
     pub fn complete(
         &mut self,
         claim: DeviceRelationInvalidation,
@@ -1271,6 +1296,30 @@ mod tests {
         let claim = queue.claim_front().unwrap();
         queue.abort(claim).unwrap();
         assert_eq!(queue.claim_front(), Some(original));
+    }
+
+    #[test]
+    fn pending_discard_rolls_back_only_the_exact_unclaimed_request() {
+        let mut queue = DeviceRelationInvalidationQueue::new();
+        let first = queue.enqueue(10, 0).unwrap().invalidation;
+        let second = queue.enqueue(20, 0).unwrap().invalidation;
+        let stale = DeviceRelationInvalidation {
+            sequence: first.sequence + 10,
+            ..first
+        };
+
+        assert_eq!(
+            queue.discard_pending(stale),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        queue.discard_pending(first).unwrap();
+        assert_eq!(queue.claim_front(), Some(second));
+        assert_eq!(
+            queue.discard_pending(second),
+            Err(DeviceRelationInvalidationError::StaleClaim)
+        );
+        queue.complete(second).unwrap();
+        assert!(queue.is_empty());
     }
 
     #[test]

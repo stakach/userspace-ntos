@@ -37922,9 +37922,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     }
                 } else {
                     HostedDeviceRelationQueryPhase::AwaitingAck {
-                        disposition: HostedDeviceRelationQueryDisposition::Barrier(
-                            completion.status,
-                        ),
+                        disposition: HostedDeviceRelationQueryDisposition::Copied,
                     }
                 };
                 progress = progress.saturating_add(1);
@@ -39289,9 +39287,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
                     pending_completion: false,
                 };
             } else {
-                set_hosted_relation_query_disposition(
-                    HostedDeviceRelationQueryDisposition::Barrier(status),
-                );
+                set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Copied);
             }
         }
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
@@ -42335,6 +42331,123 @@ unsafe fn hosted_device_relation_invalidations_mut(
     slot.as_mut().unwrap()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPnpEnumerationProgress {
+    Current,
+    Pending,
+    Blocked(nt_status::NtStatus),
+}
+
+fn hosted_relation_invalidation_status(
+    error: nt_pnp_manager::DeviceRelationInvalidationError,
+) -> nt_status::NtStatus {
+    match error {
+        nt_pnp_manager::DeviceRelationInvalidationError::InsufficientResources => {
+            nt_status::NtStatus::INSUFFICIENT_RESOURCES
+        }
+        nt_pnp_manager::DeviceRelationInvalidationError::InvalidPdo
+        | nt_pnp_manager::DeviceRelationInvalidationError::SequenceExhausted
+        | nt_pnp_manager::DeviceRelationInvalidationError::StaleClaim => {
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        }
+    }
+}
+
+unsafe fn enqueue_hosted_device_relations(
+    relation_owner: nt_pnp::AcpiPciProviderEndpoint,
+    relation_type: u32,
+) -> Result<nt_pnp_manager::EnqueuedDeviceRelationInvalidation, nt_status::NtStatus> {
+    if relation_owner.device_id == 0
+        || relation_owner.hosted_domain_id == 0
+        || relation_owner.hosted_domain_cookie == 0
+        || relation_owner.pdo_object == 0
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let enqueued = hosted_device_relation_invalidations_mut()
+        .enqueue(relation_owner.device_id, relation_type)
+        .map_err(hosted_relation_invalidation_status)?;
+    if relation_type == nt_pnp_abi::BUS_RELATIONS
+        && enqueued.disposition == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
+    {
+        if let Err(status) =
+            crate::hosted_pci_topology::note_hosted_pci_relation_queued(relation_owner)
+        {
+            hosted_device_relation_invalidations_mut()
+                .discard_pending(enqueued.invalidation)
+                .expect("unclaimed relation request could not be rolled back");
+            return Err(status);
+        }
+        cancel_stale_hosted_acpi_pci_route_query()?;
+    }
+    Ok(enqueued)
+}
+
+unsafe fn hosted_relation_owner_for_device(
+    device_id: u64,
+) -> Result<nt_pnp::AcpiPciProviderEndpoint, nt_status::NtStatus> {
+    let binding = hosted_device_binding_by_device_id(device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let projection =
+        instance(binding.projection_instance).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if binding.pdo_device_id == 0
+        || binding.pdo_object == 0
+        || instance_domain_identity(projection) != Some(binding.projection_domain)
+        || hosted_pnp_manager_mut()
+            .devnode_for_pdo(binding.pdo_device_id)
+            .is_none()
+        || io_manager_mut()
+            .device(nt_io_manager::DeviceId(binding.pdo_device_id))
+            .is_none()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    Ok(nt_pnp::AcpiPciProviderEndpoint {
+        device_id: binding.pdo_device_id,
+        hosted_domain_id: binding.projection_domain.domain_id.raw(),
+        hosted_domain_cookie: binding.projection_domain.cookie,
+        pdo_object: binding.pdo_object,
+    })
+}
+
+pub(crate) unsafe fn enqueue_hosted_initial_bus_relations(
+    device_id: u64,
+) -> Result<u64, nt_status::NtStatus> {
+    let relation_owner = hosted_relation_owner_for_device(device_id)?;
+    enqueue_hosted_device_relations(relation_owner, nt_pnp_abi::BUS_RELATIONS)
+        .map(|enqueued| enqueued.invalidation.sequence)
+}
+
+pub(crate) unsafe fn hosted_pnp_enumeration_progress() -> HostedPnpEnumerationProgress {
+    if let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() {
+        if query.phase == HostedDeviceRelationQueryPhase::Barrier {
+            return HostedPnpEnumerationProgress::Blocked(
+                query
+                    .barrier_status
+                    .unwrap_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            );
+        }
+        return HostedPnpEnumerationProgress::Pending;
+    }
+    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
+        .as_ref()
+        .is_some_and(|queue| !queue.is_empty())
+    {
+        return HostedPnpEnumerationProgress::Pending;
+    }
+    match crate::hosted_pci_topology::hosted_pci_topology_reconciliation() {
+        crate::hosted_pci_topology::HostedPciTopologyReconciliation::Current => {
+            HostedPnpEnumerationProgress::Current
+        }
+        crate::hosted_pci_topology::HostedPciTopologyReconciliation::Pending => {
+            HostedPnpEnumerationProgress::Pending
+        }
+        crate::hosted_pci_topology::HostedPciTopologyReconciliation::Blocked(status) => {
+            HostedPnpEnumerationProgress::Blocked(status)
+        }
+    }
+}
+
 unsafe fn hosted_bus_relations_mut() -> &'static mut nt_pnp_manager::BusRelationTable {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_BUS_RELATIONS);
     if slot.is_none() {
@@ -44189,12 +44302,16 @@ pub(crate) fn service_hosted_device(
                     "IoInvalidateDeviceRelations received a non-PDO or unauthenticated object: {status:?}"
                 )
             });
-        let enqueued = unsafe {
-            hosted_device_relation_invalidations_mut().enqueue(pdo_device_id.raw(), relation_type)
-        }
-        .unwrap_or_else(|error| {
-            panic!("IoInvalidateDeviceRelations could not retain its request: {error:?}")
-        });
+        let relation_owner = nt_pnp::AcpiPciProviderEndpoint {
+            device_id: pdo_device_id.raw(),
+            hosted_domain_id: inst.hosted_domain_id,
+            hosted_domain_cookie: inst.hosted_domain_cookie,
+            pdo_object,
+        };
+        let enqueued = unsafe { enqueue_hosted_device_relations(relation_owner, relation_type) }
+            .unwrap_or_else(|status| {
+                panic!("IoInvalidateDeviceRelations could not retain its request: {status:?}")
+            });
         let disposition = match enqueued.disposition {
             nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued => {
                 HOSTED_DEVICE_RELATION_INVALIDATION_QUEUED.fetch_add(1, Ordering::Relaxed);
@@ -44209,25 +44326,6 @@ pub(crate) fn service_hosted_device(
                 3
             }
         };
-        if relation_type == nt_pnp_abi::BUS_RELATIONS
-            && enqueued.disposition == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
-        {
-            let relation_owner = nt_pnp::AcpiPciProviderEndpoint {
-                device_id: pdo_device_id.raw(),
-                hosted_domain_id: inst.hosted_domain_id,
-                hosted_domain_cookie: inst.hosted_domain_cookie,
-                pdo_object,
-            };
-            let _routing_fenced = unsafe {
-                crate::hosted_pci_topology::note_hosted_pci_relation_queued(relation_owner)
-            }
-            .unwrap_or_else(|status| {
-                panic!("ACPI PCI route invalidation fence failed: {status:?}")
-            });
-            unsafe { cancel_stale_hosted_acpi_pci_route_query() }.unwrap_or_else(|status| {
-                panic!("stale ACPI PCI route IRP cancellation failed: {status:?}")
-            });
-        }
         if call <= 32 {
             print_str(b"[pnp-invalidate] pdo=");
             print_u64(pdo_device_id.raw());

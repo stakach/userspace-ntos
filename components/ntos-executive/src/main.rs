@@ -32606,7 +32606,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     } else {
         print_str(b"[driver-launch] config hive has no installed PnP driver binding\n");
     }
-    let generic_hw_gates_deferred = generic_hw_pending != 0 || generic_hw_indeterminate != 0;
+    let generic_hw_gates_deferred = generic_hw_pending != 0
+        || generic_hw_indeterminate != 0
+        || !driver_start_bootstrap.pending.is_empty();
     if !generic_hw_gates_deferred && generic_hw_selected != 0 {
         print_str(b"[driver-launch] config PnP hardware summary selected=");
         print_u64(generic_hw_selected);

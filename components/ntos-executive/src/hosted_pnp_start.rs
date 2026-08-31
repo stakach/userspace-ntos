@@ -151,6 +151,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     report: HostedPnpStartReport,
     pending_device_id: u64,
     pending_filter: Option<PendingHostedPnpFilter>,
+    pending_relations_device_id: u64,
 }
 
 struct PendingHostedPnpFilter {
@@ -195,6 +196,7 @@ impl OwnedHostedPnpStartBatch {
             report,
             pending_device_id: 0,
             pending_filter: None,
+            pending_relations_device_id: 0,
         }
     }
 
@@ -208,10 +210,11 @@ impl OwnedHostedPnpStartBatch {
 
     pub(crate) fn needs_completion_redrive(&self) -> bool {
         self.pending_filter.is_some()
+            || self.pending_relations_device_id != 0
             || matches!(
-            self.coordinator.phase(),
-            nt_driver_start::BatchPhase::Ready | nt_driver_start::BatchPhase::Awaiting { .. }
-        )
+                self.coordinator.phase(),
+                nt_driver_start::BatchPhase::Ready | nt_driver_start::BatchPhase::Awaiting { .. }
+            )
     }
 
     pub(crate) unsafe fn drive(&mut self) -> OwnedHostedPnpStartProgress {
@@ -222,6 +225,23 @@ impl OwnedHostedPnpStartBatch {
     /// Walking several pending batches must not repump that global plane once per row.
     pub(crate) unsafe fn drive_after_completion_pump(&mut self) -> OwnedHostedPnpStartProgress {
         self.drive_inner(false)
+    }
+
+    unsafe fn schedule_initial_bus_relations(
+        &mut self,
+        device_id: u64,
+    ) -> OwnedHostedPnpStartProgress {
+        assert_ne!(device_id, 0, "successful START lost its canonical device");
+        match driver_launch::enqueue_hosted_initial_bus_relations(device_id) {
+            Ok(_) => {
+                self.pending_relations_device_id = device_id;
+                OwnedHostedPnpStartProgress::AwaitingCompletion
+            }
+            Err(status) => OwnedHostedPnpStartProgress::Complete(Err(HostedPnpStartBatchFailure {
+                status,
+                teardown_blocked: true,
+            })),
+        }
     }
 
     unsafe fn apply_devnode_progress(
@@ -275,7 +295,7 @@ impl OwnedHostedPnpStartBatch {
             .expect("ready START batch rejected completed devnode preparation");
         assert_eq!(token.devnode_index(), devnode_index);
         match progress {
-            HostedPnpDevnodeProgress::Terminal { status } => {
+            HostedPnpDevnodeProgress::Terminal { device_id, status } => {
                 self.coordinator
                     .dispatch_terminal(token)
                     .expect("terminal START did not match dispatched devnode");
@@ -283,6 +303,8 @@ impl OwnedHostedPnpStartBatch {
                     self.coordinator
                         .stop()
                         .expect("terminal START failure could not stop batch");
+                } else {
+                    return Some(self.schedule_initial_bus_relations(device_id));
                 }
                 None
             }
@@ -328,6 +350,28 @@ impl OwnedHostedPnpStartBatch {
 
     unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpStartProgress {
         loop {
+            if self.pending_relations_device_id != 0 {
+                if pump_before_observe {
+                    driver_launch::pump_hosted_io_completions();
+                }
+                match driver_launch::hosted_pnp_enumeration_progress() {
+                    driver_launch::HostedPnpEnumerationProgress::Current => {
+                        self.pending_relations_device_id = 0;
+                    }
+                    driver_launch::HostedPnpEnumerationProgress::Pending => {
+                        return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                    }
+                    driver_launch::HostedPnpEnumerationProgress::Blocked(status) => {
+                        return OwnedHostedPnpStartProgress::Complete(Err(
+                            HostedPnpStartBatchFailure {
+                                status,
+                                teardown_blocked: true,
+                            },
+                        ));
+                    }
+                }
+                continue;
+            }
             if let Some(pending) = self.pending_filter.as_ref() {
                 if let Some(status) = pending.ownership_lost {
                     return OwnedHostedPnpStartProgress::OwnershipLost(
@@ -365,7 +409,10 @@ impl OwnedHostedPnpStartBatch {
                         );
                     }
                     Ok(driver_launch::HostedFilterRequirementsOutcome::Failed(status)) => {
-                        let pending = self.pending_filter.take().expect("filter owner disappeared");
+                        let pending = self
+                            .pending_filter
+                            .take()
+                            .expect("filter owner disappeared");
                         let devnode = &self.spec.devnodes[devnode_index];
                         let progress = finish_filter_failure(
                             device_id,
@@ -376,14 +423,18 @@ impl OwnedHostedPnpStartBatch {
                             status,
                             &mut self.report,
                         );
-                        if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                        if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress)
+                        {
                             return outcome;
                         }
                     }
                     Ok(driver_launch::HostedFilterRequirementsOutcome::Filtered {
                         requirements,
                     }) => {
-                        let pending = self.pending_filter.take().expect("filter owner disappeared");
+                        let pending = self
+                            .pending_filter
+                            .take()
+                            .expect("filter owner disappeared");
                         let devnode = &self.spec.devnodes[devnode_index];
                         let progress = start_filtered_devnode(
                             device_id,
@@ -394,7 +445,8 @@ impl OwnedHostedPnpStartBatch {
                             self.options,
                             &mut self.report,
                         );
-                        if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress) {
+                        if let Some(outcome) = self.apply_devnode_progress(devnode_index, progress)
+                        {
                             return outcome;
                         }
                     }
@@ -428,8 +480,9 @@ impl OwnedHostedPnpStartBatch {
                             self.coordinator
                                 .observe_terminal(irp_id)
                                 .expect("exact START terminal observation rejected");
+                            let device_id = self.pending_device_id;
                             finish_started_devnode(
-                                self.pending_device_id,
+                                device_id,
                                 &self.spec.service_name,
                                 &devnode.instance_id,
                                 self.options,
@@ -442,6 +495,8 @@ impl OwnedHostedPnpStartBatch {
                                 self.coordinator
                                     .stop()
                                     .expect("terminal START failure could not stop batch");
+                            } else {
+                                return self.schedule_initial_bus_relations(device_id);
                             }
                         }
                         CanonicalStartDisposition::Indeterminate {
@@ -489,6 +544,20 @@ impl OwnedHostedPnpStartBatch {
                     }
                 }
                 nt_driver_start::BatchPhase::Ready => {
+                    match driver_launch::hosted_pnp_enumeration_progress() {
+                        driver_launch::HostedPnpEnumerationProgress::Current => {}
+                        driver_launch::HostedPnpEnumerationProgress::Pending => {
+                            return OwnedHostedPnpStartProgress::AwaitingCompletion;
+                        }
+                        driver_launch::HostedPnpEnumerationProgress::Blocked(status) => {
+                            return OwnedHostedPnpStartProgress::Complete(Err(
+                                HostedPnpStartBatchFailure {
+                                    status,
+                                    teardown_blocked: true,
+                                },
+                            ));
+                        }
+                    }
                     let devnode_index = self.coordinator.next_devnode();
                     let devnode = &self.spec.devnodes[devnode_index];
                     let progress = start_one_devnode(
@@ -573,8 +642,7 @@ impl OwnedHostedPnpRebalance {
     pub(crate) fn needs_completion_redrive(&self) -> bool {
         matches!(
             self.stage,
-            HostedPnpRebalanceStage::AwaitingLifecycle { .. }
-                | HostedPnpRebalanceStage::Restart
+            HostedPnpRebalanceStage::AwaitingLifecycle { .. } | HostedPnpRebalanceStage::Restart
         ) && (matches!(
             self.stage,
             HostedPnpRebalanceStage::AwaitingLifecycle { .. }
@@ -585,9 +653,7 @@ impl OwnedHostedPnpRebalance {
         self.drive_inner(true)
     }
 
-    pub(crate) unsafe fn drive_after_completion_pump(
-        &mut self,
-    ) -> OwnedHostedPnpRebalanceProgress {
+    pub(crate) unsafe fn drive_after_completion_pump(&mut self) -> OwnedHostedPnpRebalanceProgress {
         self.drive_inner(false)
     }
 
@@ -629,7 +695,8 @@ impl OwnedHostedPnpRebalance {
             }) => {
                 self.lose_ownership(transport_status);
                 Some(OwnedHostedPnpRebalanceProgress::OwnershipLost(
-                    self.ownership_failure.expect("rebalance barrier disappeared"),
+                    self.ownership_failure
+                        .expect("rebalance barrier disappeared"),
                 ))
             }
             Err(status) => {
@@ -641,7 +708,8 @@ impl OwnedHostedPnpRebalance {
                 } else if minor == nt_pnp_manager::PnpMinor::CancelStopDevice {
                     self.lose_ownership(failure_status.unwrap_or(status));
                     Some(OwnedHostedPnpRebalanceProgress::OwnershipLost(
-                        self.ownership_failure.expect("rebalance barrier disappeared"),
+                        self.ownership_failure
+                            .expect("rebalance barrier disappeared"),
                     ))
                 } else {
                     self.fail_terminal(HostedPnpStartBatchFailure {
@@ -686,10 +754,9 @@ impl OwnedHostedPnpRebalance {
         loop {
             match self.stage {
                 HostedPnpRebalanceStage::QueryStop => {
-                    if let Some(progress) = self.dispatch_lifecycle(
-                        nt_pnp_manager::PnpMinor::QueryStopDevice,
-                        None,
-                    ) {
+                    if let Some(progress) =
+                        self.dispatch_lifecycle(nt_pnp_manager::PnpMinor::QueryStopDevice, None)
+                    {
                         return progress;
                     }
                 }
@@ -837,9 +904,7 @@ impl OwnedHostedPnpRemoval {
         self.drive_inner(true)
     }
 
-    pub(crate) unsafe fn drive_after_completion_pump(
-        &mut self,
-    ) -> OwnedHostedPnpRemovalProgress {
+    pub(crate) unsafe fn drive_after_completion_pump(&mut self) -> OwnedHostedPnpRemovalProgress {
         self.drive_inner(false)
     }
 
@@ -946,18 +1011,16 @@ impl OwnedHostedPnpRemoval {
         loop {
             match self.stage {
                 HostedPnpRemovalStage::QueryRemove => {
-                    if let Some(progress) = self.dispatch_lifecycle(
-                        nt_pnp_manager::PnpMinor::QueryRemoveDevice,
-                        None,
-                    ) {
+                    if let Some(progress) =
+                        self.dispatch_lifecycle(nt_pnp_manager::PnpMinor::QueryRemoveDevice, None)
+                    {
                         return progress;
                     }
                 }
                 HostedPnpRemovalStage::SurpriseRemove => {
-                    if let Some(progress) = self.dispatch_lifecycle(
-                        nt_pnp_manager::PnpMinor::SurpriseRemoval,
-                        None,
-                    ) {
+                    if let Some(progress) =
+                        self.dispatch_lifecycle(nt_pnp_manager::PnpMinor::SurpriseRemoval, None)
+                    {
                         return progress;
                     }
                 }
@@ -999,7 +1062,8 @@ impl OwnedHostedPnpRemoval {
                 }
                 HostedPnpRemovalStage::Complete => {
                     return OwnedHostedPnpRemovalProgress::Complete(
-                        self.terminal.expect("terminal removal has no retained result"),
+                        self.terminal
+                            .expect("terminal removal has no retained result"),
                     );
                 }
                 HostedPnpRemovalStage::OwnershipLost => {
@@ -1085,9 +1149,9 @@ impl PreparedHostedResourcePlan {
 
     unsafe fn release_context_lease(self) -> Result<(), nt_status::NtStatus> {
         let lease = match self {
-            Self::Pci { lease, .. }
-            | Self::Root { lease, .. }
-            | Self::Platform { lease, .. } => lease,
+            Self::Pci { lease, .. } | Self::Root { lease, .. } | Self::Platform { lease, .. } => {
+                lease
+            }
             Self::None => return Ok(()),
         };
         release_hosted_pnp_context_lease(lease.into_identity())
@@ -1341,6 +1405,7 @@ where
 
 enum HostedPnpDevnodeProgress {
     Terminal {
+        device_id: u64,
         status: nt_status::NtStatus,
     },
     Pending {
@@ -1392,7 +1457,10 @@ where
                 devnode.instance_id,
                 status,
             );
-            return HostedPnpDevnodeProgress::Terminal { status };
+            return HostedPnpDevnodeProgress::Terminal {
+                device_id: 0,
+                status,
+            };
         }
     };
     let PreparedHostedDevnode {
@@ -1419,7 +1487,10 @@ where
                 devnode.instance_id,
                 status,
             );
-            return HostedPnpDevnodeProgress::Terminal { status };
+            return HostedPnpDevnodeProgress::Terminal {
+                device_id: 0,
+                status,
+            };
         }
     }
     let add_device = if options.reuse_existing_stack {
@@ -1463,11 +1534,13 @@ where
                     device_id,
                     requirements,
                 ),
-                None => driver_launch::commit_hosted_no_resource_requirements(device_id).map(
-                    |()| driver_launch::HostedFilterRequirementsOutcome::Filtered {
-                        requirements: Vec::new(),
-                    },
-                ),
+                None => {
+                    driver_launch::commit_hosted_no_resource_requirements(device_id).map(|()| {
+                        driver_launch::HostedFilterRequirementsOutcome::Filtered {
+                            requirements: Vec::new(),
+                        }
+                    })
+                }
             };
             match filter_outcome {
                 Ok(driver_launch::HostedFilterRequirementsOutcome::Filtered { requirements }) => {
@@ -1516,7 +1589,10 @@ where
                 .unwrap_or(status);
             record_terminal_start_failure(report, status);
             print_add_device_failure(options.trace, service_name, devnode.instance_id, status);
-            HostedPnpDevnodeProgress::Terminal { status }
+            HostedPnpDevnodeProgress::Terminal {
+                device_id: 0,
+                status,
+            }
         }
     }
 }
@@ -1539,7 +1615,10 @@ unsafe fn finish_filter_failure(
         .unwrap_or(status);
     record_terminal_start_failure(report, status);
     print_resource_grant_failure(options.trace, service_name, instance_id, status);
-    HostedPnpDevnodeProgress::Terminal { status }
+    HostedPnpDevnodeProgress::Terminal {
+        device_id: 0,
+        status,
+    }
 }
 
 unsafe fn start_filtered_devnode(
@@ -1557,11 +1636,7 @@ unsafe fn start_filtered_devnode(
         filtered_resource_requirements,
     ) {
         Ok(Some(grant)) => {
-            print_hosted_devnode_grant(
-                service_name.as_bytes(),
-                instance_id.as_bytes(),
-                &grant,
-            );
+            print_hosted_devnode_grant(service_name.as_bytes(), instance_id.as_bytes(), &grant);
             match driver_launch::commit_hosted_device_resource_assignment(
                 device_id,
                 &grant.raw_resource_list,
@@ -1578,17 +1653,15 @@ unsafe fn start_filtered_devnode(
                 },
             }
         }
-        Ok(None) => match driver_launch::commit_hosted_device_resource_assignment(
-            device_id,
-            &[],
-            &[],
-        ) {
-            Ok(()) => canonical_start_status(device_id, &[], &[]),
-            Err(status) => CanonicalStartDisposition::Terminal {
-                status: rollback_pre_dispatch_start(device_id, status),
-                waited: false,
-            },
-        },
+        Ok(None) => {
+            match driver_launch::commit_hosted_device_resource_assignment(device_id, &[], &[]) {
+                Ok(()) => canonical_start_status(device_id, &[], &[]),
+                Err(status) => CanonicalStartDisposition::Terminal {
+                    status: rollback_pre_dispatch_start(device_id, status),
+                    waited: false,
+                },
+            }
+        }
         Err(status) => {
             let status = rollback_pre_dispatch_start(device_id, status);
             print_resource_grant_failure(options.trace, service_name, instance_id, status);
@@ -1609,7 +1682,10 @@ unsafe fn start_filtered_devnode(
                 waited,
                 report,
             );
-            HostedPnpDevnodeProgress::Terminal { status }
+            HostedPnpDevnodeProgress::Terminal {
+                device_id: status.is_success().then_some(device_id).unwrap_or(0),
+                status,
+            }
         }
         CanonicalStartDisposition::Indeterminate {
             transport_status,
@@ -1926,9 +2002,7 @@ fn print_add_device_success(
     device_id: u64,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::ConfigPnp => {
-            b"[driver-launch] config PnP AddDevice service="
-        }
+        HostedPnpStartTrace::ConfigPnp => b"[driver-launch] config PnP AddDevice service=",
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand AddDevice service=",
         HostedPnpStartTrace::BootService => b"[driver-launch] AddDevice service=",
     });
@@ -1947,9 +2021,7 @@ fn print_add_device_failure(
     status: nt_status::NtStatus,
 ) {
     print_str(match trace {
-        HostedPnpStartTrace::ConfigPnp => {
-            b"[driver-launch] config PnP AddDevice failed status=0x"
-        }
+        HostedPnpStartTrace::ConfigPnp => b"[driver-launch] config PnP AddDevice failed status=0x",
         HostedPnpStartTrace::DemandStart => b"[driver-launch] demand AddDevice failed status=0x",
         HostedPnpStartTrace::BootService => b"[driver-launch] AddDevice failed status=0x",
     });
@@ -2034,9 +2106,7 @@ fn print_start_status(
 ) {
     if status == 0 {
         print_str(match trace {
-            HostedPnpStartTrace::ConfigPnp => {
-                b"[driver-launch] config PnP StartDevice service="
-            }
+            HostedPnpStartTrace::ConfigPnp => b"[driver-launch] config PnP StartDevice service=",
             HostedPnpStartTrace::DemandStart => b"[driver-launch] demand StartDevice service=",
             HostedPnpStartTrace::BootService => b"[driver-launch] StartDevice service=",
         });

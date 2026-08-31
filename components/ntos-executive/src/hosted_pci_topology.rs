@@ -3,10 +3,9 @@ use alloc::vec::Vec;
 use nt_pnp::{
     AcpiPciCrsMethodSource, AcpiPciLinkCandidateFact, AcpiPciProviderEndpoint, AcpiPciScopeCatalog,
     AcpiPciScopeError, AcpiPciScopeSource, PciDevice, PciInterruptRouteOwner, PciInventory,
-    PciInventoryError, PreparedAcpiPciInterruptLinkDiscovery,
-    PreparedAcpiPciRoutingDiscovery, PreparedAcpiPciRoutingTables,
+    PciInventoryError, PreparedAcpiPciInterruptLinkDiscovery, PreparedAcpiPciRoutingDiscovery,
+    PreparedAcpiPciRoutingTables, PreparedAcpiPciScopeCatalogUpdate,
     PreparedPciInterruptRoutePublication,
-    PreparedAcpiPciScopeCatalogUpdate,
 };
 
 struct HostedPciTopologyAuthority {
@@ -31,6 +30,13 @@ struct HostedPciRouteBlock {
     inventory_generation: u64,
     route_owner_generation: u64,
     status: nt_status::NtStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPciTopologyReconciliation {
+    Current,
+    Pending,
+    Blocked(nt_status::NtStatus),
 }
 
 static mut HOSTED_PCI_TOPOLOGY: Option<HostedPciTopologyAuthority> = None;
@@ -124,6 +130,32 @@ pub(crate) unsafe fn hosted_pci_topology_generations() -> Option<(u64, u64, u64)
     ))
 }
 
+pub(crate) unsafe fn hosted_pci_topology_reconciliation() -> HostedPciTopologyReconciliation {
+    let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
+        return HostedPciTopologyReconciliation::Current;
+    };
+    refresh_hosted_pci_route_reconciliation(authority);
+    if !authority.dirty_relations.is_empty() {
+        return HostedPciTopologyReconciliation::Pending;
+    }
+    if let Some(blocked) = authority.route_blocked {
+        return HostedPciTopologyReconciliation::Blocked(blocked.status);
+    }
+    if authority.scopes.sources().is_empty() {
+        return HostedPciTopologyReconciliation::Current;
+    }
+    if authority.interrupt_overrides.is_none() {
+        return HostedPciTopologyReconciliation::Blocked(nt_status::NtStatus::DEVICE_NOT_READY);
+    }
+    if authority.routes.inventory_generation() == Some(authority.inventory.generation())
+        && authority.routes.provider_scope_generation() == Some(authority.scopes.generation())
+    {
+        HostedPciTopologyReconciliation::Current
+    } else {
+        HostedPciTopologyReconciliation::Pending
+    }
+}
+
 pub(crate) unsafe fn hosted_acpi_pci_relation_has_sources(
     relation_owner: AcpiPciProviderEndpoint,
 ) -> bool {
@@ -135,9 +167,9 @@ pub(crate) unsafe fn hosted_acpi_pci_relation_has_sources(
 pub(crate) unsafe fn note_hosted_pci_relation_queued(
     relation_owner: AcpiPciProviderEndpoint,
 ) -> Result<bool, nt_status::NtStatus> {
-    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
-        .as_mut()
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
+        return Ok(false);
+    };
     if authority
         .dirty_relations
         .iter()
@@ -170,9 +202,9 @@ pub(crate) unsafe fn note_hosted_pci_relation_completion(
     relation_owner: AcpiPciProviderEndpoint,
     completion: nt_pnp_manager::DeviceRelationInvalidationCompletion,
 ) -> Result<bool, nt_status::NtStatus> {
-    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
-        .as_mut()
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() else {
+        return Ok(false);
+    };
     let index = authority
         .dirty_relations
         .iter()
@@ -345,7 +377,11 @@ pub(crate) unsafe fn commit_hosted_pci_interrupt_routes(
     }
     let generation = authority
         .routes
-        .commit(publication, &authority.inventory, authority.scopes.generation())
+        .commit(
+            publication,
+            &authority.inventory,
+            authority.scopes.generation(),
+        )
         .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     authority.reconcile_ready = false;
     Ok(generation)
@@ -397,9 +433,7 @@ pub(crate) unsafe fn recover_hosted_pci_route_reconciliation_block(
 }
 
 pub(crate) unsafe fn retry_hosted_pci_route_reconciliation() {
-    if let Some(authority) =
-        (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut()
-    {
+    if let Some(authority) = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut() {
         refresh_hosted_pci_route_reconciliation(authority);
     }
 }
