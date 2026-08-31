@@ -20812,6 +20812,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     accepted HPET child mapping and SCI interrupt connection. No dialog, GDI, or resource fallback
     is permitted.
 
+    B3 desktop-regression acceptance checkpoint (2026-09-01, runtime green): serialized graphical
+    run `.tmp/run-desktop-hpet-video-20260901.log` completes in well under the one-hour launch
+    deadline. ACPI receives all five memory grants including the exact read-only
+    `0xFED00000/1024` HPET child, starts successfully, and connects the canonical SCI. The 16 MiB
+    bochs BAR now retains its full assigned extent while publishing the intended 32-page mapped
+    prefix; bochsmp completes START, records MMIO/video evidence, publishes its hosted video route,
+    and win32k creates a non-null PDEV. The real IDD_LOGON modal pump completes `3/3` with twelve
+    paints, the profile hive gate passes, and genuine userinit/Explorer launch reaches shell chrome
+    with every framebuffer pixel non-background. The readiness summary is `294/299`; the QEMU
+    display was captured at `.tmp/screenshots/desktop-hpet-video-20260901.png` and the validation VM
+    was then terminated instead of being left as a long-running boot job.
+
+    Review adjustment: this closes the bounded-resource/desktop regression and preserves the HPET
+    work. The five remaining gates are one earlier B3 hardware frontier, not shell regressions:
+    E1000 has no accepted platform interrupt route (`pci-topology ... routes=0`), so its filtered
+    PCI requirements cannot be assigned and its NDIS receive, ISR, and DPC gates stay open; the
+    root DMA fixture also reaches its PDO/grant but its START is rejected independently. Continue
+    with firmware/provider-owned PCI `_PRT` and interrupt-link discovery first, then revisit the
+    root-device START boundary. Do not restore a compiled PIRQ table or manufacture an interrupt
+    assignment when provider discovery is incomplete.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
