@@ -55,8 +55,9 @@ pub use codec::{
     HiveLogReplayError, HiveSubtreeEncodeError, HIVE_IMAGE_MAGIC,
 };
 pub use config_import::{
-    import_control_set_class_into_config_manager, import_control_set_enum_into_config_manager,
-    import_control_set_network_into_config_manager,
+    import_control_set_class_into_config_manager,
+    import_control_set_critical_device_database_into_config_manager,
+    import_control_set_enum_into_config_manager, import_control_set_network_into_config_manager,
     import_control_set_service_group_order_into_config_manager,
     import_control_set_services_into_config_manager,
 };

@@ -1227,6 +1227,60 @@ fn imports_service_group_order_for_service_database_order() {
 }
 
 #[test]
+fn imports_selected_control_set_critical_device_database() {
+    let mut h = Hive::new(HiveKind::System);
+    let acpi = h.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
+    h.set_value(
+        acpi,
+        "ClassGUID",
+        RegistryValueType::Sz,
+        utf16le_sz("{4D36E97D-E325-11CE-BFC1-08002BE10318}"),
+    );
+    h.set_value(acpi, "Service", RegistryValueType::Sz, utf16le_sz("acpi"));
+    let inactive = h.create_key(r"ControlSet002\Control\CriticalDeviceDatabase\ROOT#INACTIVE");
+    h.set_value(
+        inactive,
+        "ClassGUID",
+        RegistryValueType::Sz,
+        utf16le_sz("{00000000-0000-0000-0000-000000000000}"),
+    );
+
+    let mut cm = nt_config_manager::ConfigManager::new();
+    assert_eq!(
+        import_control_set_critical_device_database_into_config_manager(
+            &h,
+            &mut cm,
+            "ControlSet001",
+        ),
+        1
+    );
+    let binding = cm
+        .resolve_critical_device_id("*PNP0C08")
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.matched_id, "*PNP0C08");
+    assert_eq!(
+        binding.class_guid,
+        "{4D36E97D-E325-11CE-BFC1-08002BE10318}"
+    );
+    assert_eq!(binding.service_name.as_deref(), Some("acpi"));
+    assert_eq!(
+        cm.resolve_critical_device_id(r"ROOT\INACTIVE").unwrap(),
+        None
+    );
+
+    let mut absent = nt_config_manager::ConfigManager::new();
+    assert_eq!(
+        import_control_set_critical_device_database_into_config_manager(
+            &h,
+            &mut absent,
+            "ControlSet003",
+        ),
+        0
+    );
+}
+
+#[test]
 fn imports_control_set_enum_into_config_manager() {
     let mut h = Hive::new(HiveKind::System);
     let dn = h.create_key(r"ControlSet001\Enum\PCI\VEN_8086&DEV_100E\3&11583659&0&18");

@@ -3,8 +3,8 @@
 use alloc::vec::Vec;
 
 use nt_config_manager::{
-    ConfigManager, Registry, RegistryKeyId, CONTROL_CLASS_PATH, CONTROL_NETWORK_PATH, ENUM_PATH,
-    SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
+    ConfigManager, Registry, RegistryKeyId, CONTROL_CLASS_PATH, CONTROL_NETWORK_PATH,
+    CRITICAL_DEVICE_DATABASE_PATH, ENUM_PATH, SERVICES_PATH, SERVICE_GROUP_ORDER_PATH,
 };
 
 use crate::{CellId, Hive};
@@ -55,6 +55,39 @@ pub fn import_control_set_service_group_order_into_config_manager(
     let value_count = hive.enum_values(src_key).len();
     import_hive_key(hive, src_key, cm.registry_mut(), dst_key);
     value_count
+}
+
+/// Import `ControlSetXXX\Control\CriticalDeviceDatabase` from a hive into
+/// `\Registry\Machine\System\CurrentControlSet\Control\CriticalDeviceDatabase`.
+///
+/// Critical-device policy is registry data selected by the mounted SYSTEM hive. Importing the
+/// complete subtree keeps the live Configuration Manager authoritative without embedding device
+/// or service identities in the kernel.
+pub fn import_control_set_critical_device_database_into_config_manager(
+    hive: &Hive,
+    cm: &mut ConfigManager,
+    control_set: &str,
+) -> usize {
+    let mut src_path = alloc::string::String::from(control_set);
+    src_path.push_str("\\Control\\CriticalDeviceDatabase");
+    let Some(src_database) = hive.open_key(&src_path) else {
+        return 0;
+    };
+    let dst_database = cm
+        .registry_mut()
+        .create_key(CRITICAL_DEVICE_DATABASE_PATH);
+    let device_ids = hive.enum_subkeys(src_database);
+    let count = device_ids.len();
+    for device_id in device_ids {
+        let Some(src_device) = hive.open_subkey(src_database, &device_id) else {
+            continue;
+        };
+        let dst_device = cm
+            .registry_mut()
+            .create_subkey(dst_database, &device_id);
+        import_hive_key(hive, src_device, cm.registry_mut(), dst_device);
+    }
+    count
 }
 
 /// Import `ControlSetXXX\Enum` from a hive into

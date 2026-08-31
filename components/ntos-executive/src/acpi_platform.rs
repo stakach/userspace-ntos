@@ -54,8 +54,31 @@ fn validate_platform_ioapic_firmware(
 ) -> Result<(), nt_status::NtStatus> {
     let count = PLATFORM_IOAPIC_COUNT.load(Ordering::Acquire) as usize;
     let kernel = unsafe { &PLATFORM_IOAPICS[..count] };
-    nt_acpi::validate_ioapic_route_extents(controllers, kernel)
-        .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)
+    if nt_acpi::validate_ioapic_route_extents(controllers, kernel).is_ok() {
+        return Ok(());
+    }
+    print_str(b"[acpi-platform] IOAPIC topology mismatch firmware/kernel-count=");
+    print_u64(controllers.len() as u64);
+    print_str(b"/");
+    print_u64(kernel.len() as u64);
+    for (ordinal, controller) in controllers.iter().enumerate() {
+        print_str(b" firmware[");
+        print_u64(ordinal as u64);
+        print_str(b"] id/gsi=");
+        print_u64(controller.id as u64);
+        print_str(b"/");
+        print_u64(controller.gsi_base as u64);
+    }
+    for (ordinal, controller) in kernel.iter().enumerate() {
+        print_str(b" kernel[");
+        print_u64(ordinal as u64);
+        print_str(b"] gsi/entries=");
+        print_u64(controller.gsi_base as u64);
+        print_str(b"/");
+        print_u64(controller.redirection_entries as u64);
+    }
+    print_str(b"\n");
+    Err(nt_status::NtStatus::INVALID_PARAMETER)
 }
 
 pub(crate) const ACPI_ROOT_INSTANCE_PATH: &str = r"ACPI_HAL\PNP0C08\0";
@@ -134,8 +157,13 @@ impl<'a> AcpiPhysicalReader<'a> {
         {
             return Ok(region);
         }
-        let region = unique_device_untyped_containing(self.bi, page_paddr, PAGE_SIZE)
-            .ok_or_else(|| self.fail(nt_status::NtStatus::CONFLICTING_ADDRESSES))?;
+        let Some(region) = unique_device_untyped_containing(self.bi, page_paddr, PAGE_SIZE) else {
+            print_str(b"[acpi-platform] no unique device authority for page=");
+            print_hex((page_paddr >> 32) as u32);
+            print_hex(page_paddr as u32);
+            print_str(b"\n");
+            return Err(self.fail(nt_status::NtStatus::CONFLICTING_ADDRESSES));
+        };
         let next_validation_pages = self
             .validation_pages
             .checked_add(region.pages)
@@ -165,7 +193,15 @@ impl<'a> AcpiPhysicalReader<'a> {
             }
             self.owner.adopt_root_frame(frame, false);
             let expected_paddr = region.paddr + page * PAGE_SIZE;
-            if get_frame_paddr(frame) != expected_paddr {
+            let actual_paddr = get_frame_paddr(frame);
+            if actual_paddr != expected_paddr {
+                print_str(b"[acpi-platform] canonical frame address mismatch expected/actual=");
+                print_hex((expected_paddr >> 32) as u32);
+                print_hex(expected_paddr as u32);
+                print_str(b"/");
+                print_hex((actual_paddr >> 32) as u32);
+                print_hex(actual_paddr as u32);
+                print_str(b"\n");
                 recycle_unoccupied_run(frame + 1, region.pages - page - 1);
                 let _ = self.owner.rollback_to(checkpoint);
                 return Err(self.fail(nt_status::NtStatus::CONFLICTING_ADDRESSES));
@@ -349,6 +385,10 @@ unsafe fn prepare_memory_authority(
     while page < pages {
         let paddr = range.start + page * PAGE_SIZE;
         let Some(canonical) = canonical_frame_for(regions, paddr) else {
+            print_str(b"[acpi-platform] retained canonical frame missing for page=");
+            print_hex((paddr >> 32) as u32);
+            print_hex(paddr as u32);
+            print_str(b"\n");
             recycle_unoccupied_run(frame_base + page, pages - page);
             let _ = owner.rollback_to(checkpoint);
             return Err(nt_status::NtStatus::CONFLICTING_ADDRESSES);

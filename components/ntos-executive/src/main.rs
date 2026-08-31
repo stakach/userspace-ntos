@@ -31373,10 +31373,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    let acpi_platform_authority =
-        discover_acpi_platform_authority(bi).expect("discover authorized ACPI platform resources");
-    publish_acpi_root_devnode_from_registry_policy()
-        .expect("publish registry-selected ACPI root devnode");
+    let acpi_platform_authority = match discover_acpi_platform_authority(bi) {
+        Ok(authority) => authority,
+        Err(status) => {
+            print_str(b"[acpi-platform] authority discovery failed status=");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            panic!("discover authorized ACPI platform resources");
+        }
+    };
+    if let Err(status) = publish_acpi_root_devnode_from_registry_policy() {
+        print_str(b"[acpi-platform] root devnode publication failed status=");
+        print_hex(status.raw() as u32);
+        print_str(b"\n");
+        panic!("publish registry-selected ACPI root devnode");
+    }
 
     let boot_driver_snapshot = config_manager_query_driver_launch_plan(
         nt_config_abi::launch_plan_kind::BOOT_SYSTEM_DRIVERS,

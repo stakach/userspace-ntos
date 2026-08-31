@@ -20395,6 +20395,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ownership extension: the live boot authority currently installs the discovered segment-zero
     inventory only.
 
+    B3 page-zero physical-authority checkpoint (2026-08-31, microkernel specs green): the next
+    serialized boot reached ACPI platform discovery after win32k initialization and failed closed
+    with `STATUS_CONFLICTING_ADDRESSES`. New address diagnostics proved that the executive requested
+    the canonical BIOS-data-area frame at physical address zero but the microkernel returned address
+    one. The root cause was `rust-micro` representing physical capability addresses with the
+    non-null `PPtr<T>` type and translating the root device-untyped base through `max(1)`.
+
+    `rust-micro` commit `b07fd0d` introduces a total typed `PAddr<T>` for `Untyped` and `Frame`
+    capabilities, removes the page-zero translation, and preserves physical zero through capability
+    wire encoding, device-untyped retype, and `X86PageGetAddress`. The standard non-hosted BootInfo
+    path was also restored to its proper feature boundary. This is an authority representation fix,
+    not an executive fallback: ACPI still requires a unique device-untyped owner and verifies every
+    canonical frame address and the complete IOAPIC topology before publication. The freestanding
+    microkernel build is green, and its serialized QEMU suite reached `All specs passed!`, including
+    all three new page-zero proofs; the legacy post-suite demo was terminated immediately after that
+    acceptance rather than being treated as a boot run.
+
+    Parent runtime acceptance remains open. The next single `./run.sh` validation must prove that
+    ACPI authority discovery advances with the corrected submodule and then either reach the real
+    desktop shell proof or expose the next deterministic ownership failure. The two-NIC remove/add
+    acceptance follows only after that baseline boot is green.
+
+    B3 registry-selected ACPI root checkpoint (2026-08-31, focused tests and runtime boundary
+    green): the first parent boot with the page-zero fix passed ACPI physical-authority discovery,
+    then failed publishing the root devnode because the mounted SYSTEM hive's genuine
+    `ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08` policy was not projected into the live
+    Configuration Manager. `nt-hive-core` now imports the complete selected
+    `CriticalDeviceDatabase` subtree through the same bounded, cycle-safe registry importer as the
+    other SYSTEM policy roots. `nt-config-server` rebuilds that projection on every mount and admits
+    later durable mutations only for the selected control set. There is no compiled-in `acpi`
+    service fallback and the ordering remains firmware authority, registry policy, root Enum
+    publication, then launch-plan capture.
+
+    Focused validation passes `nt-hive-core` 88/88 library tests plus 14/14 generator tests and
+    `nt-config-server` 28/28. The next serialized boot (`.tmp/run-headless-20260831-215143.log`)
+    proved both ACPI discovery and root-devnode publication advance, loaded the registry-selected
+    driver plans, and reached the real `smss.exe` path that creates CSRSS. That run exposed the next
+    generic kernel gap: ReactOS marks CSRSS as a subsystem and reserves the low 1 MiB DOS/IVT range
+    through `NtAllocateVirtualMemory`, while the current private VAD owner admits only the high
+    hosted heap window. `RtlCreateUserProcess` therefore returns `STATUS_NO_MEMORY` after creating
+    the child process. The next slice must implement normal low explicit reservations and NT
+    rounding in the generic per-process VAD authority while preserving the high preferred range for
+    automatic hosted allocations; no image-name or CSRSS-specific route is permitted.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

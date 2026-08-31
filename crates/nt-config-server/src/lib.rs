@@ -236,6 +236,11 @@ fn config_manager_from_system_hive(
         &mut cm,
         current_control_set.as_str(),
     );
+    let _ = nt_hive_core::import_control_set_critical_device_database_into_config_manager(
+        hive,
+        &mut cm,
+        current_control_set.as_str(),
+    );
     let _ = nt_hive_core::import_control_set_enum_into_config_manager(
         hive,
         &mut cm,
@@ -357,6 +362,7 @@ fn semantic_system_registry_path(
         control_root.eq_ignore_ascii_case("ServiceGroupOrder")
             || control_root.eq_ignore_ascii_case("Class")
             || control_root.eq_ignore_ascii_case("Network")
+            || control_root.eq_ignore_ascii_case("CriticalDeviceDatabase")
     } else {
         false
     };
@@ -3524,6 +3530,30 @@ mod tests {
         bytes
     }
 
+    fn pnp_query_request(instance: &str, query_kind: u16, chunk_capacity: u32) -> Vec<u8> {
+        let instance_bytes = utf16(instance);
+        let header_size = core::mem::size_of::<CmPnpQueryRequest>();
+        let auxiliary_offset = header_size + instance_bytes.len();
+        let header = CmPnpQueryRequest {
+            abi_size: header_size as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: pnp_query_transfer::BEGIN,
+            query_kind,
+            value_offset: 0,
+            chunk_capacity,
+            selector: 0,
+            instance_offset: header_size as u32,
+            instance_len_bytes: instance_bytes.len() as u32,
+            auxiliary_offset: auxiliary_offset as u32,
+            auxiliary_len_bytes: 0,
+            _reserved: 0,
+            transfer_token: 0,
+        };
+        let mut bytes = Vec::from(header.as_bytes());
+        bytes.extend_from_slice(&instance_bytes);
+        bytes
+    }
+
     fn hive_import_request(
         operation: u16,
         transfer_token: u64,
@@ -4667,6 +4697,19 @@ mod tests {
         );
         assert_eq!(
             semantic_system_registry_path(
+                r"\Registry\Machine\System\CurrentControlSet\Control\CriticalDeviceDatabase\*PNP0C08",
+                &current_control_set,
+            )
+            .unwrap(),
+            Some((
+                String::from(
+                    r"\Registry\Machine\System\CurrentControlSet\Control\CriticalDeviceDatabase\*PNP0C08",
+                ),
+                false,
+            ))
+        );
+        assert_eq!(
+            semantic_system_registry_path(
                 r"\Registry\Machine\System\CurrentControlSet\Control\Print",
                 &current_control_set,
             )
@@ -4680,6 +4723,128 @@ mod tests {
             )
             .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn mounted_system_hive_serves_critical_device_binding() {
+        let mut hive = selected_system_hive(1);
+        let acpi =
+            hive.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
+        assert!(hive.set_value(
+            acpi,
+            "ClassGUID",
+            RegistryValueType::Sz,
+            encode_sz("{4D36E97D-E325-11CE-BFC1-08002BE10318}"),
+        ));
+        assert!(hive.set_value(
+            acpi,
+            "Service",
+            RegistryValueType::Sz,
+            encode_sz("acpi"),
+        ));
+        hive.finish_clean_import();
+
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
+        let binding = server
+            .config()
+            .resolve_critical_device_id("*PNP0C08")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.service_name.as_deref(), Some("acpi"));
+
+        let mut out = vec![0xa5; CM_LAUNCH_PLAN_CHUNK_BYTES];
+        let response = server.dispatch(
+            opcode::CM_OP_QUERY_PNP,
+            &pnp_query_request(
+                "*PNP0C08",
+                pnp_query_kind::CRITICAL_DEVICE_BINDING,
+                out.len() as u32,
+            ),
+            &mut out,
+        );
+        assert_eq!(response.status, STATUS_SUCCESS);
+        assert!(response.information as usize > CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES);
+        assert_eq!(
+            u32::from_le_bytes(out[..4].try_into().unwrap()),
+            CM_PNP_QUERY_SNAPSHOT_MAGIC
+        );
+    }
+
+    #[test]
+    fn critical_device_database_mutations_follow_selected_control_set() {
+        let mut hive = selected_system_hive(1);
+        let active =
+            hive.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
+        assert!(hive.set_value(
+            active,
+            "ClassGUID",
+            RegistryValueType::Sz,
+            encode_sz("{4D36E97D-E325-11CE-BFC1-08002BE10318}"),
+        ));
+        assert!(hive.set_value(
+            active,
+            "Service",
+            RegistryValueType::Sz,
+            encode_sz("acpi"),
+        ));
+        let inactive =
+            hive.create_key(r"ControlSet002\Control\CriticalDeviceDatabase\*PNP0C08");
+        assert!(hive.set_value(
+            inactive,
+            "Service",
+            RegistryValueType::Sz,
+            encode_sz("inactive"),
+        ));
+        hive.finish_clean_import();
+
+        let mut server = CmServer::new();
+        assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
+        let inactive_update = [HiveMutation::SetValue {
+            path: String::from(
+                r"\Registry\Machine\System\ControlSet002\Control\CriticalDeviceDatabase\*PNP0C08",
+            ),
+            name: String::from("Service"),
+            value_type: RegistryValueType::Sz as u32,
+            data: encode_sz("still-inactive"),
+        }];
+        assert_eq!(
+            server.commit_system_hive_mutations(&inactive_update, 2),
+            Ok(false)
+        );
+        assert_eq!(
+            server
+                .config()
+                .resolve_critical_device_id("*PNP0C08")
+                .unwrap()
+                .unwrap()
+                .service_name
+                .as_deref(),
+            Some("acpi")
+        );
+
+        let active_update = [HiveMutation::SetValue {
+            path: String::from(
+                r"\Registry\Machine\System\CurrentControlSet\Control\CriticalDeviceDatabase\*PNP0C08",
+            ),
+            name: String::from("Service"),
+            value_type: RegistryValueType::Sz as u32,
+            data: encode_sz("acpi-next"),
+        }];
+        assert_eq!(
+            server.commit_system_hive_mutations(&active_update, 3),
+            Ok(false)
+        );
+        assert_eq!(
+            server
+                .config()
+                .resolve_critical_device_id("*PNP0C08")
+                .unwrap()
+                .unwrap()
+                .service_name
+                .as_deref(),
+            Some("acpi-next")
         );
     }
 
