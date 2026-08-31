@@ -10,6 +10,8 @@ struct HostedPciTopologyAuthority {
     inventory: PciInventory,
     scopes: AcpiPciScopeCatalog,
     routes: PciInterruptRouteOwner,
+    dirty_relations: Vec<AcpiPciProviderEndpoint>,
+    reconcile_ready: bool,
 }
 
 static mut HOSTED_PCI_TOPOLOGY: Option<HostedPciTopologyAuthority> = None;
@@ -58,6 +60,8 @@ pub(crate) unsafe fn install_hosted_pci_topology(
         inventory,
         scopes: AcpiPciScopeCatalog::default(),
         routes: PciInterruptRouteOwner::default(),
+        dirty_relations: Vec::new(),
+        reconcile_ready: false,
     });
     Ok(snapshot)
 }
@@ -79,20 +83,61 @@ pub(crate) unsafe fn hosted_acpi_pci_relation_has_sources(
         .is_some_and(|authority| authority.scopes.relation_has_sources(relation_owner))
 }
 
-pub(crate) unsafe fn invalidate_hosted_pci_routes_for_relation(
+pub(crate) unsafe fn note_hosted_pci_relation_queued(
     relation_owner: AcpiPciProviderEndpoint,
 ) -> Result<bool, nt_status::NtStatus> {
     let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
         .as_mut()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if !authority.scopes.relation_has_sources(relation_owner) {
-        return Ok(false);
+    if authority.dirty_relations.contains(&relation_owner) {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     authority
-        .routes
-        .invalidate()
-        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    Ok(true)
+        .dirty_relations
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let relevant = authority.scopes.relation_has_sources(relation_owner);
+    if relevant {
+        authority
+            .routes
+            .invalidate()
+            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        authority.reconcile_ready = false;
+    }
+    authority.dirty_relations.push(relation_owner);
+    Ok(relevant)
+}
+
+pub(crate) unsafe fn note_hosted_pci_relation_completion(
+    relation_owner: AcpiPciProviderEndpoint,
+    completion: nt_pnp_manager::DeviceRelationInvalidationCompletion,
+) -> Result<bool, nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
+        .as_mut()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let index = authority
+        .dirty_relations
+        .iter()
+        .position(|dirty| *dirty == relation_owner)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if matches!(
+        completion,
+        nt_pnp_manager::DeviceRelationInvalidationCompletion::Requeued(_)
+    ) {
+        authority.reconcile_ready = false;
+        return Ok(false);
+    }
+    authority.dirty_relations.remove(index);
+    let relevant_dirty = authority
+        .dirty_relations
+        .iter()
+        .any(|dirty| authority.scopes.relation_has_sources(*dirty));
+    let needs_reconcile = !authority.scopes.sources().is_empty()
+        && (authority.routes.inventory_generation() != Some(authority.inventory.generation())
+            || authority.routes.provider_scope_generation()
+                != Some(authority.scopes.generation()));
+    authority.reconcile_ready = needs_reconcile && !relevant_dirty;
+    Ok(authority.reconcile_ready)
 }
 
 pub(crate) unsafe fn prepare_hosted_acpi_pci_relation_facts(

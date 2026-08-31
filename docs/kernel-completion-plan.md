@@ -20291,6 +20291,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Coalesced and Requeued requests are already covered by the same dirty interval. Start the route
     reconciler only after no accepted PCI-scope relation remains dirty.
 
+    B3 executive relation-dirty fence checkpoint (2026-08-31, implementation green): the focused
+    PCI topology authority now owns a dynamically sized exact relation-endpoint dirty set. The
+    first generic `Queued` BusRelations request reserves and enters that endpoint; if its accepted
+    catalog facts can affect PCI routing, the route owner is invalidated exactly once and any ready
+    reconcile is withdrawn. Coalesced and Requeued requests do not churn the route generation.
+    Allocation and generation-exhaustion failures are transition-atomic.
+
+    After the durable devnode, BusRelations, and catalog commits, the executive consumes the new
+    queue completion result. Requeued retains the exact dirty endpoint and suppresses reconciliation;
+    Drained removes it and marks reconciliation ready only when accepted scope facts remain, route
+    generations are stale, and no other dirty endpoint currently owns accepted PCI scope facts.
+    Unrelated buses may still enumerate dynamically without changing PCI route generations. The
+    freestanding executive check remains green at the unchanged 209-warning baseline. Review
+    adjustment: make the focused route reconciler consume this readiness atomically into the
+    three-generation `_PRT` workset, and return it to ready state on a stale completion or retryable
+    allocation failure. Provider/parse barriers must remain visible and must never restore old
+    routes.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

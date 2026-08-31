@@ -37407,6 +37407,9 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         ))?;
     let bus_object_id = query.claim.pdo_device_id;
     let claim = query.claim;
+    let relation_owner = hosted_acpi_pci_relation_owner_endpoint().ok_or(
+        HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    )?;
     let relation_domain = query
         .relation_domain
         .ok_or(HostedRelationPublishError::Barrier(
@@ -37490,9 +37493,14 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         crate::hosted_pci_topology::commit_hosted_acpi_pci_relation_sources(catalog_update)
             .expect("serialized ACPI PCI catalog preparation became stale before relation commit");
     }
-    hosted_device_relation_invalidations_mut()
+    let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete(claim)
         .expect("published relation transaction lost its exact invalidation claim");
+    crate::hosted_pci_topology::note_hosted_pci_relation_completion(
+        relation_owner,
+        invalidation_completion,
+    )
+    .expect("published relation transaction lost its PCI topology dirty claim");
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
     Ok(())
 }
@@ -43840,7 +43848,10 @@ pub(crate) fn service_hosted_device(
                 3
             }
         };
-        if relation_type == nt_pnp_abi::BUS_RELATIONS && disposition != 2 {
+        if relation_type == nt_pnp_abi::BUS_RELATIONS
+            && enqueued.disposition
+                == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
+        {
             let relation_owner = nt_pnp::AcpiPciProviderEndpoint {
                 device_id: pdo_device_id.raw(),
                 hosted_domain_id: inst.hosted_domain_id,
@@ -43848,9 +43859,7 @@ pub(crate) fn service_hosted_device(
                 pdo_object,
             };
             unsafe {
-                crate::hosted_pci_topology::invalidate_hosted_pci_routes_for_relation(
-                    relation_owner,
-                )
+                crate::hosted_pci_topology::note_hosted_pci_relation_queued(relation_owner)
             }
             .unwrap_or_else(|status| {
                 panic!("ACPI PCI route invalidation fence failed: {status:?}")
