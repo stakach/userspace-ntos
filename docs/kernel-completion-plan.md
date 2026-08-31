@@ -20623,6 +20623,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     path; do not truncate the firmware table or convert the failure into success. Mup's independent
     `IoCheckShareAccess` frontier remains queued after this ACPI data-plane fix.
 
+    B3 Config Manager raw-value transport checkpoint (2026-09-01, implementation green): raw
+    registry values no longer depend on one request or reply page. Configuration Manager now owns
+    bounded concurrent upload transactions with explicit begin/ordered-append/commit/abort and
+    immutable query snapshots with begin/ordered-pull/abort. A value becomes visible only after a
+    complete commit, incomplete transfers retain at most 32 transactions and 8 MiB per direction,
+    and malformed tokens, offsets, or lengths fail closed. The generic executive SURT client rejects
+    requests larger than its mapped 4 KiB frame before copying and caps reply copies to that frame.
+
+    Hosted `ZwSetValueKey` keeps a direct bounded fast path, but streams larger driver buffers
+    through the shared argument bank and the same tested Configuration Manager transaction. Every
+    chunk revalidates the canonical registry handle and exact total/offset; any copy, append, or
+    commit failure issues an abort rather than truncating the value or manufacturing success.
+    `nt-config-client` passes 21/21, including a 9,137-byte framed set/query round trip, the
+    freestanding executive check is green at the established 209-warning baseline, and
+    `git diff --check` passes. Runtime acceptance remains open: run one serialized desktop proof
+    with a hard one-hour boot deadline, require the ACPI DSDT `ZwSetValueKey` failure to disappear,
+    and classify the next real `acpi.sys` START boundary before moving to Mup `IoCheckShareAccess`.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

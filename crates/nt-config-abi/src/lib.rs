@@ -65,6 +65,8 @@ pub const CM_DEVICE_ACTION_CHUNK_BYTES: usize = 4096;
 pub const CM_DEVICE_ACTION_SNAPSHOT_MAGIC: u32 = 0x4144_4D43; // `CMDA`
 pub const CM_DEVICE_ACTION_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES: usize = 32;
+/// Maximum raw registry bytes carried by one request-frame upload append.
+pub const CM_RAW_VALUE_CHUNK_BYTES: usize = 3072;
 pub const CM_OPTIONAL_STRING_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_BLOB_ABSENT: u32 = u32::MAX;
 pub const CM_OPTIONAL_U32_ABSENT: u32 = u32::MAX;
@@ -83,6 +85,10 @@ pub mod opcode {
     pub const CM_OP_SET_VALUE: u16 = 0x2122;
     /// Query a typed raw value. Reply `detail0` = REG_* type, `information` = data bytes.
     pub const CM_OP_QUERY_VALUE: u16 = 0x2123;
+    /// Upload and atomically publish a typed raw value larger than one request frame.
+    pub const CM_OP_SET_VALUE_TRANSFER: u16 = 0x2124;
+    /// Query a typed raw value through an immutable, tokenized snapshot.
+    pub const CM_OP_QUERY_VALUE_TRANSFER: u16 = 0x2125;
     /// Enumerate an existing key's immediate subkey name by index. Reply `information` = name bytes.
     pub const CM_OP_ENUMERATE_KEY: u16 = 0x2130;
     /// Query one legacy device property by stable devnode instance path.
@@ -115,6 +121,20 @@ pub mod opcode {
     pub const CM_OP_EXPORT_LEASED_HIVE: u16 = 0x215b;
     /// Peek, stream, and exactly acknowledge the next live PnP device action.
     pub const CM_OP_DEVICE_ACTION: u16 = 0x215c;
+}
+
+pub mod raw_value_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const APPEND: u16 = 2;
+    pub const COMMIT: u16 = 3;
+    pub const ABORT: u16 = 4;
+}
+
+/// Operation carried by [`CmRawValueQueryRequest::operation`].
+pub mod raw_value_query_transfer {
+    pub const BEGIN: u16 = 1;
+    pub const PULL: u16 = 2;
+    pub const ABORT: u16 = 3;
 }
 
 /// Operation carried by [`CmDevicePropertyRequest::operation`]. Property values are immutable for
@@ -344,6 +364,46 @@ pub struct CmRawValueRequest {
     pub name_len_bytes: u32,
     pub data_offset: u32,
     pub data_len_bytes: u32,
+}
+
+/// Tokenized raw-value upload. BEGIN carries the key path, name, type, and total length. APPEND
+/// carries the next exact chunk at `value_offset`. COMMIT publishes only a complete value; ABORT
+/// releases all staged bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmRawValueTransferRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub _reserved: u16,
+    pub value_type: u32,
+    pub value_offset: u32,
+    pub chunk_offset: u32,
+    pub chunk_len_bytes: u32,
+    pub total_len_bytes: u32,
+    pub key_offset: u32,
+    pub key_len_bytes: u32,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+    pub transfer_token: u64,
+}
+
+/// Tokenized immutable raw-value query. BEGIN carries a key path and value name; PULL advances
+/// exactly from `value_offset`; ABORT releases an incomplete snapshot.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmRawValueQueryRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub _reserved: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub key_offset: u32,
+    pub key_len_bytes: u32,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+    pub transfer_token: u64,
 }
 
 /// `query_device_property`: a stable devnode instance path plus one bank of the caller's logical
@@ -618,6 +678,8 @@ wire!(CmKeyRequest);
 wire!(CmEnumerateKeyRequest);
 wire!(CmValueRequest);
 wire!(CmRawValueRequest);
+wire!(CmRawValueTransferRequest);
+wire!(CmRawValueQueryRequest);
 wire!(CmDevicePropertyRequest);
 wire!(CmDriverServiceRequest);
 wire!(CmHiveImportRequest);

@@ -19,30 +19,33 @@ use nt_config_abi::{
     hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_flags,
     hive_mutation_kind, hive_mutation_transfer, key_flags, launch_plan_kind, launch_plan_transfer,
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
-    win32_service_plan_kind, win32_service_process_kind, CmDeviceActionRequest,
-    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
-    CmHiveCheckpointRequest, CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest,
-    CmHiveKeyRequest, CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest,
-    CmLaunchPlanRequest, CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest,
-    CmRawValueRequest, CmReply, CmValueRequest, CM_ABI_VERSION, CM_DEVICE_ACTION_CHUNK_BYTES,
-    CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES, CM_DEVICE_ACTION_SNAPSHOT_MAGIC,
-    CM_DEVICE_ACTION_SNAPSHOT_VERSION, CM_DEVICE_PROPERTY_CHUNK_BYTES,
-    CM_DRIVER_SERVICE_CHUNK_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
-    CM_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_DRIVER_SERVICE_SNAPSHOT_VERSION,
-    CM_HIVE_CHECKPOINT_CHUNK_BYTES, CM_HIVE_CHECKPOINT_HEADER_BYTES, CM_HIVE_CHECKPOINT_MAGIC,
-    CM_HIVE_CHECKPOINT_VERSION, CM_HIVE_EXPORT_HEADER_BYTES, CM_HIVE_EXPORT_MAGIC,
-    CM_HIVE_EXPORT_VERSION, CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES,
-    CM_HIVE_KEY_RECORD_HEADER_BYTES, CM_HIVE_KEY_RECORD_MAGIC, CM_HIVE_KEY_RECORD_VERSION,
-    CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES, CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION,
-    CM_HIVE_MUTATION_CHUNK_BYTES, CM_HIVE_MUTATION_RECORD_HEADER_BYTES, CM_LAUNCH_PLAN_CHUNK_BYTES,
+    raw_value_query_transfer, raw_value_transfer, win32_service_plan_kind,
+    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
+    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
+    CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
+    CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
+    CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueQueryRequest,
+    CmRawValueRequest, CmRawValueTransferRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
+    CM_DEVICE_ACTION_CHUNK_BYTES, CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES,
+    CM_DEVICE_ACTION_SNAPSHOT_MAGIC, CM_DEVICE_ACTION_SNAPSHOT_VERSION,
+    CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
+    CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
+    CM_DRIVER_SERVICE_SNAPSHOT_VERSION, CM_HIVE_CHECKPOINT_CHUNK_BYTES,
+    CM_HIVE_CHECKPOINT_HEADER_BYTES, CM_HIVE_CHECKPOINT_MAGIC, CM_HIVE_CHECKPOINT_VERSION,
+    CM_HIVE_EXPORT_HEADER_BYTES, CM_HIVE_EXPORT_MAGIC, CM_HIVE_EXPORT_VERSION,
+    CM_HIVE_IMPORT_CHUNK_BYTES, CM_HIVE_KEY_CHUNK_BYTES, CM_HIVE_KEY_RECORD_HEADER_BYTES,
+    CM_HIVE_KEY_RECORD_MAGIC, CM_HIVE_KEY_RECORD_VERSION, CM_HIVE_KEY_SNAPSHOT_HEADER_BYTES,
+    CM_HIVE_KEY_SNAPSHOT_MAGIC, CM_HIVE_KEY_SNAPSHOT_VERSION, CM_HIVE_MUTATION_CHUNK_BYTES,
+    CM_HIVE_MUTATION_RECORD_HEADER_BYTES, CM_LAUNCH_PLAN_CHUNK_BYTES,
     CM_LAUNCH_PLAN_SNAPSHOT_HEADER_BYTES, CM_LAUNCH_PLAN_SNAPSHOT_MAGIC,
     CM_LAUNCH_PLAN_SNAPSHOT_VERSION, CM_MAX_HIVE_PATH_UNITS, CM_MAX_HIVE_VALUE_NAME_UNITS,
     CM_MAX_INSTANCE_UNITS, CM_MAX_PNP_AUX_BYTES, CM_MAX_SERVICE_UNITS,
     CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
     CM_NETWORK_PLAN_SNAPSHOT_VERSION, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
     CM_OPTIONAL_U32_ABSENT, CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES, CM_PNP_QUERY_SNAPSHOT_MAGIC,
-    CM_PNP_QUERY_SNAPSHOT_VERSION, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
-    CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
+    CM_PNP_QUERY_SNAPSHOT_VERSION, CM_RAW_VALUE_CHUNK_BYTES,
+    CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES, CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC,
+    CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 
 /// A pluggable transport: send `opcode` + `in_buf`, receive a `CmReply` (+ optional
@@ -57,7 +60,6 @@ const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: i32 = 0xC000_003Bu32 as i32;
 const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
-const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 #[cfg(test)]
@@ -1166,18 +1168,167 @@ impl<B: Backend> ConfigClient<B> {
         value_type: u32,
         data: &[u8],
     ) -> Result<(), i32> {
-        let r = self.raw_value_op(
-            opcode::CM_OP_SET_VALUE,
-            key_path,
-            name,
+        let inline_len = core::mem::size_of::<CmRawValueRequest>()
+            .saturating_add(key_path.encode_utf16().count() * 2)
+            .saturating_add(name.encode_utf16().count() * 2)
+            .saturating_add(data.len());
+        if inline_len <= CM_RAW_VALUE_CHUNK_BYTES {
+            let r = self.raw_value_op(
+                opcode::CM_OP_SET_VALUE,
+                key_path,
+                name,
+                value_type,
+                data,
+                &mut [],
+            );
+            return if r.status == STATUS_SUCCESS {
+                Ok(())
+            } else {
+                Err(r.status)
+            };
+        }
+
+        let token = self.begin_set_value_transfer(key_path, name, value_type, data.len())?;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let end = core::cmp::min(offset + CM_RAW_VALUE_CHUNK_BYTES, data.len());
+            if let Err(status) =
+                self.append_set_value_transfer(token, offset, data.len(), &data[offset..end])
+            {
+                let _ = self.abort_set_value_transfer(token, data.len());
+                return Err(status);
+            }
+            offset = end;
+        }
+        match self.commit_set_value_transfer(token, data.len()) {
+            Ok(()) => Ok(()),
+            Err(status) => {
+                let _ = self.abort_set_value_transfer(token, data.len());
+                Err(status)
+            }
+        }
+    }
+
+    pub fn begin_set_value_transfer(
+        &mut self,
+        key_path: &str,
+        name: &str,
+        value_type: u32,
+        total_len: usize,
+    ) -> Result<u64, i32> {
+        let key_bytes = utf16_bytes(key_path);
+        let name_bytes = utf16_bytes(name);
+        let base = core::mem::size_of::<CmRawValueTransferRequest>();
+        let total_len_bytes = u32::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let request = CmRawValueTransferRequest {
+            abi_size: base as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: raw_value_transfer::BEGIN,
+            _reserved: 0,
             value_type,
-            data,
+            value_offset: 0,
+            chunk_offset: 0,
+            chunk_len_bytes: 0,
+            total_len_bytes,
+            key_offset: base as u32,
+            key_len_bytes: key_bytes.len() as u32,
+            name_offset: (base + key_bytes.len()) as u32,
+            name_len_bytes: name_bytes.len() as u32,
+            transfer_token: 0,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(request.as_bytes());
+        bytes.extend_from_slice(&key_bytes);
+        bytes.extend_from_slice(&name_bytes);
+        let reply = self
+            .backend
+            .call(opcode::CM_OP_SET_VALUE_TRANSFER, &bytes, &mut []);
+        if reply.status == STATUS_SUCCESS && reply.detail1 != 0 {
+            Ok(reply.detail1)
+        } else if reply.status == STATUS_SUCCESS {
+            Err(STATUS_INVALID_PARAMETER)
+        } else {
+            Err(reply.status)
+        }
+    }
+
+    pub fn append_set_value_transfer(
+        &mut self,
+        token: u64,
+        value_offset: usize,
+        total_len: usize,
+        chunk: &[u8],
+    ) -> Result<(), i32> {
+        if token == 0 || chunk.is_empty() || chunk.len() > CM_RAW_VALUE_CHUNK_BYTES {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let base = core::mem::size_of::<CmRawValueTransferRequest>();
+        let request = CmRawValueTransferRequest {
+            abi_size: base as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: raw_value_transfer::APPEND,
+            _reserved: 0,
+            value_type: 0,
+            value_offset: u32::try_from(value_offset).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            chunk_offset: base as u32,
+            chunk_len_bytes: chunk.len() as u32,
+            total_len_bytes: u32::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            key_offset: 0,
+            key_len_bytes: 0,
+            name_offset: 0,
+            name_len_bytes: 0,
+            transfer_token: token,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(request.as_bytes());
+        bytes.extend_from_slice(chunk);
+        let reply = self
+            .backend
+            .call(opcode::CM_OP_SET_VALUE_TRANSFER, &bytes, &mut []);
+        if reply.status == STATUS_SUCCESS && reply.information as usize == chunk.len() {
+            Ok(())
+        } else if reply.status == STATUS_SUCCESS {
+            Err(STATUS_INVALID_PARAMETER)
+        } else {
+            Err(reply.status)
+        }
+    }
+
+    pub fn commit_set_value_transfer(&mut self, token: u64, total_len: usize) -> Result<(), i32> {
+        self.finish_set_value_transfer(raw_value_transfer::COMMIT, token, total_len)
+    }
+
+    pub fn abort_set_value_transfer(&mut self, token: u64, total_len: usize) -> Result<(), i32> {
+        self.finish_set_value_transfer(raw_value_transfer::ABORT, token, total_len)
+    }
+
+    fn finish_set_value_transfer(
+        &mut self,
+        operation: u16,
+        token: u64,
+        total_len: usize,
+    ) -> Result<(), i32> {
+        if token == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let base = core::mem::size_of::<CmRawValueTransferRequest>();
+        let request = CmRawValueTransferRequest {
+            abi_size: base as u16,
+            abi_version: CM_ABI_VERSION,
+            operation,
+            total_len_bytes: u32::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER)?,
+            transfer_token: token,
+            ..Default::default()
+        };
+        let reply = self.backend.call(
+            opcode::CM_OP_SET_VALUE_TRANSFER,
+            request.as_bytes(),
             &mut [],
         );
-        if r.status == STATUS_SUCCESS {
+        if reply.status == STATUS_SUCCESS {
             Ok(())
         } else {
-            Err(r.status)
+            Err(reply.status)
         }
     }
 
@@ -1198,50 +1349,129 @@ impl<B: Backend> ConfigClient<B> {
 
     /// Query a complete raw typed value without imposing a caller-selected buffer ceiling.
     ///
-    /// The first zero-capacity query obtains the Config Manager's exact required byte count. The
-    /// value is then fetched in one bounded allocation; if it changes size between the two calls,
-    /// the returned error preserves the new required length instead of exposing a partial value.
+    /// The Config Manager retains one immutable snapshot while this client pulls bounded chunks,
+    /// so a concurrent write cannot change the type, length, or contents between calls.
     pub fn query_value_owned(
         &mut self,
         key_path: &str,
         name: &str,
     ) -> Result<(u32, Vec<u8>), QueryError> {
-        let first = self.raw_value_op(opcode::CM_OP_QUERY_VALUE, key_path, name, 0, &[], &mut []);
-        let required = first.information as usize;
-        if first.status != STATUS_SUCCESS && first.status != STATUS_BUFFER_OVERFLOW {
+        let key_bytes = utf16_bytes(key_path);
+        let name_bytes = utf16_bytes(name);
+        let base = core::mem::size_of::<CmRawValueQueryRequest>();
+        let request = CmRawValueQueryRequest {
+            abi_size: base as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: raw_value_query_transfer::BEGIN,
+            _reserved: 0,
+            value_offset: 0,
+            chunk_capacity: CM_RAW_VALUE_CHUNK_BYTES as u32,
+            key_offset: base as u32,
+            key_len_bytes: key_bytes.len() as u32,
+            name_offset: (base + key_bytes.len()) as u32,
+            name_len_bytes: name_bytes.len() as u32,
+            transfer_token: 0,
+        };
+        let mut request_bytes = Vec::new();
+        request_bytes.extend_from_slice(request.as_bytes());
+        request_bytes.extend_from_slice(&key_bytes);
+        request_bytes.extend_from_slice(&name_bytes);
+        let mut chunk = [0u8; CM_RAW_VALUE_CHUNK_BYTES];
+        let first = self.backend.call(
+            opcode::CM_OP_QUERY_VALUE_TRANSFER,
+            &request_bytes,
+            &mut chunk,
+        );
+        if first.status != STATUS_SUCCESS {
             return Err(QueryError {
                 status: first.status,
+                required_len: 0,
+            });
+        }
+        let required = first.detail0 as u32 as usize;
+        let value_type = (first.detail0 >> 32) as u32;
+        let first_written = first.information as usize;
+        let mut token = first.detail1;
+        if first_written > core::cmp::min(required, chunk.len())
+            || (first_written < required) != (token != 0)
+        {
+            if token != 0 {
+                let _ = self.abort_query_value_transfer(token);
+            }
+            return Err(QueryError {
+                status: STATUS_INVALID_PARAMETER,
                 required_len: required,
             });
         }
-
-        let value_type = first.detail0 as u32;
-        if required == 0 {
-            return Ok((value_type, Vec::new()));
-        }
         let mut data = Vec::new();
-        data.try_reserve_exact(required).map_err(|_| QueryError {
-            status: STATUS_INSUFFICIENT_RESOURCES,
-            required_len: required,
-        })?;
-        data.resize(required, 0);
-        let second =
-            self.raw_value_op(opcode::CM_OP_QUERY_VALUE, key_path, name, 0, &[], &mut data);
-        if second.status != STATUS_SUCCESS {
+        if data.try_reserve_exact(required).is_err() {
+            if token != 0 {
+                let _ = self.abort_query_value_transfer(token);
+            }
             return Err(QueryError {
-                status: second.status,
-                required_len: second.information as usize,
+                status: STATUS_INSUFFICIENT_RESOURCES,
+                required_len: required,
             });
         }
-        let written = second.information as usize;
-        if written > data.len() {
-            return Err(QueryError {
-                status: STATUS_BUFFER_OVERFLOW,
-                required_len: written,
-            });
+        data.extend_from_slice(&chunk[..first_written]);
+
+        while data.len() < required {
+            let request = CmRawValueQueryRequest {
+                abi_size: base as u16,
+                abi_version: CM_ABI_VERSION,
+                operation: raw_value_query_transfer::PULL,
+                _reserved: 0,
+                value_offset: data.len() as u32,
+                chunk_capacity: core::cmp::min(required - data.len(), CM_RAW_VALUE_CHUNK_BYTES)
+                    as u32,
+                transfer_token: token,
+                ..Default::default()
+            };
+            let next = self.backend.call(
+                opcode::CM_OP_QUERY_VALUE_TRANSFER,
+                request.as_bytes(),
+                &mut chunk,
+            );
+            let written = next.information as usize;
+            if next.status != STATUS_SUCCESS
+                || next.detail0 as usize != required
+                || written == 0
+                || written > core::cmp::min(chunk.len(), required - data.len())
+            {
+                let _ = self.abort_query_value_transfer(token);
+                return Err(QueryError {
+                    status: if next.status == STATUS_SUCCESS {
+                        STATUS_INVALID_PARAMETER
+                    } else {
+                        next.status
+                    },
+                    required_len: required,
+                });
+            }
+            data.extend_from_slice(&chunk[..written]);
+            token = next.detail1;
         }
-        data.truncate(written);
-        Ok((second.detail0 as u32, data))
+        Ok((value_type, data))
+    }
+
+    fn abort_query_value_transfer(&mut self, token: u64) -> Result<(), i32> {
+        let request = CmRawValueQueryRequest {
+            abi_size: core::mem::size_of::<CmRawValueQueryRequest>() as u16,
+            abi_version: CM_ABI_VERSION,
+            operation: raw_value_query_transfer::ABORT,
+            transfer_token: token,
+            ..Default::default()
+        };
+        let reply = self.backend.call(
+            opcode::CM_OP_QUERY_VALUE_TRANSFER,
+            request.as_bytes(),
+            &mut [],
+        );
+        if reply.status == STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(reply.status)
+        }
     }
 
     /// Query a legacy device property by stable devnode instance path. Errors retain the exact
@@ -3601,6 +3831,10 @@ mod tests {
     }
     impl Backend for Framed {
         fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+            assert!(
+                in_buf.len() <= 4096,
+                "request exceeded the shared transport frame"
+            );
             let mut frame = [0u8; 4096];
             let reply = self.server.dispatch(opcode, in_buf, &mut frame);
             let copy_len = core::cmp::min(reply.information as usize, out_buf.len());
@@ -4510,7 +4744,9 @@ mod tests {
 
     #[test]
     fn owned_raw_value_query_uses_exact_reported_length() {
-        let mut c = client();
+        let mut c = ConfigClient::new(Framed {
+            server: CmServer::new(),
+        });
         let key = r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0";
         let data = vec![0x5au8; 9_137];
         assert!(c.set_value(key, "Payload", 3, &data).is_ok());

@@ -27,13 +27,14 @@ use nt_config_abi::{
     driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
     hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer, key_flags,
     launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
-    pnp_query_kind, pnp_query_transfer, read_utf16, win32_service_plan_kind,
-    win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
-    CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
-    CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
-    CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest, CmLeasedHiveKeyRequest,
-    CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueRequest, CmReply, CmValueRequest,
-    CM_ABI_VERSION, CM_DEVICE_ACTION_CHUNK_BYTES, CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES,
+    pnp_query_kind, pnp_query_transfer, raw_value_query_transfer, raw_value_transfer, read_utf16,
+    win32_service_plan_kind, win32_service_process_kind, CmDeviceActionRequest,
+    CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
+    CmHiveCheckpointRequest, CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest,
+    CmHiveKeyRequest, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
+    CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueQueryRequest,
+    CmRawValueRequest, CmRawValueTransferRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
+    CM_DEVICE_ACTION_CHUNK_BYTES, CM_DEVICE_ACTION_SNAPSHOT_HEADER_BYTES,
     CM_DEVICE_ACTION_SNAPSHOT_MAGIC, CM_DEVICE_ACTION_SNAPSHOT_VERSION,
     CM_DEVICE_PROPERTY_CHUNK_BYTES, CM_DRIVER_SERVICE_CHUNK_BYTES,
     CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC,
@@ -49,8 +50,9 @@ use nt_config_abi::{
     CM_MAX_SERVICE_UNITS, CM_NETWORK_PLAN_SNAPSHOT_HEADER_BYTES, CM_NETWORK_PLAN_SNAPSHOT_MAGIC,
     CM_NETWORK_PLAN_SNAPSHOT_VERSION, CM_OPTIONAL_BLOB_ABSENT, CM_OPTIONAL_STRING_ABSENT,
     CM_OPTIONAL_U32_ABSENT, CM_PNP_QUERY_SNAPSHOT_HEADER_BYTES, CM_PNP_QUERY_SNAPSHOT_MAGIC,
-    CM_PNP_QUERY_SNAPSHOT_VERSION, CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES,
-    CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC, CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
+    CM_PNP_QUERY_SNAPSHOT_VERSION, CM_RAW_VALUE_CHUNK_BYTES,
+    CM_WIN32_SERVICE_PLAN_SNAPSHOT_HEADER_BYTES, CM_WIN32_SERVICE_PLAN_SNAPSHOT_MAGIC,
+    CM_WIN32_SERVICE_PLAN_SNAPSHOT_VERSION,
 };
 use nt_config_manager::{
     device_property, ConfigManager, CriticalDeviceBindingError, DeviceActionEvent,
@@ -70,6 +72,10 @@ use nt_hive_core::{
 /// share of the isolated service heap. Admission failure never retires an existing reader.
 const MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS: usize = 32;
 const MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OUTSTANDING_RAW_VALUE_UPLOADS: usize = 32;
+const MAX_RETAINED_RAW_VALUE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OUTSTANDING_RAW_VALUE_SNAPSHOTS: usize = 32;
+const MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
@@ -924,6 +930,15 @@ struct PreparedSystemHiveCheckpoint {
     offset: usize,
 }
 
+struct RawValueUpload {
+    token: u64,
+    key_path: String,
+    name: String,
+    value_type: RegistryValueType,
+    total_len: usize,
+    data: Vec<u8>,
+}
+
 /// The Configuration Manager service: the registry authority + the wire dispatcher.
 pub struct CmServer {
     cm: ConfigManager,
@@ -945,6 +960,9 @@ pub struct CmServer {
     network_adapter_plan_snapshots: SnapshotBank<u16>,
     device_action_journal: DeviceActionJournal,
     device_action_claim: Option<DeviceActionClaim>,
+    raw_value_uploads: Vec<RawValueUpload>,
+    next_raw_value_upload_token: u64,
+    raw_value_snapshots: SnapshotPool<u32>,
 }
 
 impl Default for CmServer {
@@ -981,6 +999,12 @@ impl CmServer {
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
             device_action_claim: None,
+            raw_value_uploads: Vec::new(),
+            next_raw_value_upload_token: 1,
+            raw_value_snapshots: SnapshotPool::with_limits(
+                MAX_OUTSTANDING_RAW_VALUE_SNAPSHOTS,
+                MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES,
+            ),
         }
     }
 
@@ -1012,6 +1036,12 @@ impl CmServer {
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
             device_action_claim: None,
+            raw_value_uploads: Vec::new(),
+            next_raw_value_upload_token: 1,
+            raw_value_snapshots: SnapshotPool::with_limits(
+                MAX_OUTSTANDING_RAW_VALUE_SNAPSHOTS,
+                MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES,
+            ),
         }
     }
 
@@ -1035,7 +1065,9 @@ impl CmServer {
             opcode::CM_OP_SET_DWORD => self.op_set_dword(in_buf),
             opcode::CM_OP_QUERY_DWORD => self.op_query_dword(in_buf),
             opcode::CM_OP_SET_VALUE => self.op_set_value(in_buf),
+            opcode::CM_OP_SET_VALUE_TRANSFER => self.op_set_value_transfer(in_buf),
             opcode::CM_OP_QUERY_VALUE => self.op_query_value(in_buf, out_buf),
+            opcode::CM_OP_QUERY_VALUE_TRANSFER => self.op_query_value_transfer(in_buf, out_buf),
             opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
@@ -1183,6 +1215,165 @@ impl CmServer {
         }
     }
 
+    fn op_set_value_transfer(&mut self, buf: &[u8]) -> CmReply {
+        let Some(req) = CmRawValueTransferRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        if req.abi_size as usize != core::mem::size_of::<CmRawValueTransferRequest>()
+            || req.abi_version != CM_ABI_VERSION
+            || req._reserved != 0
+        {
+            return reply(STATUS_REVISION_MISMATCH, 0);
+        }
+        match req.operation {
+            raw_value_transfer::BEGIN => {
+                if req.transfer_token != 0
+                    || req.value_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || self.raw_value_uploads.len() >= MAX_OUTSTANDING_RAW_VALUE_UPLOADS
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let retained = self
+                    .raw_value_uploads
+                    .iter()
+                    .map(|upload| upload.total_len)
+                    .sum::<usize>();
+                let total_len = req.total_len_bytes as usize;
+                if retained
+                    .checked_add(total_len)
+                    .is_none_or(|total| total > MAX_RETAINED_RAW_VALUE_UPLOAD_BYTES)
+                {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                let (Some(key_path), Some(name), Some(value_type)) = (
+                    decode(buf, req.key_offset, req.key_len_bytes),
+                    decode(buf, req.name_offset, req.name_len_bytes),
+                    RegistryValueType::from_u32(req.value_type),
+                ) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                let mut data = Vec::new();
+                if data.try_reserve_exact(total_len).is_err()
+                    || self.raw_value_uploads.try_reserve(1).is_err()
+                {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                }
+                let token = self.next_raw_value_upload_token;
+                let Some(next_token) = token.checked_add(1).filter(|token| *token != 0) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                self.next_raw_value_upload_token = next_token;
+                self.raw_value_uploads.push(RawValueUpload {
+                    token,
+                    key_path,
+                    name,
+                    value_type,
+                    total_len,
+                    data,
+                });
+                reply_with_info(STATUS_SUCCESS, 0, 0, token)
+            }
+            raw_value_transfer::APPEND => {
+                if req.transfer_token == 0
+                    || req.chunk_len_bytes == 0
+                    || req.chunk_len_bytes as usize > CM_RAW_VALUE_CHUNK_BYTES
+                    || req.key_offset != 0
+                    || req.key_len_bytes != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(chunk) = request_slice(buf, req.chunk_offset, req.chunk_len_bytes) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                let Some(upload) = self
+                    .raw_value_uploads
+                    .iter_mut()
+                    .find(|upload| upload.token == req.transfer_token)
+                else {
+                    return reply(STATUS_INVALID_HANDLE, 0);
+                };
+                if req.total_len_bytes as usize != upload.total_len
+                    || req.value_offset as usize != upload.data.len()
+                    || upload
+                        .data
+                        .len()
+                        .checked_add(chunk.len())
+                        .is_none_or(|end| end > upload.total_len)
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                upload.data.extend_from_slice(chunk);
+                reply_with_info(STATUS_SUCCESS, chunk.len() as u32, 0, req.transfer_token)
+            }
+            raw_value_transfer::COMMIT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || req.key_offset != 0
+                    || req.key_len_bytes != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(index) = self
+                    .raw_value_uploads
+                    .iter()
+                    .position(|upload| upload.token == req.transfer_token)
+                else {
+                    return reply(STATUS_INVALID_HANDLE, 0);
+                };
+                if self.raw_value_uploads[index].total_len
+                    != self.raw_value_uploads[index].data.len()
+                    || req.total_len_bytes as usize != self.raw_value_uploads[index].total_len
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let upload = self.raw_value_uploads.swap_remove(index);
+                let key = self.cm.registry_mut().create_key(&upload.key_path);
+                if self.cm.registry_mut().set_value(
+                    key,
+                    &upload.name,
+                    upload.value_type,
+                    upload.data,
+                ) {
+                    reply(STATUS_SUCCESS, 0)
+                } else {
+                    reply(STATUS_INVALID_PARAMETER, 0)
+                }
+            }
+            raw_value_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_offset != 0
+                    || req.chunk_len_bytes != 0
+                    || req.key_offset != 0
+                    || req.key_len_bytes != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                if let Some(index) = self
+                    .raw_value_uploads
+                    .iter()
+                    .position(|upload| upload.token == req.transfer_token)
+                {
+                    self.raw_value_uploads.swap_remove(index);
+                    reply(STATUS_SUCCESS, 0)
+                } else {
+                    reply(STATUS_INVALID_HANDLE, 0)
+                }
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
+    }
+
     fn op_query_value(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
         let Some(req) = CmRawValueRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
@@ -1206,6 +1397,111 @@ impl CmServer {
         }
         out_buf[..needed].copy_from_slice(&value.data);
         reply_with_info(STATUS_SUCCESS, needed as u32, value_type, 0)
+    }
+
+    fn op_query_value_transfer(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmRawValueQueryRequest::from_bytes(buf) else {
+            return reply(STATUS_INVALID_PARAMETER, 0);
+        };
+        let header_size = core::mem::size_of::<CmRawValueQueryRequest>();
+        if req.abi_size as usize != header_size
+            || req.abi_version != CM_ABI_VERSION
+            || req._reserved != 0
+        {
+            return reply(STATUS_REVISION_MISMATCH, 0);
+        }
+        match req.operation {
+            raw_value_query_transfer::BEGIN => {
+                if req.transfer_token != 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity == 0
+                    || req.chunk_capacity as usize > CM_RAW_VALUE_CHUNK_BYTES
+                    || req.chunk_capacity as usize > out_buf.len()
+                    || req.key_offset as usize != header_size
+                    || req.name_offset as usize
+                        != header_size.saturating_add(req.key_len_bytes as usize)
+                    || (req.name_offset as usize).checked_add(req.name_len_bytes as usize)
+                        != Some(buf.len())
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let (Some(key_path), Some(name)) = (
+                    decode(buf, req.key_offset, req.key_len_bytes),
+                    decode(buf, req.name_offset, req.name_len_bytes),
+                ) else {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                };
+                let Some(key) = self.cm.registry().open_key(&key_path) else {
+                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                };
+                let Some(value) = self.cm.registry().query_value(key, &name) else {
+                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                };
+                let value_type = value.value_type as u32;
+                let data = value.data.clone();
+                let Ok(needed) = u32::try_from(data.len()) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let Some(chunk) = self.raw_value_snapshots.begin(
+                    value_type,
+                    data,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                ) else {
+                    return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
+                };
+                let metadata = u64::from(needed) | (u64::from(value_type) << 32);
+                reply_with_info(STATUS_SUCCESS, chunk.written as u32, metadata, chunk.token)
+            }
+            raw_value_query_transfer::PULL => {
+                if req.transfer_token == 0
+                    || req.chunk_capacity == 0
+                    || req.chunk_capacity as usize > CM_RAW_VALUE_CHUNK_BYTES
+                    || req.chunk_capacity as usize > out_buf.len()
+                    || req.key_offset != 0
+                    || req.key_len_bytes != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                let Some(chunk) = self.raw_value_snapshots.pull(
+                    req.transfer_token,
+                    req.value_offset as usize,
+                    req.chunk_capacity as usize,
+                    out_buf,
+                    |_| true,
+                ) else {
+                    return reply(STATUS_INVALID_HANDLE, 0);
+                };
+                reply_with_info(
+                    STATUS_SUCCESS,
+                    chunk.written as u32,
+                    chunk.needed as u64,
+                    chunk.token,
+                )
+            }
+            raw_value_query_transfer::ABORT => {
+                if req.transfer_token == 0
+                    || req.value_offset != 0
+                    || req.chunk_capacity != 0
+                    || req.key_offset != 0
+                    || req.key_len_bytes != 0
+                    || req.name_offset != 0
+                    || req.name_len_bytes != 0
+                    || buf.len() != header_size
+                {
+                    return reply(STATUS_INVALID_PARAMETER, 0);
+                }
+                if self.raw_value_snapshots.abort(req.transfer_token, |_| true) {
+                    reply(STATUS_SUCCESS, 0)
+                } else {
+                    reply(STATUS_INVALID_HANDLE, 0)
+                }
+            }
+            _ => reply(STATUS_INVALID_PARAMETER, 0),
+        }
     }
 
     fn op_query_device_property(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
@@ -4729,20 +5025,14 @@ mod tests {
     #[test]
     fn mounted_system_hive_serves_critical_device_binding() {
         let mut hive = selected_system_hive(1);
-        let acpi =
-            hive.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
+        let acpi = hive.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
         assert!(hive.set_value(
             acpi,
             "ClassGUID",
             RegistryValueType::Sz,
             encode_sz("{4D36E97D-E325-11CE-BFC1-08002BE10318}"),
         ));
-        assert!(hive.set_value(
-            acpi,
-            "Service",
-            RegistryValueType::Sz,
-            encode_sz("acpi"),
-        ));
+        assert!(hive.set_value(acpi, "Service", RegistryValueType::Sz, encode_sz("acpi"),));
         hive.finish_clean_import();
 
         let mut server = CmServer::new();
@@ -4775,22 +5065,15 @@ mod tests {
     #[test]
     fn critical_device_database_mutations_follow_selected_control_set() {
         let mut hive = selected_system_hive(1);
-        let active =
-            hive.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
+        let active = hive.create_key(r"ControlSet001\Control\CriticalDeviceDatabase\*PNP0C08");
         assert!(hive.set_value(
             active,
             "ClassGUID",
             RegistryValueType::Sz,
             encode_sz("{4D36E97D-E325-11CE-BFC1-08002BE10318}"),
         ));
-        assert!(hive.set_value(
-            active,
-            "Service",
-            RegistryValueType::Sz,
-            encode_sz("acpi"),
-        ));
-        let inactive =
-            hive.create_key(r"ControlSet002\Control\CriticalDeviceDatabase\*PNP0C08");
+        assert!(hive.set_value(active, "Service", RegistryValueType::Sz, encode_sz("acpi"),));
+        let inactive = hive.create_key(r"ControlSet002\Control\CriticalDeviceDatabase\*PNP0C08");
         assert!(hive.set_value(
             inactive,
             "Service",

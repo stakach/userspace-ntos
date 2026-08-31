@@ -15720,12 +15720,16 @@ struct RingChannel<'a> {
 static SURT_CLIENT_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static SURT_CLIENT_TIMER_DRAINS: AtomicU64 = AtomicU64::new(0);
 static SURT_CLIENT_WAIT_WAKES: AtomicU64 = AtomicU64::new(0);
+const SURT_STATUS_INVALID_BUFFER_SIZE: i32 = 0xC000_0206u32 as i32;
 
 impl RingChannel<'_> {
     /// One synchronous request/reply: stage `in_buf` in the request frame, push the
     /// SQE, wait for the matching completion, copy the reply payload out. Returns
     /// `(status, flags, information, detail0, detail1)`.
     fn raw(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> (i32, u32, u64, u64, u64) {
+        if in_buf.len() > REP_DATA_LEN {
+            return (SURT_STATUS_INVALID_BUFFER_SIZE, 0, 0, 0, 0);
+        }
         // SAFETY: single request in flight; the ring push/pop orders these writes.
         unsafe {
             let dst = self.req_vaddr as *mut u8;
@@ -15771,7 +15775,7 @@ impl RingChannel<'_> {
                 Err(_) => break,
             }
         }
-        let n = (out.2 as usize).min(out_buf.len());
+        let n = (out.2 as usize).min(out_buf.len()).min(REP_DATA_LEN);
         // SAFETY: reply frame holds `n` result bytes.
         unsafe {
             let src = self.rep_vaddr as *const u8;
@@ -16058,6 +16062,50 @@ pub(crate) unsafe fn config_manager_set_value(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     client.set_value(key_path, name, value_type, data)
+}
+
+pub(crate) unsafe fn config_manager_begin_set_value_transfer(
+    key_path: &str,
+    name: &str,
+    value_type: u32,
+    total_len: usize,
+) -> Result<u64, i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.begin_set_value_transfer(key_path, name, value_type, total_len)
+}
+
+pub(crate) unsafe fn config_manager_append_set_value_transfer(
+    token: u64,
+    value_offset: usize,
+    total_len: usize,
+    data: &[u8],
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.append_set_value_transfer(token, value_offset, total_len, data)
+}
+
+pub(crate) unsafe fn config_manager_commit_set_value_transfer(
+    token: u64,
+    total_len: usize,
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.commit_set_value_transfer(token, total_len)
+}
+
+pub(crate) unsafe fn config_manager_abort_set_value_transfer(
+    token: u64,
+    total_len: usize,
+) -> Result<(), i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.abort_set_value_transfer(token, total_len)
 }
 
 pub(crate) unsafe fn config_manager_query_value(

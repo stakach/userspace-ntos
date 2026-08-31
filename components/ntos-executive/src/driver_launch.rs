@@ -4991,7 +4991,7 @@ const DRIVER_REGISTRY_HANDLE_INDEX_MASK: u64 = 0x0000_FFFF;
 const HOSTED_INSTANCE_PATH_MAX: usize = 128;
 const HOSTED_DRIVER_KEY_NAME_MAX: usize = 128;
 const HOSTED_REGISTRY_PATH_MAX: usize = 384;
-const HOSTED_REGISTRY_VALUE_SCRATCH_MAX: usize = 2048;
+const HOSTED_REGISTRY_VALUE_SCRATCH_MAX: usize = nt_config_abi::CM_RAW_VALUE_CHUNK_BYTES;
 const HOSTED_REGISTRY_ARG_KEY_LEN: u64 = 0;
 const HOSTED_REGISTRY_ARG_VALUE_LEN: u64 = 4;
 const HOSTED_REGISTRY_ARG_VALUE_TYPE: u64 = 8;
@@ -5011,6 +5011,10 @@ const HOSTED_REGISTRY_OP_QUERY_HANDLE_VALUE: u64 = 5;
 const HOSTED_REGISTRY_OP_QUERY_PATH_VALUE: u64 = 6;
 const HOSTED_REGISTRY_OP_SET_HANDLE_VALUE: u64 = 7;
 const HOSTED_REGISTRY_OP_CREATE_RELATIVE_KEY: u64 = 8;
+const HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE: u64 = 9;
+const HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE: u64 = 10;
+const HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE: u64 = 11;
+const HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE: u64 = 12;
 const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
@@ -13578,16 +13582,91 @@ extern "win64" fn s_zw_set_value_key(
         ) {
             return STATUS_INVALID_PARAMETER;
         }
-        let status = write_registry_arg_data(data, data_size);
-        if status != STATUS_SUCCESS {
+        if data_size as u64 <= HOSTED_REGISTRY_ARG_DATA_CAP {
+            let status = write_registry_arg_data(data, data_size);
+            if status != STATUS_SUCCESS {
+                return status;
+            }
+            let (status, _, _) = hosted_registry_broker_call(
+                HOSTED_REGISTRY_OP_SET_HANDLE_VALUE,
+                handle,
+                typ as u64,
+                data_size as u64,
+            );
             return status;
         }
-        let (status, _, _) = hosted_registry_broker_call(
-            HOSTED_REGISTRY_OP_SET_HANDLE_VALUE,
+
+        if data == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let (status, token, _) = hosted_registry_broker_call(
+            HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE,
             handle,
             typ as u64,
             data_size as u64,
         );
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        if token == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut offset = 0u32;
+        while offset < data_size {
+            let chunk_len =
+                core::cmp::min(data_size - offset, HOSTED_REGISTRY_VALUE_SCRATCH_MAX as u32);
+            let Some(chunk_address) = data.checked_add(offset as u64) else {
+                let _ = hosted_registry_broker_call(
+                    HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE,
+                    handle,
+                    token,
+                    data_size as u64,
+                );
+                return STATUS_INVALID_PARAMETER;
+            };
+            let status = write_registry_arg_data(chunk_address, chunk_len);
+            if status != STATUS_SUCCESS {
+                let _ = hosted_registry_broker_call(
+                    HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE,
+                    handle,
+                    token,
+                    data_size as u64,
+                );
+                return status;
+            }
+            let transfer_position = (u64::from(data_size) << 32) | u64::from(offset);
+            let (status, _, _) = hosted_registry_broker_call(
+                HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE,
+                handle,
+                token,
+                transfer_position,
+            );
+            if status != STATUS_SUCCESS {
+                let _ = hosted_registry_broker_call(
+                    HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE,
+                    handle,
+                    token,
+                    data_size as u64,
+                );
+                return status;
+            }
+            offset += chunk_len;
+        }
+        let (status, _, _) = hosted_registry_broker_call(
+            HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE,
+            handle,
+            token,
+            data_size as u64,
+        );
+        if status != STATUS_SUCCESS {
+            let _ = hosted_registry_broker_call(
+                HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE,
+                handle,
+                token,
+                data_size as u64,
+            );
+        }
         status
     }
 }
@@ -47431,6 +47510,7 @@ pub(crate) fn service_hosted_driver_registry(
         return (STATUS_INVALID_PARAMETER, 0, 0);
     }
     unsafe {
+        let staged_data_len = read_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *const u32);
         write_volatile((arg + HOSTED_REGISTRY_ARG_VALUE_TYPE) as *mut u32, 0);
         write_volatile((arg + HOSTED_REGISTRY_ARG_DATA_LEN) as *mut u32, 0);
         match op {
@@ -47579,36 +47659,107 @@ pub(crate) fn service_hosted_driver_registry(
                 };
                 service_hosted_driver_query_registry_value(arg, key_path, value_name)
             }
-            HOSTED_REGISTRY_OP_SET_HANDLE_VALUE => {
+            HOSTED_REGISTRY_OP_SET_HANDLE_VALUE
+            | HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE
+            | HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE
+            | HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE
+            | HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE => {
                 let Some(slot) = driver_registry_handle_slot(a1) else {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 };
                 if slot.kind != DriverRegistryHandleKind::CmKey {
                     return (STATUS_INVALID_HANDLE, 0, 0);
                 }
-                if a3 > HOSTED_REGISTRY_ARG_DATA_CAP {
-                    return (STATUS_INVALID_BUFFER_SIZE as i32, 0, 0);
-                }
-                let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
-                    arg,
-                    HOSTED_REGISTRY_ARG_VALUE_LEN,
-                    HOSTED_REGISTRY_ARG_VALUE_OFF,
-                    true,
-                ) else {
-                    return (STATUS_INVALID_PARAMETER, 0, 0);
-                };
-                let data = core::slice::from_raw_parts(
-                    (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
-                    a3 as usize,
-                );
-                match crate::config_manager_set_value(
-                    slot.path.as_str(),
-                    value_name.as_str(),
-                    a2 as u32,
-                    data,
-                ) {
-                    Ok(()) => (STATUS_SUCCESS, 0, 0),
-                    Err(status) => (status, 0, 0),
+                match op {
+                    HOSTED_REGISTRY_OP_SET_HANDLE_VALUE => {
+                        if a3 > HOSTED_REGISTRY_ARG_DATA_CAP {
+                            return (STATUS_INVALID_BUFFER_SIZE as i32, 0, 0);
+                        }
+                        let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                            arg,
+                            HOSTED_REGISTRY_ARG_VALUE_LEN,
+                            HOSTED_REGISTRY_ARG_VALUE_OFF,
+                            true,
+                        ) else {
+                            return (STATUS_INVALID_PARAMETER, 0, 0);
+                        };
+                        let data = core::slice::from_raw_parts(
+                            (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
+                            a3 as usize,
+                        );
+                        match crate::config_manager_set_value(
+                            slot.path.as_str(),
+                            value_name.as_str(),
+                            a2 as u32,
+                            data,
+                        ) {
+                            Ok(()) => (STATUS_SUCCESS, 0, 0),
+                            Err(status) => (status, 0, 0),
+                        }
+                    }
+                    HOSTED_REGISTRY_OP_BEGIN_SET_HANDLE_VALUE => {
+                        if a3 > u32::MAX as u64 {
+                            return (STATUS_INVALID_PARAMETER, 0, 0);
+                        }
+                        let Some(value_name) = read_registry_arg_ascii_at::<HOSTED_REGISTRY_PATH_MAX>(
+                            arg,
+                            HOSTED_REGISTRY_ARG_VALUE_LEN,
+                            HOSTED_REGISTRY_ARG_VALUE_OFF,
+                            true,
+                        ) else {
+                            return (STATUS_INVALID_PARAMETER, 0, 0);
+                        };
+                        match crate::config_manager_begin_set_value_transfer(
+                            slot.path.as_str(),
+                            value_name.as_str(),
+                            a2 as u32,
+                            a3 as usize,
+                        ) {
+                            Ok(token) => (STATUS_SUCCESS, token, 0),
+                            Err(status) => (status, 0, 0),
+                        }
+                    }
+                    HOSTED_REGISTRY_OP_APPEND_SET_HANDLE_VALUE => {
+                        let total_len = (a3 >> 32) as u32 as usize;
+                        let value_offset = a3 as u32 as usize;
+                        let chunk_len = staged_data_len as usize;
+                        if a2 == 0
+                            || total_len == 0
+                            || chunk_len == 0
+                            || chunk_len > HOSTED_REGISTRY_VALUE_SCRATCH_MAX
+                            || value_offset
+                                .checked_add(chunk_len)
+                                .is_none_or(|end| end > total_len)
+                        {
+                            return (STATUS_INVALID_PARAMETER, 0, 0);
+                        }
+                        let data = core::slice::from_raw_parts(
+                            (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *const u8,
+                            chunk_len,
+                        );
+                        match crate::config_manager_append_set_value_transfer(
+                            a2,
+                            value_offset,
+                            total_len,
+                            data,
+                        ) {
+                            Ok(()) => (STATUS_SUCCESS, 0, 0),
+                            Err(status) => (status, 0, 0),
+                        }
+                    }
+                    HOSTED_REGISTRY_OP_COMMIT_SET_HANDLE_VALUE => {
+                        match crate::config_manager_commit_set_value_transfer(a2, a3 as usize) {
+                            Ok(()) => (STATUS_SUCCESS, 0, 0),
+                            Err(status) => (status, 0, 0),
+                        }
+                    }
+                    HOSTED_REGISTRY_OP_ABORT_SET_HANDLE_VALUE => {
+                        match crate::config_manager_abort_set_value_transfer(a2, a3 as usize) {
+                            Ok(()) => (STATUS_SUCCESS, 0, 0),
+                            Err(status) => (status, 0, 0),
+                        }
+                    }
+                    _ => (STATUS_INVALID_PARAMETER, 0, 0),
                 }
             }
             _ => (STATUS_INVALID_PARAMETER, 0, 0),
