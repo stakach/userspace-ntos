@@ -888,7 +888,9 @@ static HOSTED_HAL_TRANSLATE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_HAL_TRANSLATE_TRACE_CAP: u64 = 32;
 static HOSTED_INTERRUPT_VECTOR_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_INTERRUPT_CONNECT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_MMIO_MAP_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_INTERRUPT_TRACE_CAP: u64 = 32;
+const HOSTED_MMIO_MAP_TRACE_CAP: u64 = 32;
 static HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP: u64 = 16;
 static HOSTED_PROVIDER_EXPORT_REJECTION_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -3678,6 +3680,24 @@ fn print_hex64(value: u64) {
             b'a' + (nib - 10)
         });
     }
+}
+
+fn trace_hosted_mm_map_io_space(phys: u64, length: u64, cache: u32, result: u64, decision: &[u8]) {
+    let trace = HOSTED_MMIO_MAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace >= HOSTED_MMIO_MAP_TRACE_CAP {
+        return;
+    }
+    print_str(b"[hosted-mmio] MmMapIoSpace phys=");
+    print_hex64(phys);
+    print_str(b" len=");
+    print_u64(length);
+    print_str(b" cache=");
+    print_u64(cache as u64);
+    print_str(b" result=");
+    print_hex64(result);
+    print_str(b" decision=");
+    print_str(decision);
+    print_str(b"\n");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8910,9 +8930,10 @@ extern "win64" fn s_mm_get_physical_address(virtual_address: u64) -> u64 {
 /// `PVOID MmMapIoSpace(PHYSICAL_ADDRESS, SIZE_T, MEMORY_CACHING_TYPE)` — return the component VA
 /// for a BAR range the executive already granted to this hosted driver. Requests outside the active
 /// grant fail with NULL; there is no success fallback.
-extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 {
+extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, cache: u32) -> u64 {
     unsafe {
         if let Some(existing) = hosted_component_virtual_address(phys, length) {
+            trace_hosted_mm_map_io_space(phys, length, cache, existing, b"component-map");
             return existing;
         }
         let Some(resource) = find_shared_address_resource_by_range(
@@ -8922,9 +8943,11 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 
             length,
             true,
         ) else {
+            trace_hosted_mm_map_io_space(phys, length, cache, 0, b"not-assigned");
             return 0;
         };
         if resource.va == 0 || resource.map_len > resource.len {
+            trace_hosted_mm_map_io_space(phys, length, cache, 0, b"invalid-grant");
             return 0;
         }
         let offset = phys - resource.translated_start;
@@ -8936,7 +8959,9 @@ extern "win64" fn s_mm_map_io_space(phys: u64, length: u64, _cache: u32) -> u64 
             (FSD_SHARED_VADDR + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64,
             length,
         );
-        resource.va + offset
+        let result = resource.va + offset;
+        trace_hosted_mm_map_io_space(phys, length, cache, result, b"resource-grant");
+        result
     }
 }
 

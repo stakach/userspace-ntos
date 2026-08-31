@@ -20705,6 +20705,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     require `HalGetInterruptVector` and `IoConnectInterrupt` to consume the assigned SCI route, then
     prove the first FADT port instruction is brokered or classify the next real ACPICA boundary.
 
+    B3 ACPI START runtime checkpoint (2026-09-01, runtime green): serialized proof
+    `.tmp/run-headless-acpi-sci-translation-20260901.log` completed in about 85 seconds, returned SCI
+    vector 9 and affinity 1 from the assigned raw line, created the canonical interrupt connection,
+    and completed the registry-selected `acpi.sys` START IRP with `STATUS_SUCCESS`. Explorer chrome
+    and the fully non-background framebuffer remained green, the sentinel reported 294/299 checks,
+    and no QEMU remains. This accepts the reset delegation and platform interrupt translation as
+    real runtime behavior rather than merely host-tested mechanism.
+
+    The next provider diagnostic is an ACPICA `AcpiOsMapMemory` call whose `MmMapIoSpace` result is
+    null after successful interpreter/interrupt setup. The old trace omitted its requested physical
+    range, so no new memory authority is justified yet. A bounded generic `MmMapIoSpace` trace now
+    records physical address, exact length, cache type, result, and whether resolution used an
+    existing component mapping, an assigned device resource, an invalid grant, or no assignment.
+    The freestanding executive remains green at 209 warnings. Run one serialized diagnostic boot,
+    classify the exact firmware range against ACPI table/operation-region ownership, and only then
+    extend the appropriate bus/provider contract. Five unrelated generic-hardware/NDIS gates remain
+    open; Mup `IoCheckShareAccess` remains queued behind this causal ACPI mapping slice.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
