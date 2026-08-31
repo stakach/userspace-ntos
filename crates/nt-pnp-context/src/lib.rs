@@ -110,6 +110,127 @@ pub struct SlotAllocator {
     limit: u64,
 }
 
+/// A byte-addressed arena backed by [`SlotAllocator`].
+///
+/// Callers lease address spans rather than combining a slot index with a separately maintained
+/// base constant. This keeps the arena bounds, granularity, and ownership record in one authority.
+pub struct AddressSlotAllocator {
+    base: u64,
+    limit: u64,
+    stride: u64,
+    slots: SlotAllocator,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddressSlotReservation {
+    address: u64,
+    bytes: u64,
+    slots: SlotReservation,
+}
+
+impl AddressSlotReservation {
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddressSlotReleaseError {
+    error: SlotError,
+    reservation: AddressSlotReservation,
+}
+
+impl AddressSlotReleaseError {
+    pub const fn error(&self) -> SlotError {
+        self.error
+    }
+
+    pub fn into_reservation(self) -> AddressSlotReservation {
+        self.reservation
+    }
+}
+
+impl AddressSlotAllocator {
+    pub const fn new(base: u64, limit: u64, stride: u64) -> Self {
+        assert!(stride != 0 && stride.is_power_of_two());
+        assert!(base < limit);
+        let slots = (limit - base) / stride;
+        assert!(slots != 0);
+        Self {
+            base,
+            limit,
+            stride,
+            slots: SlotAllocator::new(slots),
+        }
+    }
+
+    pub fn allocate(&mut self, bytes: u64) -> Result<AddressSlotReservation, SlotError> {
+        if bytes == 0 {
+            return Err(SlotError::InvalidRange);
+        }
+        let rounded = bytes
+            .checked_add(self.stride - 1)
+            .ok_or(SlotError::InvalidRange)?
+            & !(self.stride - 1);
+        let slots = self.slots.allocate(rounded / self.stride)?;
+        let address = slots
+            .first()
+            .checked_mul(self.stride)
+            .and_then(|offset| self.base.checked_add(offset))
+            .filter(|address| {
+                address
+                    .checked_add(rounded)
+                    .is_some_and(|end| end <= self.limit)
+            });
+        let Some(address) = address else {
+            let _ = self.slots.release(slots);
+            return Err(SlotError::InvalidRange);
+        };
+        Ok(AddressSlotReservation {
+            address,
+            bytes: rounded,
+            slots,
+        })
+    }
+
+    pub fn release(
+        &mut self,
+        reservation: AddressSlotReservation,
+    ) -> Result<(), AddressSlotReleaseError> {
+        let expected = reservation
+            .slots
+            .first()
+            .checked_mul(self.stride)
+            .and_then(|offset| self.base.checked_add(offset));
+        if expected != Some(reservation.address)
+            || reservation.bytes != reservation.slots.count().saturating_mul(self.stride)
+        {
+            return Err(AddressSlotReleaseError {
+                error: SlotError::UnknownReservation,
+                reservation,
+            });
+        }
+        self.slots
+            .release(reservation.slots)
+            .map_err(|error| AddressSlotReleaseError {
+                error: error.error(),
+                reservation: AddressSlotReservation {
+                    address: reservation.address,
+                    bytes: reservation.bytes,
+                    slots: error.into_reservation(),
+                },
+            })
+    }
+
+    pub fn occupied_slots(&self) -> usize {
+        self.slots.occupied_slots()
+    }
+}
+
 impl SlotAllocator {
     pub const fn new(limit: u64) -> Self {
         Self {
@@ -499,5 +620,28 @@ mod tests {
         assert_eq!(allocator.occupied_slots(), 1);
         assert_eq!(second.first(), 1);
         assert_eq!(allocator.allocate(1).unwrap().first(), 0);
+    }
+
+    #[test]
+    fn address_slots_keep_bounds_and_ownership_together() {
+        let mut allocator = AddressSlotAllocator::new(0x4000_0000, 0x4080_0000, 0x20_0000);
+        let first = allocator.allocate(0x1000).unwrap();
+        let second = allocator.allocate(0x20_0001).unwrap();
+        assert_eq!((first.address(), first.bytes()), (0x4000_0000, 0x20_0000));
+        assert_eq!((second.address(), second.bytes()), (0x4020_0000, 0x40_0000));
+        assert_eq!(allocator.occupied_slots(), 3);
+        allocator.release(first).unwrap();
+        let replacement = allocator.allocate(0x20_0000).unwrap();
+        assert_eq!(replacement.address(), 0x4000_0000);
+    }
+
+    #[test]
+    fn address_slots_fail_closed_at_arena_limit() {
+        let mut allocator = AddressSlotAllocator::new(0x8000_0000, 0x8040_0000, 0x20_0000);
+        assert_eq!(allocator.allocate(0), Err(SlotError::InvalidRange));
+        let reservation = allocator.allocate(0x40_0000).unwrap();
+        assert_eq!(allocator.allocate(1), Err(SlotError::InsufficientResources));
+        allocator.release(reservation).unwrap();
+        assert_eq!(allocator.occupied_slots(), 0);
     }
 }

@@ -12154,10 +12154,10 @@ unsafe fn rtlp_init_environment(process_handle: u64, peb_base: u64, params: *mut
         let env_bytes = env_units.len() * 2;
         if env_bytes != 0 {
             // SAFETY: allocate in the child.
-            let base = unsafe { nt_allocate_in_process(process_handle, env_bytes) };
-            if base == 0 {
-                return 0xC000_0017;
-            }
+            let base = match unsafe { nt_allocate_in_process(process_handle, env_bytes) } {
+                Ok(base) => base,
+                Err(status) => return status,
+            };
             // SAFETY: write the env block into the child.
             let st = unsafe {
                 nt_write_virtual_memory(process_handle, base, env_units.as_ptr() as u64, env_bytes)
@@ -12173,10 +12173,10 @@ unsafe fn rtlp_init_environment(process_handle: u64, peb_base: u64, params: *mut
 
     // Allocate the parameter block in the child + write `Length` bytes.
     // SAFETY: allocate MaximumLength bytes in the child.
-    let param_base = unsafe { nt_allocate_in_process(process_handle, max_len) };
-    if param_base == 0 {
-        return 0xC000_0017;
-    }
+    let param_base = match unsafe { nt_allocate_in_process(process_handle, max_len) } {
+        Ok(base) => base,
+        Err(status) => return status,
+    };
     // SAFETY: write the parameter block.
     let st = unsafe { nt_write_virtual_memory(process_handle, param_base, params as u64, length) };
     if (st as i32) < 0 {
@@ -12199,13 +12199,13 @@ unsafe fn rtlp_init_environment(process_handle: u64, peb_base: u64, params: *mut
     0
 }
 
-/// `NtAllocateVirtualMemory` in another process (`process_handle`), MEM_COMMIT|MEM_RESERVE / RW. Returns
-/// the base VA (0 on failure). Like [`nt_allocate_virtual_memory`] but with an explicit process handle.
+/// `NtAllocateVirtualMemory` in another process (`process_handle`), MEM_COMMIT|MEM_RESERVE / RW.
+/// Returns the exact kernel failure status rather than manufacturing `STATUS_NO_MEMORY`.
 ///
 /// # Safety
 /// On-target syscall.
 #[cfg(target_arch = "x86_64")]
-unsafe fn nt_allocate_in_process(process_handle: u64, size_in: usize) -> u64 {
+unsafe fn nt_allocate_in_process(process_handle: u64, size_in: usize) -> Result<u64, u32> {
     let mut base: u64 = 0;
     let mut size: u64 = size_in as u64;
     // NtAllocateVirtualMemory(ProcessHandle, &BaseAddress, 0, &RegionSize, MEM_COMMIT|MEM_RESERVE,
@@ -12223,9 +12223,9 @@ unsafe fn nt_allocate_in_process(process_handle: u64, size_in: usize) -> u64 {
         )
     } as u32;
     if (st as i32) < 0 {
-        return 0;
+        return Err(st);
     }
-    base
+    Ok(base)
 }
 
 /// `NtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, NumberOfBytes, NULL)`.

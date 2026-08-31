@@ -1,30 +1,19 @@
 use crate::*;
 use alloc::vec::Vec;
 use nt_pnp_context::{
-    ContextId, ContextLease, ContextLeaseIdentity, ContextRegistry, SlotAllocator, SlotReservation,
+    AddressSlotAllocator, AddressSlotReservation, ContextId, ContextLease, ContextLeaseIdentity,
+    ContextRegistry,
 };
 
 const HOSTED_RESOURCE_WINDOW_STRIDE: u64 = 0x20_0000;
 const HOSTED_RESOURCE_COMPONENT_VA_BASE: u64 = 0x0000_0100_1600_0000;
 const HOSTED_RESOURCE_COMPONENT_VA_LIMIT: u64 = crate::allocator::HEAP_BASE as u64;
-const HOSTED_ROOT_SEED_VA_BASE: u64 = 0x0000_0100_1100_0000;
-const HOSTED_ROOT_SEED_VA_LIMIT: u64 = HOSTED_RESOURCE_COMPONENT_VA_BASE;
 const HOSTED_ROOT_DMA_LOGICAL_BASE: u64 = 0x0010_0000;
 const HOSTED_ROOT_DMA_LOGICAL_LIMIT: u64 = u32::MAX as u64 + 1;
 
-const COMPONENT_SLOT_LIMIT: u64 = (HOSTED_RESOURCE_COMPONENT_VA_LIMIT
-    - HOSTED_RESOURCE_COMPONENT_VA_BASE)
-    / HOSTED_RESOURCE_WINDOW_STRIDE;
-const ROOT_SEED_SLOT_LIMIT: u64 =
-    (HOSTED_ROOT_SEED_VA_LIMIT - HOSTED_ROOT_SEED_VA_BASE) / HOSTED_RESOURCE_WINDOW_STRIDE;
-const ROOT_DMA_LOGICAL_SLOT_LIMIT: u64 =
-    (HOSTED_ROOT_DMA_LOGICAL_LIMIT - HOSTED_ROOT_DMA_LOGICAL_BASE) / HOSTED_RESOURCE_WINDOW_STRIDE;
-
 const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE & 0x1F_FFFF == 0);
-const _: () = assert!(COMPONENT_SLOT_LIMIT != 0);
-const _: () = assert!(HOSTED_ROOT_SEED_VA_BASE & 0x1F_FFFF == 0);
-const _: () = assert!(ROOT_SEED_SLOT_LIMIT != 0);
-const _: () = assert!(ROOT_DMA_LOGICAL_SLOT_LIMIT != 0);
+const _: () = assert!(HOSTED_RESOURCE_COMPONENT_VA_BASE < HOSTED_RESOURCE_COMPONENT_VA_LIMIT);
+const _: () = assert!(HOSTED_ROOT_DMA_LOGICAL_BASE < HOSTED_ROOT_DMA_LOGICAL_LIMIT);
 
 #[derive(Clone)]
 pub(crate) struct HostedPnpPciMemoryDescriptor {
@@ -225,9 +214,9 @@ impl HostedPnpPlatformResourceDescriptor {
             || ports.len() > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize
             || memory.iter().enumerate().any(|(index, resource)| {
                 resource.resource_index >= driver_launch::SH_RESOURCE_KIND_CAPACITY
-                    || memory[..index].iter().any(|previous| {
-                        previous.resource_index == resource.resource_index
-                    })
+                    || memory[..index]
+                        .iter()
+                        .any(|previous| previous.resource_index == resource.resource_index)
                     || resource.len == 0
                     || resource.frame_base == 0
                     || resource.pages == 0
@@ -241,9 +230,9 @@ impl HostedPnpPlatformResourceDescriptor {
             })
             || ports.iter().enumerate().any(|(index, resource)| {
                 resource.resource_index >= driver_launch::SH_RESOURCE_KIND_CAPACITY
-                    || ports[..index].iter().any(|previous| {
-                        previous.resource_index == resource.resource_index
-                    })
+                    || ports[..index]
+                        .iter()
+                        .any(|previous| previous.resource_index == resource.resource_index)
                     || resource.len == 0
                     || resource
                         .base
@@ -391,7 +380,7 @@ enum HostedPnpVaPool {
 
 struct HostedPnpVaReservation {
     pool: HostedPnpVaPool,
-    slots: SlotReservation,
+    span: AddressSlotReservation,
 }
 
 struct HostedPnpOwnedRootFrame {
@@ -528,9 +517,8 @@ impl HostedPnpContextOwner {
 
 struct HostedPnpContextAuthority {
     registry: ContextRegistry<HostedPnpContextDescription, HostedPnpContextOwner>,
-    component_slots: SlotAllocator,
-    root_seed_slots: SlotAllocator,
-    root_dma_logical_slots: SlotAllocator,
+    component_slots: AddressSlotAllocator,
+    root_dma_logical_slots: AddressSlotAllocator,
     pending_retirements: Vec<HostedPnpContextOwner>,
 }
 
@@ -538,9 +526,16 @@ impl HostedPnpContextAuthority {
     const fn new() -> Self {
         Self {
             registry: ContextRegistry::new(),
-            component_slots: SlotAllocator::new(COMPONENT_SLOT_LIMIT),
-            root_seed_slots: SlotAllocator::new(ROOT_SEED_SLOT_LIMIT),
-            root_dma_logical_slots: SlotAllocator::new(ROOT_DMA_LOGICAL_SLOT_LIMIT),
+            component_slots: AddressSlotAllocator::new(
+                HOSTED_RESOURCE_COMPONENT_VA_BASE,
+                HOSTED_RESOURCE_COMPONENT_VA_LIMIT,
+                HOSTED_RESOURCE_WINDOW_STRIDE,
+            ),
+            root_dma_logical_slots: AddressSlotAllocator::new(
+                HOSTED_ROOT_DMA_LOGICAL_BASE,
+                HOSTED_ROOT_DMA_LOGICAL_LIMIT,
+                HOSTED_RESOURCE_WINDOW_STRIDE,
+            ),
             pending_retirements: Vec::new(),
         }
     }
@@ -551,15 +546,23 @@ impl HostedPnpContextAuthority {
     ) -> Result<(), HostedPnpVaReservation> {
         let pool = reservation.pool;
         let result = match pool {
-            HostedPnpVaPool::Component => self.component_slots.release(reservation.slots),
-            HostedPnpVaPool::RootSeed => self.root_seed_slots.release(reservation.slots),
+            HostedPnpVaPool::Component => self.component_slots.release(reservation.span),
+            HostedPnpVaPool::RootSeed => {
+                return unsafe {
+                    crate::executive_va::release_executive_device_mapping(reservation.span)
+                }
+                .map_err(|error| HostedPnpVaReservation {
+                    pool,
+                    span: error.into_reservation(),
+                });
+            }
             HostedPnpVaPool::RootDmaLogical => {
-                self.root_dma_logical_slots.release(reservation.slots)
+                self.root_dma_logical_slots.release(reservation.span)
             }
         };
         result.map_err(|error| HostedPnpVaReservation {
             pool,
-            slots: error.into_reservation(),
+            span: error.into_reservation(),
         })
     }
 }
@@ -571,44 +574,23 @@ unsafe fn hosted_pnp_context_authority_mut() -> &'static mut HostedPnpContextAut
     &mut *core::ptr::addr_of_mut!(HOSTED_PNP_CONTEXT_AUTHORITY)
 }
 
-fn slots_for_bytes(bytes: u64) -> Option<u64> {
-    bytes
-        .max(1)
-        .checked_add(HOSTED_RESOURCE_WINDOW_STRIDE - 1)
-        .map(|bytes| bytes / HOSTED_RESOURCE_WINDOW_STRIDE)
-}
-
 unsafe fn reserve_hosted_pnp_slots(
     owner: &mut HostedPnpContextOwner,
     pool: HostedPnpVaPool,
-    slots: u64,
-    base: u64,
+    bytes: u64,
 ) -> Option<u64> {
     owner.va_reservations.try_reserve(1).ok()?;
     let authority = hosted_pnp_context_authority_mut();
     let reservation = match pool {
-        HostedPnpVaPool::Component => authority.component_slots.allocate(slots),
-        HostedPnpVaPool::RootSeed => authority.root_seed_slots.allocate(slots),
-        HostedPnpVaPool::RootDmaLogical => authority.root_dma_logical_slots.allocate(slots),
+        HostedPnpVaPool::Component => authority.component_slots.allocate(bytes),
+        HostedPnpVaPool::RootSeed => crate::executive_va::reserve_executive_device_mapping(bytes),
+        HostedPnpVaPool::RootDmaLogical => authority.root_dma_logical_slots.allocate(bytes),
     }
     .ok()?;
-    let value = reservation
-        .first()
-        .checked_mul(HOSTED_RESOURCE_WINDOW_STRIDE)
-        .and_then(|offset| base.checked_add(offset));
-    let Some(value) = value else {
-        let failed = HostedPnpVaReservation {
-            pool,
-            slots: reservation,
-        };
-        if let Err(reservation) = authority.release_va(failed) {
-            owner.va_reservations.push(reservation);
-        }
-        return None;
-    };
+    let value = reservation.address();
     owner.va_reservations.push(HostedPnpVaReservation {
         pool,
-        slots: reservation,
+        span: reservation,
     });
     Some(value)
 }
@@ -617,24 +599,14 @@ pub(crate) unsafe fn reserve_hosted_pnp_component_span(
     owner: &mut HostedPnpContextOwner,
     bytes: u64,
 ) -> Option<u64> {
-    reserve_hosted_pnp_slots(
-        owner,
-        HostedPnpVaPool::Component,
-        slots_for_bytes(bytes)?,
-        HOSTED_RESOURCE_COMPONENT_VA_BASE,
-    )
+    reserve_hosted_pnp_slots(owner, HostedPnpVaPool::Component, bytes)
 }
 
 pub(crate) unsafe fn reserve_hosted_pnp_root_seed_span(
     owner: &mut HostedPnpContextOwner,
     bytes: u64,
 ) -> Option<u64> {
-    reserve_hosted_pnp_slots(
-        owner,
-        HostedPnpVaPool::RootSeed,
-        slots_for_bytes(bytes)?,
-        HOSTED_ROOT_SEED_VA_BASE,
-    )
+    reserve_hosted_pnp_slots(owner, HostedPnpVaPool::RootSeed, bytes)
 }
 
 pub(crate) unsafe fn reserve_hosted_pnp_root_dma_logical(
@@ -643,8 +615,7 @@ pub(crate) unsafe fn reserve_hosted_pnp_root_dma_logical(
     reserve_hosted_pnp_slots(
         owner,
         HostedPnpVaPool::RootDmaLogical,
-        1,
-        HOSTED_ROOT_DMA_LOGICAL_BASE,
+        HOSTED_RESOURCE_WINDOW_STRIDE,
     )
 }
 
@@ -696,12 +667,7 @@ pub(crate) unsafe fn publish_hosted_pnp_resource_context(
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let Some(description) =
-        HostedPnpContextDescription::new(
-            pci_devices,
-            pci_windows,
-            root_windows,
-            platform_windows,
-        )
+        HostedPnpContextDescription::new(pci_devices, pci_windows, root_windows, platform_windows)
     else {
         retire_or_retain(owner)?;
         return Err(nt_status::NtStatus::INVALID_PARAMETER);

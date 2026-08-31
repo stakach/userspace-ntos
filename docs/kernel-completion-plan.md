@@ -20431,13 +20431,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Focused validation passes `nt-hive-core` 88/88 library tests plus 14/14 generator tests and
     `nt-config-server` 28/28. The next serialized boot (`.tmp/run-headless-20260831-215143.log`)
     proved both ACPI discovery and root-devnode publication advance, loaded the registry-selected
-    driver plans, and reached the real `smss.exe` path that creates CSRSS. That run exposed the next
-    generic kernel gap: ReactOS marks CSRSS as a subsystem and reserves the low 1 MiB DOS/IVT range
-    through `NtAllocateVirtualMemory`, while the current private VAD owner admits only the high
-    hosted heap window. `RtlCreateUserProcess` therefore returns `STATUS_NO_MEMORY` after creating
-    the child process. The next slice must implement normal low explicit reservations and NT
-    rounding in the generic per-process VAD authority while preserving the high preferred range for
-    automatic hosted allocations; no image-name or CSRSS-specific route is permitted.
+    driver plans, and reached the real `smss.exe` path that creates CSRSS. The apparent
+    `STATUS_NO_MEMORY` was not exhaustion: final counters had ample untyped, CSlot, VAD, and committed
+    mapping capacity, with exactly one executive alias-map failure. The retained ACPI root mapping
+    pool started in the root executive at `0x10011000000`; its 16 MiB validation reservation placed
+    the first platform broker mapping at `0x10012000000`, exactly the fixed CSRSS heap-mirror VA.
+    ntdll then incorrectly collapsed the executive's `STATUS_INSUFFICIENT_RESOURCES` into
+    `STATUS_NO_MEMORY`.
+
+    B3 executive device-VA authority checkpoint (2026-08-31, host tests, freestanding check, and
+    runtime boundary green): `nt-pnp-context` now provides an address-aware slot allocator whose
+    arena bounds, paging stride, returned address, and exact release identity are one authority.
+    Retained ACPI/PnP root mappings lease from a dedicated high executive device-mapping arena;
+    component projection VAs and DMA logical addresses use the same checked address-lease model.
+    The old root-seed pool and its manual `base + slot * stride` machinery are removed. ntdll now
+    propagates the exact foreign `NtAllocateVirtualMemory` status from `RtlpInitEnvironment`.
+    `nt-pnp-context` passes 11/11 tests and the freestanding executive check is green.
+
+    Serialized proof `.tmp/run-headless-20260831-221638.log` completed in 27 seconds, retained
+    `vm-fail pt=0 frame=0 map=0 alias=0 registry=0`, ran CSRSS through 324 syscalls, launched
+    winlogon, and reached the next pre-existing failure unchanged from the prior run: registry-loaded
+    Msfs/Npfs DriverEntry cannot create its named devices, so winlogon's genuine RPC endpoint setup
+    fails with RPC status 0x6b8 and terminates the critical process. The hard one-hour runner ceiling
+    was not approached and no QEMU remains. Before debugging that I/O boundary, close the independent
+    native-subsystem VM gap: implement `RTL_USER_PROCESS_PARAMETERS_RESERVE_1MB`, normal explicit-low
+    VAD rounding, and target-process stack allocation/free without image-name or process-index checks.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
