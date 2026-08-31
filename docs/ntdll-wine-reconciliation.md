@@ -62,6 +62,11 @@ ntdll tail alias to the same shared SSN and body. An export, argc row, dispatche
 mechanism, and alias land atomically. No unsupported service is exported with a success or generic
 failure body.
 
+Current frontier (2026-08-31): `NtQueryMutant`/`ZwQueryMutant` and `NtQueryTimer`/`ZwQueryTimer` are
+implemented. The built PE has 1,376 exports and covers 1,093 of the 1,461 Windows-visible names;
+368 names remain absent. The reconciliation ledger contains 362 planned, 6 ABI-blocked, and 4
+implemented rows. The fixed 372-name baseline and classification hashes remain unchanged.
+
 | group | count | mechanism and initial exact contract |
 |---|---:|---|
 | `K-security` | 3 | Audit access captures type lists/mapping and returns granted access, access status, and generate-on-close under real privilege policy. Token comparison uses token-equivalence rules. LowBox creation requires a restricted AppContainer token, capabilities, and allowed-handle set. |

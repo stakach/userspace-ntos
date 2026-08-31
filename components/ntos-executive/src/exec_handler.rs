@@ -12486,7 +12486,13 @@ impl ExecNtHandler {
             }
         }
         if self.wait_object_ready(object) {
-            trace_wait_object(self, b"ready", handle, object, timeout_ptr, 0);
+            let status = match self.wait_object_consume(object) {
+                nt_kernel_exec::DispatcherConsumeResult::Consumed => 0,
+                nt_kernel_exec::DispatcherConsumeResult::Abandoned => 0x80,
+                nt_kernel_exec::DispatcherConsumeResult::MutantLimitExceeded => 0xC000_0191,
+                nt_kernel_exec::DispatcherConsumeResult::NotReady => return 0xC000_0001,
+            };
+            trace_wait_object(self, b"ready", handle, object, timeout_ptr, status);
             print_str(b"[wait] pi=");
             print_u64(self.pi as u64);
             print_str(b" ");
@@ -12495,9 +12501,10 @@ impl ExecNtHandler {
             print_str(object.describe());
             print_str(b" ");
             print_u64(object.id());
-            print_str(b") already SIGNALLED -> immediate WAIT_0\n");
-            self.wait_object_consume(object);
-            return 0;
+            print_str(b") already SIGNALLED -> immediate status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            return status;
         }
         if let Some(timeout) = timeout_interval.map(PendingWaitTimeout::from_interval) {
             if timeout.is_due_now() == Some(true) {
@@ -12601,18 +12608,31 @@ impl ExecNtHandler {
                 }
             }
             if all_ready {
+                if self.wait_park_objects[..count]
+                    .iter()
+                    .copied()
+                    .any(|object| self.wait_object_mutant_limit_for(object, self.current_tid))
+                {
+                    return 0xC000_0191; // STATUS_MUTANT_LIMIT_EXCEEDED
+                }
+                let mut abandoned = false;
                 for index in 0..count {
                     let object = self.wait_park_objects[index];
-                    self.wait_object_consume(object);
+                    abandoned |= self.wait_object_consume(object)
+                        == nt_kernel_exec::DispatcherConsumeResult::Abandoned;
                 }
-                return 0;
+                return if abandoned { 0x80 } else { 0 };
             }
         } else {
             for index in 0..count {
                 let object = self.wait_park_objects[index];
                 if self.wait_object_ready(object) {
-                    self.wait_object_consume(object);
-                    return index as u32;
+                    return match self.wait_object_consume(object) {
+                        nt_kernel_exec::DispatcherConsumeResult::Consumed => index as u32,
+                        nt_kernel_exec::DispatcherConsumeResult::Abandoned => 0x80 + index as u32,
+                        nt_kernel_exec::DispatcherConsumeResult::MutantLimitExceeded => 0xC000_0191,
+                        nt_kernel_exec::DispatcherConsumeResult::NotReady => 0xC000_0001,
+                    };
                 }
             }
         }
@@ -12807,13 +12827,20 @@ impl ExecNtHandler {
             })
     }
 
-    pub(crate) fn dispatcher_consume(&mut self, index: usize) -> bool {
+    pub(crate) fn dispatcher_consume(
+        &mut self,
+        index: usize,
+    ) -> nt_kernel_exec::DispatcherConsumeResult {
         self.dispatcher_consume_for(index, self.current_tid)
     }
 
-    pub(crate) fn dispatcher_consume_for(&mut self, index: usize, thread: u64) -> bool {
+    pub(crate) fn dispatcher_consume_for(
+        &mut self,
+        index: usize,
+        thread: u64,
+    ) -> nt_kernel_exec::DispatcherConsumeResult {
         let Some(object) = self.dispatcher_object_for_thread(index, thread) else {
-            return false;
+            return nt_kernel_exec::DispatcherConsumeResult::NotReady;
         };
         nt_kernel_exec::consume_dispatcher(
             &mut self.events,
@@ -12988,26 +13015,49 @@ impl ExecNtHandler {
         }
     }
 
-    pub(crate) fn wait_object_consume(&mut self, object: WaitObject) -> bool {
+    pub(crate) fn wait_object_consume(
+        &mut self,
+        object: WaitObject,
+    ) -> nt_kernel_exec::DispatcherConsumeResult {
         self.wait_object_consume_for(object, self.current_tid)
     }
 
-    pub(crate) fn wait_object_consume_for(&mut self, object: WaitObject, thread: u64) -> bool {
+    pub(crate) fn wait_object_consume_for(
+        &mut self,
+        object: WaitObject,
+        thread: u64,
+    ) -> nt_kernel_exec::DispatcherConsumeResult {
+        use nt_kernel_exec::DispatcherConsumeResult::{Consumed, NotReady};
         match object.kind() {
             WaitObject::KIND_DISPATCHER => {
                 self.dispatcher_consume_for(object.id() as usize, thread)
             }
-            WaitObject::KIND_PROCESS | WaitObject::KIND_THREAD => true,
+            WaitObject::KIND_PROCESS | WaitObject::KIND_THREAD => Consumed,
             WaitObject::KIND_WIN32K_EVENT => {
-                crate::win32k_subsystem::event_body_consume(object.id())
+                if crate::win32k_subsystem::event_body_consume(object.id()) {
+                    Consumed
+                } else {
+                    NotReady
+                }
             }
             WaitObject::KIND_FILE
             | WaitObject::KIND_FAT_FILE
             | WaitObject::KIND_FAT_DIRECTORY
             | WaitObject::KIND_OVERLAY_FILE
-            | WaitObject::KIND_JOB => true,
-            _ => false,
+            | WaitObject::KIND_JOB => Consumed,
+            _ => NotReady,
         }
+    }
+
+    pub(crate) fn wait_object_mutant_limit_for(&self, object: WaitObject, thread: u64) -> bool {
+        if object.kind() != WaitObject::KIND_DISPATCHER {
+            return false;
+        }
+        let index = object.id() as usize;
+        self.obj_ns.get(index).is_some_and(|entry| {
+            entry.kind == OBJ_KIND_MUTANT
+                && self.mutants.acquire_would_exceed(index as u64, thread)
+        })
     }
 
     pub(crate) unsafe fn abandon_mutants_for_thread(&mut self, tid: u64) -> u64 {
@@ -23479,6 +23529,43 @@ impl ExecNtHandler {
         len <= 8 && self.probe_user_output(va, len)
     }
 
+    /// Probe the fixed information structure and optional return length used by native query
+    /// services. NT checks the user ceiling before structure alignment, while `ReturnLength` is an
+    /// unaligned `ULONG` probe.
+    unsafe fn probe_fixed_query_output(
+        &self,
+        information: u64,
+        information_size: usize,
+        information_alignment: u64,
+        return_length: u64,
+    ) -> Result<(), u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+
+        let user_range = |address: u64, size: usize| {
+            address != 0
+                && address <= HIGHEST_USER_ADDRESS
+                && address
+                    .checked_add(size.saturating_sub(1) as u64)
+                    .is_some_and(|end| end <= HIGHEST_USER_ADDRESS)
+        };
+        if !user_range(information, information_size) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if information & (information_alignment - 1) != 0 {
+            return Err(STATUS_DATATYPE_MISALIGNMENT);
+        }
+        if !self.probe_user_output(information, information_size) {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        if return_length != 0
+            && (!user_range(return_length, 4) || !self.probe_user_output(return_length, 4))
+        {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        Ok(())
+    }
+
     /// Probe an arbitrary readable user range, including image and DLL `.rdata` that has not faulted
     /// into the process yet.
     pub(crate) unsafe fn probe_user_input(&self, va: u64, len: usize) -> bool {
@@ -31284,13 +31371,15 @@ impl ExecNtHandler {
 
     fn user_timer_cancel(&mut self, object_index: u64) -> bool {
         self.user_timer_remove_queued_apc(object_index);
-        let was_active = self.user_timers.cancel(object_index);
+        let was_active = self.user_timers.cancel(object_index, nt_time_snapshot());
         self.user_timer_rearm_requested = true;
         was_active
     }
 
     pub(crate) fn user_timer_cancel_thread(&mut self, thread_id: u64) -> usize {
-        let cancelled = self.user_timers.cancel_apcs_for_thread(thread_id);
+        let cancelled = self
+            .user_timers
+            .cancel_apcs_for_thread(thread_id, nt_time_snapshot());
         if cancelled != 0 {
             self.user_timer_rearm_requested = true;
         }
@@ -31301,6 +31390,7 @@ impl ExecNtHandler {
         &mut self,
         object_index: u64,
         deadline: nt_delay_execution::Deadline,
+        now: nt_delay_execution::TimeSnapshot,
         period_ms: u32,
         apc_tid: u64,
         apc_routine: u64,
@@ -31311,6 +31401,7 @@ impl ExecNtHandler {
             .set(
                 object_index,
                 deadline,
+                now,
                 period_ms as u64 * 10_000,
                 nt_user_timer::ApcTarget {
                     thread_id: apc_tid,
@@ -37286,6 +37377,53 @@ impl ExecNtHandler {
                 }
                 0
             },
+            NativeService::NtQueryTimer => {
+                const TIMER_BASIC_INFORMATION_SIZE: u32 = 16;
+                if let Err(status) = unsafe {
+                    self.probe_fixed_query_output(
+                        args[2],
+                        TIMER_BASIC_INFORMATION_SIZE as usize,
+                        4,
+                        args[4],
+                    )
+                } {
+                    return status;
+                }
+                let information_class = nt_ulong_arg(args[1]);
+                let information_length = nt_ulong_arg(args[3]);
+                if information_class != 0 {
+                    return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
+                }
+                if information_length != TIMER_BASIC_INFORMATION_SIZE {
+                    return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                }
+                let index = match self.timer_index_for_handle(args[0], TIMER_QUERY_STATE) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let Some(remaining) = self
+                    .user_timers
+                    .remaining_100ns(index as u64, nt_time_snapshot())
+                else {
+                    return 0xC000_0008; // STATUS_INVALID_HANDLE
+                };
+                let Some((_kind, signaled)) = self.events.query_existing(index as u64) else {
+                    return 0xC000_0008; // STATUS_INVALID_HANDLE
+                };
+                if !unsafe { self.xas_write_u64(args[2], remaining as u64) }
+                    || !unsafe {
+                        self.xas_try_write_buf(args[2] + 8, &[u8::from(signaled)])
+                    }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if args[4] != 0
+                    && !unsafe { self.xas_write_u32(args[4], TIMER_BASIC_INFORMATION_SIZE) }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                0
+            }
             NativeService::NtSetTimer => unsafe {
                 let due_time_ptr = args[1];
                 let apc_routine = args[2];
@@ -37324,6 +37462,7 @@ impl ExecNtHandler {
                     .user_timer_set(
                         index as u64,
                         deadline,
+                        now,
                         period as u32,
                         self.current_tid,
                         apc_routine,
@@ -37667,6 +37806,50 @@ impl ExecNtHandler {
                 }
                 0
             },
+            NativeService::NtQueryMutant => {
+                const MUTANT_BASIC_INFORMATION_SIZE: u32 = 8;
+                if let Err(status) = unsafe {
+                    self.probe_fixed_query_output(
+                        args[2],
+                        MUTANT_BASIC_INFORMATION_SIZE as usize,
+                        4,
+                        args[4],
+                    )
+                } {
+                    return status;
+                }
+                let information_class = nt_ulong_arg(args[1]);
+                let information_length = nt_ulong_arg(args[3]);
+                if information_class != 0 {
+                    return 0xC000_0003; // STATUS_INVALID_INFO_CLASS
+                }
+                if information_length != MUTANT_BASIC_INFORMATION_SIZE {
+                    return 0xC000_0004; // STATUS_INFO_LENGTH_MISMATCH
+                }
+                let index = match self.mutant_index_for_handle(args[0], MUTANT_QUERY_STATE) {
+                    Ok(index) => index,
+                    Err(status) => return status,
+                };
+                let Some(state) = self.mutants.query(index as u64, self.current_tid) else {
+                    return 0xC000_0008; // STATUS_INVALID_HANDLE
+                };
+                if !unsafe { self.xas_write_u32(args[2], state.current_count as u32) }
+                    || !unsafe {
+                        self.xas_try_write_buf(
+                            args[2] + 4,
+                            &[u8::from(state.owned_by_caller), u8::from(state.abandoned)],
+                        )
+                    }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                if args[4] != 0
+                    && !unsafe { self.xas_write_u32(args[4], MUTANT_BASIC_INFORMATION_SIZE) }
+                {
+                    return 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                }
+                0
+            }
             NativeService::NtReleaseMutant => {
                 let previous_count = args[1];
                 if previous_count != 0 && previous_count & 3 != 0 {
@@ -37683,6 +37866,7 @@ impl ExecNtHandler {
                     Ok(previous) => previous,
                     Err(nt_kernel_exec::MutantError::NotFound) => return 0xC000_0008,
                     Err(nt_kernel_exec::MutantError::NotOwned) => return 0xC000_0046,
+                    Err(nt_kernel_exec::MutantError::LimitExceeded) => return 0xC000_0191,
                 };
                 unsafe {
                     wait_wake_dispatcher_set(self);

@@ -1225,13 +1225,19 @@ mod tests {
             rows.iter()
                 .filter(|row| row.state == ReconciliationState::Planned)
                 .count(),
-            366
+            362
         );
         assert_eq!(
             rows.iter()
                 .filter(|row| row.state == ReconciliationState::BlockedAbi)
                 .count(),
             6
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.state == ReconciliationState::Implemented)
+                .count(),
+            4
         );
         assert_eq!(rows.iter().filter(|row| row.owner == "kernel").count(), 71);
         assert_eq!(rows.iter().filter(|row| row.owner == "alias").count(), 71);

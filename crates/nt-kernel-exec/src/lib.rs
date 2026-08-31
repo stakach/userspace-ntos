@@ -45,14 +45,15 @@ pub mod x86_io;
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dispatcher_wait::{
     classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready, poll_dispatchers,
-    signal_dispatcher_for_wait, DispatcherObject, DispatcherSignalError, DispatcherSignalObject,
-    DispatcherWaitResult, DispatcherWaitTimeout,
+    signal_dispatcher_for_wait, DispatcherConsumeResult, DispatcherObject, DispatcherSignalError,
+    DispatcherSignalObject, DispatcherWaitResult, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
 pub use driver_thread::{
-    HostedDispatcherWaitAdmission, HostedDispatcherWaitError, HostedDispatcherWaitQueue,
-    HostedDispatcherWaiter, HostedDispatcherWake, HostedDriverThread, HostedDriverThreadError,
-    HostedDriverThreadState, HostedDriverThreadTable, HOSTED_DRIVER_THREAD_HANDLE_BASE,
+    HostedDispatcherCompletion, HostedDispatcherWaitAdmission, HostedDispatcherWaitError,
+    HostedDispatcherWaitQueue, HostedDispatcherWaiter, HostedDispatcherWake, HostedDriverThread,
+    HostedDriverThreadError, HostedDriverThreadState, HostedDriverThreadTable,
+    HOSTED_DRIVER_THREAD_HANDLE_BASE,
 };
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
@@ -61,7 +62,7 @@ pub use lookaside::{
     general_lookaside, init_general_lookaside, DEFAULT_MAXIMUM_DEPTH, POOL_TYPE_NONPAGED,
     POOL_TYPE_PAGED,
 };
-pub use mutant::{map_mutant_access, MutantError, MutantStore};
+pub use mutant::{map_mutant_access, MutantAcquire, MutantBasicState, MutantError, MutantStore};
 pub use nt_time::{Deadline, TimeSnapshot};
 pub use runtime::{KernelExecRuntime, ReadyCallback};
 pub use semaphore::{

@@ -921,17 +921,32 @@ fn mutant_family_uses_native_numbers_and_argument_contracts() {
         &[
             (NativeService::NtCreateMutant, 45),
             (NativeService::NtOpenMutant, 126),
+            (NativeService::NtQueryMutant, 169),
             (NativeService::NtReleaseMutant, 196),
         ],
     );
     for (service, ssn, argc) in [
         (NativeService::NtCreateMutant, 45, (4, 4)),
         (NativeService::NtOpenMutant, 126, (3, 3)),
+        (NativeService::NtQueryMutant, 169, (5, 5)),
         (NativeService::NtReleaseMutant, 196, (2, 2)),
     ] {
         assert_eq!(table.lookup(ssn).unwrap().service, service);
         assert_eq!(service.arg_count(), argc);
     }
+}
+
+#[test]
+fn timer_query_uses_native_number_and_argument_contract() {
+    let table = NativeServiceTable::from_numbers(
+        UserlandAbiProfile::Windows7,
+        &[(NativeService::NtQueryTimer, 183)],
+    );
+    assert_eq!(
+        table.lookup(183).map(|entry| entry.service),
+        Some(NativeService::NtQueryTimer)
+    );
+    assert_eq!(NativeService::NtQueryTimer.arg_count(), (5, 5));
 }
 
 #[test]

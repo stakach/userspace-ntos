@@ -62,10 +62,10 @@ NtOpenKeyTransactedEx	stdcall	ptr,long,ptr,long,long	syscall	-	K-config	kernel	w
 NtOpenKeyedEvent	stdcall	ptr,long,ptr	syscall	-	K-thread	kernel	wine-spec	ptr,long,ptr	ntstatus	planned
 NtQueryLicenseValue	stdcall	ptr,ptr,ptr,long,ptr	syscall	-	K-config	kernel	wine-spec	ptr,ptr,ptr,long,ptr	ntstatus	planned
 NtQueryMultipleValueKey	stdcall	long,ptr,long,ptr,long,ptr	syscall	-	K-config	kernel	wine-spec	long,ptr,long,ptr,long,ptr	ntstatus	planned
-NtQueryMutant	stdcall	long,long,ptr,long,ptr	syscall	-	K-thread	kernel	wine-spec	long,long,ptr,long,ptr	ntstatus	planned
+NtQueryMutant	stdcall	long,long,ptr,long,ptr	syscall	-	K-thread	kernel	wine-spec	long,long,ptr,long,ptr	ntstatus	implemented
 NtQuerySystemEnvironmentValue	stdcall	ptr,ptr,long,ptr	syscall	-	K-system	kernel	wine-spec	ptr,ptr,long,ptr	ntstatus	planned
 NtQuerySystemInformationEx	stdcall	long,ptr,long,ptr,long,ptr	syscall	-	K-system	kernel	wine-spec	long,ptr,long,ptr,long,ptr	ntstatus	planned
-NtQueryTimer	stdcall	ptr,long,ptr,long,ptr	syscall=0x0038	-	K-time	kernel	wine-spec	ptr,long,ptr,long,ptr	ntstatus	planned
+NtQueryTimer	stdcall	ptr,long,ptr,long,ptr	syscall=0x0038	-	K-time	kernel	wine-spec	ptr,long,ptr,long,ptr	ntstatus	implemented
 NtQueryTimerResolution	stdcall	ptr,ptr,ptr	syscall	-	K-time	kernel	wine-spec	ptr,ptr,ptr	ntstatus	planned
 NtQueueApcThreadEx	stdcall	long,long,ptr,long,long,long	syscall	-	K-thread	kernel	wine-spec	long,long,ptr,long,long,long	ntstatus	planned
 NtQueueApcThreadEx2	stdcall	long,long,long,ptr,long,long,long	syscall	-	K-thread	kernel	wine-spec	long,long,long,ptr,long,long,long	ntstatus	planned
@@ -284,10 +284,10 @@ ZwOpenKeyTransactedEx	stdcall	ptr,long,ptr,long,long	private	NtOpenKeyTransacted
 ZwOpenKeyedEvent	stdcall	ptr,long,ptr	private	NtOpenKeyedEvent	A-native	alias	wine-spec	ptr,long,ptr	ntstatus	planned
 ZwQueryLicenseValue	stdcall	ptr,ptr,ptr,long,ptr	private	NtQueryLicenseValue	A-native	alias	wine-spec	ptr,ptr,ptr,long,ptr	ntstatus	planned
 ZwQueryMultipleValueKey	stdcall	long,ptr,long,ptr,long,ptr	private	NtQueryMultipleValueKey	A-native	alias	wine-spec	long,ptr,long,ptr,long,ptr	ntstatus	planned
-ZwQueryMutant	stdcall	long,long,ptr,long,ptr	private	NtQueryMutant	A-native	alias	wine-spec	long,long,ptr,long,ptr	ntstatus	planned
+ZwQueryMutant	stdcall	long,long,ptr,long,ptr	private	NtQueryMutant	A-native	alias	wine-spec	long,long,ptr,long,ptr	ntstatus	implemented
 ZwQuerySystemEnvironmentValue	stdcall	ptr,ptr,long,ptr	private	NtQuerySystemEnvironmentValue	A-native	alias	wine-spec	ptr,ptr,long,ptr	ntstatus	planned
 ZwQuerySystemInformationEx	stdcall	long,ptr,long,ptr,long,ptr	private	NtQuerySystemInformationEx	A-native	alias	wine-spec	long,ptr,long,ptr,long,ptr	ntstatus	planned
-ZwQueryTimer	stdcall	ptr,long,ptr,long,ptr	private	NtQueryTimer	A-native	alias	wine-spec	ptr,long,ptr,long,ptr	ntstatus	planned
+ZwQueryTimer	stdcall	ptr,long,ptr,long,ptr	private	NtQueryTimer	A-native	alias	wine-spec	ptr,long,ptr,long,ptr	ntstatus	implemented
 ZwQueryTimerResolution	stdcall	ptr,ptr,ptr	private	NtQueryTimerResolution	A-native	alias	wine-spec	ptr,ptr,ptr	ntstatus	planned
 ZwQueueApcThreadEx	stdcall	long,long,ptr,long,long,long	private	NtQueueApcThreadEx	A-native	alias	wine-spec	long,long,ptr,long,long,long	ntstatus	planned
 ZwQueueApcThreadEx2	stdcall	long,long,long,ptr,long,long,long	private	NtQueueApcThreadEx2	A-native	alias	wine-spec	long,long,long,ptr,long,long,long	ntstatus	planned

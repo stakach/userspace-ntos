@@ -30,6 +30,7 @@ pub enum TimerError {
 struct TimerRecord {
     object_id: u64,
     deadline: Deadline,
+    retained_due_100ns: u64,
     period_100ns: u64,
     apc: ApcTarget,
 }
@@ -39,6 +40,7 @@ impl TimerRecord {
         Self {
             object_id,
             deadline: Deadline::Infinite,
+            retained_due_100ns: 0,
             period_100ns: 0,
             apc: ApcTarget {
                 thread_id: 0,
@@ -99,12 +101,16 @@ impl TimerTable {
         true
     }
 
-    pub fn cancel(&mut self, object_id: u64) -> bool {
+    pub fn cancel(&mut self, object_id: u64, now: TimeSnapshot) -> bool {
         let Some(position) = self.position(object_id) else {
             return false;
         };
-        let was_active = self.records[position].deadline != Deadline::Infinite;
-        self.records[position].deadline = Deadline::Infinite;
+        let timer = &mut self.records[position];
+        let was_active = timer.deadline != Deadline::Infinite;
+        if was_active {
+            timer.retained_due_100ns = active_due_100ns(timer, now);
+            timer.deadline = Deadline::Infinite;
+        }
         was_active
     }
 
@@ -115,13 +121,14 @@ impl TimerTable {
 
     /// Cancel timers whose APC is associated with a terminating thread. Timers without an APC are
     /// dispatcher objects independent of the thread that last set them and remain active.
-    pub fn cancel_apcs_for_thread(&mut self, thread_id: u64) -> usize {
+    pub fn cancel_apcs_for_thread(&mut self, thread_id: u64, now: TimeSnapshot) -> usize {
         let mut cancelled = 0;
         for timer in self.records.iter_mut().filter(|timer| {
             timer.deadline != Deadline::Infinite
                 && timer.apc.routine != 0
                 && timer.apc.thread_id == thread_id
         }) {
+            timer.retained_due_100ns = active_due_100ns(timer, now);
             timer.deadline = Deadline::Infinite;
             cancelled += 1;
         }
@@ -132,6 +139,7 @@ impl TimerTable {
         &mut self,
         object_id: u64,
         deadline: Deadline,
+        now: TimeSnapshot,
         period_100ns: u64,
         apc: ApcTarget,
     ) -> Result<bool, TimerError> {
@@ -143,10 +151,26 @@ impl TimerTable {
         self.records[position] = TimerRecord {
             object_id,
             deadline,
+            retained_due_100ns: deadline_due_100ns(deadline, now),
             period_100ns,
             apc,
         };
         Ok(was_active)
+    }
+
+    /// Return the signed time remaining against one coherent clock snapshot.
+    ///
+    /// NT retains a timer's last due time when a timer is cancelled or a one-shot timer expires,
+    /// so inactive timers use the retained interrupt-time due value rather than infinity.
+    pub fn remaining_100ns(&self, object_id: u64, now: TimeSnapshot) -> Option<i64> {
+        let position = self.position(object_id)?;
+        let timer = &self.records[position];
+        let due = if timer.deadline == Deadline::Infinite {
+            timer.retained_due_100ns
+        } else {
+            active_due_100ns(timer, now)
+        };
+        Some(due.wrapping_sub(now.monotonic_100ns) as i64)
     }
 
     pub fn next_deadline(&self, now: TimeSnapshot) -> Option<u64> {
@@ -168,6 +192,7 @@ impl TimerTable {
             .min_by_key(|(_, timer)| timer.deadline.ordering_key(now))
             .map(|(position, _)| position)?;
         let timer = &mut self.records[position];
+        timer.retained_due_100ns = active_due_100ns(timer, now);
         timer.deadline = if timer.period_100ns == 0 {
             Deadline::Infinite
         } else {
@@ -175,6 +200,9 @@ impl TimerTable {
                 monotonic_100ns: now.monotonic_100ns.saturating_add(timer.period_100ns),
             }
         };
+        if timer.period_100ns != 0 {
+            timer.retained_due_100ns = now.monotonic_100ns.saturating_add(timer.period_100ns);
+        }
         Some(Expiration {
             object_id: timer.object_id,
             system_time_100ns: now.system_time_100ns,
@@ -197,6 +225,24 @@ impl TimerTable {
     }
 }
 
+fn active_due_100ns(timer: &TimerRecord, now: TimeSnapshot) -> u64 {
+    match timer.deadline {
+        Deadline::Absolute { .. } => deadline_due_100ns(timer.deadline, now),
+        Deadline::Infinite | Deadline::Relative { .. } => timer.retained_due_100ns,
+    }
+}
+
+fn deadline_due_100ns(deadline: Deadline, now: TimeSnapshot) -> u64 {
+    match deadline {
+        Deadline::Infinite => 0,
+        Deadline::Relative { monotonic_100ns } => monotonic_100ns,
+        Deadline::Absolute { system_time_100ns } => {
+            (now.monotonic_100ns as i128 + system_time_100ns as i128
+                - now.system_time_100ns as i128) as u64
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,8 +260,10 @@ mod tests {
     fn inactive_timer_has_no_deadline_and_cancel_reports_false() {
         let mut timers = TimerTable::new();
         timers.ensure(7).unwrap();
+        assert_eq!(timers.remaining_100ns(99, snapshot(100, 1_000)), None);
         assert_eq!(timers.next_deadline(snapshot(100, 1_000)), None);
-        assert!(!timers.cancel(7));
+        assert_eq!(timers.remaining_100ns(7, snapshot(100, 1_000)), Some(-100));
+        assert!(!timers.cancel(7, snapshot(100, 1_000)));
         assert_eq!(timers.len(), 1);
     }
 
@@ -227,6 +275,7 @@ mod tests {
             .set(
                 1,
                 Deadline::from_nt_timeout(Some(-500), clock.snapshot(100)),
+                clock.snapshot(100),
                 0,
                 ApcTarget::default(),
             )
@@ -247,6 +296,7 @@ mod tests {
                 Deadline::Absolute {
                     system_time_100ns: 2_000,
                 },
+                clock.snapshot(100),
                 0,
                 ApcTarget::default(),
             )
@@ -257,6 +307,62 @@ mod tests {
         clock.set_system_time(300, 2_500).unwrap();
         assert_eq!(timers.next_deadline(clock.snapshot(300)), Some(300));
         assert!(timers.expire_next_due(clock.snapshot(300)).is_some());
+    }
+
+    #[test]
+    fn cancelled_absolute_timer_freezes_its_interrupt_due_time() {
+        let mut clock = AdjustableClock::try_new(100, 1_000).unwrap();
+        let mut timers = TimerTable::new();
+        timers
+            .set(
+                5,
+                Deadline::Absolute {
+                    system_time_100ns: 2_000,
+                },
+                clock.snapshot(100),
+                0,
+                ApcTarget::default(),
+            )
+            .unwrap();
+        assert!(timers.cancel(5, clock.snapshot(200)));
+        assert_eq!(timers.remaining_100ns(5, clock.snapshot(300)), Some(800));
+
+        clock.set_system_time(300, 50_000).unwrap();
+        assert_eq!(timers.remaining_100ns(5, clock.snapshot(400)), Some(700));
+    }
+
+    #[test]
+    fn active_absolute_timer_tracks_clock_changes_without_clamping_overdue_time() {
+        let mut clock = AdjustableClock::try_new(100, 1_000).unwrap();
+        let mut timers = TimerTable::new();
+        timers
+            .set(
+                5,
+                Deadline::Absolute {
+                    system_time_100ns: 2_000,
+                },
+                clock.snapshot(100),
+                0,
+                ApcTarget::default(),
+            )
+            .unwrap();
+        assert_eq!(timers.remaining_100ns(5, clock.snapshot(200)), Some(900));
+
+        clock.set_system_time(200, 2_500).unwrap();
+        assert_eq!(timers.remaining_100ns(5, clock.snapshot(200)), Some(-500));
+
+        clock.set_system_time(300, 1_000).unwrap();
+        assert_eq!(timers.remaining_100ns(5, clock.snapshot(300)), Some(1_000));
+    }
+
+    #[test]
+    fn remaining_time_uses_native_width_wrapping_subtraction() {
+        let mut timers = TimerTable::new();
+        timers.ensure(7).unwrap();
+        assert_eq!(
+            timers.remaining_100ns(7, snapshot(u64::MAX, 1_000)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -273,6 +379,7 @@ mod tests {
                 Deadline::Absolute {
                     system_time_100ns: 2_000,
                 },
+                snapshot(0, 1_500),
                 250,
                 apc,
             )
@@ -288,6 +395,42 @@ mod tests {
             })
         );
         assert_eq!(timers.next_deadline(snapshot(500, 90_000)), Some(750));
+        assert_eq!(timers.remaining_100ns(9, snapshot(500, 90_000)), Some(250));
+    }
+
+    #[test]
+    fn query_retains_last_due_time_after_cancel_and_one_shot_expiry() {
+        let mut timers = TimerTable::new();
+        timers
+            .set(
+                3,
+                Deadline::Relative {
+                    monotonic_100ns: 500,
+                },
+                snapshot(200, 2_000),
+                0,
+                ApcTarget::default(),
+            )
+            .unwrap();
+        assert_eq!(timers.remaining_100ns(3, snapshot(200, 2_000)), Some(300));
+        assert!(timers.cancel(3, snapshot(200, 2_000)));
+        assert_eq!(timers.next_deadline(snapshot(200, 2_000)), None);
+        assert_eq!(timers.remaining_100ns(3, snapshot(300, 2_100)), Some(200));
+
+        timers
+            .set(
+                3,
+                Deadline::Relative {
+                    monotonic_100ns: 700,
+                },
+                snapshot(300, 2_100),
+                0,
+                ApcTarget::default(),
+            )
+            .unwrap();
+        assert!(timers.expire_next_due(snapshot(800, 2_600)).is_some());
+        assert_eq!(timers.next_deadline(snapshot(800, 2_600)), None);
+        assert_eq!(timers.remaining_100ns(3, snapshot(800, 2_600)), Some(-100));
     }
 
     #[test]
@@ -299,6 +442,7 @@ mod tests {
                 Deadline::Absolute {
                     system_time_100ns: 1_900,
                 },
+                snapshot(0, 1_500),
                 0,
                 ApcTarget::default(),
             )
@@ -309,6 +453,7 @@ mod tests {
                 Deadline::Absolute {
                     system_time_100ns: 1_800,
                 },
+                snapshot(0, 1_500),
                 0,
                 ApcTarget::default(),
             )
@@ -319,6 +464,7 @@ mod tests {
                 Deadline::Absolute {
                     system_time_100ns: 1_800,
                 },
+                snapshot(0, 1_500),
                 0,
                 ApcTarget::default(),
             )
@@ -339,12 +485,13 @@ mod tests {
                 Deadline::Relative {
                     monotonic_100ns: 400,
                 },
+                snapshot(100, 1_000),
                 0,
                 ApcTarget::default(),
             )
             .unwrap();
-        assert!(timers.cancel(4));
-        assert!(!timers.cancel(4));
+        assert!(timers.cancel(4, snapshot(100, 1_000)));
+        assert!(!timers.cancel(4, snapshot(100, 1_000)));
         assert!(timers.remove(4));
         assert!(!timers.remove(4));
         assert!(timers.is_empty());
@@ -360,6 +507,7 @@ mod tests {
             .set(
                 1,
                 deadline,
+                snapshot(100, 1_000),
                 0,
                 ApcTarget {
                     thread_id: 9,
@@ -368,11 +516,14 @@ mod tests {
                 },
             )
             .unwrap();
-        timers.set(2, deadline, 0, ApcTarget::default()).unwrap();
+        timers
+            .set(2, deadline, snapshot(100, 1_000), 0, ApcTarget::default())
+            .unwrap();
         timers
             .set(
                 3,
                 deadline,
+                snapshot(100, 1_000),
                 0,
                 ApcTarget {
                     thread_id: 10,
@@ -382,7 +533,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(timers.cancel_apcs_for_thread(9), 1);
+        assert_eq!(timers.cancel_apcs_for_thread(9, snapshot(100, 1_000)), 1);
         assert_eq!(timers.deadline(1), Some(Deadline::Infinite));
         assert_eq!(timers.deadline(2), Some(deadline));
         assert_eq!(timers.deadline(3), Some(deadline));
@@ -398,6 +549,7 @@ mod tests {
                     Deadline::Relative {
                         monotonic_100ns: 1_000 + object_id,
                     },
+                    snapshot(100, 500),
                     0,
                     ApcTarget::default(),
                 )

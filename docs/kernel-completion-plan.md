@@ -20386,11 +20386,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-io-manager` 245/245, `nt-acpi` 33/33, `nt-pnp` 64/64, and `nt-pnp-manager` 50/50; the
     freestanding executive check remains green at 209 warnings.
 
-    B3 runtime acceptance remains open. The currently running desktop QEMU owns the serialized boot
-    lane and was not disturbed. The next acceptance run must prove real route publication, then
-    remove and re-add one of two NICs without disturbing its sibling, with no PCI config-line or
-    synthetic interrupt fallback. Multi-segment PCI remains a later ownership extension: the live
-    boot authority currently installs the discovered segment-zero inventory only.
+    B3 runtime acceptance remains open. The stale desktop QEMU that had run for more than 20 hours
+    was terminated; it was not useful boot-progress evidence. `run.sh` now owns every desktop and
+    headless validation through `scripts/run_with_timeout.py`, preserves the log, returns 124 on
+    timeout, and imposes a hard 3,600-second boot-validation limit. The next acceptance run must prove
+    real route publication, then remove and re-add one of two NICs without disturbing its sibling,
+    with no PCI config-line or synthetic interrupt fallback. Multi-segment PCI remains a later
+    ownership extension: the live boot authority currently installs the discovered segment-zero
+    inventory only.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
@@ -20455,13 +20458,30 @@ stubs; those rows identify compatibility names only and do not license stub beha
   ordinals are explicitly excluded. Six names remain intentionally `blocked-abi`: the five bare
   legacy CSR stub rows plus `RtlSetPropertyClassId` lack a defensible callable prototype across the
   three references. They remain absent until a native symbol/caller oracle resolves them; this is a
-  fail-closed reconciliation result, not an implementation fallback. Local validation passes the
-  nine `ntdll-dll-verify` tests and the exact current Wine report with 366 planned, 6 ABI-blocked,
+  fail-closed reconciliation result, not an implementation fallback. Initial catalog validation
+  passed the nine `ntdll-dll-verify` tests and the exact Wine report with 366 planned, 6 ABI-blocked,
   and 0 implemented frontier rows.
 - [ ] Complete missing `Nt*` services only through the shared `nt-syscall-abi` table and genuine
   executive/object/VM/I/O/security/IPC semantics. Add the corresponding `Zw*` alias in the same
   slice. Do not allocate new syscall numbers from Wine's host-specific numbering and do not add
   success fallbacks.
+
+  Native mutant/timer query checkpoint (2026-08-31): `NtQueryMutant`/`ZwQueryMutant` use ReactOS SSN
+  169 and `NtQueryTimer`/`ZwQueryTimer` use SSN 183, all with the exact five-argument ABI. Both
+  services probe their complete fixed output and optional unaligned `ReturnLength` before validating
+  class 0 and exact length, enforce typed query-state access, preserve structure padding, and publish
+  `ReturnLength` only after successful state copyout. Mutant state now uses the native signed signal
+  count, owner/abandonment semantics, one-shot `STATUS_ABANDONED` propagation, and
+  `STATUS_MUTANT_LIMIT_EXCEEDED` without partial wait-all consumption. Timer state retains cancelled
+  and expired due times, tracks active absolute timers across clock changes, and reports signed
+  wrapping remaining time plus the real dispatcher signal state.
+
+  Focused validation passes `nt-user-timer` 12/12, `nt-kernel-exec` 184/184, `nt-syscall-abi` 19/19,
+  `nt-syscall` 80/80, the six ntdll trap-stub tests, the freestanding executive check, and all nine
+  reconciliation tests. The rebuilt PE has 1,376 exports, all 226 shared `Nt*` stubs and 226 `Zw*`
+  aliases, covers 1,093 Wine names, and leaves 368 absent. The exact ledger is now 362 planned, 6
+  ABI-blocked, and 4 implemented rows. The native-service item remains open for the remaining 69
+  `Nt*` services and their 69 aliases.
 - [ ] Complete `Rtl*`, `Ldr*`, `Tp*`, `Csr*`, API-set, CRT, and data exports in the host-testable
   ntdll crates wherever kernel authority is unnecessary. Keep loader, thread-pool, synchronization,
   and process-start policy in user mode; add kernel support only for an actual NT primitive.

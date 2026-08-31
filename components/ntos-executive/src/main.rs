@@ -1024,9 +1024,11 @@ pub const SSN_NT_SET_EVENT: u64 = 228;
 pub const SSN_NT_CANCEL_TIMER: u64 = 25;
 pub const SSN_NT_CREATE_TIMER: u64 = 56;
 pub const SSN_NT_OPEN_TIMER: u64 = 137;
+pub const SSN_NT_QUERY_TIMER: u64 = 183;
 pub const SSN_NT_SET_TIMER: u64 = 253;
 pub const SSN_NT_CREATE_MUTANT: u64 = 45;
 pub const SSN_NT_OPEN_MUTANT: u64 = 126;
+pub const SSN_NT_QUERY_MUTANT: u64 = 169;
 pub const SSN_NT_RELEASE_MUTANT: u64 = 196;
 pub const SSN_NT_CREATE_SEMAPHORE: u64 = 53;
 pub const SSN_NT_OPEN_SEMAPHORE: u64 = 132;
@@ -19206,21 +19208,45 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
         if !wake {
             continue;
         }
+        let mutant_limit = if record.wait_all {
+            record.objects[..count.min(WAITER_MAX_EVENTS)]
+                .iter()
+                .copied()
+                .any(|object| handler.wait_object_mutant_limit_for(object, record.tid))
+        } else {
+            handler.wait_object_mutant_limit_for(record.objects[selected_slot], record.tid)
+        };
         // Consume the selected dispatcher transaction only after the condition is known to hold.
         let mut wake_object = record.objects[selected_slot.min(count.saturating_sub(1))];
-        if record.wait_all {
+        if mutant_limit {
+            wake_index = 0xC000_0191; // STATUS_MUTANT_LIMIT_EXCEEDED
+        } else if record.wait_all {
+            let mut abandoned = false;
             for k in 0..count.min(WAITER_MAX_EVENTS) {
                 let object = record.objects[k];
                 if WaitObject::from_raw(object.raw()).is_none() {
                     continue;
                 };
-                handler.wait_object_consume_for(object, record.tid);
+                abandoned |= handler.wait_object_consume_for(object, record.tid)
+                    == nt_kernel_exec::DispatcherConsumeResult::Abandoned;
             }
             wake_object = record.objects[0];
+            if abandoned {
+                wake_index = 0x80;
+            }
         } else {
             let object = record.objects[selected_slot];
             if WaitObject::from_raw(object.raw()).is_some() {
-                handler.wait_object_consume_for(object, record.tid);
+                match handler.wait_object_consume_for(object, record.tid) {
+                    nt_kernel_exec::DispatcherConsumeResult::Abandoned => {
+                        wake_index = 0x80 + wake_index;
+                    }
+                    nt_kernel_exec::DispatcherConsumeResult::MutantLimitExceeded => {
+                        wake_index = 0xC000_0191;
+                    }
+                    nt_kernel_exec::DispatcherConsumeResult::Consumed
+                    | nt_kernel_exec::DispatcherConsumeResult::NotReady => {}
+                }
             }
         }
         object_waiter_mark_pending_wake(i, wake_index, wake_object);
@@ -19238,7 +19264,7 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
         };
         let cap = record.reply_cap;
         if cap != 0 {
-            // Resume with STATUS_WAIT_0 + index. UnknownSyscall replies restore the exact retained
+            // Resume with the exact wait status. UnknownSyscall replies restore the exact retained
             // register file with only RAX replaced; native seL4 calls receive a one-word status.
             reply_parked_syscall(cap, record.reply, wake_index);
             // Return this reply object to the pool (clear its used bit).
@@ -22864,9 +22890,11 @@ const SYMBOLIC_LINK_QUERY_ACCESS: u32 = 0x0001;
 const OBJ_PERMANENT: u32 = 0x0000_0010;
 const EVENT_QUERY_STATE: u32 = 0x0001;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
+const TIMER_QUERY_STATE: u32 = 0x0001;
 const TIMER_MODIFY_STATE: u32 = 0x0002;
 const SEMAPHORE_QUERY_STATE: u32 = 0x0001;
 const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
+const MUTANT_QUERY_STATE: u32 = 0x0001;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 
@@ -25657,6 +25685,7 @@ fn build_nt_table() -> NativeServiceTable {
             (NativeService::NtCreateTimer, SSN_NT_CREATE_TIMER as u32),
             (NativeService::NtOpenTimer, SSN_NT_OPEN_TIMER as u32),
             (NativeService::NtCancelTimer, SSN_NT_CANCEL_TIMER as u32),
+            (NativeService::NtQueryTimer, SSN_NT_QUERY_TIMER as u32),
             (NativeService::NtSetTimer, SSN_NT_SET_TIMER as u32),
             (
                 NativeService::NtCreateSemaphore,
@@ -25673,6 +25702,7 @@ fn build_nt_table() -> NativeServiceTable {
             ),
             (NativeService::NtCreateMutant, SSN_NT_CREATE_MUTANT as u32),
             (NativeService::NtOpenMutant, SSN_NT_OPEN_MUTANT as u32),
+            (NativeService::NtQueryMutant, SSN_NT_QUERY_MUTANT as u32),
             (NativeService::NtReleaseMutant, SSN_NT_RELEASE_MUTANT as u32),
             // NT LPC connection rendezvous → isolated nt-lpc-server (control plane).
             (NativeService::NtConnectPort, SSN_NT_CONNECT_PORT as u32),

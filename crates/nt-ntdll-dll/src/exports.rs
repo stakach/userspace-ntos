@@ -25186,6 +25186,7 @@ zw_alias!(
     nt_query_io_completion
 );
 zw_alias!(zw_query_key, "ZwQueryKey", nt_query_key);
+zw_alias!(zw_query_mutant, "ZwQueryMutant", nt_query_mutant);
 zw_alias!(zw_query_object, "ZwQueryObject", nt_query_object);
 zw_alias!(
     zw_query_performance_counter,
@@ -25219,6 +25220,7 @@ zw_alias!(
     "ZwQuerySystemTime",
     nt_query_system_time
 );
+zw_alias!(zw_query_timer, "ZwQueryTimer", nt_query_timer);
 zw_alias!(zw_query_value_key, "ZwQueryValueKey", nt_query_value_key);
 zw_alias!(
     zw_query_virtual_memory,
@@ -30261,6 +30263,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_query_install_ui_language as *const () as usize,
         zw_query_io_completion as *const () as usize,
         zw_query_key as *const () as usize,
+        zw_query_mutant as *const () as usize,
         zw_query_object as *const () as usize,
         zw_query_performance_counter as *const () as usize,
         zw_query_section as *const () as usize,
@@ -30270,6 +30273,7 @@ pub unsafe extern "C" fn export_anchor() {
         zw_query_system_environment_value_ex as *const () as usize,
         zw_query_system_information as *const () as usize,
         zw_query_system_time as *const () as usize,
+        zw_query_timer as *const () as usize,
         zw_query_value_key as *const () as usize,
         zw_query_virtual_memory as *const () as usize,
         zw_query_volume_information_file as *const () as usize,

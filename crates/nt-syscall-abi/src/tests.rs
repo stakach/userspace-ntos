@@ -5,8 +5,8 @@ use super::*;
 /// The exact count of `Nt*` services in the shared table: the current hosted ReactOS import set,
 /// ntdll-internal services (`NtSecureConnectPort`, `NtCallbackReturn`), and registry hive
 /// load/unload variants that route to real executive CM functionality.
-const REQUIRED_NT_COUNT: usize = 223;
-const REQUIRED_ZW_COUNT: usize = 223;
+const REQUIRED_NT_COUNT: usize = 226;
+const REQUIRED_ZW_COUNT: usize = 226;
 
 #[test]
 fn required_counts() {
@@ -122,9 +122,11 @@ fn ssn_anchors_match_reactos_and_executive() {
         ("NtProtectVirtualMemory", 143),  // SSN_NT_PROTECT_VM = 143
         ("NtQueryDebugFilterState", 148), // SSN_NT_QUERY_DEBUG_FILTER_STATE = 148
         ("NtQueryIoCompletion", 166),     // SSN_NT_QUERY_IO_COMPLETION = 166
+        ("NtQueryMutant", 169),           // SSN_NT_QUERY_MUTANT = 169
         ("NtQueryQuotaInformationFile", 174),
         ("NtQuerySystemInformation", 181), // SSN_NT_QUERY_SYSTEM_INFO = 0xb5
         ("NtQuerySystemTime", 182),        // SSN_NT_QUERY_SYSTEM_TIME_SVC = 182
+        ("NtQueryTimer", 183),             // SSN_NT_QUERY_TIMER = 183
         ("NtResumeProcess", 213),          // SSN_NT_RESUME_PROCESS = 213
         ("NtQueryValueKey", 185),          // SSN_NT_QUERY_VALUE_KEY = 185
         ("NtRaiseException", 189),         // SSN_NT_RAISE_EXCEPTION = 189
@@ -187,6 +189,8 @@ fn arity_anchors_and_fallback() {
     assert_eq!(argc_of("NtUnloadKeyEx"), 2);
     assert_eq!(argc_of("NtQueryDefaultUILanguage"), 1);
     assert_eq!(argc_of("NtQueryInstallUILanguage"), 1);
+    assert_eq!(argc_of("NtQueryMutant"), 5);
+    assert_eq!(argc_of("NtQueryTimer"), 5);
     assert_eq!(argc_of("NtSetDefaultUILanguage"), 1);
     // Zw* inherits its underlying Nt*'s arity.
     assert_eq!(argc_of("ZwSetValueKey"), argc_of("NtSetValueKey"));

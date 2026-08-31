@@ -203,10 +203,17 @@ pub struct HostedDispatcherWaiter {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HostedDispatcherCompletion {
+    Satisfied(usize),
+    Abandoned(usize),
+    MutantLimitExceeded,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HostedDispatcherWake {
     pub thread_handle: u64,
     pub reply_cap: u64,
-    pub wait_status_index: usize,
+    pub completion: HostedDispatcherCompletion,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -219,6 +226,7 @@ pub struct HostedDispatcherTimeout {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HostedDispatcherWaitAdmission {
     Satisfied(usize),
+    Abandoned(usize),
     PollTimeout,
     Parked,
 }
@@ -229,6 +237,7 @@ pub enum HostedDispatcherWaitError {
     InvalidReply,
     InvalidObject,
     DuplicateObject,
+    MutantLimitExceeded,
     AlreadyParked,
     NoCapacity,
 }
@@ -297,12 +306,18 @@ impl HostedDispatcherWaitQueue {
             DispatcherWaitResult::Signaled(index) => {
                 return Ok(HostedDispatcherWaitAdmission::Satisfied(index));
             }
+            DispatcherWaitResult::Abandoned(index) => {
+                return Ok(HostedDispatcherWaitAdmission::Abandoned(index));
+            }
             DispatcherWaitResult::TimedOut => {}
             DispatcherWaitResult::InvalidObject => {
                 return Err(HostedDispatcherWaitError::InvalidObject);
             }
             DispatcherWaitResult::DuplicateObject => {
                 return Err(HostedDispatcherWaitError::DuplicateObject);
+            }
+            DispatcherWaitResult::MutantLimitExceeded => {
+                return Err(HostedDispatcherWaitError::MutantLimitExceeded);
             }
         }
         if timeout == DispatcherWaitTimeout::Poll {
@@ -360,20 +375,24 @@ impl HostedDispatcherWaitQueue {
             }
         })?;
         let waiter = self.waiters.remove(index);
-        let wake_index = match poll_dispatchers(
+        let completion = match poll_dispatchers(
             events,
             semaphores,
             mutants,
             &waiter.objects,
             waiter.wait_all,
         ) {
-            DispatcherWaitResult::Signaled(index) => index,
+            DispatcherWaitResult::Signaled(index) => HostedDispatcherCompletion::Satisfied(index),
+            DispatcherWaitResult::Abandoned(index) => HostedDispatcherCompletion::Abandoned(index),
+            DispatcherWaitResult::MutantLimitExceeded => {
+                HostedDispatcherCompletion::MutantLimitExceeded
+            }
             _ => return None,
         };
         Some(HostedDispatcherWake {
             thread_handle: waiter.thread_handle,
             reply_cap: waiter.reply_cap,
-            wait_status_index: wake_index,
+            completion,
         })
     }
 
@@ -517,7 +536,7 @@ mod tests {
             Some(HostedDispatcherWake {
                 thread_handle: 0x9000,
                 reply_cap: 0x50,
-                wait_status_index: 0,
+                completion: HostedDispatcherCompletion::Satisfied(0),
             })
         );
         assert_eq!(semaphores.query(7), Some((0, 2)));
@@ -575,11 +594,44 @@ mod tests {
             Some(HostedDispatcherWake {
                 thread_handle: 0x9000,
                 reply_cap: 0x52,
-                wait_status_index: 0,
+                completion: HostedDispatcherCompletion::Satisfied(0),
             })
         );
         assert!(!events.read_state(1));
         assert_eq!(semaphores.query(2), Some((0, 1)));
+    }
+
+    #[test]
+    fn parked_mutant_wait_reports_abandonment() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        mutants.initialize(3, Some(40));
+        let mut waits = HostedDispatcherWaitQueue::new();
+        let objects = [DispatcherObject::Mutant {
+            identity: 3,
+            thread: 41,
+        }];
+        assert_eq!(
+            waits.admit(
+                &mut events,
+                &mut semaphores,
+                &mut mutants,
+                0x9000,
+                0x53,
+                &objects,
+                false,
+                DispatcherWaitTimeout::Infinite,
+            ),
+            Ok(HostedDispatcherWaitAdmission::Parked)
+        );
+        assert_eq!(mutants.abandon_thread(40), 1);
+        assert_eq!(
+            waits.pop_ready(&mut events, &mut semaphores, &mut mutants),
+            Some(HostedDispatcherWake {
+                thread_handle: 0x9000,
+                reply_cap: 0x53,
+                completion: HostedDispatcherCompletion::Abandoned(0),
+            })
+        );
     }
 
     #[test]
@@ -724,7 +776,7 @@ mod tests {
             Some(HostedDispatcherWake {
                 thread_handle: 0x9000,
                 reply_cap: 0x63,
-                wait_status_index: 0,
+                completion: HostedDispatcherCompletion::Satisfied(0),
             })
         );
         assert_eq!(waits.pop_due(snapshot(50, 150)), None);

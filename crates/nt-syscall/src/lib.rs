@@ -200,6 +200,7 @@ pub enum NativeService {
     NtCreateTimer,
     NtOpenTimer,
     NtCancelTimer,
+    NtQueryTimer,
     NtSetTimer,
     NtCreateSemaphore,
     NtOpenSemaphore,
@@ -207,6 +208,7 @@ pub enum NativeService {
     NtReleaseSemaphore,
     NtCreateMutant,
     NtOpenMutant,
+    NtQueryMutant,
     NtReleaseMutant,
     // NT LPC connection rendezvous (control plane) — routed to the isolated nt-lpc-server over
     // SURT. The message data plane (request/reply/receive) is served directly by the executive
@@ -431,6 +433,7 @@ impl NativeService {
             NtCreateTimer => "NtCreateTimer",
             NtOpenTimer => "NtOpenTimer",
             NtCancelTimer => "NtCancelTimer",
+            NtQueryTimer => "NtQueryTimer",
             NtSetTimer => "NtSetTimer",
             NtCreateSemaphore => "NtCreateSemaphore",
             NtOpenSemaphore => "NtOpenSemaphore",
@@ -438,6 +441,7 @@ impl NativeService {
             NtReleaseSemaphore => "NtReleaseSemaphore",
             NtCreateMutant => "NtCreateMutant",
             NtOpenMutant => "NtOpenMutant",
+            NtQueryMutant => "NtQueryMutant",
             NtReleaseMutant => "NtReleaseMutant",
             NtConnectPort => "NtConnectPort",
             NtSecureConnectPort => "NtSecureConnectPort",
@@ -715,6 +719,8 @@ impl NativeService {
         NativeService::NtRequestWakeupLatency,
         NativeService::NtSetDefaultHardErrorPort,
         NativeService::NtCreateProcessEx,
+        NativeService::NtQueryMutant,
+        NativeService::NtQueryTimer,
     ];
 }
 

@@ -10,6 +10,20 @@ use alloc::vec::Vec;
 pub enum MutantError {
     NotFound,
     NotOwned,
+    LimitExceeded,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MutantAcquire {
+    Busy,
+    Acquired { abandoned: bool },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MutantBasicState {
+    pub current_count: i32,
+    pub owned_by_caller: bool,
+    pub abandoned: bool,
 }
 
 pub fn map_mutant_access(mut access: u32) -> u32 {
@@ -19,6 +33,9 @@ pub fn map_mutant_access(mut access: u32) -> u32 {
 
     if access & 0x8000_0000 != 0 {
         access |= 0x0002_0000 | MUTANT_QUERY_STATE;
+    }
+    if access & 0x4000_0000 != 0 {
+        access |= 0x0002_0000;
     }
     if access & 0x2000_0000 != 0 {
         access |= 0x0002_0000 | SYNCHRONIZE;
@@ -32,7 +49,7 @@ pub fn map_mutant_access(mut access: u32) -> u32 {
 struct Mutant {
     identity: u64,
     owner_thread: u64,
-    recursion: u32,
+    current_count: i32,
     abandoned: bool,
 }
 
@@ -53,9 +70,9 @@ impl MutantStore {
     }
 
     pub fn initialize(&mut self, identity: u64, initial_owner: Option<u64>) {
-        let (owner_thread, recursion) = match initial_owner.filter(|tid| *tid != 0) {
-            Some(tid) => (tid, 1),
-            None => (0, 0),
+        let (owner_thread, current_count) = match initial_owner.filter(|tid| *tid != 0) {
+            Some(tid) => (tid, 0),
+            None => (0, 1),
         };
         if let Some(mutant) = self
             .mutants
@@ -63,14 +80,14 @@ impl MutantStore {
             .find(|mutant| mutant.identity == identity)
         {
             mutant.owner_thread = owner_thread;
-            mutant.recursion = recursion;
+            mutant.current_count = current_count;
             mutant.abandoned = false;
             return;
         }
         self.mutants.push(Mutant {
             identity,
             owner_thread,
-            recursion,
+            current_count,
             abandoned: false,
         });
     }
@@ -88,17 +105,43 @@ impl MutantStore {
             .is_some_and(|mutant| mutant.owner_thread == 0 || mutant.owner_thread == thread)
     }
 
-    pub fn acquire(&mut self, identity: u64, thread: u64) -> Option<bool> {
+    pub fn acquire(&mut self, identity: u64, thread: u64) -> Result<MutantAcquire, MutantError> {
         let mutant = self
             .mutants
             .iter_mut()
-            .find(|mutant| mutant.identity == identity)?;
+            .find(|mutant| mutant.identity == identity)
+            .ok_or(MutantError::NotFound)?;
         if mutant.owner_thread != 0 && mutant.owner_thread != thread {
-            return Some(false);
+            return Ok(MutantAcquire::Busy);
         }
+        if mutant.current_count == i32::MIN {
+            return Err(MutantError::LimitExceeded);
+        }
+        let abandoned = mutant.abandoned;
         mutant.owner_thread = thread;
-        mutant.recursion = mutant.recursion.saturating_add(1).max(1);
-        Some(true)
+        mutant.current_count -= 1;
+        mutant.abandoned = false;
+        Ok(MutantAcquire::Acquired { abandoned })
+    }
+
+    pub fn acquire_would_exceed(&self, identity: u64, thread: u64) -> bool {
+        self.mutants.iter().any(|mutant| {
+            mutant.identity == identity
+                && mutant.owner_thread == thread
+                && mutant.current_count == i32::MIN
+        })
+    }
+
+    pub fn query(&self, identity: u64, caller_thread: u64) -> Option<MutantBasicState> {
+        let mutant = self
+            .mutants
+            .iter()
+            .find(|mutant| mutant.identity == identity)?;
+        Some(MutantBasicState {
+            current_count: mutant.current_count,
+            owned_by_caller: mutant.owner_thread != 0 && mutant.owner_thread == caller_thread,
+            abandoned: mutant.abandoned,
+        })
     }
 
     pub fn release(&mut self, identity: u64, thread: u64) -> Result<i32, MutantError> {
@@ -110,9 +153,9 @@ impl MutantStore {
         if mutant.owner_thread == 0 || mutant.owner_thread != thread {
             return Err(MutantError::NotOwned);
         }
-        let previous = 0;
-        mutant.recursion = mutant.recursion.saturating_sub(1);
-        if mutant.recursion == 0 {
+        let previous = mutant.current_count;
+        mutant.current_count += 1;
+        if mutant.current_count == 1 {
             mutant.owner_thread = 0;
         }
         Ok(previous)
@@ -126,7 +169,7 @@ impl MutantStore {
         for mutant in &mut self.mutants {
             if mutant.owner_thread == thread {
                 mutant.owner_thread = 0;
-                mutant.recursion = 0;
+                mutant.current_count = 1;
                 mutant.abandoned = true;
                 abandoned += 1;
             }
@@ -156,7 +199,10 @@ mod tests {
         let mut store = MutantStore::new();
         store.initialize(7, None);
         assert!(store.ready_for(7, 10));
-        assert_eq!(store.acquire(7, 10), Some(true));
+        assert_eq!(
+            store.acquire(7, 10),
+            Ok(MutantAcquire::Acquired { abandoned: false })
+        );
         assert!(!store.ready_for(7, 11));
         assert!(store.ready_for(7, 10));
     }
@@ -174,11 +220,79 @@ mod tests {
     fn recursive_owner_release_keeps_object_unsignaled_until_final_release() {
         let mut store = MutantStore::new();
         store.initialize(9, Some(21));
-        assert_eq!(store.acquire(9, 21), Some(true));
-        assert_eq!(store.release(9, 21), Ok(0));
+        assert_eq!(
+            store.acquire(9, 21),
+            Ok(MutantAcquire::Acquired { abandoned: false })
+        );
+        assert_eq!(store.release(9, 21), Ok(-1));
         assert!(!store.ready_for(9, 22));
         assert_eq!(store.release(9, 21), Ok(0));
         assert!(store.ready_for(9, 22));
+    }
+
+    #[test]
+    fn query_reports_native_count_owner_and_abandoned_state() {
+        let mut store = MutantStore::new();
+        store.initialize(13, None);
+        assert_eq!(
+            store.query(13, 50),
+            Some(MutantBasicState {
+                current_count: 1,
+                owned_by_caller: false,
+                abandoned: false,
+            })
+        );
+
+        assert_eq!(
+            store.acquire(13, 50),
+            Ok(MutantAcquire::Acquired { abandoned: false })
+        );
+        assert_eq!(
+            store.acquire(13, 50),
+            Ok(MutantAcquire::Acquired { abandoned: false })
+        );
+        assert_eq!(
+            store.query(13, 50),
+            Some(MutantBasicState {
+                current_count: -1,
+                owned_by_caller: true,
+                abandoned: false,
+            })
+        );
+
+        assert_eq!(store.abandon_thread(50), 1);
+        assert_eq!(
+            store.query(13, 51),
+            Some(MutantBasicState {
+                current_count: 1,
+                owned_by_caller: false,
+                abandoned: true,
+            })
+        );
+        assert_eq!(
+            store.acquire(13, 51),
+            Ok(MutantAcquire::Acquired { abandoned: true })
+        );
+        assert!(!store.query(13, 51).unwrap().abandoned);
+    }
+
+    #[test]
+    fn query_rejects_missing_identity_and_reports_only_the_calling_owner() {
+        let mut store = MutantStore::new();
+        assert_eq!(store.query(99, 50), None);
+        store.initialize(13, Some(50));
+        assert!(!store.query(13, 51).unwrap().owned_by_caller);
+        assert!(store.query(13, 50).unwrap().owned_by_caller);
+    }
+
+    #[test]
+    fn recursion_limit_fails_without_mutating_state() {
+        let mut store = MutantStore::new();
+        store.initialize(14, Some(60));
+        store.mutants[0].current_count = i32::MIN;
+        assert!(store.acquire_would_exceed(14, 60));
+        assert_eq!(store.acquire(14, 60), Err(MutantError::LimitExceeded));
+        assert_eq!(store.query(14, 60).unwrap().current_count, i32::MIN);
     }
 
     #[test]
@@ -197,6 +311,7 @@ mod tests {
     #[test]
     fn generic_access_maps_to_native_rights() {
         assert_eq!(map_mutant_access(0x8000_0000) & 1, 1);
+        assert_eq!(map_mutant_access(0x4000_0000), 0x0002_0000);
         assert_eq!(map_mutant_access(0x2000_0000) & 0x0010_0000, 0x0010_0000);
         assert_eq!(map_mutant_access(0x1000_0000), 0x001F_0001);
     }

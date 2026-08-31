@@ -1,6 +1,6 @@
 //! Atomic polling across the dispatcher object kinds shared by native waits.
 
-use crate::{EventStore, MutantError, MutantStore, SemaphoreError, SemaphoreStore};
+use crate::{EventStore, MutantAcquire, MutantError, MutantStore, SemaphoreError, SemaphoreStore};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DispatcherObject {
@@ -27,9 +27,19 @@ pub enum DispatcherSignalError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DispatcherWaitResult {
     Signaled(usize),
+    Abandoned(usize),
     TimedOut,
     InvalidObject,
     DuplicateObject,
+    MutantLimitExceeded,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatcherConsumeResult {
+    Consumed,
+    Abandoned,
+    NotReady,
+    MutantLimitExceeded,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -70,13 +80,24 @@ pub fn consume_dispatcher(
     semaphores: &mut SemaphoreStore,
     mutants: &mut MutantStore,
     object: DispatcherObject,
-) -> bool {
+) -> DispatcherConsumeResult {
     match object {
-        DispatcherObject::Event(identity) => events.consume_existing(identity),
-        DispatcherObject::Semaphore(identity) => semaphores.try_wait(identity) == Some(true),
-        DispatcherObject::Mutant { identity, thread } => {
-            mutants.acquire(identity, thread) == Some(true)
-        }
+        DispatcherObject::Event(identity) => events
+            .consume_existing(identity)
+            .then_some(DispatcherConsumeResult::Consumed)
+            .unwrap_or(DispatcherConsumeResult::NotReady),
+        DispatcherObject::Semaphore(identity) => (semaphores.try_wait(identity) == Some(true))
+            .then_some(DispatcherConsumeResult::Consumed)
+            .unwrap_or(DispatcherConsumeResult::NotReady),
+        DispatcherObject::Mutant { identity, thread } => match mutants.acquire(identity, thread) {
+            Ok(MutantAcquire::Acquired { abandoned: true }) => DispatcherConsumeResult::Abandoned,
+            Ok(MutantAcquire::Acquired { abandoned: false }) => DispatcherConsumeResult::Consumed,
+            Ok(MutantAcquire::Busy) | Err(MutantError::NotFound) => {
+                DispatcherConsumeResult::NotReady
+            }
+            Err(MutantError::LimitExceeded) => DispatcherConsumeResult::MutantLimitExceeded,
+            Err(MutantError::NotOwned) => DispatcherConsumeResult::NotReady,
+        },
     }
 }
 
@@ -107,7 +128,9 @@ pub fn signal_dispatcher_for_wait(
             .map(|_| ())
             .map_err(|error| match error {
                 MutantError::NotOwned => DispatcherSignalError::MutantNotOwned,
-                MutantError::NotFound => DispatcherSignalError::InvalidObject,
+                MutantError::NotFound | MutantError::LimitExceeded => {
+                    DispatcherSignalError::InvalidObject
+                }
             }),
     }
 }
@@ -140,16 +163,36 @@ pub fn poll_dispatchers(
         {
             return DispatcherWaitResult::TimedOut;
         }
-        for object in objects {
-            consume_dispatcher(events, semaphores, mutants, *object);
+        if objects.iter().any(|object| match object {
+            DispatcherObject::Mutant { identity, thread } => {
+                mutants.acquire_would_exceed(*identity, *thread)
+            }
+            _ => false,
+        }) {
+            return DispatcherWaitResult::MutantLimitExceeded;
         }
-        DispatcherWaitResult::Signaled(0)
+        let mut abandoned = false;
+        for object in objects {
+            abandoned |= consume_dispatcher(events, semaphores, mutants, *object)
+                == DispatcherConsumeResult::Abandoned;
+        }
+        if abandoned {
+            DispatcherWaitResult::Abandoned(0)
+        } else {
+            DispatcherWaitResult::Signaled(0)
+        }
     } else if let Some(index) = objects
         .iter()
         .position(|object| dispatcher_ready(events, semaphores, mutants, *object))
     {
-        consume_dispatcher(events, semaphores, mutants, objects[index]);
-        DispatcherWaitResult::Signaled(index)
+        match consume_dispatcher(events, semaphores, mutants, objects[index]) {
+            DispatcherConsumeResult::Consumed => DispatcherWaitResult::Signaled(index),
+            DispatcherConsumeResult::Abandoned => DispatcherWaitResult::Abandoned(index),
+            DispatcherConsumeResult::MutantLimitExceeded => {
+                DispatcherWaitResult::MutantLimitExceeded
+            }
+            DispatcherConsumeResult::NotReady => DispatcherWaitResult::TimedOut,
+        }
     } else {
         DispatcherWaitResult::TimedOut
     }
@@ -287,6 +330,48 @@ mod tests {
             poll_dispatchers(&mut events, &mut semaphores, &mut mutants, &second, false),
             DispatcherWaitResult::Signaled(0)
         );
+    }
+
+    #[test]
+    fn abandoned_mutant_reports_the_selected_wait_index_once() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        events.initialize(1, EventKind::Notification, false);
+        mutants.initialize(2, Some(40));
+        assert_eq!(mutants.abandon_thread(40), 1);
+        let objects = [
+            DispatcherObject::Event(1),
+            DispatcherObject::Mutant {
+                identity: 2,
+                thread: 41,
+            },
+        ];
+        assert_eq!(
+            poll_dispatchers(&mut events, &mut semaphores, &mut mutants, &objects, false),
+            DispatcherWaitResult::Abandoned(1)
+        );
+        assert_eq!(mutants.query(2, 41).unwrap().abandoned, false);
+    }
+
+    #[test]
+    fn wait_all_reports_abandonment_after_consuming_every_ready_object() {
+        let (mut events, mut semaphores, mut mutants) = stores();
+        events.initialize(1, EventKind::Synchronization, true);
+        mutants.initialize(2, Some(40));
+        assert_eq!(mutants.abandon_thread(40), 1);
+        let objects = [
+            DispatcherObject::Event(1),
+            DispatcherObject::Mutant {
+                identity: 2,
+                thread: 41,
+            },
+        ];
+        assert_eq!(
+            poll_dispatchers(&mut events, &mut semaphores, &mut mutants, &objects, true),
+            DispatcherWaitResult::Abandoned(0)
+        );
+        assert!(!events.read_state(1));
+        assert_eq!(mutants.query(2, 41).unwrap().current_count, 0);
+        assert!(!mutants.query(2, 41).unwrap().abandoned);
     }
 
     #[test]
