@@ -18,6 +18,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 RM="$ROOT/rust-micro"
+BOOT_TIMEOUT_SECONDS="${BOOT_TIMEOUT_SECONDS:-3600}"
+
+if ! [[ "$BOOT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+   || [ "$BOOT_TIMEOUT_SECONDS" -lt 1 ] \
+   || [ "$BOOT_TIMEOUT_SECONDS" -gt 3600 ]; then
+  printf 'BOOT_TIMEOUT_SECONDS must be an integer from 1 through 3600\n' >&2
+  exit 2
+fi
 
 # ---- flags --------------------------------------------------------------
 GRAPHICS=0
@@ -35,6 +43,13 @@ done
 
 say() { printf '\033[1;36m%s\033[0m\n' "$*"; }
 err() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; }
+
+run_boot_lane() {
+  python3 "$ROOT/scripts/run_with_timeout.py" \
+    --seconds "$BOOT_TIMEOUT_SECONDS" \
+    --cwd "$RM" \
+    -- "$@"
+}
 
 BOOT_IMAGE="$RM/.tmp/disk.img"
 
@@ -197,14 +212,15 @@ if [ "$GRAPHICS" = 1 ]; then
   mkdir -p "$ROOT/.tmp"
   RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-desktop-$(date +%Y%m%d-%H%M%S).log}"
   say "      Serial log streams here and to: $RUN_LOG"
+  say "      Boot validation timeout: ${BOOT_TIMEOUT_SECONDS}s (hard maximum: 3600s)."
   say "      Close the QEMU window to quit."
   # In graphics mode run_specs drops isa-debug-exit, so QEMU stays alive with the
   # painted desktop until the user closes the window (exit status is the window's).
   set +e
   if [ "${#PASSTHRU[@]}" -gt 0 ]; then
-    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" ) 2>&1 | tee "$RUN_LOG"
+    run_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee "$RUN_LOG"
   else
-    ( cd "$RM" && GRAPHICS=1 ./scripts/run_specs.sh ) 2>&1 | tee "$RUN_LOG"
+    run_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh 2>&1 | tee "$RUN_LOG"
   fi
   rc=${PIPESTATUS[0]}
   set -e
@@ -214,17 +230,18 @@ fi
 say "[5/5] booting QEMU (headless serial gate)..."
 say "      Success = every executive check passes and Explorer shell chrome reaches the framebuffer."
 say "      Tip: ./run.sh --desktop to SEE the painted ReactOS desktop in a window."
+say "      Boot validation timeout: ${BOOT_TIMEOUT_SECONDS}s (hard maximum: 3600s)."
 # run_specs execs QEMU; the kernel signals the result through isa-debug-exit:
 #   host exit 3 = kernel qemu_exit(0) = PASS ((0<<1|1)<<1|1),  255 = panic.
 mkdir -p "$ROOT/.tmp"
 RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-headless-$(date +%Y%m%d-%H%M%S).log}"
 set +e
 if [ "${#PASSTHRU[@]}" -gt 0 ]; then
-  ( cd "$RM" && ./scripts/run_specs.sh "${PASSTHRU[@]}" ) 2>&1 | tee "$RUN_LOG"
+  run_boot_lane ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee "$RUN_LOG"
 else
-  ( cd "$RM" && ./scripts/run_specs.sh ) 2>&1 | tee "$RUN_LOG"
+  run_boot_lane ./scripts/run_specs.sh 2>&1 | tee "$RUN_LOG"
 fi
-rc=$?
+rc=${PIPESTATUS[0]}
 set -e
 echo
 summary="$(sed -n \
