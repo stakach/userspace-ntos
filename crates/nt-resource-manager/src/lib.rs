@@ -595,7 +595,6 @@ impl ResourceManager {
                     if vector == 0
                         || descriptor.raw_start > u32::MAX as u64
                         || descriptor.translated_start > u32::MAX as u64
-                        || descriptor.raw_start == 0
                         || descriptor.translated_start == 0
                         || descriptor.translated_start as u32 != vector
                         || descriptor.length != 1
@@ -1742,7 +1741,7 @@ mod tests {
         let owner = ResourceOwner::new(9, 900, 90);
         let mut rm = ResourceManager::new();
         let mut descriptor = batch_interrupt(0x990, 0x51);
-        descriptor.raw_start = 11;
+        descriptor.raw_start = 0;
         rm.replace_owner_assignments(owner, &[descriptor]).unwrap();
 
         let interrupt_id = rm
@@ -1750,7 +1749,7 @@ mod tests {
             .unwrap();
         let route = rm.connected_interrupt_route(interrupt_id).unwrap();
         assert_eq!(route.resource_id, descriptor.resource_id);
-        assert_eq!(route.line, 11);
+        assert_eq!(route.line, 0);
         assert_eq!(route.translated_vector, 0x51);
         assert_eq!(route.tokens.vector, 0x51);
         assert_eq!(route.tokens.service_routine_token, 0xAA);

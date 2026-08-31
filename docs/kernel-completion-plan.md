@@ -23,6 +23,9 @@ in SCM, user-mode system processes, and our ntdll where possible.
   moving compatibility policy into the kernel.
 - Replace old machinery when a dynamic path supersedes it. Do not leave parallel special cases behind.
 - Validate one build/spec path at a time; do not run kernel builds or boot specs in parallel.
+- Bound every boot attempt with an external one-hour deadline. A guest may run indefinitely after
+  boot, but a boot-proof lane must be terminated after its sentinel, first deterministic barrier,
+  or one hour without completing boot; never leave stale QEMU processes holding the disk image.
 - Commit each green, meaningful slice.
 
 ## Status Legend
@@ -20954,6 +20957,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     validate that exact ACPICA payload against the ACPI resource-template contract, repair the
     parser or transport without accepting malformed descriptors, publish the route owner, and only
     then admit PCI START.
+
+    B3 dynamic PCI interrupt assignment checkpoint (2026-09-01, implementation and runtime green):
+    the exact live Q35 interrupt-link `_CRS` payload is now a checked `nt-acpi` fixture. Its Extended
+    IRQ descriptor is correctly accepted as a consumer resource and decodes GSI 10 as
+    level-sensitive, active-high, and shared; producer descriptors remain rejected. PCI resource
+    windows no longer retain a stale interrupt snapshot. The generation-owned route authority now
+    allocates stable nonzero vectors per distinct GSI, shares one vector for shared routes, skips
+    vectors owned by the microkernel clock facilities, verifies every GSI against the live IOAPIC
+    topology, and clears vector state whenever route authority is invalidated.
+
+    Resource assignment retains an exact route-generation claim, builds raw and translated CM
+    interrupt descriptors from that claim, and revalidates the claim immediately before publishing
+    resources and minting capabilities. The projection preserves route polarity, trigger mode, and
+    sharing. GSI zero is treated as a valid raw line while vector zero remains the no-interrupt
+    sentinel. Focused validation passes `nt-acpi` 38/38, `nt-pnp` 68/68,
+    `nt-resource-manager` 16/16, and `nt-pnp-manager` 51/51; the freestanding executive check
+    remains green at the established 209-warning baseline and `git diff --check` passes.
+
+    Serialized run `.tmp/run-headless-acpi-dynamic-route-assignment-20260901.log` reached the
+    sentinel in about 93 seconds and exited QEMU. The readiness count advanced from 251/299 to
+    253/299, both root devices reached START, and E1000 consumed the real ACPI route during PCI
+    arbitration. E1000's `HalGetInterruptVector` returned allocated vector 2, but its subsequent
+    `IoConnectInterrupt` was rejected by the hosted interrupt broker with
+    `STATUS_INVALID_DEVICE_REQUEST`; the root DMA device reaches the same later rejection with its
+    independently assigned vector 5. The next B3 slice is therefore to isolate and repair the
+    common resource-state/route-token validation at interrupt connection, preserving the resource
+    manager as authority. Do not manufacture a hardware route, weaken connection ownership, or add
+    a driver-specific exception.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 

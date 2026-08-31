@@ -330,7 +330,9 @@ fn parse_extended_irq(
 ) -> Result<(), PciRoutingError> {
     let flags = *payload.first().ok_or(PciRoutingError::Truncated)?;
     let count = *payload.get(1).ok_or(PciRoutingError::Truncated)? as usize;
-    if flags & 0xe0 != 0 || flags & 0x01 != 0 || count != 1 {
+    // An interrupt-link device consumes its selected interrupt. Producer descriptors describe
+    // interrupt-controller authority and cannot be used as a link's current assignment.
+    if flags & 0xe0 != 0 || flags & 0x01 == 0 || count != 1 {
         return Err(PciRoutingError::InvalidResourceTemplate);
     }
     let interrupt_bytes = count
@@ -674,7 +676,7 @@ mod tests {
         let table = parse_pci_routing_table(0, 2, &prt).unwrap();
 
         let mut template = vec![0x22, 0x00, 0x02];
-        template.extend_from_slice(&[0x89, 0x06, 0x00, 0x0c, 0x01]);
+        template.extend_from_slice(&[0x89, 0x06, 0x00, 0x0d, 0x01]);
         template.extend_from_slice(&19u32.to_le_bytes());
         template.extend_from_slice(&[0x79, 0]);
         let crs = eval_output(&[argument(METHOD_ARGUMENT_BUFFER, &template)]);
@@ -697,6 +699,24 @@ mod tests {
                 active_low: true,
                 shared: true,
             }]
+        );
+    }
+
+    #[test]
+    fn live_q35_interrupt_link_crs_decodes_consumer_gsi() {
+        let bytes = [
+            0x41, 0x65, 0x6f, 0x42, 0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x0b, 0x00, 0x89, 0x06, 0x00, 0x09, 0x01, 0x0a, 0x00, 0x00, 0x00, 0x79, 0x00,
+        ];
+        assert_eq!(
+            parse_interrupt_resource_template(&bytes),
+            Ok(vec![InterruptResource {
+                descriptor_index: 0,
+                interrupt: InterruptSource::GlobalSystemInterrupt(10),
+                level_sensitive: true,
+                active_low: false,
+                shared: true,
+            }])
         );
     }
 
@@ -774,7 +794,7 @@ mod tests {
         let malformed_template = eval_output(&[argument(
             METHOD_ARGUMENT_BUFFER,
             &[
-                0x89, 0x06, 0x00, 0x0c, 0x02, 0x10, 0x00, 0x00, 0x00, 0x79, 0,
+                0x89, 0x06, 0x00, 0x0d, 0x02, 0x10, 0x00, 0x00, 0x00, 0x79, 0,
             ],
         )]);
         assert_eq!(
@@ -797,7 +817,7 @@ mod tests {
         let sourced_extended = eval_output(&[argument(
             METHOD_ARGUMENT_BUFFER,
             &[
-                0x89, 0x0b, 0x00, 0x0c, 0x01, 19, 0, 0, 0, 0, b'G', b'S', b'I', 0, 0x79, 0,
+                0x89, 0x0b, 0x00, 0x0d, 0x01, 19, 0, 0, 0, 0, b'G', b'S', b'I', 0, 0x79, 0,
             ],
         )]);
         assert_eq!(
@@ -805,12 +825,12 @@ mod tests {
             Err(PciRoutingError::UnsupportedResourceSource)
         );
 
-        let consumer_extended = eval_output(&[argument(
+        let producer_extended = eval_output(&[argument(
             METHOD_ARGUMENT_BUFFER,
-            &[0x89, 0x06, 0x00, 0x0d, 0x01, 19, 0, 0, 0, 0x79, 0],
+            &[0x89, 0x06, 0x00, 0x0c, 0x01, 19, 0, 0, 0, 0x79, 0],
         )]);
         assert_eq!(
-            parse_interrupt_resource_template(&consumer_extended),
+            parse_interrupt_resource_template(&producer_extended),
             Err(PciRoutingError::InvalidResourceTemplate)
         );
 

@@ -14414,16 +14414,24 @@ unsafe fn grant_hosted_pci_devnode_resources(
     context_lease: nt_pnp_context::ContextLeaseIdentity,
     filtered_resource_requirements: alloc::vec::Vec<u8>,
 ) -> Result<Option<HostedDevnodeGrant>, nt_status::NtStatus> {
-    let interrupt = if bus_resources.device.irq_pin != 0 && window.interrupt_routed {
-        Some(nt_pnp::PciInterruptAssignment {
-            bus_level: window.interrupt_vector,
-            vector: window.interrupt_vector,
-            latched: window.interrupt_latched,
-            affinity: 1,
-        })
+    let interrupt_claim = if bus_resources.device.irq_pin != 0 {
+        Some(
+            hosted_pci_topology::acquire_hosted_pci_interrupt_route(&bus_resources.device)
+                .map_err(|status| {
+                    hosted_pci_grant_error(device_id, b"interrupt-route-acquire", status)
+                })?
+                .ok_or_else(|| {
+                    hosted_pci_grant_error(
+                        device_id,
+                        b"interrupt-route-missing",
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    )
+                })?,
+        )
     } else {
         None
     };
+    let interrupt = interrupt_claim.map(|claim| claim.resource_assignment());
     let grant = build_devnode_pci_resource_grant(
         bus_resources,
         interrupt,
@@ -14464,6 +14472,54 @@ unsafe fn grant_hosted_pci_devnode_resources(
             b"interrupt-pairing",
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
+    }
+    let interrupt_route = interrupt_claim
+        .map(|claim| hosted_pci_topology::validate_hosted_pci_interrupt_route(claim))
+        .transpose()
+        .map_err(|status| {
+            hosted_pci_grant_error(device_id, b"interrupt-route-revalidate", status)
+        })?;
+    if let Some(route) = interrupt_route {
+        let Some(raw) = raw_interrupt else {
+            return Err(hosted_pci_grant_error(
+                device_id,
+                b"interrupt-route-raw",
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+        };
+        let Some(translated) = interrupt else {
+            return Err(hosted_pci_grant_error(
+                device_id,
+                b"interrupt-route-translated",
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+        };
+        let expected_flags = if route.level_sensitive {
+            nt_pnp::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+        } else {
+            nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED
+        };
+        let expected_share = if route.shared {
+            nt_cm_resources::CM_RESOURCE_SHARE_SHARED
+        } else {
+            nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+        };
+        if raw.level != route.gsi
+            || raw.vector != route.gsi
+            || translated.level != route.vector
+            || translated.vector != route.vector
+            || translated.affinity != 1
+            || raw.flags != nt_pnp::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
+            || translated.flags != expected_flags
+            || raw.share != expected_share
+            || translated.share != expected_share
+        {
+            return Err(hosted_pci_grant_error(
+                device_id,
+                b"interrupt-route-projection",
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            ));
+        }
     }
     let has_mmio = memory.is_some();
     let assigned_memory: Vec<_> = grant
@@ -14613,18 +14669,16 @@ unsafe fn grant_hosted_pci_devnode_resources(
         ),
         &memory_grants,
         &port_grants,
-        raw_interrupt.map(|interrupt| interrupt.level).unwrap_or(0),
-        interrupt.map(|interrupt| interrupt.vector).unwrap_or(0),
-        interrupt
-            .map(|interrupt| interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
+        interrupt_route.map(|route| route.gsi).unwrap_or(0),
+        interrupt_route.map(|route| route.vector).unwrap_or(0),
+        interrupt_route.map(|route| route.shared).unwrap_or(false),
+        interrupt_route
+            .map(|route| !route.level_sensitive)
             .unwrap_or(false),
-        interrupt
-            .map(|interrupt| interrupt.flags == nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
+        interrupt_route
+            .map(|route| route.active_low)
             .unwrap_or(false),
-        interrupt
-            .map(|interrupt| interrupt.flags != nt_pnp::CM_RESOURCE_INTERRUPT_LATCHED)
-            .unwrap_or(false),
-        false,
+        interrupt_route.is_some(),
         interrupt.map(|interrupt| interrupt.affinity).unwrap_or(0),
         window.dma_va,
         window.dma_seed_va,
@@ -21497,9 +21551,6 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
                         device.dev,
                         device.func,
                         memory,
-                        false,
-                        0,
-                        false,
                         grant.dma_frame_base,
                         grant.dma_pages,
                         dma_va,

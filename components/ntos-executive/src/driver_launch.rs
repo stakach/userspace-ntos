@@ -50039,7 +50039,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
 ) -> Result<(), nt_status::NtStatus> {
     if memory.len() + ports.len() > SH_RESOURCE_ADDRESS_RECORD_CAPACITY as usize
         || memory.is_empty() && ports.is_empty() && interrupt_vector == 0
-        || (interrupt_line == 0) != (interrupt_vector == 0)
+        || (interrupt_vector == 0 && interrupt_line != 0)
         || interrupt_affinity > u32::MAX as u64
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);

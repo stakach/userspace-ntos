@@ -29,6 +29,7 @@ extern crate alloc;
 mod acpi_pci_routing_discovery;
 mod acpi_pci_scope_catalog;
 mod pci_interrupt_routes;
+mod pci_interrupt_vectors;
 mod pci_inventory;
 
 pub use acpi_pci_routing_discovery::{
@@ -47,6 +48,9 @@ pub use acpi_pci_scope_catalog::{
 pub use pci_interrupt_routes::{
     PciInterruptRoute, PciInterruptRouteClaim, PciInterruptRouteError, PciInterruptRouteOwner,
     PciRouteFunction, PreparedPciInterruptRoutePublication, PreparedPciInterruptRouteRevocation,
+};
+pub use pci_interrupt_vectors::{
+    allocate_pci_interrupt_vectors, PciInterruptVector, PciInterruptVectorError,
 };
 pub use pci_inventory::{
     CommittedPciInventoryUpdate, PciInventory, PciInventoryError, PciLocation, PciResourceChange,
@@ -1075,7 +1079,7 @@ pub fn hal_interrupt_query_matches_assignment(
     requested_level: u32,
     requested_vector: u32,
 ) -> bool {
-    if assigned_line == 0 || assigned_vector == 0 {
+    if assigned_vector == 0 {
         return false;
     }
     let exact_bus = requested_interface_type == assigned_interface_type
@@ -1316,6 +1320,7 @@ pub struct PciInterruptAssignment {
     /// System vector after platform translation.
     pub vector: u32,
     pub latched: bool,
+    pub shared: bool,
     pub affinity: u64,
 }
 
@@ -1418,12 +1423,17 @@ pub fn pci_boot_resources(
         translated_descriptors.push(descriptor);
     }
     if let Some(translated) = translated_interrupt {
+        let share = if translated.shared {
+            CM_RESOURCE_SHARE_SHARED
+        } else {
+            CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
+        };
         raw_descriptors.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
             level: translated.bus_level,
             vector: translated.bus_level,
             affinity: u64::MAX,
             flags: CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE,
-            share: CM_RESOURCE_SHARE_SHARED,
+            share,
         }));
         translated_descriptors.push(CmResourceDescriptor::Interrupt(InterruptDescriptor {
             level: translated.vector,
@@ -1434,7 +1444,7 @@ pub fn pci_boot_resources(
             } else {
                 CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
             },
-            share: CM_RESOURCE_SHARE_SHARED,
+            share,
         }));
     }
     let size = nt_cm_resources::cm_resource_list_size(descriptor_count)
@@ -1894,6 +1904,7 @@ mod tests {
             bus_level: vector,
             vector,
             latched,
+            shared: true,
             affinity,
         })
     }
@@ -2268,6 +2279,7 @@ mod tests {
                 bus_level: 19,
                 vector: 5,
                 latched: true,
+                shared: true,
                 affinity: 0x3,
             }),
         )
@@ -3109,6 +3121,16 @@ mod tests {
             2,
             11,
             11,
+        ));
+        assert!(hal_interrupt_query_matches_assignment(
+            INTERFACE_TYPE_PCI_BUS as u32,
+            0,
+            0,
+            1,
+            INTERFACE_TYPE_PCI_BUS as u32,
+            0,
+            0,
+            0,
         ));
     }
 
