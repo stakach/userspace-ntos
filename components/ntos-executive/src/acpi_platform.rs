@@ -24,31 +24,74 @@ static PLATFORM_IOAPIC_COUNT: AtomicU32 = AtomicU32::new(0);
 static mut PLATFORM_IOAPICS: [nt_acpi::IoApicRouteExtent; sel4_rt::MAX_BOOT_IOAPICS] =
     [EMPTY_IOAPIC_EXTENT; sel4_rt::MAX_BOOT_IOAPICS];
 static LOADER_ACPI_ROOT_PADDR: AtomicU64 = AtomicU64::new(0);
+static LOADER_FIRMWARE_MEMORY_RANGE_COUNT: AtomicU32 = AtomicU32::new(0);
+const EMPTY_LOADER_FIRMWARE_MEMORY_RANGE:
+    nt_compat_exports::configuration::LoaderFirmwareMemoryRange =
+    nt_compat_exports::configuration::LoaderFirmwareMemoryRange {
+        base: 0,
+        length: 0,
+        e820_type: 0,
+        extended_attributes: 0,
+    };
+static mut LOADER_FIRMWARE_MEMORY_RANGES:
+    [nt_compat_exports::configuration::LoaderFirmwareMemoryRange;
+        sel4_rt::MAX_BOOT_FIRMWARE_MEMORY_RANGES] =
+    [EMPTY_LOADER_FIRMWARE_MEMORY_RANGE; sel4_rt::MAX_BOOT_FIRMWARE_MEMORY_RANGES];
 
-/// Retain the boot adapter's checksum-validated RSDT/XSDT identity for the NT loader-block
-/// projection. The physical table bytes remain owned by [`PreparedAcpiPlatformAuthority`]; this is
-/// only the immutable loader identity consumed by ReactOS `acpi.sys`.
-pub(crate) fn initialize_loader_acpi_root(
-    boot_info: &BootInfo,
-) -> Result<(), nt_status::NtStatus> {
+/// Retain the boot adapter's checksum-validated RSDT/XSDT identity and firmware memory map for the
+/// NT loader-block projection. The physical bytes remain owned by [`PreparedAcpiPlatformAuthority`];
+/// these are immutable loader facts consumed by ReactOS `acpi.sys`.
+pub(crate) fn initialize_loader_acpi_root(boot_info: &BootInfo) -> Result<(), nt_status::NtStatus> {
     let root = boot_info
         .acpi_root_table()
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    match LOADER_ACPI_ROOT_PADDR.compare_exchange(
-        0,
-        root.paddr,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => Ok(()),
-        Err(existing) if existing == root.paddr => Ok(()),
-        Err(_) => Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    let memory_map = boot_info
+        .firmware_memory_map()
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let existing_root = LOADER_ACPI_ROOT_PADDR.load(Ordering::Acquire);
+    if existing_root != 0 {
+        return if existing_root == root.paddr
+            && LOADER_FIRMWARE_MEMORY_RANGE_COUNT.load(Ordering::Acquire) == memory_map.len() as u32
+        {
+            Ok(())
+        } else {
+            Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        };
     }
+    unsafe {
+        let destination = core::ptr::addr_of_mut!(LOADER_FIRMWARE_MEMORY_RANGES)
+            as *mut nt_compat_exports::configuration::LoaderFirmwareMemoryRange;
+        for (index, range) in memory_map.iter().enumerate() {
+            destination.add(index).write(
+                nt_compat_exports::configuration::LoaderFirmwareMemoryRange {
+                    base: range.base,
+                    length: range.length,
+                    e820_type: range.e820_type,
+                    extended_attributes: range.extended_attributes,
+                },
+            );
+        }
+    }
+    LOADER_FIRMWARE_MEMORY_RANGE_COUNT.store(memory_map.len() as u32, Ordering::Release);
+    LOADER_ACPI_ROOT_PADDR.store(root.paddr, Ordering::Release);
+    Ok(())
 }
 
 pub(crate) fn loader_acpi_root_paddr() -> Option<u64> {
     let paddr = LOADER_ACPI_ROOT_PADDR.load(Ordering::Acquire);
     (paddr != 0).then_some(paddr)
+}
+
+pub(crate) fn loader_firmware_memory_map(
+) -> &'static [nt_compat_exports::configuration::LoaderFirmwareMemoryRange] {
+    let count = LOADER_FIRMWARE_MEMORY_RANGE_COUNT.load(Ordering::Acquire) as usize;
+    unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::addr_of!(LOADER_FIRMWARE_MEMORY_RANGES)
+                as *const nt_compat_exports::configuration::LoaderFirmwareMemoryRange,
+            count,
+        )
+    }
 }
 
 pub(crate) unsafe fn initialize_platform_ioapic_topology(

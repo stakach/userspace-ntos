@@ -211,8 +211,11 @@ const FSD_DATA_LOADER_BLOCK_OFF: u64 = 0x810;
 const FSD_DATA_LOADER_CONFIG_ROOT_OFF: u64 = 0x910;
 const FSD_DATA_LOADER_ACPI_NODE_OFF: u64 = 0x958;
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF: u64 = 0x9A0;
-const FSD_DATA_LOADER_ACPI_CONFIG_OFF: u64 = 0x9B0;
-const FSD_DATA_LOADER_CONFIG_BYTES: u64 = 40;
+const FSD_DATA_LOADER_ACPI_CONFIG_OFF: u64 = 0x2000;
+const FSD_DATA_LOADER_CONFIG_CAPACITY: usize =
+    nt_compat_exports::configuration::LOADER_ACPI_CONFIGURATION_FIXED_BYTES
+        + sel4_rt::MAX_BOOT_FIRMWARE_MEMORY_RANGES
+            * nt_compat_exports::configuration::ACPI_E820_ENTRY_BYTES;
 const FSD_DATA_PHYSICAL_MAP_OFF: u64 = 0x70000;
 const FSD_DATA_PHYSICAL_MAP_HEADER_BYTES: u64 = 16;
 const FSD_DATA_PHYSICAL_MAP_MAGIC: u64 = u64::from_le_bytes(*b"NTPHYS01");
@@ -241,7 +244,8 @@ const FSD_DATA_LOADER_ACPI_CONFIG_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACP
 const FSD_DATA_IRP_DISPATCH_REQUEST_OFF: u64 = 0x1000;
 const _: () =
     assert!(FSD_DATA_SE_SID_POOL_OFF + nt_security::se_exports::SID_POOL_SIZE as u64 <= 0x1000);
-const _: () = assert!(FSD_DATA_LOADER_ACPI_CONFIG_OFF + FSD_DATA_LOADER_CONFIG_BYTES <= 0x1000);
+const _: () =
+    assert!(FSD_DATA_LOADER_ACPI_CONFIG_OFF + FSD_DATA_LOADER_CONFIG_CAPACITY as u64 <= 0x3000);
 const _: () = assert!(FSD_DATA_PHYSICAL_MAP_CAPACITY > 0);
 const _: () = assert!(
     FSD_DATA_IRP_DISPATCH_REQUEST_OFF + core::mem::size_of::<IrpDispatchRequest>() as u64 <= 0x2000
@@ -1269,7 +1273,7 @@ struct PendingIrpNode {
     raw_irp: u64,
     entry: PendingIrp,
 }
-const FSD_RUNTIME_TABLES_OFF: u64 = 0x2000;
+const FSD_RUNTIME_TABLES_OFF: u64 = 0x3000;
 const FSD_COMPLETION_SEQ_OFF: u64 = FSD_RUNTIME_TABLES_OFF;
 const FSD_PENDING_IRP_CAP: usize = 256;
 const FSD_PENDING_IRP_HEAD_OFF: u64 = FSD_RUNTIME_TABLES_OFF + 0x08;
@@ -4432,7 +4436,7 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     core::ptr::write_bytes(block as *mut u8, 0, 0x100);
     core::ptr::write_bytes(root as *mut u8, 0, 0x48);
     core::ptr::write_bytes(acpi as *mut u8, 0, 0x48);
-    core::ptr::write_bytes(config as *mut u8, 0, FSD_DATA_LOADER_CONFIG_BYTES as usize);
+    core::ptr::write_bytes(config as *mut u8, 0, FSD_DATA_LOADER_CONFIG_CAPACITY);
 
     // NT 5.2 LOADER_PARAMETER_BLOCK: initialize the three list heads and publish the real ARC
     // configuration root at offset 0x60.
@@ -4460,10 +4464,6 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     write_unaligned((acpi + 0x18) as *mut u32, 3); // AdapterClass
     write_unaligned((acpi + 0x1C) as *mut u32, 12); // MultiFunctionAdapter
     write_unaligned((acpi + 0x2C) as *mut u32, u32::MAX); // AffinityMask
-    write_unaligned(
-        (acpi + 0x30) as *mut u32,
-        FSD_DATA_LOADER_CONFIG_BYTES as u32,
-    );
     write_unaligned((acpi + 0x34) as *mut u32, 10);
     write_unaligned(
         (acpi + 0x38) as *mut u64,
@@ -4472,14 +4472,19 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     write_unaligned((acpi + 0x40) as *mut u64, FSD_DATA_LOADER_ACPI_CONFIG_VA);
     core::ptr::copy_nonoverlapping(b"ACPI BIOS\0".as_ptr(), identifier as *mut u8, 10);
 
-    // CM_PARTIAL_RESOURCE_LIST + one DeviceSpecific descriptor, followed by the loader's
-    // ACPI_BIOS_MULTI_NODE prefix. BOOTBOOT already consumed the RSDP and published the validated
-    // RSDT/XSDT physical address, which is precisely the loader datum acpi.sys reconstructs.
-    write_unaligned((config + 0x04) as *mut u32, 1);
-    write_unaligned((config + 0x08) as *mut u8, 5); // CmResourceTypeDeviceSpecific
-    write_unaligned((config + 0x0C) as *mut u32, 16); // ACPI_BIOS_MULTI_NODE prefix bytes
-    write_unaligned((config + 0x18) as *mut u64, root_paddr);
-    write_unaligned((config + 0x20) as *mut u64, 0); // no loader E820 projection
+    // BOOTBOOT owns the firmware memory map. Project all of it into the exact variable-length
+    // FreeLdr/NT 5.2 resource-list shape; no fabricated empty E820 prefix is accepted here.
+    let config_output =
+        core::slice::from_raw_parts_mut(config as *mut u8, FSD_DATA_LOADER_CONFIG_CAPACITY);
+    let Ok(config_bytes) = nt_compat_exports::configuration::encode_loader_acpi_configuration(
+        config_output,
+        root_paddr,
+        crate::loader_firmware_memory_map(),
+    ) else {
+        write_volatile(cell as *mut u64, 0);
+        return;
+    };
+    write_unaligned((acpi + 0x30) as *mut u32, config_bytes as u32);
     write_volatile(cell as *mut u64, FSD_DATA_LOADER_BLOCK_VA);
 }
 

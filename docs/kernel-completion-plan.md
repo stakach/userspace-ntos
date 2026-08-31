@@ -20598,6 +20598,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     share state in a host-tested crate before wiring the exports. The remaining generic hardware
     and LSA route gates remain open and must not be counted as a complete boot acceptance result.
 
+    B3 firmware memory-map and ACPI loader-layout checkpoint (2026-09-01, microkernel and executive
+    builds plus desktop runtime green): rust-micro commit `6e588f9` publishes the authoritative
+    BOOTBOOT memory map in a typed variable-length extra-BootInfo chunk. Adjacent equivalent ranges
+    are coalesced, every record retains its E820 type and extended attributes, and userspace treats
+    the map as information only; device untyped capabilities remain the sole physical authority.
+    The shared `sel4-rt` decoder validates the complete typed chunk before exposing it.
+
+    `nt-compat-exports` now host-tests the exact amd64 NT 5.2 loader encoding at 42/42 tests. The
+    `CM_PARTIAL_RESOURCE_DESCRIPTOR` is 20 bytes on this ABI, so the `ACPI_BIOS_MULTI_NODE` begins
+    at `+0x1c`, not the old incorrect `+0x18`; the configuration length and device-specific data
+    size now include every real 24-byte firmware-map entry. The variable payload occupies reserved
+    per-component DATA space and the displaced IRP runtime table begins at the next page, with
+    compile-time non-overlap assertions. Both the extern-rootserver kernel and freestanding
+    executive builds pass.
+
+    Serialized proof `.tmp/run-headless-acpi-firmware-map-20260901.log` completed in about 97
+    seconds, removed the driver's `Loader ACPI BIOS node is missing valid device-specific data`
+    failure, reached genuine Explorer shell-chrome paint with a fully non-background framebuffer,
+    and exited through the sentinel at 293/299 checks. Real `acpi.sys` now reaches table publication
+    during START. Its next causal failure is `ZwSetValueKey` returning
+    `STATUS_INVALID_BUFFER_SIZE` while writing DSDT, followed by retirement of the faulting driver
+    domain. Remove that fixed registry transport limit with an owned/chunked Config Manager value
+    path; do not truncate the firmware table or convert the failure into success. Mup's independent
+    `IoCheckShareAccess` frontier remains queued after this ACPI data-plane fix.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
