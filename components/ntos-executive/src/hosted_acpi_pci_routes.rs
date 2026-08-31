@@ -120,13 +120,12 @@ struct HostedAcpiPciRouteIndeterminateIrp {
     inventory_generation: u64,
     route_owner_generation: u64,
     failure_count: u8,
-    next_retry_epoch: u64,
+    next_retry_deadline: u64,
 }
 
 static mut HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS: Option<
     Vec<HostedAcpiPciRouteIndeterminateIrp>,
 > = None;
-static mut HOSTED_ACPI_PCI_ROUTE_RECOVERY_EPOCH: u64 = 0;
 
 unsafe fn hosted_acpi_route_request_input_is(irp_id: IrpId, input: &[u8]) -> bool {
     io_manager_mut()
@@ -202,14 +201,14 @@ unsafe fn retain_hosted_acpi_pci_route_indeterminate_irp(
         inventory_generation: query.inventory_generation,
         route_owner_generation: query.route_owner_generation,
         failure_count: 1,
-        next_retry_epoch: (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_RECOVERY_EPOCH))
-            .saturating_add(1),
+        next_retry_deadline: crate::monotonic_time_100ns(),
     };
     let records = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
         .as_mut()
         .expect("ACPI PCI route indeterminate storage was not reserved");
     assert!(records.len() < records.capacity());
     records.push(retained);
+    let _ = crate::service_sec_image::rearm_registered_delay_timer();
     print_str(b"[pci-route] indeterminate irp/status=");
     print_u64(retained.irp_id.raw());
     print_str(b"/");
@@ -248,16 +247,25 @@ unsafe fn hosted_acpi_pci_route_transport_is_indeterminate() -> bool {
         .is_some_and(|records| !records.is_empty())
 }
 
-unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
-    let epoch = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_RECOVERY_EPOCH)).saturating_add(1);
-    *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_RECOVERY_EPOCH) = epoch;
+pub(crate) fn hosted_acpi_pci_route_recovery_next_deadline() -> Option<u64> {
+    unsafe {
+        (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
+            .as_ref()?
+            .iter()
+            .map(|record| record.next_retry_deadline)
+            .min()
+    }
+}
+
+pub(crate) unsafe fn hosted_acpi_pci_route_recovery_wake_due(now_100ns: u64) -> u64 {
     let due = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_INDETERMINATE_IRPS))
         .as_ref()
         .and_then(|records| {
             records
                 .iter()
                 .enumerate()
-                .find(|(_, record)| record.next_retry_epoch <= epoch)
+                .filter(|(_, record)| record.next_retry_deadline <= now_100ns)
+                .min_by_key(|(_, record)| record.next_retry_deadline)
                 .map(|(index, record)| (index, *record))
         });
     let Some((index, retained)) = due else {
@@ -288,11 +296,16 @@ unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
             assert_eq!(record.irp_id, retained.irp_id);
             record.status = status;
             record.failure_count = record.failure_count.saturating_add(1);
-            let delay = 1u64 << u32::from(record.failure_count.min(12));
-            record.next_retry_epoch = epoch.saturating_add(delay);
+            let delay_100ns = 10_000u64 << u32::from(record.failure_count.min(10));
+            record.next_retry_deadline = now_100ns.saturating_add(delay_100ns);
+            let _ = crate::service_sec_image::rearm_registered_delay_timer();
         }
     }
     1
+}
+
+unsafe fn drain_hosted_acpi_pci_route_indeterminate_irps() -> usize {
+    hosted_acpi_pci_route_recovery_wake_due(crate::monotonic_time_100ns()) as usize
 }
 
 unsafe fn cancel_stale_hosted_acpi_pci_route_query() -> Result<bool, nt_status::NtStatus> {

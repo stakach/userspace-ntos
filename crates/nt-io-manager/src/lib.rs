@@ -431,7 +431,7 @@ impl<P> IoManager<P> {
     pub fn device_mut(&mut self, id: DeviceId) -> Option<&mut DeviceRecord> {
         self.devices.get_mut(id)
     }
-    pub fn remove_device(&mut self, id: DeviceId) -> Option<DeviceRecord> {
+    pub(crate) fn remove_device(&mut self, id: DeviceId) -> Option<DeviceRecord> {
         let record = self.devices.remove(id)?;
         if let Some(driver) = self.drivers.get_mut(record.driver_id) {
             driver.devices.retain(|device| *device != id);
@@ -691,6 +691,9 @@ impl<P> IoManager<P> {
         if source_delete_pending || self.device(lower).map(|d| d.delete_pending).unwrap_or(true) {
             return Err(NtStatus::DELETE_PENDING);
         }
+        if self.device_has_live_irps(source) || self.device_has_live_irps(lower) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
         if source_attached || self.has_upper_attachment(source) || lower == source {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -708,6 +711,9 @@ impl<P> IoManager<P> {
             Some(device) => device.attached_to.ok_or(NtStatus::INVALID_PARAMETER)?,
             None => return Err(NtStatus::INVALID_PARAMETER),
         };
+        if self.device_has_live_irps(source) || self.device_has_live_irps(lower) {
+            return Err(NtStatus::DEVICE_BUSY);
+        }
         self.device_mut(source)
             .expect("validated source")
             .attached_to = None;
@@ -741,7 +747,10 @@ impl<P> IoManager<P> {
         if self.device(id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        if self.device_has_live_files(id) || self.has_upper_attachment(id) {
+        if self.device_has_live_files(id)
+            || self.device_has_live_irps(id)
+            || self.has_upper_attachment(id)
+        {
             return Err(NtStatus::DELETE_PENDING);
         }
         Ok(())
@@ -784,6 +793,12 @@ impl<P> IoManager<P> {
         self.files
             .iter()
             .any(|(_, file)| file.device_id == id && !file.state.is_closed())
+    }
+
+    fn device_has_live_irps(&self, id: DeviceId) -> bool {
+        self.irps
+            .iter()
+            .any(|(_, irp)| irp.stack.iter().any(|location| location.device_id == id))
     }
 
     fn recompute_device_stacks(&mut self) {
@@ -3730,6 +3745,16 @@ mod tests {
                 0,
             )
             .unwrap();
+        let late_filter = om
+            .create_device(
+                top_driver,
+                None,
+                DeviceType::UNKNOWN,
+                DeviceCharacteristics::empty(),
+                DeviceFlags::BUFFERED_IO,
+                0,
+            )
+            .unwrap();
         assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
         assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
         let client = om.register_client();
@@ -3757,6 +3782,12 @@ mod tests {
             other => panic!("expected pending stack request, got {other:?}"),
         };
         assert_eq!(top_state.borrow().seen[0], (top_driver, top, 0, 3, irp));
+        assert_eq!(
+            om.attach_device_to_stack(late_filter, lower),
+            Err(NtStatus::DEVICE_BUSY)
+        );
+        assert_eq!(om.detach_device_from_stack(top), Err(NtStatus::DEVICE_BUSY));
+        assert_eq!(om.can_delete_device(lower), Err(NtStatus::DELETE_PENDING));
 
         let middle_frame =
             IoStackLocation::new(middle_driver, major::IRP_MJ_DEVICE_CONTROL, middle, None);
@@ -3818,6 +3849,8 @@ mod tests {
             (lower_driver, lower)
         );
         om.acknowledge_completed_irp(irp).unwrap();
+        assert_eq!(om.attach_device_to_stack(late_filter, lower), Ok(top));
+        assert_eq!(om.detach_device_from_stack(late_filter), Ok(top));
         assert_eq!(lower_state.borrow().acknowledged, [irp]);
         assert!(middle_state.borrow().acknowledged.is_empty());
         assert!(top_state.borrow().acknowledged.is_empty());

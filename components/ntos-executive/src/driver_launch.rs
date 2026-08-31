@@ -39169,12 +39169,12 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
 pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager(io_manager_mut());
     pumped
+        .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
         .saturating_add(unsafe { drain_hosted_filter_requirements_transactions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
-        .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
 }

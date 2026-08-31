@@ -3385,6 +3385,7 @@ const DELAY_TIMER_SOURCE_USER_TIMER: u64 = 7;
 const DELAY_TIMER_SOURCE_KEYED_RELEASE: u64 = 8;
 const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
 const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
+const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
@@ -7309,9 +7310,9 @@ pub(crate) static DRAIN_REARM_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to ten wake paths; one of them owns
+/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to eleven wake paths; one of them owns
 /// the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 10;
+pub(crate) const SUBDRAIN_N: usize = 11;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17505,6 +17506,8 @@ unsafe fn delay_timer_next_deadline(
     let user_timer_deadline = handler.user_timer_next_deadline(now);
     let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
+    let acpi_pci_route_recovery_deadline =
+        driver_launch::hosted_acpi_pci_route_recovery_next_deadline();
     let job_time_deadline = handler.job_time_sample_next_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
@@ -17516,6 +17519,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(user_timer_deadline)
         .chain(hosted_kernel_timer_deadline)
         .chain(hosted_driver_deadline)
+        .chain(acpi_pci_route_recovery_deadline)
         .chain(job_time_deadline)
         .chain(deadman_deadline)
         .min()?;
@@ -17535,6 +17539,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER
     } else if hosted_driver_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_HOSTED_DRIVER
+    } else if acpi_pci_route_recovery_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY
     } else if job_time_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_JOB_TIME
     } else {
@@ -17751,6 +17757,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now_100ns))
         + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now_100ns))
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
+        + subdrain!(10, driver_launch::hosted_acpi_pci_route_recovery_wake_due(now_100ns))
         + watchdog_tick
 }
 

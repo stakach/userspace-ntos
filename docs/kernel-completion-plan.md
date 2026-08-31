@@ -20374,6 +20374,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     completion acknowledgement remains an explicit canonical IRP owner. A bounded recovery loop
     retries that acknowledgement and fences the affected device/driver lifecycle until ownership is
     recovered, then removes the matching topology block and restarts complete reconciliation.
+    Final ownership review moved the retry schedule onto the executive's shared HPET deadline
+    authority, so quiescence cannot strand a retry, and the generic I/O Manager now refuses attach,
+    detach, deletion, or driver teardown while any live canonical IRP stack still references the
+    affected Device objects. Direct hosted device operations therefore cannot bypass the fence.
 
     Review closure: route, BusRelations, filter-requirements, and PnP lifecycle admission are
     symmetric. Every dirty relation row blocks route readiness, relevant rows invalidate route
