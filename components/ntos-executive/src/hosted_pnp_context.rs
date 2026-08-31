@@ -172,6 +172,7 @@ pub(crate) struct HostedPnpPlatformMemoryDescriptor {
     pub(crate) pages: u64,
     pub(crate) va: u64,
     pub(crate) seed_va: u64,
+    pub(crate) platform_hpet: bool,
 }
 
 #[derive(Clone, Copy)]

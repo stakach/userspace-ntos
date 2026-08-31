@@ -380,6 +380,7 @@ pub(crate) struct AcpiMemoryAuthority {
     pub(crate) pages: u64,
     pub(crate) component_va: u64,
     pub(crate) broker_va: u64,
+    pub(crate) platform_hpet: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -395,6 +396,63 @@ pub(crate) struct PreparedAcpiPlatformAuthority {
     pub(crate) memory: Vec<AcpiMemoryAuthority>,
     pub(crate) ports: Vec<AcpiPortAuthority>,
     pub(crate) owner: HostedPnpContextOwner,
+}
+
+/// Map the executive's timer view from the same retained frames later projected read-only to the
+/// ACPI component. The returned address is the exact GAS address within `mapping_page_va`.
+pub(crate) unsafe fn map_executive_hpet(
+    authority: &mut PreparedAcpiPlatformAuthority,
+    mapping_page_va: u64,
+) -> Result<(u64, nt_acpi::PhysicalRange), nt_status::NtStatus> {
+    if mapping_page_va & (PAGE_SIZE - 1) != 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let range = authority
+        .discovery
+        .hpet
+        .map(|hpet| hpet.register_block)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    let resource = authority
+        .memory
+        .iter()
+        .find(|resource| {
+            resource.paddr == range.start && resource.length == range.length && !resource.writable
+        })
+        .ok_or(nt_status::NtStatus::CONFLICTING_ADDRESSES)?;
+    let offset = range.start & (PAGE_SIZE - 1);
+    let mapped_bytes = resource
+        .pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if offset
+        .checked_add(range.length)
+        .is_none_or(|length| length > mapped_bytes)
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let pages =
+        usize::try_from(resource.pages).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    if !authority.owner.reserve_alias_caps(pages) {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    }
+    let checkpoint = authority.owner.checkpoint();
+    for page in 0..resource.pages {
+        let va = mapping_page_va + page * PAGE_SIZE;
+        if !ensure_executive_paging(va) {
+            let _ = authority.owner.rollback_to(checkpoint);
+            return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+        }
+        let (alias, copy_error) = copy_cap_r(resource.frame_base + page);
+        if copy_error != 0 || page_map_r(alias, va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
+            if copy_error == 0 {
+                authority.owner.adopt_alias_cap(alias, false);
+            }
+            let _ = authority.owner.rollback_to(checkpoint);
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        authority.owner.adopt_alias_cap(alias, true);
+    }
+    Ok((mapping_page_va + offset, range))
 }
 
 unsafe fn recycle_unoccupied_run(base: u64, pages: u64) {
@@ -423,14 +481,19 @@ unsafe fn prepare_memory_authority(
     resource_index: u8,
     range: nt_acpi::PhysicalRange,
     writable: bool,
+    platform_hpet: bool,
 ) -> Result<AcpiMemoryAuthority, nt_status::NtStatus> {
-    if range.start & (PAGE_SIZE - 1) != 0
-        || range.length == 0
-        || range.length & (PAGE_SIZE - 1) != 0
-    {
+    if range.length == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    let pages = range.length / PAGE_SIZE;
+    let page_start = range.start & !(PAGE_SIZE - 1);
+    let byte_offset = range.start - page_start;
+    let backing_bytes = byte_offset
+        .checked_add(range.length)
+        .and_then(|bytes| bytes.checked_add(PAGE_SIZE - 1))
+        .map(|bytes| bytes & !(PAGE_SIZE - 1))
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let pages = backing_bytes / PAGE_SIZE;
     let pages_usize =
         usize::try_from(pages).map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let checkpoint = owner.checkpoint();
@@ -440,11 +503,11 @@ unsafe fn prepare_memory_authority(
     if !owner.reserve_alias_caps(alias_count) {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
-    let Some(component_va) = reserve_hosted_pnp_component_span(owner, range.length) else {
+    let Some(component_page_va) = reserve_hosted_pnp_component_span(owner, backing_bytes) else {
         let _ = owner.rollback_to(checkpoint);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
-    let Some(broker_va) = reserve_hosted_pnp_root_seed_span(owner, range.length) else {
+    let Some(broker_page_va) = reserve_hosted_pnp_root_seed_span(owner, backing_bytes) else {
         let _ = owner.rollback_to(checkpoint);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
@@ -454,7 +517,7 @@ unsafe fn prepare_memory_authority(
     };
     let mut page = 0;
     while page < pages {
-        let paddr = range.start + page * PAGE_SIZE;
+        let paddr = page_start + page * PAGE_SIZE;
         let Some(canonical) = canonical_frame_for(regions, paddr) else {
             print_str(b"[acpi-platform] retained canonical frame missing for page=");
             print_hex((paddr >> 32) as u32);
@@ -471,7 +534,7 @@ unsafe fn prepare_memory_authority(
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         owner.adopt_alias_cap(source, false);
-        let va = broker_va + page * PAGE_SIZE;
+        let va = broker_page_va + page * PAGE_SIZE;
         if !ensure_executive_paging(va) {
             recycle_unoccupied_run(source + 1, pages - page - 1);
             let _ = owner.rollback_to(checkpoint);
@@ -500,8 +563,9 @@ unsafe fn prepare_memory_authority(
         writable,
         frame_base,
         pages,
-        component_va,
-        broker_va,
+        component_va: component_page_va + byte_offset,
+        broker_va: broker_page_va + byte_offset,
+        platform_hpet,
     })
 }
 
@@ -624,6 +688,12 @@ unsafe fn discover_acpi_platform_authority_inner(
             .retain_range(*range)
             .map_err(|_| reader.failure.unwrap_or(nt_status::NtStatus::UNSUCCESSFUL))?;
     }
+    let hpet_registers = discovery.hpet.map(|hpet| hpet.register_block);
+    if let Some(range) = hpet_registers {
+        reader
+            .retain_range(range)
+            .map_err(|_| reader.failure.unwrap_or(nt_status::NtStatus::UNSUCCESSFUL))?;
+    }
     let mut read_only_ranges = Vec::new();
     read_only_ranges
         .try_reserve_exact(
@@ -648,6 +718,7 @@ unsafe fn discover_acpi_platform_authority_inner(
     let memory_resource_count = read_only_ranges
         .len()
         .checked_add(writable_ranges.len())
+        .and_then(|count| count.checked_add(usize::from(hpet_registers.is_some())))
         .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     if memory_resource_count > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize
         || ports.len() > driver_launch::SH_RESOURCE_KIND_CAPACITY as usize
@@ -668,6 +739,7 @@ unsafe fn discover_acpi_platform_authority_inner(
             memory.len() as u8,
             range,
             false,
+            false,
         )?);
     }
     for range in writable_ranges {
@@ -676,6 +748,17 @@ unsafe fn discover_acpi_platform_authority_inner(
             &regions,
             memory.len() as u8,
             range,
+            true,
+            false,
+        )?);
+    }
+    if let Some(range) = hpet_registers {
+        memory.push(prepare_memory_authority(
+            owner,
+            &regions,
+            memory.len() as u8,
+            range,
+            false,
             true,
         )?);
     }

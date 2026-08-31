@@ -20747,6 +20747,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     validation remains serialized and has a hard one-hour launch deadline; uptime after successful
     launch is not part of that deadline.
 
+    B3 HPET capability-delegation checkpoint (2026-09-01, implementation green): ACPI discovery now
+    runs before the executive timer probe and retains the canonical device frames for the
+    firmware-selected HPET address. The old compiled `0xFED00000` claim and its one-page retype path
+    are removed. The executive maps its writable timer view from the retained cap, while the hosted
+    ACPI platform resource carries the exact 1 KiB physical extent and receives a read-only mapping
+    of the same frame. Hosted memory projections now correctly preserve sub-page physical offsets;
+    their cap coverage is page-rounded internally without widening the assigned NT resource.
+
+    `nt-resource-manager` now supports explicit memory subleases alongside port subleases. A child
+    raw/translated range must be contained by a live named parent, use the same cache policy, and
+    request no rights beyond the parent. Unproven overlap still conflicts, exact replay retains
+    usage, and parent release/revocation recursively invalidates child assignments and mappings.
+    The executive registers its containing HPET page as a read/write platform parent and delegates
+    only the firmware-described read-only child to ACPI. `nt-resource-manager` passes 16/16 and the
+    freestanding executive check remains green at the established 209-warning baseline. The next
+    serialized boot must prove the former `MmMapIoSpace(HPET, 1024)` denial resolves through this
+    exact grant without disturbing the executive timer or the Explorer desktop.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

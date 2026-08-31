@@ -1218,9 +1218,7 @@ pub const SYSTEM_POINTER_COOKIE: u32 = 0xA3B1_C2D3;
 /// The provided "ntdll" — a page of syscall stubs mapped RX in the PE VSpace; the PE's IAT is
 /// resolved to point here, so the PE calls named ntdll functions like real Windows code.
 pub const NTDLL_VA: u64 = 0x0000_0100_0059_0000;
-/// Where the executive maps real device MMIO it claims (P1). HPET is exposed by the
-/// kernel as a device untyped and isn't used by the kernel, so it's a safe first target.
-pub const HPET_PADDR: u64 = 0xFED0_0000;
+/// Executive virtual address reserved for the firmware-described HPET register block.
 pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
 /// P2: the AHCI controller ABAR (BAR5) MMIO, and a DMA frame for its command structures +
 /// the sector data buffer in the storage cluster before IPCBUF.
@@ -14564,6 +14562,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
             } else {
                 0
             },
+            platform_hpet: false,
         });
     }
     let io_bars: Vec<_> = translated_ports
@@ -14711,6 +14710,7 @@ unsafe fn grant_hosted_root_devnode_resources(
             frame_base: window.mmio_frame_base,
             map_pages: window.mmio_pages,
             video_memory_caller_va: 0,
+            platform_hpet: false,
         });
     }
     driver_launch::grant_hosted_device_resources(
@@ -14853,6 +14853,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
             frame_base: resource.frame_base,
             map_pages: resource.pages,
             video_memory_caller_va: 0,
+            platform_hpet: resource.platform_hpet,
         });
     }
 
@@ -21329,6 +21330,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
             pages: resource.pages,
             va: resource.component_va,
             seed_va: resource.broker_va,
+            platform_hpet: resource.platform_hpet,
         });
     }
     let mut platform_ports = Vec::new();
@@ -28176,15 +28178,6 @@ unsafe fn stand_up_service(
     }
 }
 
-/// Claim a real device MMIO page (P1): find the device untyped in BootInfo whose
-/// paddr matches `paddr`, retype a device frame from it, and map it at `vaddr` in the
-/// executive's VSpace (the kernel makes device frames uncacheable). Returns whether
-/// the device untyped was found + mapped. This is how the executive, which owns the
-/// hardware caps, hands real MMIO to itself (and later to isolated driver hosts).
-unsafe fn claim_device_page(bi: &BootInfo, paddr: u64, vaddr: u64) -> bool {
-    claim_device_pages(bi, paddr, vaddr, 1) != 0
-}
-
 /// Map the first `n` 4 KiB pages of the device MMIO region whose untyped base is
 /// `paddr`, at consecutive vaddrs from `vaddr`. Consecutive retypes from one untyped
 /// hand out consecutive physical frames, so page p lands at `paddr + p*0x1000` mapped
@@ -29360,11 +29353,33 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     );
     check(b"exec_sec_image_two_sections", si_faults >= 2, &mut passed);
 
-    // --- P1: real MMIO. Claim the HPET's device memory (a real device untyped from
-    // BootInfo) as a frame cap, map it, and read a real hardware register — proving
-    // the mapping hits real device memory, not RAM.
-    print_str(b"[ntos-exec] P1: claiming real HPET MMIO (0xFED00000) as a device frame\n");
-    let mmio_mapped = claim_device_page(bi, HPET_PADDR, HPET_VADDR);
+    let mut acpi_platform_authority = match discover_acpi_platform_authority(bi) {
+        Ok(authority) => authority,
+        Err(status) => {
+            print_str(b"[acpi-platform] authority discovery failed status=");
+            print_hex(status.raw() as u32);
+            print_str(b"\n");
+            panic!("discover authorized ACPI platform resources");
+        }
+    };
+
+    // --- P1: real MMIO. Map the HPET register block selected by the validated firmware table
+    // from the canonical frame set retained by ACPI discovery. The same frames are later projected
+    // read-only to the hosted ACPI component; the executive alone owns timer programming.
+    let mapped_hpet = map_executive_hpet(&mut acpi_platform_authority, HPET_VADDR);
+    let mmio_mapped = mapped_hpet.as_ref().is_ok_and(|(register_va, range)| {
+        *register_va == HPET_VADDR && driver_launch::claim_platform_hpet_resource(*range).is_ok()
+    });
+    print_str(b"[ntos-exec] P1: firmware HPET MMIO paddr=0x");
+    if let Ok((_, range)) = mapped_hpet {
+        print_hex((range.start >> 32) as u32);
+        print_hex(range.start as u32);
+        print_str(b" len=");
+        print_u64(range.length);
+    } else {
+        print_str(b"unavailable");
+    }
+    print_str(b"\n");
     check(b"exec_hpet_device_untyped_mapped", mmio_mapped, &mut passed);
     if mmio_mapped {
         // HPET General Capabilities + ID (offset 0): bits [31:16] = VENDOR_ID.
@@ -31429,15 +31444,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
-    let acpi_platform_authority = match discover_acpi_platform_authority(bi) {
-        Ok(authority) => authority,
-        Err(status) => {
-            print_str(b"[acpi-platform] authority discovery failed status=");
-            print_hex(status.raw() as u32);
-            print_str(b"\n");
-            panic!("discover authorized ACPI platform resources");
-        }
-    };
     if let Err(status) = publish_acpi_root_devnode_from_registry_policy() {
         print_str(b"[acpi-platform] root devnode publication failed status=");
         print_hex(status.raw() as u32);

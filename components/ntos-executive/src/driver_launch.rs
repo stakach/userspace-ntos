@@ -95,7 +95,9 @@ use nt_kernel_exec::{
     SEMAPHORE_OBJECT,
 };
 use nt_mdl::MdlRegistry;
-use nt_resource_manager::{HalError, PortResourceDelegation, ResourceManager, ResourceOwner};
+use nt_resource_manager::{
+    HalError, MemoryResourceDelegation, PortResourceDelegation, ResourceManager, ResourceOwner,
+};
 use nt_types::{AccessMask, ClientId, HandleValue};
 use nt_types::{NtPath, ObjectId};
 use nt_video_miniport::{
@@ -41886,6 +41888,7 @@ const PLATFORM_RESOURCE_OWNER: ResourceOwner = ResourceOwner {
     device_object_id: u64::MAX,
 };
 const PLATFORM_PCI_CONFIG_PORT_RESOURCE_ID: u64 = u64::MAX;
+const PLATFORM_HPET_MEMORY_RESOURCE_ID: u64 = u64::MAX - 1;
 const PLATFORM_PCI_CONFIG_PORT_BASE: u64 = 0xCF8;
 const PLATFORM_PCI_CONFIG_PORT_LEN: u64 = 8;
 
@@ -43090,6 +43093,28 @@ unsafe fn hosted_resource_manager_mut() -> &'static mut ResourceManager {
         *slot = Some(manager);
     }
     slot.as_mut().unwrap()
+}
+
+pub(crate) unsafe fn claim_platform_hpet_resource(
+    range: nt_acpi::PhysicalRange,
+) -> Result<(), nt_status::NtStatus> {
+    let page_start = range.start & !0xFFF;
+    let page_bytes = (range.start & 0xFFF)
+        .checked_add(range.length)
+        .and_then(|bytes| bytes.checked_add(0xFFF))
+        .map(|bytes| bytes & !0xFFF)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    hosted_resource_manager_mut()
+        .claim_memory(
+            PLATFORM_RESOURCE_OWNER,
+            PLATFORM_HPET_MEMORY_RESOURCE_ID,
+            page_start,
+            page_start,
+            page_bytes,
+            nt_hal_abi::MM_NON_CACHED,
+            nt_hal_abi::RIGHT_READ | nt_hal_abi::RIGHT_WRITE,
+        )
+        .map_err(hosted_hal_status)
 }
 
 unsafe fn hosted_irq_connections_mut() -> &'static mut Vec<HostedIrqConnection> {
@@ -49541,6 +49566,8 @@ pub(crate) struct HostedMemoryResourceGrant {
     pub frame_base: u64,
     pub map_pages: u64,
     pub video_memory_caller_va: u64,
+    /// Exact firmware HPET register extent delegated read-only from the executive's platform page.
+    pub platform_hpet: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -49615,8 +49642,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             || grant.frame_base == 0
             || grant.map_pages == 0
             || grant.map_pages.saturating_mul(0x1000) == 0
-            || grant.component_va & 0xFFF != 0
-            || grant.broker_va & 0xFFF != 0
+            || grant.raw_start & 0xFFF != grant.translated_start & 0xFFF
+            || grant.component_va & 0xFFF != grant.translated_start & 0xFFF
+            || grant.broker_va & 0xFFF != grant.translated_start & 0xFFF
+            || grant.translated_start.checked_add(grant.length).is_none()
+            || (grant.translated_start & 0xFFF)
+                .checked_add(grant.length)
+                .is_none_or(|bytes| bytes > grant.map_pages.saturating_mul(0x1000))
             || !matches!(
                 grant.share,
                 nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
@@ -49705,6 +49737,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     port_delegations
         .try_reserve_exact(ports.len())
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let mut memory_delegations = Vec::new();
+    memory_delegations
+        .try_reserve_exact(memory.len())
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let map_cap_count = memory
         .iter()
         .try_fold(0u64, |count, grant| count.checked_add(grant.map_pages))
@@ -49718,7 +49754,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     trace_hosted_resource_grant(b"begin", device_id, 0, 0);
 
     for (resource_index, grant) in memory.iter().enumerate() {
-        let mapped_len = grant.length.min(grant.map_pages.saturating_mul(0x1000));
+        let mapped_capacity = grant
+            .map_pages
+            .saturating_mul(0x1000)
+            .saturating_sub(grant.translated_start & 0xFFF);
+        let mapped_len = grant.length.min(mapped_capacity);
         if mapped_len == 0 {
             rollback_staged_hosted_resource_grant(
                 binding,
@@ -49740,7 +49780,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         );
         for window in 0..grant.map_pages.div_ceil(512).max(1) {
             if !ensure_paging(
-                grant.component_va + window * 0x20_0000,
+                (grant.component_va & !0xFFF) + window * 0x20_0000,
                 inst.pml4,
                 paging_domain,
             ) {
@@ -49774,7 +49814,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                 );
                 return Err(nt_status::NtStatus::UNSUCCESSFUL);
             }
-            let map_va = grant.component_va + page * 0x1000;
+            let map_va = (grant.component_va & !0xFFF) + page * 0x1000;
             let rights = if grant.writable { RW_NX } else { RO_NX };
             let error = page_map_r(map_cap, map_va, rights, inst.pml4);
             if error != 0 {
@@ -50013,6 +50053,38 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                     resource_id,
                 });
             }
+        } else {
+            let Some(grant) = memory
+                .iter()
+                .find(|grant| grant.resource_index == resource.resource_index)
+            else {
+                rollback_staged_hosted_resource_grant(
+                    binding,
+                    instance_index,
+                    inst,
+                    &mut issued_port_caps,
+                );
+                return Err(nt_status::NtStatus::INVALID_PARAMETER);
+            };
+            if grant.platform_hpet {
+                if grant.writable
+                    || resource.raw_start != resource.translated_start
+                    || bus_identity.interface_type != HOSTED_INTERFACE_TYPE_INTERNAL
+                {
+                    rollback_staged_hosted_resource_grant(
+                        binding,
+                        instance_index,
+                        inst,
+                        &mut issued_port_caps,
+                    );
+                    return Err(nt_status::NtStatus::INVALID_PARAMETER);
+                }
+                memory_delegations.push(MemoryResourceDelegation {
+                    parent_owner: PLATFORM_RESOURCE_OWNER,
+                    parent_resource_id: PLATFORM_HPET_MEMORY_RESOURCE_ID,
+                    resource_id,
+                });
+            }
         }
         assignments.push(nt_hal_abi::HalResourceDescriptor {
             kind: if resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY {
@@ -50083,13 +50155,12 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             ..Default::default()
         });
     }
-    if let Err(error) = hosted_resource_manager_mut()
-        .replace_owner_assignments_with_port_delegations(
-            hosted_resource_owner(binding),
-            &assignments,
-            &port_delegations,
-        )
-    {
+    if let Err(error) = hosted_resource_manager_mut().replace_owner_assignments_with_delegations(
+        hosted_resource_owner(binding),
+        &assignments,
+        &memory_delegations,
+        &port_delegations,
+    ) {
         rollback_staged_hosted_resource_grant(binding, instance_index, inst, &mut issued_port_caps);
         return Err(hosted_hal_status(error));
     }

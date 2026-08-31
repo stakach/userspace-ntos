@@ -49,6 +49,15 @@ pub struct PortResourceDelegation {
     pub resource_id: u64,
 }
 
+/// Explicit authority for one device-owned memory resource to occupy a subrange of a live
+/// platform reservation. The child may only reduce the parent's access rights.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryResourceDelegation {
+    pub parent_owner: ResourceOwner,
+    pub parent_resource_id: u64,
+    pub resource_id: u64,
+}
+
 /// Why a resource operation was rejected (spec §6.1, §15.2, §22).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HalError {
@@ -86,6 +95,7 @@ struct MemoryResource {
     flags: u16,
     share: u16,
     revoked: bool,
+    delegated_from: Option<(ResourceOwner, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +275,7 @@ impl ResourceManager {
             flags: 0,
             share: SHARE_EXCLUSIVE,
             revoked: false,
+            delegated_from: None,
         };
         if let Some(existing) = self
             .memory
@@ -322,7 +333,7 @@ impl ResourceManager {
         owner: ResourceOwner,
         assignments: &[HalResourceDescriptor],
     ) -> Result<(), HalError> {
-        self.replace_owner_assignments_with_port_delegations(owner, assignments, &[])
+        self.replace_owner_assignments_with_delegations(owner, assignments, &[], &[])
     }
 
     /// Atomically replace one device's assignments while admitting only the listed port subleases.
@@ -335,10 +346,39 @@ impl ResourceManager {
         assignments: &[HalResourceDescriptor],
         port_delegations: &[PortResourceDelegation],
     ) -> Result<(), HalError> {
+        self.replace_owner_assignments_with_delegations(owner, assignments, &[], port_delegations)
+    }
+
+    /// Atomically replace one device's assignments while admitting only the listed memory and port
+    /// subleases. Address overlap without explicit live-parent provenance remains a conflict.
+    pub fn replace_owner_assignments_with_delegations(
+        &mut self,
+        owner: ResourceOwner,
+        assignments: &[HalResourceDescriptor],
+        memory_delegations: &[MemoryResourceDelegation],
+        port_delegations: &[PortResourceDelegation],
+    ) -> Result<(), HalError> {
         if self.query_resources(owner) == assignments
+            && self.memory_delegations_match(owner, assignments, memory_delegations)
             && self.port_delegations_match(owner, assignments, port_delegations)
         {
             return Ok(());
+        }
+
+        for (index, delegation) in memory_delegations.iter().enumerate() {
+            if delegation.parent_owner == owner
+                || delegation.parent_resource_id == 0
+                || delegation.resource_id == 0
+                || memory_delegations[..index]
+                    .iter()
+                    .any(|prior| prior.resource_id == delegation.resource_id)
+                || !assignments.iter().any(|assignment| {
+                    assignment.kind == RES_KIND_MEMORY
+                        && assignment.resource_id == delegation.resource_id
+                })
+            {
+                return Err(HalError::ConflictingAddress);
+            }
         }
 
         for (index, delegation) in port_delegations.iter().enumerate() {
@@ -392,6 +432,41 @@ impl ResourceManager {
                     {
                         return Err(HalError::AccessDenied);
                     }
+                    let delegated_from = if let Some(delegation) = memory_delegations
+                        .iter()
+                        .find(|delegation| delegation.resource_id == descriptor.resource_id)
+                    {
+                        let parent = self
+                            .memory
+                            .iter()
+                            .find(|parent| {
+                                !parent.revoked
+                                    && parent.owner == delegation.parent_owner
+                                    && parent.resource_id == delegation.parent_resource_id
+                            })
+                            .ok_or(HalError::NotAssigned)?;
+                        if !range_contains_range(
+                            parent.phys_start,
+                            parent.length,
+                            descriptor.raw_start,
+                            descriptor.length,
+                        ) || !range_contains_range(
+                            parent.translated_start,
+                            parent.length,
+                            descriptor.translated_start,
+                            descriptor.length,
+                        ) {
+                            return Err(HalError::OutOfRange);
+                        }
+                        if descriptor.arg0 as u32 != parent.cache
+                            || descriptor.arg1 & !parent.rights != 0
+                        {
+                            return Err(HalError::AccessDenied);
+                        }
+                        Some((parent.owner, parent.resource_id))
+                    } else {
+                        None
+                    };
                     let candidate = MemoryResource {
                         resource_id: descriptor.resource_id,
                         owner,
@@ -403,8 +478,15 @@ impl ResourceManager {
                         flags: descriptor.flags,
                         share: descriptor.share,
                         revoked: false,
+                        delegated_from,
                     };
                     if self.memory.iter().any(|existing| {
+                        let delegated_parent = candidate.delegated_from.is_some_and(
+                            |(parent_owner, parent_resource_id)| {
+                                existing.owner == parent_owner
+                                    && existing.resource_id == parent_resource_id
+                            },
+                        );
                         existing.owner != owner
                             && !existing.revoked
                             && ranges_overlap(
@@ -415,6 +497,7 @@ impl ResourceManager {
                             )
                             && (candidate.share == SHARE_EXCLUSIVE
                                 || existing.share == SHARE_EXCLUSIVE)
+                            && !delegated_parent
                     }) || memory.iter().any(|existing: &MemoryResource| {
                         ranges_overlap(
                             candidate.translated_start,
@@ -600,6 +683,45 @@ impl ResourceManager {
         Ok(())
     }
 
+    fn memory_delegations_match(
+        &self,
+        owner: ResourceOwner,
+        assignments: &[HalResourceDescriptor],
+        delegations: &[MemoryResourceDelegation],
+    ) -> bool {
+        if delegations.iter().enumerate().any(|(index, delegation)| {
+            delegation.parent_owner == owner
+                || delegation.parent_resource_id == 0
+                || delegation.resource_id == 0
+                || delegations[..index]
+                    .iter()
+                    .any(|prior| prior.resource_id == delegation.resource_id)
+        }) {
+            return false;
+        }
+        assignments
+            .iter()
+            .filter(|assignment| assignment.kind == RES_KIND_MEMORY)
+            .all(|assignment| {
+                let expected = delegations
+                    .iter()
+                    .find(|delegation| delegation.resource_id == assignment.resource_id)
+                    .map(|delegation| (delegation.parent_owner, delegation.parent_resource_id));
+                self.memory.iter().any(|memory| {
+                    memory.owner == owner
+                        && memory.resource_id == assignment.resource_id
+                        && !memory.revoked
+                        && memory.delegated_from == expected
+                })
+            })
+            && delegations.iter().all(|delegation| {
+                assignments.iter().any(|assignment| {
+                    assignment.kind == RES_KIND_MEMORY
+                        && assignment.resource_id == delegation.resource_id
+                })
+            })
+    }
+
     fn port_delegations_match(
         &self,
         owner: ResourceOwner,
@@ -647,6 +769,106 @@ impl ResourceManager {
         }) || self.interrupts_res.iter().any(|resource| {
             !resource.revoked && resource.resource_id == resource_id && resource.owner != owner
         })
+    }
+
+    /// Claim an exclusive physical-memory range for a platform owner.
+    ///
+    /// Exact replays are idempotent. Child devices can only overlap this claim through an explicit
+    /// [`MemoryResourceDelegation`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_memory(
+        &mut self,
+        owner: ResourceOwner,
+        resource_id: u64,
+        phys_start: u64,
+        translated_start: u64,
+        length: u64,
+        cache: u32,
+        rights: u64,
+    ) -> Result<(), HalError> {
+        validate_range(phys_start, length)?;
+        validate_range(translated_start, length)?;
+        if !matches!(cache, MM_NON_CACHED | MM_CACHED | MM_WRITE_COMBINED)
+            || rights & RIGHT_READ == 0
+            || rights & !(RIGHT_READ | RIGHT_WRITE) != 0
+        {
+            return Err(HalError::AccessDenied);
+        }
+        if let Some(existing) = self
+            .memory
+            .iter()
+            .find(|memory| memory.resource_id == resource_id && !memory.revoked)
+        {
+            return if existing.owner == owner
+                && existing.phys_start == phys_start
+                && existing.translated_start == translated_start
+                && existing.length == length
+                && existing.cache == cache
+                && existing.rights == rights
+                && existing.delegated_from.is_none()
+            {
+                Ok(())
+            } else if existing.owner != owner {
+                Err(HalError::WrongOwner)
+            } else {
+                Err(HalError::ConflictingAddress)
+            };
+        }
+        if self.memory.iter().any(|memory| {
+            !memory.revoked
+                && ranges_overlap(
+                    translated_start,
+                    length,
+                    memory.translated_start,
+                    memory.length,
+                )
+        }) {
+            return Err(HalError::ConflictingAddress);
+        }
+        let resource = MemoryResource {
+            resource_id,
+            owner,
+            phys_start,
+            translated_start,
+            length,
+            cache,
+            rights,
+            flags: 0,
+            share: SHARE_EXCLUSIVE,
+            revoked: false,
+            delegated_from: None,
+        };
+        if let Some(existing) = self
+            .memory
+            .iter_mut()
+            .find(|memory| memory.resource_id == resource_id)
+        {
+            *existing = resource;
+        } else {
+            self.memory
+                .try_reserve(1)
+                .map_err(|_| HalError::InsufficientResources)?;
+            self.memory.push(resource);
+        }
+        Ok(())
+    }
+
+    pub fn release_memory(
+        &mut self,
+        owner: ResourceOwner,
+        resource_id: u64,
+    ) -> Result<(), HalError> {
+        let memory = self
+            .memory
+            .iter_mut()
+            .find(|memory| memory.resource_id == resource_id && !memory.revoked)
+            .ok_or(HalError::StaleId)?;
+        if memory.owner != owner {
+            return Err(HalError::WrongOwner);
+        }
+        memory.revoked = true;
+        self.revoke_orphaned_memory_delegations();
+        Ok(())
     }
 
     /// Claim an exclusive I/O-port range for `owner`.
@@ -755,6 +977,37 @@ impl ResourceManager {
                 });
                 if !parent_live {
                     self.ports[index].revoked = true;
+                    revoked += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return revoked;
+            }
+        }
+    }
+
+    fn revoke_orphaned_memory_delegations(&mut self) -> usize {
+        let mut revoked = 0;
+        loop {
+            let mut changed = false;
+            for index in 0..self.memory.len() {
+                let Some((parent_owner, parent_resource_id)) = self.memory[index].delegated_from
+                else {
+                    continue;
+                };
+                if self.memory[index].revoked {
+                    continue;
+                }
+                let parent_live = self.memory.iter().any(|parent| {
+                    !parent.revoked
+                        && parent.owner == parent_owner
+                        && parent.resource_id == parent_resource_id
+                });
+                if !parent_live {
+                    let resource_id = self.memory[index].resource_id;
+                    self.memory[index].revoked = true;
+                    self.revoke_memory_resource_usage(resource_id);
                     revoked += 1;
                     changed = true;
                 }
@@ -1084,6 +1337,7 @@ impl ResourceManager {
                 memory_resources += 1;
             }
         }
+        memory_resources += self.revoke_orphaned_memory_delegations();
         let mut port_resources = 0;
         for port in self.ports.iter_mut() {
             if port.owner == owner && !port.revoked {
@@ -1276,6 +1530,76 @@ mod tests {
 
         assert_eq!(rm.release_port(platform, 300), Ok(()));
         assert!(rm.query_resources(acpi).is_empty());
+    }
+
+    #[test]
+    fn memory_delegation_reduces_rights_and_revokes_with_parent() {
+        let mut rm = ResourceManager::new();
+        let platform = ResourceOwner::new(1, 10, 100);
+        let acpi = ResourceOwner::new(2, 20, 200);
+        rm.claim_memory(
+            platform,
+            300,
+            0xfed0_0000,
+            0xfed0_0000,
+            0x1000,
+            MM_NON_CACHED,
+            RIGHT_READ,
+        )
+        .unwrap();
+        let hpet = HalResourceDescriptor {
+            kind: RES_KIND_MEMORY,
+            share: SHARE_EXCLUSIVE,
+            resource_id: 301,
+            raw_start: 0xfed0_0000,
+            translated_start: 0xfed0_0000,
+            length: 0x400,
+            arg0: MM_NON_CACHED as u64,
+            arg1: RIGHT_READ,
+            ..Default::default()
+        };
+        assert_eq!(
+            rm.replace_owner_assignments(acpi, &[hpet]),
+            Err(HalError::ConflictingAddress)
+        );
+        let delegation = MemoryResourceDelegation {
+            parent_owner: platform,
+            parent_resource_id: 300,
+            resource_id: 301,
+        };
+        assert_eq!(
+            rm.replace_owner_assignments_with_delegations(acpi, &[hpet], &[delegation], &[]),
+            Ok(())
+        );
+        let mapping = rm
+            .map_io_space(acpi, 0xfed0_0000, 0x400, MM_NON_CACHED)
+            .unwrap();
+
+        let writable_child = HalResourceDescriptor {
+            arg1: RIGHT_READ | RIGHT_WRITE,
+            ..hpet
+        };
+        assert_eq!(
+            rm.replace_owner_assignments_with_delegations(
+                acpi,
+                &[writable_child],
+                &[delegation],
+                &[],
+            ),
+            Err(HalError::AccessDenied)
+        );
+        rm.release_memory(platform, 300).unwrap();
+        assert!(rm.query_resources(acpi).is_empty());
+        assert!(!rm.mapping_valid(mapping.mapping_id));
+        assert_eq!(
+            rm.replace_owner_assignments_with_delegations(
+                acpi,
+                &[writable_child],
+                &[delegation],
+                &[],
+            ),
+            Err(HalError::NotAssigned)
+        );
     }
 
     #[test]
