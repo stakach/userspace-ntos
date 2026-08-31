@@ -1,15 +1,21 @@
 //! Step 4.0 proof: parse our emitted PE32+ `ntdll.dll` with the executive's OWN loader
 //! (`nt-pe-loader::PeFile`) and assert the properties Step 4.B relies on.
 //!
-//! Usage: `ntdll-dll-verify [path-to-dll]` (defaults to `.tmp/nt-ntdll.dll`).
+//! Usage:
+//! - `ntdll-dll-verify [path-to-dll]` (defaults to `.tmp/nt-ntdll.dll`)
+//! - `ntdll-dll-verify --wine-manifest [path-to-ntdll.spec]`
+//! - `ntdll-dll-verify --wine-report [path-to-dll]`
 //!
 //! If our own loader can read it — headers, export directory, relocations — then the executive can
 //! load it in-boot. Exits non-zero on any failure so the build script / CI can gate on it.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use nt_pe_loader::PeFile;
 use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
+
+mod wine_spec;
 
 // IMAGE_FILE_CHARACTERISTICS.IMAGE_FILE_DLL
 const IMAGE_FILE_DLL: u16 = 0x2000;
@@ -92,9 +98,40 @@ fn has_legacy_fixed_ipc_store(stub: &[u8]) -> bool {
 }
 
 fn main() -> ExitCode {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| ".tmp/nt-ntdll.dll".to_string());
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    if matches!(first.as_deref(), Some("--wine-manifest" | "--wine-report")) {
+        let mode = first.as_deref().unwrap();
+        let path = args.next().unwrap_or_else(|| match mode {
+            "--wine-manifest" => "references/wine/dlls/ntdll/ntdll.spec".to_string(),
+            "--wine-report" => ".tmp/nt-ntdll.dll".to_string(),
+            _ => unreachable!(),
+        });
+        if let Some(extra) = args.next() {
+            eprintln!("!! unexpected argument {extra:?}");
+            return ExitCode::FAILURE;
+        }
+        let result = match mode {
+            "--wine-manifest" => wine_spec::generate_manifest(Path::new(&path)),
+            "--wine-report" => wine_spec::report(Path::new(&path)),
+            _ => unreachable!(),
+        };
+        return match result {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("!! {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let path = first.unwrap_or_else(|| ".tmp/nt-ntdll.dll".to_string());
+    if let Some(extra) = args.next() {
+        eprintln!("!! unexpected argument {extra:?}");
+        return ExitCode::FAILURE;
+    }
 
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,

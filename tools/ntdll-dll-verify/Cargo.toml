@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 nt-pe-loader = { path = "../../crates/nt-pe-loader" }
 nt-syscall-abi = { path = "../../crates/nt-syscall-abi" }
+sha2 = "0.10"

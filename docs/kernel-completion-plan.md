@@ -20407,10 +20407,31 @@ The initial x86-64 inventory contains 1,477 unique applicable Wine spec rows. Si
 These are export-directory measurements, not source grep counts. Wine marks 101 applicable rows as
 stubs; those rows identify compatibility names only and do not license stub behavior here.
 
-- [ ] Add a checked parser and reproducible verifier mode for Wine's spec grammar, x86-64
+- [x] Add a checked parser and reproducible verifier mode for Wine's spec grammar, x86-64
   architecture predicates, aliases, calling conventions, data exports, and the explicit Wine
   extension exclusion. Freeze the Wine commit and categorized missing-name report in verifier
   output; never make the ignored local reference tree a build prerequisite.
+
+  Wine inventory verifier checkpoint (2026-08-31): `ntdll-dll-verify` now has a fail-closed parser
+  for the active `ntdll.spec` row forms, export kinds, argument grammar, flags, x86-64 architecture
+  predicates, handler aliases, and inline comments. The source-dependent
+  `--wine-manifest [spec]` mode accepts only the pinned source content and regenerates the checked-in
+  `tools/ntdll-dll-verify/fixtures/wine-ntdll-x86_64-2ecc2f84.tsv`; normal builds and reports read
+  that manifest and therefore do not depend on the ignored `references/wine` tree. The fixture
+  freezes Wine commit `2ecc2f84b45ec42afbf1725d756181180a8204b1`, spec blob
+  `10d42eeb1387204518711814923e19b6bbed25cf`, and SHA-256
+  `25fafa3c7f9c2f981f1dcd70ee4315d8dedb13a695a20528a80843df86fff15c`.
+
+  `--wine-report [.tmp/nt-ntdll.dll]` parses the built DLL through `nt-pe-loader`, excludes exactly
+  the 16 `wine_*`/`__wine_*` host-runtime names, and emits a stable report rather than failing on the
+  known implementation frontier. The frozen 1,477 applicable rows comprise 1,178 `stdcall`, 178
+  `cdecl`, 13 `varargs`, 101 `stub`, and 7 `extern` rows with 282 handler aliases. The current DLL
+  has 1,372 exports and covers 1,089 of the 1,461 Windows-visible Wine names. The exact 372-name gap
+  is categorized as 71 `Nt`, 71 `Zw`, 109 `Rtl`, 35 `Tp`, 9 `Ldr`, 5 `Csr`, 2 `ApiSet`, 4
+  `Ntdll`, 3 `WinSqm`, and 63 CRT/data/other. Focused validation passes
+  `cargo test -p ntdll-dll-verify`; manifest regeneration is byte-for-byte reproducible. The later
+  strict export-kind and calling-convention gate remains open until the classified names have real
+  implementations.
 - [ ] Reconcile each missing name against NT5, ReactOS, Wine, and the Windows-visible caller ABI.
   Record ABI, ownership, supported information classes, observable failures, and whether the body is
   a user-mode ntdll routine or requires a real kernel mechanism. A Wine stub is an implementation
