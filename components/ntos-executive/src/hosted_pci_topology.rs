@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
 
 use nt_pnp::{
-    AcpiPciLinkCandidateFact, AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError,
-    AcpiPciScopeSource, PciDevice, PciInterruptRouteOwner, PciInventory, PciInventoryError,
-    PreparedAcpiPciRoutingDiscovery, PreparedAcpiPciRoutingTables,
+    AcpiPciCrsMethodSource, AcpiPciLinkCandidateFact, AcpiPciProviderEndpoint, AcpiPciScopeCatalog,
+    AcpiPciScopeError, AcpiPciScopeSource, PciDevice, PciInterruptRouteOwner, PciInventory,
+    PciInventoryError, PreparedAcpiPciInterruptLinkDiscovery, PreparedAcpiPciRoutingDiscovery,
+    PreparedAcpiPciRoutingTables,
     PreparedAcpiPciScopeCatalogUpdate,
 };
 
@@ -218,6 +219,38 @@ pub(crate) unsafe fn hosted_pci_routing_tables_are_current(
         .as_ref()
         .is_some_and(|authority| {
             tables.is_current(&authority.scopes, &authority.inventory, &authority.routes)
+        })
+}
+
+pub(crate) unsafe fn prepare_hosted_pci_interrupt_link_discovery(
+    tables: PreparedAcpiPciRoutingTables,
+    filtered_sources: Vec<AcpiPciCrsMethodSource>,
+) -> Result<PreparedAcpiPciInterruptLinkDiscovery, nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
+        .as_ref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    tables
+        .prepare_interrupt_link_discovery(
+            &authority.scopes,
+            &authority.inventory,
+            &authority.routes,
+            filtered_sources,
+        )
+        .map_err(|error| match error {
+            nt_pnp::AcpiPciRoutingDiscoveryError::Allocation => {
+                nt_status::NtStatus::INSUFFICIENT_RESOURCES
+            }
+            _ => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        })
+}
+
+pub(crate) unsafe fn hosted_pci_interrupt_link_discovery_is_current(
+    discovery: &PreparedAcpiPciInterruptLinkDiscovery,
+) -> bool {
+    (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
+        .as_ref()
+        .is_some_and(|authority| {
+            discovery.is_current(&authority.scopes, &authority.inventory, &authority.routes)
         })
 }
 

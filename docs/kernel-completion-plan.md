@@ -20334,6 +20334,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     per endpoint, then call `prepare_interrupt_link_discovery`. Do not release the serialized owner
     at the table-accepted checkpoint and do not allow a later BusRelations claim to overtake it.
 
+    B3 filtered link-candidate transport checkpoint (2026-08-31, implementation green): accepted
+    routing tables now advance in the same retained reconciler into one multilevel `_CRS` namespace
+    query for every exact endpoint that owns a link-backed `_PRT` entry. The new focused
+    `hosted_acpi_pci_route_filters.rs` transport sends the fixed 17-byte filter input, accepts
+    `STATUS_BUFFER_OVERFLOW` only on the initial 8-byte probe with zero Information and a strictly
+    larger bounded length, retries once at that exact size, and requires successful Information to
+    equal the complete output capacity. Exact empty match sets are valid. Synchronous and pending
+    paths share parsing policy; pending paths copy the full retained capacity and strictly
+    acknowledge before advancing or discarding stale state.
+
+    Only after all endpoint-indexed filter results are complete does the executive consume the
+    retained `PreparedAcpiPciRoutingTables` through `prepare_interrupt_link_discovery`. The pure
+    policy remains responsible for validating endpoint coverage, unioning relation-scoped and
+    filtered candidates, resolving scoped link names, and deduplicating exact full-path link `_CRS`
+    calls. The resulting `PreparedAcpiPciInterruptLinkDiscovery` remains generation fenced in the
+    serialized owner. The freestanding executive check remains green at the unchanged 209-warning
+    baseline.
+
+    Review adjustment: dispatch every deduplicated full-path link `_CRS` METHOD_EX query through its
+    authenticated endpoint using the same strict variable output contract as `_PRT`. Parse one exact
+    resource template per request index, retain all evaluations until complete, then prepare and
+    atomically commit the single route publication with the install-once MADT overrides. A provider
+    or parse barrier must leave the route owner invalidated; no PCI config-line fallback is allowed.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

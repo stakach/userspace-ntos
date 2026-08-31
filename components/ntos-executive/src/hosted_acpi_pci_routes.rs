@@ -17,7 +17,20 @@ enum HostedAcpiPciRoutePhase {
         disposition: HostedAcpiPciPrtDisposition,
     },
     AcceptTables,
-    TablesAccepted,
+    DispatchCrsFilter { endpoint_index: usize, output_len: usize },
+    AwaitingCrsFilterCompletion { endpoint_index: usize, output_len: usize },
+    AwaitingCrsFilterCopy {
+        endpoint_index: usize,
+        output_len: usize,
+        status: nt_status::NtStatus,
+        information: u64,
+    },
+    AwaitingCrsFilterAck {
+        endpoint_index: usize,
+        disposition: HostedAcpiPciCrsFilterDisposition,
+    },
+    PrepareLinkDiscovery,
+    LinkDiscoveryPrepared,
     Barrier,
 }
 
@@ -32,6 +45,7 @@ enum HostedAcpiPciPrtDisposition {
 enum HostedAcpiPciRoutePolicy {
     Routing(nt_pnp::PreparedAcpiPciRoutingDiscovery),
     Tables(nt_pnp::PreparedAcpiPciRoutingTables),
+    Links(nt_pnp::PreparedAcpiPciInterruptLinkDiscovery),
 }
 
 struct HostedAcpiPciRouteQuery {
@@ -39,6 +53,8 @@ struct HostedAcpiPciRouteQuery {
     phase: HostedAcpiPciRoutePhase,
     tables: Vec<nt_acpi::PciRoutingTable>,
     pending_table: Option<nt_acpi::PciRoutingTable>,
+    filtered_sources: Vec<nt_pnp::AcpiPciCrsMethodSource>,
+    pending_matches: Option<nt_acpi::AcpiNamespaceMatches>,
     irp_id: IrpId,
     origin_driver_id: DriverId,
     completion_driver_id: DriverId,
@@ -56,6 +72,11 @@ fn hosted_acpi_pci_route_policy_current(policy: &HostedAcpiPciRoutePolicy) -> bo
             }
             HostedAcpiPciRoutePolicy::Tables(tables) => {
                 crate::hosted_pci_topology::hosted_pci_routing_tables_are_current(tables)
+            }
+            HostedAcpiPciRoutePolicy::Links(discovery) => {
+                crate::hosted_pci_topology::hosted_pci_interrupt_link_discovery_is_current(
+                    discovery,
+                )
             }
         }
     }
@@ -189,7 +210,7 @@ unsafe fn apply_hosted_acpi_pci_prt_disposition(
                 query.tables.push(table);
                 let query_count = match query.policy.as_ref().unwrap() {
                     HostedAcpiPciRoutePolicy::Routing(discovery) => discovery.queries().len(),
-                    HostedAcpiPciRoutePolicy::Tables(_) => 0,
+                    HostedAcpiPciRoutePolicy::Tables(_) | HostedAcpiPciRoutePolicy::Links(_) => 0,
                 };
                 if query.tables.len() == query_count {
                     HostedAcpiPciRoutePhase::AcceptTables
@@ -294,15 +315,8 @@ unsafe fn dispatch_hosted_acpi_pci_prt(query_index: usize, output_len: usize) ->
                 )
                 .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
             });
-            let Some((origin_driver_id, completion_driver_id, completion_device_id)) = identities
-            else {
-                let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                    .as_mut()
-                    .unwrap();
-                query.phase = HostedAcpiPciRoutePhase::Barrier;
-                query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-                return true;
-            };
+            let (origin_driver_id, completion_driver_id, completion_device_id) =
+                identities.unwrap_or((DriverId(0), DriverId(0), nt_io_manager::DeviceId(0)));
             let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
                 .as_mut()
                 .unwrap();
@@ -349,6 +363,8 @@ unsafe fn start_hosted_acpi_pci_route_query() -> usize {
         phase,
         tables,
         pending_table: None,
+        filtered_sources: Vec::new(),
+        pending_matches: None,
         irp_id: IrpId(0),
         origin_driver_id: DriverId(0),
         completion_driver_id: DriverId(0),
@@ -377,6 +393,9 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 HostedAcpiPciRoutePhase::AwaitingPrtCompletion { .. }
                     | HostedAcpiPciRoutePhase::AwaitingPrtCopy { .. }
                     | HostedAcpiPciRoutePhase::AwaitingPrtAck { .. }
+                    | HostedAcpiPciRoutePhase::AwaitingCrsFilterCompletion { .. }
+                    | HostedAcpiPciRoutePhase::AwaitingCrsFilterCopy { .. }
+                    | HostedAcpiPciRoutePhase::AwaitingCrsFilterAck { .. }
             )
         {
             *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
@@ -549,8 +568,21 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                     tables,
                 ) {
                     Ok(tables) => {
+                        let endpoint_count = tables.link_candidate_endpoints().len();
+                        if query.filtered_sources.try_reserve_exact(endpoint_count).is_err() {
+                            *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
+                            crate::hosted_pci_topology::retry_hosted_pci_route_reconciliation();
+                            return progress;
+                        }
                         query.policy = Some(HostedAcpiPciRoutePolicy::Tables(tables));
-                        query.phase = HostedAcpiPciRoutePhase::TablesAccepted;
+                        query.phase = if endpoint_count == 0 {
+                            HostedAcpiPciRoutePhase::PrepareLinkDiscovery
+                        } else {
+                            HostedAcpiPciRoutePhase::DispatchCrsFilter {
+                                endpoint_index: 0,
+                                output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
+                            }
+                        };
                     }
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => {
                         *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
@@ -564,7 +596,57 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
                 }
                 progress = progress.saturating_add(1);
             }
-            HostedAcpiPciRoutePhase::TablesAccepted | HostedAcpiPciRoutePhase::Barrier => {
+            HostedAcpiPciRoutePhase::DispatchCrsFilter {
+                endpoint_index,
+                output_len,
+            } => {
+                if !dispatch_hosted_acpi_pci_crs_filter(endpoint_index, output_len) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedAcpiPciRoutePhase::AwaitingCrsFilterCompletion {
+                endpoint_index,
+                output_len,
+            } => {
+                if !advance_hosted_acpi_pci_crs_filter_completion(endpoint_index, output_len) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedAcpiPciRoutePhase::AwaitingCrsFilterCopy {
+                endpoint_index,
+                output_len,
+                status,
+                information,
+            } => {
+                if !copy_hosted_acpi_pci_crs_filter_completion(
+                    endpoint_index,
+                    output_len,
+                    status,
+                    information,
+                ) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedAcpiPciRoutePhase::AwaitingCrsFilterAck {
+                endpoint_index,
+                disposition,
+            } => {
+                if !acknowledge_hosted_acpi_pci_crs_filter(endpoint_index, disposition) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedAcpiPciRoutePhase::PrepareLinkDiscovery => {
+                if !prepare_hosted_acpi_pci_interrupt_link_discovery() {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedAcpiPciRoutePhase::LinkDiscoveryPrepared
+            | HostedAcpiPciRoutePhase::Barrier => {
                 return progress;
             }
         }

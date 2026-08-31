@@ -36966,6 +36966,7 @@ unsafe fn dispatch_hosted_acpi_pci_root_method(
 
 include!("hosted_acpi_pci_relation.rs");
 include!("hosted_acpi_pci_routes.rs");
+include!("hosted_acpi_pci_route_filters.rs");
 
 fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError {
     let raw_status = status as u32;
