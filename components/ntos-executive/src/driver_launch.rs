@@ -38507,6 +38507,170 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 }
                 progress = progress.saturating_add(1);
             }
+            HostedDeviceRelationQueryPhase::BeginAcpiPciAddressMethods { child_index } => {
+                if !begin_hosted_acpi_pci_address_methods(child_index) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::DispatchAcpiPciAddressMethod {
+                child_index,
+                address_index,
+            } => {
+                if !dispatch_hosted_acpi_pci_address_method(child_index, address_index) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCompletion {
+                child_index,
+                address_index,
+            } => {
+                let (irp_id, origin_driver_id, completion_driver_id, completion_device_id) = {
+                    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                        .as_ref()
+                        .unwrap();
+                    (
+                        query.irp_id,
+                        query.origin_driver_id,
+                        query.completion_driver_id,
+                        query.completion_device_id,
+                    )
+                };
+                let Some((pdo_device_id, _, _)) = hosted_relation_child_identity(child_index)
+                else {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        ),
+                    );
+                    return progress.saturating_add(1);
+                };
+                let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
+                    return progress;
+                };
+                let request_valid = io_manager_mut().irp(irp_id).is_some_and(|irp| {
+                    irp.current_stack().is_some_and(|stack| {
+                        stack.driver_id == completion_driver_id
+                            && stack.device_id == completion_device_id
+                            && matches!(
+                                &stack.parameters,
+                                IoParameters::DeviceControl(parameters)
+                                    if parameters.ioctl_code
+                                        == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
+                                        && parameters.input_len as usize
+                                            == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
+                                        && parameters.output_len as usize
+                                            == HOSTED_ACPI_EVAL_INTEGER_LEN
+                            )
+                    })
+                });
+                let identity_valid = completion.id == irp_id
+                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+                    && completion.file_id.is_none()
+                    && completion.driver_id == origin_driver_id
+                    && completion.device_id == pdo_device_id
+                    && completion.major == major::IRP_MJ_DEVICE_CONTROL
+                    && completion.minor == 0
+                    && completion.completion_driver_id == completion_driver_id
+                    && completion.completion_device_id == completion_device_id
+                    && completion.user_data == 0
+                    && completion.requestor_tid == 0
+                    && completion.completion_origin == IrpCompletionOrigin::Driver
+                    && request_valid;
+                if !identity_valid {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        ),
+                    );
+                    return progress.saturating_add(1);
+                }
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap();
+                query.driver_status = Some(completion.status);
+                query.phase = HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCopy {
+                    child_index,
+                    address_index,
+                    status: completion.status,
+                    information: completion.information,
+                };
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodCopy {
+                child_index,
+                address_index,
+                status,
+                information,
+            } => {
+                let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .unwrap()
+                    .irp_id;
+                let mut payload = [0u8; HOSTED_ACPI_EVAL_INTEGER_LEN];
+                let disposition = match io_manager_mut()
+                    .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
+                {
+                    Ok(copied) if copied == payload.len() => {
+                        classify_hosted_acpi_pci_address_method_result(
+                            status,
+                            information,
+                            &payload,
+                        )
+                    }
+                    Ok(_) => HostedAcpiPciAddressMethodDisposition::Barrier(
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    ),
+                    Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
+                    | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
+                    Err(copy_status) => {
+                        HostedAcpiPciAddressMethodDisposition::Barrier(copy_status)
+                    }
+                };
+                (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap()
+                    .phase = HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodAck {
+                    child_index,
+                    address_index,
+                    disposition,
+                };
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AwaitingAcpiPciAddressMethodAck {
+                child_index,
+                address_index,
+                disposition,
+            } => {
+                let irp_id = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .unwrap()
+                    .irp_id;
+                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
+                    Ok(_) => {
+                        apply_hosted_acpi_pci_address_method_disposition(
+                            child_index,
+                            address_index,
+                            disposition,
+                        );
+                        progress = progress.saturating_add(1);
+                    }
+                    Err(status) => {
+                        (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                            .as_mut()
+                            .unwrap()
+                            .barrier_status = Some(status);
+                        return progress;
+                    }
+                }
+            }
+            HostedDeviceRelationQueryPhase::CompleteAcpiPciScopeSource { child_index } => {
+                if !complete_hosted_acpi_pci_scope_source(child_index) {
+                    return progress;
+                }
+                progress = progress.saturating_add(1);
+            }
             HostedDeviceRelationQueryPhase::IdsCopied => match publish_hosted_bus_relations() {
                 Ok(()) => return progress.saturating_add(1),
                 Err(HostedRelationPublishError::Retry) => return progress,
@@ -38560,6 +38724,36 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                                 properties.acpi_pci_scope_discovery,
                                 HostedAcpiPciScopeDiscoveryState::NotApplicable
                                     | HostedAcpiPciScopeDiscoveryState::Planned(_)
+                            )
+                        })
+                    });
+                if !complete {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::Barrier(
+                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                        ),
+                    );
+                    return progress.saturating_add(1);
+                }
+                let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_mut()
+                    .unwrap();
+                query.phase = if query.child_properties.is_empty() {
+                    HostedDeviceRelationQueryPhase::AcpiPciScopeSourcesReady
+                } else {
+                    HostedDeviceRelationQueryPhase::BeginAcpiPciAddressMethods { child_index: 0 }
+                };
+                progress = progress.saturating_add(1);
+            }
+            HostedDeviceRelationQueryPhase::AcpiPciScopeSourcesReady => {
+                let complete = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                    .as_ref()
+                    .is_some_and(|query| {
+                        query.child_properties.iter().all(|properties| {
+                            matches!(
+                                properties.acpi_pci_scope_discovery,
+                                HostedAcpiPciScopeDiscoveryState::NotApplicable
+                                    | HostedAcpiPciScopeDiscoveryState::Complete(_)
                             )
                         })
                     });
@@ -40843,6 +41037,32 @@ enum HostedDeviceRelationQueryPhase {
         child_index: usize,
     },
     AcpiPciScopeMethodsPlanned,
+    BeginAcpiPciAddressMethods {
+        child_index: usize,
+    },
+    DispatchAcpiPciAddressMethod {
+        child_index: usize,
+        address_index: usize,
+    },
+    AwaitingAcpiPciAddressMethodCompletion {
+        child_index: usize,
+        address_index: usize,
+    },
+    AwaitingAcpiPciAddressMethodCopy {
+        child_index: usize,
+        address_index: usize,
+        status: nt_status::NtStatus,
+        information: u64,
+    },
+    AwaitingAcpiPciAddressMethodAck {
+        child_index: usize,
+        address_index: usize,
+        disposition: HostedAcpiPciAddressMethodDisposition,
+    },
+    CompleteAcpiPciScopeSource {
+        child_index: usize,
+    },
+    AcpiPciScopeSourcesReady,
     Barrier,
 }
 
@@ -40879,6 +41099,12 @@ enum HostedAcpiPciNamespaceDisposition {
     Barrier(nt_status::NtStatus),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedAcpiPciAddressMethodDisposition {
+    Value(u32),
+    Barrier(nt_status::NtStatus),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HostedBusInformationState {
     Unqueried,
@@ -40909,6 +41135,7 @@ enum HostedAcpiPciRootState {
         base_bus: Option<u32>,
     },
     Present(nt_pnp::AcpiPciRootScopeFact),
+    Consumed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40920,6 +41147,11 @@ enum HostedAcpiPciScopeDiscoveryState {
         routing_tables: Option<nt_acpi::AcpiNamespaceMatches>,
     },
     Planned(nt_pnp::AcpiPciScopeMethodPlan),
+    EvaluatingAddresses {
+        plan: nt_pnp::AcpiPciScopeMethodPlan,
+        values: Vec<u32>,
+    },
+    Complete(nt_pnp::AcpiPciScopeSource),
 }
 
 impl Default for HostedDeviceCapabilitiesState {

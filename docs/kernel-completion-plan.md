@@ -20111,6 +20111,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and commit it only at the existing relation transaction boundary; `_PRT` and link `_CRS`
     evaluation follows after scope resolution.
 
+    B3 full-path `_ADR` source-assembly checkpoint (2026-08-31, implementation green): the relation
+    transaction now consumes each accepted root's method plan and evaluates every canonical `_ADR`
+    path in parent-first order through File-less `IOCTL_ACPI_EVAL_METHOD_EX`. Each dispatch uses the
+    exact 260-byte no-argument extended input and exact 20-byte single-integer output. Evaluation
+    failure, overflow, missing method, noninteger output, wrong Information, changed endpoint, or an
+    out-of-order result is a hard barrier; `_ADR` has no synthetic default.
+
+    Pending METHOD_EX completion revalidates the live hosted-domain cookie/PDO binding and the exact
+    IRP/client/origin/completion-driver/completion-device, IOCTL, input, and output identities before
+    copying and acknowledging the retained system buffer. Address values accumulate in one
+    pre-reserved scalar vector. Once complete, the executive moves, rather than clones, the planned
+    canonical scope paths and retained root fact into one `AcpiPciScopeSource` keyed by I/O Manager
+    DeviceId, hosted-domain id/cookie, and component PDO object. The source remains transaction-local
+    and cannot affect the live catalog or routes yet. The focused helper file contains the transport
+    and source assembly; the freestanding executive check remains green at 209 warnings.
+
+    Review adjustment: add a complete per-relation catalog prepare API so multiple current roots and
+    departed endpoints update atomically. Collect the ready sources, prepare that replacement before
+    Configuration Manager mutation, commit it after devnode/BusRelations commit and before relation
+    invalidation completion, and fence only relevant ACPI PCI authority at enqueue. Then schedule the
+    generation-checked scope reconciler; route-table and link-resource evaluation remains the next
+    fact layer and must not be replaced by swizzling or partial coverage.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
