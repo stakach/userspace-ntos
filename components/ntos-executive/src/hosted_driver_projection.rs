@@ -33,18 +33,22 @@ impl HostedDeviceProjection {
 /// released before returning the NTSTATUS.
 pub(crate) unsafe fn create_hosted_device_projection(
     driver_object: u64,
-    extension_size: u64,
+    extension_size: u32,
     device_type: u32,
     flags: u32,
     characteristics: u32,
     allocate: unsafe fn(u64) -> u64,
     free: unsafe fn(u64),
 ) -> Result<HostedDeviceProjection, i32> {
-    let Some(allocation_len) = (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(extension_size)
+    let Some(allocation_len) =
+        (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(extension_size as u64)
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Ok(allocation_len_usize) = usize::try_from(allocation_len) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Ok(size_field) = u16::try_from(allocation_len) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     let device_object = allocate(allocation_len);
@@ -68,6 +72,7 @@ pub(crate) unsafe fn create_hosted_device_projection(
     if write_wdm_device_object(
         device_bytes,
         WdmDeviceObjectInit {
+            size_field,
             driver_object,
             next_device,
             device_extension,

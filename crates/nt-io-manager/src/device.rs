@@ -41,6 +41,7 @@ bitflags::bitflags! {
         const BUFFERED_IO = 0x0000_0004;
         const EXCLUSIVE = 0x0000_0008;
         const DIRECT_IO = 0x0000_0010;
+        const DEVICE_HAS_NAME = 0x0000_0040;
         const DEVICE_INITIALIZING = 0x0000_0080;
     }
 }

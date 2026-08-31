@@ -11228,6 +11228,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
         crate::spawn_hosts::DriverObjectSpec {
             size: 0x200,
             size_field: 336,
+            driver_object_off: u64::MAX,
             ext_size: 0x40,
             mj: 0x100,
             mj_table_off: u64::MAX,

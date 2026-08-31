@@ -113,6 +113,11 @@ impl ObjectManager {
         self.clients.register(kind, access_mode)
     }
 
+    /// Return the access mode authenticated when this client connection was registered.
+    pub fn client_mode(&self, client: ClientId) -> Result<AccessMode, NtStatus> {
+        self.clients.client_mode(client)
+    }
+
     /// Close a client: close all its handles (dropping their references) and
     /// retire its id. Temporary named objects whose last handle was here lose
     /// their names; objects still referenced elsewhere survive.

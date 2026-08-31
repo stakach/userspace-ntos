@@ -2923,6 +2923,9 @@ pub(crate) struct DriverObjectSpec {
     /// The value written into the DRIVER_OBJECT `Size` field @2. USUALLY == `size` (FSD), but win32k
     /// allocates 0x200 yet stamps Size=336 (0x150) — so this is a distinct field to preserve that.
     pub size_field: u16,
+    /// Shared-frame field that publishes the component-local DRIVER_OBJECT before DriverEntry.
+    /// Use `u64::MAX` when the hosted personality does not expose that identity in its frame.
+    pub driver_object_off: u64,
     pub ext_size: u64,
     pub mj: u64,
     /// Shared-frame offset to record `drv + mj` (the MajorFunction[] base) into, for the executive to
@@ -3115,6 +3118,9 @@ pub(crate) unsafe fn component_main(
     let entry_rva = core::ptr::read_volatile((shared_va + SH_ENTRY_RVA_H) as *const u64) as u32;
 
     let (drv, reg_path) = component_driver_entry_context(spec);
+    if spec.driver_object_off != u64::MAX {
+        core::ptr::write_volatile((shared_va + spec.driver_object_off) as *mut u64, drv);
+    }
 
     let support_entry_rva = if spec.support_entry_rva_off == u64::MAX {
         0

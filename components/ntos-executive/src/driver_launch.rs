@@ -82,10 +82,11 @@ use nt_io_manager::{
     ReadWriteParameters, SetEaParameters, SetInformationControl, SetInformationParameters,
     SetQuotaParameters, SetVolumeInformationParameters, ShareAccess, StackFlags,
     WdmDriverObjectInit, WdmFileObjectInit, WdmIoStackLocationInit, WdmIoStackParameters,
-    WdmIrpInit, WDM_X64_DRIVER_EXTENSION_OFFSET, WDM_X64_DRIVER_EXTENSION_SIZE,
-    WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET, WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET,
-    WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_FILE_OBJECT_SIZE, WDM_X64_IO_STACK_LOCATION_SIZE,
-    WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER, WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
+    WdmIrpInit, WDM_X64_DEVICE_OBJECT_SIZE, WDM_X64_DRIVER_EXTENSION_OFFSET,
+    WDM_X64_DRIVER_EXTENSION_SIZE, WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET,
+    WDM_X64_DRIVER_OBJECT_SIZE, WDM_X64_DRIVER_UNLOAD_OFFSET, WDM_X64_FILE_OBJECT_SIZE,
+    WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER,
+    WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
@@ -4281,13 +4282,11 @@ extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
     if microseconds == 0 {
         return;
     }
-    let frequency_hz = unsafe {
-        read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64)
-    };
-    let Some(required_cycles) = nt_kernel_exec::stall::cycles_for_microseconds(
-        microseconds,
-        frequency_hz,
-    ) else {
+    let frequency_hz =
+        unsafe { read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64) };
+    let Some(required_cycles) =
+        nt_kernel_exec::stall::cycles_for_microseconds(microseconds, frequency_hz)
+    else {
         panic!("hosted kernel timing authority is invalid");
     };
     let start = read_ordered_tsc();
@@ -4304,9 +4303,8 @@ extern "win64" fn s_ke_stall_execution_processor(microseconds: u32) {
 /// kernel component. The measured TSC and its boot-calibrated frequency are one coherent counter
 /// authority and require no executive data/MMIO mapping in the component VSpace.
 extern "win64" fn s_hosted_ke_query_performance_counter(frequency: *mut u64) -> u64 {
-    let frequency_hz = unsafe {
-        read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64)
-    };
+    let frequency_hz =
+        unsafe { read_volatile((FSD_SHARED_VADDR + SH_TSC_FREQUENCY_HZ) as *const u64) };
     if frequency_hz == 0 {
         panic!("hosted kernel timing authority is invalid");
     }
@@ -4687,10 +4685,7 @@ impl nt_printf::Output for WidePrintfOutput {
             return false;
         }
         unsafe {
-            write_unaligned(
-                (self.buffer + self.position as u64 * 2) as *mut u16,
-                unit,
-            );
+            write_unaligned((self.buffer + self.position as u64 * 2) as *mut u16, unit);
         }
         self.position += 1;
         true
@@ -4748,13 +4743,7 @@ unsafe fn format_wide_driver<A: nt_printf::Arguments>(
 }
 
 #[no_mangle]
-extern "win64" fn s_sprintf_body(
-    dst: u64,
-    fmt: u64,
-    a0: u64,
-    a1: u64,
-    caller_rsp: u64,
-) -> i32 {
+extern "win64" fn s_sprintf_body(dst: u64, fmt: u64, a0: u64, a1: u64, caller_rsp: u64) -> i32 {
     let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
     unsafe { format_narrow_driver(dst, usize::MAX, fmt, &mut args) }
 }
@@ -4772,13 +4761,7 @@ extern "win64" fn s_snprintf_body(
 }
 
 #[no_mangle]
-extern "win64" fn s_swprintf_body(
-    dst: u64,
-    fmt: u64,
-    a0: u64,
-    a1: u64,
-    caller_rsp: u64,
-) -> i32 {
+extern "win64" fn s_swprintf_body(dst: u64, fmt: u64, a0: u64, a1: u64, caller_rsp: u64) -> i32 {
     let mut args = Win64PrintfArguments::new([a0, a1, 0], 2, caller_rsp);
     unsafe { format_wide_driver(dst, usize::MAX, fmt, &mut args) }
 }
@@ -5602,9 +5585,7 @@ fn guid_parts_to_hosted_ascii(
     Some(out)
 }
 
-fn guid_words_to_hosted_ascii(
-    words: [u64; 2],
-) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
+fn guid_words_to_hosted_ascii(words: [u64; 2]) -> Option<HostedAscii<HOSTED_DRIVER_KEY_NAME_MAX>> {
     let first = words[0].to_le_bytes();
     guid_parts_to_hosted_ascii(
         u32::from_le_bytes(first[..4].try_into().ok()?),
@@ -5815,13 +5796,7 @@ unsafe fn hosted_device_delete(device: u64) -> i32 {
 }
 
 unsafe fn hosted_symbolic_link_operation(op: u64) -> i32 {
-    let (_label, status, _, _, _) = call_on4(
-        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-        op,
-        0,
-        0,
-        0,
-    );
+    let (_label, status, _, _, _) = call_on4((FSD_SERVICE_DEVICE_LABEL << 12) | 4, op, 0, 0, 0);
     status as u32 as i32
 }
 
@@ -6476,9 +6451,7 @@ unsafe fn clear_hosted_device_interface_arg() {
     );
 }
 
-unsafe fn copy_ascii_to_hosted_device_interface_arg<const N: usize>(
-    value: &HostedAscii<N>,
-) -> i32 {
+unsafe fn copy_ascii_to_hosted_device_interface_arg<const N: usize>(value: &HostedAscii<N>) -> i32 {
     let len = value.len.saturating_mul(2);
     if value.is_empty()
         || len > HOSTED_INTERFACE_LINK_MAX.saturating_mul(2)
@@ -6489,8 +6462,7 @@ unsafe fn copy_ascii_to_hosted_device_interface_arg<const N: usize>(
     let mut i = 0usize;
     while i < value.len {
         write_volatile(
-            (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF + (i as u64) * 2)
-                as *mut u16,
+            (FSD_ARG_VADDR + HOSTED_DEVICE_INTERFACE_ARG_LINK_BUF + (i as u64) * 2) as *mut u16,
             value.bytes[i] as u16,
         );
         i += 1;
@@ -6535,22 +6507,18 @@ unsafe fn copy_unicode_to_hosted_device_interface_arg(unicode_string: u64) -> i3
 /// the shared page (the executive resolves the FSD's control device to it).
 extern "win64" fn s_io_create_device(
     drv: u64,
-    ext_size: u64,
+    ext_size: u32,
     name: u64,
-    dev_type: u64,
-    chars: u64,
-    excl: u64,
+    dev_type: u32,
+    chars: u32,
+    excl: u8,
     dev_out: u64,
 ) -> i32 {
     unsafe {
-        if drv == 0
-            || dev_out == 0
-            || ext_size > u32::MAX as u64
-            || dev_type > u32::MAX as u64
-            || chars > u32::MAX as u64
-        {
+        if drv == 0 || dev_out == 0 {
             return STATUS_INVALID_PARAMETER;
         }
+        write_unaligned(dev_out as *mut u64, 0);
         clear_shared_path_len(SH_DEVICE_NAME_LEN);
         let named_device = if name != 0 {
             match unicode_string_parts(name) {
@@ -6568,21 +6536,23 @@ extern "win64" fn s_io_create_device(
                 DeviceFlags::EXCLUSIVE.bits()
             } else {
                 0
+            }
+            | if named_device.is_some() {
+                DeviceFlags::DEVICE_HAS_NAME.bits()
+            } else {
+                0
             };
         let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
-            drv,
-            ext_size,
-            dev_type as u32,
-            flags,
-            chars as u32,
-            pool_alloc,
-            pool_free,
+            drv, ext_size, dev_type, flags, chars, pool_alloc, pool_free,
         ) {
             Ok(projection) => projection,
-            Err(status) => return status,
+            Err(status) => {
+                clear_shared_path_len(SH_DEVICE_NAME_LEN);
+                return status;
+            }
         };
         let dev = projection.device_object();
-        let (status, canonical_device_id) = hosted_device_create(dev, drv, ext_size);
+        let (status, canonical_device_id) = hosted_device_create(dev, drv, ext_size as u64);
         if status < 0 || canonical_device_id == 0 {
             crate::hosted_driver_projection::delete_hosted_device_projection(dev, pool_free);
             clear_shared_path_len(SH_DEVICE_NAME_LEN);
@@ -7143,9 +7113,7 @@ fn build_hosted_interface_link(
     if !out.push_byte(b'#') || !out.push_ascii(guid) {
         return None;
     }
-    if !reference.is_empty()
-        && (!out.push_byte(b'\\') || !out.push_ascii(reference))
-    {
+    if !reference.is_empty() && (!out.push_byte(b'\\') || !out.push_ascii(reference)) {
         return None;
     }
     Some(out)
@@ -10111,12 +10079,7 @@ extern "win64" fn s_io_delete_symbolic_link(link: u64) -> i32 {
         let Some((link_buf, link_len)) = unicode_string_parts(link) else {
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         };
-        copy_wstr_to_shared(
-            link_buf,
-            link_len,
-            SH_SYMLINK_LINK_LEN,
-            SH_SYMLINK_LINK_BUF,
-        );
+        copy_wstr_to_shared(link_buf, link_len, SH_SYMLINK_LINK_LEN, SH_SYMLINK_LINK_BUF);
         let status = hosted_symbolic_link_operation(HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK);
         clear_shared_path_len(SH_SYMLINK_LINK_LEN);
         status
@@ -10303,10 +10266,8 @@ extern "win64" fn s_io_complete_request(irp: u64, _boost: u64) {
         let returned_allocation_valid = !filter_requirements
             || information == 0
             || component_pool_allocation_capacity(information).is_some();
-        let completion_valid = source_valid
-            && reclaim_valid
-            && information_within_output
-            && returned_allocation_valid;
+        let completion_valid =
+            source_valid && reclaim_valid && information_within_output && returned_allocation_valid;
         if completion_valid && filter_requirements && information == target.data {
             write_volatile(
                 (pending_irp_entry_address(node) + core::mem::offset_of!(PendingIrp, data) as u64)
@@ -10886,7 +10847,10 @@ extern "win64" fn s_ex_initialize_fast_mutex(mutex: u64) {
         use nt_kernel_exec::executive_sync::fast_mutex_layout;
         write_unaligned((mutex + fast_mutex_layout::COUNT as u64) as *mut i32, 1);
         write_unaligned((mutex + fast_mutex_layout::OWNER as u64) as *mut u64, 0);
-        write_unaligned((mutex + fast_mutex_layout::CONTENTION as u64) as *mut u32, 0);
+        write_unaligned(
+            (mutex + fast_mutex_layout::CONTENTION as u64) as *mut u32,
+            0,
+        );
         s_ke_initialize_event(mutex + fast_mutex_layout::EVENT as u64, 1, 0);
         write_unaligned(
             (mutex + fast_mutex_layout::OLD_IRQL as u64) as *mut u32,
@@ -10909,17 +10873,11 @@ extern "win64" fn s_ex_acquire_fast_mutex(mutex: u64) {
     use nt_kernel_exec::executive_sync::fast_mutex_layout;
     let count = unsafe { &*((mutex + fast_mutex_layout::COUNT as u64) as *const AtomicI32) };
     if count.fetch_sub(1, Ordering::SeqCst) != 1 {
-        let contention = unsafe {
-            &*((mutex + fast_mutex_layout::CONTENTION as u64) as *const AtomicU32)
-        };
+        let contention =
+            unsafe { &*((mutex + fast_mutex_layout::CONTENTION as u64) as *const AtomicU32) };
         contention.fetch_add(1, Ordering::Relaxed);
-        let status = s_ke_wait_for_single_object(
-            mutex + fast_mutex_layout::EVENT as u64,
-            0,
-            0,
-            0,
-            0,
-        );
+        let status =
+            s_ke_wait_for_single_object(mutex + fast_mutex_layout::EVENT as u64, 0, 0, 0, 0);
         if status != STATUS_SUCCESS {
             unsafe { hosted_lower_irql(old_irql) };
             hosted_fast_mutex_failure(mutex, status);
@@ -12909,15 +12867,8 @@ extern "win64" fn s_ps_get_current_process_id() -> u64 {
 
 /// `HANDLE PsGetCurrentThreadId()` from the executive-owned hosted thread table.
 extern "win64" fn s_ps_get_current_thread_id() -> u64 {
-    let (_label, status, thread_id, _, _) = unsafe {
-        call_on4(
-            FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let (_label, status, thread_id, _, _) =
+        unsafe { call_on4(FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL << 12, 0, 0, 0, 0) };
     if status as u32 as i32 == STATUS_SUCCESS {
         thread_id
     } else {
@@ -13695,11 +13646,7 @@ unsafe fn write_debug_prefix(prefix: u64) {
     }
 }
 
-unsafe fn format_debug_driver<A: nt_printf::Arguments>(
-    prefix: u64,
-    fmt: u64,
-    args: &mut A,
-) -> i32 {
+unsafe fn format_debug_driver<A: nt_printf::Arguments>(prefix: u64, fmt: u64, args: &mut A) -> i32 {
     if fmt == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -13712,13 +13659,7 @@ unsafe fn format_debug_driver<A: nt_printf::Arguments>(
 }
 
 #[no_mangle]
-extern "win64" fn s_dbg_print_body(
-    fmt: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    caller_rsp: u64,
-) -> i32 {
+extern "win64" fn s_dbg_print_body(fmt: u64, a0: u64, a1: u64, a2: u64, caller_rsp: u64) -> i32 {
     let mut args = Win64PrintfArguments::new([a0, a1, a2], 3, caller_rsp);
     unsafe { format_debug_driver(0, fmt, &mut args) }
 }
@@ -13747,12 +13688,7 @@ extern "win64" fn s_video_port_debug_print_body(
     unsafe { format_debug_driver(0, fmt, &mut args) }
 }
 
-extern "win64" fn s_vdbg_print_ex(
-    _component_id: u32,
-    _level: u32,
-    fmt: u64,
-    va_list: u64,
-) -> i32 {
+extern "win64" fn s_vdbg_print_ex(_component_id: u32, _level: u32, fmt: u64, va_list: u64) -> i32 {
     let mut args = VaListPrintfArguments { cursor: va_list };
     unsafe { format_debug_driver(0, fmt, &mut args) }
 }
@@ -13973,8 +13909,7 @@ unsafe fn read_shared_address_resource(sh: u64, index: u64) -> Option<SharedAddr
         resource.kind,
         SH_RESOURCE_ADDRESS_KIND_MEMORY | SH_RESOURCE_ADDRESS_KIND_PORT
     ) || (resource.resource_index >= SH_RESOURCE_KIND_CAPACITY
-        && !(resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT
-            && resource.resource_index == u8::MAX))
+        && !(resource.kind == SH_RESOURCE_ADDRESS_KIND_PORT && resource.resource_index == u8::MAX))
         || !matches!(
             resource.share,
             nt_cm_resources::CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE
@@ -14057,12 +13992,9 @@ unsafe fn publish_shared_address_resources(sh: u64, resources: &[SharedAddressRe
                     | nt_cm_resources::CM_RESOURCE_SHARE_DRIVER_EXCLUSIVE
                     | nt_cm_resources::CM_RESOURCE_SHARE_SHARED
             )
-            || resources[..index]
-                .iter()
-                .any(|prior| {
-                    prior.kind == resource.kind
-                        && prior.resource_index == resource.resource_index
-                })
+            || resources[..index].iter().any(|prior| {
+                prior.kind == resource.kind && prior.resource_index == resource.resource_index
+            })
         {
             return false;
         }
@@ -24376,11 +24308,7 @@ unsafe fn provider_marshal_input_buffer(
     let Some(dependent_exec_va) =
         provider_marshal_input_buffer_exec_va(dependent_index, dependent_inst, arg_value, bytes)
     else {
-        trace_provider_input_buffer_marshal_rejection(
-            dependent_index,
-            arg_value,
-            bytes,
-        );
+        trace_provider_input_buffer_marshal_rejection(dependent_index, arg_value, bytes);
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
@@ -29006,9 +28934,9 @@ unsafe fn hosted_provider_miniport_binding_by_adapter_context(
         {
             continue;
         }
-        if matched.is_some_and(|previous: HostedDeviceBinding| {
-            previous.device_id != binding.device_id
-        }) {
+        if matched
+            .is_some_and(|previous: HostedDeviceBinding| previous.device_id != binding.device_id)
+        {
             return None;
         }
         matched = Some(binding);
@@ -29032,10 +28960,12 @@ fn hosted_provider_miniport_callback_adapter_context(
         | NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64
         | NDIS_MINIPORT_RETURN_PACKET_CALLBACK_OFFSET_X64
         | NDIS_MINIPORT_SEND_PACKETS_CALLBACK_OFFSET_X64 => Ok(Some(args[0])),
-        NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => Ok(Some(args[1])),
-        NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64
-        | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => Ok(Some(args[2])),
+        NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 | NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => {
+            Ok(Some(args[1]))
+        }
+        NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 | NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => {
+            Ok(Some(args[2]))
+        }
         _ => Err(STATUS_NOT_SUPPORTED),
     }
 }
@@ -29078,11 +29008,9 @@ unsafe fn hosted_provider_callback_device_binding(
             .ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
         ),
         HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => {
-            let (_, shadow) = find_hosted_provider_ndis_work_item_shadow_by_provider(
-                provider_instance,
-                args[0],
-            )
-            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+            let (_, shadow) =
+                find_hosted_provider_ndis_work_item_shadow_by_provider(provider_instance, args[0])
+                    .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
             if shadow.active.device_id == 0 {
                 None
             } else {
@@ -29178,13 +29106,12 @@ pub(crate) unsafe fn service_hosted_provider_callback(
         Err(status) => return hosted_provider_callback_failure(status),
     };
     let _device_dispatch_context = match callback_binding {
-        Some(binding) => match HostedDeviceDispatchContextGuard::enter(
-            record.dependent_instance,
-            binding,
-        ) {
-            Ok(guard) => Some(guard),
-            Err(status) => return hosted_provider_callback_failure(status.raw()),
-        },
+        Some(binding) => {
+            match HostedDeviceDispatchContextGuard::enter(record.dependent_instance, binding) {
+                Ok(guard) => Some(guard),
+                Err(status) => return hosted_provider_callback_failure(status.raw()),
+            }
+        }
         None => None,
     };
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
@@ -30076,10 +30003,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("strcat", s_strcat as *const () as usize as u64);
     reg.bind("strstr", s_strstr as *const () as usize as u64);
     reg.bind("tolower", s_tolower as *const () as usize as u64);
-    reg.bind(
-        "sprintf",
-        hosted_sprintf_gate as *const () as usize as u64,
-    );
+    reg.bind("sprintf", hosted_sprintf_gate as *const () as usize as u64);
     reg.bind(
         "_snprintf",
         hosted_snprintf_gate as *const () as usize as u64,
@@ -30537,10 +30461,7 @@ fn register_fsd_trampolines() -> bool {
         "vDbgPrintExWithPrefix",
         s_vdbg_print_ex_with_prefix as *const () as usize as u64,
     );
-    reg.bind(
-        "vDbgPrintEx",
-        s_vdbg_print_ex as *const () as usize as u64,
-    );
+    reg.bind("vDbgPrintEx", s_vdbg_print_ex as *const () as usize as u64);
     reg.bind(
         "DbgPrint",
         hosted_dbg_print_gate as *const () as usize as u64,
@@ -30916,10 +30837,7 @@ unsafe fn component_dispatch_video_add_device(drv: u64, pdo: u64) -> (i32, u64) 
     if pdo == 0 {
         return (STATUS_INVALID_PARAMETER, 0);
     }
-    write_volatile(
-        (FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64,
-        0,
-    );
+    write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
 
     let object_number = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
     if object_number > u32::MAX as u64 {
@@ -30946,7 +30864,7 @@ unsafe fn component_dispatch_video_add_device(drv: u64, pdo: u64) -> (i32, u64) 
         drv,
         0,
         unicode.as_mut_ptr() as u64,
-        nt_video_miniport::FILE_DEVICE_VIDEO as u64,
+        nt_video_miniport::FILE_DEVICE_VIDEO,
         0,
         1,
         (&mut device_object as *mut u64) as u64,
@@ -31217,6 +31135,7 @@ pub unsafe extern "C" fn fsd_component_entry(heap_frames: u64) -> ! {
         crate::spawn_hosts::DriverObjectSpec {
             size: WDM_X64_DRIVER_OBJECT_SIZE as u64,
             size_field: WDM_X64_DRIVER_OBJECT_SIZE as u16,
+            driver_object_off: SH_DRVOBJ,
             ext_size: WDM_X64_DRIVER_EXTENSION_SIZE as u64,
             mj: WDM_X64_DRIVER_MAJOR_FUNCTION_OFFSET as u64,
             mj_table_off: SH_MJ_TABLE, // 0x18 — the FSD records its MajorFunction[] base here
@@ -31254,7 +31173,6 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
         )
     };
     let v = read_volatile((FSD_SHARED_VADDR + SH_VERDICT) as *const u32);
-    write_volatile((FSD_SHARED_VADDR + SH_DRVOBJ) as *mut u64, drv);
     write_volatile(
         (FSD_SHARED_VADDR + SH_DRIVER_UNLOAD) as *mut u64,
         driver_unload,
@@ -31449,10 +31367,7 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
             (FSD_SHARED_VADDR + SH_REQ_OUTLEN) as *mut u64,
             previous_device_head,
         );
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64,
-            0,
-        );
+        write_volatile((FSD_SHARED_VADDR + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, 0);
         let add: extern "win64" fn(u64, u64) -> i32 = core::mem::transmute(add_device as *const ());
         let status = add(request_drv, pdo);
         return (
@@ -33037,7 +32952,8 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
         );
     }
     if let Some(consuming_state) = consuming_state {
-        let mut completed = read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
+        let mut completed =
+            read_volatile(pending_irp_entry_address(owner_node) as *const PendingIrp);
         if major == IRP_MJ_PNP && minor == IRP_MN_FILTER_RESOURCE_REQUIREMENTS && info != 0 {
             if component_pool_allocation_capacity(info).is_none() {
                 st = 0xC000_0005u32 as i32; // STATUS_ACCESS_VIOLATION
@@ -35557,9 +35473,7 @@ unsafe fn retain_hosted_relation_query_barrier(
     });
 }
 
-unsafe fn set_hosted_relation_query_disposition(
-    disposition: HostedDeviceRelationQueryDisposition,
-) {
+unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelationQueryDisposition) {
     let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
         .as_mut()
         .expect("hosted relation query disappeared while publishing its result");
@@ -35588,9 +35502,7 @@ fn next_hosted_query_id(id_type: u32) -> Option<u32> {
 fn next_hosted_bus_property(minor: u8) -> Option<u8> {
     match minor {
         nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION => Some(nt_pnp_abi::IRP_MN_QUERY_RESOURCES),
-        nt_pnp_abi::IRP_MN_QUERY_RESOURCES => {
-            Some(nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS)
-        }
+        nt_pnp_abi::IRP_MN_QUERY_RESOURCES => Some(nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS),
         nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS => None,
         _ => None,
     }
@@ -35619,11 +35531,11 @@ unsafe fn initialize_hosted_relation_children() -> Result<(), nt_status::NtStatu
         if io_manager_mut()
             .device(pdo_device_id)
             .is_none_or(|device| device.delete_pending)
-            || reported_children.iter().any(
-                |child: &nt_pnp_manager::BusReportedChild| {
+            || reported_children
+                .iter()
+                .any(|child: &nt_pnp_manager::BusReportedChild| {
                     child.pdo_object_id == pdo_device_id.raw()
-                },
-            )
+                })
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -35668,22 +35580,26 @@ unsafe fn store_hosted_query_id(
         .and_then(|query| query.reported_children.get_mut(child_index))
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     match (id_type, value) {
-        (
-            nt_pnp_abi::BUS_QUERY_DEVICE_ID,
-            nt_pnp_manager::BusQueryIdValue::Single(value),
-        ) if child.device_id.is_empty() => child.device_id = value,
-        (
-            nt_pnp_abi::BUS_QUERY_INSTANCE_ID,
-            nt_pnp_manager::BusQueryIdValue::Single(value),
-        ) if child.instance_id.is_empty() => child.instance_id = value,
-        (
-            nt_pnp_abi::BUS_QUERY_HARDWARE_IDS,
-            nt_pnp_manager::BusQueryIdValue::Multi(values),
-        ) if child.hardware_ids.is_empty() && !values.is_empty() => child.hardware_ids = values,
-        (
-            nt_pnp_abi::BUS_QUERY_COMPATIBLE_IDS,
-            nt_pnp_manager::BusQueryIdValue::Multi(values),
-        ) if child.compatible_ids.is_empty() => child.compatible_ids = values,
+        (nt_pnp_abi::BUS_QUERY_DEVICE_ID, nt_pnp_manager::BusQueryIdValue::Single(value))
+            if child.device_id.is_empty() =>
+        {
+            child.device_id = value
+        }
+        (nt_pnp_abi::BUS_QUERY_INSTANCE_ID, nt_pnp_manager::BusQueryIdValue::Single(value))
+            if child.instance_id.is_empty() =>
+        {
+            child.instance_id = value
+        }
+        (nt_pnp_abi::BUS_QUERY_HARDWARE_IDS, nt_pnp_manager::BusQueryIdValue::Multi(values))
+            if child.hardware_ids.is_empty() && !values.is_empty() =>
+        {
+            child.hardware_ids = values
+        }
+        (nt_pnp_abi::BUS_QUERY_COMPATIBLE_IDS, nt_pnp_manager::BusQueryIdValue::Multi(values))
+            if child.compatible_ids.is_empty() =>
+        {
+            child.compatible_ids = values
+        }
         _ => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
     }
     Ok(())
@@ -35884,13 +35800,7 @@ unsafe fn dispatch_hosted_query_id(child_index: usize, id_type: u32) -> bool {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
-        } => retain_hosted_query_id_result(
-            child_index,
-            id_type,
-            status,
-            information,
-            false,
-        ),
+        } => retain_hosted_query_id_result(child_index, id_type, status, information, false),
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -35933,10 +35843,9 @@ unsafe fn store_hosted_bus_property(
         {
             properties.bus_information = HostedBusInformationState::KnownNone
         }
-        (
-            nt_pnp_abi::IRP_MN_QUERY_RESOURCES,
-            Some(HostedBusPropertyValue::Blob(value)),
-        ) if properties.boot_resources_raw == nt_pnp_manager::PropertyBlobState::Unqueried => {
+        (nt_pnp_abi::IRP_MN_QUERY_RESOURCES, Some(HostedBusPropertyValue::Blob(value)))
+            if properties.boot_resources_raw == nt_pnp_manager::PropertyBlobState::Unqueried =>
+        {
             properties.boot_resources_raw = nt_pnp_manager::PropertyBlobState::Present(value)
         }
         (nt_pnp_abi::IRP_MN_QUERY_RESOURCES, None)
@@ -35983,8 +35892,7 @@ unsafe fn advance_hosted_bus_property(child_index: usize, minor: u8) {
         && query.child_properties.iter().all(|properties| {
             properties.bus_information != HostedBusInformationState::Unqueried
                 && properties.boot_resources_raw != nt_pnp_manager::PropertyBlobState::Unqueried
-                && properties.resource_requirements
-                    != nt_pnp_manager::PropertyBlobState::Unqueried
+                && properties.resource_requirements != nt_pnp_manager::PropertyBlobState::Unqueried
         });
     if complete {
         query.phase = HostedDeviceRelationQueryPhase::DispatchCapabilities { child_index: 0 };
@@ -36001,9 +35909,7 @@ unsafe fn apply_hosted_bus_property_disposition(
     disposition: HostedQueryPropertyDisposition,
 ) {
     match disposition {
-        HostedQueryPropertyDisposition::Advance => {
-            advance_hosted_bus_property(child_index, minor)
-        }
+        HostedQueryPropertyDisposition::Advance => advance_hosted_bus_property(child_index, minor),
         HostedQueryPropertyDisposition::Barrier(status) => {
             let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                 .as_mut()
@@ -36138,22 +36044,14 @@ unsafe fn dispatch_hosted_bus_property(child_index: usize, minor: u8) -> bool {
         query.completion_device_id = completion_device_id;
         query.allocation_instance = allocation_instance;
         query.driver_status = None;
-        query.phase = HostedDeviceRelationQueryPhase::AwaitingPropertyCompletion {
-            child_index,
-            minor,
-        };
+        query.phase =
+            HostedDeviceRelationQueryPhase::AwaitingPropertyCompletion { child_index, minor };
     }
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
-        } => retain_hosted_bus_property_result(
-            child_index,
-            minor,
-            status,
-            information,
-            false,
-        ),
+        } => retain_hosted_bus_property_result(child_index, minor, status, information, false),
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -36205,9 +36103,10 @@ unsafe fn advance_hosted_device_capabilities(child_index: usize) {
         return;
     }
     if query.child_properties.len() == query.reported_children.len()
-        && query.child_properties.iter().all(|properties| {
-            properties.capabilities != HostedDeviceCapabilitiesState::Unqueried
-        })
+        && query
+            .child_properties
+            .iter()
+            .all(|properties| properties.capabilities != HostedDeviceCapabilitiesState::Unqueried)
     {
         query.phase = HostedDeviceRelationQueryPhase::DispatchNamespace {
             child_index: 0,
@@ -36225,9 +36124,7 @@ unsafe fn apply_hosted_device_capabilities_disposition(
     disposition: HostedQueryPropertyDisposition,
 ) {
     match disposition {
-        HostedQueryPropertyDisposition::Advance => {
-            advance_hosted_device_capabilities(child_index)
-        }
+        HostedQueryPropertyDisposition::Advance => advance_hosted_device_capabilities(child_index),
         HostedQueryPropertyDisposition::Barrier(status) => {
             let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                 .as_mut()
@@ -36254,9 +36151,8 @@ unsafe fn retain_hosted_device_capabilities_result(
     }
 
     let value = if status.is_success() {
-        match payload.and_then(|payload| {
-            nt_pnp_manager::copy_device_capabilities_x64(payload).ok()
-        }) {
+        match payload.and_then(|payload| nt_pnp_manager::copy_device_capabilities_x64(payload).ok())
+        {
             Some(value) => Some(value),
             None => {
                 apply_hosted_device_capabilities_disposition(
@@ -36355,19 +36251,13 @@ unsafe fn dispatch_hosted_device_capabilities(child_index: usize) -> bool {
         query.completion_driver_id = completion_driver_id;
         query.completion_device_id = completion_device_id;
         query.driver_status = None;
-        query.phase = HostedDeviceRelationQueryPhase::AwaitingCapabilitiesCompletion {
-            child_index,
-        };
+        query.phase =
+            HostedDeviceRelationQueryPhase::AwaitingCapabilitiesCompletion { child_index };
     }
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
         ExternalPnpDispatchResult::ReturnedPayload {
             status, payload, ..
-        } => retain_hosted_device_capabilities_result(
-            child_index,
-            status,
-            Some(&payload),
-            false,
-        ),
+        } => retain_hosted_device_capabilities_result(child_index, status, Some(&payload), false),
         ExternalPnpDispatchResult::Returned { .. } => {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
                 nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -36445,9 +36335,10 @@ unsafe fn advance_hosted_acpi_namespace(child_index: usize) {
         return;
     }
     if query.child_properties.len() == query.reported_children.len()
-        && query.child_properties.iter().all(|properties| {
-            properties.acpi_namespace != HostedAcpiNamespaceState::Unqueried
-        })
+        && query
+            .child_properties
+            .iter()
+            .all(|properties| properties.acpi_namespace != HostedAcpiNamespaceState::Unqueried)
     {
         query.phase = HostedDeviceRelationQueryPhase::DispatchAcpiPciRootMethod {
             child_index: 0,
@@ -36496,9 +36387,9 @@ unsafe fn classify_hosted_acpi_namespace_result(
             Ok(required) if required > HOSTED_ACPI_NAMESPACE_HEADER_LEN => {
                 HostedNamespaceDisposition::RetryExact(required)
             }
-            Ok(_) | Err(_) => HostedNamespaceDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ),
+            Ok(_) | Err(_) => {
+                HostedNamespaceDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+            }
         };
     }
     if !status.is_success()
@@ -36547,9 +36438,7 @@ unsafe fn apply_hosted_acpi_namespace_disposition(
 }
 
 unsafe fn dispatch_hosted_acpi_namespace(child_index: usize, output_len: usize) -> bool {
-    if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
-        .contains(&output_len)
-    {
+    if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES).contains(&output_len) {
         set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         ));
@@ -36689,7 +36578,8 @@ unsafe fn hosted_relation_child_identity(
     child_index: usize,
 ) -> Option<(nt_io_manager::DeviceId, HostedDomainIdentity, u64)> {
     let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref()?;
-    let device_id = nt_io_manager::DeviceId(query.reported_children.get(child_index)?.pdo_object_id);
+    let device_id =
+        nt_io_manager::DeviceId(query.reported_children.get(child_index)?.pdo_object_id);
     let domain = query.relation_domain?;
     let pdo_object = *query.child_pdo_objects.get(child_index)?;
     (io_manager_mut().hosted_device_by_identity(domain, pdo_object) == Some(device_id)
@@ -36708,9 +36598,7 @@ unsafe fn classify_hosted_acpi_pci_root_method_result(
         return if information == 0 {
             HostedAcpiPciRootMethodDisposition::Value(0)
         } else {
-            HostedAcpiPciRootMethodDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            )
+            HostedAcpiPciRootMethodDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
         };
     }
     if !status.is_success() {
@@ -36725,9 +36613,9 @@ unsafe fn classify_hosted_acpi_pci_root_method_result(
     }
     match nt_acpi::parse_integer_evaluation(payload) {
         Ok(value) => HostedAcpiPciRootMethodDisposition::Value(value),
-        Err(_) => HostedAcpiPciRootMethodDisposition::Barrier(
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        ),
+        Err(_) => {
+            HostedAcpiPciRootMethodDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        }
     }
 }
 
@@ -36754,8 +36642,7 @@ unsafe fn apply_hosted_acpi_pci_root_method_disposition(
         ));
         return;
     };
-    let HostedAcpiPciRootState::Evaluating { segment, base_bus } =
-        &mut properties.acpi_pci_root
+    let HostedAcpiPciRootState::Evaluating { segment, base_bus } = &mut properties.acpi_pci_root
     else {
         set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -36927,9 +36814,10 @@ unsafe fn dispatch_hosted_acpi_pci_root_method(
             classify_hosted_acpi_pci_root_method_result(status, information, &output),
         ),
         ExternalDispatchResult::Pending { irp_id } => {
-            let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
-                let current = irp.current_stack()?;
-                matches!(
+            let identities =
+                io_manager_mut().irp(irp_id).and_then(|irp| {
+                    let current = irp.current_stack()?;
+                    matches!(
                     &current.parameters,
                     IoParameters::DeviceControl(parameters)
                         if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD
@@ -36937,7 +36825,7 @@ unsafe fn dispatch_hosted_acpi_pci_root_method(
                             && parameters.output_len as usize == HOSTED_ACPI_EVAL_INTEGER_LEN
                 )
                 .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
-            });
+                });
             let Some((origin_driver_id, completion_driver_id, completion_device_id)) = identities
             else {
                 set_hosted_relation_query_disposition(
@@ -37005,8 +36893,7 @@ fn hosted_relation_child_matches_instance(
     instance: &str,
 ) -> bool {
     instance.rsplit_once('\\').is_some_and(|(device, id)| {
-        device.eq_ignore_ascii_case(&child.device_id)
-            && id.eq_ignore_ascii_case(&child.instance_id)
+        device.eq_ignore_ascii_case(&child.device_id) && id.eq_ignore_ascii_case(&child.instance_id)
     })
 }
 
@@ -37032,9 +36919,9 @@ fn copy_hosted_relation_property_blob(
     state: &nt_pnp_manager::PropertyBlobState,
 ) -> Result<nt_pnp_manager::PropertyBlobState, HostedRelationPublishError> {
     match state {
-        nt_pnp_manager::PropertyBlobState::Unqueried => Err(
-            HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
-        ),
+        nt_pnp_manager::PropertyBlobState::Unqueried => Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        )),
         nt_pnp_manager::PropertyBlobState::KnownNone => {
             Ok(nt_pnp_manager::PropertyBlobState::KnownNone)
         }
@@ -37161,9 +37048,7 @@ fn encode_hosted_relation_multi_sz(
     Ok(encoded)
 }
 
-fn encode_hosted_relation_nt_path(
-    path: &NtPath,
-) -> Result<Vec<u8>, HostedRelationPublishError> {
+fn encode_hosted_relation_nt_path(path: &NtPath) -> Result<Vec<u8>, HostedRelationPublishError> {
     let units = path.to_units();
     let capacity = units
         .len()
@@ -37424,10 +37309,8 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
             .child_properties
             .iter()
             .any(|properties| properties.acpi_namespace == HostedAcpiNamespaceState::Unqueried)
-        || (!query.acpi_pci_scope_sources.is_empty()
-            && query.acpi_pci_catalog_update.is_none())
-        || (!query.acpi_pci_link_candidates.is_empty()
-            && query.acpi_pci_catalog_update.is_none())
+        || (!query.acpi_pci_scope_sources.is_empty() && query.acpi_pci_catalog_update.is_none())
+        || (!query.acpi_pci_link_candidates.is_empty() && query.acpi_pci_catalog_update.is_none())
         || query
             .reported_children
             .iter()
@@ -37462,11 +37345,13 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         .map_err(|_| HostedRelationPublishError::Retry)?;
     for change in prepared.changes() {
         let enum_path = hosted_relation_enum_path(&change.child)?;
-        policies.push(if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
-            None
-        } else {
-            resolve_hosted_relation_policy(&change.child)?
-        });
+        policies.push(
+            if change.kind == nt_pnp_manager::BusRelationChangeKind::Removal {
+                None
+            } else {
+                resolve_hosted_relation_policy(&change.child)?
+            },
+        );
         existing.push(existing_hosted_relation_values(change, &enum_path)?);
     }
 
@@ -37538,8 +37423,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
                     && completion.file_id.is_none()
                     && completion.driver_id == origin_driver_id
-                    && completion.device_id
-                        == nt_io_manager::DeviceId(claim.pdo_device_id)
+                    && completion.device_id == nt_io_manager::DeviceId(claim.pdo_device_id)
                     && completion.major == major::IRP_MJ_PNP
                     && completion.minor == nt_pnp_abi::IRP_MN_QUERY_DEVICE_RELATIONS
                     && completion.completion_driver_id == completion_driver_id
@@ -37581,30 +37465,28 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .allocation_instance;
-                let disposition = match copy_hosted_device_relations_result(
-                    allocation_instance,
-                    information,
-                ) {
-                    Ok(objects) => {
-                        (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
-                            .as_mut()
-                            .unwrap()
-                            .child_pdo_objects = objects;
-                        HostedDeviceRelationQueryDisposition::Copied
-                    }
-                    Err(HostedDriverAllocationCopyError::RetryResources) => return progress,
-                    Err(HostedDriverAllocationCopyError::InvalidPointer)
-                    | Err(HostedDriverAllocationCopyError::Malformed) => {
-                        HostedDeviceRelationQueryDisposition::Barrier(
-                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                        )
-                    }
-                    Err(HostedDriverAllocationCopyError::ReleaseFailed) => {
-                        HostedDeviceRelationQueryDisposition::Barrier(
-                            nt_status::NtStatus::UNSUCCESSFUL,
-                        )
-                    }
-                };
+                let disposition =
+                    match copy_hosted_device_relations_result(allocation_instance, information) {
+                        Ok(objects) => {
+                            (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
+                                .as_mut()
+                                .unwrap()
+                                .child_pdo_objects = objects;
+                            HostedDeviceRelationQueryDisposition::Copied
+                        }
+                        Err(HostedDriverAllocationCopyError::RetryResources) => return progress,
+                        Err(HostedDriverAllocationCopyError::InvalidPointer)
+                        | Err(HostedDriverAllocationCopyError::Malformed) => {
+                            HostedDeviceRelationQueryDisposition::Barrier(
+                                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                            )
+                        }
+                        Err(HostedDriverAllocationCopyError::ReleaseFailed) => {
+                            HostedDeviceRelationQueryDisposition::Barrier(
+                                nt_status::NtStatus::UNSUCCESSFUL,
+                            )
+                        }
+                    };
                 if pending_completion {
                     (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                         .as_mut()
@@ -37727,26 +37609,23 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_ref()
                     .unwrap()
                     .allocation_instance;
-                let disposition = match copy_hosted_query_id_result(
-                    allocation_instance,
-                    information,
-                    id_type,
-                ) {
-                    Ok(value) => match store_hosted_query_id(child_index, id_type, value) {
-                        Ok(()) => HostedQueryIdDisposition::Advance,
-                        Err(status) => HostedQueryIdDisposition::Barrier(status),
-                    },
-                    Err(HostedDriverAllocationCopyError::RetryResources) => return progress,
-                    Err(HostedDriverAllocationCopyError::InvalidPointer)
-                    | Err(HostedDriverAllocationCopyError::Malformed) => {
-                        HostedQueryIdDisposition::Barrier(
-                            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                        )
-                    }
-                    Err(HostedDriverAllocationCopyError::ReleaseFailed) => {
-                        HostedQueryIdDisposition::Barrier(nt_status::NtStatus::UNSUCCESSFUL)
-                    }
-                };
+                let disposition =
+                    match copy_hosted_query_id_result(allocation_instance, information, id_type) {
+                        Ok(value) => match store_hosted_query_id(child_index, id_type, value) {
+                            Ok(()) => HostedQueryIdDisposition::Advance,
+                            Err(status) => HostedQueryIdDisposition::Barrier(status),
+                        },
+                        Err(HostedDriverAllocationCopyError::RetryResources) => return progress,
+                        Err(HostedDriverAllocationCopyError::InvalidPointer)
+                        | Err(HostedDriverAllocationCopyError::Malformed) => {
+                            HostedQueryIdDisposition::Barrier(
+                                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                            )
+                        }
+                        Err(HostedDriverAllocationCopyError::ReleaseFailed) => {
+                            HostedQueryIdDisposition::Barrier(nt_status::NtStatus::UNSUCCESSFUL)
+                        }
+                    };
                 if pending_completion {
                     (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                         .as_mut()
@@ -37790,10 +37669,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 }
                 progress = progress.saturating_add(1);
             }
-            HostedDeviceRelationQueryPhase::AwaitingPropertyCompletion {
-                child_index,
-                minor,
-            } => {
+            HostedDeviceRelationQueryPhase::AwaitingPropertyCompletion { child_index, minor } => {
                 let (
                     irp_id,
                     origin_driver_id,
@@ -37995,13 +37871,15 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 let mut payload = [0u8; nt_pnp_abi::DEVICE_CAPABILITIES_X64_SIZE];
                 match io_manager_mut().copy_completed_pnp_payload(irp_id, 0, &mut payload) {
                     Ok(copied) if copied == payload.len() => {
-                        let disposition = match nt_pnp_manager::copy_device_capabilities_x64(&payload)
-                            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
-                            .and_then(|value| store_hosted_device_capabilities(child_index, Some(value)))
-                        {
-                            Ok(()) => HostedQueryPropertyDisposition::Advance,
-                            Err(status) => HostedQueryPropertyDisposition::Barrier(status),
-                        };
+                        let disposition =
+                            match nt_pnp_manager::copy_device_capabilities_x64(&payload)
+                                .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+                                .and_then(|value| {
+                                    store_hosted_device_capabilities(child_index, Some(value))
+                                }) {
+                                Ok(()) => HostedQueryPropertyDisposition::Advance,
+                                Err(status) => HostedQueryPropertyDisposition::Barrier(status),
+                            };
                         (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                             .as_mut()
                             .unwrap()
@@ -38318,9 +38196,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     ),
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
                     | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
-                    Err(copy_status) => {
-                        HostedAcpiPciRootMethodDisposition::Barrier(copy_status)
-                    }
+                    Err(copy_status) => HostedAcpiPciRootMethodDisposition::Barrier(copy_status),
                 };
                 (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                     .as_mut()
@@ -38437,14 +38313,13 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_mut()
                     .unwrap();
                 query.driver_status = Some(completion.status);
-                query.phase =
-                    HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterCopy {
-                        child_index,
-                        method,
-                        output_len,
-                        status: completion.status,
-                        information: completion.information,
-                    };
+                query.phase = HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterCopy {
+                    child_index,
+                    method,
+                    output_len,
+                    status: completion.status,
+                    information: completion.information,
+                };
                 progress = progress.saturating_add(1);
             }
             HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterCopy {
@@ -38481,9 +38356,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     ),
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
                     | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
-                    Err(copy_status) => {
-                        HostedAcpiPciNamespaceDisposition::Barrier(copy_status)
-                    }
+                    Err(copy_status) => HostedAcpiPciNamespaceDisposition::Barrier(copy_status),
                 };
                 if disposition == HostedAcpiPciNamespaceDisposition::RetryResources {
                     return progress;
@@ -38491,12 +38364,11 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                 (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                     .as_mut()
                     .unwrap()
-                    .phase =
-                    HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterAck {
-                        child_index,
-                        method,
-                        disposition,
-                    };
+                    .phase = HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterAck {
+                    child_index,
+                    method,
+                    disposition,
+                };
                 progress = progress.saturating_add(1);
             }
             HostedDeviceRelationQueryPhase::AwaitingAcpiPciNamespaceFilterAck {
@@ -38649,9 +38521,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     ),
                     Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
                     | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return progress,
-                    Err(copy_status) => {
-                        HostedAcpiPciAddressMethodDisposition::Barrier(copy_status)
-                    }
+                    Err(copy_status) => HostedAcpiPciAddressMethodDisposition::Barrier(copy_status),
                 };
                 (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                     .as_mut()
@@ -38870,10 +38740,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         .is_none()
         || io_manager_mut().device(pdo_device_id).is_none()
     {
-        retain_hosted_relation_query_barrier(
-            claim,
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        );
+        retain_hosted_relation_query_barrier(claim, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return 1;
     }
 
@@ -38913,10 +38780,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         io_manager_mut()
             .discard_prepared_external_pnp(prepared)
             .expect("prepared hosted relation IRP could not be discarded");
-        retain_hosted_relation_query_barrier(
-            claim,
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-        );
+        retain_hosted_relation_query_barrier(claim, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return 1;
     };
 
@@ -38971,9 +38835,9 @@ unsafe fn start_hosted_device_relation_query() -> usize {
             transport_status,
         } => {
             assert_eq!(retained_id, irp_id);
-            set_hosted_relation_query_disposition(
-                HostedDeviceRelationQueryDisposition::Barrier(transport_status),
-            );
+            set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
+                transport_status,
+            ));
         }
     }
     1usize.saturating_add(drain_hosted_device_relation_query())
@@ -39092,15 +38956,13 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
                 if status.is_success() {
                     let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
                     transaction.filtered = Some(copied);
-                    transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit {
-                        pending_completion,
-                    };
+                    transaction.phase =
+                        HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
                 } else if status == nt_status::NtStatus::NOT_SUPPORTED {
                     let transaction = &mut hosted_filter_requirements_transactions_mut()[index];
                     transaction.filtered = Some(core::mem::take(&mut transaction.original));
-                    transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit {
-                        pending_completion,
-                    };
+                    transaction.phase =
+                        HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
                 } else {
                     set_hosted_filter_requirements_disposition(
                         irp_id,
@@ -39140,13 +39002,11 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
                     .commit_filtered_resource_requirements(binding.pdo_device_id, filtered_copy)
                 {
                     Ok(()) => HostedFilterRequirementsDisposition::Ready,
-                    Err(error) => HostedFilterRequirementsDisposition::Barrier(hosted_pnp_status(error)),
+                    Err(error) => {
+                        HostedFilterRequirementsDisposition::Barrier(hosted_pnp_status(error))
+                    }
                 };
-                set_hosted_filter_requirements_disposition(
-                    irp_id,
-                    pending_completion,
-                    disposition,
-                );
+                set_hosted_filter_requirements_disposition(irp_id, pending_completion, disposition);
                 progress = progress.saturating_add(1);
             }
             HostedFilterRequirementsPhase::AwaitingAck { disposition } => {
@@ -40300,8 +40160,8 @@ pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
 pub(crate) fn loaded_driver_pnp_start_context(path: &str) -> Option<(u64, bool)> {
     let driver_id = driver_id_by_name(path)?;
     let (_, inst) = instance_by_driver_id(driver_id)?;
-    let ready_for_pnp = inst.ready
-        && (inst.add_device != 0 || hosted_driver_video_port_initialized(driver_id));
+    let ready_for_pnp =
+        inst.ready && (inst.add_device != 0 || hosted_driver_video_port_initialized(driver_id));
     Some((driver_id, ready_for_pnp))
 }
 
@@ -40369,8 +40229,9 @@ unsafe fn validate_and_sync_hosted_device_projection(
     }
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (device_exec, capacity) = hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (device_exec, capacity) =
+        hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let required = (WDM_X64_DEVICE_OBJECT_SIZE as u64)
         .checked_add(extension_size as u64)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
@@ -40379,10 +40240,12 @@ unsafe fn validate_and_sync_hosted_device_projection(
     } else {
         device_object + WDM_X64_DEVICE_OBJECT_SIZE as u64
     };
+    let expected_size =
+        u16::try_from(required).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     if capacity < required
         || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
         || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-        || read_unaligned((device_exec + 2) as *const u16) != WDM_X64_DEVICE_OBJECT_SIZE as u16
+        || read_unaligned((device_exec + 2) as *const u16) != expected_size
         || read_unaligned((device_exec + 0x08) as *const u64) != expected_driver_object
         || read_unaligned((device_exec + 0x40) as *const u64) != expected_extension
         || read_unaligned((device_exec + 0x48) as *const u32) != device_type.0
@@ -40457,11 +40320,9 @@ unsafe fn shared_path_ascii_at<const N: usize>(
     Some(path)
 }
 
-fn hosted_device_interface_target(
-    pdo_device_id: u64,
-) -> Result<NtPath, nt_status::NtStatus> {
-    let mut current = io_manager_mut()
-        .top_of_device_stack(nt_io_manager::DeviceId(pdo_device_id))?;
+fn hosted_device_interface_target(pdo_device_id: u64) -> Result<NtPath, nt_status::NtStatus> {
+    let mut current =
+        io_manager_mut().top_of_device_stack(nt_io_manager::DeviceId(pdo_device_id))?;
     let limit = io_manager_mut().device_count().saturating_add(1);
     let mut depth = 0usize;
     while depth < limit {
@@ -40469,7 +40330,11 @@ fn hosted_device_interface_target(
             let device = io_manager_mut()
                 .device(current)
                 .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-            (device.name.clone(), device.attached_to, device.delete_pending)
+            (
+                device.name.clone(),
+                device.attached_to,
+                device.delete_pending,
+            )
         };
         if delete_pending {
             return Err(nt_status::NtStatus::DELETE_PENDING);
@@ -40513,8 +40378,8 @@ unsafe fn set_hosted_device_interface_state(
     if registration.enabled == enable {
         return Ok(());
     }
-    let link = parse_nt_path(symbolic_link.as_str())
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let link =
+        parse_nt_path(symbolic_link.as_str()).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     if enable {
         let target = hosted_device_interface_target(registration.pdo_device_id)?;
         io_manager_mut().create_symbolic_link(&link, &target)?;
@@ -40674,8 +40539,7 @@ impl Drop for HostedDeviceDispatchContextGuard {
     }
 }
 
-unsafe fn hosted_device_dispatch_contexts_mut(
-) -> &'static mut Vec<HostedDeviceDispatchContext> {
+unsafe fn hosted_device_dispatch_contexts_mut() -> &'static mut Vec<HostedDeviceDispatchContext> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_DISPATCH_CONTEXTS);
     if slot.is_none() {
         *slot = Some(Vec::new());
@@ -41464,9 +41328,13 @@ struct HostedFilterRequirementsTransaction {
 }
 
 pub(crate) enum HostedFilterRequirementsOutcome {
-    Filtered { requirements: Vec<u8> },
+    Filtered {
+        requirements: Vec<u8>,
+    },
     Failed(nt_status::NtStatus),
-    Pending { irp_id: u64 },
+    Pending {
+        irp_id: u64,
+    },
     Indeterminate {
         irp_id: u64,
         transport_status: nt_status::NtStatus,
@@ -41649,8 +41517,7 @@ unsafe fn hosted_pnp_transaction_owns_stack_device(
         .as_ref()
         .is_some_and(|transactions| {
             transactions.iter().any(|transaction| {
-                transaction.irp_id == irp_id
-                    && transaction.stack_device_ids.contains(&device_id)
+                transaction.irp_id == irp_id && transaction.stack_device_ids.contains(&device_id)
             })
         })
 }
@@ -41833,8 +41700,7 @@ unsafe fn install_pending_hosted_pnp_context_lease(
         pci_vendor_device: (bus_identity.pci_device_id as u32) << 16
             | bus_identity.pci_vendor_id as u32,
         pci_class_rev: (bus_identity.pci_class & 0x00FF_FFFF) << 8,
-        pci_irq: bus_identity.pci_config_irq_line as u32
-            | ((bus_identity.pci_irq_pin as u32) << 8),
+        pci_irq: bus_identity.pci_config_irq_line as u32 | ((bus_identity.pci_irq_pin as u32) << 8),
         pnp_context_lease: Some(lease),
         ..HostedDeviceResourceState::default()
     };
@@ -42020,8 +41886,8 @@ unsafe fn copy_hosted_device_relations_result(
     let (exec_pointer, capacity) =
         hosted_pool_allocation_exec_range(inst.exec_pool_va, component_pointer)
             .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
-    let capacity = usize::try_from(capacity)
-        .map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
+    let capacity =
+        usize::try_from(capacity).map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
     let allocation = core::slice::from_raw_parts(exec_pointer as *const u8, capacity);
     match nt_pnp_manager::copy_device_relations_x64(allocation) {
         Ok(objects) => {
@@ -42061,8 +41927,8 @@ unsafe fn copy_hosted_query_id_result(
     let (exec_pointer, capacity) =
         hosted_pool_allocation_exec_range(inst.exec_pool_va, component_pointer)
             .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
-    let capacity = usize::try_from(capacity)
-        .map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
+    let capacity =
+        usize::try_from(capacity).map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
     let allocation = core::slice::from_raw_parts(exec_pointer as *const u8, capacity);
     match nt_pnp_manager::copy_bus_query_id_x64(allocation, id_type) {
         Ok(value) => {
@@ -42102,8 +41968,8 @@ unsafe fn copy_hosted_bus_property_result(
     let (exec_pointer, capacity) =
         hosted_pool_allocation_exec_range(inst.exec_pool_va, component_pointer)
             .ok_or(HostedDriverAllocationCopyError::InvalidPointer)?;
-    let capacity = usize::try_from(capacity)
-        .map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
+    let capacity =
+        usize::try_from(capacity).map_err(|_| HostedDriverAllocationCopyError::InvalidPointer)?;
     let allocation = core::slice::from_raw_parts(exec_pointer as *const u8, capacity);
     let copied = match minor {
         nt_pnp_abi::IRP_MN_QUERY_BUS_INFORMATION => {
@@ -42115,8 +41981,9 @@ unsafe fn copy_hosted_bus_property_result(
                 })
             })
         }
-        nt_pnp_abi::IRP_MN_QUERY_RESOURCES => nt_pnp_manager::copy_cm_resource_list(allocation)
-            .map(HostedBusPropertyValue::Blob),
+        nt_pnp_abi::IRP_MN_QUERY_RESOURCES => {
+            nt_pnp_manager::copy_cm_resource_list(allocation).map(HostedBusPropertyValue::Blob)
+        }
         nt_pnp_abi::IRP_MN_QUERY_RESOURCE_REQUIREMENTS => {
             nt_pnp_manager::copy_io_resource_requirements_list(allocation)
                 .map(HostedBusPropertyValue::Blob)
@@ -42189,10 +42056,7 @@ unsafe fn reserve_hosted_filter_requirements_transaction(
     Ok(())
 }
 
-unsafe fn set_hosted_filter_requirements_indeterminate(
-    irp_id: IrpId,
-    status: nt_status::NtStatus,
-) {
+unsafe fn set_hosted_filter_requirements_indeterminate(irp_id: IrpId, status: nt_status::NtStatus) {
     let transaction = hosted_filter_requirements_transactions_mut()
         .iter_mut()
         .find(|transaction| transaction.irp_id == irp_id)
@@ -42244,9 +42108,7 @@ unsafe fn retain_hosted_filter_requirements_return(
         };
     } else if status.is_success() || status == nt_status::NtStatus::NOT_SUPPORTED {
         transaction.filtered = Some(core::mem::take(&mut transaction.original));
-        transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit {
-            pending_completion,
-        };
+        transaction.phase = HostedFilterRequirementsPhase::AwaitingCommit { pending_completion };
     } else {
         set_hosted_filter_requirements_disposition(
             irp_id,
@@ -42559,10 +42421,7 @@ unsafe fn finish_hosted_remove_quiescence(irp_id: IrpId) -> Result<(), nt_status
     }
     if !interfaces_released {
         let failures = if final_remove {
-            clear_hosted_device_interfaces(
-                binding.projection_domain,
-                Some(binding.pdo_device_id),
-            )
+            clear_hosted_device_interfaces(binding.projection_domain, Some(binding.pdo_device_id))
         } else {
             disable_hosted_device_interfaces(binding.projection_domain, binding.pdo_device_id)
         };
@@ -42671,19 +42530,13 @@ unsafe fn finish_hosted_remove_publication(irp_id: IrpId) -> Result<(), nt_statu
     }
     if !device_retired {
         drain_hosted_device_retirements();
-        if let Some(retirement) = hosted_device_retirements_mut()
-            .iter()
-            .find(|retirement| {
-                hosted_pnp_transaction_owns_stack_device(irp_id, retirement.device_id)
-                    && retirement.authority
-                        == HostedDeviceRetirementAuthority::PnpRemove(irp_id)
-            })
-        {
-            return Err(
-                retirement
-                    .barrier_status
-                    .unwrap_or(nt_status::NtStatus::DELETE_PENDING),
-            );
+        if let Some(retirement) = hosted_device_retirements_mut().iter().find(|retirement| {
+            hosted_pnp_transaction_owns_stack_device(irp_id, retirement.device_id)
+                && retirement.authority == HostedDeviceRetirementAuthority::PnpRemove(irp_id)
+        }) {
+            return Err(retirement
+                .barrier_status
+                .unwrap_or(nt_status::NtStatus::DELETE_PENDING));
         }
         if hosted_device_binding_by_device_id(binding.device_id).is_some()
             || io_manager_mut()
@@ -42856,8 +42709,7 @@ unsafe fn install_hosted_irq_connection(
         || route.tokens.vector != route.translated_vector
         || route.tokens.service_routine_token != state.evidence.interrupt_routine
         || route.tokens.service_context_token != state.evidence.interrupt_context
-        || state.interrupt_latched
-            != (route.mode == nt_hal_abi::INT_MODE_LATCHED)
+        || state.interrupt_latched != (route.mode == nt_hal_abi::INT_MODE_LATCHED)
         || state.interrupt_shared != (route.share == nt_hal_abi::SHARE_SHARED)
         || !state.interrupt_route_authoritative
     {
@@ -42907,8 +42759,8 @@ unsafe fn install_hosted_irq_connection(
     hosted_irq_connections_mut()
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let event_bit = allocate_hosted_irq_event_bit()
-        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let event_bit =
+        allocate_hosted_irq_event_bit().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
 
     let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << event_bit);
     let notification_cap = crate::mint_executive_event_badge(badge)?;
@@ -43373,9 +43225,7 @@ fn hosted_pnp_status(error: nt_pnp_manager::PnpError) -> nt_status::NtStatus {
         nt_pnp_manager::PnpError::DispatchInFlight => nt_status::NtStatus::DEVICE_BUSY,
         nt_pnp_manager::PnpError::StaleId
         | nt_pnp_manager::PnpError::StaleDispatch
-        | nt_pnp_manager::PnpError::StalePublication => {
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        }
+        | nt_pnp_manager::PnpError::StalePublication => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
         nt_pnp_manager::PnpError::InvalidIdentity | nt_pnp_manager::PnpError::InvalidTransition => {
             nt_status::NtStatus::INVALID_PARAMETER
         }
@@ -43546,18 +43396,12 @@ pub(crate) fn service_hosted_device(
             Err(status) => (status.raw(), 0, 0, 0),
         };
     }
-    if op == HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK
-        || op == HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK
-    {
+    if op == HOSTED_DEVICE_OP_CREATE_SYMBOLIC_LINK || op == HOSTED_DEVICE_OP_DELETE_SYMBOLIC_LINK {
         if instance_for_pump_channel(ch, active_reply_cap).is_none() {
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         }
         let (link_len, link_capture) = unsafe {
-            read_shared_path_capture(
-                ch.shared_va,
-                SH_SYMLINK_LINK_LEN,
-                SH_SYMLINK_LINK_BUF,
-            )
+            read_shared_path_capture(ch.shared_va, SH_SYMLINK_LINK_LEN, SH_SYMLINK_LINK_BUF)
         };
         let Some(link) = captured_nt_path(&link_capture, link_len) else {
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -43569,11 +43413,7 @@ pub(crate) fn service_hosted_device(
             };
         }
         let (target_len, target_capture) = unsafe {
-            read_shared_path_capture(
-                ch.shared_va,
-                SH_SYMLINK_TARGET_LEN,
-                SH_SYMLINK_TARGET_BUF,
-            )
+            read_shared_path_capture(ch.shared_va, SH_SYMLINK_TARGET_LEN, SH_SYMLINK_TARGET_BUF)
         };
         let Some(target) = captured_nt_path(&target_capture, target_len) else {
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -43594,18 +43434,13 @@ pub(crate) fn service_hosted_device(
         let Ok(extension_size) = u32::try_from(arg3) else {
             return (STATUS_INVALID_PARAMETER, 0, 0, 0);
         };
-        let raw_name_len = unsafe {
-            read_volatile((ch.shared_va + SH_DEVICE_NAME_LEN) as *const u16)
-        };
+        let raw_name_len =
+            unsafe { read_volatile((ch.shared_va + SH_DEVICE_NAME_LEN) as *const u16) };
         let name = if raw_name_len == 0 {
             None
         } else {
             let (captured_len, captured) = unsafe {
-                read_shared_path_capture(
-                    ch.shared_va,
-                    SH_DEVICE_NAME_LEN,
-                    SH_DEVICE_NAME_BUF,
-                )
+                read_shared_path_capture(ch.shared_va, SH_DEVICE_NAME_LEN, SH_DEVICE_NAME_BUF)
             };
             if captured_len != raw_name_len {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -43630,11 +43465,14 @@ pub(crate) fn service_hosted_device(
             else {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
             };
-            let required_device_bytes = match (WDM_X64_DEVICE_OBJECT_SIZE as u64)
-                .checked_add(extension_size as u64)
-            {
-                Some(bytes) => bytes,
-                None => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
+            let required_device_bytes =
+                match (WDM_X64_DEVICE_OBJECT_SIZE as u64).checked_add(extension_size as u64) {
+                    Some(bytes) => bytes,
+                    None => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
+                };
+            let expected_device_size = match u16::try_from(required_device_bytes) {
+                Ok(size) => size,
+                Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0, 0),
             };
             if driver_capacity < WDM_X64_DRIVER_OBJECT_SIZE as u64
                 || device_capacity < required_device_bytes
@@ -43644,8 +43482,7 @@ pub(crate) fn service_hosted_device(
                 || read_unaligned((driver_exec + 2) as *const u16)
                     != WDM_X64_DRIVER_OBJECT_SIZE as u16
                 || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-                || read_unaligned((device_exec + 2) as *const u16)
-                    != WDM_X64_DEVICE_OBJECT_SIZE as u16
+                || read_unaligned((device_exec + 2) as *const u16) != expected_device_size
                 || read_unaligned((device_exec + 0x08) as *const u64) != arg2
             {
                 return (STATUS_INVALID_PARAMETER, 0, 0, 0);
@@ -43668,9 +43505,8 @@ pub(crate) fn service_hosted_device(
         let driver_id = match io_manager_mut().hosted_driver_by_identity(domain, arg2) {
             Some(driver_id) => driver_id,
             None => {
-                let shared_driver = unsafe {
-                    read_volatile((ch.shared_va + SH_DRVOBJ) as *const u64)
-                };
+                let shared_driver =
+                    unsafe { read_volatile((ch.shared_va + SH_DRVOBJ) as *const u64) };
                 let driver_id = DriverId(inst.driver_id);
                 if arg2 != shared_driver
                     || inst.driver_id == 0
@@ -43729,9 +43565,7 @@ pub(crate) fn service_hosted_device(
             return (STATUS_ACCESS_DENIED, 0, 0, 0);
         }
         return match io_manager_mut().attach_device_to_stack(source_id, target_id) {
-            Ok(lower_id) if lower_id == expected_lower_id => {
-                (STATUS_SUCCESS, lower_id.raw(), 0, 0)
-            }
+            Ok(lower_id) if lower_id == expected_lower_id => (STATUS_SUCCESS, lower_id.raw(), 0, 0),
             Ok(_) => {
                 io_manager_mut()
                     .detach_device_from_stack(source_id)
@@ -43880,8 +43714,7 @@ pub(crate) fn service_hosted_device(
             }
         };
         if relation_type == nt_pnp_abi::BUS_RELATIONS
-            && enqueued.disposition
-                == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
+            && enqueued.disposition == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
         {
             let relation_owner = nt_pnp::AcpiPciProviderEndpoint {
                 device_id: pdo_device_id.raw(),
@@ -44281,9 +44114,7 @@ fn hosted_device_binding_by_pdo_object(pdo_object: u64) -> Option<HostedDeviceBi
         .find(|slot| slot.used && slot.pdo_object != 0 && slot.pdo_object == pdo_object)
 }
 
-fn hosted_driver_device_route_by_device_id(
-    device_id: u64,
-) -> Option<(usize, DriverInstance, u64)> {
+fn hosted_driver_device_route_by_device_id(device_id: u64) -> Option<(usize, DriverInstance, u64)> {
     if let Some(binding) = hosted_device_binding_by_device_id(device_id) {
         let inst = instance(binding.instance)?;
         if inst.driver_id != binding.driver_id {
@@ -44516,7 +44347,9 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         pdo_object: read_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *const u64),
         address_resource_count,
         address_resources,
-        interrupt_line: previous_state.map(|state| state.interrupt_line).unwrap_or(0),
+        interrupt_line: previous_state
+            .map(|state| state.interrupt_line)
+            .unwrap_or(0),
         interrupt_affinity: read_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64),
         interrupt_shared: previous_state
             .map(|state| state.interrupt_shared)
@@ -45151,12 +44984,15 @@ unsafe fn retire_hosted_device_projection(
 ) -> Result<(), nt_status::NtStatus> {
     let _guard = hosted_instance_pool_lock(inst.exec_pool_va)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
-    let (device_exec, capacity) = hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
-        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let (device_exec, capacity) =
+        hosted_pool_allocation_exec_range(inst.exec_pool_va, device_object)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let projected_size = read_unaligned((device_exec + 2) as *const u16) as u64;
     if capacity < WDM_X64_DEVICE_OBJECT_SIZE as u64
         || hosted_instance_pool_allocation_is_free_unlocked(inst, device_object) != Some(false)
         || read_unaligned(device_exec as *const i16) != WDM_X64_IO_TYPE_DEVICE
-        || read_unaligned((device_exec + 2) as *const u16) != WDM_X64_DEVICE_OBJECT_SIZE as u16
+        || projected_size < WDM_X64_DEVICE_OBJECT_SIZE as u64
+        || projected_size > capacity
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -45270,10 +45106,8 @@ unsafe fn drain_hosted_device_retirements() -> usize {
             index += 1;
             continue;
         }
-        let interface_failures = clear_hosted_device_interfaces(
-            retirement.domain,
-            Some(retirement.device_id.raw()),
-        );
+        let interface_failures =
+            clear_hosted_device_interfaces(retirement.domain, Some(retirement.device_id.raw()));
         if interface_failures != 0 {
             hosted_device_retirements_mut()[index].barrier_status =
                 Some(nt_status::NtStatus::DEVICE_BUSY);
@@ -46029,9 +45863,9 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
     let retirements_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_RETIREMENTS))
         .as_ref()
         .is_none_or(|retirements| {
-            retirements.iter().all(|retirement| {
-                retirement.instance != instance && retirement.domain != domain
-            })
+            retirements
+                .iter()
+                .all(|retirement| retirement.instance != instance && retirement.domain != domain)
         });
     let interfaces_quiesced = (*core::ptr::addr_of!(HOSTED_DEVICE_INTERFACE_REGISTRATIONS))
         .as_ref()
@@ -46683,13 +46517,11 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             let Some(domain) = instance_domain_identity(inst) else {
                 return Err(nt_status::NtStatus::INVALID_PARAMETER);
             };
-            if let Err(status) = io_manager_mut()
-                .can_unregister_hosted_domain_after_unbind_driver(
-                    domain,
-                    inst.driver_object,
-                    DriverId(inst.driver_id),
-                )
-            {
+            if let Err(status) = io_manager_mut().can_unregister_hosted_domain_after_unbind_driver(
+                domain,
+                inst.driver_object,
+                DriverId(inst.driver_id),
+            ) {
                 print_str(b"[driver-launch] hosted domain preflight rejected inst=");
                 print_u64(i as u64);
                 print_str(b" status=0x");
@@ -46960,12 +46792,7 @@ pub(crate) fn service_hosted_driver_pci_config(
     let slot_number = (bus_slot >> 32) as u32;
     let offset = range as u32;
     let length = (range >> 32) as u32;
-    let access = match nt_pnp::validate_pci_config_access(
-        bus_number,
-        slot_number,
-        offset,
-        length,
-    ) {
+    let access = match nt_pnp::validate_pci_config_access(bus_number, slot_number, offset, length) {
         Ok(access) if access.length != 0 => access,
         _ => return (STATUS_INVALID_PARAMETER, 0),
     };
@@ -46973,29 +46800,28 @@ pub(crate) fn service_hosted_driver_pci_config(
     if caller_badge != 0 && runtime.is_none() {
         return (STATUS_ACCESS_DENIED, 0);
     }
-    let Some(exec_buffer) = component_to_exec_va_for_instance(
-        instance,
-        inst,
-        component_buffer,
-        access.length as u64,
-    )
-    .or_else(|| {
-        runtime.and_then(|worker| {
-            hosted_worker_component_to_exec_va(
-                worker,
-                component_buffer,
-                access.length as u64,
-            )
-        })
-    }) else {
+    let Some(exec_buffer) =
+        component_to_exec_va_for_instance(instance, inst, component_buffer, access.length as u64)
+            .or_else(|| {
+                runtime.and_then(|worker| {
+                    hosted_worker_component_to_exec_va(
+                        worker,
+                        component_buffer,
+                        access.length as u64,
+                    )
+                })
+            })
+    else {
         return (STATUS_INVALID_PARAMETER, 0);
     };
     let result = unsafe {
         if op == HOSTED_PCI_CONFIG_OP_READ {
-            let output = core::slice::from_raw_parts_mut(exec_buffer as *mut u8, access.length as usize);
+            let output =
+                core::slice::from_raw_parts_mut(exec_buffer as *mut u8, access.length as usize);
             crate::pnp::read_pci_config(access, output)
         } else {
-            let input = core::slice::from_raw_parts(exec_buffer as *const u8, access.length as usize);
+            let input =
+                core::slice::from_raw_parts(exec_buffer as *const u8, access.length as usize);
             crate::pnp::write_pci_config(access, input)
         }
     };
@@ -47024,9 +46850,7 @@ pub(crate) fn service_hosted_driver_interrupt(
         return (STATUS_ACCESS_DENIED, 0);
     }
     let sh = ch.shared_va;
-    let active = unsafe {
-        read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64)
-    };
+    let active = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) };
     if interrupt_object == 0 || active != interrupt_object {
         return (STATUS_INVALID_PARAMETER, 0);
     }
@@ -47034,8 +46858,7 @@ pub(crate) fn service_hosted_driver_interrupt(
         HOSTED_INTERRUPT_OP_CONNECT => unsafe {
             match publish_hosted_interrupt_connection_from_shared(binding, sh) {
                 Ok(()) => {
-                    let interrupt_id =
-                        read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+                    let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
                     if interrupt_id == 0 {
                         (STATUS_INVALID_DEVICE_REQUEST, 0)
                     } else {
@@ -47294,13 +47117,11 @@ pub(crate) fn service_hosted_driver_registry(
                     return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
                 };
                 let volatile = a2 as u32 & REG_OPTION_VOLATILE != 0;
-                let created = match crate::config_manager_create_key_with_options(
-                    path.as_str(),
-                    volatile,
-                ) {
-                    Ok((_key, created)) => created,
-                    Err(status) => return (status, 0, 0),
-                };
+                let created =
+                    match crate::config_manager_create_key_with_options(path.as_str(), volatile) {
+                        Ok((_key, created)) => created,
+                        Err(status) => return (status, 0, 0),
+                    };
                 let Some(handle) = allocate_cm_registry_handle(path) else {
                     return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
                 };
@@ -49606,12 +49427,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
                     .iter()
                     .find(|grant| grant.resource_index == resource.resource_index)
                     .is_some_and(|grant| grant.writable);
-                nt_hal_abi::RIGHT_READ
-                    | if writable {
-                        nt_hal_abi::RIGHT_WRITE
-                    } else {
-                        0
-                    }
+                nt_hal_abi::RIGHT_READ | if writable { nt_hal_abi::RIGHT_WRITE } else { 0 }
             } else {
                 0
             },
@@ -49885,7 +49701,7 @@ unsafe fn record_hosted_mmio_usage(
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         let expected_resource_id =
             hosted_mmio_resource_id(binding.device_id, resource.resource_index)
-            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+                .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
         let mapped = hosted_resource_manager_mut()
             .map_io_space(owner, mapped_phys, mapped_len, nt_hal_abi::MM_NON_CACHED)
             .map_err(hosted_hal_status)?;
@@ -50521,10 +50337,9 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
     device_id: u64,
     resource_requirements: &[u8],
 ) -> Result<HostedFilterRequirementsOutcome, nt_status::NtStatus> {
-    let extent = nt_cm_resources::validate_io_resource_requirements_list_extent(
-        resource_requirements,
-    )
-    .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    let extent =
+        nt_cm_resources::validate_io_resource_requirements_list_extent(resource_requirements)
+            .map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
     if extent != resource_requirements.len() {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -50589,12 +50404,7 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
         ExternalPnpDispatchResult::Returned {
             status,
             information,
-        } => retain_hosted_filter_requirements_return(
-            irp_id,
-            status,
-            information,
-            false,
-        ),
+        } => retain_hosted_filter_requirements_return(irp_id, status, information, false),
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
             set_hosted_filter_requirements_indeterminate(
                 irp_id,
@@ -51360,7 +51170,9 @@ unsafe fn dispatch_irp_for_instance_exact(
         .as_ref()
         .and_then(|request| hosted_device_binding_by_device_id(request.device_id))
         .or_else(|| hosted_device_binding_by_device_object(device_object))
-        .filter(|binding| binding.instance == inst && binding.driver_id == dependent_inst.driver_id);
+        .filter(|binding| {
+            binding.instance == inst && binding.driver_id == dependent_inst.driver_id
+        });
     let _device_dispatch_context = match dispatch_binding {
         Some(binding) => match HostedDeviceDispatchContextGuard::enter(inst, binding) {
             Ok(guard) => Some(guard),

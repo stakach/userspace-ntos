@@ -61,20 +61,62 @@ pub fn create_user_stack_layout(
     default_commit: usize,
     default_reserve: usize,
 ) -> Result<UserStackLayout, NtStatus> {
+    create_user_stack_layout_with_minimum(
+        committed_stack_size,
+        maximum_stack_size,
+        zero_bits,
+        commit_alignment,
+        reserve_alignment,
+        default_commit,
+        default_reserve,
+        DEFAULT_STACK_RESERVE,
+    )
+}
+
+/// Compute the private NT process/thread creation stack shape. Unlike the public
+/// `RtlCreateUserStack` contract, this preserves the 64-KiB system reserve default used for a
+/// foreign process when the caller and image provide no sizes.
+pub fn create_process_user_stack_layout(
+    committed_stack_size: usize,
+    maximum_stack_size: usize,
+    zero_bits: u32,
+    default_commit: usize,
+    default_reserve: usize,
+) -> Result<UserStackLayout, NtStatus> {
+    create_user_stack_layout_with_minimum(
+        committed_stack_size,
+        maximum_stack_size,
+        zero_bits,
+        DEFAULT_PAGE_SIZE,
+        DEFAULT_RESERVE_ALIGNMENT,
+        default_commit,
+        default_reserve,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_user_stack_layout_with_minimum(
+    committed_stack_size: usize,
+    maximum_stack_size: usize,
+    zero_bits: u32,
+    commit_alignment: usize,
+    reserve_alignment: usize,
+    default_commit: usize,
+    default_reserve: usize,
+    minimum_reserve: usize,
+) -> Result<UserStackLayout, NtStatus> {
     if !is_valid_alignment(commit_alignment) || !is_valid_alignment(reserve_alignment) {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if zero_bits >= 32 {
+    // AMD64 `NtAllocateVirtualMemory` accepts at most 53 zero bits. The live VM syscall applies
+    // the resulting placement ceiling and returns any more restrictive address-space error.
+    if zero_bits > 53 {
         return Err(STATUS_INVALID_PARAMETER_3);
-    }
-    // The current executive VM allocator ignores ZeroBits, so fail honestly until
-    // constrained high-address allocation is modeled.
-    if zero_bits != 0 {
-        return Err(STATUS_CONFLICTING_ADDRESSES);
     }
 
     let default_commit = default_commit.max(DEFAULT_PAGE_SIZE);
-    let default_reserve = default_reserve.max(DEFAULT_STACK_RESERVE);
+    let default_reserve = default_reserve.max(reserve_alignment).max(minimum_reserve);
     let requested_commit = if committed_stack_size == 0 {
         default_commit
     } else {
@@ -92,7 +134,8 @@ pub fn create_user_stack_layout(
     } else {
         requested_reserve
     };
-    let reserve = round_up(reserve_floor, reserve_alignment).ok_or(STATUS_INVALID_PARAMETER)?;
+    let reserve = round_up(reserve_floor.max(minimum_reserve), reserve_alignment)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
     let guard = if reserve >= commit.saturating_add(DEFAULT_PAGE_SIZE) {
         DEFAULT_PAGE_SIZE
     } else {
@@ -147,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_reserve_is_preserved_when_larger_than_commit() {
+    fn public_stack_keeps_the_one_megabyte_minimum() {
         assert_eq!(
             create_user_stack_layout(0x20_000, 0x20_000, 0, 1, 1, DCOMMIT, DRESERVE)
                 .unwrap()
@@ -158,23 +201,38 @@ mod tests {
             create_user_stack_layout(0x20_000, 0x40_000, 0, 0x1000, 0x1_0000, DCOMMIT, DRESERVE)
                 .unwrap()
                 .reserve,
-            0x40_000
+            DRESERVE
         );
     }
 
     #[test]
-    fn invalid_alignment_and_unsupported_zero_bits_fail() {
+    fn invalid_alignment_and_out_of_range_zero_bits_fail() {
         assert_eq!(
             create_user_stack_layout(0x11_000, 0x11_0000, 0, 1, 0, DCOMMIT, DRESERVE),
             Err(STATUS_INVALID_PARAMETER)
         );
         assert_eq!(
-            create_user_stack_layout(0x4000, DRESERVE, 1, 0x1000, 0x1000, DCOMMIT, DRESERVE),
-            Err(STATUS_CONFLICTING_ADDRESSES)
-        );
-        assert_eq!(
-            create_user_stack_layout(0x4000, DRESERVE, 32, 0x1000, 0x1000, DCOMMIT, DRESERVE),
+            create_user_stack_layout(0x4000, DRESERVE, 54, 0x1000, 0x1000, DCOMMIT, DRESERVE),
             Err(STATUS_INVALID_PARAMETER_3)
+        );
+    }
+
+    #[test]
+    fn foreign_process_defaults_use_system_page_and_allocation_granularity() {
+        assert_eq!(
+            create_process_user_stack_layout(
+                0,
+                0,
+                0,
+                DEFAULT_PAGE_SIZE,
+                DEFAULT_RESERVE_ALIGNMENT,
+            )
+            .unwrap(),
+            UserStackLayout {
+                commit: DEFAULT_PAGE_SIZE,
+                reserve: DEFAULT_RESERVE_ALIGNMENT,
+                guard: DEFAULT_PAGE_SIZE,
+            }
         );
     }
 

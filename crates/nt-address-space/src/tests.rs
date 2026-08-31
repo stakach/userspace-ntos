@@ -1051,6 +1051,57 @@ fn fixed_vm_map_auto_placement_honors_retry_bounds() {
 }
 
 #[test]
+fn fixed_vm_map_separates_low_explicit_domain_from_high_auto_preference() {
+    const AUTO_FLOOR: u64 = 0x0100_3000_0000;
+    const LIMIT: u64 = 0x0100_4000_0000;
+    let mut map = VmRegionMap::<4>::new(0, LIMIT);
+
+    let low = map
+        .allocate_between(
+            Some(4),
+            0x10_0000 - 0x100,
+            MEM_RESERVE,
+            PAGE_READWRITE,
+            0,
+            LIMIT,
+        )
+        .unwrap();
+    assert_eq!(
+        low,
+        VmAllocatePlan {
+            base: 0,
+            size: 0x10_0000
+        }
+    );
+    assert_eq!(map.private_committed_bytes(), 0);
+    assert_eq!(map.extent_at(0).unwrap().state, VmExtentState::Reserved);
+    assert_eq!(
+        map.allocate_between(
+            Some(4),
+            0x10_0000 - 0x100,
+            MEM_RESERVE,
+            PAGE_READWRITE,
+            0,
+            LIMIT,
+        ),
+        Err(STATUS_CONFLICTING_ADDRESSES)
+    );
+
+    let automatic = map
+        .allocate_between(
+            None,
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            AUTO_FLOOR,
+            LIMIT,
+        )
+        .unwrap();
+    assert_eq!(automatic.base, AUTO_FLOOR);
+    assert_eq!(map.private_committed_bytes(), 0x2000);
+}
+
+#[test]
 fn fixed_vm_map_reset_preserves_existing_commit() {
     let mut map = VmRegionMap::<4>::new(0x10000, 0x10_0000);
     let allocation = map

@@ -581,8 +581,7 @@ impl OwnedSystemHiveMutation {
 
 fn is_system_registry_path(path: &str) -> bool {
     let canonical = nt_hive_core::canon_path(path);
-    canonical == r"\registry\machine\system"
-        || canonical.starts_with(r"\registry\machine\system\")
+    canonical == r"\registry\machine\system" || canonical.starts_with(r"\registry\machine\system\")
 }
 
 fn with_opened_system_hive_key<R>(
@@ -891,8 +890,7 @@ impl nt_hive_core::ReactOsSetupSeedTarget for CollectSystemSetupSeedTarget {
     }
 
     fn has_value(&self, path: &str, name: &str) -> bool {
-        self.pending_value(path, name).is_some()
-            || self.existing_value(path, name).is_some()
+        self.pending_value(path, name).is_some() || self.existing_value(path, name).is_some()
     }
 
     fn value_matches(
@@ -1783,17 +1781,21 @@ unsafe fn registered_frame_first_overlap_unowned_private_vad(
     if size == 0 || end <= base {
         return None;
     }
-    let mut page = base & !0xfffu64;
-    while page < end {
-        if csrss_frame_get_exact(pi as u64, page).0 != 0 && vm_map.extent_at(page).is_none() {
-            return Some(FixedMappingOverlap {
-                base: page,
-                end: page + 0x1000,
-            });
-        }
-        page = page.checked_add(0x1000)?;
-    }
-    None
+    (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
+        .records()
+        .iter()
+        .filter(|record| {
+            record.pi == pi as u64
+                && record.page < end
+                && base < record.page.saturating_add(0x1000)
+                && vm_map.extent_at(record.page).is_none()
+        })
+        .map(|record| record.page)
+        .min()
+        .map(|page| FixedMappingOverlap {
+            base: page,
+            end: page + 0x1000,
+        })
 }
 
 unsafe fn fixed_mapping_authority_first_overlap(
@@ -1911,9 +1913,6 @@ unsafe fn allocate_vad_avoiding_fixed_authorities(
     protection: u32,
     placement_limit: u64,
 ) -> Result<nt_address_space::VmAllocatePlan, u32> {
-    const FIXED_AUTHORITY_PLACEMENT_RETRY_LIMIT: usize =
-        VM_REGION_CAPACITY + PROCESS_COMMITTED_MAPPING_CAPACITY + 64;
-
     let auto_placement = requested_base.is_none();
     if !auto_placement {
         *after = *before;
@@ -1933,9 +1932,59 @@ unsafe fn allocate_vad_avoiding_fixed_authorities(
         return Ok(plan);
     }
 
+    const MM_LOWEST_USER_ADDRESS: u64 = 0x1_0000;
+    if placement_limit > SMSS_ALLOC_VA {
+        match unsafe {
+            allocate_automatic_vad_in_slice_avoiding_fixed_authorities(
+                before,
+                after,
+                kind,
+                target_pi,
+                requested_size,
+                allocation_type,
+                protection,
+                SMSS_ALLOC_VA,
+                placement_limit,
+            )
+        } {
+            Ok(plan) => return Ok(plan),
+            Err(nt_address_space::STATUS_NO_MEMORY) => {}
+            Err(status) => return Err(status),
+        }
+    }
+    unsafe {
+        allocate_automatic_vad_in_slice_avoiding_fixed_authorities(
+            before,
+            after,
+            kind,
+            target_pi,
+            requested_size,
+            allocation_type,
+            protection,
+            MM_LOWEST_USER_ADDRESS,
+            placement_limit.min(SMSS_ALLOC_VA),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn allocate_automatic_vad_in_slice_avoiding_fixed_authorities(
+    before: &nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    after: &mut nt_address_space::VmRegionMap<VM_REGION_CAPACITY>,
+    kind: VmVadKind,
+    target_pi: usize,
+    requested_size: u64,
+    allocation_type: u32,
+    protection: u32,
+    mut lower_bound: u64,
+    mut upper_bound: u64,
+) -> Result<nt_address_space::VmAllocatePlan, u32> {
+    const FIXED_AUTHORITY_PLACEMENT_RETRY_LIMIT: usize =
+        VM_REGION_CAPACITY + PROCESS_COMMITTED_MAPPING_CAPACITY + 64;
+    if lower_bound >= upper_bound {
+        return Err(nt_address_space::STATUS_NO_MEMORY);
+    }
     let top_down = allocation_type & nt_address_space::MEM_TOP_DOWN != 0;
-    let mut lower_bound = 0;
-    let mut upper_bound = placement_limit;
     for _ in 0..=FIXED_AUTHORITY_PLACEMENT_RETRY_LIMIT {
         *after = *before;
         let plan = allocate_vad_between(
@@ -2744,8 +2793,7 @@ impl Default for SystemTimeConfiguration {
 fn query_system_time_configuration() -> Result<SystemTimeConfiguration, u32> {
     use nt_kernel_exec::timezone::{TimeZoneInformation, TimeZoneRegistryField};
 
-    const KEY: &str =
-        r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation";
+    const KEY: &str = r"\Registry\Machine\System\CurrentControlSet\Control\TimeZoneInformation";
     const REG_DWORD: u32 = 4;
 
     with_system_hive_key_lease(KEY, |lease| {
@@ -3028,9 +3076,7 @@ fn parse_decimal_u32(bytes: &[u8]) -> Option<u32> {
         if !byte.is_ascii_digit() {
             return None;
         }
-        value = value
-            .checked_mul(10)?
-            .checked_add(u32::from(byte - b'0'))?;
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
         seen = true;
     }
     seen.then_some(value)
@@ -3143,8 +3189,7 @@ fn parse_utf16le_ascii_hex_u32(bytes: &[u8]) -> Option<u32> {
 }
 
 fn query_system_default_language_id() -> Result<u32, u32> {
-    let Some((value_type, data)) =
-        query_system_hive_value(SYSTEM_NLS_LANGUAGE_PATH, "Default")?
+    let Some((value_type, data)) = query_system_hive_value(SYSTEM_NLS_LANGUAGE_PATH, "Default")?
     else {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     };
@@ -3795,7 +3840,10 @@ impl ExecNtHandler {
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_driver_starts, driver_starts.pending);
         write_field!(boot_driver_start_reports, driver_starts.reports);
-        write_field!(native_driver_start_report, NativeDriverStartReport::default());
+        write_field!(
+            native_driver_start_report,
+            NativeDriverStartReport::default()
+        );
         write_field!(pending_driver_start_transfer, None);
         write_field!(
             pending_pnp_operations,
@@ -3910,9 +3958,7 @@ impl ExecNtHandler {
             };
             handler.time_zone_information = configuration.information;
             handler.real_time_is_universal = configuration.real_time_is_universal;
-            unsafe {
-                publish_time_zone(&handler.time_zone_information, nt_system_time_100ns())
-            };
+            unsafe { publish_time_zone(&handler.time_zone_information, nt_system_time_100ns()) };
             trace_setup_provision_phase(b"timezone-end", 1);
             trace_setup_provision_phase(b"locale-begin", 0);
             unsafe { handler.provision_default_user_locale() };
@@ -3936,9 +3982,7 @@ impl ExecNtHandler {
             handler.provision_reactos_explorer_shell_com_classes();
             trace_setup_provision_phase(b"shell-com-end", 0);
         } else {
-            unsafe {
-                publish_time_zone(&handler.time_zone_information, nt_system_time_100ns())
-            };
+            unsafe { publish_time_zone(&handler.time_zone_information, nt_system_time_100ns()) };
         }
         handler
     }
@@ -4138,8 +4182,8 @@ impl ExecNtHandler {
             print_str(b"\n");
             return Ok(outcome);
         }
-        let generation = self
-            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)?;
+        let generation =
+            self.persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)?;
         self.note_mutable_hives_changed();
         print_str(b"[timezone-setup] ReactOS timezone index=");
         print_u64(selected_index as u64);
@@ -4251,17 +4295,16 @@ impl ExecNtHandler {
             .iter()
             .map(OwnedSystemHiveMutation::as_client_mutation)
             .collect();
-        let outcome = match unsafe {
-            crate::persist_and_publish_system_hive_mutation(&client_mutations)
-        } {
-            Ok(outcome) => outcome,
-            Err(status) => {
-                if matches!(origin, SystemHiveMutationOrigin::Runtime) {
-                    CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+        let outcome =
+            match unsafe { crate::persist_and_publish_system_hive_mutation(&client_mutations) } {
+                Ok(outcome) => outcome,
+                Err(status) => {
+                    if matches!(origin, SystemHiveMutationOrigin::Runtime) {
+                        CM_RUNTIME_SYSTEM_MUTATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(status);
                 }
-                return Err(status);
-            }
-        };
+            };
         if outcome.wake_device_action {
             unsafe { self.pnp_signal_pending_action() };
         }
@@ -4731,10 +4774,7 @@ impl ExecNtHandler {
             nt_hive_core::RegistryValueType::Sz,
             system_locale[..system_locale_len].to_vec(),
         );
-        trace_setup_provision_phase(
-            b"locale-system-default-end",
-            system_default_changed as u64,
-        );
+        trace_setup_provision_phase(b"locale-system-default-end", system_default_changed as u64);
         trace_setup_provision_phase(b"locale-install-language-begin", system_locale_len as u64);
         let install_language_changed = nt_hive_core::ReactOsSetupSeedTarget::set_value(
             &mut target,
@@ -7134,10 +7174,8 @@ impl ExecNtHandler {
         const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
-        self.native_driver_start_report.load_calls = self
-            .native_driver_start_report
-            .load_calls
-            .saturating_add(1);
+        self.native_driver_start_report.load_calls =
+            self.native_driver_start_report.load_calls.saturating_add(1);
 
         if !self.current_token_has_privilege(nt_security::SE_LOAD_DRIVER) {
             return STATUS_PRIVILEGE_NOT_HELD;
@@ -7375,10 +7413,8 @@ impl ExecNtHandler {
     }
 
     fn registry_overlay_index_for_canon_path(&self, canon: &str) -> Option<usize> {
-        self.overlay.find_for_path_authority(
-            canon,
-            self.registry_path_has_mounted_authority(canon),
-        )
+        self.overlay
+            .find_for_path_authority(canon, self.registry_path_has_mounted_authority(canon))
     }
 
     fn mutable_registry_key_by_path(
@@ -7443,10 +7479,7 @@ impl ExecNtHandler {
             .map(alloc::string::String::from))
     }
 
-    fn registry_key_class(
-        &self,
-        target: KeyRef,
-    ) -> Result<Option<alloc::string::String>, u32> {
+    fn registry_key_class(&self, target: KeyRef) -> Result<Option<alloc::string::String>, u32> {
         if let Some(lease) = self.cm_system_key_target(target).map(|target| target.lease) {
             return unsafe { config_manager_query_leased_system_hive_key_information(lease) }
                 .map(|information| information.class_name)
@@ -7861,9 +7894,7 @@ impl ExecNtHandler {
                 return Err(STATUS_OBJECT_NAME_NOT_FOUND);
             }
             if query_system_hive_value(&path, value_name)?.is_some_and(
-                |(existing_type, existing)| {
-                    existing_type == value_type && existing == &data[..len]
-                },
+                |(existing_type, existing)| existing_type == value_type && existing == &data[..len],
             ) {
                 return Ok(());
             }
@@ -7934,9 +7965,8 @@ impl ExecNtHandler {
                 return Ok(None);
             };
             if is_system_registry_path(path) {
-                return query_system_hive_value(path, name).map(|value| {
-                    value.map(|(value_type, data)| visit(value_type as u32, &data))
-                });
+                return query_system_hive_value(path, name)
+                    .map(|value| value.map(|(value_type, data)| visit(value_type as u32, &data)));
             }
             if let Some(key) = self.mutable_registry_key_by_path(path) {
                 return Ok(self
@@ -8277,113 +8307,113 @@ impl ExecNtHandler {
             }
         }
         let result = (|| -> Option<R> {
-        let mutable_base = base_path
-            .as_deref()
-            .and_then(|path| self.mutable_registry_key_by_path(path));
-        let mutable_owned = base_path
-            .as_deref()
-            .is_some_and(|path| self.mutable_hive_owns_path(path));
-        let base_key = if let Some(index) = overlay_index {
-            if mutable_owned {
+            let mutable_base = base_path
+                .as_deref()
+                .and_then(|path| self.mutable_registry_key_by_path(path));
+            let mutable_owned = base_path
+                .as_deref()
+                .is_some_and(|path| self.mutable_hive_owns_path(path));
+            let base_key = if let Some(index) = overlay_index {
+                if mutable_owned {
+                    None
+                } else {
+                    self.overlay
+                        .path(index)
+                        .and_then(|path| self.resolve_key(path))
+                }
+            } else if mutable_owned {
                 None
+            } else if !is_virtual_registry_key(target) {
+                Some(target)
             } else {
-                self.overlay
-                    .path(index)
-                    .and_then(|path| self.resolve_key(path))
-            }
-        } else if mutable_owned {
-            None
-        } else if !is_virtual_registry_key(target) {
-            Some(target)
-        } else {
-            None
-        };
-        let mut visible_index = 0usize;
-        if let Some(key) = mutable_base {
-            if let Some(hive) = self.mutable_hives.hive(key.hive) {
-                let value_count = hive.value_count(key.key);
-                for index in 0..value_count {
-                    let Some((source, name, ty, data)) =
-                        self.mutable_hives.value_ref_by_index(key, index)
-                    else {
-                        continue;
-                    };
-                    if let Some(overlay) = overlay_index {
-                        if self.overlay.value_is_deleted(overlay, name) {
+                None
+            };
+            let mut visible_index = 0usize;
+            if let Some(key) = mutable_base {
+                if let Some(hive) = self.mutable_hives.hive(key.hive) {
+                    let value_count = hive.value_count(key.key);
+                    for index in 0..value_count {
+                        let Some((source, name, ty, data)) =
+                            self.mutable_hives.value_ref_by_index(key, index)
+                        else {
+                            continue;
+                        };
+                        if let Some(overlay) = overlay_index {
+                            if self.overlay.value_is_deleted(overlay, name) {
+                                continue;
+                            }
+                            if visible_index == requested_index {
+                                if let Some((overlay_ty, overlay_data)) =
+                                    self.overlay.value(overlay, name)
+                                {
+                                    return Some(visit(name, overlay_ty, overlay_data, None));
+                                }
+                                return Some(visit(name, ty as u32, data, Some(source)));
+                            }
+                            visible_index += 1;
                             continue;
                         }
                         if visible_index == requested_index {
-                            if let Some((overlay_ty, overlay_data)) =
-                                self.overlay.value(overlay, name)
-                            {
-                                return Some(visit(name, overlay_ty, overlay_data, None));
-                            }
                             return Some(visit(name, ty as u32, data, Some(source)));
                         }
                         visible_index += 1;
-                        continue;
                     }
-                    if visible_index == requested_index {
-                        return Some(visit(name, ty as u32, data, Some(source)));
-                    }
-                    visible_index += 1;
                 }
-            }
-        } else if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
-            for index in 0..hive.value_count(base) {
-                let Some(hit) = hive.value_by_index_with(base, index, |name, ty, data| {
-                    if let Some(overlay) = overlay_index {
-                        if self.overlay.value_is_deleted(overlay, name) {
+            } else if let Some((hive, base)) = base_key.and_then(|key| self.base_hive(key)) {
+                for index in 0..hive.value_count(base) {
+                    let Some(hit) = hive.value_by_index_with(base, index, |name, ty, data| {
+                        if let Some(overlay) = overlay_index {
+                            if self.overlay.value_is_deleted(overlay, name) {
+                                return None;
+                            }
+                            if visible_index == requested_index {
+                                if let Some((overlay_ty, overlay_data)) =
+                                    self.overlay.value(overlay, name)
+                                {
+                                    return Some(visit(name, overlay_ty, overlay_data, None));
+                                }
+                                return Some(visit(name, ty, data, None));
+                            }
+                            visible_index += 1;
                             return None;
                         }
                         if visible_index == requested_index {
-                            if let Some((overlay_ty, overlay_data)) =
-                                self.overlay.value(overlay, name)
-                            {
-                                return Some(visit(name, overlay_ty, overlay_data, None));
-                            }
                             return Some(visit(name, ty, data, None));
                         }
                         visible_index += 1;
-                        return None;
+                        None
+                    }) else {
+                        continue;
+                    };
+                    if let Some(result) = hit {
+                        return Some(result);
+                    }
+                }
+            }
+            if let Some(overlay) = overlay_index {
+                for index in 0..self.overlay.values_len(overlay) {
+                    let Some((name, ty, data)) = self.overlay.value_by_index(overlay, index) else {
+                        continue;
+                    };
+                    let exists_in_base = mutable_base
+                        .and_then(|key| self.mutable_hives.query_value(key, name).map(|_| ()))
+                        .or_else(|| {
+                            base_key.and_then(|key| {
+                                let (hive, base) = self.base_hive(key)?;
+                                hive.value_exists(base, name).then_some(())
+                            })
+                        })
+                        .is_some();
+                    if exists_in_base {
+                        continue;
                     }
                     if visible_index == requested_index {
                         return Some(visit(name, ty, data, None));
                     }
                     visible_index += 1;
-                    None
-                }) else {
-                    continue;
-                };
-                if let Some(result) = hit {
-                    return Some(result);
                 }
             }
-        }
-        if let Some(overlay) = overlay_index {
-            for index in 0..self.overlay.values_len(overlay) {
-                let Some((name, ty, data)) = self.overlay.value_by_index(overlay, index) else {
-                    continue;
-                };
-                let exists_in_base = mutable_base
-                    .and_then(|key| self.mutable_hives.query_value(key, name).map(|_| ()))
-                    .or_else(|| {
-                        base_key.and_then(|key| {
-                            let (hive, base) = self.base_hive(key)?;
-                            hive.value_exists(base, name).then_some(())
-                        })
-                    })
-                    .is_some();
-                if exists_in_base {
-                    continue;
-                }
-                if visible_index == requested_index {
-                    return Some(visit(name, ty, data, None));
-                }
-                visible_index += 1;
-            }
-        }
-        None
+            None
         })();
         Ok(result)
     }
@@ -8424,10 +8454,7 @@ impl ExecNtHandler {
                         .or(subkey.class_name.as_deref())
                         .map(utf16le_byte_len)
                         .unwrap_or(0);
-                    stats.add_subkey(
-                        utf16le_byte_len(&subkey.name),
-                        class_bytes,
-                    );
+                    stats.add_subkey(utf16le_byte_len(&subkey.name), class_bytes);
                     base_subkeys.push(subkey.name);
                 }
                 for index in 0..information.value_count {
@@ -8660,10 +8687,8 @@ impl ExecNtHandler {
 
     fn registry_key_stats_by_path(&self, path: &str) -> Result<RegistryKeyStats, u32> {
         if is_system_registry_path(path) {
-            return self.registry_system_key_stats(
-                path,
-                self.registry_overlay_index_for_path(path),
-            );
+            return self
+                .registry_system_key_stats(path, self.registry_overlay_index_for_path(path));
         }
         if let Some(index) = self.registry_overlay_index_for_path(path) {
             return self.registry_key_stats(OVERLAY_KEY_TAG | index as u32);
@@ -8783,11 +8808,7 @@ impl ExecNtHandler {
                 }
                 if visible_index == requested_index {
                     return self
-                        .registry_subkey_entry_for_name(
-                            &overlay_path,
-                            name.clone(),
-                            include_stats,
-                        )
+                        .registry_subkey_entry_for_name(&overlay_path, name.clone(), include_stats)
                         .map(Some);
                 }
                 visible_index += 1;
@@ -8830,11 +8851,7 @@ impl ExecNtHandler {
         let path = self.registry_target_path(target);
         if let Some(path) = path.as_deref() {
             if is_system_registry_path(path) {
-                return self.registry_system_subkey_by_index(
-                    path,
-                    requested_index,
-                    include_stats,
-                );
+                return self.registry_system_subkey_by_index(path, requested_index, include_stats);
             }
         }
         let mutable_base = path
@@ -8935,13 +8952,13 @@ impl ExecNtHandler {
                     continue;
                 }
                 if visible_index == requested_index {
-                        return self
-                            .registry_subkey_entry_for_name(
-                                path,
-                                alloc::string::String::from(name),
-                                include_stats,
-                            )
-                            .map(Some);
+                    return self
+                        .registry_subkey_entry_for_name(
+                            path,
+                            alloc::string::String::from(name),
+                            include_stats,
+                        )
+                        .map(Some);
                 }
                 visible_index += 1;
             }
@@ -13055,8 +13072,7 @@ impl ExecNtHandler {
         }
         let index = object.id() as usize;
         self.obj_ns.get(index).is_some_and(|entry| {
-            entry.kind == OBJ_KIND_MUTANT
-                && self.mutants.acquire_would_exceed(index as u64, thread)
+            entry.kind == OBJ_KIND_MUTANT && self.mutants.acquire_would_exceed(index as u64, thread)
         })
     }
 
@@ -19546,13 +19562,13 @@ impl ExecNtHandler {
         if self.pnp_live_action.is_some() {
             return Ok(true);
         }
-        let Some(event) = crate::config_manager_next_device_action().map_err(|status| status as u32)?
+        let Some(event) =
+            crate::config_manager_next_device_action().map_err(|status| status as u32)?
         else {
             return Ok(false);
         };
-        self.pnp_live_action = Some(
-            LiveDeviceActionState::new(event).map_err(|()| STATUS_INVALID_PARAMETER)?,
-        );
+        self.pnp_live_action =
+            Some(LiveDeviceActionState::new(event).map_err(|()| STATUS_INVALID_PARAMETER)?);
         Ok(true)
     }
 
@@ -19953,7 +19969,10 @@ impl ExecNtHandler {
             }
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
                 let status = failure.status.raw() as u32;
-                if self.pnp_retain_live_start_barrier(identity, status).is_err() {
+                if self
+                    .pnp_retain_live_start_barrier(identity, status)
+                    .is_err()
+                {
                     self.pending_driver_starts
                         .cancel(reservation)
                         .expect("invalid live START barrier lost its reservation");
@@ -20013,7 +20032,8 @@ impl ExecNtHandler {
         };
         let owner_slot = reservation.slot();
         if let Some(identity) = live_identity {
-            if let Err(status) = self.pnp_begin_live_operation_claim(identity, OPERATION, owner_slot)
+            if let Err(status) =
+                self.pnp_begin_live_operation_claim(identity, OPERATION, owner_slot)
             {
                 self.pending_pnp_operations
                     .cancel(reservation)
@@ -20119,13 +20139,11 @@ impl ExecNtHandler {
         if !ready_for_pnp {
             return STATUS_DEVICE_NOT_READY;
         }
-        let device_id = match driver_launch::hosted_function_device_id_for_instance(
-            &instance,
-            driver_id,
-        ) {
-            Ok(device_id) => device_id,
-            Err(status) => return status.raw() as u32,
-        };
+        let device_id =
+            match driver_launch::hosted_function_device_id_for_instance(&instance, driver_id) {
+                Ok(device_id) => device_id,
+                Err(status) => return status.raw() as u32,
+            };
         self.pnp_begin_rebalance(device_id, driver_id, ready_for_pnp, spec, None)
     }
 
@@ -20146,7 +20164,8 @@ impl ExecNtHandler {
         };
         let owner_slot = reservation.slot();
         if let Some(identity) = live_identity {
-            if let Err(status) = self.pnp_begin_live_operation_claim(identity, OPERATION, owner_slot)
+            if let Err(status) =
+                self.pnp_begin_live_operation_claim(identity, OPERATION, owner_slot)
             {
                 self.pending_pnp_operations
                     .cancel(reservation)
@@ -20254,12 +20273,11 @@ impl ExecNtHandler {
         {
             return STATUS_ACCESS_VIOLATION;
         }
-        let (device_id, _) = match driver_launch::hosted_function_device_context_for_instance(
-            &instance,
-        ) {
-            Ok(context) => context,
-            Err(status) => return status.raw() as u32,
-        };
+        let (device_id, _) =
+            match driver_launch::hosted_function_device_context_for_instance(&instance) {
+                Ok(context) => context,
+                Err(status) => return status.raw() as u32,
+            };
         self.pnp_begin_removal(device_id, HostedPnpRemovalKind::Orderly, None)
     }
 
@@ -20312,14 +20330,12 @@ impl ExecNtHandler {
                         if !ready_for_pnp {
                             return STATUS_DEVICE_NOT_READY;
                         }
-                        let device_id =
-                            match driver_launch::hosted_function_device_id_for_instance(
-                                &instance,
-                                driver_id,
-                            ) {
-                                Ok(device_id) => device_id,
-                                Err(status) => return status.raw() as u32,
-                            };
+                        let device_id = match driver_launch::hosted_function_device_id_for_instance(
+                            &instance, driver_id,
+                        ) {
+                            Ok(device_id) => device_id,
+                            Err(status) => return status.raw() as u32,
+                        };
                         self.pnp_begin_rebalance(
                             device_id,
                             driver_id,
@@ -22614,9 +22630,8 @@ impl ExecNtHandler {
             "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Lsa";
         const POLICY_VALUE: &str = "EveryoneIncludesAnonymous";
 
-        let (value_type, data) =
-            query_system_hive_value(LSA_CONTROL_PATH, POLICY_VALUE)?
-                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let (value_type, data) = query_system_hive_value(LSA_CONTROL_PATH, POLICY_VALUE)?
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         if value_type != nt_hive_core::RegistryValueType::Dword || data.len() != 4 {
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
         }
@@ -33688,8 +33703,7 @@ impl ExecNtHandler {
                     };
                     match opened {
                         Ok(opened) => {
-                            CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES
-                                .fetch_add(1, Ordering::Relaxed);
+                            CM_NATIVE_SYSTEM_KEY_LEASE_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                             let status = self.mint_opened_cm_system_registry_key(
                                 opened,
                                 desired_access,
@@ -34470,10 +34484,10 @@ impl ExecNtHandler {
                     } else {
                         let status = self
                             .checkpoint_non_system_boot_mutable_hive_preserving_headroom(
-                            mutable_key.hive,
-                            dirty,
-                            BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
-                        );
+                                mutable_key.hive,
+                                dirty,
+                                BOOT_HIVE_FLUSH_POST_CHECKPOINT_HEADROOM,
+                            );
                         if status != nt_fs::STATUS_SUCCESS {
                             return status;
                         }
@@ -34811,32 +34825,27 @@ impl ExecNtHandler {
                     );
                     return status;
                 }
-                let entry = match self.registry_subkey_by_index(
-                    key,
-                    index as usize,
-                    info_class == 2,
-                ) {
-                    Ok(Some(entry)) => entry,
-                    Ok(None) => {
-                        trace_winlogon_post_lsa_registry(
-                            self,
-                            b"enum-key",
-                            key_path.as_deref(),
-                            "",
-                            0x8000_001A,
-                            None,
-                            None,
-                        );
-                        return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
-                    }
-                    Err(status) => return status,
-                };
+                let entry =
+                    match self.registry_subkey_by_index(key, index as usize, info_class == 2) {
+                        Ok(Some(entry)) => entry,
+                        Ok(None) => {
+                            trace_winlogon_post_lsa_registry(
+                                self,
+                                b"enum-key",
+                                key_path.as_deref(),
+                                "",
+                                0x8000_001A,
+                                None,
+                                None,
+                            );
+                            return 0x8000_001A; // STATUS_NO_MORE_ENTRIES
+                        }
+                        Err(status) => return status,
+                    };
                 // Everything below is a synchronous caller-copy encoder and must not survive this
                 // dispatch.
                 let _transient = allocator::enter_transient();
-                let stats = (info_class == 2)
-                    .then_some(entry.stats)
-                    .unwrap_or_default();
+                let stats = (info_class == 2).then_some(entry.stats).unwrap_or_default();
                 let (information, minimum_length) = match build_registry_key_query_info(
                     info_class,
                     &entry.name,
@@ -37411,9 +37420,7 @@ impl ExecNtHandler {
                     return 0xC000_0008; // STATUS_INVALID_HANDLE
                 };
                 if !unsafe { self.xas_write_u64(args[2], remaining as u64) }
-                    || !unsafe {
-                        self.xas_try_write_buf(args[2] + 8, &[u8::from(signaled)])
-                    }
+                    || !unsafe { self.xas_try_write_buf(args[2] + 8, &[u8::from(signaled)]) }
                 {
                     return 0xC000_0005; // STATUS_ACCESS_VIOLATION
                 }
@@ -38481,9 +38488,9 @@ impl ExecNtHandler {
                     }
                     None => match self.registry_key_security_descriptor(key) {
                         Ok(Some(descriptor)) => descriptor,
-                        Ok(None) => alloc::vec::Vec::from(
-                            &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..],
-                        ),
+                        Ok(None) => {
+                            alloc::vec::Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..])
+                        }
                         Err(status) => return status,
                     },
                 };

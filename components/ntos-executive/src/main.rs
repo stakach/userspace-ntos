@@ -19,9 +19,9 @@ extern crate alloc;
 // Re-export the kernel ABI at crate root so `server` can `use crate::*`.
 pub use sel4_rt::*;
 
+mod acpi_platform;
 mod allocator;
 mod alpc_selftest;
-mod acpi_platform;
 pub(crate) use acpi_platform::*;
 mod cm_server;
 mod io_server;
@@ -63,11 +63,11 @@ pub(crate) use device_io::*;
 mod pnp;
 pub(crate) use pnp::*;
 mod hard_error;
-mod hosted_pnp_context;
 mod hosted_pci_topology;
+mod hosted_pnp_context;
 mod power_manager;
-pub(crate) use hosted_pnp_context::*;
 pub(crate) use hosted_pci_topology::*;
+pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
 mod selftests;
@@ -1351,6 +1351,10 @@ pub(crate) const HOSTED_PROCESS_IMAGE_CAP: usize = MAX_PI * 4;
 /// progress. Keep the reset-safe table fixed, but size it with measured runway so the headroom gate
 /// remains meaningful instead of sitting exactly on its three-quarter ceiling.
 const VM_REGION_CAPACITY: usize = 96;
+/// The VAD authority covers the complete NT private-address domain. Automatic allocations retain
+/// [`SMSS_ALLOC_VA`] as their preferred floor in the syscall policy layer; explicit reservations may
+/// occupy lower addresses when normal NT rounding admits them.
+const PRIVATE_VM_DOMAIN_BASE: u64 = 0;
 const USER_ADDRESS_LIMIT: u64 = 0x0000_07ff_ffff_0000;
 static PROCESS_VM_REGION_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut PROCESS_VM_REGIONS: alloc::vec::Vec<nt_address_space::VmRegionMap<VM_REGION_CAPACITY>> =
@@ -1376,7 +1380,7 @@ pub(crate) unsafe fn reset_process_vm_region_maps(slots: usize) -> bool {
     }
     while maps.len() < slots {
         maps.push(nt_address_space::VmRegionMap::new(
-            SMSS_ALLOC_VA,
+            PRIVATE_VM_DOMAIN_BASE,
             PRIVATE_VM_LIMIT,
         ));
     }
@@ -1397,7 +1401,7 @@ pub(crate) unsafe fn process_vm_region_map(
 
 pub(crate) unsafe fn process_vm_region_map_reset(pi: usize) {
     if let Some(map) = process_vm_region_map_mut(pi) {
-        *map = nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
+        *map = nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, PRIVATE_VM_LIMIT);
     }
 }
 
@@ -1578,9 +1582,9 @@ fn process_committed_mapping_stats() -> (usize, usize, u64) {
 /// [`VM_REGION_CAPACITY`] grew. Static (the executive is single-threaded and neither snapshot
 /// outlives its call), so the frame cost is a pointer.
 pub(crate) static mut VM_MAP_BEFORE: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
-    nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
+    nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, PRIVATE_VM_LIMIT);
 pub(crate) static mut VM_MAP_AFTER: nt_address_space::VmRegionMap<VM_REGION_CAPACITY> =
-    nt_address_space::VmRegionMap::new(SMSS_ALLOC_VA, PRIVATE_VM_LIMIT);
+    nt_address_space::VmRegionMap::new(PRIVATE_VM_DOMAIN_BASE, PRIVATE_VM_LIMIT);
 pub(crate) static mut COMMITTED_MAP_BEFORE: nt_address_space::VmCommittedRangeTable<
     PROCESS_COMMITTED_MAPPING_CAPACITY,
 > = nt_address_space::VmCommittedRangeTable::new();
@@ -14524,9 +14528,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
         .assignment
         .port_resources(nt_pnp::ResourceView::Translated)
         .collect();
-    if raw_memory.len() != memory_bars.len()
-        || raw_ports.len() != translated_ports.len()
-    {
+    if raw_memory.len() != memory_bars.len() || raw_ports.len() != translated_ports.len() {
         return Err(hosted_pci_grant_error(
             device_id,
             b"resource-pairing",
@@ -14759,11 +14761,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
     raw_memory
         .try_reserve_exact(window.memory.len())
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    raw_memory.extend(
-        grant
-            .assignment
-            .memory_resources(nt_pnp::ResourceView::Raw),
-    );
+    raw_memory.extend(grant.assignment.memory_resources(nt_pnp::ResourceView::Raw));
     let mut translated_memory = Vec::new();
     translated_memory
         .try_reserve_exact(window.memory.len())
@@ -14777,11 +14775,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
     raw_ports
         .try_reserve_exact(window.ports.len())
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    raw_ports.extend(
-        grant
-            .assignment
-            .port_resources(nt_pnp::ResourceView::Raw),
-    );
+    raw_ports.extend(grant.assignment.port_resources(nt_pnp::ResourceView::Raw));
     let mut translated_ports = Vec::new();
     translated_ports
         .try_reserve_exact(window.ports.len())
@@ -14815,8 +14809,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
             } else {
                 nt_pnp::CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE
             }
-        || (interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED)
-            != window.interrupt_shared
+        || (interrupt.share == nt_cm_resources::CM_RESOURCE_SHARE_SHARED) != window.interrupt_shared
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -14869,9 +14862,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
         let resource = window
             .ports
             .iter()
-            .find(|resource| {
-                resource.base == translated.start && resource.len == translated.length
-            })
+            .find(|resource| resource.base == translated.start && resource.len == translated.length)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         if raw.start != translated.start || raw.length != translated.length {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
@@ -14910,13 +14901,19 @@ unsafe fn grant_hosted_platform_devnode_resources(
         kind: HostedDevnodeGrantKind::RootBus,
         raw_resource_list: grant.raw_resource_list,
         translated_resource_list: grant.translated_resource_list,
-        mmio_phys: translated_memory.first().map(|memory| memory.start).unwrap_or(0),
+        mmio_phys: translated_memory
+            .first()
+            .map(|memory| memory.start)
+            .unwrap_or(0),
         mmio_len: translated_memory
             .first()
             .map(|memory| memory.length as u64)
             .unwrap_or(0),
         io_port_base: translated_ports.first().map(|port| port.start).unwrap_or(0),
-        io_port_len: translated_ports.first().map(|port| port.length).unwrap_or(0),
+        io_port_len: translated_ports
+            .first()
+            .map(|port| port.length)
+            .unwrap_or(0),
         vector: interrupt.vector,
         dma_len: 0,
     }))
@@ -16452,10 +16449,8 @@ pub(crate) unsafe fn config_manager_publish_system_hive_mutation(
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(outcome.generation, Ordering::Release);
-    let was_pending = CONFIG_DEVICE_ACTION_PENDING.swap(
-        outcome.has_pending_device_action,
-        Ordering::AcqRel,
-    );
+    let was_pending =
+        CONFIG_DEVICE_ACTION_PENDING.swap(outcome.has_pending_device_action, Ordering::AcqRel);
     Ok((
         outcome.generation,
         outcome.has_pending_device_action && !was_pending,
@@ -16484,8 +16479,8 @@ pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
 ) -> Result<DurableSystemHiveMutationOutcome, u32> {
     const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
-    let prepared = config_manager_prepare_system_hive_mutation(mutations)
-        .map_err(|status| status as u32)?;
+    let prepared =
+        config_manager_prepare_system_hive_mutation(mutations).map_err(|status| status as u32)?;
     let mut provider =
         writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
     let previous_log_len = provider.log_len();
@@ -17352,13 +17347,7 @@ unsafe fn executive_event_notification() -> Result<u64, nt_status::NtStatus> {
     let Some(notification) = try_alloc_slot() else {
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
-    let retype = untyped_retype_r(
-        CAP_INIT_UNTYPED,
-        OBJ_NOTIFICATION,
-        0,
-        1,
-        notification,
-    );
+    let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_NOTIFICATION, 0, 1, notification);
     if retype != 0 {
         recycle_deleted_root_slot(notification);
         return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
@@ -17373,9 +17362,7 @@ unsafe fn executive_event_notification() -> Result<u64, nt_status::NtStatus> {
     Ok(notification)
 }
 
-pub(crate) unsafe fn mint_executive_event_badge(
-    badge: u64,
-) -> Result<u64, nt_status::NtStatus> {
+pub(crate) unsafe fn mint_executive_event_badge(badge: u64) -> Result<u64, nt_status::NtStatus> {
     if badge == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -17760,7 +17747,10 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(6, driver_launch::hosted_driver_timer_wake_due(now_100ns))
         + subdrain!(7, driver_launch::hosted_driver_wait_wake_due(now_100ns))
         + subdrain!(9, handler.job_time_sample_due(now_100ns))
-        + subdrain!(10, driver_launch::hosted_acpi_pci_route_recovery_wake_due(now_100ns))
+        + subdrain!(
+            10,
+            driver_launch::hosted_acpi_pci_route_recovery_wake_due(now_100ns)
+        )
         + watchdog_tick
 }
 
@@ -19391,14 +19381,7 @@ unsafe fn ioapic_issue_irq_handler(
     level: u64,
     polarity: u64,
 ) {
-    let _ = ioapic_issue_irq_handler_r(
-        dest_slot,
-        ioapic_ordinal,
-        pin,
-        vector,
-        level,
-        polarity,
-    );
+    let _ = ioapic_issue_irq_handler_r(dest_slot, ioapic_ordinal, pin, vector, level, polarity);
 }
 
 pub(crate) unsafe fn issue_ioapic_irq_handler_checked(
@@ -19436,14 +19419,7 @@ pub(crate) unsafe fn irq_handler_set_notification_checked(
     if handler == 0 || notification == 0 {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    if syscall5_call(
-        handler,
-        LBL_IRQ_SET_NOTIFICATION << 12,
-        notification,
-        0,
-        0,
-    ) == 0
-    {
+    if syscall5_call(handler, LBL_IRQ_SET_NOTIFICATION << 12, notification, 0, 0) == 0 {
         Ok(())
     } else {
         Err(nt_status::NtStatus::UNSUCCESSFUL)
@@ -19456,9 +19432,7 @@ pub(crate) unsafe fn acknowledge_ioapic_irq_handler(handler: u64) {
     }
 }
 
-pub(crate) unsafe fn clear_ioapic_irq_handler(
-    handler: u64,
-) -> Result<(), nt_status::NtStatus> {
+pub(crate) unsafe fn clear_ioapic_irq_handler(handler: u64) -> Result<(), nt_status::NtStatus> {
     if handler == 0 {
         return Ok(());
     }
@@ -20366,14 +20340,13 @@ struct LiveDeviceActionState {
 
 impl LiveDeviceActionState {
     fn new(event: nt_config_client::DeviceActionEvent) -> Result<Self, ()> {
-        let owner = nt_pnp_manager::DeviceActionOwner::new(
-            nt_pnp_manager::DeviceActionClaimIdentity {
+        let owner =
+            nt_pnp_manager::DeviceActionOwner::new(nt_pnp_manager::DeviceActionClaimIdentity {
                 mount_generation: event.mount_generation,
                 sequence: event.sequence,
                 claim_token: event.claim_token,
-            },
-        )
-        .map_err(|_| ())?;
+            })
+            .map_err(|_| ())?;
         Ok(Self {
             event,
             owner,
@@ -21185,11 +21158,9 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
                     if let Some(dma) = dma_grant {
                         report.dma_grants += 1;
-                        let Some(grant) = HostedPciHardwareGrant::for_device(
-                            device,
-                            memory,
-                            Some(dma),
-                        ) else {
+                        let Some(grant) =
+                            HostedPciHardwareGrant::for_device(device, memory, Some(dma))
+                        else {
                             report.claim_failures += 1;
                             continue;
                         };
@@ -21214,11 +21185,8 @@ unsafe fn discover_hosted_pci_hardware_grants_for_launch_plans(
                     }
                 } else {
                     report.dma_not_required += 1;
-                    let Some(grant) = HostedPciHardwareGrant::for_device(
-                        device,
-                        memory,
-                        None,
-                    ) else {
+                    let Some(grant) = HostedPciHardwareGrant::for_device(device, memory, None)
+                    else {
                         report.claim_failures += 1;
                         continue;
                     };
@@ -21259,10 +21227,8 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
         ports: acpi_ports,
         owner: mut context_owner,
     } = acpi_authority;
-    install_hosted_pci_interrupt_overrides(core::mem::take(
-        &mut discovery.interrupt_overrides,
-    ))
-    .expect("validated MADT interrupt overrides could not enter PCI topology authority");
+    install_hosted_pci_interrupt_overrides(core::mem::take(&mut discovery.interrupt_overrides))
+        .expect("validated MADT interrupt overrides could not enter PCI topology authority");
     let mut devices = Vec::new();
     if devices.try_reserve_exact(pci_devices.len()).is_err() {
         report.missing_grants += 1;
@@ -21275,7 +21241,10 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     let mut root_windows: Vec<HostedPnpRootResourceDescriptor> = Vec::new();
     let mut platform_windows = Vec::new();
     let mut platform_memory = Vec::new();
-    if platform_memory.try_reserve_exact(acpi_memory.len()).is_err() {
+    if platform_memory
+        .try_reserve_exact(acpi_memory.len())
+        .is_err()
+    {
         report.missing_platform_grants += 1;
         let _ = retire_hosted_pnp_context_owner(context_owner);
         return report;
@@ -22150,8 +22119,7 @@ pub(crate) unsafe fn live_config_driver_service_launch_spec_from_registry_path(
     service_path: &str,
     max_start: u32,
 ) -> Result<DriverServiceLaunchSpec, i32> {
-    let resolved =
-        config_manager_query_active_driver_service_by_registry_path(service_path)?;
+    let resolved = config_manager_query_active_driver_service_by_registry_path(service_path)?;
     owned_driver_launch_spec_from_live_config_binding(resolved.binding, max_start)
         .ok_or(0xC000_0034u32 as i32)
 }
@@ -29699,14 +29667,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (registry devnode selection required)\n");
     }
     if pre_hive_network_grant_required {
-        if let Some(device) =
-            hosted_pci_device_by_location(
-                &pci_devices,
-                pre_hive_nic_bus,
-                pre_hive_nic_dev,
-                pre_hive_nic_func,
-            )
-        {
+        if let Some(device) = hosted_pci_device_by_location(
+            &pci_devices,
+            pre_hive_nic_bus,
+            pre_hive_nic_dev,
+            pre_hive_nic_func,
+        ) {
             if let Some(memory) = claim_hosted_pci_memory_grants(bi, device) {
                 print_str(b"[driver-launch] pre-storage hosted PCI grant bus=");
                 print_u64(pre_hive_nic_bus as u64);
@@ -29804,9 +29770,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // with the AHCI's PCI request-id (00:3.0 -> rid 0x18) + its own domain, build the
             // 4-level IO page-table hierarchy toward AHCI_IOVA, and map the DMA frame there.
             // The AHCI can then DMA to AHCI_IOVA only — VT-d faults anything else.
-            let ahci_rid = ((storage_bus as u64) << 8)
-                | ((storage_dev as u64) << 3)
-                | (storage_func as u64);
+            let ahci_rid =
+                ((storage_bus as u64) << 8) | ((storage_dev as u64) << 3) | (storage_func as u64);
             let ahci_io_badge = (2u64 << 16) | ahci_rid; // storage proof domain
             let ahci_io_space = alloc_slot();
             let _ = syscall5(
@@ -31655,8 +31620,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             );
             check(
                 b"npfs_device_created",
-                (dc.verdict & V_DEVICE) != 0
-                    && driver_launch::driver_has_live_device(dc.driver_id),
+                (dc.verdict & V_DEVICE) != 0 && driver_launch::driver_has_live_device(dc.driver_id),
                 &mut passed,
             );
             check(
@@ -32433,8 +32397,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             for config_plan in config_pnp_launch_plans {
                 for config_spec in config_plan.as_slice() {
                     let config_devnodes = config_plan.devnodes_for(config_spec);
-                    let spec_has_pci_devnode =
-                        inline_launch_spec_has_pci_devnode(config_devnodes);
+                    let spec_has_pci_devnode = inline_launch_spec_has_pci_devnode(config_devnodes);
                     let spec_devnodes = config_spec.devnode_count as u64;
                     generic_hw_selected += spec_devnodes;
                     generic_hw_registry_selected |= config_spec.devnode_count != 0;

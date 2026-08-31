@@ -31,7 +31,7 @@ fn client(server: &mut Server, cid: ClientId) -> ObjectClient<Direct<'_>> {
 #[test]
 fn full_service_roundtrip() {
     let mut server = Server::new().unwrap();
-    let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
     let mut c = client(&mut server, cid);
 
     assert!(c.ping().is_success());
@@ -109,7 +109,7 @@ fn service_lookup_errors_map_through() {
 #[test]
 fn service_creates_and_references_file_handles() {
     let mut server = Server::new().unwrap();
-    let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
     let mut c = client(&mut server, cid);
 
     let dev = c.create_device("\\Device\\Io0", 0x494f, 10, true).unwrap();
@@ -137,7 +137,7 @@ fn service_creates_and_references_file_handles() {
 #[test]
 fn persistent_reference_keeps_file_alive_after_handle_close() {
     let mut server = Server::new().unwrap();
-    let cid = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let cid = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
     let (file, reference) = {
         let mut c = client(&mut server, cid);
         let dev = c.create_device("\\Device\\Ref0", 0x494f, 10, true).unwrap();
@@ -165,7 +165,7 @@ fn persistent_reference_keeps_file_alive_after_handle_close() {
 #[test]
 fn persistent_reference_is_client_scoped_and_disconnect_releases_it() {
     let mut server = Server::new().unwrap();
-    let owner = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let owner = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
     let other = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
     let (file, reference) = {
         let mut c = client(&mut server, owner);

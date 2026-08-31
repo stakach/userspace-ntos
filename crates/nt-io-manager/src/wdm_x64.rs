@@ -37,6 +37,7 @@ pub struct WdmDriverObjectInit {
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct WdmDeviceObjectInit {
+    pub size_field: u16,
     pub driver_object: u64,
     pub next_device: u64,
     pub device_extension: u64,
@@ -215,7 +216,7 @@ pub fn write_wdm_device_object(
     require(bytes, WDM_X64_DEVICE_OBJECT_SIZE)?;
     zero(bytes);
     put_i16(bytes, 0x00, WDM_X64_IO_TYPE_DEVICE);
-    put_u16(bytes, 0x02, WDM_X64_DEVICE_OBJECT_SIZE as u16);
+    put_u16(bytes, 0x02, init.size_field);
     put_u64(bytes, 0x08, init.driver_object);
     put_u64(bytes, 0x10, init.next_device);
     put_u32(bytes, 0x30, init.flags);
@@ -261,6 +262,7 @@ pub fn write_wdm_open_device_projection(
     write_wdm_device_object(
         device_bytes,
         WdmDeviceObjectInit {
+            size_field: WDM_X64_DEVICE_OBJECT_SIZE as u16,
             driver_object: init.driver_object,
             next_device: 0,
             device_extension: 0,

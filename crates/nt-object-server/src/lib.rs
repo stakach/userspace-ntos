@@ -110,8 +110,8 @@ impl Server {
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
-            opcode::OB_OP_CREATE_DRIVER => self.op_create_driver(in_buf),
-            opcode::OB_OP_CREATE_DEVICE => self.op_create_device(in_buf),
+            opcode::OB_OP_CREATE_DRIVER => self.op_create_driver(client, in_buf),
+            opcode::OB_OP_CREATE_DEVICE => self.op_create_device(client, in_buf),
             opcode::OB_OP_CREATE_FILE_HANDLE => self.op_create_file_handle(client, in_buf),
             opcode::OB_OP_REFERENCE_FILE_HANDLE => self.op_reference_file_handle(client, in_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
@@ -251,7 +251,10 @@ impl Server {
         Ok(reply(NtStatus::SUCCESS, 0, dir.id().0, 0))
     }
 
-    fn op_create_driver(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
+    fn op_create_driver(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        if self.om.client_mode(client)? != AccessMode::KernelMode {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
         let req: ObCreateIoObjectRequest = read_req(buf)?;
         check_size::<ObCreateIoObjectRequest>(req.abi_size)?;
         let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
@@ -266,7 +269,10 @@ impl Server {
         Ok(reply(NtStatus::SUCCESS, 0, obj.id().0, 0))
     }
 
-    fn op_create_device(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {
+    fn op_create_device(&mut self, client: ClientId, buf: &[u8]) -> Result<ObReply, NtStatus> {
+        if self.om.client_mode(client)? != AccessMode::KernelMode {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
         let req: ObCreateIoObjectRequest = read_req(buf)?;
         check_size::<ObCreateIoObjectRequest>(req.abi_size)?;
         let path = read_path(buf, req.path_offset, req.path_len_bytes)?;
@@ -538,6 +544,20 @@ mod tests {
         assert_eq!(r.status, NtStatus::SUCCESS.raw());
         let r = s.dispatch(c, opcode::OB_OP_LOOKUP_PATH, &query_req, &mut []);
         assert_eq!(r.status, NtStatus::OBJECT_NAME_NOT_FOUND.raw());
+    }
+
+    #[test]
+    fn user_client_cannot_create_kernel_io_objects() {
+        let mut s = Server::new().unwrap();
+        let c = s.connect(ClientKind::NativeUser, AccessMode::UserMode);
+
+        let driver_req = io_req("\\Driver\\Untrusted", 0x5000, 1);
+        let r = s.dispatch(c, opcode::OB_OP_CREATE_DRIVER, &driver_req, &mut []);
+        assert_eq!(r.status, NtStatus::ACCESS_DENIED.raw());
+
+        let device_req = io_req("\\Device\\Untrusted", 0x5000, 2);
+        let r = s.dispatch(c, opcode::OB_OP_CREATE_DEVICE, &device_req, &mut []);
+        assert_eq!(r.status, NtStatus::ACCESS_DENIED.raw());
     }
 
     fn io_req(path: &str, owner_component: u64, owner_local_id: u64) -> Vec<u8> {

@@ -36,7 +36,7 @@ pub unsafe extern "C" fn server_entry(heap_frames: u64) -> ! {
         Ok(s) => s,
         Err(_) => park(),
     };
-    let client = server.connect(ClientKind::NativeUser, AccessMode::UserMode);
+    let client = server.connect(ClientKind::ExecutiveService, AccessMode::KernelMode);
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop pairs order the

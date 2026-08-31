@@ -6955,6 +6955,7 @@ mod tests {
         write_wdm_device_object(
             &mut dev,
             WdmDeviceObjectInit {
+                size_field: (WDM_X64_DEVICE_OBJECT_SIZE + 16) as u16,
                 driver_object: 0x1111,
                 next_device: 0x2222,
                 device_extension: 0x3333,
@@ -6966,7 +6967,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(le_u16(&dev, 0x00), WDM_X64_IO_TYPE_DEVICE as u16);
-        assert_eq!(le_u16(&dev, 0x02), WDM_X64_DEVICE_OBJECT_SIZE as u16);
+        assert_eq!(le_u16(&dev, 0x02), (WDM_X64_DEVICE_OBJECT_SIZE + 16) as u16);
         assert_eq!(le_u64(&dev, 0x08), 0x1111);
         assert_eq!(le_u64(&dev, 0x10), 0x2222);
         assert_eq!(le_u32(&dev, 0x30), 0x4455_6677);
