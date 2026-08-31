@@ -20309,6 +20309,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     allocation failure. Provider/parse barriers must remain visible and must never restore old
     routes.
 
+    B3 live `_PRT` transport checkpoint (2026-08-31, implementation green): the executive now
+    transfers the MADT legacy-IRQ override vector exactly once into the live PCI topology authority
+    instead of leaving it in boot-local discovery state. Reconciliation readiness is consumed into
+    one retained `PreparedAcpiPciRoutingDiscovery`; relation BusRelations IRPs and route METHOD_EX
+    IRPs share one serialized pump lane, so neither owner can dispatch across the other's retained
+    transaction.
+
+    The focused `hosted_acpi_pci_routes.rs` owner now evaluates every planned full-path `_PRT`
+    through its authenticated PCI-root endpoint. It uses the real 260-byte File-less METHOD_EX
+    request, a 20-byte output probe, one bounded exact-size retry, exact `IoStatus.Information`
+    acceptance, and the host-tested routing-table parser. Synchronous and pending completions follow
+    the same policy. Pending results copy the complete retained output capacity and strictly
+    acknowledge the IRP before advancing; malformed identity and stale-generation results still
+    drain that ownership path before being fenced. Empty exact tables remain authoritative, while
+    missing methods, malformed output, illegal overflow, terminal provider status, and a second
+    overflow enter the visible barrier state. Table publication remains all-or-nothing in the pure
+    policy object. The freestanding executive check remains green at the unchanged 209-warning
+    baseline.
+
+    Review adjustment: continue the retained `PreparedAcpiPciRoutingTables` directly into exact
+    multilevel filtered `_CRS` enumeration for only those root endpoints with link-backed entries.
+    Apply the fixed 17-byte input/8-byte probe contract, accept exactly one complete filtered result
+    per endpoint, then call `prepare_interrupt_link_discovery`. Do not release the serialized owner
+    at the table-accepted checkpoint and do not allow a later BusRelations claim to overtake it.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

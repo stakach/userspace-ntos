@@ -21220,11 +21220,15 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
 ) -> HostedPciWindowPublishReport {
     let mut report = HostedPciWindowPublishReport::default();
     let PreparedAcpiPlatformAuthority {
-        discovery,
+        mut discovery,
         memory: acpi_memory,
         ports: acpi_ports,
         owner: mut context_owner,
     } = acpi_authority;
+    install_hosted_pci_interrupt_overrides(core::mem::take(
+        &mut discovery.interrupt_overrides,
+    ))
+    .expect("validated MADT interrupt overrides could not enter PCI topology authority");
     let mut devices = Vec::new();
     if devices.try_reserve_exact(pci_devices.len()).is_err() {
         report.missing_grants += 1;

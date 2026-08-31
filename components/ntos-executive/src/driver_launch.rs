@@ -36965,6 +36965,7 @@ unsafe fn dispatch_hosted_acpi_pci_root_method(
 }
 
 include!("hosted_acpi_pci_relation.rs");
+include!("hosted_acpi_pci_routes.rs");
 
 fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError {
     let raw_status = status as u32;
@@ -38840,6 +38841,7 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
 
 unsafe fn start_hosted_device_relation_query() -> usize {
     if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some()
+        || (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).is_some()
         || hosted_pnp_lifecycle_dispatch_active()
     {
         return 0;
@@ -39159,7 +39161,9 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_pnp_completions() })
         .saturating_add(unsafe { drain_hosted_filter_requirements_transactions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
+        .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
+        .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
 }
 
 pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
