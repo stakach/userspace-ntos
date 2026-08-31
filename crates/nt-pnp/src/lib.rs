@@ -60,10 +60,11 @@ pub use nt_cm_resources::{
     CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE, CM_RESOURCE_MEMORY_BAR, CM_RESOURCE_MEMORY_PREFETCHABLE,
     CM_RESOURCE_MEMORY_READ_ONLY, CM_RESOURCE_MEMORY_READ_WRITE, CM_RESOURCE_PORT_16_BIT_DECODE,
     CM_RESOURCE_PORT_BAR, CM_RESOURCE_PORT_IO, CM_RESOURCE_PORT_POSITIVE_DECODE,
-    CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_SHARED, INTERFACE_TYPE_PCI_BUS,
-    INTERFACE_TYPE_PNP_BUS, IO_RESOURCE_ALTERNATIVE, IO_RESOURCE_PREFERRED, IO_RESOURCE_REQUIRED,
-    MEMORY_INTERRUPT_LIST_SIZE, MEMORY_LIST_SIZE, MEMORY_PORT_INTERRUPT_LIST_SIZE,
-    MEMORY_PORT_LIST_SIZE, PORT_INTERRUPT_LIST_SIZE, PORT_LIST_SIZE,
+    CM_RESOURCE_SHARE_DEVICE_EXCLUSIVE, CM_RESOURCE_SHARE_SHARED, INTERFACE_TYPE_INTERNAL,
+    INTERFACE_TYPE_PCI_BUS, INTERFACE_TYPE_PNP_BUS, IO_RESOURCE_ALTERNATIVE, IO_RESOURCE_PREFERRED,
+    IO_RESOURCE_REQUIRED, MEMORY_INTERRUPT_LIST_SIZE, MEMORY_LIST_SIZE,
+    MEMORY_PORT_INTERRUPT_LIST_SIZE, MEMORY_PORT_LIST_SIZE, PORT_INTERRUPT_LIST_SIZE,
+    PORT_LIST_SIZE,
 };
 
 /// PCI configuration-space register offsets (byte offsets, dword-aligned).
@@ -1056,6 +1057,34 @@ pub struct PlatformResourceProfile {
     pub memory: Vec<PlatformMemoryResource>,
     pub ports: Vec<PlatformPortResource>,
     pub interrupt: PlatformInterruptResource,
+}
+
+/// Validate one `HalGetInterruptVector` bus query against a device's assigned raw interrupt line.
+///
+/// NT platform providers describe their resources on `PNPBus`, while firmware interrupt handlers
+/// conventionally query the HAL through `Internal, bus 0`. That alias is valid only for a PnP-bus
+/// assignment; PCI and other buses retain exact interface/bus matching.
+pub fn hal_interrupt_query_matches_assignment(
+    assigned_interface_type: u32,
+    assigned_bus_number: u32,
+    assigned_line: u32,
+    assigned_vector: u32,
+    requested_interface_type: u32,
+    requested_bus_number: u32,
+    requested_level: u32,
+    requested_vector: u32,
+) -> bool {
+    if assigned_line == 0 || assigned_vector == 0 {
+        return false;
+    }
+    let exact_bus = requested_interface_type == assigned_interface_type
+        && requested_bus_number == assigned_bus_number;
+    let internal_platform_alias = requested_interface_type == INTERFACE_TYPE_INTERNAL as u32
+        && requested_bus_number == 0
+        && assigned_interface_type == INTERFACE_TYPE_PNP_BUS as u32;
+    (exact_bus || internal_platform_alias)
+        && requested_level == assigned_line
+        && (requested_vector == 0 || requested_vector == assigned_line)
 }
 
 /// A validated type-0 PCI configuration-space access.
@@ -3036,6 +3065,50 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 1);
         assert_eq!(bytes[60], nt_cm_resources::CM_RESOURCE_TYPE_PORT);
         assert_eq!(bytes[80], nt_cm_resources::CM_RESOURCE_TYPE_INTERRUPT);
+    }
+
+    #[test]
+    fn hal_interrupt_queries_use_raw_line_and_only_alias_internal_platform_routes() {
+        assert!(hal_interrupt_query_matches_assignment(
+            INTERFACE_TYPE_PNP_BUS as u32,
+            0,
+            9,
+            32,
+            INTERFACE_TYPE_INTERNAL as u32,
+            0,
+            9,
+            9,
+        ));
+        assert!(!hal_interrupt_query_matches_assignment(
+            INTERFACE_TYPE_PNP_BUS as u32,
+            0,
+            9,
+            32,
+            INTERFACE_TYPE_INTERNAL as u32,
+            0,
+            10,
+            10,
+        ));
+        assert!(!hal_interrupt_query_matches_assignment(
+            INTERFACE_TYPE_PCI_BUS as u32,
+            2,
+            11,
+            40,
+            INTERFACE_TYPE_INTERNAL as u32,
+            0,
+            11,
+            11,
+        ));
+        assert!(hal_interrupt_query_matches_assignment(
+            INTERFACE_TYPE_PCI_BUS as u32,
+            2,
+            11,
+            40,
+            INTERFACE_TYPE_PCI_BUS as u32,
+            2,
+            11,
+            11,
+        ));
     }
 
     #[test]

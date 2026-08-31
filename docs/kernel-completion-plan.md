@@ -20685,6 +20685,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     next serialized boot proves both the delegated reset admission and the real PM1a `in ax,dx`
     fault at `0x604` complete through the bounded port broker.
 
+    B3 platform interrupt-translation checkpoint (2026-09-01, implementation green): serialized
+    proof `.tmp/run-headless-acpi-reset-delegation-20260901.log` completed in about 105 seconds,
+    retained genuine Explorer chrome and a fully non-background framebuffer, and exited through the
+    sentinel at 293/299 checks. The exact FADT reset sublease was admitted, all address-resource caps
+    were published, and the complete 440-byte START payload reached `acpi.sys`. The next failure was
+    ACPICA's standard `HalGetInterruptVector(Internal, 0, SCI, SCI, ...)` call returning zero even
+    though the PnP-bus ACPI PDO owned SCI line/vector 9. The component projection retained only the
+    translated vector and required the query interface to equal the CM resource-list interface, so
+    it could neither authenticate the raw line nor implement NT's internal-platform translation.
+
+    The hosted resource projection now carries the assigned raw interrupt line independently from
+    its translated vector. Host-tested `nt-pnp` accepts `Internal, bus 0` only as an alias for a
+    `PNPBus` platform assignment, requires both requested bus-level inputs to match the exact raw
+    line, and leaves PCI/other buses on exact interface and bus matching. A nonzero translated vector
+    is still required and remains the only returned vector; no route is inferred from a config-space
+    line or caller identity. `nt-pnp` passes 65/65, the freestanding executive check is green at the
+    unchanged 209-warning baseline, and `git diff --check` passes. Runtime acceptance is next:
+    require `HalGetInterruptVector` and `IoConnectInterrupt` to consume the assigned SCI route, then
+    prove the first FADT port instruction is brokered or classify the next real ACPICA boundary.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

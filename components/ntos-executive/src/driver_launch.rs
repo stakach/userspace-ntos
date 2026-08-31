@@ -364,6 +364,7 @@ pub const SH_SYMLINK_TARGET_BUF: u64 = 0x290; // out: UTF-16LE path capture
 pub const SH_CAPTURED_PATH_BYTES: usize = 0x100;
 pub const SH_REQ_CONTROL_ID: u64 = 0x390; // in: exact IrpId for cancel/copy/ack control selectors
 pub const SH_RESOURCE_INTERRUPT_VECTOR: u64 = 0x3B8; // in: granted interrupt vector/level (u32)
+pub const SH_RESOURCE_INTERRUPT_LINE: u64 = 0x3BC; // in: raw bus interrupt line (u32)
 pub const SH_RESOURCE_INTERRUPT_AFFINITY: u64 = 0x3C0; // in: granted interrupt affinity
 pub const SH_RESOURCE_MMIO_MAPPED_PHYS: u64 = 0x3C8; // out: last MmMapIoSpace phys
 pub const SH_RESOURCE_MMIO_MAPPED_LEN: u64 = 0x3D0; // out: last MmMapIoSpace length
@@ -13874,28 +13875,24 @@ extern "win64" fn s_hal_get_interrupt_vector(
     affinity_out: u64,
 ) -> u32 {
     unsafe {
+        let assigned_interface =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32);
+        let assigned_bus = read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32);
+        let assigned_line =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_LINE) as *const u32);
+        let granted_vector =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
         if !hosted_resource_identity_active()
-            || interface_type
-                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERFACE_TYPE) as *const u32)
-            || bus_number
-                != read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_BUS_NUMBER) as *const u32)
-        {
-            trace_hosted_hal_interrupt_vector(
+            || !nt_pnp::hal_interrupt_query_matches_assignment(
+                assigned_interface,
+                assigned_bus,
+                assigned_line,
+                granted_vector,
                 interface_type,
                 bus_number,
                 bus_interrupt_level,
                 bus_interrupt_vector,
-                0,
-                0,
-                0,
-                0,
-            );
-            return 0;
-        }
-        let granted_vector =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
-        if granted_vector == 0
-            || (bus_interrupt_vector != 0 && bus_interrupt_vector != granted_vector)
+            )
         {
             trace_hosted_hal_interrupt_vector(
                 interface_type,
@@ -43517,6 +43514,7 @@ unsafe fn clear_hosted_resource_projection(
     clear_shared_address_resources(sh);
     write_volatile((sh + SH_RESOURCE_PDO_OBJECT) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_LINE) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
@@ -45064,6 +45062,10 @@ unsafe fn write_hosted_resource_state_projection(
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
         evidence.interrupt_vector,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_LINE) as *mut u32,
+        state.interrupt_line,
     );
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64,
@@ -50076,6 +50078,10 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32,
         interrupt_vector,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_LINE) as *mut u32,
+        interrupt_line,
     );
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64,
