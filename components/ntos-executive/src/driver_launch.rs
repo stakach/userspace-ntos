@@ -45976,6 +45976,72 @@ pub(crate) fn hosted_hardware_evidence(device_id: u64) -> Option<HostedHardwareE
     Some(evidence)
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostedInterruptDeliveryEvidence {
+    pub(crate) connected: bool,
+    pub(crate) delivered: bool,
+    pub(crate) dpc_delivered: bool,
+    pub(crate) deliveries: u64,
+    pub(crate) dpc_deliveries: u64,
+    pub(crate) pci_connected: bool,
+    pub(crate) pci_delivered: bool,
+    pub(crate) pci_dpc_delivered: bool,
+    pub(crate) pci_deliveries: u64,
+    pub(crate) pci_dpc_deliveries: u64,
+}
+
+/// Snapshot interrupt evidence from the canonical state of every live hosted IRQ connection.
+///
+/// START reports intentionally describe the synchronous PnP transaction and therefore precede
+/// normal device workload. Interrupt proof must instead be sampled after that workload has run.
+/// Restricting the fold to current broker connections prevents retired devices or stale shared
+/// projections from satisfying the gate.
+pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvidence {
+    let mut summary = HostedInterruptDeliveryEvidence::default();
+    let Some(connections) = (unsafe { hosted_irq_connections() }) else {
+        return summary;
+    };
+    for connection in connections.iter().copied() {
+        if hosted_device_binding_by_device_id(connection.binding.device_id)
+            != Some(connection.binding)
+        {
+            continue;
+        }
+        let Some(state) = (unsafe {
+            hosted_device_resource_state_by_device_id(connection.binding.device_id)
+        }) else {
+            continue;
+        };
+        let evidence = state.evidence;
+        if evidence.interrupt_id != connection.interrupt_id || !evidence.interrupt_connected() {
+            continue;
+        }
+        let delivered = evidence.interrupt_delivered();
+        let dpc_delivered = evidence.dpc_delivered();
+        summary.connected = true;
+        summary.delivered |= delivered;
+        summary.dpc_delivered |= dpc_delivered;
+        summary.deliveries = summary
+            .deliveries
+            .saturating_add(evidence.interrupt_deliveries);
+        summary.dpc_deliveries = summary
+            .dpc_deliveries
+            .saturating_add(evidence.dpc_deliveries);
+        if state.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS {
+            summary.pci_connected = true;
+            summary.pci_delivered |= delivered;
+            summary.pci_dpc_delivered |= dpc_delivered;
+            summary.pci_deliveries = summary
+                .pci_deliveries
+                .saturating_add(evidence.interrupt_deliveries);
+            summary.pci_dpc_deliveries = summary
+                .pci_dpc_deliveries
+                .saturating_add(evidence.dpc_deliveries);
+        }
+    }
+    summary
+}
+
 fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
     let resource_state_exists =
         unsafe { hosted_device_resource_state_by_device_id(binding.device_id).is_some() };

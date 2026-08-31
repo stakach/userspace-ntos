@@ -21015,6 +21015,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Do not toggle the authority bit, synthesize an interrupt, or count driver callbacks without a
     hardware event.
 
+    B3 live hardware interrupt and deferred-proof checkpoint (2026-09-01, implementation and
+    runtime green): a QEMU interrupt trace proved that E1000 asserts real PCI INTx, the Q35 root
+    complex routes it to firmware-owned GSI 11, and the IOAPIC delivers CPU vector 34, exactly the
+    microkernel IRQ-table slot represented by translated vector 2. The executive had already
+    received and serviced that interrupt; the remaining red gate was observational. PnP START
+    reports sampled hardware evidence synchronously, before TCP/IP's later ARP workload, and the
+    final gate reused that stale snapshot.
+
+    Hardware proof now folds only canonical resource state belonging to current hosted interrupt
+    broker connections at final quiescence. Retired bindings, stale projections, mismatched
+    interrupt tokens, and disconnected devices cannot contribute. PCI evidence is reported
+    separately from other live routes. The old early duplicate hardware-gate block and its local
+    START-time boolean shadow state were removed; all generic PnP hardware gates now run once after
+    real workload and pending START completion.
+
+    The freestanding executive check remains green at the established 209-warning baseline and
+    `git diff --check` passes. Serialized run
+    `.tmp/run-headless-live-irq-evidence-20260901.log` completed in about 96 seconds, reached the
+    sentinel, and exited QEMU under the hard one-hour deadline. Its final canonical evidence is
+    `live-irq/dpc=1/2` and `pci-live-irq/dpc=1/2`; both
+    `exec_generic_hw_interrupt_delivered` and `exec_generic_hw_dpc_delivered` pass from the genuine
+    E1000 event. No interrupt or callback was injected. The run reached 255/299 but did not reach
+    Explorer in this timing lane, so it is an interrupt checkpoint rather than desktop acceptance.
+    The next B3 slice is to remove the synthetic root DMA fixture from production boot selection and
+    retain its DMA/resource-manager semantics in host-testable coverage, unless a real enumerated
+    platform device with firmware routing authority replaces it.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

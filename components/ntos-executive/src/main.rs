@@ -23974,8 +23974,8 @@ unsafe fn launch_boot_driver_service(
 }
 
 fn report_deferred_generic_hardware_checks(
-    report: HostedPnpStartReport,
-    pci_report: HostedPnpStartReport,
+    mut report: HostedPnpStartReport,
+    mut pci_report: HostedPnpStartReport,
     registry_selected: bool,
     selected: u64,
     root_selected: u64,
@@ -23984,6 +23984,13 @@ fn report_deferred_generic_hardware_checks(
     provider: driver_launch::HostedProviderSharingEvidence,
     passed: &mut u64,
 ) {
+    let live_interrupts = driver_launch::hosted_interrupt_delivery_evidence();
+    report.interrupt_connected |= live_interrupts.connected;
+    report.interrupt_delivered |= live_interrupts.delivered;
+    report.dpc_delivered |= live_interrupts.dpc_delivered;
+    pci_report.interrupt_connected |= live_interrupts.pci_connected;
+    pci_report.interrupt_delivered |= live_interrupts.pci_delivered;
+    pci_report.dpc_delivered |= live_interrupts.pci_dpc_delivered;
     unsafe {
         driver_launch::print_hosted_pnp_enumeration_evidence();
     }
@@ -24019,6 +24026,14 @@ fn report_deferred_generic_hardware_checks(
     print_u64(root_selected);
     print_str(b"/");
     print_u64(report.root_started_count);
+    print_str(b" live-irq/dpc=");
+    print_u64(live_interrupts.deliveries);
+    print_str(b"/");
+    print_u64(live_interrupts.dpc_deliveries);
+    print_str(b" pci-live-irq/dpc=");
+    print_u64(live_interrupts.pci_deliveries);
+    print_str(b"/");
+    print_u64(live_interrupts.pci_dpc_deliveries);
     print_str(b"\n");
 
     check(
@@ -32494,18 +32509,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     // generation-owned resources. The fixture device remains an independent compatibility lane and
     // does not participate in normal config-selected driver startup.
     let mut generic_hw_registry_selected = false;
-    let mut generic_hw_driver_loaded = false;
-    let mut generic_hw_add_device = false;
-    let mut generic_hw_start_ok = false;
-    let mut generic_hw_granted = false;
-    let mut generic_hw_mmio_mapped = false;
-    let mut generic_hw_interrupt_connected = false;
-    let mut generic_hw_interrupt_delivered = false;
-    let mut generic_hw_dpc_delivered = false;
-    let mut generic_hw_dma_adapter = false;
-    let mut generic_hw_dma_common = false;
     let mut generic_hw_io_out32 = false;
-    let mut generic_hw_root_started = false;
     let mut generic_hw_video_route_published = false;
     let mut generic_hw_selected = 0u64;
     let mut generic_hw_attempted = 0u64;
@@ -32525,7 +32529,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut generic_root_selected = 0u64;
     let mut generic_pci_registry_selected = false;
     let mut generic_pci_provider_domain_bound = false;
-    let mut generic_pci_add_device = false;
     let mut generic_pci_selected = 0u64;
     let mut generic_pci_attempted = 0u64;
     let mut generic_pci_provider_export_requests = 0u64;
@@ -32576,8 +32579,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         &mut driver_start_bootstrap,
                     ) {
                         let provider_after = driver_launch::hosted_provider_sharing_evidence();
-                        generic_hw_driver_loaded |= start_report.driver_ready_for_pnp;
-                        generic_hw_add_device |= start_report.add_device;
                         generic_hw_attempted += start_report.attempted;
                         generic_hw_terminal += start_report.terminal;
                         generic_hw_add_device_count += start_report.add_device_count;
@@ -32595,7 +32596,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_hw_first_indeterminate = start_report.first_indeterminate;
                         }
                         if spec_has_pci_devnode {
-                            generic_pci_add_device |= start_report.add_device;
                             generic_pci_attempted += start_report.attempted;
                             generic_pci_add_device_count += start_report.add_device_count;
                             generic_pci_started += start_report.started;
@@ -32630,16 +32630,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_root_attempted += start_report.attempted;
                             generic_root_started += start_report.started;
                         }
-                        generic_hw_start_ok |= start_report.start_ok;
-                        generic_hw_granted |= start_report.resource_granted;
-                        generic_hw_mmio_mapped |= start_report.mmio_mapped;
-                        generic_hw_interrupt_connected |= start_report.interrupt_connected;
-                        generic_hw_interrupt_delivered |= start_report.interrupt_delivered;
-                        generic_hw_dpc_delivered |= start_report.dpc_delivered;
-                        generic_hw_dma_adapter |= start_report.dma_adapter;
-                        generic_hw_dma_common |= start_report.dma_common;
                         generic_hw_io_out32 |= start_report.io_port_out32;
-                        generic_hw_root_started |= start_report.root_started;
                         generic_hw_video_route_published |= start_report.video_route_published;
                         generic_hw_video_route_attempted +=
                             start_report.video_route_attempted_count;
@@ -32789,108 +32780,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_u64(provider_sharing.singleton_conflicts);
         print_str(b"\n");
     }
-    if !generic_hw_gates_deferred {
-        check(
-            b"exec_generic_hw_registry_selected",
-            generic_hw_registry_selected
-                && generic_hw_driver_loaded
-                && generic_hw_add_device
-                && generic_hw_attempted == generic_hw_selected
-                && generic_hw_add_device_count == generic_hw_selected,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_pnp_starts_terminal",
-            generic_hw_attempted != 0
-                && generic_hw_terminal == generic_hw_attempted
-                && generic_hw_started + generic_hw_failed == generic_hw_terminal
-                && generic_hw_pending == 0
-                && generic_hw_indeterminate == 0
-                && generic_hw_first_indeterminate == 0,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_hw_mmio_interrupt_dma",
-            generic_hw_granted
-                && generic_hw_mmio_mapped
-                && generic_hw_interrupt_connected
-                && generic_hw_dma_adapter
-                && generic_hw_dma_common,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_hw_root_pdo_started",
-            generic_root_attempted != 0
-                && generic_root_started == generic_root_attempted
-                && generic_hw_start_ok
-                && generic_hw_root_started,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_pci_registry_selected",
-            generic_pci_registry_selected && generic_pci_selected != 0,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_pci_provider_domain_serviced",
-            generic_pci_provider_domain_bound
-                && generic_pci_provider_export_requests != 0
-                && generic_pci_provider_export_completions != 0
-                && generic_pci_provider_export_rejections == 0,
-            &mut passed,
-        );
-        let provider_legacy_receive_ok = provider_sharing.provider_protocol_receive_requests != 0
-            && provider_sharing.provider_protocol_receive_requests
-                == provider_sharing.provider_protocol_receive_completions
-            && provider_sharing.provider_protocol_receive_complete_requests != 0
-            && provider_sharing.provider_protocol_receive_complete_requests
-                == provider_sharing.provider_protocol_receive_complete_completions;
-        let provider_packet_receive_ok = provider_sharing.provider_protocol_receive_packet_requests
-            != 0
-            && provider_sharing.provider_protocol_receive_packet_requests
-                == provider_sharing.provider_protocol_receive_packet_completions;
-        let provider_packet_array_receive_ok = provider_sharing
-            .provider_packet_array_export_requests
-            != 0
-            && provider_sharing.provider_packet_array_export_requests
-                == provider_sharing.provider_packet_array_export_completions
-            && ((provider_sharing.provider_packet_array_protocol_receive_packet_requests != 0
-                && provider_sharing.provider_packet_array_protocol_receive_packet_requests
-                    == provider_sharing.provider_packet_array_protocol_receive_packet_completions)
-                || (provider_sharing.provider_packet_array_protocol_receive_requests != 0
-                    && provider_sharing.provider_packet_array_protocol_receive_requests
-                        == provider_sharing.provider_packet_array_protocol_receive_completions));
-        check(
-            b"exec_provider_ndis_receive_indicated",
-            provider_legacy_receive_ok
-                || provider_packet_receive_ok
-                || provider_packet_array_receive_ok,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_pci_add_device_reached",
-            generic_pci_add_device
-                && generic_pci_selected != 0
-                && generic_pci_add_device_count == generic_pci_selected,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_pci_resource_accessed",
-            generic_pci_registry_selected && generic_pci_resource_accessed,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_hw_interrupt_delivered",
-            generic_hw_interrupt_connected && generic_hw_interrupt_delivered,
-            &mut passed,
-        );
-        check(
-            b"exec_generic_hw_dpc_delivered",
-            generic_hw_interrupt_delivered && generic_hw_dpc_delivered,
-            &mut passed,
-        );
-    }
-
     // --- P3 ReactOS-binary pipeline: the storage host read a REAL, redistributable (GPL)
     // ReactOS x64 smss.exe off the disk into the file buffer. Parse it through the REAL
     // PE-load path (nt-pe-loader) and validate our SEC_IMAGE page-fill against it — a genuine
@@ -33148,7 +33037,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             && final_boot.first_indeterminate == 0,
                         &mut passed,
                     );
-                    if generic_hw_gates_deferred {
+                    if generic_hw_selected != 0 {
                         report_deferred_generic_hardware_checks(
                             final_config,
                             final_driver_start_reports.config_pci,
