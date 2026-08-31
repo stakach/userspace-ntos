@@ -16071,6 +16071,19 @@ pub(crate) unsafe fn config_manager_query_value(
     client.query_value(key_path, name, out)
 }
 
+pub(crate) unsafe fn config_manager_query_value_owned(
+    key_path: &str,
+    name: &str,
+) -> Result<(u32, alloc::vec::Vec<u8>), nt_config_client::QueryError> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_config_client::QueryError {
+            status: CONFIG_STATUS_DEVICE_NOT_READY,
+            required_len: 0,
+        })?;
+    client.query_value_owned(key_path, name)
+}
+
 pub(crate) unsafe fn config_manager_query_device_property(
     instance: &str,
     property: u32,
@@ -19829,10 +19842,16 @@ const USER_ROOT_KEY: KeyRef = 0xFFFF_FF04;
 /// above every mounted-hive selector.
 const MUTABLE_KEY_TAG: u32 = 0x7000_0000;
 const MUTABLE_KEY_MAX: u32 = 0x1000;
-/// A registry `KeyRef` in `[CM_SYSTEM_KEY_TAG, OVERLAY_KEY_TAG)` names one CM-owned SYSTEM key
+/// A registry `KeyRef` in `[CM_SYSTEM_KEY_TAG, CM_SYSTEM_KEY_TAG+CM_SYSTEM_KEY_MAX)` names one
+/// CM-owned SYSTEM key
 /// lease. Its low bits index `ExecNtHandler::cm_system_key_handles`; the isolated Configuration
 /// Manager owns the stable hive-cell identity and the executive owns only the lease reference.
 const CM_SYSTEM_KEY_TAG: u32 = 0x7100_0000;
+const CM_SYSTEM_KEY_MAX: u32 = 0x1000;
+/// Runtime registry state owned by the isolated Configuration Manager, outside its persistent
+/// SYSTEM hive mount. The initial consumer is the kernel-published volatile HARDWARE description.
+const CM_RUNTIME_KEY_TAG: u32 = 0x7200_0000;
+const CM_RUNTIME_KEY_MAX: u32 = 0x1000;
 /// A registry `KeyRef` in the range `[OVERLAY_KEY_TAG, OVERLAY_KEY_TAG+OVERLAY_KEY_MAX)` names an
 /// OVERLAY (created) key; its low bits are the index into `ExecNtHandler::overlay`. The range sits
 /// far above any real cell offset and below the predefined-root sentinel targets.
@@ -22500,8 +22519,16 @@ fn mutable_key_idx(kr: KeyRef) -> Option<usize> {
 }
 
 fn cm_system_key_idx(kr: KeyRef) -> Option<usize> {
-    if (CM_SYSTEM_KEY_TAG..OVERLAY_KEY_TAG).contains(&kr) {
+    if (CM_SYSTEM_KEY_TAG..CM_SYSTEM_KEY_TAG + CM_SYSTEM_KEY_MAX).contains(&kr) {
         Some((kr - CM_SYSTEM_KEY_TAG) as usize)
+    } else {
+        None
+    }
+}
+
+fn cm_runtime_key_idx(kr: KeyRef) -> Option<usize> {
+    if (CM_RUNTIME_KEY_TAG..CM_RUNTIME_KEY_TAG + CM_RUNTIME_KEY_MAX).contains(&kr) {
+        Some((kr - CM_RUNTIME_KEY_TAG) as usize)
     } else {
         None
     }
@@ -23372,6 +23399,9 @@ struct ExecNtHandler {
     /// Native handle targets for the CM-owned SYSTEM hive. Each slot owns exactly one CM lease;
     /// duplicated process handles share the slot and final Object Manager release closes the lease.
     cm_system_key_handles: alloc::vec::Vec<Option<CmSystemKeyTarget>>,
+    /// Native handle targets for Config Manager-owned volatile/runtime keys outside the persistent
+    /// SYSTEM mount. Entries carry only canonical paths; Config Manager owns key/value identity.
+    cm_runtime_key_handles: alloc::vec::Vec<Option<alloc::string::String>>,
     /// Durable hive journal records appended since the last writable-volume snapshot, including
     /// CM-owned SYSTEM records. The append itself is synchronous in the mounted volume; this counter
     /// batches the expensive snapshot reserve commit instead of exporting the whole writable volume
@@ -30389,6 +30419,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             && live_cm_mount.status == 0,
         &mut passed,
     );
+    // The SYSTEM import replaces Config Manager's registry tree. Publish kernel-discovered,
+    // volatile hardware state only after that replacement and before any registry-selected driver
+    // is loaded, so native processes and hosted DriverEntry calls observe the same authority.
+    ExecNtHandler::provision_volatile_hardware_registry();
 
     // --- P3: source a demand-paged section from a REAL disk file. The storage host read
     // SYSTEM.DAT (the hive) off the FAT32 disk into the shared frame; copy it into a file

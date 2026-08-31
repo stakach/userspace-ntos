@@ -154,6 +154,32 @@ pub fn compare_ascii_case_insensitive(a: &[u8], b: &[u8]) -> i32 {
     }
 }
 
+/// `_wcsnicmp`: compare at most `count` UTF-16 code units with the kernel CRT's ASCII folding.
+///
+/// Missing units are treated as terminating NULs so host tests can use ordinary slices. The
+/// comparison stops at the first shared NUL and returns the difference between the first distinct
+/// folded units, matching the ReactOS/NT kernel implementation without locale state.
+pub fn compare_utf16_case_insensitive_n(a: &[u16], b: &[u16], count: usize) -> i32 {
+    for index in 0..count {
+        let left = fold_ascii_utf16(a.get(index).copied().unwrap_or(0));
+        let right = fold_ascii_utf16(b.get(index).copied().unwrap_or(0));
+        if left != right {
+            return left as i32 - right as i32;
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    0
+}
+
+fn fold_ascii_utf16(unit: u16) -> u16 {
+    match unit {
+        0x41..=0x5a => unit + 0x20,
+        _ => unit,
+    }
+}
+
 /// `wcschr`: locate one UTF-16 code unit in a string that excludes its trailing NUL.
 pub fn find_utf16_unit(string: &[u16], unit: u16) -> Option<usize> {
     string.iter().position(|candidate| *candidate == unit)
@@ -370,6 +396,18 @@ mod tests {
         let path = u("System32\\drivers");
         assert_eq!(find_utf16_unit(&path, b'\\' as u16), Some(8));
         assert_eq!(find_utf16_unit(&path, b'%' as u16), None);
+
+        assert_eq!(
+            compare_utf16_case_insensitive_n(&u("Mailslot"), &u("MAIL"), 4),
+            0
+        );
+        assert!(compare_utf16_case_insensitive_n(&u("Mailslot"), &u("Mailstop"), 8) < 0);
+        assert_eq!(compare_utf16_case_insensitive_n(&u("a"), &u("ab"), 1), 0);
+        assert_eq!(
+            compare_utf16_case_insensitive_n(&[b'a' as u16, 0, b'x' as u16], &u("A"), 3),
+            0
+        );
+        assert_eq!(compare_utf16_case_insensitive_n(&u("a"), &u("z"), 0), 0);
     }
 
     #[test]

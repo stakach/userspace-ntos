@@ -111,7 +111,7 @@ use crate::ntoskrnl_shared::{
     s_ex_query_depth_slist, s_exp_interlocked_pop_entry_slist, s_exp_interlocked_push_entry_slist,
     s_memcpy, s_memmove, s_memset, s_rtl_compare_memory, s_rtl_integer_to_unicode_string,
     s_rtl_unicode_string_to_integer, s_rtl_upcase_unicode_char, s_stricmp, s_wcschr, s_wcsicmp,
-    s_wcslen,
+    s_wcslen, s_wcsnicmp,
 };
 
 use crate::*;
@@ -216,11 +216,9 @@ const FSD_DATA_LOADER_CONFIG_BYTES: u64 = 40;
 const FSD_DATA_PHYSICAL_MAP_OFF: u64 = 0x70000;
 const FSD_DATA_PHYSICAL_MAP_HEADER_BYTES: u64 = 16;
 const FSD_DATA_PHYSICAL_MAP_MAGIC: u64 = u64::from_le_bytes(*b"NTPHYS01");
-const FSD_DATA_PHYSICAL_MAP_CAPACITY: usize = ((FSD_DATA_FRAMES * 0x1000
-    - FSD_DATA_PHYSICAL_MAP_OFF
-    - FSD_DATA_PHYSICAL_MAP_HEADER_BYTES)
-    / core::mem::size_of::<nt_compat_exports::memory::PhysicalMapping>() as u64)
-    as usize;
+const FSD_DATA_PHYSICAL_MAP_CAPACITY: usize =
+    ((FSD_DATA_FRAMES * 0x1000 - FSD_DATA_PHYSICAL_MAP_OFF - FSD_DATA_PHYSICAL_MAP_HEADER_BYTES)
+        / core::mem::size_of::<nt_compat_exports::memory::PhysicalMapping>() as u64) as usize;
 const FSD_DATA_MM_SYSTEM_RANGE_START_VA: u64 = FSD_DATA_VADDR + FSD_DATA_MM_SYSTEM_RANGE_START_OFF;
 const FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_IO_FILE_OBJECT_TYPE_CELL_OFF;
@@ -233,11 +231,9 @@ const FSD_DATA_EX_EVENT_OBJECT_TYPE_BODY_VA: u64 =
 const FSD_DATA_SE_EXPORTS_CELL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_CELL_OFF;
 const FSD_DATA_SE_EXPORTS_STRUCT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_EXPORTS_STRUCT_OFF;
 const FSD_DATA_SE_SID_POOL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_SE_SID_POOL_OFF;
-const FSD_DATA_KE_LOADER_BLOCK_CELL_VA: u64 =
-    FSD_DATA_VADDR + FSD_DATA_KE_LOADER_BLOCK_CELL_OFF;
+const FSD_DATA_KE_LOADER_BLOCK_CELL_VA: u64 = FSD_DATA_VADDR + FSD_DATA_KE_LOADER_BLOCK_CELL_OFF;
 const FSD_DATA_LOADER_BLOCK_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_BLOCK_OFF;
-const FSD_DATA_LOADER_CONFIG_ROOT_VA: u64 =
-    FSD_DATA_VADDR + FSD_DATA_LOADER_CONFIG_ROOT_OFF;
+const FSD_DATA_LOADER_CONFIG_ROOT_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_CONFIG_ROOT_OFF;
 const FSD_DATA_LOADER_ACPI_NODE_VA: u64 = FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_NODE_OFF;
 const FSD_DATA_LOADER_ACPI_IDENTIFIER_VA: u64 =
     FSD_DATA_VADDR + FSD_DATA_LOADER_ACPI_IDENTIFIER_OFF;
@@ -4436,11 +4432,7 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     core::ptr::write_bytes(block as *mut u8, 0, 0x100);
     core::ptr::write_bytes(root as *mut u8, 0, 0x48);
     core::ptr::write_bytes(acpi as *mut u8, 0, 0x48);
-    core::ptr::write_bytes(
-        config as *mut u8,
-        0,
-        FSD_DATA_LOADER_CONFIG_BYTES as usize,
-    );
+    core::ptr::write_bytes(config as *mut u8, 0, FSD_DATA_LOADER_CONFIG_BYTES as usize);
 
     // NT 5.2 LOADER_PARAMETER_BLOCK: initialize the three list heads and publish the real ARC
     // configuration root at offset 0x60.
@@ -4454,10 +4446,7 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
             FSD_DATA_LOADER_BLOCK_VA + list_off,
         );
     }
-    write_unaligned(
-        (block + 0x60) as *mut u64,
-        FSD_DATA_LOADER_CONFIG_ROOT_VA,
-    );
+    write_unaligned((block + 0x60) as *mut u64, FSD_DATA_LOADER_CONFIG_ROOT_VA);
 
     // CONFIGURATION_COMPONENT_DATA root: SystemClass / MaximumType, with the firmware ACPI node as
     // its child. CONFIGURATION_COMPONENT_DATA is 0x48 bytes on NT amd64.
@@ -4480,10 +4469,7 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
         (acpi + 0x38) as *mut u64,
         FSD_DATA_LOADER_ACPI_IDENTIFIER_VA,
     );
-    write_unaligned(
-        (acpi + 0x40) as *mut u64,
-        FSD_DATA_LOADER_ACPI_CONFIG_VA,
-    );
+    write_unaligned((acpi + 0x40) as *mut u64, FSD_DATA_LOADER_ACPI_CONFIG_VA);
     core::ptr::copy_nonoverlapping(b"ACPI BIOS\0".as_ptr(), identifier as *mut u8, 10);
 
     // CM_PARTIAL_RESOURCE_LIST + one DeviceSpecific descriptor, followed by the loader's
@@ -4635,16 +4621,7 @@ extern "win64" fn s_ke_find_configuration_next_entry(
     component_key: u64,
     next_link: u64,
 ) -> u64 {
-    unsafe {
-        find_hosted_configuration_next_entry(
-            child,
-            class,
-            kind,
-            component_key,
-            next_link,
-            0,
-        )
-    }
+    unsafe { find_hosted_configuration_next_entry(child, class, kind, component_key, next_link, 0) }
 }
 
 extern "win64" fn s_strlen(src: u64) -> u64 {
@@ -8865,13 +8842,9 @@ unsafe fn initialize_hosted_physical_map(
         (FSD_STACK_VADDR, stack_frame_base, stack_frame_count),
         (IPCBUF_VADDR, ipc_buffer_frame, 1),
     ] {
-        let Some(next) = append_hosted_physical_cap_run(
-            exec_data_va,
-            count,
-            virtual_base,
-            frame_base,
-            frames,
-        ) else {
+        let Some(next) =
+            append_hosted_physical_cap_run(exec_data_va, count, virtual_base, frame_base, frames)
+        else {
             return false;
         };
         count = next;
@@ -30371,6 +30344,7 @@ fn register_fsd_trampolines() -> bool {
     reg.bind("wcsstr", s_wcsstr as *const () as usize as u64);
     reg.bind("wcschr", s_wcschr as *const () as usize as u64);
     reg.bind("_wcsicmp", s_wcsicmp as *const () as usize as u64);
+    reg.bind("_wcsnicmp", s_wcsnicmp as *const () as usize as u64);
     reg.bind("wcsicmp", s_wcsicmp as *const () as usize as u64);
     reg.bind("wcsncmp", s_wcsncmp as *const () as usize as u64);
     reg.bind("wcsncpy", s_wcsncpy as *const () as usize as u64);
@@ -50184,10 +50158,10 @@ unsafe fn dispatch_video_pnp_irp_for_instance(
         // VideoPort forwards this IRP to the PDO first. A PnP miniport without legacy access
         // ranges (including bochsmp) leaves the returned requirements list unchanged.
         return PnpBackendDispatch::Returned {
-            status: nt_status::NtStatus(hosted_root_bus_mut().dispatch_pnp(
-                nt_io_manager::DeviceId(binding.pdo_device_id),
-                irp.minor,
-            )),
+            status: nt_status::NtStatus(
+                hosted_root_bus_mut()
+                    .dispatch_pnp(nt_io_manager::DeviceId(binding.pdo_device_id), irp.minor),
+            ),
             information: 0,
         };
     }

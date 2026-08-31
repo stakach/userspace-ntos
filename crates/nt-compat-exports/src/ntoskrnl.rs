@@ -36,6 +36,11 @@ pub const NTOSKRNL: &[ExportDescriptor] = &[
     e("_stricmp", Implemented, "allocation-free ASCII CRT compare"),
     e("wcschr", Implemented, "bounded UTF-16 CRT search"),
     e(
+        "_wcsnicmp",
+        Implemented,
+        "allocation-free bounded UTF-16 case-insensitive CRT compare",
+    ),
+    e(
         "KeFindConfigurationNextEntry",
         Implemented,
         "bounded traversal of the NT loader configuration tree",

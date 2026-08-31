@@ -57,6 +57,7 @@ const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
 const STATUS_OBJECT_PATH_SYNTAX_BAD: i32 = 0xC000_003Bu32 as i32;
 const STATUS_REGISTRY_CORRUPT: i32 = 0xC000_014Cu32 as i32;
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
+const STATUS_BUFFER_OVERFLOW: i32 = 0x8000_0005u32 as i32;
 #[cfg(test)]
 const STATUS_DEVICE_BUSY: i32 = 0x8000_0011u32 as i32;
 #[cfg(test)]
@@ -1193,6 +1194,54 @@ impl<B: Backend> ConfigClient<B> {
         } else {
             Err(r.status)
         }
+    }
+
+    /// Query a complete raw typed value without imposing a caller-selected buffer ceiling.
+    ///
+    /// The first zero-capacity query obtains the Config Manager's exact required byte count. The
+    /// value is then fetched in one bounded allocation; if it changes size between the two calls,
+    /// the returned error preserves the new required length instead of exposing a partial value.
+    pub fn query_value_owned(
+        &mut self,
+        key_path: &str,
+        name: &str,
+    ) -> Result<(u32, Vec<u8>), QueryError> {
+        let first = self.raw_value_op(opcode::CM_OP_QUERY_VALUE, key_path, name, 0, &[], &mut []);
+        let required = first.information as usize;
+        if first.status != STATUS_SUCCESS && first.status != STATUS_BUFFER_OVERFLOW {
+            return Err(QueryError {
+                status: first.status,
+                required_len: required,
+            });
+        }
+
+        let value_type = first.detail0 as u32;
+        if required == 0 {
+            return Ok((value_type, Vec::new()));
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(required).map_err(|_| QueryError {
+            status: STATUS_INSUFFICIENT_RESOURCES,
+            required_len: required,
+        })?;
+        data.resize(required, 0);
+        let second =
+            self.raw_value_op(opcode::CM_OP_QUERY_VALUE, key_path, name, 0, &[], &mut data);
+        if second.status != STATUS_SUCCESS {
+            return Err(QueryError {
+                status: second.status,
+                required_len: second.information as usize,
+            });
+        }
+        let written = second.information as usize;
+        if written > data.len() {
+            return Err(QueryError {
+                status: STATUS_BUFFER_OVERFLOW,
+                required_len: written,
+            });
+        }
+        data.truncate(written);
+        Ok((second.detail0 as u32, data))
     }
 
     /// Query a legacy device property by stable devnode instance path. Errors retain the exact
@@ -4457,6 +4506,30 @@ mod tests {
             Ok((1, data.len()))
         );
         assert_eq!(&out[..data.len()], data);
+    }
+
+    #[test]
+    fn owned_raw_value_query_uses_exact_reported_length() {
+        let mut c = client();
+        let key = r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0";
+        let data = vec![0x5au8; 9_137];
+        assert!(c.set_value(key, "Payload", 3, &data).is_ok());
+
+        let (value_type, value) = c.query_value_owned(key, "Payload").unwrap();
+        assert_eq!(value_type, 3);
+        assert_eq!(value, data);
+    }
+
+    #[test]
+    fn owned_raw_value_query_preserves_empty_values_and_misses() {
+        let mut c = client();
+        let key = r"\Registry\Machine\Hardware\Description\System";
+        assert!(c.set_value(key, "Empty", 3, &[]).is_ok());
+        assert_eq!(c.query_value_owned(key, "Empty"), Ok((3, Vec::new())));
+
+        let error = c.query_value_owned(key, "Absent").unwrap_err();
+        assert_eq!(error.status, STATUS_OBJECT_NAME_NOT_FOUND);
+        assert_eq!(error.required_len, 0);
     }
 
     #[test]

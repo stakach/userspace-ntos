@@ -2629,6 +2629,34 @@ fn native_processor_registry_identifier() -> alloc::string::String {
     )
 }
 
+fn native_processor_name_identifier() -> Option<alloc::string::String> {
+    use core::arch::x86_64::__cpuid;
+
+    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+        return None;
+    }
+    let mut bytes = [0u8; 48];
+    for (index, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
+        let registers = __cpuid(leaf);
+        let offset = index * 16;
+        bytes[offset..offset + 4].copy_from_slice(&registers.eax.to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&registers.ebx.to_le_bytes());
+        bytes[offset + 8..offset + 12].copy_from_slice(&registers.ecx.to_le_bytes());
+        bytes[offset + 12..offset + 16].copy_from_slice(&registers.edx.to_le_bytes());
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let name = core::str::from_utf8(&bytes[..end]).ok()?.trim();
+    (!name.is_empty()).then(|| alloc::string::String::from(name))
+}
+
+fn is_cm_runtime_registry_path(path: &str) -> bool {
+    let canon = nt_hive_core::canon_path(path);
+    canon == r"\registry\machine\hardware" || canon.starts_with(r"\registry\machine\hardware\")
+}
+
 fn registry_sz_bytes(value: &str) -> alloc::vec::Vec<u8> {
     let mut data = alloc::vec::Vec::new();
     for unit in value.encode_utf16() {
@@ -3750,6 +3778,7 @@ impl ExecNtHandler {
         write_field!(mutable_hives, mutable_hives);
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(cm_system_key_handles, alloc::vec::Vec::with_capacity(256));
+        write_field!(cm_runtime_key_handles, alloc::vec::Vec::with_capacity(64));
         write_field!(mutable_hive_journal_pending_records, 0);
         write_field!(mutable_hive_journal_pending_boot_mask, 0);
         write_field!(mutable_hive_journal_dirty_boot_mask, 0);
@@ -3922,9 +3951,6 @@ impl ExecNtHandler {
         trace_setup_provision_phase(b"srm-begin", 0);
         handler.provision_kernel_srm_objects();
         trace_setup_provision_phase(b"srm-end", 0);
-        trace_setup_provision_phase(b"hardware-begin", 0);
-        handler.provision_volatile_hardware_registry();
-        trace_setup_provision_phase(b"hardware-end", 0);
         if require_boot_system {
             trace_setup_provision_phase(b"timezone-begin", 0);
             let configuration = match query_system_time_configuration() {
@@ -4052,58 +4078,92 @@ impl ExecNtHandler {
         }
     }
 
-    /// Seed the kernel-owned volatile HARDWARE hive state that ReactOS expects during early SMSS.
-    /// These keys are not backed by the disk hives; on NT they are runtime registry state published
-    /// from detected platform/CPU data. Keep it in the normal overlay so callers use ordinary
-    /// registry handles, enumeration, and query paths.
-    fn provision_volatile_hardware_registry(&mut self) {
+    /// Publish the kernel-discovered volatile HARDWARE description through Configuration Manager.
+    /// Native processes and hosted drivers then resolve one authority rather than maintaining a
+    /// native-only overlay beside the driver's registry broker.
+    pub(crate) fn provision_volatile_hardware_registry() {
         const REG_SZ: u32 = 1;
         const REG_DWORD: u32 = 4;
-        const HARDWARE_PATHS: [&str; 5] = [
+        const HARDWARE_PATHS: [&str; 4] = [
             r"\Registry\Machine\Hardware",
             r"\Registry\Machine\Hardware\Description",
             r"\Registry\Machine\Hardware\Description\System",
             r"\Registry\Machine\Hardware\Description\System\CentralProcessor",
-            r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0",
         ];
         let mut created = 0u32;
         for path in HARDWARE_PATHS {
-            let canon = self.overlay_canon(path);
-            let (_, was_created) = self.overlay.create(&canon);
-            if was_created {
-                created += 1;
+            match unsafe { crate::config_manager_create_key_with_options(path, true) } {
+                Ok((_key, was_created)) => created += u32::from(was_created),
+                Err(status) => {
+                    print_str(b"[hardware-reg] CM key publication failed status=0x");
+                    print_hex(status as u32);
+                    print_str(b" path=");
+                    print_ascii_str(path);
+                    print_str(b"\n");
+                    return;
+                }
             }
         }
-
-        let cpu_key =
-            self.overlay_canon(r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0");
-        let Some(cpu_index) = self.overlay.find(&cpu_key) else {
-            print_str(b"[hardware-reg] CPU key provisioning failed\n");
-            return;
-        };
         let identifier = native_processor_registry_identifier();
         let vendor = native_processor_vendor_identifier();
+        let processor_name = native_processor_name_identifier();
         let processor = native_processor_information();
-        self.overlay.set_value(
-            cpu_index,
-            "Identifier",
-            REG_SZ,
-            &registry_sz_bytes(&identifier),
-        );
-        self.overlay.set_value(
-            cpu_index,
-            "VendorIdentifier",
-            REG_SZ,
-            &registry_sz_bytes(&vendor),
-        );
-        self.overlay.set_value(
-            cpu_index,
-            "FeatureSet",
-            REG_DWORD,
-            &processor.processor_feature_bits.to_le_bytes(),
-        );
+        let identifier_data = registry_sz_bytes(&identifier);
+        let vendor_data = registry_sz_bytes(&vendor);
+        let processor_name_data = processor_name.as_deref().map(registry_sz_bytes);
+        let processor_count = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed).clamp(1, 64);
+        for number in 0..processor_count {
+            let cpu_key = alloc::format!(
+                "\\Registry\\Machine\\Hardware\\Description\\System\\CentralProcessor\\{}",
+                number
+            );
+            let result = unsafe {
+                crate::config_manager_create_key_with_options(&cpu_key, true).and_then(
+                    |(_key, was_created)| {
+                        created += u32::from(was_created);
+                        crate::config_manager_set_value(
+                            &cpu_key,
+                            "Identifier",
+                            REG_SZ,
+                            &identifier_data,
+                        )?;
+                        crate::config_manager_set_value(
+                            &cpu_key,
+                            "VendorIdentifier",
+                            REG_SZ,
+                            &vendor_data,
+                        )?;
+                        crate::config_manager_set_value(
+                            &cpu_key,
+                            "FeatureSet",
+                            REG_DWORD,
+                            &processor.processor_feature_bits.to_le_bytes(),
+                        )?;
+                        if let Some(name) = processor_name_data.as_deref() {
+                            crate::config_manager_set_value(
+                                &cpu_key,
+                                "ProcessorNameString",
+                                REG_SZ,
+                                name,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )
+            };
+            if let Err(status) = result {
+                print_str(b"[hardware-reg] CM CPU publication failed status=0x");
+                print_hex(status as u32);
+                print_str(b" cpu=");
+                print_u64(number);
+                print_str(b"\n");
+                return;
+            }
+        }
         print_str(b"[hardware-reg] provisioned volatile CPU registry keys=");
         print_u64(created as u64);
+        print_str(b" processors=");
+        print_u64(processor_count);
         print_str(b" Identifier=\"");
         print_ascii_str(&identifier);
         print_str(b"\" VendorIdentifier=\"");
@@ -5005,6 +5065,48 @@ impl ExecNtHandler {
         status
     }
 
+    fn install_cm_runtime_key_target(
+        &mut self,
+        path: alloc::string::String,
+    ) -> Result<KeyRef, u32> {
+        if let Some(index) = self
+            .cm_runtime_key_handles
+            .iter()
+            .position(|entry| entry.as_deref() == Some(path.as_str()))
+        {
+            return Ok(CM_RUNTIME_KEY_TAG | index as u32);
+        }
+        if let Some(index) = self.cm_runtime_key_handles.iter().position(Option::is_none) {
+            self.cm_runtime_key_handles[index] = Some(path);
+            return Ok(CM_RUNTIME_KEY_TAG | index as u32);
+        }
+        if self.cm_runtime_key_handles.len() >= CM_RUNTIME_KEY_MAX as usize {
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        self.cm_runtime_key_handles
+            .try_reserve_exact(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        self.cm_runtime_key_handles.push(Some(path));
+        Ok(CM_RUNTIME_KEY_TAG | (self.cm_runtime_key_handles.len() - 1) as u32)
+    }
+
+    unsafe fn mint_cm_runtime_registry_key(
+        &mut self,
+        full_path: &str,
+        desired: u32,
+        out: u64,
+    ) -> u32 {
+        let canon = nt_hive_core::canon_path(full_path);
+        if !crate::config_manager_open_key(&canon) {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+        let target = match self.install_cm_runtime_key_target(canon) {
+            Ok(target) => target,
+            Err(status) => return status,
+        };
+        self.mint_registry_key(target, desired, out)
+    }
+
     /// Resolve a registry handle owned by the current process and enforce the requested key right.
     fn resolve_registry_key(&self, handle: u64, required_access: u32) -> Result<KeyRef, u32> {
         if handle > u32::MAX as u64 {
@@ -5115,7 +5217,22 @@ impl ExecNtHandler {
             .as_ref()
     }
 
+    fn cm_runtime_key_target(&self, target: KeyRef) -> Option<&str> {
+        self.cm_runtime_key_handles
+            .get(cm_runtime_key_idx(target)?)?
+            .as_deref()
+    }
+
     fn release_registry_key_target(&mut self, target: KeyRef) {
+        if let Some(index) = cm_runtime_key_idx(target) {
+            let object = nt_process::HandleObject::RegistryKey(target);
+            if self.pm.handle_object_count(object) == 0 {
+                if let Some(entry) = self.cm_runtime_key_handles.get_mut(index) {
+                    *entry = None;
+                }
+            }
+            return;
+        }
         if let Some(index) = cm_system_key_idx(target) {
             let object = nt_process::HandleObject::RegistryKey(target);
             if self.pm.handle_object_count(object) != 0 {
@@ -5509,6 +5626,9 @@ impl ExecNtHandler {
         }
         if let Some(target) = self.cm_system_key_target(target) {
             return Some(target.physical_path.clone());
+        }
+        if let Some(path) = self.cm_runtime_key_target(target) {
+            return Some(alloc::string::String::from(path));
         }
         if let Some(key) = self.mutable_key_handle(target) {
             return self.mutable_key_path(key);
@@ -7703,6 +7823,9 @@ impl ExecNtHandler {
             }
             return Some(self.mint_registry_key(OVERLAY_KEY_TAG | index as u32, desired, out));
         }
+        if is_cm_runtime_registry_path(&canon) {
+            return Some(self.mint_cm_runtime_registry_key(&canon, desired, out));
+        }
         if is_system_registry_path(&canon) {
             let status = self.mint_cm_system_registry_key(&canon, desired, out);
             if status == 0 {
@@ -7945,6 +8068,13 @@ impl ExecNtHandler {
         name: &str,
         mut visit: impl FnMut(u32, &[u8]) -> R,
     ) -> Result<Option<R>, u32> {
+        if let Some(path) = self.cm_runtime_key_target(target) {
+            return match unsafe { crate::config_manager_query_value_owned(path, name) } {
+                Ok((value_type, data)) => Ok(Some(visit(value_type, &data))),
+                Err(error) if error.status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => Ok(None),
+                Err(error) => Err(error.status as u32),
+            };
+        }
         if let Some(target) = self.cm_system_key_target(target) {
             return match unsafe {
                 crate::config_manager_query_leased_system_hive_value(target.lease, name)
@@ -8033,7 +8163,9 @@ impl ExecNtHandler {
     }
 
     fn registry_path_has_mounted_authority(&self, path: &str) -> bool {
-        is_system_registry_path(path) || self.mutable_hive_owns_path(path)
+        is_cm_runtime_registry_path(path)
+            || is_system_registry_path(path)
+            || self.mutable_hive_owns_path(path)
     }
 
     fn registry_value_matches(
@@ -8112,6 +8244,9 @@ impl ExecNtHandler {
         ) || self.registry_overlay_index_for_canon_path(canon).is_some()
         {
             return Ok(true);
+        }
+        if is_cm_runtime_registry_path(canon) {
+            return Ok(unsafe { crate::config_manager_open_key(canon) });
         }
         if is_system_registry_path(canon) {
             return system_hive_key_exists(canon);
@@ -8227,6 +8362,9 @@ impl ExecNtHandler {
         requested_index: usize,
         mut visit: impl FnMut(&str, u32, &[u8], Option<ResolvedHiveValue>) -> R,
     ) -> Result<Option<R>, u32> {
+        if self.cm_runtime_key_target(target).is_some() {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
         let overlay_index = self.registry_overlay_index(target);
         let base_path = if let Some(index) = overlay_index {
             self.overlay.path(index).map(alloc::string::String::from)
@@ -8533,6 +8671,9 @@ impl ExecNtHandler {
     }
 
     fn registry_key_stats(&self, target: KeyRef) -> Result<RegistryKeyStats, u32> {
+        if self.cm_runtime_key_target(target).is_some() {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
         if let Some(lease) = self.cm_system_key_target(target).map(|target| target.lease) {
             return unsafe { config_manager_query_leased_system_hive_key_information(lease) }
                 .map(|information| RegistryKeyStats::from_leased_key(&information))
@@ -33661,6 +33802,36 @@ impl ExecNtHandler {
                 let create_options = nt_ulong_arg(args[5]);
                 let create_volatile = create_options & 0x1 != 0;
                 let root_is_overlay = root_target.and_then(overlay_key_idx).is_some();
+                if is_cm_runtime_registry_path(&canon) {
+                    if args[4] != 0 || security_descriptor_ptr != 0 {
+                        return STATUS_NOT_SUPPORTED;
+                    }
+                    let (created_key, created) = match crate::config_manager_create_key_with_options(
+                        &canon,
+                        create_volatile,
+                    ) {
+                        Ok(result) => result,
+                        Err(status) => return status as u32,
+                    };
+                    let _ = created_key;
+                    let status = self.mint_cm_runtime_registry_key(&canon, desired_access, args[0]);
+                    if status != 0 {
+                        return status;
+                    }
+                    if args[6] != 0 {
+                        self.xas_write_buf(
+                            args[6],
+                            &(if created {
+                                REG_CREATED_NEW_KEY
+                            } else {
+                                REG_OPENED_EXISTING_KEY
+                            })
+                            .to_le_bytes(),
+                        );
+                    }
+                    bump_progress();
+                    return 0;
+                }
                 let overlay_existing = crate::probe_seg!(
                     3,
                     if root_is_overlay {
@@ -34176,6 +34347,7 @@ impl ExecNtHandler {
                 let mut shadow_path_scratch = [0u8; 2048];
                 let mut shadow_path_len = 0usize;
                 let cm_lease = self.cm_system_key_target(key).map(|target| target.lease);
+                let cm_runtime_target = self.cm_runtime_key_target(key).is_some();
                 let existing_overlay = if let Some(index) = overlay_key_idx(key) {
                     if self.overlay.path(index).is_none() {
                         return 0xC000_0008;
@@ -34228,6 +34400,7 @@ impl ExecNtHandler {
                         .unwrap_or("")
                 });
                 let mutable_target = if cm_lease.is_none()
+                    && !cm_runtime_target
                     && overlay_key_idx(key).is_none()
                     && existing_overlay.is_none()
                 {
@@ -34346,6 +34519,30 @@ impl ExecNtHandler {
                         return status;
                     }
                     self.note_mutable_hives_changed();
+                    return 0;
+                }
+                if cm_runtime_target {
+                    let value_data = match data_view {
+                        Some(data) => data.to_vec(),
+                        None => match self.read_user_data_vec(
+                            data_ptr,
+                            data_size,
+                            REG_VALUE_SCRATCH_CAP,
+                        ) {
+                            Ok(data) => data,
+                            Err(status) => return status,
+                        },
+                    };
+                    let path = match core::str::from_utf8(&shadow_path_scratch[..shadow_path_len]) {
+                        Ok(path) => path,
+                        Err(_) => return 0xC000_003B,
+                    };
+                    if let Err(status) =
+                        crate::config_manager_set_value(path, durable_name, ty, &value_data)
+                    {
+                        return status as u32;
+                    }
+                    bump_progress();
                     return 0;
                 }
                 if let Some(mutable_key) = mutable_target {
@@ -35367,8 +35564,8 @@ impl ExecNtHandler {
             },
             // NtQueryValueKey(KeyHandle[0], *ValueName[1], InfoClass[2], KeyValueInfo[3], Length[4],
             // *ResultLength[5]). SmpInit reads Identifier/VendorIdentifier from the kernel-owned
-            // volatile HARDWARE overlay to build PROCESSOR_IDENTIFIER. Real-hive values by name
-            // continue to fall through to the mounted hives.
+            // volatile HARDWARE tree published through Config Manager. Other values use their
+            // mounted-hive or Config Manager authority through the same handle contract.
             NativeService::NtQueryValueKey => unsafe {
                 let key = match self.resolve_registry_key(args[0], 0x1) {
                     Ok(key) => key,
@@ -35420,7 +35617,9 @@ impl ExecNtHandler {
                 let mut use_xas_write =
                     shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
                 if pe_backed_registry_strings
-                    && (!is_virtual_registry_key(key) || self.cm_system_key_target(key).is_some())
+                    && (!is_virtual_registry_key(key)
+                        || self.cm_system_key_target(key).is_some()
+                        || self.cm_runtime_key_target(key).is_some())
                 {
                     // Hosted clients reading a value out of a real mounted hive or a CM-owned SYSTEM
                     // lease have out-params in advapi/userenv heap or stack that the plain mirror can't

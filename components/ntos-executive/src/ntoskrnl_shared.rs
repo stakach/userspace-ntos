@@ -271,6 +271,31 @@ pub extern "win64" fn s_wcschr(string: u64, unit: u16) -> u64 {
         .unwrap_or(0)
 }
 
+/// `_wcsnicmp(const wchar_t*, const wchar_t*, size_t)` — allocation-free kernel CRT compare.
+pub extern "win64" fn s_wcsnicmp(left: u64, right: u64, count: u64) -> i32 {
+    if count == 0 {
+        return 0;
+    }
+    if left == 0 || right == 0 {
+        return i32::from(left != 0) - i32::from(right != 0);
+    }
+    let mut index = 0u64;
+    while index < count {
+        let left_unit = unsafe { core::ptr::read_unaligned((left + index * 2) as *const u16) };
+        let right_unit = unsafe { core::ptr::read_unaligned((right + index * 2) as *const u16) };
+        let difference = nt_compat_exports::rtl::compare_utf16_case_insensitive_n(
+            &[left_unit],
+            &[right_unit],
+            1,
+        );
+        if difference != 0 || left_unit == 0 {
+            return difference;
+        }
+        index += 1;
+    }
+    0
+}
+
 fn downcase_utf16(unit: u16) -> u16 {
     match unit {
         0x0041..=0x005A => unit + 0x20,

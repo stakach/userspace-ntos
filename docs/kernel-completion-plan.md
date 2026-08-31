@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 ## Objective
 
@@ -20575,6 +20575,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     volatile hardware description under isolated Config Manager ownership and remove the overlay;
     then continue through ACPI AddDevice/START and the generic interrupt/DPC gates. A separately
     exposed Mup import gap, `_wcsnicmp`, belongs in the next compatibility-export slice.
+
+    B3 Config Manager hardware-description checkpoint (2026-09-01, host tests, freestanding build,
+    and desktop runtime green): volatile `HARDWARE\DESCRIPTION\System\CentralProcessor` ownership
+    now lives in the isolated Config Manager instead of the executive's native-only registry
+    overlay. The executive publishes one processor key per discovered processor immediately after
+    the real SYSTEM hive mount, with CPUID-derived identifier, vendor, feature set, and processor
+    name values. Native registry callers and hosted drivers therefore observe the same authority;
+    the replaced CPU overlay and its duplicate query path are removed. `nt-config-client` adds an
+    exact-size, two-call owned-value query and passes 21/21 focused tests, including large, empty,
+    and absent values. The compatibility export layer also implements the ReactOS-compatible
+    bounded `_wcsnicmp` behavior and keeps `nt-compat-exports` green at 40/40 tests.
+
+    Serialized proof `.tmp/run-headless-acpi-cm-order-20260901.log` completed in about 104 seconds,
+    reached genuine Explorer shell-chrome paint with a fully non-background framebuffer, and exited
+    through the normal microtest sentinel at 293/299 executive checks. Real `acpi.sys` now completes
+    `DriverEntry`, `AddDevice`, and reaches `IRP_MN_START_DEVICE`; its next failure is the loader
+    `ACPI BIOS` node's device-specific-data validation. Correct that projection from authoritative
+    boot memory-map facts rather than weakening the driver or manufacturing a successful START.
+    Mup independently advances past `_wcsnicmp` and now requires the real I/O Manager share-access
+    family beginning with `IoCheckShareAccess`; implement that family against common file-object
+    share state in a host-tested crate before wiring the exports. The remaining generic hardware
+    and LSA route gates remain open and must not be counted as a complete boot acceptance result.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
