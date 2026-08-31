@@ -20159,6 +20159,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     generations. The serialized reconciler must also observe invalidations requeued before initial
     catalog acceptance so it cannot restore routes across a pending newer relation transaction.
 
+    B3 generation-fenced `_PRT` discovery-plan checkpoint (2026-08-31, crate accepted): the
+    accepted ACPI scope catalog now resolves against the exact live PCI inventory into an immutable
+    routing workset. Only scopes that actually own `_PRT` produce queries; each query retains the
+    authenticated root-PDO evaluation endpoint, canonical owning scope, canonical full method path,
+    segment, resolved bus, and optional live bridge BDF. The workset retains both catalog and
+    inventory generations and becomes stale as soon as either authority changes. No route or
+    partial provider result is published by this phase.
+
+    Canonical full paths are formed by a checked, fallible `AcpiNamespacePath` NameSeg join rather
+    than executive string manipulation. It handles the ACPI root separator exactly and rejects
+    invalid NameSegs. Focused validation passes `nt-acpi` 32/32 and `nt-pnp` 58/58. Review
+    adjustment: the executive's serialized reconciler must now consume this workset through exact
+    full-path `_PRT` METHOD_EX calls, rechecking both generations after every synchronous or pending
+    completion. Probe only with the standard output header, retry only a strictly larger bounded
+    firmware length with zero overflow Information, and parse the exact successful byte count into
+    one table per query. Before route preparation, enumerate a complete canonical `_CRS` candidate
+    set per evaluation endpoint, resolve every link reference in its `_PRT` owner scope with ACPI
+    up-search, and evaluate each unique resolved link path through full-path `_CRS`.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

@@ -26,10 +26,12 @@
 
 extern crate alloc;
 
+mod acpi_pci_routing_discovery;
 mod acpi_pci_scope_catalog;
 mod pci_interrupt_routes;
 mod pci_inventory;
 
+pub use acpi_pci_routing_discovery::{AcpiPciRoutingMethodQuery, PreparedAcpiPciRoutingDiscovery};
 pub use acpi_pci_scope_catalog::{
     acpi_pci_root_hardware_id, build_acpi_pci_root_scope_fact, plan_acpi_pci_scope_methods,
     AcpiPciAddressMethodQuery, AcpiPciAddressScopeFact, AcpiPciProviderEndpoint,

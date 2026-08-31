@@ -59,6 +59,20 @@ impl AcpiNamespacePath {
         Ok(Self(owned))
     }
 
+    /// Fallibly append one canonical ACPI NameSeg to this absolute namespace path.
+    pub fn try_join_name_seg(&self, name: [u8; 4]) -> Result<Self, AcpiNamespaceError> {
+        validate_relative_path(&name).map_err(|_| AcpiNamespaceError::InvalidPath)?;
+        let separator = if self.0 == "\\" { "" } else { "." };
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(self.0.len() + separator.len() + name.len())
+            .map_err(|_| AcpiNamespaceError::Allocation)?;
+        owned.push_str(&self.0);
+        owned.push_str(separator);
+        owned.push_str(core::str::from_utf8(&name).map_err(|_| AcpiNamespaceError::InvalidPath)?);
+        Ok(Self(owned))
+    }
+
     pub fn name_seg(&self) -> Option<&str> {
         (self.0 != "\\").then(|| self.0.rsplit('.').next().unwrap_or(&self.0[1..]))
     }
@@ -365,6 +379,32 @@ mod tests {
         assert_eq!(
             parse_namespace_children(&empty, 8),
             Err(AcpiNamespaceError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn name_seg_join_preserves_canonical_absolute_paths() {
+        assert_eq!(
+            AcpiNamespacePath::parse("\\_SB_.PCI0")
+                .unwrap()
+                .try_join_name_seg(*b"_PRT")
+                .unwrap()
+                .as_str(),
+            "\\_SB_.PCI0._PRT"
+        );
+        assert_eq!(
+            AcpiNamespacePath::parse("\\")
+                .unwrap()
+                .try_join_name_seg(*b"_CRS")
+                .unwrap()
+                .as_str(),
+            "\\_CRS"
+        );
+        assert_eq!(
+            AcpiNamespacePath::parse("\\_SB_")
+                .unwrap()
+                .try_join_name_seg(*b"bad!"),
+            Err(AcpiNamespaceError::InvalidPath)
         );
     }
 

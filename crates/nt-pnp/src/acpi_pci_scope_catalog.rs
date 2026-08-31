@@ -948,6 +948,57 @@ mod tests {
     }
 
     #[test]
+    fn routing_discovery_is_complete_canonical_and_generation_fenced() {
+        let inventory =
+            PciInventory::try_from_initial(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 4, 1)])
+                .unwrap();
+        let mut catalog = AcpiPciScopeCatalog::default();
+        let mut facts = source(44);
+        facts.addresses.push(AcpiPciAddressScopeFact {
+            path: path("\\_SB_.PCI0.DEV0"),
+            adr: 3 << 16,
+            routing_table: false,
+        });
+        let update = catalog.prepare_replace_source(facts).unwrap();
+        catalog.commit(update).unwrap();
+
+        let discovery = catalog.prepare_routing_discovery(&inventory).unwrap();
+        assert_eq!(discovery.catalog_generation(), 1);
+        assert_eq!(discovery.inventory_generation(), 1);
+        assert_eq!(discovery.queries().len(), 2);
+        assert_eq!(discovery.queries()[0].endpoint, provider(44));
+        assert_eq!(discovery.queries()[0].scope, path("\\_SB_.PCI0"));
+        assert_eq!(discovery.queries()[0].method_path, path("\\_SB_.PCI0._PRT"));
+        assert_eq!(discovery.queries()[0].bus, 0);
+        assert_eq!(discovery.queries()[0].bridge, None);
+        assert_eq!(discovery.queries()[1].scope, path("\\_SB_.PCI0.BRG0"));
+        assert_eq!(
+            discovery.queries()[1].method_path,
+            path("\\_SB_.PCI0.BRG0._PRT")
+        );
+        assert_eq!(discovery.queries()[1].bus, 2);
+        assert_eq!(
+            discovery.queries()[1].bridge,
+            Some(PciLocation::new(0, 1, 0))
+        );
+        assert!(discovery.is_current(&catalog, &inventory));
+
+        let inventory_update = inventory
+            .prepare_rescan(vec![bridge(), endpoint(0, 3, 1), endpoint(2, 5, 1)])
+            .unwrap();
+        let mut newer_inventory = inventory.clone();
+        newer_inventory.commit(inventory_update).unwrap();
+        assert!(!discovery.is_current(&catalog, &newer_inventory));
+
+        let mut replacement = source(44);
+        replacement.root.routing_table = false;
+        replacement.addresses[0].routing_table = false;
+        let update = catalog.prepare_replace_source(replacement).unwrap();
+        catalog.commit(update).unwrap();
+        assert!(!discovery.is_current(&catalog, &inventory));
+    }
+
+    #[test]
     fn ordinary_address_scopes_are_ignored_but_prt_owners_must_be_bridges() {
         let inventory = PciInventory::try_from_initial(vec![endpoint(0, 3, 0)]).unwrap();
         let mut facts = source(44);
