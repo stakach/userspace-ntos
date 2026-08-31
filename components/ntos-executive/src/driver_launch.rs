@@ -36967,6 +36967,7 @@ unsafe fn dispatch_hosted_acpi_pci_root_method(
 include!("hosted_acpi_pci_relation.rs");
 include!("hosted_acpi_pci_routes.rs");
 include!("hosted_acpi_pci_route_filters.rs");
+include!("hosted_acpi_pci_route_links.rs");
 
 fn hosted_relation_error_from_config(status: i32) -> HostedRelationPublishError {
     let raw_status = status as u32;
@@ -38854,6 +38855,16 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         return 0;
     };
     let pdo_device_id = nt_io_manager::DeviceId(claim.pdo_device_id);
+    let pdo_driver_id = io_manager_mut()
+        .device(pdo_device_id)
+        .map(|device| device.driver_id)
+        .unwrap_or(DriverId(0));
+    if hosted_acpi_pci_route_transport_fences(pdo_device_id, pdo_driver_id) {
+        hosted_device_relation_invalidations_mut()
+            .abort(claim)
+            .expect("fenced hosted relation claim could not be returned to its queue");
+        return 0;
+    }
     if hosted_pnp_manager_mut()
         .devnode_for_pdo(claim.pdo_device_id)
         .is_none()
@@ -39163,6 +39174,7 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_filter_requirements_transactions() })
         .saturating_add(unsafe { drain_hosted_device_relation_query() })
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
+        .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
 }
@@ -42148,6 +42160,12 @@ unsafe fn hosted_filter_requirements_transactions_mut(
 unsafe fn reserve_hosted_filter_requirements_transaction(
     transaction: HostedFilterRequirementsTransaction,
 ) -> Result<(), nt_status::NtStatus> {
+    if hosted_acpi_pci_route_transport_fences(
+        nt_io_manager::DeviceId(transaction.binding.pdo_device_id),
+        DriverId(transaction.binding.driver_id),
+    ) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let transactions = hosted_filter_requirements_transactions_mut();
     if transaction.irp_id.raw() == 0
         || transactions.iter().any(|current| {
@@ -42249,6 +42267,14 @@ unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction
 unsafe fn reserve_hosted_pnp_transaction(
     transaction: HostedPnpTransaction,
 ) -> Result<(), nt_status::NtStatus> {
+    if (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).is_some()
+        || hosted_acpi_pci_route_transport_fences(
+            nt_io_manager::DeviceId(transaction.binding.pdo_device_id),
+            DriverId(transaction.binding.driver_id),
+        )
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let transactions = hosted_pnp_transactions_mut();
     if transaction.irp_id.raw() == 0
         || transactions.iter().any(|current| {
@@ -43863,11 +43889,14 @@ pub(crate) fn service_hosted_device(
                 hosted_domain_cookie: inst.hosted_domain_cookie,
                 pdo_object,
             };
-            unsafe {
+            let _routing_fenced = unsafe {
                 crate::hosted_pci_topology::note_hosted_pci_relation_queued(relation_owner)
             }
             .unwrap_or_else(|status| {
                 panic!("ACPI PCI route invalidation fence failed: {status:?}")
+            });
+            unsafe { cancel_stale_hosted_acpi_pci_route_query() }.unwrap_or_else(|status| {
+                panic!("stale ACPI PCI route IRP cancellation failed: {status:?}")
             });
         }
         if call <= 32 {
@@ -50499,7 +50528,9 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
     if extent != resource_requirements.len() {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
-    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some() {
+    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some()
+        || (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).is_some()
+    {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     let binding = hosted_device_binding_by_device_id(device_id)

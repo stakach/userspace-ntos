@@ -490,6 +490,22 @@ pub enum IrpCompletionOrigin {
     TransportFault,
 }
 
+/// Immutable identity of the request bytes copied into an IRP's system buffer before dispatch.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct RequestInputFingerprint {
+    pub len: u32,
+    pub digest: u64,
+}
+
+pub fn request_input_fingerprint(input: &[u8]) -> RequestInputFingerprint {
+    RequestInputFingerprint {
+        len: input.len().min(u32::MAX as usize) as u32,
+        digest: input.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        }),
+    }
+}
+
 /// Canonical I/O Manager IRP record (spec §13.1). Lives only in the I/O Manager;
 /// driver peers receive a projection, never this.
 pub struct IrpRecord {
@@ -513,6 +529,7 @@ pub struct IrpRecord {
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
     pub buffer: Option<IoBufferRef>,
+    request_input_fingerprint: Option<RequestInputFingerprint>,
     pub cancel: CancelState,
     pub user_data: u64,
     /// Requesting thread identity used by NT's thread-scoped cancellation contract.
@@ -544,10 +561,20 @@ impl IrpRecord {
             stack: Vec::new(),
             current_location: 0,
             buffer: None,
+            request_input_fingerprint: None,
             cancel: CancelState::NotCancelled,
             user_data: 0,
             requestor_tid: 0,
         }
+    }
+
+    /// Return the identity captured before the request was visible to a driver.
+    pub fn request_input_fingerprint(&self) -> Option<RequestInputFingerprint> {
+        self.request_input_fingerprint
+    }
+
+    pub(crate) fn set_request_input_fingerprint(&mut self, input: &[u8]) {
+        self.request_input_fingerprint = Some(request_input_fingerprint(input));
     }
 
     /// Advance the IRP state if the transition is allowed. Returns whether it

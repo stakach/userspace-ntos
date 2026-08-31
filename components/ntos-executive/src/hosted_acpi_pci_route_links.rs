@@ -1,96 +1,68 @@
-// Exact filtered `_CRS` namespace transport for the serialized PCI route reconciler.
+// Full-path interrupt-link `_CRS` evaluation and atomic route publication.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HostedAcpiPciCrsFilterDisposition {
+enum HostedAcpiPciLinkDisposition {
     RetryResources,
     RetryExact(usize),
-    SourceReady,
+    EvaluationReady,
     Barrier(nt_status::NtStatus),
 }
 
-unsafe fn hosted_acpi_pci_crs_filter_endpoint(
-    endpoint_index: usize,
-) -> Option<nt_pnp::AcpiPciProviderEndpoint> {
+unsafe fn hosted_acpi_pci_link_query(
+    request_index: usize,
+) -> Option<&'static nt_pnp::AcpiPciInterruptLinkMethodQuery> {
     let query = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).as_ref()?;
-    let HostedAcpiPciRoutePolicy::Tables(tables) = query.policy.as_ref()? else {
+    let HostedAcpiPciRoutePolicy::Links(discovery) = query.policy.as_ref()? else {
         return None;
     };
-    tables.link_candidate_endpoints().get(endpoint_index).copied()
+    discovery.link_queries().get(request_index)
 }
 
-fn classify_hosted_acpi_pci_crs_filter_result(
+fn classify_hosted_acpi_pci_link_result(
     output_len: usize,
     status: nt_status::NtStatus,
     information: u64,
     payload: &[u8],
 ) -> (
-    HostedAcpiPciCrsFilterDisposition,
-    Option<nt_acpi::AcpiNamespaceMatches>,
+    HostedAcpiPciLinkDisposition,
+    Option<Vec<nt_acpi::InterruptResource>>,
 ) {
-    if status.raw() as u32 == STATUS_BUFFER_OVERFLOW {
-        let required = (output_len == HOSTED_ACPI_NAMESPACE_HEADER_LEN
-            && information == 0
-            && payload.len() == output_len)
-            .then(|| {
-                nt_acpi::namespace_children_required_len(
-                    payload,
-                    HOSTED_ACPI_NAMESPACE_MAX_BYTES,
-                )
-                .ok()
-            })
-            .flatten();
-        return (
-            required
-                .filter(|required| *required > output_len)
-                .map_or(
-                    HostedAcpiPciCrsFilterDisposition::Barrier(
-                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-                    ),
-                    HostedAcpiPciCrsFilterDisposition::RetryExact,
-                ),
-            None,
-        );
-    }
-    if status.raw() != STATUS_SUCCESS {
-        return (HostedAcpiPciCrsFilterDisposition::Barrier(status), None);
-    }
-    if information != output_len as u64
-        || payload.len() != output_len
-        || !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
-            .contains(&output_len)
-    {
-        return (
-            HostedAcpiPciCrsFilterDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ),
-            None,
-        );
-    }
-    match nt_acpi::parse_namespace_matches(payload, HOSTED_ACPI_NAMESPACE_MAX_CHILDREN) {
-        Ok(matches) => (
-            HostedAcpiPciCrsFilterDisposition::SourceReady,
-            Some(matches),
+    let information = match classify_hosted_acpi_variable_eval_result(
+        output_len,
+        status,
+        information,
+        payload,
+    ) {
+        HostedAcpiVariableEvalDisposition::RetryExact(required) => {
+            return (HostedAcpiPciLinkDisposition::RetryExact(required), None);
+        }
+        HostedAcpiVariableEvalDisposition::Payload(information) => information,
+        HostedAcpiVariableEvalDisposition::Barrier(status) => {
+            return (HostedAcpiPciLinkDisposition::Barrier(status), None);
+        }
+    };
+    match nt_acpi::parse_interrupt_resource_template(&payload[..information]) {
+        Ok(resources) => (
+            HostedAcpiPciLinkDisposition::EvaluationReady,
+            Some(resources),
         ),
-        Err(nt_acpi::AcpiNamespaceError::Allocation) => {
-            (HostedAcpiPciCrsFilterDisposition::RetryResources, None)
+        Err(nt_acpi::PciRoutingError::Allocation) => {
+            (HostedAcpiPciLinkDisposition::RetryResources, None)
         }
         Err(_) => (
-            HostedAcpiPciCrsFilterDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ),
+            HostedAcpiPciLinkDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
             None,
         ),
     }
 }
 
-unsafe fn apply_hosted_acpi_pci_crs_filter_disposition(
-    endpoint_index: usize,
-    disposition: HostedAcpiPciCrsFilterDisposition,
+unsafe fn apply_hosted_acpi_pci_link_disposition(
+    request_index: usize,
+    disposition: HostedAcpiPciLinkDisposition,
 ) {
-    let endpoint = hosted_acpi_pci_crs_filter_endpoint(endpoint_index);
     let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_mut()
-        .expect("ACPI PCI route query disappeared while applying filtered _CRS result");
+        .expect("ACPI PCI route query disappeared while applying link _CRS result");
     if query
         .policy
         .as_ref()
@@ -100,64 +72,57 @@ unsafe fn apply_hosted_acpi_pci_crs_filter_disposition(
         return;
     }
     query.phase = match disposition {
-        HostedAcpiPciCrsFilterDisposition::RetryResources => {
+        HostedAcpiPciLinkDisposition::RetryResources => {
             query.barrier_status = Some(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             HostedAcpiPciRoutePhase::Barrier
         }
-        HostedAcpiPciCrsFilterDisposition::RetryExact(output_len) => {
-            HostedAcpiPciRoutePhase::DispatchCrsFilter {
-                endpoint_index,
+        HostedAcpiPciLinkDisposition::RetryExact(output_len) => {
+            HostedAcpiPciRoutePhase::DispatchLink {
+                request_index,
                 output_len,
             }
         }
-        HostedAcpiPciCrsFilterDisposition::SourceReady => {
-            let Some(endpoint) = endpoint else {
+        HostedAcpiPciLinkDisposition::EvaluationReady => {
+            let Some(resources) = query.pending_resources.take() else {
                 query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 query.phase = HostedAcpiPciRoutePhase::Barrier;
                 return;
             };
-            let Some(methods) = query.pending_matches.take() else {
-                query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-                query.phase = HostedAcpiPciRoutePhase::Barrier;
-                return;
-            };
-            if query.filtered_sources.len() != endpoint_index {
+            if query.link_evaluations.len() != request_index {
                 query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
                 HostedAcpiPciRoutePhase::Barrier
             } else {
                 query
-                    .filtered_sources
-                    .push(nt_pnp::AcpiPciCrsMethodSource { endpoint, methods });
-                let endpoint_count = match query.policy.as_ref().unwrap() {
-                    HostedAcpiPciRoutePolicy::Tables(tables) => {
-                        tables.link_candidate_endpoints().len()
-                    }
+                    .link_evaluations
+                    .push(nt_pnp::AcpiPciInterruptLinkEvaluation {
+                        request_index,
+                        resources,
+                    });
+                let request_count = match query.policy.as_ref().unwrap() {
+                    HostedAcpiPciRoutePolicy::Links(discovery) => discovery.link_queries().len(),
                     HostedAcpiPciRoutePolicy::Routing(_)
-                    | HostedAcpiPciRoutePolicy::Links(_)
+                    | HostedAcpiPciRoutePolicy::Tables(_)
                     | HostedAcpiPciRoutePolicy::Publication(_) => 0,
                 };
-                if query.filtered_sources.len() == endpoint_count {
-                    HostedAcpiPciRoutePhase::PrepareLinkDiscovery
+                if query.link_evaluations.len() == request_count {
+                    HostedAcpiPciRoutePhase::PreparePublication
                 } else {
-                    HostedAcpiPciRoutePhase::DispatchCrsFilter {
-                        endpoint_index: endpoint_index + 1,
-                        output_len: HOSTED_ACPI_NAMESPACE_HEADER_LEN,
+                    HostedAcpiPciRoutePhase::DispatchLink {
+                        request_index: request_index + 1,
+                        output_len: nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN,
                     }
                 }
             }
         }
-        HostedAcpiPciCrsFilterDisposition::Barrier(status) => {
+        HostedAcpiPciLinkDisposition::Barrier(status) => {
             query.barrier_status = Some(status);
             HostedAcpiPciRoutePhase::Barrier
         }
     };
 }
 
-unsafe fn dispatch_hosted_acpi_pci_crs_filter(
-    endpoint_index: usize,
-    output_len: usize,
-) -> bool {
-    if !(HOSTED_ACPI_NAMESPACE_HEADER_LEN..=HOSTED_ACPI_NAMESPACE_MAX_BYTES)
+unsafe fn dispatch_hosted_acpi_pci_link(request_index: usize, output_len: usize) -> bool {
+    if !(nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN..=HOSTED_ACPI_ROUTE_MAX_EVAL_BYTES)
         .contains(&output_len)
     {
         let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
@@ -167,7 +132,7 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
     }
-    let Some(endpoint) = hosted_acpi_pci_crs_filter_endpoint(endpoint_index) else {
+    let Some(method_query) = hosted_acpi_pci_link_query(request_index) else {
         let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
             .as_mut()
             .unwrap();
@@ -175,7 +140,7 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
     };
-    let Some(device_id) = hosted_acpi_pci_route_endpoint_device(endpoint) else {
+    let Some(device_id) = hosted_acpi_pci_route_endpoint_device(method_query.endpoint) else {
         let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
             .as_mut()
             .unwrap();
@@ -183,8 +148,17 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
     };
-    let input = nt_acpi::multilevel_namespace_filter_input(*b"_CRS")
-        .expect("fixed filtered _CRS input was invalid");
+    let input = match nt_acpi::eval_method_input_ex(method_query.method_path.as_str()) {
+        Ok(input) => input,
+        Err(_) => {
+            let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
+                .as_mut()
+                .unwrap();
+            query.phase = HostedAcpiPciRoutePhase::Barrier;
+            query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            return true;
+        }
+    };
     let mut output = Vec::new();
     if output.try_reserve_exact(output_len).is_err() {
         return false;
@@ -193,7 +167,7 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
     let result = match io_manager_mut().buffered_device_control_device_payload(
         ClientId(IO_MANAGER_COMPONENT_ID),
         device_id,
-        nt_acpi::IOCTL_ACPI_ENUM_CHILDREN,
+        nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX,
         &input,
         &mut output,
     ) {
@@ -218,8 +192,8 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
                 .as_mut()
                 .unwrap();
             query.inline_payload = Some(output);
-            query.phase = HostedAcpiPciRoutePhase::DecodeInlineCrsFilter {
-                endpoint_index,
+            query.phase = HostedAcpiPciRoutePhase::DecodeInlineLink {
+                request_index,
                 output_len,
                 status,
                 information,
@@ -231,9 +205,9 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
                 matches!(
                     &current.parameters,
                     IoParameters::DeviceControl(parameters)
-                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
+                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
                             && parameters.input_len as usize
-                                == nt_acpi::ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN
+                                == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
                             && parameters.output_len as usize == output_len
                 )
                 .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
@@ -247,8 +221,8 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
             query.origin_driver_id = origin_driver_id;
             query.completion_driver_id = completion_driver_id;
             query.completion_device_id = completion_device_id;
-            query.phase = HostedAcpiPciRoutePhase::AwaitingCrsFilterCompletion {
-                endpoint_index,
+            query.phase = HostedAcpiPciRoutePhase::AwaitingLinkCompletion {
+                request_index,
                 output_len,
             };
         }
@@ -256,22 +230,17 @@ unsafe fn dispatch_hosted_acpi_pci_crs_filter(
     true
 }
 
-unsafe fn decode_inline_hosted_acpi_pci_crs_filter(
-    endpoint_index: usize,
+unsafe fn decode_inline_hosted_acpi_pci_link(
+    request_index: usize,
     output_len: usize,
     status: nt_status::NtStatus,
     information: u64,
 ) -> bool {
-    let Some((disposition, matches)) = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
+    let Some((disposition, resources)) = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_ref()
         .and_then(|query| query.inline_payload.as_deref())
         .map(|payload| {
-            classify_hosted_acpi_pci_crs_filter_result(
-                output_len,
-                status,
-                information,
-                payload,
-            )
+            classify_hosted_acpi_pci_link_result(output_len, status, information, payload)
         })
     else {
         let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
@@ -281,20 +250,20 @@ unsafe fn decode_inline_hosted_acpi_pci_crs_filter(
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
     };
-    if disposition == HostedAcpiPciCrsFilterDisposition::RetryResources {
+    if disposition == HostedAcpiPciLinkDisposition::RetryResources {
         return false;
     }
     let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_mut()
         .unwrap();
     query.inline_payload = None;
-    query.pending_matches = matches;
-    apply_hosted_acpi_pci_crs_filter_disposition(endpoint_index, disposition);
+    query.pending_resources = resources;
+    apply_hosted_acpi_pci_link_disposition(request_index, disposition);
     true
 }
 
-unsafe fn advance_hosted_acpi_pci_crs_filter_completion(
-    endpoint_index: usize,
+unsafe fn advance_hosted_acpi_pci_link_completion(
+    request_index: usize,
     output_len: usize,
 ) -> bool {
     let query = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
@@ -303,12 +272,11 @@ unsafe fn advance_hosted_acpi_pci_crs_filter_completion(
     let Some(completion) = io_manager_mut().completed_irp(query.irp_id) else {
         return false;
     };
-    let endpoint = hosted_acpi_pci_crs_filter_endpoint(endpoint_index);
-    let expected_device_id = endpoint.and_then(|endpoint| {
-        hosted_acpi_pci_route_endpoint_device(endpoint)
-    });
-    let request_fingerprint_valid = nt_acpi::multilevel_namespace_filter_input(*b"_CRS")
-        .ok()
+    let method_query = hosted_acpi_pci_link_query(request_index);
+    let expected_device_id = method_query
+        .and_then(|method| hosted_acpi_pci_route_endpoint_device(method.endpoint));
+    let request_fingerprint_valid = method_query
+        .and_then(|method| nt_acpi::eval_method_input_ex(method.method_path.as_str()).ok())
         .is_some_and(|input| hosted_acpi_route_request_input_is(query.irp_id, &input));
     let request_valid = io_manager_mut().irp(query.irp_id).is_some_and(|irp| {
         irp.current_stack().is_some_and(|stack| {
@@ -317,9 +285,9 @@ unsafe fn advance_hosted_acpi_pci_crs_filter_completion(
                 && matches!(
                     &stack.parameters,
                     IoParameters::DeviceControl(parameters)
-                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_ENUM_CHILDREN
+                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
                             && parameters.input_len as usize
-                                == nt_acpi::ACPI_ENUM_CHILDREN_FILTER_INPUT_LEN
+                                == nt_acpi::ACPI_EVAL_INPUT_BUFFER_EX_LEN
                             && parameters.output_len as usize == output_len
                 )
         })
@@ -346,8 +314,8 @@ unsafe fn advance_hosted_acpi_pci_crs_filter_completion(
     (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_mut()
         .unwrap()
-        .phase = HostedAcpiPciRoutePhase::AwaitingCrsFilterCopy {
-        endpoint_index,
+        .phase = HostedAcpiPciRoutePhase::AwaitingLinkCopy {
+        request_index,
         output_len,
         status,
         information,
@@ -355,8 +323,8 @@ unsafe fn advance_hosted_acpi_pci_crs_filter_completion(
     true
 }
 
-unsafe fn copy_hosted_acpi_pci_crs_filter_completion(
-    endpoint_index: usize,
+unsafe fn copy_hosted_acpi_pci_link_completion(
+    request_index: usize,
     output_len: usize,
     status: nt_status::NtStatus,
     information: u64,
@@ -370,45 +338,40 @@ unsafe fn copy_hosted_acpi_pci_crs_filter_completion(
         return false;
     }
     payload.resize(output_len, 0);
-    let (disposition, matches) = match io_manager_mut()
+    let (disposition, resources) = match io_manager_mut()
         .copy_completed_buffered_device_control_payload(irp_id, 0, &mut payload)
     {
-        Ok(copied) if copied == output_len => classify_hosted_acpi_pci_crs_filter_result(
+        Ok(copied) if copied == output_len => classify_hosted_acpi_pci_link_result(
             output_len,
             status,
             information,
             &payload,
         ),
         Ok(_) => (
-            HostedAcpiPciCrsFilterDisposition::Barrier(
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ),
+            HostedAcpiPciLinkDisposition::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
             None,
         ),
         Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES)
         | Err(nt_status::NtStatus::DEVICE_NOT_READY) => return false,
-        Err(copy_status) => (
-            HostedAcpiPciCrsFilterDisposition::Barrier(copy_status),
-            None,
-        ),
+        Err(copy_status) => (HostedAcpiPciLinkDisposition::Barrier(copy_status), None),
     };
-    if disposition == HostedAcpiPciCrsFilterDisposition::RetryResources {
+    if disposition == HostedAcpiPciLinkDisposition::RetryResources {
         return false;
     }
     let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_mut()
         .unwrap();
-    query.pending_matches = matches;
-    query.phase = HostedAcpiPciRoutePhase::AwaitingCrsFilterAck {
-        endpoint_index,
+    query.pending_resources = resources;
+    query.phase = HostedAcpiPciRoutePhase::AwaitingLinkAck {
+        request_index,
         disposition,
     };
     true
 }
 
-unsafe fn acknowledge_hosted_acpi_pci_crs_filter(
-    endpoint_index: usize,
-    disposition: HostedAcpiPciCrsFilterDisposition,
+unsafe fn acknowledge_hosted_acpi_pci_link(
+    request_index: usize,
+    disposition: HostedAcpiPciLinkDisposition,
 ) -> bool {
     let irp_id = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_ref()
@@ -416,7 +379,7 @@ unsafe fn acknowledge_hosted_acpi_pci_crs_filter(
         .irp_id;
     match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
         Ok(_) => {
-            apply_hosted_acpi_pci_crs_filter_disposition(endpoint_index, disposition);
+            apply_hosted_acpi_pci_link_disposition(request_index, disposition);
             true
         }
         Err(status) => {
@@ -426,46 +389,51 @@ unsafe fn acknowledge_hosted_acpi_pci_crs_filter(
     }
 }
 
-unsafe fn prepare_hosted_acpi_pci_interrupt_link_discovery() -> bool {
+unsafe fn prepare_hosted_acpi_pci_route_publication() -> bool {
     let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
         .as_mut()
         .unwrap();
-    let Some(HostedAcpiPciRoutePolicy::Tables(tables)) = query.policy.take() else {
+    let Some(HostedAcpiPciRoutePolicy::Links(discovery)) = query.policy.take() else {
         query.phase = HostedAcpiPciRoutePhase::Barrier;
         query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         return true;
     };
-    let filtered_sources = core::mem::take(&mut query.filtered_sources);
-    match crate::hosted_pci_topology::prepare_hosted_pci_interrupt_link_discovery(
-        tables,
-        filtered_sources,
+    let evaluations = core::mem::take(&mut query.link_evaluations);
+    match crate::hosted_pci_topology::prepare_hosted_pci_interrupt_route_publication(
+        discovery,
+        evaluations,
     ) {
-        Ok(discovery) => {
-            let request_count = discovery.link_queries().len();
-            if query
-                .link_evaluations
-                .try_reserve_exact(request_count)
-                .is_err()
-            {
-                *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
-                crate::hosted_pci_topology::retry_hosted_pci_route_reconciliation();
-                return false;
-            }
-            query.policy = Some(HostedAcpiPciRoutePolicy::Links(discovery));
-            query.phase = if request_count == 0 {
-                HostedAcpiPciRoutePhase::PreparePublication
-            } else {
-                HostedAcpiPciRoutePhase::DispatchLink {
-                    request_index: 0,
-                    output_len: nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN,
-                }
-            };
+        Ok(publication) => {
+            query.policy = Some(HostedAcpiPciRoutePolicy::Publication(publication));
+            query.phase = HostedAcpiPciRoutePhase::CommitPublication;
             true
         }
         Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => {
             *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
             crate::hosted_pci_topology::retry_hosted_pci_route_reconciliation();
             false
+        }
+        Err(status) => {
+            query.phase = HostedAcpiPciRoutePhase::Barrier;
+            query.barrier_status = Some(status);
+            true
+        }
+    }
+}
+
+unsafe fn commit_hosted_acpi_pci_route_publication() -> bool {
+    let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
+        .as_mut()
+        .unwrap();
+    let Some(HostedAcpiPciRoutePolicy::Publication(publication)) = query.policy.take() else {
+        query.phase = HostedAcpiPciRoutePhase::Barrier;
+        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        return true;
+    };
+    match crate::hosted_pci_topology::commit_hosted_pci_interrupt_routes(publication) {
+        Ok(_) => {
+            *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = None;
+            true
         }
         Err(status) => {
             query.phase = HostedAcpiPciRoutePhase::Barrier;

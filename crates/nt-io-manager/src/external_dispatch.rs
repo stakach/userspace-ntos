@@ -757,6 +757,8 @@ impl<P> IoManager<P> {
         }
         irp.user_data = user_data;
         irp.requestor_tid = requestor_tid;
+        let captured_input_len = input_len.min(system_buffer.len() as u32) as usize;
+        irp.set_request_input_fingerprint(&system_buffer[..captured_input_len]);
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,

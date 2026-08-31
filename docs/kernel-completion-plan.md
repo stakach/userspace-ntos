@@ -20358,6 +20358,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     atomically commit the single route publication with the install-once MADT overrides. A provider
     or parse barrier must leave the route owner invalidated; no PCI config-line fallback is allowed.
 
+    B3 complete live ACPI PCI route-publication checkpoint (2026-08-31, implementation green): the
+    serialized executive reconciler now dispatches every deduplicated full-path link `_CRS` query
+    through its authenticated endpoint, accepts one exact indexed resource-template result, and
+    retains all link evaluations until the pure `nt-pnp` pipeline prepares one complete route
+    replacement. The topology authority applies its install-once MADT overrides and commits the
+    publication only while the catalog, inventory, route-owner generation, and complete dirty-
+    relation set are still current. No table, link, or individual route is published early.
+
+    Synchronous and pending `_PRT`, filtered `_CRS`, and link `_CRS` paths now retain their complete
+    inline or canonical I/O Manager output across allocation retries. Pending identity validation
+    uses an immutable request-input fingerprint captured by the canonical I/O Manager before driver
+    dispatch, rather than comparing reconstructed executive inputs. Provider barriers are durable
+    generation-keyed topology blocks; stale work is canceled and requeued, while an indeterminate
+    completion acknowledgement remains an explicit canonical IRP owner. A bounded recovery loop
+    retries that acknowledgement and fences the affected device/driver lifecycle until ownership is
+    recovered, then removes the matching topology block and restarts complete reconciliation.
+
+    Review closure: route, BusRelations, filter-requirements, and PnP lifecycle admission are
+    symmetric. Every dirty relation row blocks route readiness, relevant rows invalidate route
+    generations exactly once, and publication rechecks both dirty relations and durable barriers in
+    the same authority mutation that commits the replacement. Focused validation passes
+    `nt-io-manager` 245/245, `nt-acpi` 33/33, `nt-pnp` 64/64, and `nt-pnp-manager` 50/50; the
+    freestanding executive check remains green at 209 warnings.
+
+    B3 runtime acceptance remains open. The currently running desktop QEMU owns the serialized boot
+    lane and was not disturbed. The next acceptance run must prove real route publication, then
+    remove and re-add one of two NICs without disturbing its sibling, with no PCI config-line or
+    synthetic interrupt fallback. Multi-segment PCI remains a later ownership extension: the live
+    boot authority currently installs the discovered segment-zero inventory only.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

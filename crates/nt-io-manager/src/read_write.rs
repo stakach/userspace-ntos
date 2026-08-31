@@ -332,6 +332,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
         .max()
         .unwrap_or(0)
         .min(u32::MAX as usize) as u32;
+        let captured_input_len = input_len as usize;
+        if let Some(input) = system_buffer.get(..captured_input_len).or_else(|| {
+            type3_input_buffer
+                .as_deref()
+                .and_then(|buffer| buffer.get(..captured_input_len))
+        }) {
+            irp.set_request_input_fingerprint(input);
+        }
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
             offset: 0,

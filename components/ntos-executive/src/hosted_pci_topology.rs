@@ -3,8 +3,9 @@ use alloc::vec::Vec;
 use nt_pnp::{
     AcpiPciCrsMethodSource, AcpiPciLinkCandidateFact, AcpiPciProviderEndpoint, AcpiPciScopeCatalog,
     AcpiPciScopeError, AcpiPciScopeSource, PciDevice, PciInterruptRouteOwner, PciInventory,
-    PciInventoryError, PreparedAcpiPciInterruptLinkDiscovery, PreparedAcpiPciRoutingDiscovery,
-    PreparedAcpiPciRoutingTables,
+    PciInventoryError, PreparedAcpiPciInterruptLinkDiscovery,
+    PreparedAcpiPciRoutingDiscovery, PreparedAcpiPciRoutingTables,
+    PreparedPciInterruptRoutePublication,
     PreparedAcpiPciScopeCatalogUpdate,
 };
 
@@ -12,9 +13,24 @@ struct HostedPciTopologyAuthority {
     inventory: PciInventory,
     scopes: AcpiPciScopeCatalog,
     routes: PciInterruptRouteOwner,
-    dirty_relations: Vec<AcpiPciProviderEndpoint>,
+    dirty_relations: Vec<HostedPciDirtyRelation>,
     reconcile_ready: bool,
     interrupt_overrides: Option<Vec<nt_acpi::LegacyIrqOverride>>,
+    route_blocked: Option<HostedPciRouteBlock>,
+}
+
+#[derive(Clone, Copy)]
+struct HostedPciDirtyRelation {
+    endpoint: AcpiPciProviderEndpoint,
+    routing_fenced: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HostedPciRouteBlock {
+    catalog_generation: u64,
+    inventory_generation: u64,
+    route_owner_generation: u64,
+    status: nt_status::NtStatus,
 }
 
 static mut HOSTED_PCI_TOPOLOGY: Option<HostedPciTopologyAuthority> = None;
@@ -48,6 +64,21 @@ fn copy_inventory_devices(inventory: &PciInventory) -> Result<Vec<PciDevice>, nt
     Ok(snapshot)
 }
 
+fn refresh_hosted_pci_route_reconciliation(authority: &mut HostedPciTopologyAuthority) {
+    if authority.route_blocked.is_some_and(|blocked| {
+        blocked.catalog_generation != authority.scopes.generation()
+            || blocked.inventory_generation != authority.inventory.generation()
+            || blocked.route_owner_generation != authority.routes.generation()
+    }) {
+        authority.route_blocked = None;
+    }
+    authority.reconcile_ready = !authority.scopes.sources().is_empty()
+        && authority.dirty_relations.is_empty()
+        && authority.route_blocked.is_none()
+        && (authority.routes.inventory_generation() != Some(authority.inventory.generation())
+            || authority.routes.provider_scope_generation() != Some(authority.scopes.generation()));
+}
+
 /// Install the one live PCI topology authority from the platform discovery result. The returned
 /// vector is an immutable observation for boot resource projection, not a second authority.
 pub(crate) unsafe fn install_hosted_pci_topology(
@@ -66,6 +97,7 @@ pub(crate) unsafe fn install_hosted_pci_topology(
         dirty_relations: Vec::new(),
         reconcile_ready: false,
         interrupt_overrides: None,
+        route_blocked: None,
     });
     Ok(snapshot)
 }
@@ -106,7 +138,11 @@ pub(crate) unsafe fn note_hosted_pci_relation_queued(
     let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
         .as_mut()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if authority.dirty_relations.contains(&relation_owner) {
+    if authority
+        .dirty_relations
+        .iter()
+        .any(|dirty| dirty.endpoint == relation_owner)
+    {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     authority
@@ -120,8 +156,13 @@ pub(crate) unsafe fn note_hosted_pci_relation_queued(
             .invalidate()
             .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         authority.reconcile_ready = false;
+        authority.route_blocked = None;
     }
-    authority.dirty_relations.push(relation_owner);
+    authority.dirty_relations.push(HostedPciDirtyRelation {
+        endpoint: relation_owner,
+        routing_fenced: relevant,
+    });
+    authority.reconcile_ready = false;
     Ok(relevant)
 }
 
@@ -135,7 +176,7 @@ pub(crate) unsafe fn note_hosted_pci_relation_completion(
     let index = authority
         .dirty_relations
         .iter()
-        .position(|dirty| *dirty == relation_owner)
+        .position(|dirty| dirty.endpoint == relation_owner)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     if matches!(
         completion,
@@ -144,16 +185,11 @@ pub(crate) unsafe fn note_hosted_pci_relation_completion(
         authority.reconcile_ready = false;
         return Ok(false);
     }
-    authority.dirty_relations.remove(index);
-    let relevant_dirty = authority
-        .dirty_relations
-        .iter()
-        .any(|dirty| authority.scopes.relation_has_sources(*dirty));
-    let needs_reconcile = !authority.scopes.sources().is_empty()
-        && (authority.routes.inventory_generation() != Some(authority.inventory.generation())
-            || authority.routes.provider_scope_generation()
-                != Some(authority.scopes.generation()));
-    authority.reconcile_ready = needs_reconcile && !relevant_dirty;
+    let completed = authority.dirty_relations.remove(index);
+    if completed.routing_fenced {
+        authority.route_blocked = None;
+    }
+    refresh_hosted_pci_route_reconciliation(authority);
     Ok(authority.reconcile_ready)
 }
 
@@ -162,15 +198,16 @@ pub(crate) unsafe fn begin_hosted_pci_route_reconciliation(
     let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
         .as_mut()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    refresh_hosted_pci_route_reconciliation(authority);
+    if let Some(blocked) = authority.route_blocked {
+        let _blocked_status = blocked.status;
+        return Ok(None);
+    }
     if !authority.reconcile_ready || authority.interrupt_overrides.is_none() {
         return Ok(None);
     }
-    if authority
-        .dirty_relations
-        .iter()
-        .any(|dirty| authority.scopes.relation_has_sources(*dirty))
-    {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    if !authority.dirty_relations.is_empty() {
+        return Ok(None);
     }
     let discovery = authority
         .scopes
@@ -186,7 +223,8 @@ pub(crate) unsafe fn hosted_pci_route_discovery_is_current(
     (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .is_some_and(|authority| {
-            discovery.is_current(&authority.scopes, &authority.inventory, &authority.routes)
+            authority.dirty_relations.is_empty()
+                && discovery.is_current(&authority.scopes, &authority.inventory, &authority.routes)
         })
 }
 
@@ -218,7 +256,8 @@ pub(crate) unsafe fn hosted_pci_routing_tables_are_current(
     (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .is_some_and(|authority| {
-            tables.is_current(&authority.scopes, &authority.inventory, &authority.routes)
+            authority.dirty_relations.is_empty()
+                && tables.is_current(&authority.scopes, &authority.inventory, &authority.routes)
         })
 }
 
@@ -250,23 +289,118 @@ pub(crate) unsafe fn hosted_pci_interrupt_link_discovery_is_current(
     (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .is_some_and(|authority| {
-            discovery.is_current(&authority.scopes, &authority.inventory, &authority.routes)
+            authority.dirty_relations.is_empty()
+                && discovery.is_current(&authority.scopes, &authority.inventory, &authority.routes)
         })
+}
+
+pub(crate) unsafe fn prepare_hosted_pci_interrupt_route_publication(
+    discovery: PreparedAcpiPciInterruptLinkDiscovery,
+    evaluations: Vec<nt_pnp::AcpiPciInterruptLinkEvaluation>,
+) -> Result<PreparedPciInterruptRoutePublication, nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
+        .as_ref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let overrides = authority
+        .interrupt_overrides
+        .as_deref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    discovery
+        .prepare_route_publication(
+            &authority.scopes,
+            &authority.inventory,
+            &authority.routes,
+            overrides,
+            evaluations,
+        )
+        .map_err(|error| match error {
+            nt_pnp::AcpiPciRoutingDiscoveryError::Allocation => {
+                nt_status::NtStatus::INSUFFICIENT_RESOURCES
+            }
+            _ => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        })
+}
+
+pub(crate) unsafe fn hosted_pci_route_publication_is_current(
+    publication: &PreparedPciInterruptRoutePublication,
+) -> bool {
+    (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
+        .as_ref()
+        .is_some_and(|authority| {
+            authority.dirty_relations.is_empty()
+                && publication.base_generation() == authority.routes.generation()
+                && publication.inventory_generation() == authority.inventory.generation()
+                && publication.provider_scope_generation() == authority.scopes.generation()
+        })
+}
+
+pub(crate) unsafe fn commit_hosted_pci_interrupt_routes(
+    publication: PreparedPciInterruptRoutePublication,
+) -> Result<u64, nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
+        .as_mut()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !authority.dirty_relations.is_empty() || authority.route_blocked.is_some() {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let generation = authority
+        .routes
+        .commit(publication, &authority.inventory, authority.scopes.generation())
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    authority.reconcile_ready = false;
+    Ok(generation)
+}
+
+pub(crate) unsafe fn block_hosted_pci_route_reconciliation(
+    catalog_generation: u64,
+    inventory_generation: u64,
+    route_owner_generation: u64,
+    status: nt_status::NtStatus,
+) -> Result<bool, nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
+        .as_mut()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if !authority.dirty_relations.is_empty()
+        || catalog_generation != authority.scopes.generation()
+        || inventory_generation != authority.inventory.generation()
+        || route_owner_generation != authority.routes.generation()
+    {
+        return Ok(false);
+    }
+    authority.route_blocked = Some(HostedPciRouteBlock {
+        catalog_generation,
+        inventory_generation,
+        route_owner_generation,
+        status,
+    });
+    authority.reconcile_ready = false;
+    Ok(true)
+}
+
+pub(crate) unsafe fn recover_hosted_pci_route_reconciliation_block(
+    catalog_generation: u64,
+    inventory_generation: u64,
+    route_owner_generation: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let authority = (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY))
+        .as_mut()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if authority.route_blocked.is_some_and(|blocked| {
+        blocked.catalog_generation == catalog_generation
+            && blocked.inventory_generation == inventory_generation
+            && blocked.route_owner_generation == route_owner_generation
+    }) {
+        authority.route_blocked = None;
+    }
+    refresh_hosted_pci_route_reconciliation(authority);
+    Ok(())
 }
 
 pub(crate) unsafe fn retry_hosted_pci_route_reconciliation() {
     if let Some(authority) =
         (*core::ptr::addr_of_mut!(HOSTED_PCI_TOPOLOGY)).as_mut()
     {
-        let relevant_dirty = authority
-            .dirty_relations
-            .iter()
-            .any(|dirty| authority.scopes.relation_has_sources(*dirty));
-        authority.reconcile_ready = !authority.scopes.sources().is_empty()
-            && !relevant_dirty
-            && (authority.routes.inventory_generation() != Some(authority.inventory.generation())
-                || authority.routes.provider_scope_generation()
-                    != Some(authority.scopes.generation()));
+        refresh_hosted_pci_route_reconciliation(authority);
     }
 }
 

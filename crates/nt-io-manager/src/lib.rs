@@ -105,10 +105,11 @@ pub use file_information::{
 };
 pub use hosted_domain::{HostedDomainIdentity, HostedDomainRecord, HostedProviderIdentity};
 pub use irp::{
-    BufferAccess, CancelState, CreateParameters, DeviceControlParameters, InformationParameters,
-    IoBufferRef, IoParameters, IoStackLocation, IrpCompletionOrigin, IrpRecord, IrpState,
-    PnpParameters, PnpStartParameters, ReadWriteParameters, SetInformationControl,
-    SetInformationParameters, StackControl, StackFlags,
+    request_input_fingerprint, BufferAccess, CancelState, CreateParameters,
+    DeviceControlParameters, InformationParameters, IoBufferRef, IoParameters, IoStackLocation,
+    IrpCompletionOrigin, IrpRecord, IrpState, PnpParameters, PnpStartParameters,
+    ReadWriteParameters, RequestInputFingerprint, SetInformationControl, SetInformationParameters,
+    StackControl, StackFlags,
 };
 pub use lock_control::{
     LockControlParameters, IRP_MN_LOCK, IRP_MN_UNLOCK_SINGLE, SL_EXCLUSIVE_LOCK,
@@ -5443,13 +5444,14 @@ mod tests {
             ioctl::METHOD_BUFFERED,
             ioctl::FILE_READ_ACCESS | ioctl::FILE_WRITE_ACCESS,
         );
+        let request = b"AeiH\x01\x00\x00\x00\0\0\0\0\0\0\0\0";
         let mut dispatch_output = [0u8; 8];
         let irp_id = match io
             .buffered_device_control_device_payload(
                 client,
                 device,
                 code,
-                b"AeiH\x01\x00\x00\x00\0\0\0\0\0\0\0\0",
+                request,
                 &mut dispatch_output,
             )
             .unwrap()
@@ -5457,7 +5459,15 @@ mod tests {
             ExternalDispatchResult::Pending { irp_id } => irp_id,
             other => panic!("expected pending buffered IOCTL, got {other:?}"),
         };
+        assert_eq!(
+            io.irp(irp_id).unwrap().request_input_fingerprint(),
+            Some(request_input_fingerprint(request))
+        );
         assert_eq!(io.pump(), 1);
+        assert_eq!(
+            io.irp(irp_id).unwrap().request_input_fingerprint(),
+            Some(request_input_fingerprint(request))
+        );
         assert_eq!(io.completed_irp(irp_id).unwrap().information, 0);
         let mut copied = [0u8; 8];
         assert_eq!(
