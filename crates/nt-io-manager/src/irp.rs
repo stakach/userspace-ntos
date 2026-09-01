@@ -526,6 +526,8 @@ pub struct IrpRecord {
     /// Driver-owned context captured by the terminal CREATE result.
     pub completion_file_context: Option<u64>,
     pub completion_origin: Option<IrpCompletionOrigin>,
+    /// One-shot authority consumed when an external PnP owner claims the terminal stack receipt.
+    pub(crate) external_pnp_terminal_receipt_claimed: bool,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
     pub buffer: Option<IoBufferRef>,
@@ -558,6 +560,7 @@ impl IrpRecord {
             information: 0,
             completion_file_context: None,
             completion_origin: None,
+            external_pnp_terminal_receipt_claimed: false,
             stack: Vec::new(),
             current_location: 0,
             buffer: None,

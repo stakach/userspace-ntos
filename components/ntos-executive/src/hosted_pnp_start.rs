@@ -152,6 +152,22 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     pending_device_id: u64,
     pending_filter: Option<PendingHostedPnpFilter>,
     pending_relations_device_id: u64,
+    single_start_evidence: SingleStartEvidence,
+}
+
+pub(crate) enum SingleStartEvidence {
+    Consumed,
+    NotDispatched,
+    Dispatched {
+        irp_id: u64,
+    },
+    Lifecycle {
+        receipt: nt_pnp_manager::StartDeviceLifecycleReceipt,
+    },
+    OwnershipLost {
+        irp_id: u64,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
+    },
 }
 
 struct PendingHostedPnpFilter {
@@ -197,6 +213,7 @@ impl OwnedHostedPnpStartBatch {
             pending_device_id: 0,
             pending_filter: None,
             pending_relations_device_id: 0,
+            single_start_evidence: SingleStartEvidence::NotDispatched,
         }
     }
 
@@ -208,8 +225,82 @@ impl OwnedHostedPnpStartBatch {
         self.report
     }
 
+    /// The live StartDevice path owns exactly one devnode. Keep its canonical START receipt across
+    /// any later initial-BusRelations wait so the outer syscall can join to the retired IRP.
+    pub(crate) fn take_single_start_evidence(&mut self) -> Option<SingleStartEvidence> {
+        if self.spec.devnodes.len() == 1 {
+            let evidence = core::mem::replace(
+                &mut self.single_start_evidence,
+                SingleStartEvidence::Consumed,
+            );
+            assert!(
+                !matches!(evidence, SingleStartEvidence::Consumed),
+                "single-devnode START evidence was consumed twice"
+            );
+            Some(evidence)
+        } else {
+            None
+        }
+    }
+
+    fn retain_start_receipt(&mut self, receipt: nt_pnp_manager::StartDeviceLifecycleReceipt) {
+        if self.spec.devnodes.len() == 1 {
+            assert!(unsafe {
+                driver_launch::hosted_pnp_start_receipt_matches_instance(
+                    &receipt,
+                    &self.spec.devnodes[0].instance_id,
+                )
+            });
+            assert!(
+                matches!(
+                    self.single_start_evidence,
+                    SingleStartEvidence::NotDispatched | SingleStartEvidence::Dispatched { .. }
+                ),
+                "single-devnode START batch produced duplicate lifecycle evidence"
+            );
+            self.single_start_evidence = SingleStartEvidence::Lifecycle { receipt };
+        }
+    }
+
+    fn retain_start_dispatch(&mut self, irp_id: u64) {
+        if self.spec.devnodes.len() == 1 {
+            assert_ne!(irp_id, 0);
+            assert!(matches!(
+                self.single_start_evidence,
+                SingleStartEvidence::NotDispatched
+            ));
+            self.single_start_evidence = SingleStartEvidence::Dispatched { irp_id };
+        }
+    }
+
+    fn retain_start_ownership_lost(
+        &mut self,
+        irp_id: u64,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
+    ) {
+        if self.spec.devnodes.len() == 1 {
+            assert_ne!(irp_id, 0);
+            if let Some(receipt) = receipt.as_ref() {
+                assert_eq!(receipt.dispatch().canonical_irp_id, irp_id);
+                assert!(unsafe {
+                    driver_launch::hosted_pnp_start_receipt_matches_instance(
+                        receipt,
+                        &self.spec.devnodes[0].instance_id,
+                    )
+                });
+            }
+            assert!(matches!(
+                self.single_start_evidence,
+                SingleStartEvidence::NotDispatched | SingleStartEvidence::Dispatched { .. }
+            ));
+            self.single_start_evidence = SingleStartEvidence::OwnershipLost { irp_id, receipt };
+        }
+    }
+
     pub(crate) fn needs_completion_redrive(&self) -> bool {
-        self.pending_filter.is_some()
+        self.pending_filter
+            .as_ref()
+            .is_some_and(|pending| pending.ownership_lost.is_none())
             || self.pending_relations_device_id != 0
             || matches!(
                 self.coordinator.phase(),
@@ -295,10 +386,17 @@ impl OwnedHostedPnpStartBatch {
             .expect("ready START batch rejected completed devnode preparation");
         assert_eq!(token.devnode_index(), devnode_index);
         match progress {
-            HostedPnpDevnodeProgress::Terminal { device_id, status } => {
+            HostedPnpDevnodeProgress::Terminal {
+                device_id,
+                status,
+                receipt,
+            } => {
                 self.coordinator
                     .dispatch_terminal(token)
                     .expect("terminal START did not match dispatched devnode");
+                if let Some(receipt) = receipt {
+                    self.retain_start_receipt(receipt);
+                }
                 if !status.is_success() {
                     self.coordinator
                         .stop()
@@ -311,25 +409,19 @@ impl OwnedHostedPnpStartBatch {
             HostedPnpDevnodeProgress::Pending {
                 device_id, irp_id, ..
             } => {
+                self.retain_start_dispatch(irp_id);
                 self.coordinator
                     .dispatch_pending(token, irp_id)
                     .expect("pending START did not match dispatched devnode");
                 self.pending_device_id = device_id;
                 Some(OwnedHostedPnpStartProgress::AwaitingCompletion)
             }
-            HostedPnpDevnodeProgress::Indeterminate => {
-                self.coordinator
-                    .dispatch_terminal(token)
-                    .expect("indeterminate START did not match dispatched devnode");
-                self.coordinator
-                    .stop()
-                    .expect("indeterminate START could not stop batch");
-                None
-            }
             HostedPnpDevnodeProgress::OwnershipLost {
                 irp_id,
                 transport_status,
+                receipt,
             } => {
+                self.retain_start_ownership_lost(irp_id, receipt);
                 self.coordinator
                     .dispatch_pending(token, irp_id)
                     .expect("lost START did not match dispatched devnode");
@@ -471,7 +563,9 @@ impl OwnedHostedPnpStartBatch {
                 } => {
                     let devnode = &self.spec.devnodes[devnode_index];
                     match observe_canonical_start(irp_id, false, pump_before_observe) {
-                        CanonicalStartDisposition::Terminal { status, .. } => {
+                        CanonicalStartDisposition::Terminal {
+                            status, receipt, ..
+                        } => {
                             assert_eq!(
                                 self.report.pending, 1,
                                 "START pending count lost ownership"
@@ -490,6 +584,9 @@ impl OwnedHostedPnpStartBatch {
                                 false,
                                 &mut self.report,
                             );
+                            if let Some(receipt) = receipt {
+                                self.retain_start_receipt(receipt);
+                            }
                             self.pending_device_id = 0;
                             if !status.is_success() {
                                 self.coordinator
@@ -499,28 +596,11 @@ impl OwnedHostedPnpStartBatch {
                                 return self.schedule_initial_bus_relations(device_id);
                             }
                         }
-                        CanonicalStartDisposition::Indeterminate {
-                            transport_status, ..
-                        } => {
-                            assert_eq!(
-                                self.report.pending, 1,
-                                "START pending count lost ownership"
-                            );
-                            self.report.pending -= 1;
-                            record_start_indeterminate(&mut self.report, transport_status, false);
-                            print_start_indeterminate(
-                                self.options.trace,
-                                &self.spec.service_name,
-                                &devnode.instance_id,
-                                transport_status,
-                            );
-                            self.coordinator
-                                .observe_indeterminate(irp_id)
-                                .expect("exact START indeterminate observation rejected");
-                            self.pending_device_id = 0;
-                        }
                         CanonicalStartDisposition::OwnershipLost {
-                            transport_status, ..
+                            irp_id,
+                            transport_status,
+                            receipt,
+                            ..
                         } => {
                             assert_eq!(
                                 self.report.pending, 1,
@@ -537,6 +617,7 @@ impl OwnedHostedPnpStartBatch {
                             self.coordinator
                                 .lose_ownership(irp_id, transport_status.raw() as u32)
                                 .expect("lost START ownership did not match exact IRP");
+                            self.retain_start_ownership_lost(irp_id, receipt);
                         }
                         CanonicalStartDisposition::Pending { .. } => {
                             return OwnedHostedPnpStartProgress::AwaitingCompletion;
@@ -1339,6 +1420,7 @@ enum HostedPnpDevnodeProgress {
     Terminal {
         device_id: u64,
         status: nt_status::NtStatus,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     },
     Pending {
         device_id: u64,
@@ -1347,6 +1429,7 @@ enum HostedPnpDevnodeProgress {
     OwnershipLost {
         irp_id: u64,
         transport_status: nt_status::NtStatus,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     },
     FilterPending {
         device_id: u64,
@@ -1359,7 +1442,6 @@ enum HostedPnpDevnodeProgress {
         resource_plan: PreparedHostedResourcePlan,
         transport_status: nt_status::NtStatus,
     },
-    Indeterminate,
 }
 
 unsafe fn start_one_devnode<H, C>(
@@ -1392,6 +1474,7 @@ where
             return HostedPnpDevnodeProgress::Terminal {
                 device_id: 0,
                 status,
+                receipt: None,
             };
         }
     };
@@ -1422,6 +1505,7 @@ where
             return HostedPnpDevnodeProgress::Terminal {
                 device_id: 0,
                 status,
+                receipt: None,
             };
         }
     }
@@ -1524,6 +1608,7 @@ where
             HostedPnpDevnodeProgress::Terminal {
                 device_id: 0,
                 status,
+                receipt: None,
             }
         }
     }
@@ -1550,6 +1635,7 @@ unsafe fn finish_filter_failure(
     HostedPnpDevnodeProgress::Terminal {
         device_id: 0,
         status,
+        receipt: None,
     }
 }
 
@@ -1582,6 +1668,7 @@ unsafe fn start_filtered_devnode(
                 Err(status) => CanonicalStartDisposition::Terminal {
                     status: rollback_pre_dispatch_start(device_id, status),
                     waited: false,
+                    receipt: None,
                 },
             }
         }
@@ -1591,6 +1678,7 @@ unsafe fn start_filtered_devnode(
                 Err(status) => CanonicalStartDisposition::Terminal {
                     status: rollback_pre_dispatch_start(device_id, status),
                     waited: false,
+                    receipt: None,
                 },
             }
         }
@@ -1600,11 +1688,16 @@ unsafe fn start_filtered_devnode(
             CanonicalStartDisposition::Terminal {
                 status,
                 waited: false,
+                receipt: None,
             }
         }
     };
     match start_status {
-        CanonicalStartDisposition::Terminal { status, waited } => {
+        CanonicalStartDisposition::Terminal {
+            status,
+            waited,
+            receipt,
+        } => {
             finish_started_devnode(
                 device_id,
                 service_name,
@@ -1617,19 +1710,13 @@ unsafe fn start_filtered_devnode(
             HostedPnpDevnodeProgress::Terminal {
                 device_id: status.is_success().then_some(device_id).unwrap_or(0),
                 status,
+                receipt,
             }
-        }
-        CanonicalStartDisposition::Indeterminate {
-            transport_status,
-            waited,
-        } => {
-            record_start_indeterminate(report, transport_status, waited);
-            print_start_indeterminate(options.trace, service_name, instance_id, transport_status);
-            HostedPnpDevnodeProgress::Indeterminate
         }
         CanonicalStartDisposition::OwnershipLost {
             irp_id,
             transport_status,
+            receipt,
             observed_driver_pending,
         } => {
             record_start_indeterminate(report, transport_status, observed_driver_pending);
@@ -1637,6 +1724,7 @@ unsafe fn start_filtered_devnode(
             HostedPnpDevnodeProgress::OwnershipLost {
                 irp_id,
                 transport_status,
+                receipt,
             }
         }
         CanonicalStartDisposition::Pending {
@@ -1655,10 +1743,7 @@ enum CanonicalStartDisposition {
     Terminal {
         status: nt_status::NtStatus,
         waited: bool,
-    },
-    Indeterminate {
-        transport_status: nt_status::NtStatus,
-        waited: bool,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     },
     Pending {
         irp_id: u64,
@@ -1668,6 +1753,7 @@ enum CanonicalStartDisposition {
         irp_id: u64,
         transport_status: nt_status::NtStatus,
         observed_driver_pending: bool,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     },
 }
 
@@ -1681,24 +1767,31 @@ unsafe fn canonical_start_status(
         raw_resource_list,
         translated_resource_list,
     ) {
-        Ok(driver_launch::HostedPnpStartOutcome::Started) => CanonicalStartDisposition::Terminal {
-            status: nt_status::NtStatus::SUCCESS,
-            waited: false,
-        },
-        Ok(driver_launch::HostedPnpStartOutcome::Failed(status)) => {
+        Ok(driver_launch::HostedPnpStartOutcome::Started { receipt }) => {
+            CanonicalStartDisposition::Terminal {
+                status: nt_status::NtStatus::SUCCESS,
+                waited: false,
+                receipt: Some(receipt),
+            }
+        }
+        Ok(driver_launch::HostedPnpStartOutcome::Failed { status, receipt }) => {
             CanonicalStartDisposition::Terminal {
                 status,
                 waited: false,
+                receipt: Some(receipt),
             }
         }
         Ok(driver_launch::HostedPnpStartOutcome::Pending { irp_id }) => {
             observe_canonical_start(irp_id, true, true)
         }
         Ok(driver_launch::HostedPnpStartOutcome::Indeterminate {
-            transport_status, ..
-        }) => CanonicalStartDisposition::Indeterminate {
+            irp_id,
             transport_status,
-            waited: false,
+        }) => CanonicalStartDisposition::OwnershipLost {
+            irp_id,
+            transport_status,
+            observed_driver_pending: false,
+            receipt: None,
         },
         Ok(driver_launch::HostedPnpStartOutcome::RepairRequired { irp_id, .. }) => {
             observe_canonical_start(irp_id, false, true)
@@ -1706,10 +1799,12 @@ unsafe fn canonical_start_status(
         Err(failure) if failure.rollback_safe => CanonicalStartDisposition::Terminal {
             status: rollback_pre_dispatch_start(device_id, failure.status),
             waited: false,
+            receipt: None,
         },
         Err(failure) => CanonicalStartDisposition::Terminal {
             status: failure.status,
             waited: false,
+            receipt: None,
         },
     }
 }
@@ -1723,18 +1818,23 @@ unsafe fn observe_canonical_start(
         driver_launch::pump_hosted_io_completions();
     }
     match driver_launch::observe_hosted_pnp_start(irp_id) {
-        Ok(driver_launch::HostedPnpStartObservation::Terminal { driver_status }) => {
-            CanonicalStartDisposition::Terminal {
-                status: driver_status,
-                waited: driver_pending,
-            }
-        }
-        Ok(driver_launch::HostedPnpStartObservation::Indeterminate { transport_status }) => {
-            CanonicalStartDisposition::Indeterminate {
-                transport_status,
-                waited: driver_pending,
-            }
-        }
+        Ok(driver_launch::HostedPnpStartObservation::Terminal {
+            driver_status,
+            receipt,
+        }) => CanonicalStartDisposition::Terminal {
+            status: driver_status,
+            waited: driver_pending,
+            receipt: Some(receipt),
+        },
+        Ok(driver_launch::HostedPnpStartObservation::Indeterminate {
+            transport_status,
+            receipt,
+        }) => CanonicalStartDisposition::OwnershipLost {
+            irp_id,
+            transport_status,
+            observed_driver_pending: driver_pending,
+            receipt,
+        },
         Ok(driver_launch::HostedPnpStartObservation::AwaitingCompletion) => {
             CanonicalStartDisposition::Pending {
                 irp_id,
@@ -1745,6 +1845,7 @@ unsafe fn observe_canonical_start(
             irp_id,
             transport_status,
             observed_driver_pending: driver_pending,
+            receipt: None,
         },
     }
 }

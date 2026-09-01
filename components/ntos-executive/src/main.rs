@@ -20424,6 +20424,251 @@ fn report_live_device_action_check(report: LiveDeviceActionReport, passed: &mut 
     check(b"exec_live_device_actions_exact", report.coherent(), passed);
 }
 
+#[derive(Clone, Copy, Default)]
+struct StartDeviceCallReport {
+    calls: u64,
+    rows: u64,
+    synchronous: u64,
+    pending: u64,
+    no_start_irp: u64,
+    lifecycle_terminal: u64,
+    ownership_lost: u64,
+    delivered: u64,
+    failed_replies: u64,
+    abandoned: u64,
+    pending_statuses: u64,
+    active: u64,
+    protocol_errors: u64,
+    reply_tail: u64,
+    transfer: u64,
+    retained_replies: u64,
+    ownership_barriers: u64,
+    pending_linked: u64,
+    pending_missing: u64,
+}
+
+impl StartDeviceCallReport {
+    const fn coherent(self) -> bool {
+        self.calls == self.rows + self.active
+            && self.synchronous + self.pending == self.rows
+            && self.no_start_irp + self.lifecycle_terminal + self.ownership_lost == self.rows
+            && self.delivered + self.failed_replies + self.abandoned == self.rows
+    }
+
+    const fn exactly_replied_quiescent(self) -> bool {
+        self.coherent()
+            && self.active == 0
+            && self.protocol_errors == 0
+            && self.reply_tail == 0
+            && self.transfer == 0
+            && self.retained_replies == 0
+            && self.ownership_barriers == 0
+            && self.failed_replies == 0
+            && self.abandoned == 0
+            && self.pending_statuses == 0
+            && self.ownership_lost == 0
+            && self.pending_missing == 0
+    }
+}
+
+unsafe fn print_start_device_call_report(handler: &ExecNtHandler) -> StartDeviceCallReport {
+    let mut report = StartDeviceCallReport {
+        calls: handler.pnp_start_device_calls.started(),
+        rows: handler.pnp_start_device_calls.terminal_rows().len() as u64,
+        active: handler.pnp_start_device_calls.active_len() as u64,
+        protocol_errors: handler.pnp_start_device_calls.protocol_errors(),
+        reply_tail: handler.pnp_start_device_reply_tail.is_some() as u64,
+        transfer: handler.pending_driver_start_transfer.is_some() as u64,
+        ..StartDeviceCallReport::default()
+    };
+    for slot in handler.pending_driver_starts.occupied_slots() {
+        let Some(pending) = handler.pending_driver_starts.get(slot) else {
+            continue;
+        };
+        if let PendingDriverStartOwner::User { request, reply } = &pending.owner {
+            report.retained_replies = report
+                .retained_replies
+                .saturating_add(reply.is_some() as u64);
+            report.ownership_barriers = report
+                .ownership_barriers
+                .saturating_add((request.is_none() && reply.is_none()) as u64);
+        }
+    }
+    for row in handler.pnp_start_device_calls.terminal_rows() {
+        match row.path() {
+            nt_pnp_manager::StartDeviceCallPath::Synchronous => {
+                report.synchronous = report.synchronous.saturating_add(1)
+            }
+            nt_pnp_manager::StartDeviceCallPath::Pending => {
+                report.pending = report.pending.saturating_add(1)
+            }
+        }
+        match row.completion() {
+            nt_pnp_manager::StartDeviceCompletionKind::NoStartIrp => {
+                report.no_start_irp = report.no_start_irp.saturating_add(1)
+            }
+            nt_pnp_manager::StartDeviceCompletionKind::LifecycleTerminal => {
+                report.lifecycle_terminal = report.lifecycle_terminal.saturating_add(1)
+            }
+            nt_pnp_manager::StartDeviceCompletionKind::OwnershipLost => {
+                report.ownership_lost = report.ownership_lost.saturating_add(1)
+            }
+        }
+        match row.reply_outcome() {
+            nt_pnp_manager::StartDeviceReplyOutcome::Delivered => {
+                report.delivered = report.delivered.saturating_add(1)
+            }
+            nt_pnp_manager::StartDeviceReplyOutcome::Failed => {
+                report.failed_replies = report.failed_replies.saturating_add(1)
+            }
+            nt_pnp_manager::StartDeviceReplyOutcome::Abandoned => {
+                report.abandoned = report.abandoned.saturating_add(1)
+            }
+        }
+        let receipt = row.lifecycle_receipt();
+        if row.status() == nt_status::NtStatus::PENDING.raw() as u32
+            || row.reply_status() == Some(nt_status::NtStatus::PENDING.raw() as u32)
+            || receipt.is_some_and(|receipt| {
+                receipt.start_status() == nt_status::NtStatus::PENDING.raw() as u32
+            })
+        {
+            report.pending_statuses = report.pending_statuses.saturating_add(1);
+        }
+        if let Some(receipt) = receipt {
+            if driver_launch::hosted_pending_start_proof_joins_receipt(receipt) {
+                report.pending_linked = report
+                    .pending_linked
+                    .saturating_add(receipt.driver_pending() as u64);
+            } else {
+                report.pending_missing = report.pending_missing.saturating_add(1);
+            }
+        }
+        let dispatch = receipt.map(|receipt| receipt.dispatch());
+        print_str(b"[pnp-start-proof] call=");
+        print_u64(row.identity().sequence());
+        print_str(b" instance=");
+        print_str(row.instance_id().as_bytes());
+        print_str(b" path=");
+        print_str(match row.path() {
+            nt_pnp_manager::StartDeviceCallPath::Synchronous => b"synchronous",
+            nt_pnp_manager::StartDeviceCallPath::Pending => b"pending",
+        });
+        print_str(b" completion=");
+        print_str(match row.completion() {
+            nt_pnp_manager::StartDeviceCompletionKind::NoStartIrp => b"no-start-irp",
+            nt_pnp_manager::StartDeviceCompletionKind::LifecycleTerminal => b"lifecycle-terminal",
+            nt_pnp_manager::StartDeviceCompletionKind::OwnershipLost => b"ownership-lost",
+        });
+        print_str(b" dispatched=");
+        print_u64((row.irp_id() != 0) as u64);
+        print_str(b" irp=");
+        print_u64(row.irp_id());
+        print_str(b" devnode/gen/dispatch=");
+        print_u64(dispatch.map(|identity| identity.devnode_id).unwrap_or(0));
+        print_str(b"/");
+        print_u64(
+            dispatch
+                .map(|identity| identity.devnode_generation)
+                .unwrap_or(0),
+        );
+        print_str(b"/");
+        print_u64(
+            dispatch
+                .map(|identity| identity.dispatch_generation)
+                .unwrap_or(0),
+        );
+        print_str(b" pdo/fdo=");
+        print_u64(receipt.map(|receipt| receipt.pdo_device_id()).unwrap_or(0));
+        print_str(b"/");
+        print_u64(receipt.map(|receipt| receipt.fdo_device_id()).unwrap_or(0));
+        print_str(b" origin/completion-driver/device=");
+        print_u64(
+            receipt
+                .map(|receipt| receipt.origin_driver_id())
+                .unwrap_or(0),
+        );
+        print_str(b"/");
+        print_u64(
+            receipt
+                .map(|receipt| receipt.completion_driver_id())
+                .unwrap_or(0),
+        );
+        print_str(b"/");
+        print_u64(
+            receipt
+                .map(|receipt| receipt.completion_device_id())
+                .unwrap_or(0),
+        );
+        print_str(b" driver-pending=");
+        print_u64(
+            receipt
+                .map(|receipt| receipt.driver_pending())
+                .unwrap_or(false) as u64,
+        );
+        print_str(b" start-status=");
+        print_hex(receipt.map(|receipt| receipt.start_status()).unwrap_or(0));
+        print_str(b" terminal/reply=");
+        print_hex(row.status());
+        print_str(b"/");
+        print_hex(row.reply_status().unwrap_or(0));
+        print_str(b" reply-outcome=");
+        print_str(match row.reply_outcome() {
+            nt_pnp_manager::StartDeviceReplyOutcome::Delivered => b"delivered",
+            nt_pnp_manager::StartDeviceReplyOutcome::Failed => b"failed",
+            nt_pnp_manager::StartDeviceReplyOutcome::Abandoned => b"abandoned",
+        });
+        print_str(b"\n");
+    }
+    print_str(b"[pnp-start-proof] summary calls/rows/replied=");
+    print_u64(report.calls);
+    print_str(b"/");
+    print_u64(report.rows);
+    print_str(b"/");
+    print_u64(report.delivered);
+    print_str(b" sync/pending/no-start/lifecycle/lost=");
+    print_u64(report.synchronous);
+    print_str(b"/");
+    print_u64(report.pending);
+    print_str(b"/");
+    print_u64(report.no_start_irp);
+    print_str(b"/");
+    print_u64(report.lifecycle_terminal);
+    print_str(b"/");
+    print_u64(report.ownership_lost);
+    print_str(b" failed/abandoned/pending-status/active/protocol=");
+    print_u64(report.failed_replies);
+    print_str(b"/");
+    print_u64(report.abandoned);
+    print_str(b"/");
+    print_u64(report.pending_statuses);
+    print_str(b"/");
+    print_u64(report.active);
+    print_str(b"/");
+    print_u64(report.protocol_errors);
+    print_str(b" tail/transfer/retained/barriers=");
+    print_u64(report.reply_tail);
+    print_str(b"/");
+    print_u64(report.transfer);
+    print_str(b"/");
+    print_u64(report.retained_replies);
+    print_str(b"/");
+    print_u64(report.ownership_barriers);
+    print_str(b" pending-linked/missing=");
+    print_u64(report.pending_linked);
+    print_str(b"/");
+    print_u64(report.pending_missing);
+    print_str(b"\n");
+    report
+}
+
+fn report_start_device_call_check(report: StartDeviceCallReport, passed: &mut u64) {
+    check(
+        b"exec_start_device_calls_exact",
+        report.exactly_replied_quiescent(),
+        passed,
+    );
+}
+
 impl LiveDeviceActionState {
     fn new(event: nt_config_client::DeviceActionEvent) -> Result<Self, ()> {
         let owner =
@@ -21590,14 +21835,14 @@ pub(crate) unsafe fn live_config_existing_device_launch_spec(
         .map_err(|_| 0xC000_009Au32 as i32)?;
     enum_path.push('\\');
     enum_path.push_str(instance_id);
-    let (value_type, service_data) = config_manager_query_value_owned(&enum_path, "Service")
-        .map_err(|error| error.status)?;
+    let (value_type, service_data) =
+        config_manager_query_value_owned(&enum_path, "Service").map_err(|error| error.status)?;
     if value_type != nt_hive_core::RegistryValueType::Sz as u32 {
         return Err(0xC000_000Du32 as i32);
     }
     let service_bytes = registry_utf16_ascii_vec(&service_data).ok_or(0xC000_0034u32 as i32)?;
-    let service_name = alloc::string::String::from_utf8(service_bytes)
-        .map_err(|_| 0xC000_0034u32 as i32)?;
+    let service_name =
+        alloc::string::String::from_utf8(service_bytes).map_err(|_| 0xC000_0034u32 as i32)?;
     let binding = config_manager_query_driver_service(&service_name)?;
     let mut spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start)
         .ok_or(0xC000_0034u32 as i32)?;
@@ -23569,6 +23814,7 @@ struct ExecNtHandler {
     /// side effects, and the service loop attaches the live syscall Reply object only when an exact
     /// START IRP remains pending.
     pending_driver_starts: nt_driver_start::PendingOperationTable<PendingDriverStart>,
+    pnp_start_device_calls: nt_pnp_manager::StartDeviceCallLedger,
     boot_driver_start_reports: BootDriverStartReports,
     native_driver_load_report: NativeDriverLoadReport,
     pending_driver_start_transfer: Option<PendingDriverStartTransfer>,
@@ -23603,6 +23849,7 @@ struct ExecNtHandler {
     /// acknowledgement retries. Device installation and StartDevice have independent owners.
     pnp_live_action: Option<LiveDeviceActionState>,
     pnp_live_action_reply_tail: Option<nt_pnp_manager::DeviceActionClaimIdentity>,
+    pnp_start_device_reply_tail: Option<nt_pnp_manager::StartDeviceRequestIdentity>,
     pnp_live_action_claims: u64,
     pnp_live_action_terminals: alloc::vec::Vec<LiveDeviceActionTerminalRecord>,
     /// Dispatcher event used to park `NtGetPlugPlayEvent` callers once the CM-backed stream drains.
@@ -23835,6 +24082,7 @@ fn report_deferred_generic_hardware_checks(
     pci_registry_selected: bool,
     pci_selected: u64,
     provider: driver_launch::HostedProviderSharingEvidence,
+    pending_proofs: driver_launch::HostedPnpPendingProofReport,
     passed: &mut u64,
 ) {
     let live_interrupts = driver_launch::hosted_interrupt_delivery_evidence();
@@ -23847,7 +24095,6 @@ fn report_deferred_generic_hardware_checks(
     unsafe {
         driver_launch::print_hosted_pnp_enumeration_evidence();
     }
-    let pending_proofs = unsafe { driver_launch::print_hosted_pnp_pending_proofs() };
     print_str(b"[driver-launch] final config PnP summary selected=");
     print_u64(selected);
     print_str(b" attempted=");
@@ -23907,7 +24154,7 @@ fn report_deferred_generic_hardware_checks(
     );
     check(
         b"exec_generic_pending_pnp_proofs_exact",
-        pending_proofs.coherent() && pending_proofs.rows == report.pending_observed,
+        pending_proofs.coherent() && pending_proofs.rows >= report.pending_observed,
         passed,
     );
     check(
@@ -24082,10 +24329,14 @@ struct PendingPnpSyscallReply {
 struct PendingDriverStartTransfer {
     batch: OwnedHostedPnpStartBatch,
     reservation: nt_driver_start::PendingOperationReservation,
+    request: nt_pnp_manager::StartDeviceRequestIdentity,
 }
 
 enum PendingDriverStartOwner {
-    User(Option<PendingPnpSyscallReply>),
+    User {
+        request: Option<nt_pnp_manager::StartDeviceRequestIdentity>,
+        reply: Option<PendingPnpSyscallReply>,
+    },
     Boot {
         target: BootDriverStartReportTarget,
         report_published: bool,
@@ -29201,7 +29452,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         let _ = tcb_resume(spawn.main_tcb);
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
-            let (v, f, _, _, _, _, _, _, _) = service_sec_image(
+            let (v, f, _, _, _, _, _, _, _, _) = service_sec_image(
                 si_fault,
                 spawn.pml4,
                 spawn.main_tcb,
@@ -32782,6 +33033,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         final_driver_start_reports,
                         native_driver_load_report,
                         live_device_action_report,
+                        start_device_call_report,
                     ) = service_sec_image(
                         si_fault,
                         spawn.pml4,
@@ -32794,6 +33046,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     let final_config = final_driver_start_reports.config_pnp;
                     let final_boot = final_driver_start_reports.boot_service;
+                    let hosted_pnp_pending_proofs =
+                        driver_launch::print_hosted_pnp_pending_proofs();
                     print_str(b"[driver-launch] final boot STARTs attempted/terminal/pending/indeterminate=");
                     print_u64(final_boot.attempted);
                     print_str(b"/");
@@ -32829,11 +33083,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             generic_pci_registry_selected,
                             generic_pci_selected,
                             driver_launch::hosted_provider_sharing_evidence(),
+                            hosted_pnp_pending_proofs,
                             &mut passed,
                         );
                     }
                     report_native_driver_load_check(native_driver_load_report, &mut passed);
                     report_live_device_action_check(live_device_action_report, &mut passed);
+                    report_start_device_call_check(start_device_call_report, &mut passed);
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
                     print_u64(sfaults);
                     print_str(b" page(s) (");

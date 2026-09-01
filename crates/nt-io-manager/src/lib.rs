@@ -96,7 +96,8 @@ pub use ea::{
     EaValidationError, QueryEaParameters, SetEaParameters,
 };
 pub use external_dispatch::{
-    ExternalDispatchResult, ExternalPnpDispatchResult, PreparedExternalPnpIrp,
+    ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
+    PreparedExternalPnpIrp,
 };
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use file_information::{
@@ -2701,13 +2702,24 @@ mod tests {
         assert_eq!(irp.origin_device_id, pdo);
         assert_eq!(irp.current_stack().unwrap().device_id, pdo);
         assert_eq!(irp.current_stack().unwrap().driver_id, driver);
-        assert_eq!(
-            io.dispatch_prepared_external_pnp(prepared),
+        let receipt = match io.dispatch_prepared_external_pnp(prepared) {
             ExternalPnpDispatchResult::Returned {
-                status: NtStatus::SUCCESS,
-                information: 0,
+                status,
+                information,
+                receipt,
+            } => {
+                assert_eq!(status, NtStatus::SUCCESS);
+                assert_eq!(information, 0);
+                receipt
             }
-        );
+            outcome => panic!("unexpected external PnP outcome: {outcome:?}"),
+        };
+        assert_eq!(receipt.origin_driver_id(), driver);
+        assert_eq!(receipt.origin_device_id(), pdo);
+        assert_eq!(receipt.completion_driver_id(), driver);
+        assert_eq!(receipt.completion_device_id(), pdo);
+        assert_eq!(receipt.minor(), nt_pnp_abi::IRP_MN_QUERY_ID);
+        assert!(!receipt.driver_pending());
     }
 
     #[test]
@@ -2730,13 +2742,21 @@ mod tests {
             .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
             .unwrap();
         let returned_id = prepared.irp_id();
-        assert_eq!(
-            returned_io.dispatch_prepared_external_pnp(prepared),
+        let returned_receipt = match returned_io.dispatch_prepared_external_pnp(prepared) {
             ExternalPnpDispatchResult::Returned {
-                status: warning,
-                information: 7,
+                status,
+                information,
+                receipt,
+            } => {
+                assert_eq!(status, warning);
+                assert_eq!(information, 7);
+                receipt
             }
-        );
+            outcome => panic!("unexpected external PnP outcome: {outcome:?}"),
+        };
+        assert_eq!(returned_receipt.irp_id(), returned_id);
+        assert_eq!(returned_receipt.completion_device_id(), function);
+        assert!(!returned_receipt.driver_pending());
         assert!(returned_io.irp(returned_id).is_none());
         assert_eq!(seen.borrow()[0].device_id, function);
 
@@ -2747,13 +2767,19 @@ mod tests {
             .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
             .unwrap();
         let failed_id = prepared.irp_id();
-        assert_eq!(
-            failed_io.dispatch_prepared_external_pnp(prepared),
+        match failed_io.dispatch_prepared_external_pnp(prepared) {
             ExternalPnpDispatchResult::Returned {
-                status: NtStatus::ACCESS_DENIED,
-                information: 0,
+                status,
+                information,
+                receipt,
+            } => {
+                assert_eq!(status, NtStatus::ACCESS_DENIED);
+                assert_eq!(information, 0);
+                assert_eq!(receipt.status(), status);
+                assert!(!receipt.driver_pending());
             }
-        );
+            outcome => panic!("unexpected external PnP outcome: {outcome:?}"),
+        }
         assert!(failed_io.irp(failed_id).is_none());
 
         let mut pending_io = io();
@@ -2782,6 +2808,25 @@ mod tests {
         let completion = pending_io.completed_irp(pending_id).unwrap();
         assert_eq!(completion.minor, nt_pnp_abi::IRP_MN_QUERY_STOP_DEVICE);
         assert_eq!(completion.completion_origin, IrpCompletionOrigin::Driver);
+        let receipt = pending_io
+            .take_completed_external_pnp_receipt(pending_id)
+            .expect("pending PnP completion did not mint its terminal receipt");
+        assert_eq!(receipt.irp_id(), pending_id);
+        assert_eq!(receipt.origin_driver_id(), completion.driver_id);
+        assert_eq!(receipt.origin_device_id(), completion.device_id);
+        assert_eq!(
+            receipt.completion_driver_id(),
+            completion.completion_driver_id
+        );
+        assert_eq!(
+            receipt.completion_device_id(),
+            completion.completion_device_id
+        );
+        assert_eq!(receipt.status(), completion.status);
+        assert!(receipt.driver_pending());
+        assert!(pending_io
+            .take_completed_external_pnp_receipt(pending_id)
+            .is_none());
         pending_io.acknowledge_completed_irp(pending_id).unwrap();
 
         let mut indeterminate_io = io();
@@ -2835,13 +2880,19 @@ mod tests {
             .unwrap();
         let irp_id = prepared.irp_id();
 
-        assert_eq!(
-            io.dispatch_prepared_external_pnp(prepared),
+        match io.dispatch_prepared_external_pnp(prepared) {
             ExternalPnpDispatchResult::Returned {
-                status: NtStatus::NOT_SUPPORTED,
-                information: 0,
+                status,
+                information,
+                receipt,
+            } => {
+                assert_eq!(status, NtStatus::NOT_SUPPORTED);
+                assert_eq!(information, 0);
+                assert_eq!(receipt.irp_id(), irp_id);
+                assert_eq!(receipt.status(), status);
             }
-        );
+            outcome => panic!("unexpected external PnP outcome: {outcome:?}"),
+        }
         assert!(io.irp(irp_id).is_none());
     }
 
@@ -2868,14 +2919,20 @@ mod tests {
                 &initialized,
             )
             .unwrap();
-        assert_eq!(
-            io.dispatch_prepared_external_pnp(prepared),
+        match io.dispatch_prepared_external_pnp(prepared) {
             ExternalPnpDispatchResult::ReturnedPayload {
-                status: NtStatus::SUCCESS,
-                information: 0,
-                payload: returned,
+                status,
+                information,
+                payload,
+                receipt,
+            } => {
+                assert_eq!(status, NtStatus::SUCCESS);
+                assert_eq!(information, 0);
+                assert_eq!(payload, returned);
+                assert_eq!(receipt.status(), status);
             }
-        );
+            outcome => panic!("unexpected external PnP outcome: {outcome:?}"),
+        }
         let recorded = &seen.borrow()[0];
         assert_eq!(recorded.input_len, 64);
         assert_eq!(recorded.output_len, 64);
@@ -3589,13 +3646,7 @@ mod tests {
         assert!(function_seen.borrow().is_empty());
 
         assert_eq!(
-            om.buffered_device_control_device_payload(
-                client,
-                pdo,
-                code,
-                b"request",
-                &mut output,
-            ),
+            om.buffered_device_control_device_payload(client, pdo, code, b"request", &mut output,),
             Ok(ExternalDispatchResult::Completed {
                 status: NtStatus::SUCCESS,
                 information: 0,

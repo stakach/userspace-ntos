@@ -219,6 +219,538 @@ impl DeviceActionOwner {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StartDeviceRequestIdentity {
+    sequence: u64,
+}
+
+impl StartDeviceRequestIdentity {
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StartDeviceCompletionKind {
+    NoStartIrp,
+    LifecycleTerminal,
+    OwnershipLost,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StartDeviceCallPath {
+    Synchronous,
+    Pending,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StartDeviceReplyOutcome {
+    Delivered,
+    Failed,
+    Abandoned,
+}
+
+const STATUS_PENDING: u32 = 0x0000_0103;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ActiveStartDeviceReply {
+    Awaiting,
+    Delivered { status: u32 },
+    Failed { status: u32 },
+    Abandoned,
+}
+
+/// Manager-minted proof that one exact canonical START IRP retired into its terminal devnode
+/// state. All fields are private so syscall/reply code can carry and inspect this receipt but
+/// cannot manufacture lifecycle completion from a status value.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartDeviceLifecycleReceipt {
+    dispatch: PnpDispatchIdentity,
+    pdo_device_id: u64,
+    fdo_device_id: u64,
+    origin_driver_id: u64,
+    completion_driver_id: u64,
+    completion_device_id: u64,
+    driver_pending: bool,
+    start_status: u32,
+}
+
+struct StartDeviceIoTerminalIdentity {
+    irp_id: u64,
+    pdo_device_id: u64,
+    origin_driver_id: u64,
+    completion_driver_id: u64,
+    completion_device_id: u64,
+    minor: u8,
+    driver_pending: bool,
+    start_status: u32,
+}
+
+impl StartDeviceLifecycleReceipt {
+    pub const fn dispatch(&self) -> PnpDispatchIdentity {
+        self.dispatch
+    }
+
+    pub const fn pdo_device_id(&self) -> u64 {
+        self.pdo_device_id
+    }
+
+    pub const fn fdo_device_id(&self) -> u64 {
+        self.fdo_device_id
+    }
+
+    pub const fn origin_driver_id(&self) -> u64 {
+        self.origin_driver_id
+    }
+
+    pub const fn completion_driver_id(&self) -> u64 {
+        self.completion_driver_id
+    }
+
+    pub const fn completion_device_id(&self) -> u64 {
+        self.completion_device_id
+    }
+
+    pub const fn driver_pending(&self) -> bool {
+        self.driver_pending
+    }
+
+    pub const fn start_status(&self) -> u32 {
+        self.start_status
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartDeviceCompletion {
+    NoStartIrp {
+        status: u32,
+    },
+    Lifecycle {
+        receipt: StartDeviceLifecycleReceipt,
+        status: u32,
+    },
+    OwnershipLost {
+        irp_id: u64,
+        receipt: Option<StartDeviceLifecycleReceipt>,
+        status: u32,
+    },
+}
+
+impl StartDeviceCompletion {
+    const fn kind(&self) -> StartDeviceCompletionKind {
+        match self {
+            Self::NoStartIrp { .. } => StartDeviceCompletionKind::NoStartIrp,
+            Self::Lifecycle { .. } => StartDeviceCompletionKind::LifecycleTerminal,
+            Self::OwnershipLost { .. } => StartDeviceCompletionKind::OwnershipLost,
+        }
+    }
+
+    const fn status(&self) -> u32 {
+        match self {
+            Self::NoStartIrp { status }
+            | Self::Lifecycle { status, .. }
+            | Self::OwnershipLost { status, .. } => *status,
+        }
+    }
+
+    const fn irp_id(&self) -> u64 {
+        match self {
+            Self::Lifecycle { receipt, .. } => receipt.dispatch.canonical_irp_id,
+            Self::OwnershipLost { irp_id, .. } => *irp_id,
+            Self::NoStartIrp { .. } => 0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct StartDeviceTerminalRecord {
+    identity: StartDeviceRequestIdentity,
+    instance_id: String,
+    completion: StartDeviceCompletionKind,
+    path: StartDeviceCallPath,
+    lifecycle_receipt: Option<StartDeviceLifecycleReceipt>,
+    irp_id: u64,
+    status: u32,
+    reply_status: Option<u32>,
+    reply_outcome: StartDeviceReplyOutcome,
+}
+
+impl StartDeviceTerminalRecord {
+    pub const fn identity(&self) -> StartDeviceRequestIdentity {
+        self.identity
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub const fn completion(&self) -> StartDeviceCompletionKind {
+        self.completion
+    }
+
+    pub const fn path(&self) -> StartDeviceCallPath {
+        self.path
+    }
+
+    pub const fn lifecycle_receipt(&self) -> Option<&StartDeviceLifecycleReceipt> {
+        self.lifecycle_receipt.as_ref()
+    }
+
+    pub const fn irp_id(&self) -> u64 {
+        self.irp_id
+    }
+
+    pub const fn status(&self) -> u32 {
+        self.status
+    }
+
+    pub const fn reply_status(&self) -> Option<u32> {
+        self.reply_status
+    }
+
+    pub const fn reply_outcome(&self) -> StartDeviceReplyOutcome {
+        self.reply_outcome
+    }
+
+    pub const fn reply_matches(&self) -> bool {
+        matches!(self.reply_outcome, StartDeviceReplyOutcome::Delivered)
+            && matches!(self.reply_status, Some(status) if status == self.status)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ActiveStartDeviceRequest {
+    identity: StartDeviceRequestIdentity,
+    instance_id: String,
+    path: StartDeviceCallPath,
+    completion: Option<StartDeviceCompletion>,
+    reply: ActiveStartDeviceReply,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StartDeviceLedgerError {
+    InvalidInstance,
+    SequenceExhausted,
+    AllocationFailed,
+    UnknownRequest,
+    WrongPhase,
+    ReplyFailed,
+}
+
+/// Exact syscall-result ledger for instance-addressed `PlugPlayControlStartDevice` requests.
+///
+/// Device lifecycle ownership remains in the PnP/IRP machinery. This ledger proves the separate
+/// user contract: every accepted request reaches one terminal classification and that exact status
+/// is delivered through its syscall reply. Terminal capacity is reserved while the request is
+/// active so a pending completion cannot disappear because proof publication allocates late.
+#[derive(Default)]
+pub struct StartDeviceCallLedger {
+    next_sequence: u64,
+    started: u64,
+    active: Vec<ActiveStartDeviceRequest>,
+    terminal: Vec<StartDeviceTerminalRecord>,
+    protocol_errors: u64,
+}
+
+impl StartDeviceCallLedger {
+    pub const fn new() -> Self {
+        Self {
+            next_sequence: 1,
+            started: 0,
+            active: Vec::new(),
+            terminal: Vec::new(),
+            protocol_errors: 0,
+        }
+    }
+
+    pub fn begin(
+        &mut self,
+        instance_id: &str,
+    ) -> Result<StartDeviceRequestIdentity, StartDeviceLedgerError> {
+        if instance_id.is_empty() {
+            return Err(StartDeviceLedgerError::InvalidInstance);
+        }
+        if self.next_sequence == 0 {
+            return Err(StartDeviceLedgerError::SequenceExhausted);
+        }
+        let required_terminal_spare = self.active.len().saturating_add(1);
+        let terminal_spare = self.terminal.capacity().saturating_sub(self.terminal.len());
+        if terminal_spare < required_terminal_spare {
+            self.terminal
+                .try_reserve(required_terminal_spare)
+                .map_err(|_| StartDeviceLedgerError::AllocationFailed)?;
+            if self.terminal.capacity().saturating_sub(self.terminal.len())
+                < required_terminal_spare
+            {
+                return Err(StartDeviceLedgerError::AllocationFailed);
+            }
+        }
+        self.active
+            .try_reserve(1)
+            .map_err(|_| StartDeviceLedgerError::AllocationFailed)?;
+        let mut owned_instance = String::new();
+        owned_instance
+            .try_reserve_exact(instance_id.len())
+            .map_err(|_| StartDeviceLedgerError::AllocationFailed)?;
+        owned_instance.push_str(instance_id);
+        let identity = StartDeviceRequestIdentity {
+            sequence: self.next_sequence,
+        };
+        self.next_sequence = self.next_sequence.checked_add(1).unwrap_or(0);
+        self.started = self.started.saturating_add(1);
+        self.active.push(ActiveStartDeviceRequest {
+            identity,
+            instance_id: owned_instance,
+            path: StartDeviceCallPath::Synchronous,
+            completion: None,
+            reply: ActiveStartDeviceReply::Awaiting,
+        });
+        Ok(identity)
+    }
+
+    pub fn mark_pending(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Result<(), StartDeviceLedgerError> {
+        let Some(request) = self
+            .active
+            .iter_mut()
+            .find(|request| request.identity == identity)
+        else {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::UnknownRequest);
+        };
+        if request.path != StartDeviceCallPath::Synchronous
+            || request.completion.is_some()
+            || request.reply != ActiveStartDeviceReply::Awaiting
+        {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::WrongPhase);
+        }
+        request.path = StartDeviceCallPath::Pending;
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        completion: StartDeviceCompletion,
+    ) -> Result<(), StartDeviceLedgerError> {
+        let Some(request) = self
+            .active
+            .iter_mut()
+            .find(|request| request.identity == identity)
+        else {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::UnknownRequest);
+        };
+        if request.completion.is_some() {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::WrongPhase);
+        }
+        request.completion = Some(completion);
+        self.finalize_if_ready(identity)?;
+        Ok(())
+    }
+
+    pub fn complete_without_start_irp(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        status: u32,
+    ) -> Result<(), StartDeviceLedgerError> {
+        self.complete(identity, StartDeviceCompletion::NoStartIrp { status })
+    }
+
+    pub fn complete_protocol_without_start_irp(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        status: u32,
+    ) -> Result<(), StartDeviceLedgerError> {
+        self.protocol_errors = self.protocol_errors.saturating_add(1);
+        self.complete_without_start_irp(identity, status)
+    }
+
+    pub fn complete_lifecycle(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        receipt: StartDeviceLifecycleReceipt,
+        status: u32,
+    ) -> Result<(), StartDeviceLedgerError> {
+        self.complete(
+            identity,
+            StartDeviceCompletion::Lifecycle { receipt, status },
+        )
+    }
+
+    pub fn complete_ownership_lost(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        irp_id: u64,
+        receipt: Option<StartDeviceLifecycleReceipt>,
+        status: u32,
+    ) -> Result<(), StartDeviceLedgerError> {
+        if irp_id == 0
+            || receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.dispatch().canonical_irp_id != irp_id)
+        {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::WrongPhase);
+        }
+        self.complete(
+            identity,
+            StartDeviceCompletion::OwnershipLost {
+                irp_id,
+                receipt,
+                status,
+            },
+        )
+    }
+
+    /// Retire an outer call whose batch claimed completion while canonical START authority was
+    /// still unresolved. The row remains an ownership barrier, but the protocol counter makes the
+    /// impossible transition independently visible to the exactness gate.
+    pub fn complete_protocol_ownership_lost(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        irp_id: u64,
+        receipt: Option<StartDeviceLifecycleReceipt>,
+        status: u32,
+    ) -> Result<(), StartDeviceLedgerError> {
+        self.protocol_errors = self.protocol_errors.saturating_add(1);
+        self.complete_ownership_lost(identity, irp_id, receipt, status)
+    }
+
+    pub fn record_reply(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+        reply_status: u32,
+        delivered: bool,
+    ) -> Result<(), StartDeviceLedgerError> {
+        let Some(request) = self
+            .active
+            .iter_mut()
+            .find(|request| request.identity == identity)
+        else {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::UnknownRequest);
+        };
+        let Some(completion) = request.completion.as_ref() else {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::WrongPhase);
+        };
+        if request.reply != ActiveStartDeviceReply::Awaiting {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::WrongPhase);
+        }
+        let reply_matches = delivered && completion.status() == reply_status;
+        request.reply = if reply_matches {
+            ActiveStartDeviceReply::Delivered {
+                status: reply_status,
+            }
+        } else {
+            ActiveStartDeviceReply::Failed {
+                status: reply_status,
+            }
+        };
+        self.finalize_if_ready(identity)?;
+        if !reply_matches {
+            return Err(StartDeviceLedgerError::ReplyFailed);
+        }
+        Ok(())
+    }
+
+    pub fn abandon(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Result<(), StartDeviceLedgerError> {
+        let Some(request) = self
+            .active
+            .iter_mut()
+            .find(|request| request.identity == identity)
+        else {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::UnknownRequest);
+        };
+        if request.path != StartDeviceCallPath::Pending
+            || request.reply != ActiveStartDeviceReply::Awaiting
+        {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::WrongPhase);
+        }
+        request.reply = ActiveStartDeviceReply::Abandoned;
+        self.finalize_if_ready(identity)
+    }
+
+    fn finalize_if_ready(
+        &mut self,
+        identity: StartDeviceRequestIdentity,
+    ) -> Result<(), StartDeviceLedgerError> {
+        let Some(index) = self
+            .active
+            .iter()
+            .position(|request| request.identity == identity)
+        else {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+            return Err(StartDeviceLedgerError::UnknownRequest);
+        };
+        if self.active[index].completion.is_none() {
+            return Ok(());
+        }
+        let (reply_status, reply_outcome) = match self.active[index].reply {
+            ActiveStartDeviceReply::Awaiting => return Ok(()),
+            ActiveStartDeviceReply::Delivered { status } => {
+                (Some(status), StartDeviceReplyOutcome::Delivered)
+            }
+            ActiveStartDeviceReply::Failed { status } => {
+                (Some(status), StartDeviceReplyOutcome::Failed)
+            }
+            ActiveStartDeviceReply::Abandoned => (None, StartDeviceReplyOutcome::Abandoned),
+        };
+        let request = self.active.swap_remove(index);
+        let completion = request
+            .completion
+            .expect("completed START request lost its result during retirement");
+        let completion_kind = completion.kind();
+        let irp_id = completion.irp_id();
+        let status = completion.status();
+        let lifecycle_receipt = match completion {
+            StartDeviceCompletion::Lifecycle { receipt, .. } => Some(receipt),
+            StartDeviceCompletion::OwnershipLost { receipt, .. } => receipt,
+            StartDeviceCompletion::NoStartIrp { .. } => None,
+        };
+        debug_assert!(self.terminal.len() < self.terminal.capacity());
+        self.terminal.push(StartDeviceTerminalRecord {
+            identity,
+            instance_id: request.instance_id,
+            completion: completion_kind,
+            path: request.path,
+            lifecycle_receipt,
+            irp_id,
+            status,
+            reply_status,
+            reply_outcome,
+        });
+        Ok(())
+    }
+
+    pub const fn started(&self) -> u64 {
+        self.started
+    }
+
+    pub fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    pub fn terminal_rows(&self) -> &[StartDeviceTerminalRecord] {
+        &self.terminal
+    }
+
+    pub const fn protocol_errors(&self) -> u64 {
+        self.protocol_errors
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PnpBusInformation {
     pub bus_type_guid: [u8; 16],
@@ -1328,6 +1860,117 @@ impl PnpManager {
         Ok(devnode.state)
     }
 
+    /// Complete one canonical START dispatch and mint its immutable lifecycle receipt.
+    ///
+    /// The caller must retain the original dispatch token until this point. The manager checks the
+    /// token against the current devnode generation, canonical stack binding, absence of an
+    /// in-flight dispatch, and the terminal state implied by the exact driver status.
+    pub fn complete_start_device_dispatch(
+        &mut self,
+        token: &PnpDispatchToken,
+        fdo_device_id: u64,
+        io_receipt: nt_io_manager::ExternalPnpTerminalReceipt,
+    ) -> Result<StartDeviceLifecycleReceipt, PnpError> {
+        let io_identity = StartDeviceIoTerminalIdentity {
+            irp_id: io_receipt.irp_id().raw(),
+            pdo_device_id: io_receipt.origin_device_id().raw(),
+            origin_driver_id: io_receipt.origin_driver_id().raw(),
+            completion_driver_id: io_receipt.completion_driver_id().raw(),
+            completion_device_id: io_receipt.completion_device_id().raw(),
+            minor: io_receipt.minor(),
+            driver_pending: io_receipt.driver_pending(),
+            start_status: io_receipt.status().raw() as u32,
+        };
+        self.complete_start_device_dispatch_identity(token, fdo_device_id, io_identity)
+    }
+
+    fn complete_start_device_dispatch_identity(
+        &mut self,
+        token: &PnpDispatchToken,
+        fdo_device_id: u64,
+        io_identity: StartDeviceIoTerminalIdentity,
+    ) -> Result<StartDeviceLifecycleReceipt, PnpError> {
+        let identity = token.identity();
+        let pdo_device_id = io_identity.pdo_device_id;
+        let origin_driver_id = io_identity.origin_driver_id;
+        let completion_driver_id = io_identity.completion_driver_id;
+        let completion_device_id = io_identity.completion_device_id;
+        let start_status = io_identity.start_status;
+        if identity.minor != PnpMinor::StartDevice
+            || identity.canonical_irp_id == 0
+            || io_identity.irp_id != identity.canonical_irp_id
+            || io_identity.minor != PnpMinor::StartDevice.raw()
+            || start_status == STATUS_PENDING
+            || pdo_device_id == 0
+            || fdo_device_id == 0
+            || origin_driver_id == 0
+            || completion_driver_id == 0
+            || completion_device_id == 0
+        {
+            return Err(PnpError::InvalidIdentity);
+        }
+        let pending_devnode = self
+            .find(identity.devnode_id)
+            .ok_or(PnpError::StaleDispatch)?;
+        let pending = pending_devnode
+            .pending_dispatch
+            .ok_or(PnpError::StaleDispatch)?;
+        if pending_devnode.generation != identity.devnode_generation
+            || pending.generation != identity.dispatch_generation
+            || pending.canonical_irp_id != identity.canonical_irp_id
+            || pending.minor != PnpMinor::StartDevice
+            || pending_devnode.pdo_object_id != pdo_device_id
+            || pending_devnode.fdo_object_id != fdo_device_id
+        {
+            return Err(PnpError::StaleDispatch);
+        }
+        self.complete_pnp_dispatch(token, identity.canonical_irp_id, start_status as i32 >= 0)?;
+        let devnode = self
+            .find(identity.devnode_id)
+            .ok_or(PnpError::StaleDispatch)?;
+        let expected_state = if start_status as i32 >= 0 {
+            DeviceState::Started
+        } else {
+            DeviceState::Failed
+        };
+        if devnode.generation != identity.devnode_generation
+            || devnode.pending_dispatch.is_some()
+            || devnode.state != expected_state
+            || devnode.pdo_object_id != pdo_device_id
+            || devnode.fdo_object_id != fdo_device_id
+        {
+            return Err(PnpError::StaleDispatch);
+        }
+        Ok(StartDeviceLifecycleReceipt {
+            dispatch: identity,
+            pdo_device_id,
+            fdo_device_id,
+            origin_driver_id,
+            completion_driver_id,
+            completion_device_id,
+            driver_pending: io_identity.driver_pending,
+            start_status,
+        })
+    }
+
+    /// Confirm that a manager-minted START receipt belongs to the exact requested instance.
+    pub fn start_device_receipt_matches_instance(
+        &self,
+        receipt: &StartDeviceLifecycleReceipt,
+        instance_id: &str,
+    ) -> bool {
+        self.find(receipt.dispatch.devnode_id)
+            .is_some_and(|devnode| {
+                devnode.generation == receipt.dispatch.devnode_generation
+                    && devnode.pdo_object_id == receipt.pdo_device_id
+                    && devnode.fdo_object_id == receipt.fdo_device_id
+                    && devnode
+                        .instance_id
+                        .as_deref()
+                        .is_some_and(|current| current.eq_ignore_ascii_case(instance_id))
+            })
+    }
+
     /// Obtain the authority created by a returned REMOVE IRP. This is retryable while external
     /// teardown remains incomplete and does not itself mutate the devnode.
     pub fn removal_token(&self, pdo_object_id: u64) -> Result<PnpRemovalToken, PnpError> {
@@ -2421,5 +3064,283 @@ mod tests {
             owner.respond(),
             Err(DeviceActionOwnerError::DuplicateResponse)
         );
+    }
+
+    fn completed_start_receipt(
+        canonical_irp_id: u64,
+        driver_pending: bool,
+        status: u32,
+    ) -> StartDeviceLifecycleReceipt {
+        let mut manager = PnpManager::new();
+        let pdo = 0x7000 + canonical_irp_id;
+        let id = assigned_pci_devnode(&mut manager, pdo);
+        let token = manager
+            .begin_pnp_dispatch(pdo, PnpMinor::StartDevice, canonical_irp_id)
+            .unwrap();
+        let receipt = manager
+            .complete_start_device_dispatch_identity(
+                &token,
+                pdo + 1,
+                StartDeviceIoTerminalIdentity {
+                    irp_id: canonical_irp_id,
+                    pdo_device_id: pdo,
+                    origin_driver_id: 0x55,
+                    completion_driver_id: 0x55,
+                    completion_device_id: pdo + 1,
+                    minor: PnpMinor::StartDevice.raw(),
+                    driver_pending,
+                    start_status: status,
+                },
+            )
+            .unwrap();
+        assert_eq!(receipt.dispatch(), token.identity());
+        assert_eq!(receipt.driver_pending(), driver_pending);
+        assert_eq!(manager.state(id), Some(DeviceState::Started));
+        receipt
+    }
+
+    #[test]
+    fn start_receipt_rejects_wrong_stack_before_lifecycle_mutation() {
+        let mut manager = PnpManager::new();
+        let pdo = 0x7800;
+        let id = assigned_pci_devnode(&mut manager, pdo);
+        let token = manager
+            .begin_pnp_dispatch(pdo, PnpMinor::StartDevice, 0x99)
+            .unwrap();
+        assert_eq!(
+            manager.complete_start_device_dispatch_identity(
+                &token,
+                pdo + 1,
+                StartDeviceIoTerminalIdentity {
+                    irp_id: 0x99,
+                    pdo_device_id: pdo,
+                    origin_driver_id: 0x55,
+                    completion_driver_id: 0x55,
+                    completion_device_id: pdo + 1,
+                    minor: PnpMinor::StartDevice.raw(),
+                    driver_pending: true,
+                    start_status: STATUS_PENDING,
+                },
+            ),
+            Err(PnpError::InvalidIdentity)
+        );
+        assert_eq!(manager.state(id), Some(DeviceState::StartIrpSent));
+        assert!(manager.pnp_dispatch_in_flight(id));
+        assert_eq!(
+            manager.complete_start_device_dispatch_identity(
+                &token,
+                pdo + 2,
+                StartDeviceIoTerminalIdentity {
+                    irp_id: 0x99,
+                    pdo_device_id: pdo,
+                    origin_driver_id: 0x55,
+                    completion_driver_id: 0x55,
+                    completion_device_id: pdo + 1,
+                    minor: PnpMinor::StartDevice.raw(),
+                    driver_pending: false,
+                    start_status: 0,
+                },
+            ),
+            Err(PnpError::StaleDispatch)
+        );
+        assert_eq!(manager.state(id), Some(DeviceState::StartIrpSent));
+        assert!(manager.pnp_dispatch_in_flight(id));
+        let receipt = manager
+            .complete_start_device_dispatch_identity(
+                &token,
+                pdo + 1,
+                StartDeviceIoTerminalIdentity {
+                    irp_id: 0x99,
+                    pdo_device_id: pdo,
+                    origin_driver_id: 0x55,
+                    completion_driver_id: 0x55,
+                    completion_device_id: pdo + 1,
+                    minor: PnpMinor::StartDevice.raw(),
+                    driver_pending: false,
+                    start_status: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(manager.state(id), Some(DeviceState::Started));
+        assert!(
+            manager.start_device_receipt_matches_instance(&receipt, r"PCI\VEN_1234&DEV_5678\0001")
+        );
+        assert!(
+            !manager.start_device_receipt_matches_instance(&receipt, r"PCI\VEN_1234&DEV_5678\0002")
+        );
+    }
+
+    #[test]
+    fn start_device_ledger_tracks_no_irp_and_exact_pending_lifecycle() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let sync = ledger.begin(r"ROOT\SYNC\0000").unwrap();
+        ledger.complete_without_start_irp(sync, 0).unwrap();
+        ledger.record_reply(sync, 0, true).unwrap();
+
+        let pending = ledger.begin(r"PCI\VEN_1234&DEV_5678\0001").unwrap();
+        ledger.mark_pending(pending).unwrap();
+        assert_eq!(ledger.active_len(), 1);
+        let receipt = completed_start_receipt(0x91, true, 0);
+        let expected_dispatch = receipt.dispatch();
+        ledger.complete_lifecycle(pending, receipt, 0).unwrap();
+        ledger.record_reply(pending, 0, true).unwrap();
+
+        assert_eq!(ledger.started(), 2);
+        assert_eq!(ledger.active_len(), 0);
+        assert_eq!(ledger.protocol_errors(), 0);
+        assert_eq!(ledger.terminal_rows().len(), 2);
+        assert_eq!(ledger.terminal_rows()[0].identity(), sync);
+        assert_eq!(
+            ledger.terminal_rows()[0].completion(),
+            StartDeviceCompletionKind::NoStartIrp
+        );
+        assert_eq!(
+            ledger.terminal_rows()[0].path(),
+            StartDeviceCallPath::Synchronous
+        );
+        assert_eq!(ledger.terminal_rows()[1].identity(), pending);
+        assert_eq!(
+            ledger.terminal_rows()[1].completion(),
+            StartDeviceCompletionKind::LifecycleTerminal
+        );
+        assert_eq!(
+            ledger.terminal_rows()[1].path(),
+            StartDeviceCallPath::Pending
+        );
+        assert_eq!(
+            ledger.terminal_rows()[1]
+                .lifecycle_receipt()
+                .map(StartDeviceLifecycleReceipt::dispatch),
+            Some(expected_dispatch)
+        );
+        assert!(ledger
+            .terminal_rows()
+            .iter()
+            .all(StartDeviceTerminalRecord::reply_matches));
+    }
+
+    #[test]
+    fn start_device_ledger_reserves_every_active_terminal_before_side_effects() {
+        let mut ledger = StartDeviceCallLedger::new();
+        for index in 0..5 {
+            let instance = alloc::format!(r"ROOT\TERMINAL\{index:04}");
+            let request = ledger.begin(&instance).unwrap();
+            ledger.complete_without_start_irp(request, 0).unwrap();
+            ledger.record_reply(request, 0, true).unwrap();
+        }
+        ledger.terminal.shrink_to_fit();
+        for index in 0..4 {
+            let instance = alloc::format!(r"ROOT\ACTIVE\{index:04}");
+            ledger.begin(&instance).unwrap();
+            assert!(
+                ledger.terminal.capacity() - ledger.terminal.len() >= ledger.active.len(),
+                "terminal storage was not reserved for every active request"
+            );
+        }
+    }
+
+    #[test]
+    fn start_device_ledger_retains_reply_failure_and_ownership_loss() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let request = ledger.begin(r"PCI\LOST\0000").unwrap();
+        ledger.mark_pending(request).unwrap();
+        ledger
+            .complete_ownership_lost(request, 0x88, None, 0xc000_0001)
+            .unwrap();
+        assert_eq!(
+            ledger.record_reply(request, 0xc000_0001, false),
+            Err(StartDeviceLedgerError::ReplyFailed)
+        );
+        assert_eq!(ledger.active_len(), 0);
+        assert_eq!(ledger.terminal_rows().len(), 1);
+        assert!(!ledger.terminal_rows()[0].reply_matches());
+        assert_eq!(
+            ledger.terminal_rows()[0].completion(),
+            StartDeviceCompletionKind::OwnershipLost
+        );
+        assert_eq!(ledger.terminal_rows()[0].irp_id(), 0x88);
+        assert_eq!(
+            ledger.terminal_rows()[0].reply_outcome(),
+            StartDeviceReplyOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn start_device_ledger_preserves_committed_receipt_across_ownership_loss() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let request = ledger.begin(r"PCI\LOST_AFTER_COMMIT\0000").unwrap();
+        ledger.mark_pending(request).unwrap();
+        let receipt = completed_start_receipt(0x93, true, 0);
+        let dispatch = receipt.dispatch();
+        ledger
+            .complete_ownership_lost(request, 0x93, Some(receipt), 0xc000_0001)
+            .unwrap();
+        ledger.record_reply(request, 0xc000_0001, true).unwrap();
+
+        let row = &ledger.terminal_rows()[0];
+        assert_eq!(row.completion(), StartDeviceCompletionKind::OwnershipLost);
+        assert_eq!(
+            row.lifecycle_receipt()
+                .map(StartDeviceLifecycleReceipt::dispatch),
+            Some(dispatch)
+        );
+    }
+
+    #[test]
+    fn start_device_ledger_keeps_start_and_outer_statuses_distinct() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let request = ledger.begin(r"PCI\OUTER_FAILURE\0000").unwrap();
+        let receipt = completed_start_receipt(0x94, false, 0);
+        ledger
+            .complete_lifecycle(request, receipt, 0xc000_0001)
+            .unwrap();
+        ledger.record_reply(request, 0xc000_0001, true).unwrap();
+        let row = &ledger.terminal_rows()[0];
+        assert_eq!(row.status(), 0xc000_0001);
+        assert_eq!(row.lifecycle_receipt().unwrap().start_status(), 0);
+    }
+
+    #[test]
+    fn start_device_ledger_retains_abandonment_until_lifecycle_terminal() {
+        let mut ledger = StartDeviceCallLedger::new();
+        let request = ledger.begin(r"ROOT\ABANDON\0000").unwrap();
+        ledger.mark_pending(request).unwrap();
+        ledger.abandon(request).unwrap();
+        assert_eq!(ledger.active_len(), 1);
+        let receipt = completed_start_receipt(0x92, true, 0);
+        ledger.complete_lifecycle(request, receipt, 0).unwrap();
+        assert_eq!(ledger.active_len(), 0);
+        assert_eq!(ledger.terminal_rows()[0].reply_status(), None);
+        assert_eq!(
+            ledger.terminal_rows()[0].reply_outcome(),
+            StartDeviceReplyOutcome::Abandoned
+        );
+    }
+
+    #[test]
+    fn start_device_ledger_rejects_wrong_phase_and_identity() {
+        let mut ledger = StartDeviceCallLedger::new();
+        assert_eq!(
+            ledger.begin(""),
+            Err(StartDeviceLedgerError::InvalidInstance)
+        );
+        let request = ledger.begin(r"ROOT\EXACT\0000").unwrap();
+        assert_eq!(
+            ledger.record_reply(request, 0, true),
+            Err(StartDeviceLedgerError::WrongPhase)
+        );
+        assert_eq!(ledger.protocol_errors(), 1);
+        ledger.complete_without_start_irp(request, 0).unwrap();
+        assert_eq!(
+            ledger.complete_without_start_irp(request, 0),
+            Err(StartDeviceLedgerError::WrongPhase)
+        );
+        assert_eq!(ledger.protocol_errors(), 2);
+        ledger.record_reply(request, 0, true).unwrap();
+        assert_eq!(
+            ledger.complete_without_start_irp(request, 0),
+            Err(StartDeviceLedgerError::UnknownRequest)
+        );
+        assert_eq!(ledger.protocol_errors(), 3);
     }
 }

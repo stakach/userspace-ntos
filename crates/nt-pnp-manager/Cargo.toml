@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 nt-cm-resources = { workspace = true }
+nt-io-manager = { workspace = true }
 nt-pnp-abi = { workspace = true }
 
 [lints.clippy]

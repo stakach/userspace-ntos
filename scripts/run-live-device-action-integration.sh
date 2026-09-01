@@ -64,11 +64,46 @@ summary_re = re.compile(
     r"empty-after-ack/active/response-tail/cm-pending="
     r"(?P<empty>[0-9]+)/(?P<active>[0-9]+)/(?P<response_tail>[0-9]+)/(?P<pending>[0-9]+)$"
 )
+start_proof_re = re.compile(
+    r"^\[pnp-start-proof\] call=(?P<call>[0-9]+) instance=(?P<instance>.+?) "
+    r"path=(?P<path>synchronous|pending) "
+    r"completion=(?P<completion>no-start-irp|lifecycle-terminal|ownership-lost) "
+    r"dispatched=(?P<dispatched>[01]) irp=(?P<irp>[0-9]+) "
+    r"devnode/gen/dispatch=(?P<devnode>[0-9]+)/(?P<generation>[0-9]+)/(?P<dispatch>[0-9]+) "
+    r"pdo/fdo=(?P<pdo>[0-9]+)/(?P<fdo>[0-9]+) "
+    r"origin/completion-driver/device=(?P<origin>[0-9]+)/(?P<completion_driver>[0-9]+)/(?P<completion_device>[0-9]+) "
+    r"driver-pending=(?P<driver_pending>[01]) "
+    r"start-status=(?P<start_status>0x[0-9a-fA-F]+) "
+    r"terminal/reply=(?P<terminal>0x[0-9a-fA-F]+)/(?P<reply>0x[0-9a-fA-F]+) "
+    r"reply-outcome=(?P<reply_outcome>delivered|failed|abandoned)$"
+)
+start_summary_re = re.compile(
+    r"^\[pnp-start-proof\] summary calls/rows/replied="
+    r"(?P<calls>[0-9]+)/(?P<rows>[0-9]+)/(?P<replied>[0-9]+) "
+    r"sync/pending/no-start/lifecycle/lost="
+    r"(?P<sync>[0-9]+)/(?P<parked>[0-9]+)/(?P<no_start>[0-9]+)/(?P<lifecycle>[0-9]+)/(?P<lost>[0-9]+) "
+    r"failed/abandoned/pending-status/active/protocol="
+    r"(?P<failed>[0-9]+)/(?P<abandoned>[0-9]+)/(?P<pending_status>[0-9]+)/(?P<active>[0-9]+)/(?P<protocol>[0-9]+) "
+    r"tail/transfer/retained/barriers="
+    r"(?P<tail>[0-9]+)/(?P<transfer>[0-9]+)/(?P<retained>[0-9]+)/(?P<barriers>[0-9]+) "
+    r"pending-linked/missing=(?P<linked>[0-9]+)/(?P<missing>[0-9]+)$"
+)
+pending_proof_re = re.compile(
+    r"^\[pnp-pending-proof\] irp=(?P<irp>[0-9]+) "
+    r"devnode/gen/dispatch=(?P<devnode>[0-9]+)/(?P<generation>[0-9]+)/(?P<dispatch>[0-9]+) "
+    r"pdo/fdo=(?P<pdo>[0-9]+)/(?P<fdo>[0-9]+) "
+    r"origin/completion-driver/device=(?P<origin>[0-9]+)/(?P<completion_driver>[0-9]+)/(?P<completion_device>[0-9]+) "
+    r"status=(?P<status>0x[0-9a-fA-F]+) stages=(?P<stages>0x[0-9a-fA-F]+) "
+    r"irp-retired=(?P<retired>[01]) observed=(?P<observed>[01])$"
+)
 
 phases = {"claimed": [], "delivered": [], "retired": []}
 positions = {}
 proofs = []
 summaries = []
+start_proofs = []
+start_summaries = []
+pending_proofs = []
 
 def row_key(match):
     return (
@@ -95,6 +130,12 @@ for line_number, line in enumerate(lines):
             raise SystemExit(f"live-device-action integration failure: non-success proof row: {line}")
     elif match := summary_re.match(line):
         summaries.append({name: int(value) for name, value in match.groupdict().items()})
+    elif match := start_proof_re.match(line):
+        start_proofs.append(match.groupdict())
+    elif match := start_summary_re.match(line):
+        start_summaries.append({name: int(value) for name, value in match.groupdict().items()})
+    elif match := pending_proof_re.match(line):
+        pending_proofs.append(match.groupdict())
 
 if not summaries:
     raise SystemExit("live-device-action integration failure: missing final live-action summary")
@@ -135,6 +176,90 @@ if len(start_positions) != 1:
     raise SystemExit("live-device-action integration failure: target NIC START count is not exact")
 if add_positions[0] >= start_positions[0]:
     raise SystemExit("live-device-action integration failure: target NIC START preceded AddDevice")
+start_call_ids = [int(row["call"]) for row in start_proofs]
+if any(call_id == 0 for call_id in start_call_ids) or len(set(start_call_ids)) != len(start_call_ids):
+    raise SystemExit("live-device-action integration failure: StartDevice call IDs are zero or reused")
+for row in start_proofs:
+    if row["reply_outcome"] == "delivered" and row["terminal"] != row["reply"]:
+        raise SystemExit(
+            f"live-device-action integration failure: delivered StartDevice status mismatch: {row}"
+        )
+dispatched_rows = [row for row in start_proofs if row["dispatched"] == "1"]
+dispatched_irps = [int(row["irp"]) for row in dispatched_rows]
+if any(irp == 0 for irp in dispatched_irps) or len(set(dispatched_irps)) != len(dispatched_irps):
+    raise SystemExit("live-device-action integration failure: canonical START IRP was reused")
+receipt_rows = [row for row in start_proofs if int(row["devnode"]) != 0]
+receipt_dispatches = [
+    (int(row["devnode"]), int(row["generation"]), int(row["dispatch"]))
+    for row in receipt_rows
+]
+if (
+    any(any(part == 0 for part in identity) for identity in receipt_dispatches)
+    or len(set(receipt_dispatches)) != len(receipt_dispatches)
+):
+    raise SystemExit("live-device-action integration failure: lifecycle dispatch identity was reused")
+target_start_rows = [row for row in start_proofs if row["instance"] == target_instance]
+if len(target_start_rows) != 1:
+    raise SystemExit("live-device-action integration failure: target StartDevice reply row is not exact")
+start_row = target_start_rows[0]
+numeric_identity = [
+    "irp", "devnode", "generation", "dispatch", "pdo", "fdo", "origin",
+    "completion_driver", "completion_device",
+]
+if (
+    start_row["completion"] != "lifecycle-terminal"
+    or start_row["dispatched"] != "1"
+    or start_row["reply_outcome"] != "delivered"
+    or any(int(start_row[name]) == 0 for name in numeric_identity)
+    or int(start_row["start_status"], 16) != 0
+    or int(start_row["terminal"], 16) != 0
+    or int(start_row["reply"], 16) != 0
+):
+    raise SystemExit(f"live-device-action integration failure: invalid target StartDevice row: {start_row}")
+add_device_id = int(lines[add_positions[0]].removeprefix(add_prefix))
+if int(start_row["fdo"]) != add_device_id:
+    raise SystemExit("live-device-action integration failure: StartDevice FDO differs from AddDevice")
+same_irp_pending = [row for row in pending_proofs if row["irp"] == start_row["irp"]]
+if start_row["driver_pending"] == "1":
+    if len(same_irp_pending) != 1:
+        raise SystemExit("live-device-action integration failure: pending START has no exact proof row")
+    pending_row = same_irp_pending[0]
+    for outer_name, pending_name in [
+        ("irp", "irp"), ("devnode", "devnode"), ("generation", "generation"),
+        ("dispatch", "dispatch"), ("pdo", "pdo"), ("fdo", "fdo"),
+        ("origin", "origin"), ("completion_driver", "completion_driver"),
+        ("completion_device", "completion_device"),
+    ]:
+        if start_row[outer_name] != pending_row[pending_name]:
+            raise SystemExit("live-device-action integration failure: pending START identity join failed")
+    if (
+        int(pending_row["status"], 16) != int(start_row["start_status"], 16)
+        or int(pending_row["stages"], 16) != 0x7F
+        or pending_row["retired"] != "1"
+        or pending_row["observed"] != "1"
+    ):
+        raise SystemExit("live-device-action integration failure: pending START proof is incomplete")
+elif same_irp_pending:
+    raise SystemExit("live-device-action integration failure: synchronous START has a pending proof row")
+if not start_summaries:
+    raise SystemExit("live-device-action integration failure: missing StartDevice summary")
+start_summary = start_summaries[-1]
+if not (
+    start_summary["calls"] == start_summary["rows"] == start_summary["replied"] == len(start_proofs)
+    and start_summary["lifecycle"] >= 1
+    and start_summary["lost"] == 0
+    and start_summary["failed"] == 0
+    and start_summary["abandoned"] == 0
+    and start_summary["pending_status"] == 0
+    and start_summary["active"] == 0
+    and start_summary["protocol"] == 0
+    and start_summary["tail"] == 0
+    and start_summary["transfer"] == 0
+    and start_summary["retained"] == 0
+    and start_summary["barriers"] == 0
+    and start_summary["missing"] == 0
+):
+    raise SystemExit(f"live-device-action integration failure: incoherent StartDevice summary: {start_summary}")
 if not (
     summary["claims"] == summary["rows"] == summary["responded"] == count
     and summary["failed"] == 0
@@ -147,6 +272,7 @@ if not (
 PY
 
 require_fixed 'PASS exec_live_device_actions_exact' 'the generic live-action gate failed'
+require_fixed 'PASS exec_start_device_calls_exact' 'the exact StartDevice reply gate failed'
 require_fixed 'PASS exec_explorer_shell_chrome_painted' 'desktop paint regressed'
 require_fixed '[microtest sentinel matched -- exiting QEMU]' 'QEMU did not exit through the sentinel'
 

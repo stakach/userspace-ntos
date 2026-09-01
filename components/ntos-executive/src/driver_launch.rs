@@ -34979,8 +34979,8 @@ unsafe fn load_driver_reserved(
     // NT publishes the canonical driver object before DriverEntry can run. Reserve that identity
     // before resuming the component so imports serviced during DriverEntry can project it into a
     // provider domain without relying on component scheduling order.
-    let domain = crate::driver_launch::instance(instance)
-        .ok_or(nt_status::NtStatus::UNSUCCESSFUL)?;
+    let domain =
+        crate::driver_launch::instance(instance).ok_or(nt_status::NtStatus::UNSUCCESSFUL)?;
     if domain.hosted_domain_id == 0 || domain.hosted_domain_cookie == 0 {
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
@@ -35650,9 +35650,7 @@ unsafe fn clear_hosted_resource_map_caps(
         let owned = caps[index].instance == instance
             && caps[index].domain == domain
             && device_id.is_none_or(|device_id| caps[index].device_id == device_id);
-        if owned
-            && pnp_context_lease.is_some_and(|lease| caps[index].pnp_context_lease != lease)
-        {
+        if owned && pnp_context_lease.is_some_and(|lease| caps[index].pnp_context_lease != lease) {
             failures += 1;
         } else if owned {
             if caps[index].cap != 0 && cnode_delete_recycle_r(caps[index].cap) != 0 {
@@ -35681,12 +35679,7 @@ unsafe fn clear_hosted_resource_map_caps_for_device(
     if device_id == 0 {
         return 0;
     }
-    clear_hosted_resource_map_caps(
-        instance,
-        domain,
-        Some(device_id),
-        pnp_context_lease,
-    )
+    clear_hosted_resource_map_caps(instance, domain, Some(device_id), pnp_context_lease)
 }
 
 /// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
@@ -36445,6 +36438,7 @@ unsafe fn dispatch_hosted_query_id(child_index: usize, id_type: u32) -> bool {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
+            ..
         } => retain_hosted_query_id_result(child_index, id_type, status, information, false),
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
@@ -36704,6 +36698,7 @@ unsafe fn dispatch_hosted_bus_property(child_index: usize, minor: u8) -> bool {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
+            ..
         } => retain_hosted_bus_property_result(child_index, minor, status, information, false),
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
             set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Barrier(
@@ -39519,6 +39514,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
+            ..
         } => {
             let query = (*core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY))
                 .as_mut()
@@ -39830,22 +39826,30 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
         match phase {
             HostedPnpTransactionPhase::Dispatching
             | HostedPnpTransactionPhase::AwaitingCompletion => {
-                let Some(completion) = io_manager_mut().completed_irp(irp_id) else {
-                    index += 1;
-                    continue;
+                let (completion_status, io_receipt) = {
+                    let io = io_manager_mut();
+                    let Some(completion) = io.completed_irp(irp_id) else {
+                        index += 1;
+                        continue;
+                    };
+                    let identity_valid = completion.id == irp_id
+                        && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
+                        && completion.file_id.is_none()
+                        && completion.driver_id == origin_driver_id
+                        && completion.device_id == nt_io_manager::DeviceId(binding.pdo_device_id)
+                        && completion.major == major::IRP_MJ_PNP
+                        && completion.minor == minor.raw()
+                        && completion.completion_driver_id == completion_driver_id
+                        && completion.completion_device_id == completion_device_id
+                        && completion.user_data == 0
+                        && completion.requestor_tid == 0
+                        && completion.completion_origin == IrpCompletionOrigin::Driver;
+                    let io_receipt = identity_valid
+                        .then(|| io.take_completed_external_pnp_receipt(irp_id))
+                        .flatten();
+                    (completion.status, io_receipt)
                 };
-                let identity_valid = completion.id == irp_id
-                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
-                    && completion.file_id.is_none()
-                    && completion.driver_id == origin_driver_id
-                    && completion.device_id == nt_io_manager::DeviceId(binding.pdo_device_id)
-                    && completion.major == major::IRP_MJ_PNP
-                    && completion.minor == minor.raw()
-                    && completion.completion_driver_id == completion_driver_id
-                    && completion.completion_device_id == completion_device_id
-                    && completion.user_data == 0
-                    && completion.requestor_tid == 0;
-                if !identity_valid || completion.completion_origin != IrpCompletionOrigin::Driver {
+                let Some(io_receipt) = io_receipt else {
                     set_hosted_pnp_indeterminate(
                         irp_id,
                         nt_status::NtStatus::INVALID_DEVICE_REQUEST,
@@ -39854,7 +39858,9 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     progress = progress.saturating_add(1);
                     index += 1;
                     continue;
-                }
+                };
+                set_hosted_pnp_terminal_io_receipt(irp_id, io_receipt)
+                    .expect("hosted PnP completion receipt lost its transaction");
                 if let Err(proof_status) = mark_pending_start_completion_identity(irp_id) {
                     set_hosted_pnp_indeterminate(irp_id, proof_status)
                         .expect("hosted PnP completion-proof failure lost its transaction");
@@ -39862,7 +39868,7 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     index += 1;
                     continue;
                 }
-                let lifecycle_state = match complete_hosted_pnp_lifecycle(irp_id, completion.status)
+                let lifecycle_state = match complete_hosted_pnp_lifecycle(irp_id, completion_status)
                 {
                     Ok(state) => state,
                     Err(lifecycle_status) => {
@@ -39875,7 +39881,7 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 };
                 if let Err(proof_status) = mark_pending_start_lifecycle_committed(
                     irp_id,
-                    completion.status,
+                    completion_status,
                     lifecycle_state,
                 ) {
                     set_hosted_pnp_indeterminate(irp_id, proof_status)
@@ -39887,7 +39893,7 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                 set_hosted_pnp_driver_status(
                     irp_id,
                     HostedPnpTransactionPhase::LifecycleCommittedAwaitingAck,
-                    completion.status,
+                    completion_status,
                 )
                 .expect("hosted PnP completion lost its transaction");
                 progress = progress.saturating_add(1);
@@ -39981,28 +39987,26 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
     match phase {
         HostedPnpTransactionPhase::Terminal => {
             publish_pending_start_terminal_proof(irp_id)?;
-            let transactions = hosted_pnp_transactions_mut();
-            let index = transactions
-                .iter()
-                .position(|transaction| transaction.irp_id == irp_id)
-                .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-            if transactions[index].phase != HostedPnpTransactionPhase::Terminal {
-                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            }
-            let transaction = transactions.remove(index);
+            let (driver_status, receipt) = take_terminal_hosted_pnp_start(irp_id)?;
             Ok(HostedPnpStartObservation::Terminal {
-                driver_status: transaction
-                    .driver_status
-                    .expect("terminal hosted PnP START has no driver status"),
+                driver_status,
+                receipt,
             })
         }
         HostedPnpTransactionPhase::Indeterminate => {
-            let transport_status = hosted_pnp_transactions_mut()
-                .iter()
+            let (transport_status, receipt) = hosted_pnp_transactions_mut()
+                .iter_mut()
                 .find(|transaction| transaction.irp_id == irp_id)
-                .and_then(|transaction| transaction.barrier_status)
+                .and_then(|transaction| {
+                    transaction
+                        .barrier_status
+                        .map(|status| (status, transaction.start_receipt.take()))
+                })
                 .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-            Ok(HostedPnpStartObservation::Indeterminate { transport_status })
+            Ok(HostedPnpStartObservation::Indeterminate {
+                transport_status,
+                receipt,
+            })
         }
         HostedPnpTransactionPhase::Prepared
         | HostedPnpTransactionPhase::Dispatching
@@ -40012,6 +40016,45 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
             Ok(HostedPnpStartObservation::AwaitingCompletion)
         }
     }
+}
+
+unsafe fn take_terminal_hosted_pnp_start(
+    irp_id: IrpId,
+) -> Result<
+    (
+        nt_status::NtStatus,
+        nt_pnp_manager::StartDeviceLifecycleReceipt,
+    ),
+    nt_status::NtStatus,
+> {
+    let transactions = hosted_pnp_transactions_mut();
+    let index = transactions
+        .iter()
+        .position(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+    if transactions[index].phase != HostedPnpTransactionPhase::Terminal
+        || transactions[index].minor != nt_pnp_manager::PnpMinor::StartDevice
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let driver_status = transactions[index]
+        .driver_status
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let receipt = transactions[index]
+        .start_receipt
+        .as_ref()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if receipt.start_status() != driver_status.raw() as u32
+        || receipt.dispatch().canonical_irp_id != irp_id.raw()
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let mut transaction = transactions.remove(index);
+    let receipt = transaction
+        .start_receipt
+        .take()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    Ok((driver_status, receipt))
 }
 
 pub(crate) unsafe fn print_hosted_pnp_pending_proofs() -> HostedPnpPendingProofReport {
@@ -40084,6 +40127,46 @@ pub(crate) unsafe fn print_hosted_pnp_pending_proofs() -> HostedPnpPendingProofR
     print_u64(report.duplicates);
     print_str(b"\n");
     report
+}
+
+pub(crate) unsafe fn hosted_pending_start_proof_joins_receipt(
+    receipt: &nt_pnp_manager::StartDeviceLifecycleReceipt,
+) -> bool {
+    let dispatch = receipt.dispatch();
+    let mut rows_for_irp = 0u64;
+    let mut exact = 0u64;
+    for proof in hosted_pnp_pending_proofs_mut().rows().iter().copied() {
+        let identity = proof.identity();
+        if identity.irp_id != dispatch.canonical_irp_id {
+            continue;
+        }
+        rows_for_irp = rows_for_irp.saturating_add(1);
+        if proof.is_complete()
+            && proof.terminal_status() as u32 == receipt.start_status()
+            && identity.devnode_id == dispatch.devnode_id
+            && identity.devnode_generation == dispatch.devnode_generation
+            && identity.dispatch_generation == dispatch.dispatch_generation
+            && identity.pdo_device_id == receipt.pdo_device_id()
+            && identity.fdo_device_id == receipt.fdo_device_id()
+            && identity.origin_driver_id == receipt.origin_driver_id()
+            && identity.completion_driver_id == receipt.completion_driver_id()
+            && identity.completion_device_id == receipt.completion_device_id()
+        {
+            exact = exact.saturating_add(1);
+        }
+    }
+    if receipt.driver_pending() {
+        rows_for_irp == 1 && exact == 1
+    } else {
+        rows_for_irp == 0
+    }
+}
+
+pub(crate) unsafe fn hosted_pnp_start_receipt_matches_instance(
+    receipt: &nt_pnp_manager::StartDeviceLifecycleReceipt,
+    instance_id: &str,
+) -> bool {
+    hosted_pnp_manager_mut().start_device_receipt_matches_instance(receipt, instance_id)
 }
 
 pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
@@ -40953,8 +41036,7 @@ fn register_io_driver(
     driver_object_path: &str,
     instance: usize,
 ) -> Result<u64, nt_status::NtStatus> {
-    let name =
-        parse_nt_path(driver_object_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let name = parse_nt_path(driver_object_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let io = io_manager_mut();
     let mut dispatch = MajorFunctionTable::new();
     dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(0)));
@@ -42290,6 +42372,8 @@ struct HostedPnpTransaction {
     completion_driver_id: DriverId,
     completion_device_id: nt_io_manager::DeviceId,
     token: Option<nt_pnp_manager::PnpDispatchToken>,
+    terminal_io_receipt: Option<nt_io_manager::ExternalPnpTerminalReceipt>,
+    start_receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     phase: HostedPnpTransactionPhase,
     driver_status: Option<nt_status::NtStatus>,
     barrier_status: Option<nt_status::NtStatus>,
@@ -42364,10 +42448,15 @@ pub(crate) enum HostedFilterRequirementsOutcome {
     },
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum HostedPnpStartOutcome {
-    Started,
-    Failed(nt_status::NtStatus),
+    Started {
+        receipt: nt_pnp_manager::StartDeviceLifecycleReceipt,
+    },
+    Failed {
+        status: nt_status::NtStatus,
+        receipt: nt_pnp_manager::StartDeviceLifecycleReceipt,
+    },
     Pending {
         irp_id: u64,
     },
@@ -42382,14 +42471,16 @@ pub(crate) enum HostedPnpStartOutcome {
     },
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum HostedPnpStartObservation {
     AwaitingCompletion,
     Terminal {
         driver_status: nt_status::NtStatus,
+        receipt: nt_pnp_manager::StartDeviceLifecycleReceipt,
     },
     Indeterminate {
         transport_status: nt_status::NtStatus,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
     },
 }
 
@@ -43600,7 +43691,7 @@ unsafe fn mark_pending_start_lifecycle_committed(
     status: nt_status::NtStatus,
     state: nt_pnp_manager::DeviceState,
 ) -> Result<(), nt_status::NtStatus> {
-    let Some((identity, token_identity)) = hosted_pnp_transactions_mut()
+    let Some((identity, token_identity, receipt)) = hosted_pnp_transactions_mut()
         .iter()
         .find(|transaction| transaction.irp_id == irp_id)
         .and_then(|transaction| {
@@ -43612,6 +43703,10 @@ unsafe fn mark_pending_start_lifecycle_committed(
                         .as_ref()
                         .expect("pending START proof lost its PnP token")
                         .identity(),
+                    transaction
+                        .start_receipt
+                        .as_ref()
+                        .expect("pending START lifecycle lost its manager receipt"),
                 )
             })
         })
@@ -43628,6 +43723,14 @@ unsafe fn mark_pending_start_lifecycle_committed(
         && token_identity.devnode_generation == identity.devnode_generation
         && token_identity.dispatch_generation == identity.dispatch_generation
         && token_identity.canonical_irp_id == identity.irp_id
+        && receipt.dispatch() == token_identity
+        && receipt.pdo_device_id() == identity.pdo_device_id
+        && receipt.fdo_device_id() == identity.fdo_device_id
+        && receipt.origin_driver_id() == identity.origin_driver_id
+        && receipt.completion_driver_id() == identity.completion_driver_id
+        && receipt.completion_device_id() == identity.completion_device_id
+        && receipt.driver_pending()
+        && receipt.start_status() == status.raw() as u32
         && !hosted_pnp_manager_mut().pnp_dispatch_in_flight(identity.devnode_id)
         && hosted_pnp_manager_mut().state(identity.devnode_id) == Some(expected_state)
         && hosted_pnp_manager_mut().generation(identity.devnode_id)
@@ -43845,22 +43948,79 @@ unsafe fn set_hosted_pnp_indeterminate(
     Ok(())
 }
 
+unsafe fn set_hosted_pnp_terminal_io_receipt(
+    irp_id: IrpId,
+    receipt: nt_io_manager::ExternalPnpTerminalReceipt,
+) -> Result<(), nt_status::NtStatus> {
+    let transaction = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if transaction.terminal_io_receipt.is_some()
+        || receipt.irp_id() != irp_id
+        || receipt.status() == nt_status::NtStatus::PENDING
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    transaction.terminal_io_receipt = Some(receipt);
+    Ok(())
+}
+
 unsafe fn complete_hosted_pnp_lifecycle(
     irp_id: IrpId,
     status: nt_status::NtStatus,
 ) -> Result<nt_pnp_manager::DeviceState, nt_status::NtStatus> {
-    let transactions = hosted_pnp_transactions_mut();
-    let transaction = transactions
+    let minor = hosted_pnp_transactions_mut()
         .iter()
         .find(|transaction| transaction.irp_id == irp_id)
+        .map(|transaction| transaction.minor)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let token = transaction
-        .token
-        .as_ref()
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    hosted_pnp_manager_mut()
-        .complete_pnp_dispatch(token, irp_id.raw(), status.is_success())
-        .map_err(hosted_pnp_status)
+    if minor == nt_pnp_manager::PnpMinor::StartDevice {
+        let (fdo_device_id, io_receipt) = {
+            let transaction = hosted_pnp_transactions_mut()
+                .iter_mut()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            (
+                transaction.binding.device_id,
+                transaction
+                    .terminal_io_receipt
+                    .take()
+                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?,
+            )
+        };
+        if io_receipt.status() != status {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let token = hosted_pnp_transactions_mut()
+            .iter()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .and_then(|transaction| transaction.token.as_ref())
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let receipt = hosted_pnp_manager_mut()
+            .complete_start_device_dispatch(token, fdo_device_id, io_receipt)
+            .map_err(hosted_pnp_status)?;
+        let state = if status.is_success() {
+            nt_pnp_manager::DeviceState::Started
+        } else {
+            nt_pnp_manager::DeviceState::Failed
+        };
+        hosted_pnp_transactions_mut()
+            .iter_mut()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .start_receipt = Some(receipt);
+        Ok(state)
+    } else {
+        let token = hosted_pnp_transactions_mut()
+            .iter()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .and_then(|transaction| transaction.token.as_ref())
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        hosted_pnp_manager_mut()
+            .complete_pnp_dispatch(token, irp_id.raw(), status.is_success())
+            .map_err(hosted_pnp_status)
+    }
 }
 
 unsafe fn finish_hosted_start_publication(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
@@ -48446,14 +48606,18 @@ pub(crate) fn hosted_domain_identity_for_pml4(pml4: u64) -> Option<HostedDomainI
 }
 
 pub(crate) fn hosted_published_dma_aperture_contains(pml4: u64, address: u64) -> bool {
-    let Some((instance_index, instance_domain)) = (unsafe { driver_instances() }).and_then(|table| {
-        table
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, inst)| inst.used && inst.pml4 == pml4)
-            .and_then(|(index, inst)| instance_domain_identity(inst).map(|domain| (index, domain)))
-    }) else {
+    let Some((instance_index, instance_domain)) =
+        (unsafe { driver_instances() }).and_then(|table| {
+            table
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, inst)| inst.used && inst.pml4 == pml4)
+                .and_then(|(index, inst)| {
+                    instance_domain_identity(inst).map(|domain| (index, domain))
+                })
+        })
+    else {
         return false;
     };
     let Some(bindings) = (unsafe { hosted_device_bindings() }) else {
@@ -48461,16 +48625,14 @@ pub(crate) fn hosted_published_dma_aperture_contains(pml4: u64, address: u64) ->
     };
     bindings.iter().copied().any(|binding| {
         if !binding.used
-            || (instance_index != binding.instance
-                && instance_index != binding.projection_instance)
+            || (instance_index != binding.instance && instance_index != binding.projection_instance)
             || (instance_index == binding.projection_instance
                 && instance_domain != binding.projection_domain)
         {
             return false;
         }
-        let Some(state) = (unsafe {
-            hosted_device_resource_state_by_device_id(binding.device_id)
-        }) else {
+        let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(binding.device_id) })
+        else {
             return false;
         };
         let start = state.evidence.dma_common_va;
@@ -50984,7 +51146,11 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         if projection_domain != binding.projection_domain {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
-        Some((binding.projection_instance, projection_inst, projection_domain))
+        Some((
+            binding.projection_instance,
+            projection_inst,
+            projection_domain,
+        ))
     };
     if video_memory.is_some() && !hosted_instance_video_port_initialized(inst) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
@@ -52427,6 +52593,7 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
         ExternalPnpDispatchResult::Returned {
             status,
             information,
+            ..
         } => retain_hosted_filter_requirements_return(irp_id, status, information, false),
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
             set_hosted_filter_requirements_indeterminate(
@@ -52537,6 +52704,8 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         completion_driver_id,
         completion_device_id,
         token: None,
+        terminal_io_receipt: None,
+        start_receipt: None,
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
         barrier_status: None,
@@ -52592,7 +52761,11 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
     }
 
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
-        ExternalPnpDispatchResult::Returned { status, .. } => {
+        ExternalPnpDispatchResult::Returned {
+            status, receipt, ..
+        } => {
+            set_hosted_pnp_terminal_io_receipt(irp_id, receipt)
+                .expect("synchronous hosted lifecycle receipt lost its transaction");
             if let Err(transport_status) = complete_hosted_pnp_lifecycle(irp_id, status) {
                 set_hosted_pnp_indeterminate(irp_id, transport_status)
                     .expect("synchronous hosted lifecycle failure lost its transaction");
@@ -52743,6 +52916,8 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         completion_driver_id,
         completion_device_id,
         token: None,
+        terminal_io_receipt: None,
+        start_receipt: None,
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
         barrier_status: None,
@@ -52788,7 +52963,11 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         .expect("reserved hosted PnP transaction disappeared before dispatch");
 
     match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
-        ExternalPnpDispatchResult::Returned { status, .. } => {
+        ExternalPnpDispatchResult::Returned {
+            status, receipt, ..
+        } => {
+            set_hosted_pnp_terminal_io_receipt(irp_id, receipt)
+                .expect("synchronous hosted PnP START receipt lost its transaction");
             if let Err(transport_status) = complete_hosted_pnp_lifecycle(irp_id, status) {
                 set_hosted_pnp_indeterminate(irp_id, transport_status)
                     .expect("synchronous hosted PnP lifecycle failure lost its transaction");
@@ -52810,11 +52989,15 @@ pub(crate) unsafe fn start_hosted_device_canonical(
                     repair_status,
                 });
             }
-            remove_hosted_pnp_transaction(irp_id);
+            transition_hosted_pnp_transaction_phase(irp_id, HostedPnpTransactionPhase::Terminal)
+                .expect("synchronous hosted PnP START could not become terminal");
+            let (terminal_status, receipt) = take_terminal_hosted_pnp_start(irp_id)
+                .expect("terminal synchronous hosted PnP START lost its receipt");
+            debug_assert_eq!(terminal_status, status);
             if status.is_success() {
-                Ok(HostedPnpStartOutcome::Started)
+                Ok(HostedPnpStartOutcome::Started { receipt })
             } else {
-                Ok(HostedPnpStartOutcome::Failed(status))
+                Ok(HostedPnpStartOutcome::Failed { status, receipt })
             }
         }
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {

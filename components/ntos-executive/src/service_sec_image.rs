@@ -5646,6 +5646,7 @@ pub(crate) unsafe fn service_sec_image(
     BootDriverStartReports,
     NativeDriverLoadReport,
     LiveDeviceActionReport,
+    StartDeviceCallReport,
 ) {
     let live_service = ntdll.is_some();
     loader_trace_clear();
@@ -15987,6 +15988,15 @@ pub(crate) unsafe fn service_sec_image(
                         .map(|identity| (identity, result as u32))
                 })
                 .flatten();
+            let start_device_reply = (native_call_transport
+                && m0 == SSN_NT_PLUG_PLAY_CONTROL
+                && !redirected_user_control)
+                .then(|| {
+                    nt_handler
+                        .pnp_take_start_device_reply_tail()
+                        .map(|identity| (identity, result as u32))
+                })
+                .flatten();
             let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
                 let (r0, r1, r2, r3) = stage_serviced_syscall_reply(
@@ -16038,6 +16048,13 @@ pub(crate) unsafe fn service_sec_image(
                 nt_handler
                     .pnp_record_live_action_reply(identity, status, delivered)
                     .expect("live PnP notification reply did not match its UserResponse result");
+            }
+            if let Some((identity, status)) = start_device_reply {
+                let delivered = nb != COMPOSITE_SEND_ERROR_BADGE;
+                match nt_handler.pnp_record_start_device_reply(identity, status, delivered) {
+                    Ok(()) | Err(nt_pnp_manager::StartDeviceLedgerError::ReplyFailed) => {}
+                    Err(_) => panic!("StartDevice reply did not match its exact result"),
+                }
             }
             badge = nb;
             mi = nmi;
@@ -20071,6 +20088,7 @@ pub(crate) unsafe fn service_sec_image(
     let boot_driver_start_reports = pending_driver_start_reports_snapshot(&nt_handler);
     let native_driver_load_report = nt_handler.native_driver_load_report;
     let live_device_action_report = print_live_device_action_report(&nt_handler);
+    let start_device_call_report = print_start_device_call_report(&nt_handler);
     (
         verdict,
         procs[primary_pi].faults,
@@ -20081,6 +20099,7 @@ pub(crate) unsafe fn service_sec_image(
         boot_driver_start_reports,
         native_driver_load_report,
         live_device_action_report,
+        start_device_call_report,
     )
 }
 
@@ -22514,7 +22533,11 @@ unsafe fn pending_driver_start_transfer(
     transfer: PendingDriverStartTransfer,
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
-    let PendingDriverStartTransfer { batch, reservation } = transfer;
+    let PendingDriverStartTransfer {
+        batch,
+        reservation,
+        request,
+    } = transfer;
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
         stolen, 0,
@@ -22528,7 +22551,10 @@ unsafe fn pending_driver_start_transfer(
         reply_cap: stolen,
         reply,
     };
-    let owner = PendingDriverStartOwner::User(Some(reply));
+    let owner = PendingDriverStartOwner::User {
+        request: Some(request),
+        reply: Some(reply),
+    };
     nt_handler
         .pending_driver_starts
         .publish(reservation, PendingDriverStart { batch, owner })
@@ -22580,6 +22606,58 @@ unsafe fn pending_driver_start_reply_owner(
     delivered
 }
 
+fn record_pending_start_result(
+    nt_handler: &mut ExecNtHandler,
+    request: nt_pnp_manager::StartDeviceRequestIdentity,
+    batch: &mut OwnedHostedPnpStartBatch,
+    status: u32,
+) {
+    let evidence = batch
+        .take_single_start_evidence()
+        .expect("pending live StartDevice batch did not own exactly one devnode");
+    let result = match evidence {
+        SingleStartEvidence::Consumed => {
+            panic!("pending live StartDevice batch evidence was consumed twice")
+        }
+        SingleStartEvidence::NotDispatched => {
+            if status == nt_status::NtStatus::SUCCESS.raw() as u32 {
+                nt_handler
+                    .pnp_start_device_calls
+                    .complete_protocol_without_start_irp(request, status)
+            } else {
+                nt_handler
+                    .pnp_start_device_calls
+                    .complete_without_start_irp(request, status)
+            }
+        }
+        SingleStartEvidence::Lifecycle { receipt } => nt_handler
+            .pnp_start_device_calls
+            .complete_lifecycle(request, receipt, status),
+        SingleStartEvidence::Dispatched { irp_id } => nt_handler
+            .pnp_start_device_calls
+            .complete_protocol_ownership_lost(request, irp_id, None, status),
+        SingleStartEvidence::OwnershipLost { irp_id, receipt } => nt_handler
+            .pnp_start_device_calls
+            .complete_protocol_ownership_lost(request, irp_id, receipt, status),
+    };
+    result.expect("pending StartDevice result lost its exact request");
+}
+
+fn record_pending_start_reply(
+    nt_handler: &mut ExecNtHandler,
+    request: nt_pnp_manager::StartDeviceRequestIdentity,
+    status: u32,
+    delivered: bool,
+) {
+    match nt_handler
+        .pnp_start_device_calls
+        .record_reply(request, status, delivered)
+    {
+        Ok(()) | Err(nt_pnp_manager::StartDeviceLedgerError::ReplyFailed) => {}
+        Err(_) => panic!("pending StartDevice reply did not match its exact result"),
+    }
+}
+
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let mut completed = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
@@ -22604,16 +22682,29 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     PendingDriverStartOwner::Boot { target, .. } => nt_handler
                         .boot_driver_start_reports
                         .merge(*target, pending.batch.report()),
-                    PendingDriverStartOwner::User(reply) => {
+                    PendingDriverStartOwner::User { request, reply } => {
+                        let request = request.take();
+                        if let Some(request) = request {
+                            record_pending_start_result(
+                                nt_handler,
+                                request,
+                                &mut pending.batch,
+                                status,
+                            );
+                        }
                         let reply = reply.take();
                         if let Some(reply) = reply {
-                            pending_driver_start_reply_owner(
+                            let delivered = pending_driver_start_reply_owner(
                                 nt_handler,
                                 reply.reply_cap,
                                 reply.reply,
                                 reply.badge,
                                 status,
                             );
+                            let request = request.expect(
+                                "pending StartDevice reply survived after request retirement",
+                            );
+                            record_pending_start_reply(nt_handler, request, status, delivered);
                         }
                     }
                 }
@@ -22622,7 +22713,7 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
                 let status = failure.status.raw() as u32;
                 let mut boot_report = None;
-                let reply = {
+                let user = {
                     let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
                         continue;
                     };
@@ -22637,21 +22728,57 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                             }
                             None
                         }
-                        PendingDriverStartOwner::User(reply) => reply.take(),
+                        PendingDriverStartOwner::User { request, reply } => Some((
+                            request.take(),
+                            reply.take(),
+                            pending.batch.take_single_start_evidence(),
+                        )),
                     }
                 };
                 if let Some((target, report)) = boot_report {
                     nt_handler.boot_driver_start_reports.merge(target, report);
                 }
-                if let Some(reply) = reply {
-                    pending_driver_start_reply_owner(
-                        nt_handler,
-                        reply.reply_cap,
-                        reply.reply,
-                        reply.badge,
-                        status,
-                    );
-                    completed += 1;
+                if let Some((request, reply, evidence)) = user {
+                    if let Some(request) = request {
+                        let evidence = evidence
+                            .expect("lost live StartDevice batch did not own exactly one devnode");
+                        let result = match evidence {
+                            SingleStartEvidence::Consumed => {
+                                panic!("lost live StartDevice batch evidence was consumed twice")
+                            }
+                            SingleStartEvidence::NotDispatched => nt_handler
+                                .pnp_start_device_calls
+                                .complete_without_start_irp(request, status),
+                            SingleStartEvidence::Lifecycle { receipt } => nt_handler
+                                .pnp_start_device_calls
+                                .complete_protocol_ownership_lost(
+                                    request,
+                                    receipt.dispatch().canonical_irp_id,
+                                    Some(receipt),
+                                    status,
+                                ),
+                            SingleStartEvidence::Dispatched { irp_id } => nt_handler
+                                .pnp_start_device_calls
+                                .complete_ownership_lost(request, irp_id, None, status),
+                            SingleStartEvidence::OwnershipLost { irp_id, receipt } => nt_handler
+                                .pnp_start_device_calls
+                                .complete_ownership_lost(request, irp_id, receipt, status),
+                        };
+                        result.expect("lost StartDevice result lost its exact request");
+                    }
+                    if let Some(reply) = reply {
+                        let request = request
+                            .expect("lost StartDevice reply survived after request retirement");
+                        let delivered = pending_driver_start_reply_owner(
+                            nt_handler,
+                            reply.reply_cap,
+                            reply.reply,
+                            reply.badge,
+                            status,
+                        );
+                        record_pending_start_reply(nt_handler, request, status, delivered);
+                        completed += 1;
+                    }
                 }
             }
         }
@@ -22767,21 +22894,40 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
 ) -> u64 {
     let mut abandoned = 0u64;
     for slot in 0..nt_handler.pending_driver_starts.slot_count() {
-        let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
-            continue;
-        };
-        let PendingDriverStartOwner::User(Some(reply)) = &pending.owner else {
-            continue;
-        };
-        if reply.tid != tid || reply.reply_cap == 0 {
+        let matches = nt_handler
+            .pending_driver_starts
+            .get(slot)
+            .is_some_and(|pending| {
+                matches!(
+                    &pending.owner,
+                    PendingDriverStartOwner::User {
+                        request: Some(_),
+                        reply: Some(reply),
+                    } if reply.tid == tid && reply.reply_cap != 0
+                )
+            });
+        if !matches {
             continue;
         }
-        let PendingDriverStartOwner::User(reply) = &mut pending.owner else {
-            unreachable!()
+        let (request, reply) = {
+            let pending = nt_handler
+                .pending_driver_starts
+                .get_mut(slot)
+                .expect("matched StartDevice owner disappeared during abandonment");
+            let PendingDriverStartOwner::User { request, reply } = &mut pending.owner else {
+                unreachable!()
+            };
+            (
+                request.expect("parked StartDevice reply lost its exact request"),
+                reply
+                    .take()
+                    .expect("user START reply disappeared during abandonment"),
+            )
         };
-        let reply = reply
-            .take()
-            .expect("user START reply disappeared during abandonment");
+        nt_handler
+            .pnp_start_device_calls
+            .abandon(request)
+            .expect("abandoned StartDevice reply did not match its pending request");
         let cap = reply.reply_cap;
         let deleted = cnode_delete_r(cap);
         let retyped = if deleted == 0 {

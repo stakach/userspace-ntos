@@ -21467,6 +21467,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     its 900-second operational timeout under the hard one-hour boot ceiling, never an unbounded QEMU
     process.
 
+    B3 exact StartDevice call/lifecycle/reply checkpoint (2026-09-01, implementation and host
+    validation green; runtime pending): `PlugPlayControlStartDevice` now owns a separate monotonic
+    per-call ledger keyed by the captured instance, independent of CM notification identity. Every
+    accepted call records synchronous versus parked execution, one terminal classification, and the
+    exact delivered, failed, or abandoned syscall reply. Early failures are explicitly
+    `no-start-irp`; they cannot be mistaken for a dispatched lifecycle. A thread may abandon its
+    parked reply before the device result becomes terminal without erasing the active request.
+
+    Lifecycle success is no longer assertable from a bare status. The I/O manager is the sole
+    authority that mints a move-only terminal receipt from the canonical IRP and captured stack. A
+    synchronous return mints it while retiring the IRP; a driver-pending completion can claim it
+    exactly once from retained IRP state. `nt-pnp-manager` consumes that opaque authority, atomically
+    completes the retained canonical START token, validates devnode and dispatch generations,
+    terminal state, PDO/FDO binding, stack driver/device identities, exact instance membership, and
+    non-pending START status, then mints a second move-only lifecycle receipt. Scalar stack metadata
+    can no longer manufacture either receipt.
+
+    Hosted synchronous and driver-pending paths retain the lifecycle receipt before destroying
+    their transaction. The single-devnode demand-start batch now exposes explicit `NotDispatched`,
+    `Dispatched`, `Lifecycle`, or `OwnershipLost` evidence rather than an ambiguous optional receipt.
+    It carries lifecycle evidence across later initial-BusRelations work and preserves an already
+    committed receipt if IRP acknowledgement or publication subsequently loses ownership. Thus a
+    missing post-dispatch receipt cannot be downgraded to `no-start-irp`, and the outer syscall
+    terminal status remains distinct from the START status.
+
+    Quiescent output publishes one `[pnp-start-proof]` row with all canonical identities plus a
+    leak/error summary. A driver-pending receipt must join exactly one complete existing
+    `[pnp-pending-proof]` row; a synchronous receipt must join none. The generic gate rejects active
+    calls, reply tails, transfers, retained replies, ownership-loss barriers, reply failures,
+    abandonment, protocol errors, lost lifecycle ownership, or a missing pending-proof join. The
+    live-device-action verifier independently locates the target instance, rejects zero or reused
+    call, canonical IRP, and lifecycle dispatch identities, requires every delivered terminal/reply
+    status pair to match, and requires the target's exact
+    successful lifecycle row and reply, matches the FDO to the real AddDevice result, checks the
+    optional pending proof field-for-field, and still imposes no notification-retirement/install
+    ordering.
+
+    Pending START proof output is now global rather than conditional on a boot hardware-selection
+    gate. The boot Config-PnP report requires its observed pending count to be a subset of that
+    coherent global ledger; live StartDevice rows prove their own exact membership through the
+    receipt join, so a genuine live pending IRP no longer corrupts the boot-batch accounting.
+
+    Focused validation passes `nt-io-manager` 250/250 and `nt-pnp-manager` 60/60 tests, and the
+    freestanding executive check remains green at the established 209-warning baseline. Review
+    adjustment: the exact terminal rows currently retain owned instance strings until the service
+    loop's final report. Replace that diagnostic sink with streamed or bounded, aggregate-backed
+    evidence before treating multi-day StartDevice traffic as a supported instrumentation profile;
+    functional reply and lifecycle ownership must remain independent of evidence retention. Then run
+    the serialized live-device-action lane under its 900-second operational timeout. If that resident
+    E1000 path is accepted, add a distinct nonresident driver profile to prove the Config Manager
+    selected ensure-load path rather than inferring it from the resident target.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

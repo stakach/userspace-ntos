@@ -13,8 +13,62 @@ use nt_types::{AccessMask, ClientId, ObjectId, UnicodeString};
 
 use crate::dispatch::{DispatchContext, DispatchOutcome, IrpProjection, PnpBackendDispatch};
 use crate::file::{CreateOptions, FileRecord, FileState, ShareAccess};
-use crate::irp::{BufferAccess, IoBufferRef, IoParameters, IrpState, PnpParameters, StackFlags};
+use crate::irp::{
+    BufferAccess, IoBufferRef, IoParameters, IrpCompletionOrigin, IrpState, PnpParameters,
+    StackFlags,
+};
+use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
+
+/// I/O-manager-minted terminal identity for one canonical external PnP IRP.
+///
+/// Private fields prevent lifecycle managers from manufacturing stack completion evidence out of
+/// scalar IDs. Synchronous outer returns and acknowledged driver completions use the same shape.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExternalPnpTerminalReceipt {
+    irp_id: IrpId,
+    origin_driver_id: DriverId,
+    origin_device_id: DeviceId,
+    completion_driver_id: DriverId,
+    completion_device_id: DeviceId,
+    minor: u8,
+    status: NtStatus,
+    driver_pending: bool,
+}
+
+impl ExternalPnpTerminalReceipt {
+    pub const fn irp_id(&self) -> IrpId {
+        self.irp_id
+    }
+
+    pub const fn origin_driver_id(&self) -> DriverId {
+        self.origin_driver_id
+    }
+
+    pub const fn origin_device_id(&self) -> DeviceId {
+        self.origin_device_id
+    }
+
+    pub const fn completion_driver_id(&self) -> DriverId {
+        self.completion_driver_id
+    }
+
+    pub const fn completion_device_id(&self) -> DeviceId {
+        self.completion_device_id
+    }
+
+    pub const fn minor(&self) -> u8 {
+        self.minor
+    }
+
+    pub const fn status(&self) -> NtStatus {
+        self.status
+    }
+
+    pub const fn driver_pending(&self) -> bool {
+        self.driver_pending
+    }
+}
 
 /// Result of dispatching an externally constructed IRP. A pending request stays
 /// owned by the I/O Manager until its driver publishes a terminal completion and
@@ -47,16 +101,21 @@ impl PreparedExternalPnpIrp {
 }
 
 /// Exact outcome of entering a prepared canonical PnP request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ExternalPnpDispatchResult {
     /// The outer device-stack call returned a terminal status.
-    Returned { status: NtStatus, information: u64 },
+    Returned {
+        status: NtStatus,
+        information: u64,
+        receipt: ExternalPnpTerminalReceipt,
+    },
     /// A synchronous in/out PnP request returned its exact request-owned payload. Native callers
     /// must validate this independently of `IoStatus.Information`.
     ReturnedPayload {
         status: NtStatus,
         information: u64,
         payload: Vec<u8>,
+        receipt: ExternalPnpTerminalReceipt,
     },
     /// The outer device-stack call returned `STATUS_PENDING`; the canonical IRP remains owned by
     /// the I/O manager until a genuine terminal completion is acknowledged.
@@ -270,6 +329,28 @@ impl<P> IoManager<P> {
                 status,
                 information,
             } => {
+                let receipt = match self.irp(irp_id).and_then(|irp| {
+                    let completion = irp.current_stack()?;
+                    Some(ExternalPnpTerminalReceipt {
+                        irp_id,
+                        origin_driver_id: irp.origin_driver_id,
+                        origin_device_id: irp.origin_device_id,
+                        completion_driver_id: completion.driver_id,
+                        completion_device_id: completion.device_id,
+                        minor: irp.origin_minor,
+                        status,
+                        driver_pending: false,
+                    })
+                }) {
+                    Some(receipt) => receipt,
+                    None => {
+                        self.mark_external_pnp_indeterminate(irp_id);
+                        return ExternalPnpDispatchResult::Indeterminate {
+                            irp_id,
+                            transport_status: NtStatus::INVALID_PARAMETER,
+                        };
+                    }
+                };
                 if let Some(irp) = self.irp_mut(irp_id) {
                     irp.status = status;
                     irp.information = information;
@@ -285,11 +366,13 @@ impl<P> IoManager<P> {
                         status,
                         information,
                         payload: prepared.payload,
+                        receipt,
                     }
                 } else {
                     ExternalPnpDispatchResult::Returned {
                         status,
                         information,
+                        receipt,
                     }
                 }
             }
@@ -326,6 +409,45 @@ impl<P> IoManager<P> {
                 irp.transition(IrpState::Indeterminate);
             }
         }
+    }
+
+    /// Mint the same opaque terminal identity for a PnP IRP that genuinely returned pending and
+    /// later completed through the retained I/O-manager completion queue.
+    pub fn take_completed_external_pnp_receipt(
+        &mut self,
+        irp_id: IrpId,
+    ) -> Option<ExternalPnpTerminalReceipt>
+    where
+        P: ObjectManagerPort,
+    {
+        let completion = self.completed_irp(irp_id)?;
+        if completion.id != irp_id
+            || completion.file_id.is_some()
+            || completion.major != nt_io_abi::major::IRP_MJ_PNP
+            || completion.status == NtStatus::PENDING
+            || completion.completion_origin != IrpCompletionOrigin::Driver
+            || completion.driver_id == DriverId::NULL
+            || completion.device_id == DeviceId::NULL
+            || completion.completion_driver_id == DriverId::NULL
+            || completion.completion_device_id == DeviceId::NULL
+        {
+            return None;
+        }
+        let irp = self.irp_mut(irp_id)?;
+        if irp.external_pnp_terminal_receipt_claimed {
+            return None;
+        }
+        irp.external_pnp_terminal_receipt_claimed = true;
+        Some(ExternalPnpTerminalReceipt {
+            irp_id,
+            origin_driver_id: completion.driver_id,
+            origin_device_id: completion.device_id,
+            completion_driver_id: completion.completion_driver_id,
+            completion_device_id: completion.completion_device_id,
+            minor: completion.minor,
+            status: completion.status,
+            driver_pending: true,
+        })
     }
 
     /// Allocate a canonical File owned by an integration host whose process

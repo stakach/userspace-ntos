@@ -3868,6 +3868,10 @@ impl ExecNtHandler {
         write_field!(pending_file_io_wait, false);
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_driver_starts, driver_starts.pending);
+        write_field!(
+            pnp_start_device_calls,
+            nt_pnp_manager::StartDeviceCallLedger::new()
+        );
         write_field!(boot_driver_start_reports, driver_starts.reports);
         write_field!(native_driver_load_report, NativeDriverLoadReport::default());
         write_field!(pending_driver_start_transfer, None);
@@ -3884,6 +3888,7 @@ impl ExecNtHandler {
         write_field!(anon_event_seq, 0);
         write_field!(pnp_live_action, None);
         write_field!(pnp_live_action_reply_tail, None);
+        write_field!(pnp_start_device_reply_tail, None);
         write_field!(pnp_live_action_claims, 0);
         write_field!(pnp_live_action_terminals, alloc::vec::Vec::new());
         write_field!(pnp_notify_event, 0);
@@ -19752,6 +19757,121 @@ impl ExecNtHandler {
         Ok(())
     }
 
+    fn pnp_stage_start_device_reply(
+        &mut self,
+        identity: nt_pnp_manager::StartDeviceRequestIdentity,
+    ) {
+        assert!(
+            self.pnp_start_device_reply_tail.replace(identity).is_none(),
+            "StartDevice reply tail already owns an unreplied result"
+        );
+    }
+
+    fn pnp_complete_start_without_irp(
+        &mut self,
+        identity: nt_pnp_manager::StartDeviceRequestIdentity,
+        status: u32,
+    ) -> u32 {
+        self.pnp_start_device_calls
+            .complete_without_start_irp(identity, status)
+            .expect("StartDevice no-IRP result lost its exact request");
+        self.pnp_stage_start_device_reply(identity);
+        status
+    }
+
+    fn pnp_complete_start_lifecycle(
+        &mut self,
+        identity: nt_pnp_manager::StartDeviceRequestIdentity,
+        receipt: nt_pnp_manager::StartDeviceLifecycleReceipt,
+        status: u32,
+    ) -> u32 {
+        self.pnp_start_device_calls
+            .complete_lifecycle(identity, receipt, status)
+            .expect("StartDevice lifecycle result lost its exact request");
+        self.pnp_stage_start_device_reply(identity);
+        status
+    }
+
+    fn pnp_complete_start_ownership_lost(
+        &mut self,
+        identity: nt_pnp_manager::StartDeviceRequestIdentity,
+        irp_id: u64,
+        receipt: Option<nt_pnp_manager::StartDeviceLifecycleReceipt>,
+        status: u32,
+    ) -> u32 {
+        self.pnp_start_device_calls
+            .complete_ownership_lost(identity, irp_id, receipt, status)
+            .expect("StartDevice ownership-loss result lost its exact request");
+        self.pnp_stage_start_device_reply(identity);
+        status
+    }
+
+    fn pnp_complete_start_evidence(
+        &mut self,
+        identity: nt_pnp_manager::StartDeviceRequestIdentity,
+        evidence: SingleStartEvidence,
+        status: u32,
+        ownership_lost: bool,
+    ) -> u32 {
+        match evidence {
+            SingleStartEvidence::Consumed => {
+                panic!("live StartDevice batch evidence was consumed twice")
+            }
+            SingleStartEvidence::NotDispatched => {
+                if status == nt_status::NtStatus::SUCCESS.raw() as u32 {
+                    self.pnp_start_device_calls
+                        .complete_protocol_without_start_irp(identity, status)
+                        .expect("successful StartDevice batch had no canonical dispatch");
+                    self.pnp_stage_start_device_reply(identity);
+                    status
+                } else {
+                    self.pnp_complete_start_without_irp(identity, status)
+                }
+            }
+            SingleStartEvidence::Lifecycle { receipt } => {
+                self.pnp_complete_start_lifecycle(identity, receipt, status)
+            }
+            SingleStartEvidence::Dispatched { irp_id } => {
+                if ownership_lost {
+                    self.pnp_complete_start_ownership_lost(identity, irp_id, None, status)
+                } else {
+                    self.pnp_start_device_calls
+                        .complete_protocol_ownership_lost(identity, irp_id, None, status)
+                        .expect("completed StartDevice batch lost unresolved dispatch evidence");
+                    self.pnp_stage_start_device_reply(identity);
+                    status
+                }
+            }
+            SingleStartEvidence::OwnershipLost { irp_id, receipt } => {
+                if ownership_lost {
+                    self.pnp_complete_start_ownership_lost(identity, irp_id, receipt, status)
+                } else {
+                    self.pnp_start_device_calls
+                        .complete_protocol_ownership_lost(identity, irp_id, receipt, status)
+                        .expect("completed StartDevice batch reported lost lifecycle ownership");
+                    self.pnp_stage_start_device_reply(identity);
+                    status
+                }
+            }
+        }
+    }
+
+    pub(crate) fn pnp_take_start_device_reply_tail(
+        &mut self,
+    ) -> Option<nt_pnp_manager::StartDeviceRequestIdentity> {
+        self.pnp_start_device_reply_tail.take()
+    }
+
+    pub(crate) fn pnp_record_start_device_reply(
+        &mut self,
+        identity: nt_pnp_manager::StartDeviceRequestIdentity,
+        status: u32,
+        delivered: bool,
+    ) -> Result<(), nt_pnp_manager::StartDeviceLedgerError> {
+        self.pnp_start_device_calls
+            .record_reply(identity, status, delivered)
+    }
+
     unsafe fn pnp_read_u32(&self, va: u64) -> Result<u32, u32> {
         let mut bytes = [0u8; 4];
         if va == 0 || !self.xas_read(va, &mut bytes) {
@@ -19917,38 +20037,47 @@ impl ExecNtHandler {
             Ok(instance) => instance,
             Err(status) => return status,
         };
+        let request = match self.pnp_start_device_calls.begin(&instance) {
+            Ok(request) => request,
+            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+        };
+        macro_rules! no_start_irp {
+            ($status:expr) => {{
+                return self.pnp_complete_start_without_irp(request, $status);
+            }};
+        }
         match Self::pnp_device_exists(&instance) {
             Ok(true) => {}
-            Ok(false) => return STATUS_NO_SUCH_DEVICE,
-            Err(status) => return status,
+            Ok(false) => no_start_irp!(STATUS_NO_SUCH_DEVICE),
+            Err(status) => no_start_irp!(status),
         }
 
         match nt_pnp_manager::existing_device_start_disposition(
             driver_launch::hosted_pnp_device_state_for_instance(&instance),
         ) {
-            nt_pnp_manager::ExistingDeviceStartDisposition::AlreadyStarted => return 0,
+            nt_pnp_manager::ExistingDeviceStartDisposition::AlreadyStarted => no_start_irp!(0),
             nt_pnp_manager::ExistingDeviceStartDisposition::Busy => {
-                return nt_status::NtStatus::DEVICE_BUSY.raw() as u32;
+                no_start_irp!(nt_status::NtStatus::DEVICE_BUSY.raw() as u32);
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::NoSuchDevice => {
-                return STATUS_NO_SUCH_DEVICE;
+                no_start_irp!(STATUS_NO_SUCH_DEVICE);
             }
             nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {}
         }
 
         let spec = match live_config_existing_device_launch_spec(&instance, SERVICE_DEMAND_START) {
             Ok(spec) => spec,
-            Err(status) => return status as u32,
+            Err(status) => no_start_irp!(status as u32),
         };
         if spec.class != driver_launch::DriverClass::Device || spec.devnodes.len() != 1 {
-            return STATUS_INVALID_PARAMETER;
+            no_start_irp!(STATUS_INVALID_PARAMETER);
         }
         if REPLY_MAIN_SLOT.load(Ordering::Relaxed) == 0 || !wait_reply_pool_has_free() {
-            return STATUS_INSUFFICIENT_RESOURCES;
+            no_start_irp!(STATUS_INSUFFICIENT_RESOURCES);
         }
         let reservation = match self.pending_driver_starts.reserve() {
             Ok(reservation) => reservation,
-            Err(_) => return STATUS_INSUFFICIENT_RESOURCES,
+            Err(_) => no_start_irp!(STATUS_INSUFFICIENT_RESOURCES),
         };
 
         let (driver_id, ready_for_pnp) =
@@ -19959,7 +20088,7 @@ impl ExecNtHandler {
                         self.pending_driver_starts
                             .cancel(reservation)
                             .expect("unusable PnP route lost its START reservation");
-                        return STATUS_DEVICE_NOT_READY;
+                        no_start_irp!(STATUS_DEVICE_NOT_READY);
                     }
                     print_str(b"[pnp-start] ensure-load instance=");
                     print_str(instance.as_bytes());
@@ -19984,7 +20113,7 @@ impl ExecNtHandler {
                         self.pending_driver_starts
                             .cancel(reservation)
                             .expect("failed driver load lost its START reservation");
-                        return load_status;
+                        no_start_irp!(load_status);
                     }
                     let Some(context) =
                         driver_launch::loaded_driver_pnp_start_context(&spec.driver_object_path)
@@ -19992,7 +20121,7 @@ impl ExecNtHandler {
                         self.pending_driver_starts
                             .cancel(reservation)
                             .expect("unpublished driver load lost its START reservation");
-                        return STATUS_UNSUCCESSFUL;
+                        no_start_irp!(STATUS_UNSUCCESSFUL);
                     };
                     context
                 }
@@ -20001,7 +20130,7 @@ impl ExecNtHandler {
             self.pending_driver_starts
                 .cancel(reservation)
                 .expect("non-PnP driver lost its START reservation");
-            return STATUS_DEVICE_NOT_READY;
+            no_start_irp!(STATUS_DEVICE_NOT_READY);
         }
 
         let mut batch = OwnedHostedPnpStartBatch::new_for_driver(
@@ -20012,8 +20141,14 @@ impl ExecNtHandler {
         );
         match batch.drive() {
             OwnedHostedPnpStartProgress::AwaitingCompletion => {
-                self.pending_driver_start_transfer =
-                    Some(PendingDriverStartTransfer { batch, reservation });
+                self.pnp_start_device_calls
+                    .mark_pending(request)
+                    .expect("parked StartDevice request lost its synchronous owner");
+                self.pending_driver_start_transfer = Some(PendingDriverStartTransfer {
+                    batch,
+                    reservation,
+                    request,
+                });
                 nt_status::NtStatus::PENDING.raw() as u32
             }
             OwnedHostedPnpStartProgress::Complete(result) => {
@@ -20024,16 +20159,26 @@ impl ExecNtHandler {
                     Ok(_) => 0,
                     Err(failure) => failure.status.raw() as u32,
                 };
-                status
+                let evidence = batch
+                    .take_single_start_evidence()
+                    .expect("live StartDevice batch did not own exactly one devnode");
+                self.pnp_complete_start_evidence(request, evidence, status, false)
             }
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
                 let status = failure.status.raw() as u32;
+                let evidence = batch
+                    .take_single_start_evidence()
+                    .expect("lost live StartDevice batch did not own exactly one devnode");
+                self.pnp_complete_start_evidence(request, evidence, status, true);
                 self.pending_driver_starts
                     .publish(
                         reservation,
                         PendingDriverStart {
                             batch,
-                            owner: PendingDriverStartOwner::User(None),
+                            owner: PendingDriverStartOwner::User {
+                                request: None,
+                                reply: None,
+                            },
                         },
                     )
                     .expect("indeterminate user START rejected its barrier owner");
