@@ -17,3 +17,6 @@ undocumented_unsafe_blocks = "deny"
 [dependencies]
 nt-time.workspace = true
 nt-types.workspace = true
+
+[dev-dependencies]
+nt-process.workspace = true

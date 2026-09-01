@@ -733,4 +733,48 @@ mod tests {
             Err(EventObjectError::SignalNotDelivering)
         );
     }
+
+    #[test]
+    fn process_local_handles_hold_independent_registry_leases() {
+        let mut processes = nt_process::ProcessManager::new();
+        let owner_pid = processes.create_process("owner.exe", None, None);
+        let duplicate_pid = processes.create_process("duplicate.exe", Some(owner_pid), None);
+        let mut registry = EventObjectRegistry::new();
+        let id = registry
+            .create(EventObjectOwner::new(owner_pid as u64, 1), 81)
+            .unwrap();
+
+        registry.retain_handle(id).unwrap();
+        let owner_handle = processes
+            .insert_handle(owner_pid, nt_process::HandleObject::Event(id.0), 0x1f0003)
+            .unwrap();
+        let object = processes.lookup_handle(owner_pid, owner_handle).unwrap();
+        registry.retain_handle(id).unwrap();
+        let duplicate_handle = processes
+            .insert_handle(duplicate_pid, object, 0x100000)
+            .unwrap();
+        assert_eq!(registry.snapshot(id).unwrap().handle_leases, 2);
+
+        let closed = processes
+            .take_handle_for_close(owner_pid, owner_handle)
+            .unwrap();
+        assert_eq!(closed, nt_process::HandleObject::Event(id.0));
+        assert!(registry.release_handle(id).unwrap().is_none());
+        assert_eq!(registry.snapshot(id).unwrap().handle_leases, 1);
+
+        let closed = processes
+            .take_handle_for_close(duplicate_pid, duplicate_handle)
+            .unwrap();
+        assert_eq!(closed, nt_process::HandleObject::Event(id.0));
+        assert!(registry.release_handle(id).unwrap().is_none());
+        assert_eq!(registry.snapshot(id).unwrap().handle_leases, 0);
+        assert_eq!(
+            registry
+                .request_delete(id)
+                .unwrap()
+                .unwrap()
+                .native_identity,
+            81
+        );
+    }
 }

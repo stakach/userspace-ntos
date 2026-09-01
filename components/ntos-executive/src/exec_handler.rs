@@ -1161,6 +1161,10 @@ fn trace_handle_object_for(nt: &ExecNtHandler, handle: u64) {
             print_str(b"overlay-file fid=0x");
             print_hex(file_id as u32);
         }
+        Some(nt_process::HandleObject::Event(id)) => {
+            print_str(b"event id=0x");
+            print_hex_u64(id.0);
+        }
         Some(nt_process::HandleObject::Opaque(tag)) => {
             print_str(b"opaque tag=0x");
             print_hex_u64(tag);
@@ -3910,6 +3914,10 @@ impl ExecNtHandler {
         write_field!(real_time_is_universal, real_time_is_universal);
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
+        write_field!(
+            event_objects,
+            nt_kernel_exec::EventObjectRegistry::with_capacity(192, 192)
+        );
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
         write_field!(job_time_sample_deadline, u64::MAX);
@@ -11081,7 +11089,6 @@ impl ExecNtHandler {
         let tag = match kind {
             OBJ_KIND_DIRECTORY => DIRECTORY_OBJECT_HANDLE_TAG,
             OBJ_KIND_SYMBOLIC_LINK => SYMBOLIC_LINK_HANDLE_TAG,
-            OBJ_KIND_EVENT => EVENT_HANDLE_TAG,
             OBJ_KIND_SEMAPHORE => SEMAPHORE_HANDLE_TAG,
             OBJ_KIND_MUTANT => MUTANT_HANDLE_TAG,
             OBJ_KIND_TIMER => TIMER_HANDLE_TAG,
@@ -11099,9 +11106,7 @@ impl ExecNtHandler {
     }
 
     fn opaque_object_namespace_index(tag: u64) -> Option<(u8, usize)> {
-        let tag_kind = if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG {
-            Some(OBJ_KIND_EVENT)
-        } else if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG {
+        let tag_kind = if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG {
             Some(OBJ_KIND_SEMAPHORE)
         } else if tag & MUTANT_HANDLE_TAG_MASK == MUTANT_HANDLE_TAG {
             Some(OBJ_KIND_MUTANT)
@@ -11863,15 +11868,43 @@ impl ExecNtHandler {
     /// Mint a process-local event handle that references a shared executive event identity.
     pub(crate) fn mint_event_handle(&mut self, event_index: usize, access: u32) -> Option<u64> {
         let pid = self.pm_pid_for_pi(self.pi)?;
-        let tag = EVENT_HANDLE_TAG | event_index as u64;
-        let handle = self
-            .insert_process_handle(
-                pid,
-                nt_process::HandleObject::Opaque(tag),
-                nt_kernel_exec::map_event_access(access),
-            )
-            .ok()?;
-        Some(handle as u64)
+        let generation = self.hosted_process_generation(self.pi)?;
+        let entry = self.obj_ns.get(event_index)?;
+        if !entry.is_live()
+            || entry.kind != OBJ_KIND_EVENT
+            || !self.events.contains(event_index as u64)
+        {
+            return None;
+        }
+        let mut registered = false;
+        let id = if let Some(id) = self.event_objects.id_for_native(event_index as u64) {
+            id
+        } else {
+            registered = true;
+            self.event_objects
+                .create(
+                    nt_kernel_exec::EventObjectOwner::new(pid as u64, generation),
+                    event_index as u64,
+                )
+                .ok()?
+        };
+        if self.event_objects.retain_handle(id).is_err() {
+            if registered {
+                let _ = self.event_objects.request_delete(id);
+            }
+            return None;
+        }
+        let object = nt_process::HandleObject::Event(id.0);
+        match self.insert_process_handle(pid, object, nt_kernel_exec::map_event_access(access)) {
+            Ok(handle) => Some(handle as u64),
+            Err(_) => {
+                let _ = self.event_objects.release_handle(id);
+                if registered {
+                    let _ = self.event_objects.request_delete(id);
+                }
+                None
+            }
+        }
     }
 
     /// Resolve a typed process-local event handle and enforce the access requested by the operation.
@@ -11891,12 +11924,8 @@ impl ExecNtHandler {
             };
         }
         let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
-        let tag = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
-            Some(nt_process::HandleObject::Opaque(tag))
-                if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
-            {
-                tag
-            }
+        let id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
+            Some(nt_process::HandleObject::Event(id)) => nt_kernel_exec::EventObjectId(id),
             Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
             None => return Err(STATUS_INVALID_HANDLE),
         };
@@ -11907,10 +11936,20 @@ impl ExecNtHandler {
         if required_access != 0 && granted & required_access != required_access {
             return Err(STATUS_ACCESS_DENIED);
         }
-        let index = (tag & 0xFFFF_FFFF) as usize;
+        let index = usize::try_from(
+            self.event_objects
+                .snapshot(id)
+                .map_err(|_| STATUS_INVALID_HANDLE)?
+                .native_identity,
+        )
+        .map_err(|_| STATUS_INVALID_HANDLE)?;
         self.obj_ns
             .get(index)
-            .filter(|entry| entry.kind == 2 && self.events.contains(index as u64))
+            .filter(|entry| {
+                entry.is_live()
+                    && entry.kind == OBJ_KIND_EVENT
+                    && self.events.contains(index as u64)
+            })
             .map(|_| index)
             .ok_or(STATUS_INVALID_HANDLE)
     }
@@ -13137,12 +13176,21 @@ impl ExecNtHandler {
             .ok_or(STATUS_INVALID_PARAMETER)?;
         let kind = entry.kind;
         self.obj_ns[index].wait_references = references;
-        let final_handleless_reference = references == 0
-            && Self::object_namespace_handle_tag(kind, index).is_some_and(|tag| {
-                self.pm
-                    .handle_object_count(nt_process::HandleObject::Opaque(tag))
-                    == 0
-            });
+        let final_handleless_reference = if kind == OBJ_KIND_EVENT {
+            references == 0
+                && self
+                    .event_objects
+                    .id_for_native(index as u64)
+                    .and_then(|id| self.event_objects.snapshot(id).ok())
+                    .is_some_and(|snapshot| snapshot.handle_leases == 0)
+        } else {
+            references == 0
+                && Self::object_namespace_handle_tag(kind, index).is_some_and(|tag| {
+                    self.pm
+                        .handle_object_count(nt_process::HandleObject::Opaque(tag))
+                        == 0
+                })
+        };
         if final_handleless_reference {
             self.obj_delete_name_check(index);
         }
@@ -17597,6 +17645,7 @@ impl ExecNtHandler {
                 nt_process::HandleObject::Process(_) => b"Process",
                 nt_process::HandleObject::Thread(_) => b"Thread",
                 nt_process::HandleObject::Section(_) => b"Section",
+                nt_process::HandleObject::Event(_) => b"Event",
                 nt_process::HandleObject::File(_)
                 | nt_process::HandleObject::RoutedFile { .. }
                 | nt_process::HandleObject::DiskFile { .. }
@@ -17609,11 +17658,6 @@ impl ExecNtHandler {
                 }
                 nt_process::HandleObject::DebugObject(_) => b"DebugObject",
                 nt_process::HandleObject::Job(_) => b"Job",
-                nt_process::HandleObject::Opaque(tag)
-                    if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
-                {
-                    b"Event"
-                }
                 nt_process::HandleObject::Opaque(tag)
                     if tag & SEMAPHORE_HANDLE_TAG_MASK == SEMAPHORE_HANDLE_TAG =>
                 {
@@ -17664,6 +17708,15 @@ impl ExecNtHandler {
         }
         if let nt_process::HandleObject::Job(id) = object {
             return self.job_namespace_index(id);
+        }
+        if let nt_process::HandleObject::Event(id) = object {
+            let id = nt_kernel_exec::EventObjectId(id);
+            let index = usize::try_from(self.event_objects.snapshot(id).ok()?.native_identity).ok()?;
+            return self
+                .obj_ns
+                .get(index)
+                .filter(|entry| entry.is_live() && entry.kind == OBJ_KIND_EVENT)
+                .map(|_| index);
         }
         let tag = match object {
             nt_process::HandleObject::Opaque(tag) => tag,
@@ -21580,6 +21633,10 @@ impl ExecNtHandler {
         object: nt_process::HandleObject,
     ) -> Result<(), u32> {
         match object {
+            nt_process::HandleObject::Event(id) => self
+                .event_objects
+                .retain_handle(nt_kernel_exec::EventObjectId(id))
+                .map_err(|_| nt_process::STATUS_INVALID_HANDLE),
             nt_process::HandleObject::TokenObject(token) => self
                 .token_store
                 .retain(token)
@@ -21607,6 +21664,11 @@ impl ExecNtHandler {
     /// references do not enter this path because they are acquired by handle-table publication.
     fn release_external_handle_reference(&mut self, object: nt_process::HandleObject) {
         match object {
+            nt_process::HandleObject::Event(id) => {
+                let _ = self
+                    .event_objects
+                    .release_handle(nt_kernel_exec::EventObjectId(id));
+            }
             nt_process::HandleObject::TokenObject(token) => {
                 let _ = self.token_store.release(token);
             }
@@ -21633,6 +21695,9 @@ impl ExecNtHandler {
 
     fn release_handle_object(&mut self, object: nt_process::HandleObject) {
         match object {
+            nt_process::HandleObject::Event(id) => {
+                self.release_event_handle_reference(nt_kernel_exec::EventObjectId(id));
+            }
             nt_process::HandleObject::TokenObject(token) => {
                 let _ = self.token_store.release(token);
             }
@@ -25425,6 +25490,15 @@ impl ExecNtHandler {
     }
 
     fn rollback_new_event(&mut self, index: usize) {
+        if let Some(id) = self.event_objects.id_for_native(index as u64) {
+            if self
+                .event_objects
+                .snapshot(id)
+                .is_ok_and(|snapshot| snapshot.handle_leases == 0)
+            {
+                let _ = self.event_objects.request_delete(id);
+            }
+        }
         if index + 1 == self.obj_ns.len() {
             self.obj_ns.pop();
             self.events.remove_existing(index as u64);
@@ -25459,7 +25533,85 @@ impl ExecNtHandler {
         }
     }
 
+    fn finalize_retired_event_object(
+        &mut self,
+        retired: nt_kernel_exec::RetiredEventObject,
+    ) {
+        assert!(
+            retired.provider_body.is_none(),
+            "provider KEVENT retirement must cross the win32k broker"
+        );
+        let Ok(index) = usize::try_from(retired.native_identity) else {
+            return;
+        };
+        let Some(entry) = self.obj_ns.get(index) else {
+            return;
+        };
+        if !entry.is_live() || entry.kind != OBJ_KIND_EVENT || entry.wait_references != 0 {
+            return;
+        }
+        self.events.remove_existing(index as u64);
+        self.obj_ns[index].unlink();
+    }
+
+    /// Remove a nonpermanent Event from name lookup once its last handle closes, then request
+    /// backing deletion after the legacy dispatcher-wait bridge has drained. Registry pointer,
+    /// native-wait, GUI-wait, and signal leases can independently defer final retirement.
+    fn event_delete_name_check(&mut self, index: usize) {
+        let Some(id) = self.event_objects.id_for_native(index as u64) else {
+            return;
+        };
+        let Ok(snapshot) = self.event_objects.snapshot(id) else {
+            return;
+        };
+        let Some(entry) = self.obj_ns.get(index) else {
+            return;
+        };
+        if !entry.is_live()
+            || entry.kind != OBJ_KIND_EVENT
+            || entry.permanent
+            || snapshot.handle_leases != 0
+        {
+            return;
+        }
+        let wait_references = entry.wait_references;
+        let entry = &mut self.obj_ns[index];
+        entry.name = [0; OBJ_NAME_CAP];
+        entry.name_len = 0;
+        entry.parent = OBJ_PARENT_ANONYMOUS;
+        if wait_references != 0 {
+            return;
+        }
+        if let Ok(Some(retired)) = self.event_objects.request_delete(id) {
+            self.finalize_retired_event_object(retired);
+        }
+    }
+
+    fn release_event_handle_reference(&mut self, id: nt_kernel_exec::EventObjectId) {
+        match self.event_objects.release_handle(id) {
+            Ok(Some(retired)) => self.finalize_retired_event_object(retired),
+            Ok(None) => {
+                if let Ok(snapshot) = self.event_objects.snapshot(id) {
+                    if snapshot.handle_leases == 0 {
+                        if let Ok(index) = usize::try_from(snapshot.native_identity) {
+                            self.event_delete_name_check(index);
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
     fn obj_delete_name_check(&mut self, index: usize) {
+        if self
+            .obj_ns
+            .get(index)
+            .is_some_and(|entry| entry.kind == OBJ_KIND_EVENT)
+        {
+            self.event_delete_name_check(index);
+            return;
+        }
         let Some(entry) = self.obj_ns.get(index) else {
             return;
         };
@@ -25486,9 +25638,6 @@ impl ExecNtHandler {
         }
         match kind {
             OBJ_KIND_DIRECTORY | OBJ_KIND_SYMBOLIC_LINK | OBJ_KIND_LPC_PORT => {}
-            OBJ_KIND_EVENT => {
-                self.events.remove_existing(index as u64);
-            }
             OBJ_KIND_TIMER => {
                 self.events.remove_existing(index as u64);
                 self.user_timer_remove(index as u64);
@@ -29569,11 +29718,7 @@ impl ExecNtHandler {
                     .pm
                     .lookup_handle(pid, event_handle as nt_process::Handle)
                 {
-                    Some(nt_process::HandleObject::Opaque(tag))
-                        if tag & EVENT_HANDLE_TAG_MASK == EVENT_HANDLE_TAG =>
-                    {
-                        Err(event_status)
-                    }
+                    Some(nt_process::HandleObject::Event(_)) => Err(event_status),
                     Some(nt_process::HandleObject::Opaque(_)) => Ok(None),
                     _ => Err(event_status),
                 }

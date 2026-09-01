@@ -22145,6 +22145,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `ObDereferenceObject`, native waits, GUI waits, and signal redrive must all cross that boundary
     before deleting the old four-slot ring, raw-pointer FIFO, no-op references, and queue-event repair.
 
+    Queue-event process-handle integration checkpoint (2026-09-02, host and freestanding green):
+    Process Manager now stores `HandleObject::Event(ObjectId)` rather than an opaque tag containing
+    a namespace index. `ExecNtHandler` owns the generation-fenced registry beside the existing
+    canonical `EventStore`; first handle publication binds the namespace index and creator process
+    generation, while duplicate and inherited handles acquire independent handle leases before
+    publication and roll them back exactly on failure. Access-checked lookup resolves the registry
+    identity back to a live Event namespace entry, and query/type paths use that same typed target.
+    There is no opaque Event-handle compatibility path.
+
+    Native close and process handle-table rundown now release registry handle leases. Last-handle
+    close removes a nonpermanent Event from name lookup immediately, but preserves dispatcher
+    backing until legacy published waits drain and pointer/native-wait/GUI-wait/signal leases permit
+    final retirement. A combined Process Manager/registry test proves two process-local handles own
+    two leases, either close preserves the canonical object, and final close still requires the
+    Object Manager deletion transition. `cargo test -p nt-process` passes 151/151,
+    `cargo test -p nt-kernel-exec` passes 197/197, and freestanding executive `cargo check
+    --manifest-path components/ntos-executive/Cargo.toml --target x86_64-unknown-none` is green.
+
+    Next add the dedicated pointer-free win32k Event broker and move provider `ZwCreateEvent`,
+    `ObReferenceObjectByHandle`, `ObCloseHandle`, and `ObDereferenceObject` onto these exact leases.
+    Only after those imports use the broker should provider-body publication and final pool reclaim
+    be enabled; the four-slot ring and repair path remain deletion targets, not fallback behavior.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

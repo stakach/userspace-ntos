@@ -760,6 +760,9 @@ pub enum HandleObject {
     Process(ProcessId),
     Thread(ThreadId),
     Section(SectionId),
+    /// A canonical executive Event object. The generation-protected identity is shared by every
+    /// process-local handle while dispatcher and provider state remain owned outside Ps.
+    Event(nt_types::ObjectId),
     /// An I/O Manager `FILE_OBJECT`. The identifier belongs to the backing filesystem service.
     File(u64),
     /// An I/O Manager `FILE_OBJECT` plus the device route that owned it at create/open time.

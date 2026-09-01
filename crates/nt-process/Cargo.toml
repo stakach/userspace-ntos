@@ -11,6 +11,7 @@ authors.workspace = true
 nt-pe-loader = { workspace = true }
 nt-security = { workspace = true }
 nt-syscall-abi = { workspace = true }
+nt-types = { workspace = true }
 
 [dev-dependencies]
 nt-driver-test-fixtures = { workspace = true }

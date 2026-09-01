@@ -23573,11 +23573,6 @@ static NT_CREATE_FILE_WINLOGON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Base for object-manager handles (index into `obj_ns`, distinct from key handles).
 const OBJ_HANDLE_BASE: u64 = 0x0000_0002_0000_0000;
-/// Opaque-tag payload used by the real per-process handle table for anonymous events. The low
-/// 32 bits are the shared object-namespace index; named/global event handles keep OBJ_HANDLE_BASE
-/// for win32k and cross-process compatibility.
-const EVENT_HANDLE_TAG: u64 = 0x4556_4E54_0000_0000;
-const EVENT_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const TIMER_HANDLE_TAG: u64 = 0x5449_4D52_0000_0000;
 const TIMER_HANDLE_TAG_MASK: u64 = 0xFFFF_FFFF_0000_0000;
 const SEMAPHORE_HANDLE_TAG: u64 = 0x5345_4D41_0000_0000;
@@ -24162,6 +24157,10 @@ struct ExecNtHandler {
     /// Dispatcher state for every `obj_ns` event, keyed by the stable namespace index. The store
     /// owns manual/auto-reset and signal state; `obj_ns` owns names and identity.
     events: nt_kernel_exec::EventStore,
+    /// Generation-fenced ownership for native Event identities. Process handles, provider object
+    /// pointers, native/GUI waits, and queued provider signals hold independent leases here; the
+    /// `EventStore` namespace index remains the canonical dispatcher identity.
+    event_objects: nt_kernel_exec::EventObjectRegistry,
     /// Native waitable timers, keyed by `obj_ns` timer entries. Dispatcher signal state is stored in
     /// `events`; this table holds due-time, period, and optional APC metadata.
     user_timers: nt_user_timer::TimerTable,
