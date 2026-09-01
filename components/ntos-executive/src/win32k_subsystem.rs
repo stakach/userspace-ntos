@@ -334,8 +334,7 @@ pub const WIN32K_REQUEST_SSDT: u64 = 0;
 pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
 pub const PS_WIN32_PROVIDER_THREAD_EXIT: u64 = 1;
 pub const PS_WIN32_PROVIDER_PROCESS_EXIT: u64 = 2;
-pub const PS_WIN32_PROVIDER_RETIRE_PROCESS_CONTEXT: u64 = 3;
-pub const PS_WIN32_PROVIDER_RETIRE_THREAD_CONTEXT: u64 = 4;
+pub const PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS: u64 = 3;
 pub const PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT: u64 = 1;
 pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
 const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
@@ -6251,7 +6250,7 @@ unsafe fn note_context_retirement_failure(kind: &[u8], identity: u64) -> bool {
     false
 }
 
-unsafe fn retire_thread_ctx_record(index: usize) -> bool {
+unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
     let Some(ptr) = thread_ctx_ptr(index) else {
         return note_context_retirement_failure(b"thread", index as u64);
     };
@@ -6354,7 +6353,7 @@ unsafe fn clear_token_handle_publications(token: u64) -> u64 {
     cleared
 }
 
-unsafe fn retire_process_ctx_record(index: usize) -> bool {
+unsafe fn finalize_process_ctx_record(index: usize) -> bool {
     let Some(ptr) = process_ctx_ptr(index) else {
         return note_context_retirement_failure(b"process", index as u64);
     };
@@ -11996,10 +11995,63 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
     const STATUS_UNSUCCESSFUL: u64 = 0xC000_0001u32 as u64;
     const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
     const STATUS_DEVICE_NOT_READY: u64 = 0xC000_00A3u32 as u64;
-    let require_thread = matches!(
-        command,
-        PS_WIN32_PROVIDER_THREAD_EXIT | PS_WIN32_PROVIDER_RETIRE_THREAD_CONTEXT
-    );
+    if command == PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS {
+        if expected != 0 || flags != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let sh = WIN32K_SHARED_VADDR;
+        let pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+        let pid = read_volatile((sh + SH_REQ_PROCESS_ID) as *const u64);
+        let generation = read_volatile((sh + SH_REQ_GENERATION) as *const u64);
+        if checked_client_index(pi).is_none() || pid == 0 || generation == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let Some(process_index) = process_context_index_for_pid(pid) else {
+            return if (0..thread_ctx_len()).any(|index| thread_ctx_pid(index) == pid) {
+                STATUS_UNSUCCESSFUL
+            } else {
+                STATUS_SUCCESS
+            };
+        };
+        if process_ctx_pi(process_index) != pi
+            || process_ctx_generation(process_index) != generation
+            || process_ctx_w32process(process_index) != 0
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let eprocess = process_ctx_eprocess(process_index);
+        if eprocess == 0
+            || read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64) != 0
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        for index in 0..thread_ctx_len() {
+            if thread_ctx_pid(index) != pid {
+                continue;
+            }
+            let ethread = thread_ctx_ethread(index);
+            if thread_ctx_pi(index) != pi
+                || thread_ctx_generation(index) != generation
+                || thread_ctx_w32thread(index) != 0
+                || ethread == 0
+                || read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != 0
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+        for index in 0..thread_ctx_len() {
+            if thread_ctx_pid(index) == pid && !finalize_thread_ctx_record(index) {
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
+        return if finalize_process_ctx_record(process_index) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_UNSUCCESSFUL
+        };
+    }
+
+    let require_thread = command == PS_WIN32_PROVIDER_THREAD_EXIT;
     let (process_index, thread_index) =
         match select_existing_ps_provider_context(require_thread) {
             Ok(selected) => selected,
@@ -12077,48 +12129,6 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
                 publish_selected_context(process_index, thread_index);
             }
             STATUS_SUCCESS
-        }
-        PS_WIN32_PROVIDER_RETIRE_THREAD_CONTEXT => {
-            let Some(thread_index) = thread_index else {
-                return STATUS_INVALID_PARAMETER;
-            };
-            let ethread = thread_ctx_ethread(thread_index);
-            if expected != 0
-                || flags != 0
-                || thread_ctx_w32thread(thread_index) != 0
-                || read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != 0
-            {
-                return STATUS_INVALID_PARAMETER;
-            }
-            if retire_thread_ctx_record(thread_index) {
-                STATUS_SUCCESS
-            } else {
-                STATUS_UNSUCCESSFUL
-            }
-        }
-        PS_WIN32_PROVIDER_RETIRE_PROCESS_CONTEXT => {
-            if expected != 0 || flags != 0 || process_ctx_w32process(process_index) != 0 {
-                return STATUS_INVALID_PARAMETER;
-            }
-            for index in 0..thread_ctx_len() {
-                if thread_ctx_pid(index) == pid {
-                    let ethread = thread_ctx_ethread(index);
-                    if thread_ctx_w32thread(index) != 0
-                        || ethread == 0
-                        || read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != 0
-                    {
-                        return STATUS_INVALID_PARAMETER;
-                    }
-                    if !retire_thread_ctx_record(index) {
-                        return STATUS_UNSUCCESSFUL;
-                    }
-                }
-            }
-            if retire_process_ctx_record(process_index) {
-                STATUS_SUCCESS
-            } else {
-                STATUS_UNSUCCESSFUL
-            }
         }
         _ => STATUS_INVALID_PARAMETER,
     }

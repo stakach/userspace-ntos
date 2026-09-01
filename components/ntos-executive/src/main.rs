@@ -19256,29 +19256,6 @@ unsafe fn release_hosted_thread_win32_context(
         }
     }
 
-    if !final_mechanism && provider_thread {
-        let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
-            win32k_subsystem::PS_WIN32_PROVIDER_RETIRE_THREAD_CONTEXT,
-            0,
-            0,
-            client,
-        );
-        if !completed || status as u32 != 0 {
-            print_str(b"[ps-win32-exit] thread context retirement failed tid=");
-            print_u64(tid);
-            print_str(b" status=0x");
-            print_hex(if completed { status as u32 } else { STATUS_DEVICE_NOT_READY });
-            print_str(b"\n");
-            return false;
-        }
-        if !handler
-            .pm
-            .clear_thread_kernel_object_exact(tid as nt_process::ThreadId, client.ethread)
-        {
-            return false;
-        }
-    }
-
     if let Some(expected) = process_win32 {
         if handler
             .remove_process_win32_job_membership(pid, expected)
@@ -19306,35 +19283,6 @@ unsafe fn release_hosted_thread_win32_context(
     }
 
     if final_mechanism {
-        if provider_process {
-            let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
-                win32k_subsystem::PS_WIN32_PROVIDER_RETIRE_PROCESS_CONTEXT,
-                0,
-                0,
-                client,
-            );
-            if !completed || status as u32 != 0 {
-                print_str(b"[ps-win32-exit] process context retirement failed pid=");
-                print_u64(u64::from(pid));
-                print_str(b" status=0x");
-                print_hex(if completed { status as u32 } else { STATUS_DEVICE_NOT_READY });
-                print_str(b"\n");
-                return false;
-            }
-            if provider_thread
-                && !handler
-                    .pm
-                    .clear_thread_kernel_object_exact(tid as nt_process::ThreadId, client.ethread)
-            {
-                return false;
-            }
-            if !handler
-                .pm
-                .clear_process_kernel_object_exact(pid, client.eprocess)
-            {
-                return false;
-            }
-        }
         if !win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid)) {
             return false;
         }
@@ -19471,10 +19419,14 @@ unsafe fn reclaim_final_process_vm(
                     print_str(b" status=0x");
                     print_hex(status);
                     print_str(b"\n");
+                    break;
                 }
             }
             let _ = generic_sections.unmap_view(pi, view.base);
             stats.generic_views = stats.generic_views.saturating_add(1);
+        }
+        if stats.generic_writeback_failures != 0 {
+            return stats;
         }
         stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
         {
@@ -19504,7 +19456,8 @@ unsafe fn reclaim_final_process_vm(
     }
     stats.private_pts = private_pts;
     stats.private_pt_failures = private_pt_failures;
-    let leaf_ownership_clear = stats.win32k_client_cap_failures == 0
+    let leaf_ownership_clear = stats.generic_writeback_failures == 0
+        && stats.win32k_client_cap_failures == 0
         && win32k_glue::win32k_client_cap_bank_is_empty(pi)
         && client_frame_registry_process_is_empty(pi as u64)
         && stats.client_copyin_frame_failures == 0
@@ -19572,7 +19525,6 @@ unsafe fn teardown_job_terminated_processes(
         }
         let reclaimed =
             terminate_hosted_process_mechanisms(process_index, None, delay_queue, handler);
-        let vm_reclaim = reclaim_final_process_vm(process_index, handler);
         if let Some(pid) = handler.pm_pid_for_pi(process_index as usize) {
             let _ = handler.try_delete_hosted_process_object(pid);
         }
@@ -19580,8 +19532,8 @@ unsafe fn teardown_job_terminated_processes(
         print_u64(process_index as u64);
         print_str(b" mechanisms=");
         print_u64(reclaimed as u64);
-        print_str(b" vm-frames=");
-        print_u64(vm_reclaim.registered_frames);
+        print_str(b" runtimes-pending=");
+        print_u64(handler.thread_runtime.has_process(process_index as usize) as u64);
         print_str(b"\n");
     }
     handler.refresh_process_manager_gates();

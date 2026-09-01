@@ -5696,6 +5696,7 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         output_stage,
         client,
         win32k_subsystem::WIN32K_REQUEST_SSDT,
+        true,
     )
 }
 
@@ -5717,6 +5718,30 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
         None,
         client,
         win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
+        true,
+    )
+}
+
+/// Complete provider-owned process backing after Ps has run the Object Manager delete procedure.
+/// The client VSpace is already gone at this boundary, and this command is forbidden from attaching
+/// or faulting client pages; it can touch only provider-owned context and pool state.
+pub(crate) unsafe fn win32k_finalize_ps_provider_process_objects(
+    client: Win32kClientContext,
+) -> (u64, bool) {
+    let command = win32k_subsystem::PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS;
+    win32k_dispatch_wide_with_completion_args_and_kind(
+        0,
+        command,
+        0,
+        0,
+        0,
+        0,
+        &[],
+        [command, 0, 0, 0],
+        None,
+        client,
+        win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
+        false,
     )
 }
 
@@ -5732,6 +5757,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
     client: Win32kClientContext,
     request_kind: u64,
+    attach_client: bool,
 ) -> (u64, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
@@ -5746,10 +5772,12 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     let client_pi = client.pi as u64;
     // TAIL WATCH tag 4/5 — sample EVERY hosted process' TEB tail immediately before and after every
     // win32k dispatch (this is the single funnel all dispatch sites go through, nested ones too).
-    for watch_pi in 1..5usize {
-        crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
+    if attach_client {
+        for watch_pi in 1..5usize {
+            crate::teb_tail_watch(watch_pi, 4, ssn, client_pi);
+        }
     }
-    if !w32_client_attach(client_pi) {
+    if attach_client && !w32_client_attach(client_pi) {
         return (0xC000_0001u64, false);
     }
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
@@ -5949,7 +5977,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
-            client_attach: true,
+        client_attach: attach_client,
             usermode_callback: callback_capable,
             wide_arg_marshal: true,
             assert_skip: true,
@@ -5958,8 +5986,10 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
         },
     };
     let pr = crate::spawn_hosts::component_pump(&ch);
-    for watch_pi in 1..5usize {
-        crate::teb_tail_watch(watch_pi, 5, ssn, client_pi);
+    if attach_client {
+        for watch_pi in 1..5usize {
+            crate::teb_tail_watch(watch_pi, 5, ssn, client_pi);
+        }
     }
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),

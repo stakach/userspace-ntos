@@ -619,9 +619,9 @@ pub struct NtProcess {
     /// Opaque `W32PROCESS` pointer parked by win32k via `PsSetProcessWin32Process`
     /// (read back with `PsGetProcessWin32Process`). `None` until win32k attaches.
     pub win32_process: Option<u64>,
-    /// Opaque executive-owned `EPROCESS` body pointer used by kernel-mode providers that need a
-    /// stable process object address. The object bytes live outside this crate; ProcessManager owns
-    /// the NT identity and stores the pointer verbatim.
+    /// Opaque stable `EPROCESS` body pointer used by kernel-mode providers. The object bytes live
+    /// outside this crate and their allocator retains them through the Process delete procedure;
+    /// ProcessManager owns the NT identity and rejects pointer replacement while it is live.
     pub kernel_process_object: Option<u64>,
     /// Opaque `WINDOWSTATION` pointer (`PsSetProcessWindowStation` /
     /// `PsGetProcessWin32WindowStation`).
@@ -719,7 +719,6 @@ impl ProcessObjectDeleteBlockers {
             && self.live_threads == 0
             && self.thread_wait_references == 0
             && self.thread_termination_ports == 0
-            && self.thread_impersonations == 0
             && self.external_thread_handles == 0
     }
 }
@@ -919,9 +918,9 @@ pub struct NtThread {
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
     /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
     pub win32_thread: Option<u64>,
-    /// Opaque executive-owned `ETHREAD` body pointer used by kernel-mode providers that need a
-    /// stable thread object address. The object bytes live outside this crate; ProcessManager owns
-    /// the NT identity and stores the pointer verbatim.
+    /// Opaque stable `ETHREAD` body pointer used by kernel-mode providers. Its allocator retains the
+    /// bytes through the owning Process delete procedure; ProcessManager rejects replacement while
+    /// the thread object remains live, including across dormant mechanism activation.
     pub kernel_thread_object: Option<u64>,
     /// The thread's TEB base VA (its `NtCurrentTeb()` / `KTHREAD.Teb`). Set when the host actually
     /// spawns the backing thread (its TEB is a per-thread page); read back by
@@ -2043,14 +2042,18 @@ impl ProcessManager {
     // pointers on those objects. These are pointer slots — the executive stores
     // what the owning boundary hands it and returns it verbatim.
 
-    /// Park the executive-owned `EPROCESS` body pointer on `pid`.
-    /// Returns `false` for an unknown process.
-    pub fn set_process_kernel_object(&mut self, pid: ProcessId, eprocess: u64) -> bool {
+    /// Publish the stable `EPROCESS` body pointer on `pid` exactly once. Re-publishing the same
+    /// pointer is idempotent; zero, an unknown process, or replacement is rejected.
+    pub fn publish_process_kernel_object(&mut self, pid: ProcessId, eprocess: u64) -> bool {
+        if eprocess == 0 {
+            return false;
+        }
         match self.processes.get_mut(&pid) {
-            Some(p) => {
-                p.kernel_process_object = (eprocess != 0).then_some(eprocess);
+            Some(p) if p.kernel_process_object.is_none() => {
+                p.kernel_process_object = Some(eprocess);
                 true
             }
+            Some(p) => p.kernel_process_object == Some(eprocess),
             None => false,
         }
     }
@@ -2060,21 +2063,6 @@ impl ProcessManager {
         self.processes
             .get(&pid)
             .and_then(|p| p.kernel_process_object)
-    }
-
-    /// Clear an EPROCESS publication only when it still names the exact provider-owned object being
-    /// retired. A stale lifecycle completion must not detach a newer process generation.
-    pub fn clear_process_kernel_object_exact(&mut self, pid: ProcessId, expected: u64) -> bool {
-        if expected == 0 {
-            return false;
-        }
-        match self.processes.get_mut(&pid) {
-            Some(process) if process.kernel_process_object == Some(expected) => {
-                process.kernel_process_object = None;
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Reverse-map an `EPROCESS` body pointer to the owning PID.
@@ -2150,14 +2138,18 @@ impl ProcessManager {
         self.threads.get(&tid).and_then(|t| t.win32_thread)
     }
 
-    /// Park the executive-owned `ETHREAD` body pointer on `tid`.
-    /// Returns `false` for an unknown thread.
-    pub fn set_thread_kernel_object(&mut self, tid: ThreadId, ethread: u64) -> bool {
+    /// Publish the stable `ETHREAD` body pointer on `tid` exactly once. Re-publishing the same
+    /// pointer is idempotent; zero, an unknown thread, or replacement is rejected.
+    pub fn publish_thread_kernel_object(&mut self, tid: ThreadId, ethread: u64) -> bool {
+        if ethread == 0 {
+            return false;
+        }
         match self.threads.get_mut(&tid) {
-            Some(t) => {
-                t.kernel_thread_object = (ethread != 0).then_some(ethread);
+            Some(t) if t.kernel_thread_object.is_none() => {
+                t.kernel_thread_object = Some(ethread);
                 true
             }
+            Some(t) => t.kernel_thread_object == Some(ethread),
             None => false,
         }
     }
@@ -2165,21 +2157,6 @@ impl ProcessManager {
     /// Read back the parked `ETHREAD` body pointer.
     pub fn thread_kernel_object(&self, tid: ThreadId) -> Option<u64> {
         self.threads.get(&tid).and_then(|t| t.kernel_thread_object)
-    }
-
-    /// Clear an ETHREAD publication only when it still names the exact provider-owned object being
-    /// retired. This generation-fences provider storage reclamation.
-    pub fn clear_thread_kernel_object_exact(&mut self, tid: ThreadId, expected: u64) -> bool {
-        if expected == 0 {
-            return false;
-        }
-        match self.threads.get_mut(&tid) {
-            Some(thread) if thread.kernel_thread_object == Some(expected) => {
-                thread.kernel_thread_object = None;
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Reverse-map an `ETHREAD` body pointer to the owning TID.
@@ -2861,7 +2838,12 @@ impl ProcessManager {
     /// resources independently of the policy object.
     pub fn can_reclaim_thread(&self, tid: ThreadId) -> bool {
         self.thread(tid).is_some_and(|thread| {
-            thread.state == ThreadState::Terminated && thread.wait_references == 0
+            thread.state == ThreadState::Terminated
+                && thread.wait_references == 0
+                && thread.termination_ports.is_empty()
+                && thread.impersonation.is_none()
+                && thread.win32_thread.is_none()
+                && thread.user_apc_queue.is_empty()
         }) && !self.processes.values().any(|process| {
             process.handles.iter().any(|entry| {
                 entry

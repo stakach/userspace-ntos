@@ -2664,9 +2664,12 @@ unsafe fn sync_win32k_context_to_process_manager(
     if pid != 0 && pid <= nt_process::ProcessId::MAX as u64 {
         let pid = pid as nt_process::ProcessId;
         if published.eprocess != 0 {
-            let _ = nt_handler
+            if !nt_handler
                 .pm
-                .set_process_kernel_object(pid, published.eprocess);
+                .publish_process_kernel_object(pid, published.eprocess)
+            {
+                return false;
+            }
         }
         if published.w32process != 0 {
             if !nt_handler.pm.set_process_win32(pid, published.w32process) {
@@ -2725,9 +2728,12 @@ unsafe fn sync_win32k_context_to_process_manager(
             }
         }
         if published.ethread != 0 {
-            let _ = nt_handler
+            if !nt_handler
                 .pm
-                .set_thread_kernel_object(tid, published.ethread);
+                .publish_thread_kernel_object(tid, published.ethread)
+            {
+                return false;
+            }
         }
         if published.w32thread != 0 {
             let _ = nt_handler.pm.set_thread_win32(tid, published.w32thread);
@@ -9736,20 +9742,6 @@ pub(crate) unsafe fn service_sec_image(
                             false
                         };
                         let final_process_teardown = drop_reply || current_tid == 0;
-                        let vm_reclaim = if final_process_teardown {
-                            reclaim_final_process_vm(process_index, &mut nt_handler)
-                        } else {
-                            ProcessVmReclaimStats::default()
-                        };
-                        if vm_reclaim.vspace_released {
-                            pfilled[process_index as usize] = [0; 512];
-                            if pi == process_index as usize {
-                                faults = 0;
-                                first = 0;
-                                ntfaults = 0;
-                                *filled_pages = [0; 512];
-                            }
-                        }
                         if final_process_teardown {
                             if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
                                 let _ = nt_handler.try_delete_hosted_process_object(pid);
@@ -9775,32 +9767,12 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(reclaimed as u64);
                         print_str(b" current-deleted=");
                         print_u64(current_deleted as u64);
-                        print_str(b" vm-frames=");
-                        print_u64(vm_reclaim.registered_frames);
-                        print_str(b" shared-maps=");
-                        print_u64(vm_reclaim.shared_image_maps);
-                        print_str(b" w32-caps=");
-                        print_u64(vm_reclaim.win32k_client_caps);
-                        print_str(b"/");
-                        print_u64(vm_reclaim.win32k_client_cap_failures);
-                        print_str(b" dll-cache-evict=");
-                        print_u64(vm_reclaim.dll_cache_evictions);
-                        print_str(b" dll-views=");
-                        print_u64(vm_reclaim.dll_views);
-                        print_str(b" section-views=");
-                        print_u64(vm_reclaim.generic_views);
-                        print_str(b" section-writeback-fails=");
-                        print_u64(vm_reclaim.generic_writeback_failures);
-                        print_str(b" private-pts=");
-                        print_u64(vm_reclaim.private_pts);
-                        print_str(b"/");
-                        print_u64(vm_reclaim.private_pt_failures);
-                        print_str(b" copyin-frames=");
-                        print_u64(vm_reclaim.client_copyin_frames);
-                        print_str(b"/");
-                        print_u64(vm_reclaim.client_copyin_frame_failures);
-                        print_str(b" vspace-released=");
-                        print_u64(vm_reclaim.vspace_released as u64);
+                        print_str(b" runtimes-pending=");
+                        print_u64(
+                            nt_handler
+                                .thread_runtime
+                                .has_process(process_index as usize) as u64,
+                        );
                         print_str(b"\n");
                         if drop_reply {
                             procs[pi].faults = faults;

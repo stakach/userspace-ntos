@@ -35,6 +35,9 @@ pub struct ProcessDeletionCandidate {
     pub pi: usize,
     pub pid: u32,
     pub generation: u64,
+    /// The process published provider-owned EPROCESS/ETHREAD backing that must be finalized after
+    /// the Process delete procedure. False means no provider destructor is part of this identity.
+    pub provider_objects: bool,
 }
 
 impl ProcessDeletionCandidate {
@@ -43,14 +46,16 @@ impl ProcessDeletionCandidate {
             pi: 0,
             pid: 0,
             generation: 0,
+            provider_objects: false,
         }
     }
 
-    pub const fn from_mechanism(mechanism: ProcessMechanism) -> Self {
+    pub const fn from_mechanism(mechanism: ProcessMechanism, provider_objects: bool) -> Self {
         Self {
             pi: mechanism.pi,
             pid: mechanism.pid,
             generation: mechanism.generation,
+            provider_objects,
         }
     }
 
@@ -642,7 +647,7 @@ mod tests {
             top_badge: 2,
             generation: 7,
         };
-        let candidate = ProcessDeletionCandidate::from_mechanism(old);
+        let candidate = ProcessDeletionCandidate::from_mechanism(old, true);
         let mut table = ProcessDeletionCandidateTable::<4>::new();
         assert_eq!(table.queue(candidate), Ok(true));
         assert_eq!(table.queue(candidate), Ok(false));
@@ -657,13 +662,13 @@ mod tests {
         };
         assert!(!candidate.matches_mechanism(replacement));
         assert_eq!(
-            table.queue(ProcessDeletionCandidate::from_mechanism(replacement)),
+            table.queue(ProcessDeletionCandidate::from_mechanism(replacement, true)),
             Err(MechanismError::SlotOccupied)
         );
         assert_eq!(table.remove_exact(candidate), Ok(candidate));
         assert_eq!(table.live_len(), 0);
         assert_eq!(
-            table.queue(ProcessDeletionCandidate::from_mechanism(replacement)),
+            table.queue(ProcessDeletionCandidate::from_mechanism(replacement, true)),
             Ok(true)
         );
     }
@@ -675,6 +680,7 @@ mod tests {
             pi: 1,
             pid: 12,
             generation: 3,
+            provider_objects: true,
         };
         table.queue(candidate).unwrap();
         assert_eq!(

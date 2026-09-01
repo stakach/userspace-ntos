@@ -1908,23 +1908,17 @@ fn win32_process_thread_context_slots() {
 
     // The executive owns EPROCESS / ETHREAD body addresses; win32k parks its
     // opaque W32PROCESS / W32THREAD pointers on those objects.
-    assert!(pm.set_process_kernel_object(pid, 0xFFFF_8000_1000_0000));
-    assert!(pm.set_thread_kernel_object(tid, 0xFFFF_8000_2000_0000));
+    assert!(pm.publish_process_kernel_object(pid, 0xFFFF_8000_1000_0000));
+    assert!(pm.publish_thread_kernel_object(tid, 0xFFFF_8000_2000_0000));
     assert!(pm.set_process_win32(pid, 0xFFFF_9E00_1234_0000));
     assert!(pm.set_thread_win32(tid, 0xFFFF_9E00_5678_0000));
     assert!(pm.set_process_window_station(pid, 0xFFFF_9E00_9ABC_0000));
     assert_eq!(pm.process_kernel_object(pid), Some(0xFFFF_8000_1000_0000));
     assert_eq!(pm.thread_kernel_object(tid), Some(0xFFFF_8000_2000_0000));
-    assert!(!pm.clear_process_kernel_object_exact(pid, 0));
-    assert!(!pm.clear_process_kernel_object_exact(pid, 0xFFFF_8000_1000_0001));
-    assert!(!pm.clear_thread_kernel_object_exact(tid, 0));
-    assert!(!pm.clear_thread_kernel_object_exact(tid, 0xFFFF_8000_2000_0001));
-    assert!(pm.clear_thread_kernel_object_exact(tid, 0xFFFF_8000_2000_0000));
-    assert_eq!(pm.thread_kernel_object(tid), None);
-    assert!(pm.set_thread_kernel_object(tid, 0xFFFF_8000_2000_0000));
-    assert!(pm.clear_process_kernel_object_exact(pid, 0xFFFF_8000_1000_0000));
-    assert_eq!(pm.process_kernel_object(pid), None);
-    assert!(pm.set_process_kernel_object(pid, 0xFFFF_8000_1000_0000));
+    assert!(pm.publish_process_kernel_object(pid, 0xFFFF_8000_1000_0000));
+    assert!(pm.publish_thread_kernel_object(tid, 0xFFFF_8000_2000_0000));
+    assert!(!pm.publish_process_kernel_object(pid, 0xFFFF_8000_1000_0001));
+    assert!(!pm.publish_thread_kernel_object(tid, 0xFFFF_8000_2000_0001));
     assert_eq!(
         pm.pid_for_kernel_process_object(0xFFFF_8000_1000_0000),
         Some(pid)
@@ -1945,22 +1939,25 @@ fn win32_process_thread_context_slots() {
     assert_eq!(pm.process_win32(pid), None);
     assert!(pm.set_process_win32(pid, 0xFFFF_9E00_1234_0000));
 
-    // Setting NULL clears the slot (win32k detaches on process/thread teardown).
-    assert!(pm.set_process_kernel_object(pid, 0));
-    assert!(pm.set_thread_kernel_object(tid, 0));
+    // Native object backing remains stable until the Process delete procedure.
+    assert!(!pm.publish_process_kernel_object(pid, 0));
+    assert!(!pm.publish_thread_kernel_object(tid, 0));
     assert!(pm.set_process_win32(pid, 0));
-    assert_eq!(pm.process_kernel_object(pid), None);
-    assert_eq!(pm.thread_kernel_object(tid), None);
+    assert_eq!(pm.process_kernel_object(pid), Some(0xFFFF_8000_1000_0000));
+    assert_eq!(pm.thread_kernel_object(tid), Some(0xFFFF_8000_2000_0000));
     assert_eq!(
         pm.pid_for_kernel_process_object(0xFFFF_8000_1000_0000),
-        None
+        Some(pid)
     );
-    assert_eq!(pm.tid_for_kernel_thread_object(0xFFFF_8000_2000_0000), None);
+    assert_eq!(
+        pm.tid_for_kernel_thread_object(0xFFFF_8000_2000_0000),
+        Some(tid)
+    );
     assert_eq!(pm.process_win32(pid), None);
 
     // Unknown pid/tid is rejected, not a panic.
-    assert!(!pm.set_process_kernel_object(9999, 1));
-    assert!(!pm.set_thread_kernel_object(9999, 1));
+    assert!(!pm.publish_process_kernel_object(9999, 1));
+    assert!(!pm.publish_thread_kernel_object(9999, 1));
     assert!(!pm.set_process_win32(9999, 1));
     assert!(!pm.set_thread_win32(9999, 1));
     assert_eq!(pm.process_kernel_object(9999), None);
@@ -3752,6 +3749,32 @@ fn final_process_object_deletion_releases_job_membership() {
     assert!(pm.thread(tid).is_none());
     assert!(!pm.job_exists(job));
     assert_eq!(pm.take_job_destruction().unwrap().id, job);
+}
+
+#[test]
+fn process_delete_readiness_leaves_impersonation_to_the_delete_procedure() {
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("target.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let context = ImpersonationContext {
+        token: nt_security::TokenId::from_raw(7).unwrap(),
+        copy_on_open: false,
+        effective_only: false,
+        level: nt_security::SecurityImpersonationLevel::Impersonation,
+    };
+    pm.replace_thread_impersonation(tid, Some(context)).unwrap();
+    pm.terminate_process(pid, 0x55).unwrap();
+
+    let blockers = pm.process_object_delete_blockers(pid).unwrap();
+    assert_eq!(blockers.thread_impersonations, 1);
+    assert!(blockers.delete_ready());
+    assert_eq!(pm.delete_process_object_if_unreferenced(pid), None);
+
+    assert_eq!(
+        pm.replace_thread_impersonation(tid, None),
+        Ok(Some(context))
+    );
+    assert!(pm.delete_process_object_if_unreferenced(pid).is_some());
 }
 
 #[test]

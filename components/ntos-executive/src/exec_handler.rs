@@ -21810,7 +21810,10 @@ impl ExecNtHandler {
         let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
             return false;
         };
-        let candidate = nt_user_host::ProcessDeletionCandidate::from_mechanism(process_mechanism);
+        let candidate = nt_user_host::ProcessDeletionCandidate::from_mechanism(
+            process_mechanism,
+            self.pm.process_kernel_object(pid).is_some(),
+        );
         let newly_queued = match self.process_deletion_candidates.queue(candidate) {
             Ok(newly_queued) => newly_queued,
             Err(_) => return false,
@@ -21913,12 +21916,28 @@ impl ExecNtHandler {
         if !candidate.matches_mechanism(process_mechanism) {
             return false;
         }
+        let process_object_present = self.pm.process(pid).is_some();
+        if self.thread_runtime.has_process(pi)
+            || (process_object_present && !self.pm.process_object_delete_ready(pid))
+        {
+            return false;
+        }
+        if self.process_vspaces.get(pi).copied().unwrap_or(0) != 0
+            || self
+                .process_vspace_caps
+                .get(pi)
+                .is_some_and(Option::is_some)
+        {
+            let reclaim = unsafe { reclaim_final_process_vm(pi as u8, self) };
+            if !reclaim.vspace_released {
+                return false;
+            }
+        }
         if self.process_vspaces.get(pi).copied().unwrap_or(1) != 0
             || self
                 .process_vspace_caps
                 .get(pi)
                 .is_none_or(Option::is_some)
-            || !self.pm.process_object_delete_ready(pid)
         {
             return false;
         }
@@ -21991,34 +22010,78 @@ impl ExecNtHandler {
             debug_assert_eq!(removed, Some(accounting));
         }
 
-        let Some(deletion) = self.pm.delete_process_object_if_unreferenced(pid) else {
-            return false;
-        };
-        let deleted_threads = deletion.deleted_threads;
-        if let Some(token) = deletion.primary_token {
-            let _ = self.token_store.release(token);
-        }
-        if let Some(endpoint) = deletion.exception_port {
-            let client = unsafe { lpc_client() };
-            match client {
-                Some(client) => {
-                    if let Err(status) = client.release_port_object(endpoint.get()) {
+        let mut deleted_threads = 0usize;
+        if process_object_present {
+            let Some(deletion) = self.pm.delete_process_object_if_unreferenced(pid) else {
+                return false;
+            };
+            deleted_threads = deletion.deleted_threads;
+            if let Some(token) = deletion.primary_token {
+                let _ = self.token_store.release(token);
+            }
+            if let Some(endpoint) = deletion.exception_port {
+                let client = unsafe { lpc_client() };
+                match client {
+                    Some(client) => {
+                        if let Err(status) = client.release_port_object(endpoint.get()) {
+                            print_str(
+                                b"[lpc-invariant] deleted process port release failed endpoint=0x",
+                            );
+                            print_hex_u64(endpoint.get());
+                            print_str(b" status=0x");
+                            print_hex(status.raw() as u32);
+                            print_str(b"\n");
+                        }
+                    }
+                    None => {
                         print_str(
-                            b"[lpc-invariant] deleted process port release failed endpoint=0x",
+                            b"[lpc-invariant] deleted process retained port without broker endpoint=0x",
                         );
                         print_hex_u64(endpoint.get());
-                        print_str(b" status=0x");
-                        print_hex(status.raw() as u32);
                         print_str(b"\n");
                     }
                 }
-                None => {
-                    print_str(
-                        b"[lpc-invariant] deleted process retained port without broker endpoint=0x",
-                    );
-                    print_hex_u64(endpoint.get());
-                    print_str(b"\n");
-                }
+            }
+        }
+
+        if candidate.provider_objects {
+            let finalizer_client = win32k_glue::Win32kClientContext {
+                pi: pi as u32,
+                generation: candidate.generation,
+                pid: u64::from(pid),
+                badge: process_mechanism.top_badge,
+                tid: 0,
+                tcb: 0,
+                eprocess: 0,
+                ethread: 0,
+                role: None,
+                process_role: self.hosted_process_role(pi),
+                top_badge: process_mechanism.top_badge,
+                teb: 0,
+                peb_mirror: 0,
+                scratch_base: EXECUTIVE_WIN32K_SCRATCH_BASE,
+                token_authentication_id: 0,
+                token_user_sid: [0; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX],
+                token_user_sid_len: 0,
+            };
+            let (status, completed) = unsafe {
+                win32k_glue::win32k_finalize_ps_provider_process_objects(finalizer_client)
+            };
+            if !completed || status as u32 != 0 {
+                print_str(b"[process-delete] provider finalizer pending pi=");
+                print_u64(pi as u64);
+                print_str(b" pid=");
+                print_u64(u64::from(pid));
+                print_str(b" generation=");
+                print_u64(candidate.generation);
+                print_str(b" status=0x");
+                print_hex(if completed {
+                    status as u32
+                } else {
+                    STATUS_DEVICE_NOT_READY
+                });
+                print_str(b"\n");
+                return false;
             }
         }
         let _ = self.thread_mechanisms.release_main(pi);

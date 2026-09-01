@@ -21978,18 +21978,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     bodies, and superseded context-table backing; retirement must first clear exact KPCR/shared/token
     publications.
 
-    Provider context-lifetime frontier (2026-09-01, in progress): add explicit owned-versus-borrowed
-    provenance to every process and thread context row, validate exact live allocation headers before
-    retirement, clear only matching KPCR, compatibility-slot, shared-context, and token-handle
-    publications, and reclaim component-owned storage after the row is tombstoned. Superseded
-    process/thread/token-handle table backing must be released immediately after atomic publication
-    of its replacement. Add a separate provider command for a terminating thread that has a context
-    row but never acquired a ReactOS W32THREAD; process teardown must not be the first chance to
-    reclaim it. Executive lifecycle routing must issue thread and final-process retirement even when
-    Process Manager has no W32 object, after callback frames have been unwound or proven absent.
-    Accept this slice only with focused allocator tests, the freestanding check, and serialized
-    desktop/process-generation churn showing balanced context retirement, zero invalid frees or
-    corruptions, and a complete sentinel under the one-hour ceiling.
+    Provider context-lifetime frontier (2026-09-02, in progress): explicit owned-versus-borrowed
+    provenance, exact allocation validation, publication clearing, and superseded table-backing
+    reclamation are implemented. The first serialized run rejected the original retirement boundary:
+    CSRSS's real thread exit completed, then mechanism teardown freed its provider-allocated ETHREAD
+    and callout TEB while Process Manager still retained the native thread object. Immediate provider
+    pool reuse exposed the stale object during winlogon's first GUI attach, where ReactOS failed to
+    allocate `CLIENTTHREADINFO` and winlogon terminated. This is an ownership defect, not pool
+    exhaustion or a reason to restore invalid-generation teardown.
+
+    NT5 and ReactOS run W32 thread/process exit callouts during thread exit, but retain ETHREAD and
+    EPROCESS backing through the later Object Manager delete procedures. Correct the hosted boundary
+    accordingly: mechanism teardown runs only the genuine W32 delete callouts and callback unwind;
+    provider context rows retain their callout TEB, primary-token mirror, ETHREAD, and EPROCESS until
+    Process Manager proves the exact process object unreferenced and removes it. One generation-
+    fenced post-delete provider finalizer then clears matching KPCR/shared/token publications and
+    reclaims every provider-owned thread/process allocation. It must use the provider control channel
+    without attaching the already-destroyed client VSpace, remain idempotent after a lost reply, and
+    keep the existing deletion candidate queued on failure. Remove the superseded per-thread and
+    per-process storage-retirement commands rather than retaining parallel machinery.
+
+    Before acceptance, also make process VM teardown fail closed: no section, cap, page-table, or
+    VSpace reclamation may occur while any expected thread mechanism remains, and a mapped-section
+    writeback failure must retain the view for retry. Fix destructor-owned impersonation references
+    so they cannot permanently block the process delete procedure. Then require focused tests, the
+    freestanding check, and serialized desktop/process-generation churn showing balanced finalization,
+    zero invalid frees or corruptions, and a complete sentinel under the one-hour ceiling. The runner
+    already enforces `BOOT_TIMEOUT_SECONDS <= 3600`; deterministic barriers terminate immediately and
+    no validation lane may leave a stale QEMU process.
+
+    Implementation correction checkpoint (2026-09-02, host/freestanding green; runtime pending):
+    mechanism teardown no longer clears Process Manager kernel-object slots or invokes the removed
+    per-thread/per-process storage-retirement commands. Kernel-object publication is set-once and
+    idempotent, rejecting zero and replacement pointers. Exact deletion candidates now carry a
+    provider-object destructor bit; after Process Manager removes the unreferenced process and all
+    threads, one idempotent provider finalizer reclaims the retained context rows and their owned
+    storage without attaching the deleted client VSpace. A lost or failed finalizer reply keeps the
+    exact `(pi, pid, generation, provider-objects)` candidate owned for retry.
+
+    VM reclamation now runs from the same final-deletion candidate only after native reference
+    blockers drain and the hosted thread-runtime table proves empty. The ordinary and Job termination
+    paths no longer unconditionally destroy VM leaves. Mapped-section writeback failure retains the
+    failing view and returns the candidate to the retry loop; VSpace release requires zero writeback,
+    cap, copy-in, KUSER, and page-table failures. Thread impersonation remains visible in blocker
+    diagnostics but is destructor-owned, so the executive can detach and release its token before
+    the Process delete procedure instead of deadlocking readiness. `nt-process` passes 151/151,
+    `nt-user-host` passes 18/18 including integration tests, and the freestanding executive check is
+    green. Next run the serialized desktop/churn acceptance and correct any finalizer or VM retry
+    ordering exposed by live process generations before closing this frontier.
 
     Queue events then require a growable, process-generation-fenced registry with separate
     handle, pointer, native-wait, GUI-wait, and signal leases. The current four-entry evicting event
