@@ -1806,6 +1806,237 @@ pub(crate) struct PumpResult {
     pub demand: u64,
 }
 
+/// One operation on a dedicated hosted-interrupt lane. The component remains blocked in its
+/// completion `Call` between commands, so bootstrapping starts with a receive and every later
+/// command replies to that exact parked call before receiving its completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedIrqExchangeAction {
+    ReceiveReady,
+    ReplyCommand { sequence: u64 },
+}
+
+/// Raw IRQ-lane transport result. Unlike [`PumpResult`], this never reads a component request bank
+/// or updates the ordinary IRP/syscall dispatch counters.
+#[derive(Clone, Copy)]
+pub(crate) struct HostedIrqExchangeResult {
+    pub reply_cap: u64,
+    pub completed: bool,
+    pub sequence: u64,
+    pub wall_ip: u64,
+    pub wall_addr: u64,
+    pub wall_label: u64,
+    pub wall_flags: u64,
+    pub wall_exception: u64,
+    pub wall_code: u64,
+    pub faults: u64,
+    pub demand: u64,
+}
+
+/// Screen a bound executive notification without running ordinary scheduler work recursively from
+/// an interrupt lane. Hardware IRQs remain latched for the outer service loop. A timer tick is
+/// recorded and acknowledged only far enough to prevent its level-triggered source from starving
+/// the lane endpoint; wait queues and timer callbacks remain deferred.
+#[inline]
+unsafe fn hosted_irq_exchange_event(badge: u64) -> bool {
+    let timer = crate::badge_has_delay_timer(badge);
+    let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
+    if !timer && irq_lines == 0 {
+        return false;
+    }
+    if timer {
+        crate::DELAY_TIMER_TICKS_PENDING.fetch_add(1, Ordering::Relaxed);
+        crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
+        crate::delay_timer_nested_ack();
+    }
+    true
+}
+
+#[inline(never)]
+unsafe fn hosted_irq_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
+    loop {
+        let badge: u64;
+        let mi: u64;
+        let m0: u64;
+        let m1: u64;
+        let m2: u64;
+        let m3: u64;
+        core::arch::asm!(
+            "syscall",
+            in("rdx") crate::SYS_RECV as u64,
+            inout("rdi") ch.fault_ep => badge,
+            lateout("rsi") mi,
+            lateout("r10") m0,
+            lateout("r8") m1,
+            lateout("r9") m2,
+            lateout("r15") m3,
+            in("r12") reply_cap,
+            in("r13") 0u64,
+            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+            options(nostack),
+        );
+        if hosted_irq_exchange_event(badge) {
+            if pump_deadman_tripped() {
+                return PumpMessage::deadman_wall();
+            }
+            continue;
+        }
+        let m4 = if (mi & 0x7f) > 4 {
+            crate::get_recv_mr(4)
+        } else {
+            0
+        };
+        return PumpMessage {
+            badge,
+            mi,
+            m0,
+            m1,
+            m2,
+            m3,
+            m4,
+            scheduler_yield: false,
+        };
+    }
+}
+
+#[inline(never)]
+unsafe fn hosted_irq_reply_recv(
+    ch: &PumpChannel,
+    reply_cap: u64,
+    reply_len: u64,
+    reply_mr0: u64,
+) -> PumpMessage {
+    let mut reply = true;
+    loop {
+        let badge: u64;
+        let mi: u64;
+        let m0: u64;
+        let m1: u64;
+        let m2: u64;
+        let m3: u64;
+        if reply {
+            let send_mi = reply_len;
+            let send_m0 = reply_mr0;
+            core::arch::asm!(
+                "syscall",
+                in("rdx") crate::SYS_NB_SEND_RECV as u64,
+                inout("rdi") ch.fault_ep => badge,
+                inout("rsi") send_mi => mi,
+                inout("r10") send_m0 => m0,
+                inout("r8") 0u64 => m1,
+                inout("r9") 0u64 => m2,
+                inout("r15") 0u64 => m3,
+                in("r12") reply_cap,
+                in("r13") reply_cap,
+                lateout("rax") _, lateout("rcx") _, lateout("r11") _,
+                options(nostack),
+            );
+            reply = false;
+        } else {
+            return hosted_irq_recv(ch, reply_cap);
+        }
+        if hosted_irq_exchange_event(badge) {
+            if pump_deadman_tripped() {
+                return PumpMessage::deadman_wall();
+            }
+            continue;
+        }
+        let m4 = if (mi & 0x7f) > 4 {
+            crate::get_recv_mr(4)
+        } else {
+            0
+        };
+        return PumpMessage {
+            badge,
+            mi,
+            m0,
+            m1,
+            m2,
+            m3,
+            m4,
+            scheduler_yield: false,
+        };
+    }
+}
+
+/// Exchange one command with a private hosted-interrupt lane. This protocol deliberately has a
+/// much smaller service surface than the normal component pump: completion, demand faults, and
+/// explicitly granted I/O faults only. An ordinary `FSD_SERVICE_*` request is a fatal protocol wall
+/// because servicing it could touch the parked component's fixed request bank.
+pub(crate) unsafe fn component_hosted_irq_exchange(
+    ch: &PumpChannel,
+    action: HostedIrqExchangeAction,
+    expected_badge: u64,
+    completion_label: u64,
+) -> HostedIrqExchangeResult {
+    let expected_sequence = match action {
+        HostedIrqExchangeAction::ReceiveReady => 0,
+        HostedIrqExchangeAction::ReplyCommand { sequence } => sequence,
+    };
+    let mut msg = match action {
+        HostedIrqExchangeAction::ReceiveReady => hosted_irq_recv(ch, ch.reply_cap),
+        HostedIrqExchangeAction::ReplyCommand { sequence } => {
+            hosted_irq_reply_recv(ch, ch.reply_cap, REQUEST_TAG_LEN, sequence)
+        }
+    };
+    let mut outcome = PumpLoopOutcome::new();
+    loop {
+        let label = msg.label();
+        let length = msg.mi & 0x7f;
+        if msg.badge != expected_badge {
+            outcome.wall(msg);
+            break;
+        }
+        if label == completion_label {
+            if length == 1 && msg.m0 == expected_sequence {
+                outcome.completed = true;
+            } else {
+                outcome.wall(msg);
+            }
+            break;
+        }
+        if label == 6 {
+            outcome.faults += 1;
+            if !pump_service_vm_fault(
+                ch,
+                label,
+                msg.m0,
+                msg.m1,
+                msg.m3,
+                outcome.faults,
+                outcome.demand,
+            ) {
+                outcome.wall(msg);
+                break;
+            }
+            outcome.demand += 1;
+            msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, 0);
+            continue;
+        }
+        if label == 3 && ch.caps.io_port_faults {
+            if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
+                msg = hosted_irq_reply_recv(ch, ch.reply_cap, 1, next_ip);
+                continue;
+            }
+        }
+        outcome.wall(msg);
+        break;
+    }
+    pump_suspend_walled_component(ch, outcome);
+    HostedIrqExchangeResult {
+        reply_cap: ch.reply_cap,
+        completed: outcome.completed,
+        sequence: if outcome.completed { msg.m0 } else { 0 },
+        wall_ip: outcome.wall_ip,
+        wall_addr: outcome.wall_addr,
+        wall_label: outcome.wall_label,
+        wall_flags: outcome.wall_flags,
+        wall_exception: outcome.wall_exception,
+        wall_code: outcome.wall_code,
+        faults: outcome.faults,
+        demand: outcome.demand,
+    }
+}
+
 /// Drive ONE request to a Family-A dispatch server: wake the parked server with `dispatch_label`,
 /// demand-map its page faults against `pml4`, and return when it re-parks (completed) or walls.
 ///

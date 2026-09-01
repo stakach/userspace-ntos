@@ -22312,6 +22312,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     workers as well as the forthcoming interrupt lanes. `nt-thread-start` passes 14/14 and the
     freestanding executive check remains green.
 
+    B3 private interrupt-exchange checkpoint (2026-09-02, freestanding green; lane wiring open):
+    `spawn_hosts` now exposes a raw dedicated IRQ-lane exchange instead of abusing the ordinary IRP
+    pump or adding a third request kind. The bootstrap receive and every sequenced reply/receive
+    validate the lane's exact private endpoint badge, completion label, message length, and mailbox
+    sequence. The loop services only demand faults and explicitly granted I/O faults; any historical
+    `FSD_SERVICE_*` request walls the lane rather than touching a parked component's `SH_REQ_*`
+    bank. Bound hardware notifications are latched for the outer service loop, while HPET delivery
+    is recorded and acknowledged without recursively draining waits, DPCs, or another IRQ. The raw
+    result does not read `SH_REQ_STATUS` or increment ordinary dispatch counters. The freestanding
+    executive check is green. Next allocate the domain-owned lane objects and complete their ready
+    handshake through this transport before enabling an IRQ handler.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after
