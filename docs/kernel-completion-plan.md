@@ -22571,6 +22571,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the generation-backed DPC registry. The old request-bank ISR path remains the sole temporary
     transport and must still be removed atomically at cutover.
 
+    B3 timer-source and firmware interrupt-mode correction (2026-09-02, focused host and
+    freestanding validation green; serialized desktop acceptance pending): the production wait
+    broker no longer consumes an arbitrary HPET Timer0 IOAPIC route. Q35 advertises GSI 23 as HPET
+    capable while also routing PCI `00:03.0` INTA to GSI 23; the prior accepted desktop happened to
+    move HPET to GSI 22 only because the now-deleted boot proof occupied GSI 23. Route capability is
+    not route ownership, so selecting any advertised unobserved HPET GSI was architecturally wrong.
+
+    The executive now retains HPET only as its firmware-authenticated monotonic clocksource and owns
+    the already delegated PIT channel 0 plus generic kernel IRQ 2 as a userspace one-shot. The pure
+    `nt-kernel-exec` conversion rounds deadlines upward, clamps each shot to the exact 16-bit PIT
+    range, and explicitly chunks longer waits so no requested deadline is reported early. PIT
+    I/O-port, IRQ-handler, badged-notification, checked Ack, and fault teardown are one monotonic
+    lifecycle. Reusing the executive event notification now checks tracked bind ownership instead of
+    attempting a second TCB bind against a notification that is already live.
+
+    PCI routing now invokes the standard extended simple-integer `\\_PIC(1)` method at the ACPI
+    namespace root through an authenticated provider endpoint before evaluating any `_PRT`. Inline
+    and pending results require exact success with zero result bytes; pending IRPs additionally
+    validate the request fingerprint, IOCTL/input/output shape, provider identities, completion
+    origin, and strict acknowledgement. There is no PIC-mode `_PRT` fallback. `nt-acpi` passes
+    40/40, `nt-kernel-exec` passes 219/219, formatting is clean, and the executive freestanding
+    check is green.
+
+    Review adjustment: run the serialized desktop acceptance with PIT IRQ evidence, `_PIC(1)`
+    success, Q35 E1000 GSI 23 publication, genuine NIC delivery, Explorer framebuffer proof, and the
+    full gate sentinel. After acceptance, add one generation-owned physical-line authority shared by
+    SCI and hosted PCI publication; invalidation must fence new admissions while retaining physical
+    claims until old connection leases drain. Then complete the private interrupt arena cutover and
+    model wait reply capabilities as move-only lifecycle leases before deleting the request-bank ISR
+    transport.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after

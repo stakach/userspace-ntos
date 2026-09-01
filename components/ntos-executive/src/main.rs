@@ -2175,23 +2175,14 @@ const HOSTED_BOOT_FRAMEBUFFER_EAGER_MMIO_PAGES: u64 = 32;
 pub const RESLIST_VADDR: u64 = 0x0000_0100_105F_D000;
 const _: () =
     assert!(STORAGE_SHARED_END <= RESLIST_VADDR || RESLIST_VADDR + 0x1000 <= STORAGE_SHARED_VADDR);
-const IOAPIC_ROUTE_GSI_NONE: u64 = u64::MAX;
-
 // HPET register offsets (from the mapped MMIO base).
 const HPET_GEN_CONF: u64 = 0x10;
 const HPET_MAIN_COUNTER: u64 = 0xF0;
-const HPET_GEN_INT_STATUS: u64 = 0x20;
-const HPET_T0_CONFIG: u64 = 0x100;
-/// ★ Timer N Configuration bits (IA-PC HPET spec §2.3.8). These MUST be named: the arm/disarm path
-/// used to toggle bit **1** believing it was the enable, which silently left the timer ENABLED
-/// FOREVER with a comparator in the past — a ~34 kHz interrupt storm (see `delay_timer_rearm`).
-/// `Tn_INT_TYPE_CNF`: 0 = edge-triggered, 1 = level-triggered. The IOAPIC pin this timer is routed
-/// to is issued LEVEL (`issue_ioapic_irq_handler_checked(..., true, ..)`), so this stays SET for the
-/// timer's whole life — it is a wiring property, never an arm/disarm control.
-const HPET_TN_INT_TYPE_LEVEL: u64 = 1 << 1;
-/// `Tn_INT_ENB_CNF` — THE arm/disarm bit. Clearing it makes the timer stop delivering, full stop.
-const HPET_TN_INT_ENB: u64 = 1 << 2;
-const HPET_T0_COMPARATOR: u64 = 0x108;
+// The NT wait broker uses the userspace-owned PIT channel 0 as a one-shot interrupt source. HPET
+// remains the monotonic clocksource only; none of its globally routed interrupt pins are claimed.
+const PIT_CHANNEL0_PORT: u16 = 0x40;
+const PIT_COMMAND_PORT: u16 = 0x43;
+const PIT_CHANNEL0_ONE_SHOT_LO_HI: u8 = 0x30;
 /// The executive's own IPC buffer VA (from BootInfo) — stages reply message registers 4+.
 static IPC_BUFFER: AtomicU64 = AtomicU64::new(0);
 /// The executive stack-mirror base for the process whose fault/syscall is currently being serviced.
@@ -3343,12 +3334,9 @@ unsafe fn watchdog_report(messages: u64) {
     print_str(b"\n[deadman] -> the service loop will QUIESCE and run the gate rather than hang\n");
 }
 
-/// Re-arm the HPET from inside a NESTED component-pump receive. The main service loop's
-/// `delay_timer_interrupt` (which owns the ordinary re-arm + IRQ Ack) cannot run while the pump is
-/// blocked, and the IOAPIC line stays masked until that Ack — so without this a nested deadlock
-/// would get exactly ONE tick and could never TRIP. The sequence mirrors the ordinary one-shot
-/// rearm: disable delivery, clear the level-triggered HPET status, program a comparator strictly
-/// AHEAD of `now`, clear any status latched by the old comparator, enable, then Ack.
+/// Re-arm the userspace PIT one-shot from inside a nested component-pump receive. The main service
+/// loop cannot service its wait queues while the pump is blocked, but the deadman still needs
+/// bounded notifications in order to diagnose and break a stuck provider call.
 pub(crate) unsafe fn watchdog_nested_rearm() {
     if WATCHDOG_ARMED.load(Ordering::Relaxed) == 0
         || DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire) != DELAY_TIMER_IRQ_ACTIVE
@@ -3356,44 +3344,36 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
         return;
     }
     let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
-    let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
-    if handler == 0 || period == 0 {
+    let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
+    if handler == 0 || ioport == 0 {
         return;
     }
-    let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
+    let now = monotonic_time_100ns();
     let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
     let target = if deadline == u64::MAX {
-        let step =
-            nt_delay_execution::hundred_ns_to_ticks_ceil(WATCHDOG_PERIOD_100NS, period).max(1);
-        now.saturating_add(step)
+        now.saturating_add(WATCHDOG_PERIOD_100NS)
     } else {
-        let counter_deadline = hpet_counter_deadline_100ns(deadline);
-        nt_delay_execution::timer_arm_target_ticks(
-            counter_deadline,
-            period,
-            now,
-            delay_timer_min_arm_ticks(period),
-        )
+        deadline
     };
-    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    config &= !HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64, target);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    core::ptr::write_volatile(
-        (HPET_VADDR + HPET_T0_CONFIG) as *mut u64,
-        config | HPET_TN_INT_ENB,
+    let shot = nt_kernel_exec::pit_oneshot_for_deadline(
+        now,
+        target,
+        DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed),
     );
-    if delay_timer_ack_irq().is_ok() {
+    let programmed = io_out8(ioport, PIT_COMMAND_PORT, PIT_CHANNEL0_ONE_SHOT_LO_HI) == 0
+        && io_out8(ioport, PIT_CHANNEL0_PORT, shot.reload as u8) == 0
+        && io_out8(ioport, PIT_CHANNEL0_PORT, (shot.reload >> 8) as u8) == 0;
+    if programmed && delay_timer_ack_irq().is_ok() {
         WATCHDOG_NESTED_REARMS.fetch_add(1, Ordering::Relaxed);
+    } else if !programmed {
+        delay_timer_irq_fault(handler, u64::MAX - 1);
     }
 }
 
 /// A component or rendezvous pump received the executive's bound timer notification while the main
 /// service loop is unavailable. The pump cannot pop delay waiters because the wait queues live in
 /// the service loop, so it records the pending tick and uses this helper only to prevent the
-/// level-triggered HPET line from starving the component's real reply.
+/// one-shot IRQ from starving the component's real reply.
 pub(crate) unsafe fn delay_timer_nested_ack() {
     if WATCHDOG_ARMED.load(Ordering::Relaxed) != 0 {
         watchdog_on_tick();
@@ -3406,17 +3386,13 @@ pub(crate) unsafe fn delay_timer_nested_ack() {
     {
         return;
     }
-    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    config &= !HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     if delay_timer_ack_irq().is_ok() {
         PUMP_TIMER_NESTED_ACKS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-const DELAY_TIMER_IRQ: u64 = 12;
-/// Floor for how far ahead the HPET one-shot may be armed, in 100ns units (1 ms).
+const DELAY_TIMER_IRQ: u64 = 2;
+/// Floor for how far ahead the userspace PIT one-shot may be armed, in 100ns units (1 ms).
 ///
 /// This is a FLOOR, not the value used — see `DELAY_TIMER_ROUND_TRIP_100NS`. Arming the comparator
 /// closer than the system can actually service the resulting interrupt is a self-sustaining storm:
@@ -3426,7 +3402,6 @@ const DELAY_TIMER_IRQ: u64 = 12;
 /// per second in `irq12_entry` -> `irq_dispatch` -> `notification::signal` while the guest retired
 /// ZERO. 1 ms is far below one service round trip under emulation.
 const DELAY_TIMER_MIN_ARM_100NS: u64 = 10_000;
-const DELAY_TIMER_MIN_ARM_FLOOR_TICKS: u64 = 4096;
 const DELAY_TIMER_SOURCE_DELAY_QUEUE: u64 = 1;
 const DELAY_TIMER_SOURCE_EVENT_WAIT: u64 = 2;
 const DELAY_TIMER_SOURCE_KEYED_WAIT: u64 = 3;
@@ -3440,7 +3415,6 @@ const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
 const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
-const LBL_TCB_UNBIND_NOTIFICATION: u64 = 15;
 const LBL_IRQ_ACK: u64 = 31;
 const LBL_IRQ_SET_NOTIFICATION: u64 = 32;
 const LBL_IRQ_CLEAR_HANDLER: u64 = 33;
@@ -3498,13 +3472,6 @@ fn delay_timer_widen_arm_guard() {
     }
 }
 
-fn delay_timer_min_arm_ticks(period_fs: u64) -> u64 {
-    nt_delay_execution::timer_min_delta_ticks(
-        DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed),
-        period_fs,
-        DELAY_TIMER_MIN_ARM_FLOOR_TICKS,
-    )
-}
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 static PLATFORM_TSC_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
 static HPET_MONOTONIC_OFFSET_100NS: AtomicI64 = AtomicI64::new(0);
@@ -3515,15 +3482,16 @@ static DELAY_TIMER_HANDLER: AtomicU64 = AtomicU64::new(0);
 static EXEC_EVENT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static EXEC_EVENT_NOTIFICATION_BOUND: AtomicBool = AtomicBool::new(false);
 static DELAY_TIMER_BADGED_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static DELAY_TIMER_IOPORT: AtomicU64 = AtomicU64::new(0);
 const DELAY_TIMER_IRQ_UNINITIALIZED: u64 = 0;
 const DELAY_TIMER_IRQ_ACTIVE: u64 = 1;
 const DELAY_TIMER_IRQ_MASK_PENDING: u64 = 2;
 const DELAY_TIMER_IRQ_DELETE_PENDING: u64 = 3;
-const DELAY_TIMER_IRQ_BADGE_DELETE_PENDING: u64 = 4;
-const DELAY_TIMER_IRQ_RETIRED: u64 = 5;
+const DELAY_TIMER_IRQ_IOPORT_DELETE_PENDING: u64 = 4;
+const DELAY_TIMER_IRQ_BADGE_DELETE_PENDING: u64 = 5;
+const DELAY_TIMER_IRQ_RETIRED: u64 = 6;
 static DELAY_TIMER_IRQ_STATE: AtomicU64 = AtomicU64::new(DELAY_TIMER_IRQ_UNINITIALIZED);
 static DELAY_TIMER_IRQ_ACK_FAILURES: AtomicU64 = AtomicU64::new(0);
-static DELAY_TIMER_IOAPIC_GSI: AtomicU64 = AtomicU64::new(IOAPIC_ROUTE_GSI_NONE);
 static KUSER_CLOCK_INIT_OK: AtomicBool = AtomicBool::new(false);
 static KUSER_CLOCK_INITIAL_TICK: AtomicU64 = AtomicU64::new(0);
 static KUSER_CLOCK_PUBLISH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -7001,79 +6969,40 @@ fn lsa_worker_route_spec(passed: &mut u64) {
     lsa_selfrpc_bounded_spec(passed);
 }
 
-/// ═══ ★ THE HPET ONE-SHOT REALLY DISARMS (batch 51) ══════════════════════════════════════════════
-///
-/// The LSA self-RPC route is the FIRST thing on the boot that ever arms the executive's HPET
-/// one-shot (its rpcrt4 worker calls `NtDelayExecution`). Turning it on therefore exercised the
-/// arm/disarm path for the first time at scale, and it was BROKEN: `delay_timer_rearm` toggled
-/// **bit 1** of the Timer-0 Configuration register to arm/disarm, but bit 1 is `Tn_INT_TYPE_CNF`
-/// (the edge/level trigger selector). The real enable is **bit 2**, `Tn_INT_ENB_CNF`, which
-/// `delay_timer_init` set once and nothing ever cleared. So "disarm" only flipped the timer from
-/// level- to edge-triggered and left it ENABLED with a comparator now permanently behind the main
-/// counter — a self-sustaining ~34 kHz interrupt storm.
-///
-/// It was not a small effect. Measured on one route-ON boot BEFORE the fix: **2,745,192** HPET
-/// deliveries, of which **2,745,189 woke nothing** (99.9999% spurious), consuming **80 s** of the
-/// executive's single-threaded service loop — against a self-RPC whose ENTIRE legitimate cost is
-/// 51 worker service events. That is what starved winlogon of the forward progress the desktop
-/// paint needs, and it is why the paint was non-deterministic with the route on. It was never a
-/// priority or scheduling-context problem: no MCS budget, period or priority was changed to fix it.
-///
-/// The assertions are the invariants that CANNOT hold under the bug:
-///   * `Tn_INT_TYPE_CNF` is still SET at the gate — the arm/disarm path is not touching the
-///     trigger-type bit any more. Under the bug this reads 0 whenever the timer is disarmed (which
-///     is the steady state), so this alone falsifies it;
-///   * deliveries are BOUNDED, and essentially all of them did real work. A storm is unbounded by
-///     construction, so a ceiling is the honest shape of the claim.
+/// The NT wait broker owns a userspace PIT channel/IRQ capability. HPET is only its clocksource, so
+/// no firmware PCI/SCI IOAPIC route can alias timer delivery.
 fn delay_timer_disarm_spec(passed: &mut u64) {
     let seen = TIMER_TICKS_SEEN.load(Ordering::Relaxed);
     let spurious = TIMER_TICKS_SPURIOUS.load(Ordering::Relaxed);
     let past = TIMER_PAST_DEADLINE_REARMS.load(Ordering::Relaxed);
     let handler = DELAY_TIMER_HANDLER.load(Ordering::Relaxed);
+    let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
     let irq_state = DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire);
     let ack_failures = DELAY_TIMER_IRQ_ACK_FAILURES.load(Ordering::Relaxed);
-    let delay_gsi = DELAY_TIMER_IOAPIC_GSI.load(Ordering::Relaxed);
-    let config = if handler != 0 {
-        unsafe { core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64) }
-    } else {
-        0
-    };
     print_str(b"[delay-timer] armed-ever=");
     print_u64(if handler != 0 { 1 } else { 0 });
     print_str(b" deliveries=");
     print_u64(seen);
     print_str(b" woke-nothing=");
     print_u64(spurious);
-    print_str(b" early-stale=");
+    print_str(b" chunk-wakes=");
     print_u64(TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed));
     print_str(b" past-deadline-rearms=");
     print_u64(past);
-    print_str(b" T0_CONFIG=0x");
-    print_hex_u64(config);
-    print_str(b" gsi=");
-    if delay_gsi == IOAPIC_ROUTE_GSI_NONE {
-        print_str(b"none");
-    } else {
-        print_u64(delay_gsi);
-    }
+    print_str(b" source=pit irq=");
+    print_u64(DELAY_TIMER_IRQ);
     print_str(b" irq-state=");
     print_u64(irq_state);
     print_str(b" ack-failures=");
     print_u64(ack_failures);
-    print_str(b" (bit1=level bit2=enable)\n");
-    // A boot that never armed the timer must show no deliveries at all (nothing is fabricated);
-    // a boot that did must show BOUNDED deliveries that overwhelmingly did real work, on a timer
-    // whose trigger-type bit was never used as an arm control.
+    print_str(b"\n");
     let shape = if handler == 0 {
         seen == 0
             && spurious == 0
             && irq_state == DELAY_TIMER_IRQ_UNINITIALIZED
             && ack_failures == 0
     } else {
-        let isolated_route = delay_gsi != IOAPIC_ROUTE_GSI_NONE
-            && (ioapic_route_gsi_mask(delay_gsi) & driver_launch::hosted_irq_gsi_mask()) == 0;
-        (config & HPET_TN_INT_TYPE_LEVEL) != 0
-            && isolated_route
+        ioport != 0
             && irq_state == DELAY_TIMER_IRQ_ACTIVE
             && ack_failures == 0
             && seen >= 1
@@ -7569,6 +7498,8 @@ pub(crate) static LAST_REARM_SOURCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_TARGET: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_NOW: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LAST_REARM_ARMED: AtomicU64 = AtomicU64::new(0);
+static LAST_REARM_WAKE_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_REARM_CHUNKED: AtomicBool = AtomicBool::new(false);
 /// ═══ PERIODIC CENSUS (batch 58) ══════════════════════════════════════════════════════════════
 ///
 /// [`print_progress_census`] only ever ran AFTER the loop quiesced — which is exactly the boot that
@@ -17156,12 +17087,6 @@ unsafe fn initialize_hpet_monotonic_epoch(period_fs: u64) {
     print_str(b"\n");
 }
 
-#[inline]
-fn hpet_counter_deadline_100ns(deadline_100ns: u64) -> u64 {
-    let offset = HPET_MONOTONIC_OFFSET_100NS.load(Ordering::Relaxed);
-    nt_delay_execution::counter_time_from_epoch(deadline_100ns, offset)
-}
-
 fn monotonic_time_100ns() -> u64 {
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
     if period != 0 && HPET_MONOTONIC_READY.load(Ordering::Acquire) {
@@ -17527,36 +17452,27 @@ fn release_reply_pool_cap(cap: u64) {
     }
 }
 
-fn ioapic_route_gsi_mask(gsi: u64) -> u32 {
-    if gsi < 32 {
-        1u32 << (gsi as u32)
-    } else {
-        0
+unsafe fn ensure_executive_event_notification_bound(
+    notification: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if notification == 0 {
+        return Err(nt_status::NtStatus::INVALID_HANDLE);
     }
-}
-
-fn highest_ioapic_route_gsi(mask: u32) -> Option<u64> {
-    if mask == 0 {
-        None
-    } else {
-        Some((31 - mask.leading_zeros()) as u64)
+    if EXEC_EVENT_NOTIFICATION_BOUND.load(Ordering::Acquire) {
+        return Ok(());
     }
-}
-
-fn select_delay_hpet_route_gsi(route_cap: u32, used_mask: u32) -> Option<u64> {
-    highest_ioapic_route_gsi(route_cap & !used_mask)
+    let bind = syscall5_call(1, LBL_TCB_BIND_NOTIFICATION << 12, notification, 0, 0);
+    if bind != 0 {
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    EXEC_EVENT_NOTIFICATION_BOUND.store(true, Ordering::Release);
+    Ok(())
 }
 
 unsafe fn executive_event_notification() -> Result<u64, nt_status::NtStatus> {
     let existing = EXEC_EVENT_NOTIFICATION.load(Ordering::Acquire);
     if existing != 0 {
-        if !EXEC_EVENT_NOTIFICATION_BOUND.load(Ordering::Acquire) {
-            let bind = syscall5_call(1, LBL_TCB_BIND_NOTIFICATION << 12, existing, 0, 0);
-            if bind != 0 {
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-            EXEC_EVENT_NOTIFICATION_BOUND.store(true, Ordering::Release);
-        }
+        ensure_executive_event_notification_bound(existing)?;
         return Ok(existing);
     }
     let Some(notification) = try_alloc_slot() else {
@@ -17575,6 +17491,24 @@ unsafe fn executive_event_notification() -> Result<u64, nt_status::NtStatus> {
     EXEC_EVENT_NOTIFICATION.store(notification, Ordering::Release);
     EXEC_EVENT_NOTIFICATION_BOUND.store(true, Ordering::Release);
     Ok(notification)
+}
+
+unsafe fn issue_generic_irq_handler_checked(irq: u64) -> Result<u64, nt_status::NtStatus> {
+    let Some(handler) = try_alloc_slot() else {
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    };
+    let error = syscall5_call(
+        SLOT_IRQ_CONTROL,
+        (sel4_rt::LBL_IRQ_ISSUE_IRQ_HANDLER << 12) | 2,
+        irq,
+        handler,
+        0,
+    );
+    if error != 0 {
+        recycle_deleted_root_slot(handler);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    Ok(handler)
 }
 
 pub(crate) unsafe fn mint_executive_event_badge(badge: u64) -> Result<u64, nt_status::NtStatus> {
@@ -17608,58 +17542,39 @@ unsafe fn delay_timer_init() -> bool {
     let irq_state = DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire);
     if irq_state == DELAY_TIMER_IRQ_ACTIVE && DELAY_TIMER_HANDLER.load(Ordering::Relaxed) != 0 {
         let notification = EXEC_EVENT_NOTIFICATION.load(Ordering::Relaxed);
-        if notification != 0 {
-            // `delay_timer_shutdown` may temporarily unbind the root TCB when no timed waits are
-            // live. Re-establish the production binding whenever a later wait reuses the timer.
-            if syscall5_call(1, LBL_TCB_BIND_NOTIFICATION << 12, notification, 0, 0) != 0 {
-                return false;
-            }
-        }
-        return true;
+        // `delay_timer_shutdown` may temporarily unbind the root TCB when no timed waits are live.
+        // Re-establish that binding once when a later wait reuses the timer. Binding an already
+        // bound notification is an error, so this must use the tracked ownership state.
+        return ensure_executive_event_notification_bound(notification).is_ok();
     }
     if irq_state != DELAY_TIMER_IRQ_UNINITIALIZED {
         return false;
     }
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
     if period == 0 {
-        print_str(b"[delay] HPET unavailable; refusing nonzero immediate-success fallback\n");
+        print_str(b"[delay] monotonic clock unavailable; refusing timed-wait fallback\n");
         return false;
     }
-    let initial_config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    let route_cap = (initial_config >> 32) as u32;
-    if route_cap == 0 {
-        return false;
-    }
-    core::ptr::write_volatile(
-        (HPET_VADDR + HPET_T0_CONFIG) as *mut u64,
-        initial_config & !HPET_TN_INT_ENB,
-    );
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let used_mask = driver_launch::hosted_irq_gsi_mask();
-    let Some(gsi) = select_delay_hpet_route_gsi(route_cap, used_mask) else {
-        print_str(b"[delay] HPET timer0 has no non-shared IOAPIC route route_cap=0x");
-        print_hex(route_cap);
-        print_str(b" used=0x");
-        print_hex(used_mask);
-        print_str(b"\n");
-        return false;
-    };
-    let Some(route) = resolve_platform_ioapic_gsi(gsi as u32) else {
-        return false;
-    };
+    let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
+    initialize_hpet_monotonic_epoch(period);
+    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     if executive_event_notification().is_err() {
         return false;
     }
     let Ok(badged) = mint_executive_event_badge(DELAY_TIMER_BADGE) else {
         return false;
     };
-    let Ok(handler) = issue_ioapic_irq_handler_checked(
-        route.controller_ordinal as u64,
-        route.local_pin as u64,
-        DELAY_TIMER_IRQ,
-        true,
-        false,
-    ) else {
+    let Some(ioport) = try_alloc_slot() else {
+        let _ = delete_executive_event_badge(badged);
+        return false;
+    };
+    if issue_ioport_cap(ioport, PIT_CHANNEL0_PORT, PIT_COMMAND_PORT) != 0 {
+        recycle_deleted_root_slot(ioport);
+        let _ = delete_executive_event_badge(badged);
+        return false;
+    }
+    let Ok(handler) = issue_generic_irq_handler_checked(DELAY_TIMER_IRQ) else {
+        let _ = cnode_delete_recycle_r(ioport);
         let _ = delete_executive_event_badge(badged);
         return false;
     };
@@ -17667,30 +17582,16 @@ unsafe fn delay_timer_init() -> bool {
         if mask_ioapic_irq_handler_checked(handler).is_ok() {
             let _ = delete_ioapic_irq_handler_cap_checked(handler);
         }
+        let _ = cnode_delete_recycle_r(ioport);
         let _ = delete_executive_event_badge(badged);
         return false;
     }
-    // The shared executive event notification is already bound to the root TCB, so an HPET signal
-    // cancels any blocking receive and returns DELAY_TIMER_BADGE with empty msginfo.
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    // LEVEL-triggered (matching the IOAPIC route we just issued) and DISARMED: the timer delivers
-    // only while `delay_timer_rearm` has a real deadline to arm it with. Init used to set
-    // `Tn_INT_ENB` here and never clear it again, which is what made the disarm path a no-op.
-    let config = HPET_TN_INT_TYPE_LEVEL | (gsi << 9);
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    let general = core::ptr::read_volatile((HPET_VADDR + HPET_GEN_CONF) as *const u64);
-    initialize_hpet_monotonic_epoch(period);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_CONF) as *mut u64, general | 1);
     DELAY_TIMER_HANDLER.store(handler, Ordering::Relaxed);
     DELAY_TIMER_BADGED_NOTIFICATION.store(badged, Ordering::Relaxed);
-    DELAY_TIMER_IOAPIC_GSI.store(gsi, Ordering::Relaxed);
+    DELAY_TIMER_IOPORT.store(ioport, Ordering::Relaxed);
     DELAY_TIMER_IRQ_STATE.store(DELAY_TIMER_IRQ_ACTIVE, Ordering::Release);
-    print_str(b"[delay] timer ready gsi=");
-    print_u64(gsi);
-    print_str(b" irq=");
+    print_str(b"[delay] userspace PIT one-shot ready irq=");
     print_u64(DELAY_TIMER_IRQ);
-    print_str(b" period_fs=");
-    print_u64(period);
     print_str(b" bound_badge=0x");
     print_hex_u64(DELAY_TIMER_BADGE);
     print_str(b"\n");
@@ -17762,33 +17663,24 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtH
     {
         return;
     }
-    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    config &= !HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     if let Some((deadline, source)) = delay_timer_next_deadline(queue, handler) {
-        let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
-        let guard_ticks = delay_timer_min_arm_ticks(period);
-        let now = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
-        let counter_deadline = hpet_counter_deadline_100ns(deadline);
-        let deadline_target =
-            nt_delay_execution::hundred_ns_to_ticks_ceil(counter_deadline, period);
-        let target =
-            nt_delay_execution::timer_arm_target_ticks(counter_deadline, period, now, guard_ticks);
-        // Keep the comparator safely ahead of the enable edge. For accounting, still record when
-        // the original deadline target has already passed; that means a wake path failed to drain
-        // its due waiter promptly and the guarded rearm is only preventing a lost one-shot.
-        if deadline_target <= now {
+        let now = monotonic_time_100ns();
+        if deadline <= now {
             TIMER_PAST_DEADLINE_REARMS.fetch_add(1, Ordering::Relaxed);
             TIMER_PAST_DEADLINE_SOURCE.store(source, Ordering::Relaxed);
         }
+        let shot = nt_kernel_exec::pit_oneshot_for_deadline(
+            now,
+            deadline,
+            DELAY_TIMER_ARM_GUARD_100NS.load(Ordering::Relaxed),
+        );
         LAST_REARM_DEADLINE.store(deadline, Ordering::Relaxed);
         LAST_REARM_SOURCE.store(source, Ordering::Relaxed);
-        LAST_REARM_TARGET.store(target, Ordering::Relaxed);
+        LAST_REARM_TARGET.store(shot.wake_deadline_100ns, Ordering::Relaxed);
         LAST_REARM_NOW.store(now, Ordering::Relaxed);
         LAST_REARM_ARMED.store(1, Ordering::Relaxed);
-        core::ptr::write_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *mut u64, target);
-        core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
+        LAST_REARM_WAKE_DEADLINE.store(shot.wake_deadline_100ns, Ordering::Relaxed);
+        LAST_REARM_CHUNKED.store(shot.chunked, Ordering::Relaxed);
         if source == DELAY_TIMER_SOURCE_IO_COMPLETION {
             let trace = DELAY_TIMER_REARM_TRACE_N.fetch_add(1, Ordering::Relaxed);
             if trace < 16 {
@@ -17796,31 +17688,31 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtH
                 print_str(b"[delay-rearm] source=iocp deadline=");
                 print_u64(deadline);
                 print_str(b" now100=");
-                print_u64(monotonic_time_100ns());
-                print_str(b" hpet-now=0x");
-                print_hex_u64(now);
-                print_str(b" target=0x");
-                print_hex_u64(target);
+                print_u64(now);
+                print_str(b" pit-wake=");
+                print_u64(shot.wake_deadline_100ns);
+                print_str(b" ticks=");
+                print_u64(shot.ticks as u64);
                 print_str(b" waiters=");
                 print_u64(completion_waiters.len() as u64);
                 print_str(b"\n");
             }
         }
-        // ARM. The comparator is written before the enable edge, with stale level status cleared on
-        // both sides of the comparator write so an old assertion cannot storm as soon as we unmask.
-        config |= HPET_TN_INT_ENB;
-        core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+        let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
+        if ioport == 0
+            || io_out8(ioport, PIT_COMMAND_PORT, PIT_CHANNEL0_ONE_SHOT_LO_HI) != 0
+            || io_out8(ioport, PIT_CHANNEL0_PORT, shot.reload as u8) != 0
+            || io_out8(ioport, PIT_CHANNEL0_PORT, (shot.reload >> 8) as u8) != 0
+        {
+            delay_timer_irq_fault(timer_handler, u64::MAX - 1);
+        }
     } else {
-        // DISARM — nothing is waiting on time, so the timer must stop delivering entirely.
-        // This used to clear `Tn_INT_TYPE_CNF` (bit 1) instead, leaving `Tn_INT_ENB` set with a
-        // comparator now permanently BEHIND the main counter. The result was a self-sustaining
-        // ~34 kHz interrupt storm: measured 2,745,189 spurious deliveries in one boot (99.9999% of
-        // all ticks woke nothing), 80 s of the executive's single-threaded service loop, which
-        // starved winlogon of the forward progress the desktop paint needs. See
-        // `exec_delay_timer_disarms` and `docs/transport-migration.md` §5.
+        // Channel 0 is in hardware one-shot mode and therefore already stopped after its delivery.
+        // A cancelled outstanding shot may still produce one bounded notification; the handler
+        // acknowledges it without programming another shot.
         LAST_REARM_ARMED.store(0, Ordering::Relaxed);
-        config &= !HPET_TN_INT_ENB;
-        core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
+        LAST_REARM_WAKE_DEADLINE.store(u64::MAX, Ordering::Relaxed);
+        LAST_REARM_CHUNKED.store(false, Ordering::Relaxed);
     }
 }
 
@@ -18039,7 +17931,6 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
     TIMER_DUE_WORK_DRAINS.fetch_add(1, Ordering::Relaxed);
     let rearm_started = disk_census_ticks();
     delay_timer_rearm(queue, handler);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     if delay_timer_ack_irq().is_err() {
         return woken;
     }
@@ -18048,10 +17939,6 @@ pub(crate) unsafe fn delay_timer_drain_overdue_without_badge(
         Ordering::Relaxed,
     );
     woken
-}
-
-fn delay_timer_delivery_is_stale(config: u64, counter: u64, comparator: u64) -> bool {
-    (config & HPET_TN_INT_ENB) == 0 || counter < comparator
 }
 
 unsafe fn delay_timer_ack_irq() -> Result<(), nt_status::NtStatus> {
@@ -18085,10 +17972,6 @@ unsafe fn delay_timer_irq_fault(handler: u64, error: u64) {
     }
     DELAY_TIMER_IRQ_ACK_FAILURES.fetch_add(1, Ordering::Relaxed);
     LAST_REARM_ARMED.store(0, Ordering::Release);
-    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    config &= !HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     print_str(b"[delay] FATAL IRQ acknowledgement error=");
     print_u64(error);
     print_str(b" handler=0x");
@@ -18099,15 +17982,19 @@ unsafe fn delay_timer_irq_fault(handler: u64, error: u64) {
         DELAY_TIMER_IRQ_STATE.store(DELAY_TIMER_IRQ_DELETE_PENDING, Ordering::Release);
         if delete_ioapic_irq_handler_cap_checked(handler).is_ok() {
             DELAY_TIMER_HANDLER.store(0, Ordering::Release);
-            DELAY_TIMER_IOAPIC_GSI.store(IOAPIC_ROUTE_GSI_NONE, Ordering::Release);
-            DELAY_TIMER_IRQ_STATE.store(
-                DELAY_TIMER_IRQ_BADGE_DELETE_PENDING,
-                Ordering::Release,
-            );
-            let badged = DELAY_TIMER_BADGED_NOTIFICATION.load(Ordering::Acquire);
-            if delete_executive_event_badge(badged).is_ok() {
-                DELAY_TIMER_BADGED_NOTIFICATION.store(0, Ordering::Release);
-                DELAY_TIMER_IRQ_STATE.store(DELAY_TIMER_IRQ_RETIRED, Ordering::Release);
+            DELAY_TIMER_IRQ_STATE.store(DELAY_TIMER_IRQ_IOPORT_DELETE_PENDING, Ordering::Release);
+            let ioport = DELAY_TIMER_IOPORT.load(Ordering::Acquire);
+            if ioport != 0 && cnode_delete_recycle_r(ioport) == 0 {
+                DELAY_TIMER_IOPORT.store(0, Ordering::Release);
+                DELAY_TIMER_IRQ_STATE.store(
+                    DELAY_TIMER_IRQ_BADGE_DELETE_PENDING,
+                    Ordering::Release,
+                );
+                let badged = DELAY_TIMER_BADGED_NOTIFICATION.load(Ordering::Acquire);
+                if delete_executive_event_badge(badged).is_ok() {
+                    DELAY_TIMER_BADGED_NOTIFICATION.store(0, Ordering::Release);
+                    DELAY_TIMER_IRQ_STATE.store(DELAY_TIMER_IRQ_RETIRED, Ordering::Release);
+                }
             }
         }
     }
@@ -18305,77 +18192,28 @@ unsafe fn delay_timer_interrupt(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) {
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    let counter = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
-    let cmp = core::ptr::read_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *const u64);
-    let cfg = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    if delay_timer_delivery_is_stale(cfg, counter, cmp) {
-        TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
-        delay_timer_widen_arm_guard();
-        let n = TIMER_TICKS_EARLY_STALE.fetch_add(1, Ordering::Relaxed);
-        if n < 16 {
-            print_str(b"[timer-stale] #");
-            print_u64(n);
-            print_str(b" counter=0x");
-            print_hex_u64(counter);
-            print_str(b" cmp=0x");
-            print_hex_u64(cmp);
-            print_str(b" cfg=0x");
-            print_hex_u64(cfg);
-            print_str(b" armed=");
-            print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
-            print_str(b" src=");
-            print_u64(LAST_REARM_SOURCE.load(Ordering::Relaxed));
-            print_str(b" deadline=");
-            print_u64(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
-            print_str(b"\n");
-        }
-        // ★ A "stale" delivery must still DRAIN and RE-ARM. `counter < comparator` is not proof
-        // that this interrupt belongs to a previous arm: the counter is read a few instructions
-        // after entry, and QEMU's HPET can assert a tick or so before the read observes the match.
-        // Dropping such a delivery outright STRANDS the waiter it was armed for — it then sleeps
-        // until some unrelated timer happens to fire. Measured on a hosted boot: io-completion
-        // waiters woke ~84 SECONDS past their deadline, over and over, which is where most of the
-        // post-fix boot time went (`[io-completion] TIMEOUT … deadline=4830460920 now=5676701000`).
-        //
-        // Draining is idempotent — nothing due means nothing woken — and re-arming restores the
-        // one-shot for the earliest remaining deadline, so a genuinely stale edge costs one wasted
-        // scan instead of a lost wakeup. The storm protection is unchanged: a storming timer still
-        // wakes nothing, is still counted here, and the guarded rearm still keeps the comparator
-        // ahead of the enable edge.
-        let now_100ns = monotonic_time_100ns();
-        let _ = delay_timer_drain_due_work(queue, handler, now_100ns);
-        teardown_pending_job_time_terminations(queue, handler);
-        delay_timer_rearm(queue, handler);
-        core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-        let _ = delay_timer_ack_irq();
-        return;
-    }
-    // A delivery the DEADMAN's own deadline produced did real work (it ran the deadlock check), so
-    // it must not be counted as a spurious wake — `exec_delay_timer_disarms`' `spurious <= 64`
-    // clause has to keep meaning "this timer woke nothing", or it stops detecting a storm.
-    // The comparator is programmed with hundred_ns_to_ticks_ceil().  When HPET delivers at that
-    // tick, ticks_to_100ns() can still floor one quantum below the original deadline; use the armed
-    // deadline as the minimum effective time for this non-stale delivery.
-    let now_100ns = monotonic_time_100ns().max(LAST_REARM_DEADLINE.load(Ordering::Relaxed));
+    // The PIT is a hardware one-shot, so every notification corresponds to at most one programmed
+    // interval. Long NT waits are split into representable chunks; only the final chunk may advance
+    // the effective time to the original deadline.
+    let wake_deadline = LAST_REARM_WAKE_DEADLINE.load(Ordering::Relaxed);
+    let chunked = LAST_REARM_CHUNKED.swap(false, Ordering::Relaxed);
+    let sampled_now = monotonic_time_100ns();
+    let now_100ns = if wake_deadline == u64::MAX {
+        sampled_now
+    } else {
+        sampled_now.max(wake_deadline)
+    };
     let woken = delay_timer_drain_due_work(queue, handler, now_100ns);
     teardown_pending_job_time_terminations(queue, handler);
     TIMER_TICKS_SEEN.fetch_add(1, Ordering::Relaxed);
-    if woken == 0 {
+    if chunked {
+        TIMER_TICKS_EARLY_STALE.fetch_add(1, Ordering::Relaxed);
+    } else if woken == 0 {
         delay_timer_widen_arm_guard();
         let n = TIMER_TICKS_SPURIOUS.fetch_add(1, Ordering::Relaxed);
-        if n < 10 || n % 400_000 == 0 {
-            let counter = core::ptr::read_volatile((HPET_VADDR + HPET_MAIN_COUNTER) as *const u64);
-            let cmp = core::ptr::read_volatile((HPET_VADDR + HPET_T0_COMPARATOR) as *const u64);
-            let cfg = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-            print_str(b"[timer-storm] spurious #");
+        if n < 10 {
+            print_str(b"[timer-spurious] #");
             print_u64(n);
-            print_str(b" counter=0x");
-            print_hex_u64(counter);
-            print_str(b" cmp=0x");
-            print_hex_u64(cmp);
-            print_str(b" cfg=0x");
-            print_hex_u64(cfg);
             print_str(b" armed=");
             print_u64(LAST_REARM_ARMED.load(Ordering::Relaxed));
             print_str(b" src=");
@@ -18398,9 +18236,6 @@ unsafe fn delay_timer_interrupt(
         }
     }
     delay_timer_rearm(queue, handler);
-    // Timer 0 is level-triggered. Disable/rearm the comparator and clear the status before Ack
-    // unmasks the IOAPIC line; acknowledging first lets the still-asserted line immediately storm.
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
     let _ = delay_timer_ack_irq();
 }
 
@@ -18410,16 +18245,9 @@ unsafe fn delay_timer_shutdown(queue: &nt_delay_execution::Queue, handler: &Exec
     {
         return;
     }
-    let mut config = core::ptr::read_volatile((HPET_VADDR + HPET_T0_CONFIG) as *const u64);
-    // Same correction as `delay_timer_rearm`'s disarm: clear the ENABLE bit, not the trigger-type.
-    config &= !HPET_TN_INT_ENB;
-    core::ptr::write_volatile((HPET_VADDR + HPET_T0_CONFIG) as *mut u64, config);
-    core::ptr::write_volatile((HPET_VADDR + HPET_GEN_INT_STATUS) as *mut u64, 1);
-    if !driver_launch::hosted_irq_routes_active()
-        && syscall5_call(1, LBL_TCB_UNBIND_NOTIFICATION << 12, 0, 0, 0) == 0
-    {
-        EXEC_EVENT_NOTIFICATION_BOUND.store(false, Ordering::Release);
-    }
+    // A channel-0 one-shot stops itself. Keep the executive event notification bound: a cancelled
+    // shot may deliver once, and hosted hardware IRQs share this notification independently.
+    LAST_REARM_ARMED.store(0, Ordering::Release);
 }
 
 unsafe fn delay_cancel_thread(
@@ -20067,10 +19895,6 @@ pub(crate) unsafe fn delete_ioapic_irq_handler_cap_checked(
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     Ok(())
-}
-
-pub(crate) fn executive_ioapic_gsi_reserved(gsi: u32) -> bool {
-    DELAY_TIMER_IOAPIC_GSI.load(Ordering::Acquire) == gsi as u64
 }
 
 /// The fixed object path for a syscall's directory index.

@@ -45520,26 +45520,6 @@ unsafe fn ensure_hosted_irq_lane(
     Ok(generation)
 }
 
-pub(crate) fn hosted_irq_gsi_mask() -> u32 {
-    unsafe {
-        hosted_irq_lines()
-            .map(|lines| {
-                lines.iter().fold(0u32, |mask, route| {
-                    if route.gsi < u32::BITS {
-                        mask | (1u32 << route.gsi)
-                    } else {
-                        mask
-                    }
-                })
-            })
-            .unwrap_or(0)
-    }
-}
-
-pub(crate) fn hosted_irq_routes_active() -> bool {
-    unsafe { hosted_irq_lines().is_some_and(|lines| !lines.is_empty()) }
-}
-
 pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u64 {
     if badge != crate::COMPOSITE_SEND_ERROR_BADGE
         && (crate::badge_has_delay_timer(badge) || badge & crate::HOSTED_IRQ_EVENT_BADGE != 0)
@@ -45822,8 +45802,7 @@ unsafe fn install_hosted_irq_connection(
         lines
             .iter()
             .any(|existing| existing.vector == route.translated_vector)
-    }) || crate::executive_ioapic_gsi_reserved(route.line)
-    {
+    }) {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
     hosted_irq_lines_mut()

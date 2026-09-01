@@ -3,12 +3,16 @@
 pub const IOCTL_ACPI_EVAL_METHOD: u32 = 0x0032_c004;
 pub const IOCTL_ACPI_EVAL_METHOD_EX: u32 = 0x0032_c018;
 pub const ACPI_EVAL_INPUT_BUFFER_LEN: usize = 8;
+pub const ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_LEN: usize = 12;
 pub const ACPI_EVAL_INPUT_BUFFER_EX_LEN: usize = 260;
+pub const ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN: usize = 268;
 /// Native `sizeof(ACPI_EVAL_OUTPUT_BUFFER)` for the shipped amd64 provider.
 pub const ACPI_EVAL_OUTPUT_PROBE_LEN: usize = 20;
 
 const EVAL_INPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"BieA");
+const EVAL_INPUT_SIMPLE_INTEGER_SIGNATURE: u32 = u32::from_be_bytes(*b"IieA");
 const EVAL_INPUT_EX_SIGNATURE: u32 = u32::from_be_bytes(*b"AieA");
+const EVAL_INPUT_SIMPLE_INTEGER_EX_SIGNATURE: u32 = u32::from_be_bytes(*b"DieA");
 const EVAL_OUTPUT_SIGNATURE: u32 = u32::from_be_bytes(*b"BoeA");
 const EVAL_OUTPUT_HEADER_LEN: usize = 12;
 const METHOD_ARGUMENT_STORAGE_LEN: usize = 8;
@@ -33,6 +37,38 @@ pub fn eval_method_input(
     let mut input = [0u8; ACPI_EVAL_INPUT_BUFFER_LEN];
     input[..4].copy_from_slice(&EVAL_INPUT_SIGNATURE.to_le_bytes());
     input[4..].copy_from_slice(&method);
+    Ok(input)
+}
+
+/// Build an `ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER` for one exact ACPI NameSeg.
+pub fn eval_method_input_integer(
+    method: [u8; 4],
+    argument: u32,
+) -> Result<[u8; ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_LEN], AcpiEvalError> {
+    if !valid_name_seg(method) {
+        return Err(AcpiEvalError::InvalidMethodName);
+    }
+    let mut input = [0u8; ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_LEN];
+    input[..4].copy_from_slice(&EVAL_INPUT_SIMPLE_INTEGER_SIGNATURE.to_le_bytes());
+    input[4..8].copy_from_slice(&method);
+    input[8..12].copy_from_slice(&argument.to_le_bytes());
+    Ok(input)
+}
+
+/// Build an `ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX` for one canonical full path.
+pub fn eval_method_input_integer_ex(
+    method_path: &str,
+    argument: u64,
+) -> Result<[u8; ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN], AcpiEvalError> {
+    if method_path.len() >= ACPI_EVAL_INPUT_BUFFER_EX_LEN - 4
+        || crate::namespace::validate_absolute_path(method_path.as_bytes()).is_err()
+    {
+        return Err(AcpiEvalError::InvalidMethodName);
+    }
+    let mut input = [0u8; ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN];
+    input[..4].copy_from_slice(&EVAL_INPUT_SIMPLE_INTEGER_EX_SIGNATURE.to_le_bytes());
+    input[4..4 + method_path.len()].copy_from_slice(method_path.as_bytes());
+    input[260..268].copy_from_slice(&argument.to_le_bytes());
     Ok(input)
 }
 
@@ -141,6 +177,31 @@ mod tests {
         );
         assert_eq!(
             eval_method_input(*b"_prT"),
+            Err(AcpiEvalError::InvalidMethodName)
+        );
+    }
+
+    #[test]
+    fn simple_integer_input_matches_native_pic_mode_contract() {
+        assert_eq!(
+            eval_method_input_integer(*b"_PIC", 1).unwrap(),
+            [0x41, 0x65, 0x69, 0x49, b'_', b'P', b'I', b'C', 1, 0, 0, 0]
+        );
+        assert_eq!(
+            eval_method_input_integer(*b"_pic", 1),
+            Err(AcpiEvalError::InvalidMethodName)
+        );
+    }
+
+    #[test]
+    fn extended_integer_input_addresses_the_namespace_root() {
+        let input = eval_method_input_integer_ex("\\_PIC", 1).unwrap();
+        assert_eq!(&input[..4], &[0x41, 0x65, 0x69, 0x44]);
+        assert_eq!(&input[4..10], b"\\_PIC\0");
+        assert!(input[10..260].iter().all(|byte| *byte == 0));
+        assert_eq!(&input[260..], &1u64.to_le_bytes());
+        assert_eq!(
+            eval_method_input_integer_ex("_PIC", 1),
             Err(AcpiEvalError::InvalidMethodName)
         );
     }

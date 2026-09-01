@@ -6,6 +6,61 @@
 use alloc::vec::Vec;
 use nt_time::{AdjustableClock, Deadline, TimeSnapshot};
 
+/// Input frequency of the PC-compatible 8254 timer.
+pub const PIT_INPUT_HZ: u64 = 1_193_182;
+const HUNDRED_NS_PER_SECOND: u64 = 10_000_000;
+const PIT_MAX_TICKS: u64 = 65_536;
+
+/// One bounded channel-0 one-shot. A zero reload is the 8254 encoding of 65,536 ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PitOneShot {
+    pub reload: u16,
+    pub ticks: u32,
+    pub wake_deadline_100ns: u64,
+    pub chunked: bool,
+}
+
+/// Convert an NT monotonic deadline into one PC timer channel-0 one-shot.
+///
+/// The PIT cannot represent more than 65,536 input clocks. Longer waits are deliberately split into
+/// bounded chunks; the interrupt owner re-evaluates the authoritative wait queue after every chunk.
+/// Both conversions round upward so neither timer granularity nor integer truncation can wake a
+/// waiter before its requested deadline.
+pub fn pit_oneshot_for_deadline(
+    now_100ns: u64,
+    deadline_100ns: u64,
+    minimum_delay_100ns: u64,
+) -> PitOneShot {
+    let requested = deadline_100ns
+        .saturating_sub(now_100ns)
+        .max(minimum_delay_100ns)
+        .max(1);
+    let ticks = div_ceil_u128(
+        requested as u128 * PIT_INPUT_HZ as u128,
+        HUNDRED_NS_PER_SECOND as u128,
+    )
+    .clamp(1, PIT_MAX_TICKS as u128) as u64;
+    let represented_100ns = div_ceil_u128(
+        ticks as u128 * HUNDRED_NS_PER_SECOND as u128,
+        PIT_INPUT_HZ as u128,
+    ) as u64;
+    let wake_deadline_100ns = now_100ns.saturating_add(represented_100ns);
+    PitOneShot {
+        reload: if ticks == PIT_MAX_TICKS {
+            0
+        } else {
+            ticks as u16
+        },
+        ticks: ticks as u32,
+        wake_deadline_100ns,
+        chunked: wake_deadline_100ns < deadline_100ns,
+    }
+}
+
+fn div_ceil_u128(numerator: u128, denominator: u128) -> u128 {
+    numerator / denominator + u128::from(numerator % denominator != 0)
+}
+
 /// A monotonic + system time source (spec §10). Host tests use [`FakeClock`].
 pub trait Clock {
     fn snapshot(&self) -> TimeSnapshot;
@@ -264,6 +319,33 @@ mod tests {
 
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn pit_one_shot_rounds_up_and_honours_the_service_guard() {
+        let one_tick = pit_oneshot_for_deadline(1_000, 1_001, 0);
+        assert_eq!(one_tick.reload, 1);
+        assert_eq!(one_tick.ticks, 1);
+        assert!(one_tick.wake_deadline_100ns >= 1_001);
+        assert!(!one_tick.chunked);
+
+        let guarded = pit_oneshot_for_deadline(10_000, 10_001, 20_000);
+        assert!(guarded.wake_deadline_100ns >= 30_000);
+        assert!(!guarded.chunked);
+    }
+
+    #[test]
+    fn pit_one_shot_chunks_unrepresentable_deadlines() {
+        let shot = pit_oneshot_for_deadline(50, 10_000_000, 0);
+        assert_eq!(shot.reload, 0);
+        assert_eq!(shot.ticks, 65_536);
+        assert!(shot.chunked);
+        assert!(shot.wake_deadline_100ns > 50);
+        assert!(shot.wake_deadline_100ns < 10_000_000);
+
+        let next = pit_oneshot_for_deadline(shot.wake_deadline_100ns, 10_000_000, 0);
+        assert_eq!(next.reload, 0);
+        assert!(next.wake_deadline_100ns > shot.wake_deadline_100ns);
+    }
 
     #[test]
     fn relative_timer_fires_and_queues_dpc() {
