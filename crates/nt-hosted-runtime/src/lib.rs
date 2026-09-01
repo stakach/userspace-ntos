@@ -6,6 +6,13 @@
 
 #![no_std]
 
+mod hosted_irq;
+
+pub use hosted_irq::{
+    HostedIrqCommand, HostedIrqCompletion, HostedIrqFrame, HostedIrqFrameError,
+    HostedIrqLaneIdentity, HostedIrqWork, HOSTED_IRQ_FRAME_MAGIC, HOSTED_IRQ_FRAME_VERSION,
+};
+
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;
 pub const HOSTED_PROVIDER_IMPORT_THUNK_LEN: usize = 33;

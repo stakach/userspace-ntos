@@ -22296,6 +22296,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the exact actual-lock identity under the hosted UP IRQL/barrier contract, invokes, and restores
     IRQL. `nt-resource-manager` passes 18/18 and the freestanding executive check is green.
 
+    B3 interrupt-lane mailbox checkpoint (2026-09-02, host and freestanding green):
+    `nt-hosted-runtime::HostedIrqFrame` defines a cache-aligned, page-safe, lane-private transport
+    with immutable domain id/cookie/lane generation, release/acquire command publication, monotonic
+    sequence binding, validated worker admission, explicit complete versus faulted results, exact
+    root acknowledgement, and an idle-only shutdown fence. Stale generations, stale completions,
+    double publication, invalid commands, and teardown during pending/running work all fail closed.
+    The crate passes 76/76 and the executive still checks freestanding. Map one such frame into each
+    real lane next; do not recreate this state with ad hoc `SH_REQ_*` fields.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after
