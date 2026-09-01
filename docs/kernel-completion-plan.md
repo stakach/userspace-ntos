@@ -22550,8 +22550,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     sentinel. The subsequent monotonic Clear/delete edits affect only injected teardown failures and
     are covered by the host lifecycle test plus the final executive build.
 
-    B3 production timer IRQ cleanup checkpoint (2026-09-02, host and freestanding validation green;
-    serialized desktop acceptance pending): every remaining executive IRQ acknowledgement now uses
+    B3 production timer IRQ cleanup checkpoint (2026-09-02, host, freestanding, and desktop
+    acceptance green): every remaining executive IRQ acknowledgement now uses
     a checked request/reply invocation. The production HPET delay timer publishes an explicit
     `ACTIVE`/mask-pending/delete-pending/badge-delete-pending/retired lifecycle, confirms a tick only
     after a successful kernel Ack, and fails closed by disabling HPET, clearing the level source,
@@ -22571,8 +22571,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the generation-backed DPC registry. The old request-bank ISR path remains the sole temporary
     transport and must still be removed atomically at cutover.
 
-    B3 timer-source and firmware interrupt-mode correction (2026-09-02, focused host and
-    freestanding validation green; serialized desktop acceptance pending): the production wait
+    B3 timer-source and firmware interrupt-mode correction (2026-09-02, focused host,
+    freestanding, and desktop validation green): the production wait
     broker no longer consumes an arbitrary HPET Timer0 IOAPIC route. Q35 advertises GSI 23 as HPET
     capable while also routing PCI `00:03.0` INTA to GSI 23; the prior accepted desktop happened to
     move HPET to GSI 22 only because the now-deleted boot proof occupied GSI 23. Route capability is
@@ -22633,6 +22633,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the SCI, then require real E1000 connect/ISR/DPC/receive evidence before accepting this slice.
     The BusRelations commit now also consumes the generic `route_reconciliation_ready` edge after
     clearing its relation-query owner; the pump-tail start remains only the fallible redrive path.
+
+    B3 live interrupt-vector arbitration acceptance checkpoint (2026-09-02, complete): PCI route
+    publication now snapshots the vectors owned by every active, draining, or quarantined hosted
+    physical line, together with the production wait-timer vector, and allocates against that exact
+    fallible snapshot. The static timer-only exclusion list is deleted. The serialized desktop run
+    `.tmp/run-desktop-20260902-094533.log` kept ACPI SCI GSI/vector 9 connected, assigned firmware
+    route GSI 23 to E1000 vector 10, accepted E1000 `IoConnectInterrupt`, serviced both observed
+    hardware deliveries, ran the real ISR/DPC/NDIS receive path, and passed
+    `exec_provider_ndis_receive_indicated`, `exec_generic_hw_interrupt_delivered`,
+    `exec_generic_hw_dpc_delivered`, and `exec_delay_timer_disarms`. Explorer filled the complete
+    1024x768 framebuffer with at least 32 non-background colors, the full gate passed 295/295, and
+    QEMU exited on the sentinel in about five minutes under the external one-hour deadline. This
+    accepts the provider artifact, provider-owned `_PIC(1)`, PIT timer conversion, and live-vector
+    collision correction together; no IRQ, callback, route, or successful status was synthesized.
+
+    Review adjustment: the snapshot is a correct serialized admission boundary, but it is not the
+    final shared authority. Continue with one generation-owned physical-line catalog keyed by GSI
+    and retaining translated vector, trigger, polarity, sharing policy, lifecycle, and connection
+    leases. A compatible second claimant for the same GSI must reuse its line/vector; a conflicting
+    claimant must fail before publication. Route invalidation must fence new admissions while old
+    leases drain. Both SCI and hosted PCI resource publication must consult this catalog, after which
+    the temporary cross-table vector snapshot can be removed.
 
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
