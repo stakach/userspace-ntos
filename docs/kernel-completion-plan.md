@@ -22377,8 +22377,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lane-to-executive service pages. In-place initialization avoids materializing the 132-KiB
     aggregate on a kernel stack. Immutable lane identity/config includes the domain id/cookie/lane
     generation, component KPCR VA, stack bounds, and maximum IRQL. Every command carries an exact
-    owner/id/generation grant plus transaction/class/depth/direction/sequence token; the crate treats
-    that grant as a lookup key and the executive must still resolve it against its live lease ledger.
+    owner/id/generation grant plus transaction/depth/direction/sequence token; transaction class is
+    bound in the arena control state. The crate treats the grant as a lookup key and the executive
+    must still resolve it against its live lease ledger.
 
     Lifetime and running masks enforce `dispatch[d] -> service[d] -> dispatch[d+1]` and strict LIFO
     unwind. A parent must actually be running, not merely allocated. Typed ISR/DPC/provider-callback
@@ -22386,8 +22387,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `Running`; malformed work records poison and releases its pending lease. Completion first closes
     child admission, refuses outstanding deeper work, and publishes its result only after the
     running mask is cleared. A failed acknowledgement restores the exact terminal page state for
-    retry. DPC work is accepted only as a new depth-zero DPC transaction, so it cannot execute before
-    the interrupt scan and physical acknowledgement complete.
+    retry. DPC work is accepted only as a new depth-zero DPC transaction. The executive must publish
+    that transaction only after the interrupt scan and physical acknowledgement complete.
 
     Lane-local IRQL must unwind to passive before transaction completion. First fault and first
     bugcheck records are independently sticky; poison rejects new publication while exact terminal
@@ -22396,7 +22397,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exhaustion poisons rather than wrapping. Depth high-water is retained. The contract assumes the
     private endpoint serializes one root actor and one lane worker; a genuinely dead worker is still
     retired by the executive's out-of-band TCB-suspend barrier rather than graceful shutdown. The
-    crate passes 96/96 tests including all 16 depths, stale reuse, malformed wire cleanup, poison
+    crate passes 97/97 tests including all 16 depths, stale reuse, malformed wire cleanup, poison
     unwind, retryable acknowledgement, exact layout/in-place initialization, DPC separation, and
     exhaustion. The executive freestanding check remains green. V1 stays live only for bootstrap
     until the next step maps the KPCR plus all 33 pages, expands the private message token, and moves

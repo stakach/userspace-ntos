@@ -1214,7 +1214,7 @@ struct HostedIrqSlotPage {
 #[derive(Clone, Copy)]
 struct HostedIrqWireCommand {
     kind: u32,
-    argument_count: u8,
+    argument_count: u32,
     operation: u64,
     target0: u64,
     target1: u64,
@@ -1404,7 +1404,7 @@ impl HostedIrqSlotPage {
         }
         let command = HostedIrqWireCommand {
             kind: self.kind.load(Ordering::Relaxed),
-            argument_count: self.argument_count.load(Ordering::Relaxed) as u8,
+            argument_count: self.argument_count.load(Ordering::Relaxed),
             operation: self.operation.load(Ordering::Relaxed),
             target0: self.target0.load(Ordering::Relaxed),
             target1: self.target1.load(Ordering::Relaxed),
@@ -1497,6 +1497,11 @@ impl HostedIrqSlotPage {
     ) -> bool {
         match direction {
             HostedIrqLaneDirection::Dispatch => {
+                if wire.argument_count > HOSTED_IRQ_ARENA_ARGUMENT_CAP as u32
+                    || wire.irql & !0xffff != 0
+                {
+                    return false;
+                }
                 let Some(kind) = HostedIrqDispatchKind::from_raw(wire.kind) else {
                     return false;
                 };
@@ -1509,7 +1514,7 @@ impl HostedIrqSlotPage {
                     entry_irql: wire.irql as u8,
                     synchronize_irql: (wire.irql >> 8) as u8,
                     grant: wire.grant,
-                    argument_count: wire.argument_count,
+                    argument_count: wire.argument_count as u8,
                     arguments: wire.arguments,
                 };
                 let Some(class) = HostedIrqTransactionClass::from_raw(
@@ -1528,6 +1533,9 @@ impl HostedIrqSlotPage {
                         || (class == HostedIrqTransactionClass::Dpc && token.depth == 0))
             }
             HostedIrqLaneDirection::Service => {
+                if wire.argument_count > HOSTED_IRQ_ARENA_ARGUMENT_CAP as u32 {
+                    return false;
+                }
                 let Some(kind) = HostedIrqServiceKind::from_raw(wire.kind) else {
                     return false;
                 };
@@ -1537,7 +1545,7 @@ impl HostedIrqSlotPage {
                     target_domain_id: wire.target0,
                     target_domain_cookie: wire.target1,
                     grant: wire.grant,
-                    argument_count: wire.argument_count,
+                    argument_count: wire.argument_count as u8,
                     arguments: wire.arguments,
                 }
                 .valid()
@@ -1654,10 +1662,11 @@ impl HostedIrqSlotPage {
         if !matches!(state, SLOT_COMPLETE | SLOT_FAULTED) {
             return Err(HostedIrqArenaError::ResultNotReady);
         }
-        let value_count = self.result_value_count.load(Ordering::Relaxed) as u8;
-        if value_count as usize > HOSTED_IRQ_ARENA_RESULT_CAP {
+        let raw_value_count = self.result_value_count.load(Ordering::Relaxed);
+        if raw_value_count > HOSTED_IRQ_ARENA_RESULT_CAP as u32 {
             return Err(HostedIrqArenaError::InvalidResult);
         }
+        let value_count = raw_value_count as u8;
         Ok(HostedIrqArenaResult {
             status: self.result_status.load(Ordering::Relaxed),
             faulted: state == SLOT_FAULTED,
@@ -1738,7 +1747,7 @@ impl HostedIrqDispatchPage {
             depth,
             HostedIrqWireCommand {
                 kind: command.kind as u32,
-                argument_count: command.argument_count,
+                argument_count: command.argument_count as u32,
                 operation: command.work_id,
                 target0: command.routine,
                 target1: command.object,
@@ -1771,7 +1780,7 @@ impl HostedIrqDispatchPage {
             entry_irql: wire.irql as u8,
             synchronize_irql: (wire.irql >> 8) as u8,
             grant: wire.grant,
-            argument_count: wire.argument_count,
+            argument_count: wire.argument_count as u8,
             arguments: wire.arguments,
         };
         if command.valid() {
@@ -1861,7 +1870,7 @@ impl HostedIrqServicePage {
             depth,
             HostedIrqWireCommand {
                 kind: command.kind as u32,
-                argument_count: command.argument_count,
+                argument_count: command.argument_count as u32,
                 operation: command.service_id,
                 target0: command.target_domain_id,
                 target1: command.target_domain_cookie,
@@ -1891,7 +1900,7 @@ impl HostedIrqServicePage {
             target_domain_id: wire.target0,
             target_domain_cookie: wire.target1,
             grant: wire.grant,
-            argument_count: wire.argument_count,
+            argument_count: wire.argument_count as u8,
             arguments: wire.arguments,
         };
         if command.valid() {
@@ -2646,6 +2655,52 @@ mod tests {
 
     #[test]
     fn malformed_pending_command_is_poisoned_and_released_without_running() {
+        fn verify(tamper: impl FnOnce(&HostedIrqDispatchPage)) {
+            let control = active_control();
+            let page = HostedIrqDispatchPage::new(identity());
+            let transaction = control
+                .root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt)
+                .unwrap();
+            let token = page
+                .root_publish(
+                    &control,
+                    identity(),
+                    transaction,
+                    0,
+                    dispatch(HostedIrqDispatchKind::InterruptService),
+                )
+                .unwrap();
+            tamper(&page);
+            assert_eq!(
+                page.worker_begin(&control, identity(), token),
+                Err(HostedIrqArenaError::InvalidCommand)
+            );
+            assert_eq!(page.0.state.load(Ordering::Acquire), SLOT_IDLE);
+            assert_eq!(control.dispatch_mask.load(Ordering::Acquire), 0);
+            assert_eq!(control.dispatch_running_mask.load(Ordering::Acquire), 0);
+            control
+                .root_finish_transaction(identity(), transaction)
+                .unwrap();
+            assert_eq!(
+                control.root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt),
+                Err(HostedIrqArenaError::Poisoned)
+            );
+        }
+
+        verify(|page| {
+            page.0.kind.store(
+                HostedIrqDispatchKind::DeferredProcedure as u32,
+                Ordering::Relaxed,
+            );
+        });
+        verify(|page| page.0.argument_count.store(0x100, Ordering::Relaxed));
+        verify(|page| {
+            page.0.irql.fetch_or(1 << 24, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn noncanonical_result_count_is_never_narrowed_into_success() {
         let control = active_control();
         let page = HostedIrqDispatchPage::new(identity());
         let transaction = control
@@ -2660,24 +2715,19 @@ mod tests {
                 dispatch(HostedIrqDispatchKind::InterruptService),
             )
             .unwrap();
-        page.0.kind.store(
-            HostedIrqDispatchKind::DeferredProcedure as u32,
-            Ordering::Relaxed,
-        );
+        page.worker_begin(&control, identity(), token).unwrap();
+        page.worker_complete(&control, identity(), token, success(1))
+            .unwrap();
+        page.0.result_value_count.store(0x100, Ordering::Relaxed);
         assert_eq!(
-            page.worker_begin(&control, identity(), token),
-            Err(HostedIrqArenaError::InvalidCommand)
+            page.root_completion(identity(), token),
+            Err(HostedIrqArenaError::InvalidResult)
         );
-        assert_eq!(page.0.state.load(Ordering::Acquire), SLOT_IDLE);
-        assert_eq!(control.dispatch_mask.load(Ordering::Acquire), 0);
-        assert_eq!(control.dispatch_running_mask.load(Ordering::Acquire), 0);
+        page.0.result_value_count.store(1, Ordering::Relaxed);
+        page.root_acknowledge(&control, identity(), token).unwrap();
         control
             .root_finish_transaction(identity(), transaction)
             .unwrap();
-        assert_eq!(
-            control.root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt),
-            Err(HostedIrqArenaError::Poisoned)
-        );
     }
 
     #[test]
