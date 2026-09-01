@@ -220,15 +220,9 @@ impl<C: Clock> KernelExecRuntime<C> {
     /// queues a DPC bottom-half — then calls [`Self::finish_isr`] to lower the IRQL,
     /// after which the DPC queue is drained. Returns `None` if no ISR is connected.
     pub fn inject_interrupt(&mut self, vector: u32) -> Option<ReadyIsr> {
-        let (service_routine, interrupt, service_context, dirql) =
-            self.interrupts.find_vector(vector)?;
-        self.irql.raise(dirql);
-        Some(ReadyIsr {
-            service_routine,
-            interrupt,
-            service_context,
-            dirql,
-        })
+        let isr = self.interrupts.begin_scan(vector)?.next_isr()?;
+        self.irql.raise(isr.dirql);
+        Some(isr)
     }
 
     /// Lower the IRQL back to `PASSIVE_LEVEL` after an injected ISR returns.

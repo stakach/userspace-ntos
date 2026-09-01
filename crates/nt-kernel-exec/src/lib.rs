@@ -63,7 +63,10 @@ pub use event_object::{
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
     ProviderEventProjectionError, RetiredEventObject, SignalQueueResult,
 };
-pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
+pub use interrupt::{
+    InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,
+    InterruptScanProgress, InterruptTable, ReadyIsr, SYNTHETIC_DIRQL,
+};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use lookaside::{
     general_lookaside, init_general_lookaside, DEFAULT_MAXIMUM_DEPTH, POOL_TYPE_NONPAGED,

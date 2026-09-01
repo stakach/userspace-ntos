@@ -22265,12 +22265,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Runtime acceptance remains open. An interrupt projected through a provider can target the same
     NDIS request bank already occupied by a miniport/protocol callback chain; rewriting that bank
-    re-entrantly is forbidden. Add a dedicated kernel-owned hosted interrupt worker/context per
-    executing driver domain, with a private command/result frame and no `SH_REQ_*` reuse, so same-bank
-    ISR execution can preempt the main hosted component context and queue its DPC correctly. Extend
-    per-line received/deferred/dispatched/claimed/acknowledged and per-bank owner/depth diagnostics,
-    then run one serialized `./run.sh --desktop` attempt under the hard 3,600-second readiness limit.
-    Kill deterministic stalls immediately; uptime beyond one hour is meaningful only after readiness.
+    re-entrantly is forbidden. A second TCB in the same VSpace is also insufficient: hosted imports
+    and provider callback marshalling still address the fixed `FSD_SHARED_VADDR`, so it would collide
+    with the parked request even with a private stack. NDIS's ISR synchronously calls the dependent
+    miniport ISR, which can itself preempt an occupied dependent request bank. Add sibling provider
+    ISR and dependent callback execution lanes with aliased mutable image/heap/device frames but
+    private VSpaces, fixed-VA control banks, stacks, IPC buffers, endpoints, reply objects, and
+    command/result mailboxes. Neither lane may reuse `SH_REQ_*` or the normal component transport.
+
+    B3 native interrupt-contract checkpoint (2026-09-02, focused host validation green; kernel
+    wiring open): `nt-kernel-exec::InterruptTable` now retains the complete connection contract:
+    service routine/context, actual lock, vector, DIRQL, synchronization IRQL, trigger mode, sharing,
+    and affinity. Its borrow-free ordered `InterruptScan` implements the NT5 contract rather than
+    preserving the ReactOS amd64 gap: level-sensitive chains stop at the first claimant; latched
+    chains scan every handler and repeat until a full pass is unclaimed. Incompatible shared-line
+    mode/sharing contracts fail closed. The focused suite passes 205/205.
+
+    Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
+    performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
+    Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after
+    acknowledgement may the canonical per-domain DPC lane run at `DISPATCH_LEVEL`; clear a KDPC's
+    inserted state before invoking it so a later DIRQL interrupt can requeue that same object. Make
+    `KeSynchronizeExecution` use the connection's actual lock and synchronization IRQL, and make
+    disconnect mask first, drain exact in-flight leases, then tear down every lane mapping/cap.
+    Extend per-line received/deferred/dispatched/claimed/acknowledged/quarantined and per-lane
+    owner/depth diagnostics, then run one serialized `./run.sh --desktop` attempt. The runner must
+    kill a deterministic stall immediately and enforce 3,600 seconds as an absolute readiness
+    ceiling; uptime beyond one hour is meaningful only after genuine desktop readiness disarms it.
 
     Review adjustment: this closes handle-side and hosted GUI queue-event ownership, but does not
     close the provider pointer-wait ABI. The current `KeWaitForSingleObject` import still lacks a

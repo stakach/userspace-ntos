@@ -1,29 +1,69 @@
-//! Simulated interrupt bridge (spec §11). A `KINTERRUPT` is opaque driver storage;
-//! the runtime keeps its ISR registration keyed by the driver's pointer. There is
-//! no real hardware interrupt in this milestone — a test harness (later, a real
-//! seL4 IRQ notification) injects an interrupt by vector, the runtime raises to the
-//! ISR's synthetic DIRQL, the driver's `KSERVICE_ROUTINE` runs (typically queuing a
-//! DPC bottom-half), then the IRQL lowers and the DPC queue drains.
+//! NT interrupt connection metadata and shared-line arbitration.
+//!
+//! Driver callbacks are returned to the host as values so no runtime borrow is held while driver
+//! code runs. The host reports each ISR's Boolean result back to [`InterruptScan`], which applies
+//! the NT5 shared-line rules: level-sensitive lines stop at the first claimant; latched lines scan
+//! every handler and repeat the full chain while any handler claims a pass.
 
 use alloc::vec::Vec;
 
-/// The synthetic Device IRQL an injected ISR runs at — above `DISPATCH_LEVEL`
-/// (real DIRQL values are platform interrupt-controller specific, spec §6.1).
+/// Compatibility DIRQL used by callers that do not yet supply a platform IRQL.
 pub const SYNTHETIC_DIRQL: u8 = 5;
 
-struct Interrupt {
-    ptr: u64,
-    service_routine: u64,
-    service_context: u64,
-    vector: u32,
-    dirql: u8,
-    connected: bool,
+/// Interrupt trigger mode (`KINTERRUPT_MODE`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InterruptMode {
+    LevelSensitive,
+    Latched,
 }
 
-/// The Driver Host's connected interrupts (spec §11).
+/// Exact `IoConnectInterrupt` policy retained for one interrupt object.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InterruptConnection {
+    pub interrupt: u64,
+    pub service_routine: u64,
+    pub service_context: u64,
+    pub spin_lock: u64,
+    pub vector: u32,
+    pub irql: u8,
+    pub synchronize_irql: u8,
+    pub mode: InterruptMode,
+    pub share_vector: bool,
+    pub affinity: u64,
+}
+
+impl InterruptConnection {
+    fn valid(self) -> bool {
+        self.interrupt != 0
+            && self.service_routine != 0
+            && self.synchronize_irql >= self.irql
+            && self.affinity != 0
+    }
+
+    fn ready(self) -> ReadyIsr {
+        ReadyIsr {
+            service_routine: self.service_routine,
+            interrupt: self.interrupt,
+            service_context: self.service_context,
+            spin_lock: self.spin_lock,
+            dirql: self.irql,
+            synchronize_irql: self.synchronize_irql,
+            mode: self.mode,
+            affinity: self.affinity,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InterruptConnectError {
+    InvalidParameter,
+    SharingViolation,
+}
+
+/// The Driver Host's connected interrupts, retained in deterministic connection order.
 #[derive(Default)]
 pub struct InterruptTable {
-    interrupts: Vec<Interrupt>,
+    interrupts: Vec<InterruptConnection>,
 }
 
 impl InterruptTable {
@@ -33,22 +73,7 @@ impl InterruptTable {
         }
     }
 
-    fn slot(&mut self, ptr: u64) -> &mut Interrupt {
-        if let Some(i) = self.interrupts.iter().position(|x| x.ptr == ptr) {
-            return &mut self.interrupts[i];
-        }
-        self.interrupts.push(Interrupt {
-            ptr,
-            service_routine: 0,
-            service_context: 0,
-            vector: 0,
-            dirql: SYNTHETIC_DIRQL,
-            connected: false,
-        });
-        self.interrupts.last_mut().unwrap()
-    }
-
-    /// `IoConnectInterrupt[Ex]` — register an ISR (`KSERVICE_ROUTINE`) for a vector.
+    /// Compatibility form for older hosts. New kernel wiring should call [`Self::connect_exact`].
     pub fn connect(
         &mut self,
         ptr: u64,
@@ -57,43 +82,185 @@ impl InterruptTable {
         vector: u32,
         dirql: u8,
     ) {
-        let x = self.slot(ptr);
-        x.service_routine = service_routine;
-        x.service_context = service_context;
-        x.vector = vector;
-        x.dirql = dirql;
-        x.connected = true;
+        let _ = self.connect_exact(InterruptConnection {
+            interrupt: ptr,
+            service_routine,
+            service_context,
+            spin_lock: 0,
+            vector,
+            irql: dirql,
+            synchronize_irql: dirql,
+            mode: InterruptMode::LevelSensitive,
+            share_vector: false,
+            affinity: 1,
+        });
+    }
+
+    /// Register the complete `IoConnectInterrupt` contract.
+    pub fn connect_exact(
+        &mut self,
+        connection: InterruptConnection,
+    ) -> Result<(), InterruptConnectError> {
+        if !connection.valid() {
+            return Err(InterruptConnectError::InvalidParameter);
+        }
+        if self.interrupts.iter().any(|entry| {
+            entry.interrupt != connection.interrupt
+                && entry.vector == connection.vector
+                && (entry.mode != connection.mode
+                    || !entry.share_vector
+                    || !connection.share_vector)
+        }) {
+            return Err(InterruptConnectError::SharingViolation);
+        }
+        if let Some(entry) = self
+            .interrupts
+            .iter_mut()
+            .find(|entry| entry.interrupt == connection.interrupt)
+        {
+            *entry = connection;
+        } else {
+            self.interrupts.push(connection);
+        }
+        Ok(())
     }
 
     /// `IoDisconnectInterrupt[Ex]`.
     pub fn disconnect(&mut self, ptr: u64) {
-        if let Some(x) = self.interrupts.iter_mut().find(|x| x.ptr == ptr) {
-            x.connected = false;
-        }
+        self.interrupts.retain(|entry| entry.interrupt != ptr);
     }
 
     pub fn is_connected(&self, ptr: u64) -> bool {
-        self.interrupts.iter().any(|x| x.ptr == ptr && x.connected)
+        self.interrupts.iter().any(|entry| entry.interrupt == ptr)
     }
 
-    /// The connected ISR bound to `vector`: `(service_routine, interrupt, service_context, dirql)`.
+    pub fn connection(&self, ptr: u64) -> Option<InterruptConnection> {
+        self.interrupts
+            .iter()
+            .copied()
+            .find(|entry| entry.interrupt == ptr)
+    }
+
+    /// Compatibility lookup for a single-handler host.
     pub fn find_vector(&self, vector: u32) -> Option<(u64, u64, u64, u8)> {
         self.interrupts
             .iter()
-            .find(|x| x.connected && x.vector == vector)
-            .map(|x| (x.service_routine, x.ptr, x.service_context, x.dirql))
+            .find(|entry| entry.vector == vector)
+            .map(|entry| {
+                (
+                    entry.service_routine,
+                    entry.interrupt,
+                    entry.service_context,
+                    entry.irql,
+                )
+            })
+    }
+
+    /// Snapshot a vector's ordered ISR chain for invocation without a table borrow.
+    pub fn begin_scan(&self, vector: u32) -> Option<InterruptScan> {
+        let entries: Vec<_> = self
+            .interrupts
+            .iter()
+            .copied()
+            .filter(|entry| entry.vector == vector)
+            .collect();
+        InterruptScan::new(entries)
     }
 }
 
-/// An ISR ready to run, from [`crate::KernelExecRuntime::inject_interrupt`]. The
-/// caller invokes `KSERVICE_ROUTINE(Interrupt, ServiceContext) -> BOOLEAN` with no
-/// runtime borrow held (spec §17), then calls `finish_isr`.
+/// An ISR ready to run with the complete synchronization contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ReadyIsr {
     pub service_routine: u64,
     pub interrupt: u64,
     pub service_context: u64,
+    pub spin_lock: u64,
     pub dirql: u8,
+    pub synchronize_irql: u8,
+    pub mode: InterruptMode,
+    pub affinity: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InterruptScanProgress {
+    Continue,
+    Complete { claimed: bool, passes: u64 },
+}
+
+/// Borrow-free NT shared-line scan state.
+pub struct InterruptScan {
+    entries: Vec<InterruptConnection>,
+    mode: InterruptMode,
+    cursor: usize,
+    pass_claimed: bool,
+    ever_claimed: bool,
+    passes: u64,
+    awaiting_result: bool,
+    complete: bool,
+}
+
+impl InterruptScan {
+    fn new(entries: Vec<InterruptConnection>) -> Option<Self> {
+        let mode = entries.first()?.mode;
+        debug_assert!(entries.iter().all(|entry| entry.mode == mode));
+        Some(Self {
+            entries,
+            mode,
+            cursor: 0,
+            pass_claimed: false,
+            ever_claimed: false,
+            passes: 1,
+            awaiting_result: false,
+            complete: false,
+        })
+    }
+
+    /// Return the next ISR. The previous ISR result must be reported first.
+    pub fn next_isr(&mut self) -> Option<ReadyIsr> {
+        if self.complete || self.awaiting_result {
+            return None;
+        }
+        let entry = self.entries.get(self.cursor).copied()?;
+        self.awaiting_result = true;
+        Some(entry.ready())
+    }
+
+    /// Apply one `KSERVICE_ROUTINE` result and advance the NT scan state.
+    pub fn complete_isr(&mut self, claimed: bool) -> InterruptScanProgress {
+        if self.complete || !self.awaiting_result {
+            return InterruptScanProgress::Complete {
+                claimed: self.ever_claimed,
+                passes: self.passes,
+            };
+        }
+        self.awaiting_result = false;
+        self.pass_claimed |= claimed;
+        self.ever_claimed |= claimed;
+
+        if self.mode == InterruptMode::LevelSensitive && claimed {
+            self.complete = true;
+        } else {
+            self.cursor += 1;
+            if self.cursor == self.entries.len() {
+                if self.mode == InterruptMode::Latched && self.pass_claimed {
+                    self.cursor = 0;
+                    self.pass_claimed = false;
+                    self.passes = self.passes.saturating_add(1);
+                } else {
+                    self.complete = true;
+                }
+            }
+        }
+
+        if self.complete {
+            InterruptScanProgress::Complete {
+                claimed: self.ever_claimed,
+                passes: self.passes,
+            }
+        } else {
+            InterruptScanProgress::Continue
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,18 +269,95 @@ mod tests {
 
     use super::*;
 
+    fn connection(ptr: u64, mode: InterruptMode, shared: bool) -> InterruptConnection {
+        InterruptConnection {
+            interrupt: ptr,
+            service_routine: ptr + 1,
+            service_context: ptr + 2,
+            spin_lock: ptr + 3,
+            vector: 0x30,
+            irql: 5,
+            synchronize_irql: 6,
+            mode,
+            share_vector: shared,
+            affinity: 1,
+        }
+    }
+
     #[test]
-    fn connect_find_disconnect() {
-        let mut t = InterruptTable::new();
-        assert!(t.find_vector(0x30).is_none());
-        t.connect(0x1000, 0x15E, 0xC7, 0x30, SYNTHETIC_DIRQL);
-        assert!(t.is_connected(0x1000));
+    fn connect_find_disconnect_retains_exact_policy() {
+        let mut table = InterruptTable::new();
+        let exact = connection(0x1000, InterruptMode::LevelSensitive, false);
+        table.connect_exact(exact).unwrap();
+        assert_eq!(table.connection(0x1000), Some(exact));
+        assert_eq!(table.find_vector(0x30), Some((0x1001, 0x1000, 0x1002, 5)));
+        table.disconnect(0x1000);
+        assert!(!table.is_connected(0x1000));
+        assert!(table.find_vector(0x30).is_none());
+    }
+
+    #[test]
+    fn rejects_incompatible_shared_line_contracts() {
+        let mut table = InterruptTable::new();
+        table
+            .connect_exact(connection(1, InterruptMode::LevelSensitive, true))
+            .unwrap();
         assert_eq!(
-            t.find_vector(0x30),
-            Some((0x15E, 0x1000, 0xC7, SYNTHETIC_DIRQL))
+            table.connect_exact(connection(2, InterruptMode::Latched, true)),
+            Err(InterruptConnectError::SharingViolation)
         );
-        t.disconnect(0x1000);
-        assert!(!t.is_connected(0x1000));
-        assert!(t.find_vector(0x30).is_none());
+        assert_eq!(
+            table.connect_exact(connection(2, InterruptMode::LevelSensitive, false)),
+            Err(InterruptConnectError::SharingViolation)
+        );
+    }
+
+    #[test]
+    fn level_scan_stops_at_first_claimant() {
+        let mut table = InterruptTable::new();
+        for ptr in [1, 2, 3] {
+            table
+                .connect_exact(connection(ptr, InterruptMode::LevelSensitive, true))
+                .unwrap();
+        }
+        let mut scan = table.begin_scan(0x30).unwrap();
+        assert_eq!(scan.next_isr().unwrap().interrupt, 1);
+        assert_eq!(scan.complete_isr(false), InterruptScanProgress::Continue);
+        assert_eq!(scan.next_isr().unwrap().interrupt, 2);
+        assert_eq!(
+            scan.complete_isr(true),
+            InterruptScanProgress::Complete {
+                claimed: true,
+                passes: 1
+            }
+        );
+        assert!(scan.next_isr().is_none());
+    }
+
+    #[test]
+    fn latched_scan_repeats_until_a_full_pass_is_unclaimed() {
+        let mut table = InterruptTable::new();
+        for ptr in [1, 2] {
+            table
+                .connect_exact(connection(ptr, InterruptMode::Latched, true))
+                .unwrap();
+        }
+        let mut scan = table.begin_scan(0x30).unwrap();
+        let results = [(1, true), (2, false), (1, false), (2, false)];
+        for (index, (interrupt, claimed)) in results.into_iter().enumerate() {
+            assert_eq!(scan.next_isr().unwrap().interrupt, interrupt);
+            let progress = scan.complete_isr(claimed);
+            if index + 1 == results.len() {
+                assert_eq!(
+                    progress,
+                    InterruptScanProgress::Complete {
+                        claimed: true,
+                        passes: 2
+                    }
+                );
+            } else {
+                assert_eq!(progress, InterruptScanProgress::Continue);
+            }
+        }
     }
 }
