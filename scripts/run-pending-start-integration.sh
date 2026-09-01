@@ -57,7 +57,7 @@ for instance in 0001 0002; do
     "[driver-launch] config PnP StartDevice service=PendingStartTest devnode=$devnode status=0x00000000" \
     "fixture devnode $instance did not complete with STATUS_SUCCESS"
   require_line_parts \
-    "[driver-launch] config PnP hardware evidence service=PendingStartTest devnode=$devnode group=irq " \
+    "[driver-launch] config PnP evidence service=PendingStartTest devnode=$devnode " \
     'dpc=1' \
     "fixture devnode $instance did not complete through its timer/DPC"
 done

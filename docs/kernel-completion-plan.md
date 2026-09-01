@@ -21249,8 +21249,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     devnodes out of the production generated hive into an explicit integration-test fixture. Do not
     weaken pending START coverage or synthesize a terminal result while making this split.
 
-    B3 native-load/PnP ownership split checkpoint (2026-09-01, implementation and host validation
-    green; runtime pending): `NtLoadDriver` now terminates after the registry-selected image is
+    B3 native-load/PnP ownership split checkpoint (2026-09-01, implementation, host validation, and
+    runtime green): `NtLoadDriver` now terminates after the registry-selected image is
     validated, the hosted driver instance and `DRIVER_OBJECT` are published, and the real
     `DriverEntry` returns. It propagates the exact loader or `DriverEntry` status and no longer
     reserves a PnP batch, calls `AddDevice`, assigns resources, sends START, owns a pending START
@@ -21288,6 +21288,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     syscall-reply result and eventual action retirement. The historical eager demand-PnP launch and
     permissive `PlugPlayControlStartDevice` no-action success remain explicit follow-up debt; neither
     may be treated as the final live Config Manager device-action boundary.
+
+    Serialized integration run
+    `.tmp/run-pending-start-integration-20260901-104521.log` completed at guest time 116 seconds and
+    exited QEMU through the sentinel. The separate SCM load-only service produced an exact `1/1/1`
+    terminal/replied proof with matching `STATUS_SUCCESS`. Both fixture devnodes independently
+    returned pending, completed through their timer/DPC with `dpc=1`, reached terminal START success,
+    and left the aggregate PnP owner with `pending-observed=2`, no pending or indeterminate row.
+    Explorer retained a fully painted 786432-pixel framebuffer and all 296 gates passed. The runner's
+    stale `config PnP hardware evidence` phrase was corrected to the emitted generic `config PnP
+    evidence` record, and every corrected predicate matches the accepted log.
+
+    The serialized production run
+    `.tmp/run-headless-production-load-pnp-split-20260901.log` likewise completed at guest time 116
+    seconds, passed 296/296, painted all 786432 framebuffer pixels with at least 32 colours, and
+    exited QEMU. Its native-load ledger is coherently empty at `0/0/0`; three real config-selected
+    PnP devices all reached terminal START with zero pending observation or failure. Neither fixture
+    service appears in the log and `PendingStartTest.sys` is absent from the production FAT image.
+    Both runs used a 900-second operational timeout under the hard one-hour ceiling and left no QEMU
+    process running. Review adjustment: the load/PnP ownership and production-fixture separation are
+    runtime accepted. The next slice remains the exact generic per-devnode terminal ledger described
+    above; do not close the broader live device-action boundary on aggregate counters.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
