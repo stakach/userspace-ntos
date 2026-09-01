@@ -5,7 +5,8 @@ pub const IOCTL_ACPI_EVAL_METHOD_EX: u32 = 0x0032_c018;
 pub const ACPI_EVAL_INPUT_BUFFER_LEN: usize = 8;
 pub const ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_LEN: usize = 12;
 pub const ACPI_EVAL_INPUT_BUFFER_EX_LEN: usize = 260;
-pub const ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN: usize = 268;
+/// Native amd64 size. The `ULONG64` argument is aligned to offset 264 after the 260-byte prefix.
+pub const ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN: usize = 272;
 /// Native `sizeof(ACPI_EVAL_OUTPUT_BUFFER)` for the shipped amd64 provider.
 pub const ACPI_EVAL_OUTPUT_PROBE_LEN: usize = 20;
 
@@ -68,7 +69,7 @@ pub fn eval_method_input_integer_ex(
     let mut input = [0u8; ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN];
     input[..4].copy_from_slice(&EVAL_INPUT_SIMPLE_INTEGER_EX_SIGNATURE.to_le_bytes());
     input[4..4 + method_path.len()].copy_from_slice(method_path.as_bytes());
-    input[260..268].copy_from_slice(&argument.to_le_bytes());
+    input[264..272].copy_from_slice(&argument.to_le_bytes());
     Ok(input)
 }
 
@@ -198,8 +199,8 @@ mod tests {
         let input = eval_method_input_integer_ex("\\_PIC", 1).unwrap();
         assert_eq!(&input[..4], &[0x41, 0x65, 0x69, 0x44]);
         assert_eq!(&input[4..10], b"\\_PIC\0");
-        assert!(input[10..260].iter().all(|byte| *byte == 0));
-        assert_eq!(&input[260..], &1u64.to_le_bytes());
+        assert!(input[10..264].iter().all(|byte| *byte == 0));
+        assert_eq!(&input[264..], &1u64.to_le_bytes());
         assert_eq!(
             eval_method_input_integer_ex("_PIC", 1),
             Err(AcpiEvalError::InvalidMethodName)
