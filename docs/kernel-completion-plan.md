@@ -21949,26 +21949,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     1,024x768 framebuffer, and all 298/298 checks passing at the sentinel. The wrapper reaped QEMU
     normally. This closes dynamic hosted-process churn and the post-quiesce Dbgk lifecycle gate.
 
-    Provider main-pool reclamation frontier (2026-09-01, audit complete; implementation pending):
-    the runtime's same-pi reuse does not reclaim ordinary win32k pool memory. The provider's main
-    8 MiB arena remains bump-only: `ExAllocatePool*` uses that arena, while `ExFreePool*` only tries
-    the separate FTYP reclaiming arena and silently ignores main-arena pointers. Real ReactOS
-    W32PROCESS/W32THREAD, GDI process pools, message queues, Eng allocations, and their exit callouts
-    therefore execute correctly but cannot return their bytes. Per-generation component-owned
-    callout TEB and primary-token allocations are also dropped when context records retire; queue
-    event bodies have no handle/reference lifetime owner.
+    Provider main-pool reclamation frontier (2026-09-01, allocator core in progress): the ordinary
+    8 MiB win32k provider arena is no longer wired as a silent bump-only pool. Reclaiming mechanics
+    now live in the host-testable `nt-kernel-exec::provider_pool` module and operate on offsets behind
+    an explicit memory boundary. They validate the complete ordered free list before mutation, use
+    checked arithmetic, first-fit split, eager coalescing and tail trimming, distinguish explicit
+    zeroing from native nonzeroing allocation, and fail closed on invalid sizes, exhaustion, foreign
+    or duplicate frees, cycles, and out-of-range metadata. Focused tests cover reuse/coalescing/tail
+    return, zero/nonzero reuse, exact invalid-free accounting, exhaustion, and injected corruption;
+    the complete `nt-kernel-exec` suite passes 188/188.
 
-    Replace the main provider arena with a headered reclaiming allocator, using the existing tested
-    split/coalesce/tail-shrink machinery rather than tag-specific exceptions. Route frees by exact
-    arena membership, report foreign/misaligned/double frees instead of ignoring them, preserve
-    ordinary NT nonzeroing allocation semantics, and keep explicit zeroing for component-owned
-    objects that require it. Release component-owned TEB/token/local process-thread bodies before
-    clearing their generation records, and give event bodies typed handle/reference lifetime.
-    Focused tests must prove split/coalesce, same-size reuse, invalid-free rejection, zero-on-reuse
-    where requested, and stable live bytes/high-water across repeated process/thread generations.
-    Runtime acceptance requires provider pool live bytes to return toward the pre-churn baseline,
-    high-water stabilization, clean provider exit, and the full 298/298 desktop gate. Only then
-    start the separate real-provider GetClassInfo integration client.
+    The executive/provider adapter initializes and version-publishes the already mapped arena once,
+    serializes every mutation through a lock stored in the shared physical pages, routes
+    `ExAllocatePool*` and the distinct one-argument/tagged free ABIs through exact arena ownership,
+    preserves zeroing only for component-owned allocations, and publishes shared live/high-water,
+    reuse, invalid-free, OOM, and corruption census. The freestanding executive check is green.
+
+    Serialized desktop/churn proof `.tmp/run-desktop-provider-pool-20260901-231755.log` completes
+    under five minutes and exits QEMU at the full 298/298 sentinel. The final shared census records
+    9,918 allocations, 8,390 frees, 7,152 actual free-list reuse hits, 2,137 KiB live against a
+    2,200 KiB live high-water and 2,229 KiB arena high-water, with zero invalid frees, OOMs,
+    corruptions, or win32k pool exhaustions. Explorer executes 683 real api0 callbacks with zero
+    callback failures and paints every framebuffer pixel with at least 32 non-background colors.
+    This accepts the provider main-pool allocator and import/free routing slice.
+
+    The allocator alone does not close provider lifetime debt. Context records still need explicit
+    provenance before freeing locally allocated callout TEBs, primary tokens, EPROCESS/ETHREAD
+    bodies, and superseded context-table backing; retirement must first clear exact KPCR/shared/token
+    publications. Queue events require a growable, process-generation-fenced registry with separate
+    handle, pointer, native-wait, GUI-wait, and signal leases. The current four-entry evicting event
+    ring, no-op dereference path, raw wait/signal pointers, and synthetic queue-event repair must be
+    removed as that typed lifetime model is wired. Only after repeated-generation live bytes settle
+    toward baseline should work start on the separate real-provider GetClassInfo client.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 

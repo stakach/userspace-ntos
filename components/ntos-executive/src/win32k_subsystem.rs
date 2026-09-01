@@ -38,6 +38,7 @@ use nt_compat_exports::{
     },
     DriverExportRegistry, DriverExportRegistryStats, DRIVER_EXPORT_INITIAL_RESERVE,
 };
+use nt_kernel_exec::provider_pool as shared_pool;
 
 // Pure, driver-agnostic ntoskrnl byte/string primitives shared with the FSD class.
 use crate::ntoskrnl_shared::{
@@ -57,12 +58,10 @@ pub const WIN32K_CODE_VA: u64 = 0x0000_0100_0680_0000;
 /// win32k image frame count (size_of_image 0x220000 / 0x1000).
 pub const WIN32K_IMAGE_FRAMES: u64 = 0x220;
 const WIN32K_IMAGE_BYTES: u64 = WIN32K_IMAGE_FRAMES * 0x1000;
-/// Pool arena the `ExAllocatePool*` trampolines bump-allocate from (counter at +0, data at +0x1000).
-/// PRE-MAPPED pure bump (the committed-baseline mechanism), relocated to its own window + grown from
-/// 1 MiB → 8 MiB: win32k's GUI init (DirectX + fonts + PDEV/surface/brush) needs more than 1 MiB, and
-/// the old 1 MiB exhausted at the gray-brush allocation. Retype-zeroed frames give counter 0. Its own
-/// 0x0A00_0000 window (4 × 2 MiB PTs). (Demand-mapping + a real free list were tried and reverted —
-/// win32k's init froze with them.)
+/// Pool arena used by the `ExAllocatePool*` trampolines and component-owned GUI objects. It is
+/// pre-mapped because provider pointers must remain directly dereferenceable, but allocation is a
+/// headered first-fit free list with eager coalescing and tail trimming. Counter at +0, free-list
+/// head at +8, data at +0x1000. Its own 0x0A00_0000 window spans four 2 MiB page tables.
 pub const WIN32K_POOL_VADDR: u64 = 0x0000_0100_0A00_0000;
 pub const WIN32K_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
 /// The win32k COMPONENT's own stack (32 frames = 128 KiB, own 2 MiB PT). Deliberately NOT at the
@@ -821,29 +820,142 @@ const _: () = assert!(LPC_SERVICE_MESSAGE as usize + LPC_SERVICE_MESSAGE_CAP <= 
 
 // --- pool allocator (host-side; the trampolines run in the component) ------------------------
 //
-// The main win32k pool remains the known-good pure bump arena; earlier attempts to reclaim general
-// pool blocks froze GUI init when reclaimed object bodies were reused across incompatible paths.
-// FreeType/session-heap churn is reclaimed by dedicated allocators below, where ownership is clear.
+// The main provider arena uses the same checked header/free-list machinery as the hosted RTL heaps
+// below. Direct component allocations request explicit zeroing; ExAllocatePool* retains native
+// nonzeroing semantics. This distinction prevents stale host object state without turning provider
+// pool reuse into an implicit success fallback.
+
+pub type ProviderPoolCensus = shared_pool::PoolCensus;
+
+struct ProviderPoolMemory;
+
+impl shared_pool::PoolMemory for ProviderPoolMemory {
+    fn len(&self) -> u64 {
+        WIN32K_POOL_FRAMES * 0x1000
+    }
+
+    fn read_u64(&self, offset: u64) -> Option<u64> {
+        if offset.checked_add(8)? > self.len() || offset & 7 != 0 {
+            return None;
+        }
+        Some(unsafe { read_volatile((WIN32K_POOL_VADDR + offset) as *const u64) })
+    }
+
+    fn write_u64(&mut self, offset: u64, value: u64) -> bool {
+        if offset.checked_add(8).is_none_or(|end| end > self.len()) || offset & 7 != 0 {
+            return false;
+        }
+        unsafe { write_volatile((WIN32K_POOL_VADDR + offset) as *mut u64, value) };
+        true
+    }
+
+    fn zero(&mut self, offset: u64, len: u64) -> bool {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return false;
+        }
+        unsafe { core::ptr::write_bytes((WIN32K_POOL_VADDR + offset) as *mut u8, 0, len as usize) };
+        true
+    }
+}
+
+struct ProviderPoolLockGuard;
+
+impl Drop for ProviderPoolLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (&*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64))
+                .store(0, Ordering::Release);
+        }
+    }
+}
+
+fn provider_pool_ready() -> bool {
+    unsafe {
+        (&*((WIN32K_POOL_VADDR + shared_pool::MAGIC_OFFSET) as *const AtomicU64))
+            .load(Ordering::Acquire)
+            == shared_pool::MAGIC
+    }
+}
+
+unsafe fn provider_pool_lock() -> Option<ProviderPoolLockGuard> {
+    if !provider_pool_ready() {
+        return None;
+    }
+    let lock = &*((WIN32K_POOL_VADDR + shared_pool::LOCK_OFFSET) as *const AtomicU64);
+    while lock
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        crate::yield_now();
+    }
+    Some(ProviderPoolLockGuard)
+}
+
+/// Initialize the already mapped provider arena exactly once, before the component is spawned.
+pub unsafe fn initialize_provider_pool() -> bool {
+    let magic = &*((WIN32K_POOL_VADDR + shared_pool::MAGIC_OFFSET) as *const AtomicU64);
+    if magic.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    let mut memory = ProviderPoolMemory;
+    if shared_pool::initialize(&mut memory).is_err() {
+        return false;
+    }
+    magic.store(shared_pool::MAGIC, Ordering::Release);
+    true
+}
+
+pub fn provider_pool_census() -> ProviderPoolCensus {
+    unsafe {
+        let Some(_guard) = provider_pool_lock() else {
+            return ProviderPoolCensus::default();
+        };
+        shared_pool::census(&ProviderPoolMemory).unwrap_or_default()
+    }
+}
+
+unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
+    let Some(_guard) = provider_pool_lock() else {
+        print_str(b"[win32k-host] provider pool is not initialized\n");
+        crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    };
+    let mut memory = ProviderPoolMemory;
+    match shared_pool::allocate(&mut memory, size, zero) {
+        Ok(allocation) => WIN32K_POOL_VADDR + allocation.payload_offset,
+        Err(error) => {
+            crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+            print_str(b"[win32k-host] provider pool allocation failed reason=");
+            print_u64(error as u64);
+            print_str(b" size=0x");
+            print_hex(size as u32);
+            print_str(b"\n");
+            0
+        }
+    }
+}
+
+fn provider_pool_contains(p: u64) -> bool {
+    p >= WIN32K_POOL_VADDR + shared_pool::DATA_OFFSET + shared_pool::HEADER_SIZE
+        && p < WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000
+}
+
+unsafe fn provider_pool_free(p: u64) -> bool {
+    let Some(_guard) = provider_pool_lock() else {
+        return false;
+    };
+    let mut memory = ProviderPoolMemory;
+    shared_pool::free(&mut memory, p - WIN32K_POOL_VADDR).is_ok()
+}
+
+unsafe fn provider_pool_note_invalid_free() {
+    if let Some(_guard) = provider_pool_lock() {
+        let _ = shared_pool::note_invalid_free(&mut ProviderPoolMemory);
+    }
+}
 
 unsafe fn pool_alloc(size: u64) -> u64 {
-    let ctr = WIN32K_POOL_VADDR as *mut u64;
-    let mut cur = read_volatile(ctr);
-    if cur < POOL_DATA_OFF {
-        cur = POOL_DATA_OFF;
-    }
-    let start = (WIN32K_POOL_VADDR + cur + 15) & !15;
-    let cap = WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000;
-    if size == 0 || start + size > cap {
-        crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        print_str(b"[win32k-host] POOL EXHAUSTED size=0x");
-        print_hex(size as u32);
-        print_str(b" used=0x");
-        print_hex(cur as u32);
-        print_str(b"\n");
-        return 0;
-    }
-    write_volatile(ctr, (start + size) - WIN32K_POOL_VADDR);
-    start
+    provider_pool_alloc(size, true)
 }
 
 /// A separate reclaiming arena for allocations with explicit lifetime. FreeType first required it
@@ -898,7 +1010,6 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
         cur = next;
         scanned += 1;
     }
-
     let ctr = WIN32K_FTYP_VADDR as *mut u64;
     let mut cur = read_volatile(ctr);
     if cur < POOL_DATA_OFF {
@@ -915,20 +1026,20 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
     hdr + FTYP_HDR_SIZE
 }
 
-unsafe fn reclaiming_pool_free(p: u64) {
+unsafe fn reclaiming_pool_free(p: u64) -> bool {
     let arena_start = WIN32K_FTYP_VADDR + POOL_DATA_OFF;
     let arena_end = WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
     if p < arena_start + FTYP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
-        return;
+        return false;
     }
     let hdr = p - FTYP_HDR_SIZE;
     let cap = read_volatile(hdr as *const u64);
     let marker = read_volatile((hdr + 8) as *const u64);
     if marker != FTYP_ALLOC_MARKER || cap == 0 || (cap & 15) != 0 {
-        return;
+        return false;
     }
     if hdr < arena_start || hdr + FTYP_HDR_SIZE + cap > arena_end {
-        return;
+        return false;
     }
 
     let head = (WIN32K_FTYP_VADDR + 8) as *mut u64;
@@ -941,7 +1052,7 @@ unsafe fn reclaiming_pool_free(p: u64) {
         scanned += 1;
     }
     if scanned >= 4096 {
-        return;
+        return false;
     }
 
     write_volatile(hdr as *mut u64, cap);
@@ -993,6 +1104,7 @@ unsafe fn reclaiming_pool_free(p: u64) {
             write_volatile(ctr, block - WIN32K_FTYP_VADDR);
         }
     }
+    true
 }
 
 /// User-mode VM arena for `ZwAllocateVirtualMemory(NtCurrentProcess(), ...)`. win32k's GDI attribute
@@ -4954,17 +5066,17 @@ extern "win64" fn s_ex_alloc_pool_with_tag(_pool: u64, size: u64, tag: u64) -> u
         if (tag as u32) as u64 == FTYP_TAG {
             reclaiming_pool_alloc(size)
         } else {
-            pool_alloc(size)
+            provider_pool_alloc(size, false)
         }
     }
 }
 /// `PVOID ExAllocatePool(POOL_TYPE, SIZE_T NumberOfBytes)`.
 extern "win64" fn s_ex_alloc_pool(_pool: u64, size: u64) -> u64 {
-    unsafe { pool_alloc(size) }
+    unsafe { provider_pool_alloc(size, false) }
 }
 /// `PVOID ExAllocatePoolWithQuotaTag(POOL_TYPE, SIZE_T, ULONG Tag)`.
 extern "win64" fn s_ex_alloc_pool_quota(_pool: u64, size: u64, _tag: u64) -> u64 {
-    unsafe { pool_alloc(size) }
+    unsafe { provider_pool_alloc(size, false) }
 }
 
 /// `VOID RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source)`.
@@ -5134,12 +5246,41 @@ extern "win64" fn s_vdbg_print_ex_with_prefix(
 // memcpy / memmove / memset are the pure, driver-agnostic byte-loop primitives —
 // shared with the FSD class in [`crate::ntoskrnl_shared`] (registered by name below).
 
-/// `VOID ExFreePoolWithTag(PVOID, ULONG)`. The main pool remains a bump arena, but FreeType's
-/// dedicated FTYP arena has real frees because ReactOS ftfd alloc/free churns heavily per client.
+/// `VOID ExFreePoolWithTag(PVOID, ULONG)`. Resolve the allocation by exact arena membership and
+/// live-header validation. Foreign and duplicate frees remain visible instead of being accepted.
 extern "win64" fn s_ex_free_pool_with_tag(p: u64, _tag: u64) {
     unsafe {
-        reclaiming_pool_free(p);
+        let in_provider_pool = provider_pool_contains(p);
+        let in_ftyp_pool = p >= WIN32K_FTYP_VADDR + POOL_DATA_OFF + FTYP_HDR_SIZE
+            && p < WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
+        let freed = if in_provider_pool {
+            provider_pool_free(p)
+        } else if in_ftyp_pool {
+            reclaiming_pool_free(p)
+        } else {
+            provider_pool_note_invalid_free();
+            false
+        };
+        if freed {
+            return;
+        }
+        if in_ftyp_pool {
+            provider_pool_note_invalid_free();
+        }
+        let invalid = provider_pool_census().invalid_frees;
+        if invalid <= 8 || invalid.is_power_of_two() {
+            print_str(b"[win32k-host] invalid ExFreePool pointer=0x");
+            print_hex((p >> 32) as u32);
+            print_hex(p as u32);
+            print_str(b" count=");
+            print_u64(invalid);
+            print_str(b"\n");
+        }
     }
+}
+
+extern "win64" fn s_ex_free_pool(p: u64) {
+    s_ex_free_pool_with_tag(p, 0);
 }
 
 // --- ZwAllocateVirtualMemory + RTL_BITMAP (GDI DC_ATTR / RGN_ATTR pool) -----------------------
@@ -10181,7 +10322,7 @@ fn register_trampolines() -> bool {
         s_ex_alloc_pool_quota as usize as u64,
     );
     reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as usize as u64);
-    reg.bind("ExFreePool", s_ex_free_pool_with_tag as usize as u64);
+    reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",
@@ -11256,7 +11397,8 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
 /// then trips the SENTINEL fault so the executive knows init finished.
 /// win32k's pool allocator exposed as a fn pointer for the shared [`crate::spawn_hosts::component_main`]
 /// DriverEntry preamble (which must build the DRIVER_OBJECT / ext / RegistryPath from win32k's OWN
-/// bump arena over `WIN32K_POOL_VADDR`, so the DriverEntry + `SH_POOL_USED` readback see win32k's pool).
+/// reclaiming arena over `WIN32K_POOL_VADDR`, so DriverEntry and executive bridge allocations share
+/// one serialized ownership domain.
 pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
     pool_alloc(size)
 }
@@ -11265,6 +11407,10 @@ pub(crate) unsafe fn pool_alloc_export(size: u64) -> u64 {
 #[link_section = ".text.win32k_subsystem_entry"]
 pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
     if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+        park();
+    }
+    if !provider_pool_ready() {
+        print_str(b"[win32k-host] ERROR: provider pool metadata is not initialized\n");
         park();
     }
     // NOW RUNS ON THE SHARED HARNESS (Phase B, Step 4b). The DriverEntry preamble (build DRIVER_OBJECT
@@ -11328,7 +11474,7 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
 /// `win32k_subsystem_entry` → `dispatch_loop` did before its first sentinel.
 unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
     let v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
-    let pool_used = read_volatile(WIN32K_POOL_VADDR as *const u64);
+    let pool_used = provider_pool_census().arena_high_water;
     write_volatile((WIN32K_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
     print_str(b"[win32k-host] DriverEntry returned status=0x");
     print_hex(status as u32);

@@ -10476,6 +10476,25 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_ctx_thread_growths);
     print_str(b"/");
     print_u64(w32_ctx_thread_fails);
+    let provider_pool = win32k_subsystem::provider_pool_census();
+    print_str(b" w32-provider-pool=");
+    print_u64(provider_pool.live_bytes >> 10);
+    print_str(b"KiB/");
+    print_u64(provider_pool.live_high_water >> 10);
+    print_str(b"KiB arena-hw=");
+    print_u64(provider_pool.arena_high_water >> 10);
+    print_str(b"KiB alloc/free/reuse/invalid=");
+    print_u64(provider_pool.allocations);
+    print_str(b"/");
+    print_u64(provider_pool.frees);
+    print_str(b"/");
+    print_u64(provider_pool.reuses);
+    print_str(b"/");
+    print_u64(provider_pool.invalid_frees);
+    print_str(b" oom/corrupt=");
+    print_u64(provider_pool.out_of_memory);
+    print_str(b"/");
+    print_u64(provider_pool.corruptions);
     let dll_paging = service_sec_image::service_dll_arena_paging_stats();
     print_str(b" dll-paging=");
     print_u64(dll_paging.records as u64);
@@ -31395,6 +31414,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     RW_NX,
                     CAP_INIT_THREAD_VSPACE,
                 );
+            }
+            if !win32k_subsystem::initialize_provider_pool() {
+                print_str(b"[win32k-svc] provider pool initialization failed\n");
+                park();
             }
             let data_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_DATA_FRAMES {
