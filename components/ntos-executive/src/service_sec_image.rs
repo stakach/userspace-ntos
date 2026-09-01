@@ -19057,13 +19057,17 @@ pub(crate) unsafe fn service_sec_image(
                         wait_cancel_thread(&mut nt_handler, 0xD1D1_0001);
                     }
 
-                    // 0x0080 — ★ THE ESCAPE HATCH. Leave a reporter blocked and destroy the debug
-                    // object (`NtClose` → `DbgkpCloseObject`, i.e. the debugger died holding the
-                    // event): every blocked target is RELEASED, so nothing can stay parked forever.
+                    // 0x0080 — ★ THE ESCAPE HATCH. Leave the live keepalive reporter blocked on
+                    // the breakpoint event posted above, then destroy the debug object (`NtClose`
+                    // → `DbgkpCloseObject`, i.e. the debugger died holding the event): every
+                    // blocked target is RELEASED, so nothing can stay parked forever. The main
+                    // reporter was deliberately terminated by the preceding phase and therefore
+                    // cannot own another event.
                     let released_before = DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed);
+                    let escape_tid = keepalive.unwrap_or(0) as u64;
                     let stranded = nt_handler.dbgk_block_reporter(
                         blk_test_pi,
-                        main_tid as u64,
+                        escape_tid,
                         0,
                         dbgk::DBGK_BLOCK_VM_FAULT,
                         reply_spare,

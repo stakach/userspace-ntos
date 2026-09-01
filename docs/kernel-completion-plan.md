@@ -21910,6 +21910,66 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     desktop attempt was terminated at the deterministic SEC_IMAGE spawn barrier; it was not allowed
     to consume the one-hour ceiling. Repeat the same serialized churn acceptance with `67efbc7`.
 
+    Dynamic identity reuse runtime checkpoint (2026-09-01, churn accepted; final gate rerun
+    pending): serialized desktop run `.tmp/run-desktop-20260901-222215.log` reached the genuine
+    Explorer shell and exercised the repaired paging/final-deletion path. Dynamic pi 11, pid 796,
+    generation 5 completed provider rundown, released its VSpace with `private-pts=34/0`, emitted
+    `[process-delete] retired`, and was then immediately selected for pid 940. Later pi 17, 16, 14,
+    and the transient userinit pi 5 also retired with zero residual private paging capabilities and
+    `vspace-released=1`. The run emitted no dynamic-admission `err=6`, no `max_pi=24` exhaustion,
+    and no provider or capability-delete failure. This accepts same-pi/new-generation reuse without
+    increasing the process window.
+
+    The run was manually interrupted at roughly 244 seconds after Explorer had entered its normal
+    empty `GetMessage` park only about eight seconds earlier. That was too early for the existing
+    45-second no-progress window, so absence of the post-quiesce Dbgk `dw2`, final framebuffer
+    summary, and sentinel is not evidence that periodic NIC traffic suppresses the gate. Do not
+    weaken or specialize quiescence from this trace. Complete one serialized rerun and allow the
+    quiet window to expire; require the remaining Dbgk, framebuffer, and 298/298 sentinel evidence.
+    The runner's 3,600-second limit remains a boot-readiness ceiling and is disarmed by real Explorer
+    paint; an explicitly long-lived OS session is a separate caller policy, while validation runs
+    still terminate on their complete verdict and never retain stale QEMU processes.
+
+    Final-gate Dbgk correction (2026-09-01, accepted): the unchanged rerun
+    `.tmp/run-desktop-20260901-223009.log` reached the sentinel in roughly five minutes, retained
+    same-pi reuse, completed `dw2`, painted all 786,432 framebuffer pixels with at least 32 distinct
+    non-background colors, and passed 297/298 checks. The sole failure was the escape-hatch half of
+    `exec_dbgk_terminate_status_enforced`: after correctly terminating the main throwaway reporter,
+    the selftest attempted to attach another reporter to that already terminated TID. The live
+    keepalive ETHREAD owns the breakpoint event posted to wake the debugger-side wait. Bind the
+    escape-hatch reporter to that exact live event/thread before closing the debug object; require
+    `DBGK_REPORTERS_RELEASED` to advance and the complete 0x03ff target-block mask on the next run.
+
+    The correction binds the escape-hatch reporter to the live keepalive ETHREAD and its exact
+    queued breakpoint event; the deliberately terminated main reporter cannot own a later event.
+    The freestanding executive check is green, and serialized desktop proof
+    `.tmp/run-desktop-20260901-223927.log` completed in minutes with the full `0x03ff` target-block
+    mask, `dw2`, one enforced termination, one blocked-reporter release, zero left-blocked reporters,
+    same-pi/new-generation reuse, 661 real api0 callbacks with zero failures, the complete
+    1,024x768 framebuffer, and all 298/298 checks passing at the sentinel. The wrapper reaped QEMU
+    normally. This closes dynamic hosted-process churn and the post-quiesce Dbgk lifecycle gate.
+
+    Provider main-pool reclamation frontier (2026-09-01, audit complete; implementation pending):
+    the runtime's same-pi reuse does not reclaim ordinary win32k pool memory. The provider's main
+    8 MiB arena remains bump-only: `ExAllocatePool*` uses that arena, while `ExFreePool*` only tries
+    the separate FTYP reclaiming arena and silently ignores main-arena pointers. Real ReactOS
+    W32PROCESS/W32THREAD, GDI process pools, message queues, Eng allocations, and their exit callouts
+    therefore execute correctly but cannot return their bytes. Per-generation component-owned
+    callout TEB and primary-token allocations are also dropped when context records retire; queue
+    event bodies have no handle/reference lifetime owner.
+
+    Replace the main provider arena with a headered reclaiming allocator, using the existing tested
+    split/coalesce/tail-shrink machinery rather than tag-specific exceptions. Route frees by exact
+    arena membership, report foreign/misaligned/double frees instead of ignoring them, preserve
+    ordinary NT nonzeroing allocation semantics, and keep explicit zeroing for component-owned
+    objects that require it. Release component-owned TEB/token/local process-thread bodies before
+    clearing their generation records, and give event bodies typed handle/reference lifetime.
+    Focused tests must prove split/coalesce, same-size reuse, invalid-free rejection, zero-on-reuse
+    where requested, and stable live bytes/high-water across repeated process/thread generations.
+    Runtime acceptance requires provider pool live bytes to return toward the pre-churn baseline,
+    high-water stabilization, clean provider exit, and the full 298/298 desktop gate. Only then
+    start the separate real-provider GetClassInfo integration client.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
