@@ -22371,6 +22371,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     issue later DPC work as separate commands. Only then delete `FSD_DISPATCH_INTERRUPT`, its request-
     bank busy deferral, shared interrupt evidence, and old request-bank interrupt path atomically.
 
+    B3 depth-indexed interrupt-arena contract checkpoint (2026-09-02, host and freestanding green;
+    executive mapping open): `nt-hosted-runtime` now defines the v2 lane arena as an exact 33-page,
+    4-KiB-aligned layout: one control page, 16 executive-to-lane dispatch pages, and 16 independent
+    lane-to-executive service pages. In-place initialization avoids materializing the 132-KiB
+    aggregate on a kernel stack. Immutable lane identity/config includes the domain id/cookie/lane
+    generation, component KPCR VA, stack bounds, and maximum IRQL. Every command carries an exact
+    owner/id/generation grant plus transaction/class/depth/direction/sequence token; the crate treats
+    that grant as a lookup key and the executive must still resolve it against its live lease ledger.
+
+    Lifetime and running masks enforce `dispatch[d] -> service[d] -> dispatch[d+1]` and strict LIFO
+    unwind. A parent must actually be running, not merely allocated. Typed ISR/DPC/provider-callback
+    and provider-import/DPC-queue/synchronize commands are validated before a pending page enters
+    `Running`; malformed work records poison and releases its pending lease. Completion first closes
+    child admission, refuses outstanding deeper work, and publishes its result only after the
+    running mask is cleared. A failed acknowledgement restores the exact terminal page state for
+    retry. DPC work is accepted only as a new depth-zero DPC transaction, so it cannot execute before
+    the interrupt scan and physical acknowledgement complete.
+
+    Lane-local IRQL must unwind to passive before transaction completion. First fault and first
+    bugcheck records are independently sticky; poison rejects new publication while exact terminal
+    completion/acknowledgement and transaction unwind remain legal. Fully unwound poison can enter
+    terminal shutdown, late reports cannot resurrect shutdown, and transaction/page sequence
+    exhaustion poisons rather than wrapping. Depth high-water is retained. The contract assumes the
+    private endpoint serializes one root actor and one lane worker; a genuinely dead worker is still
+    retired by the executive's out-of-band TCB-suspend barrier rather than graceful shutdown. The
+    crate passes 96/96 tests including all 16 depths, stale reuse, malformed wire cleanup, poison
+    unwind, retryable acknowledgement, exact layout/in-place initialization, DPC separation, and
+    exhaustion. The executive freestanding check remains green. V1 stays live only for bootstrap
+    until the next step maps the KPCR plus all 33 pages, expands the private message token, and moves
+    READY to the v2 control page; delete v1 only with the final live IRQ cutover.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after
