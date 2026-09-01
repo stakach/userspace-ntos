@@ -65,7 +65,6 @@ pub(crate) const fn pts_for(count: u64) -> u64 {
 /// `Option<cap>`; `None` = not granted. This is the declarative least-privilege cap POLICY.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GrantedCaps {
-    pub irq_ntfn: Option<u64>,
     pub result_ntfn: Option<u64>,
     pub fault_ep: Option<u64>,
 }
@@ -627,10 +626,6 @@ unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> Spawne
     component_expect(b"cnode-mint", raw, error);
     let error = cnode_copy_at_r(cnode, CT_PML4, pml4);
     component_expect(b"cnode-pml4-copy", pml4, error);
-    if let Some(c) = d.granted.irq_ntfn {
-        let error = cnode_copy_at_r(cnode, CT_IRQ_NTFN, c);
-        component_expect(b"cnode-irq-copy", c, error);
-    }
     if let Some(c) = d.granted.result_ntfn {
         let error = cnode_copy_at_r(cnode, CT_RESULT_NTFN, c);
         component_expect(b"cnode-result-copy", c, error);
@@ -752,37 +747,6 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
     if r.base_va == crate::win32k_subsystem::WIN32K_USERVM_VADDR && first != 0 {
         crate::WIN32K_USERVM_FRAME_BASE.store(first, Ordering::Relaxed);
     }
-}
-
-/// Spawn the isolated ISR "driver host" (P1): its own VSpace (image RO + stack + IPC
-/// buffer) and a CNode holding ONLY a cap to the IRQ notification + the result
-/// notification — least privilege. Its thread (`isr_entry`) blocks on the IRQ
-/// notification and, when the real interrupt fires, signals the result notification.
-pub(crate) unsafe fn spawn_isr(
-    entry: unsafe extern "C" fn(u64) -> !,
-    irq_cap: u64,
-    result_cap: u64,
-    prio: u64,
-) {
-    let d = ComponentDescriptor {
-        entry,
-        image_rights: Rights::Uniform(2), // RO
-        lazy_image: false,
-        map_heap_pt: false,
-        stack_base: STACK_BASE,
-        stack_frames: STACK_FRAMES,
-        stack_dedicated_pt: false,
-        regions: &[],
-        granted: GrantedCaps {
-            irq_ntfn: Some(irq_cap),
-            result_ntfn: Some(result_cap),
-            fault_ep: None,
-        },
-        prio,
-        gs_base: None,
-        caps: HostCaps::default(),
-    };
-    let _ = spawn_component(&d);
 }
 
 /// Spawn an isolated **storage** host: an RO-image component granted ONLY the AHCI BAR + a
@@ -975,7 +939,6 @@ pub(crate) unsafe fn spawn_storage_host(
         stack_dedicated_pt: false,
         regions: &regions[..n],
         granted: GrantedCaps {
-            irq_ntfn: None,
             result_ntfn: Some(result_cap),
             fault_ep: Some(fault_ep),
         },

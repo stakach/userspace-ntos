@@ -35641,7 +35641,6 @@ unsafe fn spawn_fsd_component(
         stack_dedicated_pt: true,
         regions: &regions,
         granted: GrantedCaps {
-            irq_ntfn: None,
             result_ntfn: None,
             fault_ep: Some(fault_ep),
         },
@@ -50478,7 +50477,6 @@ unsafe fn release_driver_component_mechanism(index: usize, inst: DriverInstance)
     let (source_caps, source_failures) = release_driver_source_frame_runs(inst);
     failures += source_failures;
     if inst.cnode != 0 {
-        let _ = cnode_delete_in_cnode_r(inst.cnode, CT_IRQ_NTFN);
         let _ = cnode_delete_in_cnode_r(inst.cnode, CT_RESULT_NTFN);
         let mut slot = 0;
         while slot < CT_IO_PORT_CAPACITY {

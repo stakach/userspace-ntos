@@ -22548,15 +22548,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     traffic, serviced both observed hosted IRQ deliveries, reached quiescence in 283 seconds, and
     passed 297/297 desktop checks with the complete Explorer framebuffer before QEMU exited on the
     sentinel. The subsequent monotonic Clear/delete edits affect only injected teardown failures and
-    are covered by the host lifecycle test plus the final executive build. Four separately owned
-    HPET/watchdog/proof Ack sites still use raw sends; audit those timer owners independently and do
-    not describe this checkpoint as a conversion of every executive physical Ack.
+    are covered by the host lifecycle test plus the final executive build.
 
-    Review adjustment: the hosted-line Ack prerequisite is closed. Before private-arena cutover,
-    audit the four timer/proof Ack owners for checked retry and permanent-mask semantics, then proceed
-    with lane-private IRQL/actual-lock ownership, provider and dependent lanes, nested
-    callback/import exchange, and the generation-backed DPC registry. The old request-bank ISR path
-    remains the sole temporary transport and must still be removed atomically at cutover.
+    B3 production timer IRQ cleanup checkpoint (2026-09-02, host and freestanding validation green;
+    serialized desktop acceptance pending): every remaining executive IRQ acknowledgement now uses
+    a checked request/reply invocation. The production HPET delay timer publishes an explicit
+    `ACTIVE`/mask-pending/delete-pending/badge-delete-pending/retired lifecycle, confirms a tick only
+    after a successful kernel Ack, and fails closed by disabling HPET, clearing the level source,
+    masking the IOAPIC handler, retiring its exact capabilities, and forcing service-loop quiescence
+    on an acknowledgement error. Nested watchdog and component-pump paths refuse to touch HPET after
+    the timer leaves `ACTIVE`, and the stale-delivery path now drains due work and completes rearm and
+    source clear before Ack unmasks the line.
+
+    The old boot-only P1 HPET proof has been deleted together with its isolated ISR component,
+    private notification grant, permanent GSI/vector reservation, throwaway TCB, and unchecked final
+    Ack. Real delay-timer and hosted-device deliveries are now the only physical interrupt proofs.
+    `cargo test -p nt-kernel-exec` passes 217/217 and the executive freestanding check is green.
+
+    Review adjustment: the hosted-line and timer-Ack prerequisites are closed at source level. Run
+    one serialized desktop acceptance boot for this timer cleanup, then proceed with lane-private
+    IRQL/actual-lock ownership, provider and dependent lanes, nested callback/import exchange, and
+    the generation-backed DPC registry. The old request-bank ISR path remains the sole temporary
+    transport and must still be removed atomically at cutover.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.

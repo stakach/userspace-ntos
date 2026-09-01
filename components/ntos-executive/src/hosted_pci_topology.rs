@@ -10,8 +10,7 @@ use nt_pnp::{
 };
 
 const HOSTED_INTERRUPT_VECTOR_LIMIT: u32 = 64;
-const HOSTED_KERNEL_INTERRUPT_VECTORS: [u32; 2] =
-    [crate::IRQ_VECTOR as u32, crate::DELAY_TIMER_IRQ as u32];
+const HOSTED_KERNEL_INTERRUPT_VECTORS: [u32; 1] = [crate::DELAY_TIMER_IRQ as u32];
 
 struct HostedPciTopologyAuthority {
     inventory: PciInventory,
