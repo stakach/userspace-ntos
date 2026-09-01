@@ -1474,6 +1474,20 @@ impl PumpMessage {
     }
 
     #[inline]
+    const fn transport_wall() -> Self {
+        Self {
+            badge: 0,
+            mi: 0xfff << 12,
+            m0: 0,
+            m1: 0,
+            m2: 0,
+            m3: 0,
+            m4: 0,
+            scheduler_yield: false,
+        }
+    }
+
+    #[inline]
     const fn scheduler_yield() -> Self {
         Self {
             badge: 0,
@@ -1930,6 +1944,9 @@ unsafe fn hosted_irq_reply_recv(
                 lateout("rax") _, lateout("rcx") _, lateout("r11") _,
                 options(nostack),
             );
+            if badge == crate::COMPOSITE_SEND_ERROR_BADGE {
+                return PumpMessage::transport_wall();
+            }
             reply = false;
         } else {
             return hosted_irq_recv(ch, reply_cap);
@@ -1987,7 +2004,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             break;
         }
         if label == completion_label {
-            if length == 1 && msg.m0 == expected_sequence {
+            if msg.mi & 0xfff == 1 && length == 1 && msg.m0 == expected_sequence {
                 outcome.completed = true;
             } else {
                 outcome.wall(msg);

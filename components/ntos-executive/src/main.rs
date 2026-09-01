@@ -15135,7 +15135,9 @@ unsafe fn ensure_executive_paging_level(
     if !exec_paging_prepare_mark(key, page, level) {
         return false;
     }
-    let slot = alloc_slot();
+    let Some(slot) = try_alloc_slot() else {
+        return false;
+    };
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, slot);
     if retype != 0 {
         print_str(b"[exec-paging] retype ");
@@ -15146,7 +15148,7 @@ unsafe fn ensure_executive_paging_level(
         print_str(b" error=");
         print_u64(retype);
         print_str(b"\n");
-        let _ = cnode_delete_recycle_r(slot);
+        recycle_deleted_root_slot(slot);
         return false;
     }
     let map = paging_struct_map_r(slot, map_label, page, CAP_INIT_THREAD_VSPACE);

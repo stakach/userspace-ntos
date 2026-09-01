@@ -22324,6 +22324,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive check is green. Next allocate the domain-owned lane objects and complete their ready
     handshake through this transport before enabling an IRQ handler.
 
+    B3 domain interrupt-lane bootstrap checkpoint (2026-09-02, freestanding green; command cutover
+    open): the executive now allocates one lane for each exact projection `(instance, domain id,
+    cookie, PML4)` before binding a physical IRQ handler to its notification. Hosted worker component
+    slot zero is reserved for this lane and ordinary `PsCreateSystemThread` workers are offset to
+    slot one and above. Each lane owns a private 32-page stack, IPC buffer, Win64 trampoline,
+    dual-mapped `HostedIrqFrame`, endpoint, reply object, guarded CNode, TCB, scheduling context,
+    endpoint badge, and monotonic lane generation. It shares the owning projection PML4 so real
+    driver pointers and globals keep their domain identity, but the ready handshake crosses only the
+    private exchange and exact completion sequence zero. Protocol faults use a distinct fatal label,
+    full message-info shape is validated, and a failed composite reply-send walls immediately rather
+    than being misread as a timer plus every IRQ notification.
+
+    Checked slot/frame/cap allocation retains every lane leaf and temporary executive alias in a
+    quarantined runtime until retryable teardown succeeds; domain paging-hierarchy caps remain in the
+    existing domain-owned paging ledger. TCB suspension, scheduling-context deletion, TCB deletion,
+    child `CT_FAULT`/`CT_PML4` deletion, and CNode deletion are hard ordered barriers before any code,
+    stack, IPC, or mailbox page is unmapped. Component mappings therefore retire before the projection
+    PML4, and a failed suspend cannot release pages below a possibly live worker. The executive paging
+    allocator also fails cleanly on CSpace exhaustion instead of parking the kernel.
+
+    Disconnect is monotonic: connection and line tombstones retain every partial phase while a
+    last-on-line route is masked, its handler and notification caps are deleted, canonical resource-
+    manager ownership is removed, and the generation-bound lane is fenced. Direct disconnect retries
+    that same tombstone and cannot clear the published id early. Orphan pre-enable notification caps
+    are retained by exact projection instance/domain. Retired notification bits are quarantined until
+    a later delivery from the common bound notification advances its drain epoch; reclamation clears
+    any stale software bit before reuse, preventing an old badge from dispatching a newly installed
+    line without imposing a lifetime connection-churn limit. A partially retired line cannot be
+    acknowledged or reused. Instance teardown now masks connections and fences lanes before it
+    destroys waits, worker TCBs, timers, or MMIO/port mappings; it refuses to release the domain on
+    any failed phase. Exact install replay validates binding plus live lane generation, and provider
+    lane authority is the authenticated projection domain/PML4 rather than unrelated control-device
+    dispatch readiness. Formatting, diff checks, and the freestanding executive check are green.
+
+    This checkpoint deliberately does not route live ISR work through the new frame. NDIS provider
+    ISR entry synchronously invokes dependent miniport ISR code, and its deferred handler re-enters
+    provider exports while the outer provider continuation is parked. Before cutover, replace the
+    single-command frame with a depth-indexed lane-private callback/export arena. The bounded design
+    uses one control page plus independent dispatch and service pages at each of 16 nesting depths so
+    an inbound callback and its synchronous outbound provider call never alias payload ownership.
+    Add transaction/depth/sequence tokens, sticky first-fault and lane-local bugcheck records, exact
+    grant identities, lane-local IRQL/KPCR state selected by the lane stack, and callback/import/DPC
+    leases in addition to physical-connection leases. Enforce exclusion from the domain's ordinary
+    mutable request state, perform a complete line ISR scan before one physical acknowledgement, and
+    issue later DPC work as separate commands. Only then delete `FSD_DISPATCH_INTERRUPT`, its request-
+    bank busy deferral, shared interrupt evidence, and old request-bank interrupt path atomically.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after

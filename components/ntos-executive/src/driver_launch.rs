@@ -183,6 +183,8 @@ pub const FSD_WORKER_STACK_FRAMES: u64 = 32;
 const FSD_WORKER_IPCBUF_OFFSET: u64 = 0x0004_0000;
 const FSD_WORKER_TRAMP_OFFSET: u64 = 0x0004_1000;
 const FSD_WORKER_SCRATCH_OFFSET: u64 = 0x0004_2000;
+const FSD_IRQ_LANE_MAILBOX_OFFSET: u64 = 0x0004_3000;
+const FSD_IRQ_LANE_COMPONENT_SLOT: usize = 0;
 const FSD_WORKER_EXEC_ALIAS_BASE: u64 = 0x0000_0102_0000_0000;
 const FSD_WORKER_BADGE_BASE: u64 = 0x0000_0000_0001_0000;
 const HOSTED_DRIVER_WAIT_OBJECT_MAX: u32 = 64;
@@ -194,7 +196,8 @@ const _: () = assert!(
         > crate::TP_WORKER_AUX_BADGE_BASE + (crate::MAX_PI * crate::TP_WORKER_SLOT_COUNT) as u64
 );
 const _: () = assert!(
-    FSD_WORKER_SCRATCH_OFFSET + 0x1000 <= FSD_WORKER_STRIDE
+    FSD_IRQ_LANE_MAILBOX_OFFSET + 0x1000 <= FSD_WORKER_STRIDE
+        && FSD_WORKER_SCRATCH_OFFSET + 0x1000 <= FSD_IRQ_LANE_MAILBOX_OFFSET
         && FSD_WORKER_TRAMP_OFFSET + 0x1000 <= FSD_WORKER_SCRATCH_OFFSET
         && FSD_WORKER_STACK_FRAMES * 0x1000 <= FSD_WORKER_IPCBUF_OFFSET
 );
@@ -677,6 +680,8 @@ pub const FSD_SERVICE_DEVICE_LABEL: u64 = 0x782;
 pub const FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL: u64 = 0x783;
 pub const FSD_SERVICE_PCI_CONFIG_LABEL: u64 = 0x784;
 pub const FSD_SERVICE_INTERRUPT_LABEL: u64 = 0x785;
+pub const FSD_IRQ_LANE_COMPLETION_LABEL: u64 = 0x786;
+pub const FSD_IRQ_LANE_FAULT_LABEL: u64 = 0x787;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -11326,6 +11331,93 @@ unsafe fn hosted_raise_irql(irql: u8) -> u8 {
 #[inline]
 unsafe fn hosted_lower_irql(irql: u8) {
     hosted_set_current_irql(irql);
+}
+
+fn hosted_irq_lane_protocol_fault(sequence: u64) -> ! {
+    loop {
+        unsafe {
+            let _ = call_on4(
+                (FSD_IRQ_LANE_FAULT_LABEL << 12) | 1,
+                sequence,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+/// Entry point for the one private interrupt execution lane in each hosted driver domain. The lane
+/// parks in a completion `Call`, validates the root-published mailbox sequence before invoking the
+/// real PKSERVICE_ROUTINE with the Win64 ABI, and publishes the BOOLEAN claim result before it
+/// speaks again. Ordinary driver request banks are never accessed here.
+extern "win64" fn hosted_irq_lane_component_entry(frame_va: u64) -> ! {
+    if frame_va != FSD_WORKER_VADDR + FSD_IRQ_LANE_MAILBOX_OFFSET {
+        hosted_irq_lane_protocol_fault(0);
+    }
+    let frame = unsafe { &*(frame_va as *const nt_hosted_runtime::HostedIrqFrame) };
+    let Some(identity) = frame.identity() else {
+        hosted_irq_lane_protocol_fault(0);
+    };
+    let mut completed_sequence = 0u64;
+    loop {
+        let (label, sequence, _, _, _) = unsafe {
+            call_on4(
+                (FSD_IRQ_LANE_COMPLETION_LABEL << 12) | 1,
+                completed_sequence,
+                0,
+                0,
+                0,
+            )
+        };
+        if label != 0 || sequence == 0 {
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        let work = match frame.worker_begin(identity) {
+            Ok(work) => work,
+            Err(_) => hosted_irq_lane_protocol_fault(sequence),
+        };
+        if work.sequence != sequence {
+            let _ = frame.worker_complete(
+                work.sequence,
+                STATUS_INVALID_PARAMETER,
+                false,
+                true,
+            );
+            completed_sequence = work.sequence;
+            continue;
+        }
+        let old_irql = unsafe { hosted_current_irql() };
+        if work.command.irql <= old_irql {
+            let _ = frame.worker_complete(sequence, STATUS_INVALID_PARAMETER, false, true);
+            completed_sequence = sequence;
+            continue;
+        }
+        unsafe {
+            hosted_set_current_irql(work.command.irql);
+        }
+        compiler_fence(Ordering::SeqCst);
+        let service: extern "win64" fn(u64, u64) -> u8 = unsafe {
+            core::mem::transmute::<u64, extern "win64" fn(u64, u64) -> u8>(
+                work.command.service_routine,
+            )
+        };
+        let claimed = service(
+            work.command.interrupt_object,
+            work.command.service_context,
+        ) != 0;
+        compiler_fence(Ordering::SeqCst);
+        unsafe {
+            hosted_set_current_irql(old_irql);
+        }
+        if frame
+            .worker_complete(sequence, STATUS_SUCCESS, claimed, false)
+            .is_err()
+        {
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        completed_sequence = sequence;
+    }
 }
 
 fn hosted_fast_mutex_failure(mutex: u64, status: i32) -> ! {
@@ -35671,7 +35763,9 @@ unsafe fn ensure_hosted_paging_level(
         return false;
     }
 
-    let cap = alloc_slot();
+    let Some(cap) = try_alloc_slot() else {
+        return false;
+    };
     let retype = untyped_retype_r(CAP_INIT_UNTYPED, object_type, PAGING_BITS, 1, cap);
     if retype != 0 {
         print_str(b"[driver-launch] hosted paging ");
@@ -41910,10 +42004,117 @@ struct HostedIrqConnection {
     binding: HostedDeviceBinding,
     interrupt_id: u64,
     gsi: u32,
+    lane_generation: u64,
+    retiring: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedIrqLaneState {
+    Booting,
+    Ready,
+    Active,
+    Quarantined,
+    ShuttingDown,
+}
+
+#[derive(Clone, Copy)]
+struct HostedIrqLaneLeaf {
+    cap: u64,
+    mapped: bool,
+    temporary_exec_cap: u64,
+    temporary_exec_mapped: bool,
+}
+
+impl HostedIrqLaneLeaf {
+    const EMPTY: Self = Self {
+        cap: 0,
+        mapped: false,
+        temporary_exec_cap: 0,
+        temporary_exec_mapped: false,
+    };
+}
+
+struct HostedIrqLaneRuntime {
+    projection_instance: usize,
+    domain: HostedDomainIdentity,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    state: HostedIrqLaneState,
+    pml4: u64,
+    endpoint: u64,
+    reply_cap: u64,
+    tcb: u64,
+    tcb_resumed: bool,
+    sched_context: u64,
+    raw_cnode: u64,
+    cnode: u64,
+    cspace_pml4: bool,
+    cspace_fault: bool,
+    badge: u64,
+    exec_alias_slot: u64,
+    exec_base: u64,
+    component_mailbox_va: u64,
+    exec_mailbox_va: u64,
+    stack: [HostedIrqLaneLeaf; FSD_WORKER_STACK_FRAMES as usize],
+    ipc_buffer: HostedIrqLaneLeaf,
+    trampoline: HostedIrqLaneLeaf,
+    component_mailbox: HostedIrqLaneLeaf,
+    exec_mailbox: HostedIrqLaneLeaf,
+    active_sequence: u64,
+    active_interrupt_id: u64,
+}
+
+struct HostedIrqLaneBuildError {
+    status: nt_status::NtStatus,
+    partial: Option<HostedIrqLaneRuntime>,
+}
+
+impl HostedIrqLaneRuntime {
+    fn new(
+        projection_instance: usize,
+        domain: HostedDomainIdentity,
+        identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+        pml4: u64,
+        exec_alias_slot: u64,
+        exec_base: u64,
+        component_mailbox_va: u64,
+        exec_mailbox_va: u64,
+        badge: u64,
+    ) -> Self {
+        Self {
+            projection_instance,
+            domain,
+            identity,
+            state: HostedIrqLaneState::Booting,
+            pml4,
+            endpoint: 0,
+            reply_cap: 0,
+            tcb: 0,
+            tcb_resumed: false,
+            sched_context: 0,
+            raw_cnode: 0,
+            cnode: 0,
+            cspace_pml4: false,
+            cspace_fault: false,
+            badge,
+            exec_alias_slot,
+            exec_base,
+            component_mailbox_va,
+            exec_mailbox_va,
+            stack: [HostedIrqLaneLeaf::EMPTY; FSD_WORKER_STACK_FRAMES as usize],
+            ipc_buffer: HostedIrqLaneLeaf::EMPTY,
+            trampoline: HostedIrqLaneLeaf::EMPTY,
+            component_mailbox: HostedIrqLaneLeaf::EMPTY,
+            exec_mailbox: HostedIrqLaneLeaf::EMPTY,
+            active_sequence: 0,
+            active_interrupt_id: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedIrqLine {
+    owner_projection_instance: usize,
+    owner_domain: HostedDomainIdentity,
     gsi: u32,
     controller_ordinal: u16,
     local_pin: u16,
@@ -41924,6 +42125,7 @@ struct HostedIrqLine {
     shared: bool,
     handler_cap: u64,
     notification_cap: u64,
+    retiring: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -42063,7 +42265,13 @@ static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
+static mut HOSTED_IRQ_LANES: Option<Vec<HostedIrqLaneRuntime>> = None;
+static HOSTED_IRQ_LANE_GENERATION_NEXT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_PENDING_EVENTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_RETIRED_EVENT_BITS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_NOTIFICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+static mut HOSTED_IRQ_EVENT_RETIREMENT_EPOCHS: [u64; crate::HOSTED_IRQ_EVENT_SLOT_COUNT as usize] =
+    [0; crate::HOSTED_IRQ_EVENT_SLOT_COUNT as usize];
 static HOSTED_IRQ_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_SERVICED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_DEFERRED_BUSY: AtomicU64 = AtomicU64::new(0);
@@ -44622,6 +44830,582 @@ unsafe fn hosted_irq_connections() -> Option<&'static Vec<HostedIrqConnection>> 
     (*core::ptr::addr_of!(HOSTED_IRQ_CONNECTIONS)).as_ref()
 }
 
+unsafe fn hosted_irq_lanes_mut() -> &'static mut Vec<HostedIrqLaneRuntime> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_IRQ_LANES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_irq_lanes() -> Option<&'static Vec<HostedIrqLaneRuntime>> {
+    (*core::ptr::addr_of!(HOSTED_IRQ_LANES)).as_ref()
+}
+
+unsafe fn release_hosted_irq_lane_leaf(leaf: &mut HostedIrqLaneLeaf) -> u64 {
+    let mut failures = 0u64;
+    if leaf.temporary_exec_cap != 0 && leaf.temporary_exec_mapped {
+        if page_unmap_r(leaf.temporary_exec_cap) == 0 {
+            leaf.temporary_exec_mapped = false;
+        } else {
+            failures += 1;
+        }
+    }
+    if leaf.temporary_exec_cap != 0 && !leaf.temporary_exec_mapped {
+        if cnode_delete_recycle_r(leaf.temporary_exec_cap) == 0 {
+            leaf.temporary_exec_cap = 0;
+        } else {
+            failures += 1;
+        }
+    }
+    if leaf.cap != 0 && leaf.mapped {
+        if page_unmap_r(leaf.cap) == 0 {
+            leaf.mapped = false;
+        } else {
+            failures += 1;
+        }
+    }
+    if leaf.cap != 0 && !leaf.mapped {
+        if cnode_delete_recycle_r(leaf.cap) == 0 {
+            leaf.cap = 0;
+        } else {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+unsafe fn release_hosted_irq_lane_cap(cap: &mut u64) -> u64 {
+    if *cap == 0 {
+        return 0;
+    }
+    if cnode_delete_recycle_r(*cap) == 0 {
+        *cap = 0;
+        0
+    } else {
+        1
+    }
+}
+
+unsafe fn release_hosted_irq_lane_mechanism(lane: &mut HostedIrqLaneRuntime) -> u64 {
+    lane.state = HostedIrqLaneState::ShuttingDown;
+    let mut failures = 0u64;
+    if lane.tcb != 0 && lane.tcb_resumed && tcb_suspend_r(lane.tcb) != 0 {
+        // The TCB may still execute from every mapping below. Retain the complete tombstone and
+        // retry suspension before releasing even one subordinate capability.
+        return 1;
+    }
+    lane.tcb_resumed = false;
+    if release_hosted_irq_lane_cap(&mut lane.sched_context) != 0 {
+        return 1;
+    }
+    if release_hosted_irq_lane_cap(&mut lane.tcb) != 0 {
+        return 1;
+    }
+    if lane.cnode != 0 && lane.cspace_fault {
+        if crate::cnode_delete_in_cnode_r(lane.cnode, CT_FAULT) == 0 {
+            lane.cspace_fault = false;
+        } else {
+            failures += 1;
+        }
+    }
+    if lane.cnode != 0 && lane.cspace_pml4 {
+        if crate::cnode_delete_in_cnode_r(lane.cnode, CT_PML4) == 0 {
+            lane.cspace_pml4 = false;
+        } else {
+            failures += 1;
+        }
+    }
+    if failures != 0 {
+        return failures;
+    }
+    if release_hosted_irq_lane_cap(&mut lane.cnode) != 0 {
+        return 1;
+    }
+    if release_hosted_irq_lane_cap(&mut lane.raw_cnode) != 0 {
+        return 1;
+    }
+    failures += release_hosted_irq_lane_leaf(&mut lane.exec_mailbox);
+    failures += release_hosted_irq_lane_leaf(&mut lane.component_mailbox);
+    failures += release_hosted_irq_lane_leaf(&mut lane.trampoline);
+    failures += release_hosted_irq_lane_leaf(&mut lane.ipc_buffer);
+    for leaf in lane.stack.iter_mut().rev() {
+        failures += release_hosted_irq_lane_leaf(leaf);
+    }
+    failures += release_hosted_irq_lane_cap(&mut lane.reply_cap);
+    failures += release_hosted_irq_lane_cap(&mut lane.endpoint);
+    failures
+}
+
+unsafe fn allocate_hosted_irq_endpoint() -> Option<u64> {
+    let cap = try_alloc_slot()?;
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_ENDPOINT, 0, 1, cap) != 0 {
+        recycle_deleted_root_slot(cap);
+        return None;
+    }
+    Some(cap)
+}
+
+unsafe fn attach_hosted_irq_lane_sched_context(
+    lane: &mut HostedIrqLaneRuntime,
+) -> Result<(), u64> {
+    let Some(sc) = try_alloc_slot() else {
+        return Err(u64::MAX);
+    };
+    let retype_error = untyped_retype_r(
+        CAP_INIT_UNTYPED,
+        OBJ_SCHED_CONTEXT,
+        SCHED_CONTEXT_BITS,
+        1,
+        sc,
+    );
+    if retype_error != 0 {
+        recycle_deleted_root_slot(sc);
+        return Err(retype_error);
+    }
+
+    // Publish ownership before either fallible operation. A failed configure or bind leaves the
+    // live cap in the lane tombstone so ordered teardown can retry its deletion.
+    lane.sched_context = sc;
+    let configure_error = sched_control_configure_r(sc, 10, 10);
+    if configure_error != 0 {
+        return Err(configure_error);
+    }
+    let bind_error = sched_context_bind_r(sc, lane.tcb);
+    if bind_error != 0 {
+        return Err(bind_error);
+    }
+    Ok(())
+}
+
+unsafe fn map_hosted_irq_component_leaf(
+    inst: DriverInstance,
+    component_va: u64,
+    temporary_exec_va: u64,
+    component_rights: u64,
+    contents: &[u8],
+    leaf: &mut HostedIrqLaneLeaf,
+) -> bool {
+    if contents.len() > 0x1000
+        || leaf.cap != 0
+        || leaf.mapped
+        || leaf.temporary_exec_cap != 0
+        || leaf.temporary_exec_mapped
+    {
+        return false;
+    }
+    let (component_cap, frame_error) = alloc_frame_r();
+    if frame_error != 0 {
+        if component_cap != 0 {
+            recycle_deleted_root_slot(component_cap);
+        }
+        return false;
+    }
+    leaf.cap = component_cap;
+    let (exec_cap, copy_error) = copy_cap_r(component_cap);
+    if copy_error != 0 {
+        let _ = release_hosted_irq_lane_leaf(leaf);
+        return false;
+    }
+    leaf.temporary_exec_cap = exec_cap;
+    if page_map_r(
+        exec_cap,
+        temporary_exec_va,
+        RW_NX,
+        CAP_INIT_THREAD_VSPACE,
+    ) != 0
+    {
+        let _ = release_hosted_irq_lane_leaf(leaf);
+        return false;
+    }
+    leaf.temporary_exec_mapped = true;
+    core::ptr::write_bytes(temporary_exec_va as *mut u8, 0, 0x1000);
+    core::ptr::copy_nonoverlapping(contents.as_ptr(), temporary_exec_va as *mut u8, contents.len());
+    if page_unmap_r(exec_cap) == 0 {
+        leaf.temporary_exec_mapped = false;
+        if cnode_delete_recycle_r(exec_cap) == 0 {
+            leaf.temporary_exec_cap = 0;
+        }
+    }
+    if page_map_r(component_cap, component_va, component_rights, inst.pml4) != 0 {
+        let _ = release_hosted_irq_lane_leaf(leaf);
+        return false;
+    }
+    leaf.mapped = true;
+    true
+}
+
+unsafe fn build_hosted_irq_lane(
+    projection_instance: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+) -> Result<HostedIrqLaneRuntime, HostedIrqLaneBuildError> {
+    if inst.pml4 == 0
+        || instance_domain_identity(inst) != Some(domain)
+        || domain.domain_id == nt_io_manager::HostedDomainId::NULL
+        || domain.cookie == 0
+    {
+        return Err(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+            partial: None,
+        });
+    }
+    let generation = HOSTED_IRQ_LANE_GENERATION_NEXT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1).filter(|generation| *generation != 0)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
+    let identity = nt_hosted_runtime::HostedIrqLaneIdentity::new(
+        domain.domain_id.raw(),
+        domain.cookie,
+        generation,
+    )
+    .ok_or(HostedIrqLaneBuildError {
+        status: nt_status::NtStatus::INVALID_PARAMETER,
+        partial: None,
+    })?;
+    // Worker slot zero is reserved for the domain interrupt lane. PsCreateSystemThread offsets its
+    // independently indexed runtime table by one, so ordinary workers can never alias this VSpace.
+    let component_base = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT)
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
+    let exec_alias_slot = HOSTED_DRIVER_WORKER_ALIAS_NEXT.fetch_add(1, Ordering::Relaxed);
+    let exec_base = hosted_worker_exec_base_for_alias(exec_alias_slot)
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
+    let badge = FSD_WORKER_BADGE_BASE
+        .checked_add(exec_alias_slot)
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
+    let component_mailbox_va = component_base
+        .checked_add(FSD_IRQ_LANE_MAILBOX_OFFSET)
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
+    let exec_mailbox_va = exec_base
+        .checked_add(FSD_IRQ_LANE_MAILBOX_OFFSET)
+        .ok_or(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: None,
+        })?;
+    let mut lane = HostedIrqLaneRuntime::new(
+        projection_instance,
+        domain,
+        identity,
+        inst.pml4,
+        exec_alias_slot,
+        exec_base,
+        component_mailbox_va,
+        exec_mailbox_va,
+        badge,
+    );
+
+    let built = (|| -> Option<()> {
+        if !ensure_paging(component_base, inst.pml4, domain)
+            || !crate::ensure_executive_paging(exec_base)
+        {
+            return None;
+        }
+        for index in 0..FSD_WORKER_STACK_FRAMES as usize {
+            let offset = index as u64 * 0x1000;
+            if !map_hosted_irq_component_leaf(
+                inst,
+                component_base + offset,
+                exec_base + offset,
+                RW_NX,
+                &[],
+                &mut lane.stack[index],
+            ) {
+                return None;
+            }
+        }
+        let ipcbuf_va = component_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?;
+        if !map_hosted_irq_component_leaf(
+            inst,
+            ipcbuf_va,
+            exec_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?,
+            RW_NX,
+            &[],
+            &mut lane.ipc_buffer,
+        ) {
+            return None;
+        }
+
+        let trampoline = nt_thread_start::Amd64ThreadContext {
+            rip: hosted_irq_lane_component_entry as *const () as u64,
+            rsp: 0,
+            rcx: component_mailbox_va,
+            rdx: 0,
+        }
+        .call_trampoline();
+        let tramp_va = component_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?;
+        if !map_hosted_irq_component_leaf(
+            inst,
+            tramp_va,
+            exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?,
+            2,
+            &trampoline,
+            &mut lane.trampoline,
+        ) {
+            return None;
+        }
+
+        let (mailbox_cap, mailbox_error) = alloc_frame_r();
+        if mailbox_error != 0 {
+            if mailbox_cap != 0 {
+                recycle_deleted_root_slot(mailbox_cap);
+            }
+            return None;
+        }
+        lane.component_mailbox.cap = mailbox_cap;
+        let (exec_mailbox_cap, mailbox_copy_error) = copy_cap_r(mailbox_cap);
+        if mailbox_copy_error != 0 {
+            return None;
+        }
+        lane.exec_mailbox.cap = exec_mailbox_cap;
+        if page_map_r(mailbox_cap, component_mailbox_va, RW_NX, inst.pml4) != 0 {
+            return None;
+        }
+        lane.component_mailbox.mapped = true;
+        if page_map_r(
+            exec_mailbox_cap,
+            exec_mailbox_va,
+            RW_NX,
+            CAP_INIT_THREAD_VSPACE,
+        ) != 0
+        {
+            return None;
+        }
+        lane.exec_mailbox.mapped = true;
+        core::ptr::write_bytes(exec_mailbox_va as *mut u8, 0, 0x1000);
+        core::ptr::write(
+            exec_mailbox_va as *mut nt_hosted_runtime::HostedIrqFrame,
+            nt_hosted_runtime::HostedIrqFrame::new(identity),
+        );
+
+        lane.endpoint = allocate_hosted_irq_endpoint()?;
+        lane.reply_cap = allocate_hosted_driver_reply_cap()?;
+        lane.raw_cnode = try_alloc_slot()?;
+        if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, lane.raw_cnode) != 0 {
+            recycle_deleted_root_slot(lane.raw_cnode);
+            lane.raw_cnode = 0;
+            return None;
+        }
+        lane.cnode = try_alloc_slot()?;
+        if cnode_mint_r(CAP_INIT_THREAD_CNODE, lane.cnode, lane.raw_cnode, CN_GUARD_BADGE) != 0 {
+            recycle_deleted_root_slot(lane.cnode);
+            lane.cnode = 0;
+            return None;
+        }
+        if cnode_copy_at_r(lane.cnode, CT_PML4, inst.pml4) != 0 {
+            return None;
+        }
+        lane.cspace_pml4 = true;
+        if cnode_mint_r(lane.cnode, CT_FAULT, lane.endpoint, badge) != 0 {
+            return None;
+        }
+        lane.cspace_fault = true;
+
+        lane.tcb = try_alloc_slot()?;
+        if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, lane.tcb) != 0 {
+            recycle_deleted_root_slot(lane.tcb);
+            lane.tcb = 0;
+            return None;
+        }
+        if tcb_set_space_r(lane.tcb, CT_FAULT, lane.cnode, inst.pml4) != 0
+            || tcb_set_ipc_buffer_r(lane.tcb, ipcbuf_va, lane.ipc_buffer.cap) != 0
+        {
+            return None;
+        }
+        let stack_top = component_base + FSD_WORKER_STACK_FRAMES * 0x1000 - 16;
+        if tcb_write_registers_r(lane.tcb, tramp_va, stack_top, 0) != 0 {
+            return None;
+        }
+        if tcb_set_gs_base(lane.tcb, FSD_KPCR_VA) != 0 || tcb_set_priority(lane.tcb, 101) != 0 {
+            return None;
+        }
+        attach_hosted_irq_lane_sched_context(&mut lane).ok()?;
+        Some(())
+    })();
+    if built.is_none() {
+        lane.state = HostedIrqLaneState::Quarantined;
+        return Err(HostedIrqLaneBuildError {
+            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            partial: Some(lane),
+        });
+    }
+    Ok(lane)
+}
+
+unsafe fn hosted_irq_lane_channel(
+    lane: &HostedIrqLaneRuntime,
+    inst: DriverInstance,
+) -> Option<crate::spawn_hosts::PumpChannel> {
+    Some(crate::spawn_hosts::PumpChannel {
+        fault_ep: lane.endpoint,
+        pml4: lane.pml4,
+        code_va: FSD_CODE_VA,
+        image_frames: inst.image_frames,
+        exec_code_va: ExecVaWindow::try_for_instance(lane.projection_instance)?.code_va,
+        root_image_rights: 3,
+        root_image_map_owner: inst.map_cap_bank.owner,
+        shared_va: inst.exec_shared_va,
+        dispatch_label: FSD_IRQ_LANE_COMPLETION_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::RecvFirst,
+        tcb: lane.tcb,
+        reply_cap: lane.reply_cap,
+        client_pi: 0,
+        client_generation: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: shared_has_port_resources(inst.exec_shared_va),
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    })
+}
+
+unsafe fn hosted_irq_lane_has_connections(lane: &HostedIrqLaneRuntime) -> bool {
+    hosted_irq_connections().is_some_and(|connections| {
+        connections.iter().any(|connection| {
+            !connection.retiring
+                && connection.binding.projection_instance == lane.projection_instance
+                && connection.binding.projection_domain == lane.domain
+                && connection.lane_generation == lane.identity.lane_generation
+        })
+    })
+}
+
+unsafe fn retire_hosted_irq_lane_if_unreferenced(
+    projection_instance: usize,
+    domain: HostedDomainIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    let Some(index) = hosted_irq_lanes().and_then(|lanes| {
+        lanes.iter().position(|lane| {
+            lane.projection_instance == projection_instance && lane.domain == domain
+        })
+    }) else {
+        return Ok(());
+    };
+    if hosted_irq_lane_has_connections(&hosted_irq_lanes_mut()[index]) {
+        return Ok(());
+    }
+    let state = hosted_irq_lanes_mut()[index].state;
+    match state {
+        HostedIrqLaneState::Ready => {
+            let lane = &mut hosted_irq_lanes_mut()[index];
+            if lane.active_sequence != 0
+                || lane.active_interrupt_id != 0
+                || !lane.exec_mailbox.mapped
+                || lane.exec_mailbox_va == 0
+            {
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+            let frame = &*(lane.exec_mailbox_va as *const nt_hosted_runtime::HostedIrqFrame);
+            frame
+                .root_request_shutdown(lane.identity)
+                .map_err(|_| nt_status::NtStatus::DEVICE_BUSY)?;
+            lane.state = HostedIrqLaneState::ShuttingDown;
+        }
+        HostedIrqLaneState::Quarantined | HostedIrqLaneState::ShuttingDown => {}
+        HostedIrqLaneState::Booting | HostedIrqLaneState::Active => {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+    }
+    let failures = release_hosted_irq_lane_mechanism(&mut hosted_irq_lanes_mut()[index]);
+    if failures != 0 {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    hosted_irq_lanes_mut().remove(index);
+    Ok(())
+}
+
+unsafe fn ensure_hosted_irq_lane(
+    projection_instance: usize,
+    domain: HostedDomainIdentity,
+) -> Result<u64, nt_status::NtStatus> {
+    if let Some(index) = hosted_irq_lanes().and_then(|lanes| {
+        lanes.iter().position(|lane| {
+            lane.projection_instance == projection_instance || lane.domain == domain
+        })
+    }) {
+        let existing = &hosted_irq_lanes_mut()[index];
+        if existing.projection_instance == projection_instance && existing.domain == domain {
+            if existing.state == HostedIrqLaneState::Ready {
+                return Ok(existing.identity.lane_generation);
+            }
+            if matches!(
+                existing.state,
+                HostedIrqLaneState::Quarantined | HostedIrqLaneState::ShuttingDown
+            ) && !hosted_irq_lane_has_connections(existing)
+            {
+                retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)?;
+            } else {
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+        } else {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+    }
+    let inst = instance(projection_instance).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    hosted_irq_lanes_mut()
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let lane = match build_hosted_irq_lane(projection_instance, inst, domain) {
+        Ok(lane) => lane,
+        Err(error) => {
+            if let Some(partial) = error.partial {
+                hosted_irq_lanes_mut().push(partial);
+                let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
+            }
+            return Err(error.status);
+        }
+    };
+    let generation = lane.identity.lane_generation;
+    let badge = lane.badge;
+    let tcb = lane.tcb;
+    hosted_irq_lanes_mut().push(lane);
+    let lane_index = hosted_irq_lanes_mut().len() - 1;
+    let Some(channel) = hosted_irq_lane_channel(&hosted_irq_lanes_mut()[lane_index], inst) else {
+        hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
+        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+    };
+    if tcb_resume(tcb) != 0 {
+        hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
+        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    hosted_irq_lanes_mut()[lane_index].tcb_resumed = true;
+    let exchange = crate::spawn_hosts::component_hosted_irq_exchange(
+        &channel,
+        crate::spawn_hosts::HostedIrqExchangeAction::ReceiveReady,
+        badge,
+        FSD_IRQ_LANE_COMPLETION_LABEL,
+    );
+    if !exchange.completed || exchange.sequence != 0 || exchange.reply_cap != channel.reply_cap {
+        hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;
+        let _ = retire_hosted_irq_lane_if_unreferenced(projection_instance, domain);
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Ready;
+    Ok(generation)
+}
+
 pub(crate) fn hosted_irq_gsi_mask() -> u32 {
     unsafe {
         hosted_irq_lines()
@@ -44643,6 +45427,11 @@ pub(crate) fn hosted_irq_routes_active() -> bool {
 }
 
 pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u64 {
+    if badge != crate::COMPOSITE_SEND_ERROR_BADGE
+        && (crate::badge_has_delay_timer(badge) || badge & crate::HOSTED_IRQ_EVENT_BADGE != 0)
+    {
+        HOSTED_IRQ_NOTIFICATION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
     let events = crate::hosted_irq_lines_from_badge(badge);
     if events != 0 {
         HOSTED_IRQ_EVENTS_RECEIVED.fetch_add(events.count_ones() as u64, Ordering::Relaxed);
@@ -44652,26 +45441,127 @@ pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u64 {
 }
 
 unsafe fn allocate_hosted_irq_event_bit() -> Option<u8> {
+    let epoch = HOSTED_IRQ_NOTIFICATION_EPOCH.load(Ordering::Acquire);
+    let retired = HOSTED_IRQ_RETIRED_EVENT_BITS.load(Ordering::Acquire);
+    let mut reclaimed = 0u64;
+    for bit in 0..crate::HOSTED_IRQ_EVENT_SLOT_COUNT {
+        let event = 1u64 << bit;
+        let retired_epoch = HOSTED_IRQ_EVENT_RETIREMENT_EPOCHS[bit as usize];
+        if retired & event != 0 && epoch > retired_epoch {
+            HOSTED_IRQ_EVENT_RETIREMENT_EPOCHS[bit as usize] = 0;
+            reclaimed |= event;
+        }
+    }
+    if reclaimed != 0 {
+        HOSTED_IRQ_PENDING_EVENTS.fetch_and(!reclaimed, Ordering::AcqRel);
+        HOSTED_IRQ_RETIRED_EVENT_BITS.fetch_and(!reclaimed, Ordering::AcqRel);
+    }
     let used = hosted_irq_lines()
         .map(|lines| {
             lines
                 .iter()
                 .fold(0u64, |bits, line| bits | (1u64 << line.event_bit))
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+        | HOSTED_IRQ_RETIRED_EVENT_BITS.load(Ordering::Acquire);
     (0..crate::HOSTED_IRQ_EVENT_SLOT_COUNT).find(|bit| used & (1u64 << bit) == 0)
+}
+
+unsafe fn release_hosted_irq_line_caps(line: &mut HostedIrqLine) -> u64 {
+    line.retiring = true;
+    if line.handler_cap != 0 {
+        if crate::clear_ioapic_irq_handler(line.handler_cap).is_err() {
+            return 1;
+        }
+        line.handler_cap = 0;
+    }
+    if line.notification_cap != 0 {
+        if crate::delete_executive_event_badge(line.notification_cap).is_err() {
+            return 1;
+        }
+        line.notification_cap = 0;
+    }
+    0
+}
+
+unsafe fn remove_released_hosted_irq_line(index: usize, quarantine_event: bool) {
+    let event_bit = hosted_irq_lines_mut()[index].event_bit;
+    let event = 1u64 << event_bit;
+    if quarantine_event {
+        HOSTED_IRQ_EVENT_RETIREMENT_EPOCHS[event_bit as usize] =
+            HOSTED_IRQ_NOTIFICATION_EPOCH.load(Ordering::Acquire);
+        HOSTED_IRQ_RETIRED_EVENT_BITS.fetch_or(event, Ordering::AcqRel);
+    }
+    HOSTED_IRQ_PENDING_EVENTS.fetch_and(!event, Ordering::AcqRel);
+    hosted_irq_lines_mut().remove(index);
+}
+
+unsafe fn clear_hosted_irq_orphan_lines_for_instance(
+    instance: usize,
+    domain: HostedDomainIdentity,
+) -> u64 {
+    let mut failures = 0u64;
+    loop {
+        let Some(index) = hosted_irq_lines().and_then(|lines| {
+            lines.iter().position(|line| {
+                line.owner_projection_instance == instance
+                    && line.owner_domain == domain
+                    && line.retiring
+                    && hosted_irq_connections().is_none_or(|connections| {
+                        connections
+                            .iter()
+                            .all(|connection| connection.gsi != line.gsi)
+                    })
+            })
+        }) else {
+            return failures;
+        };
+        if release_hosted_irq_line_caps(&mut hosted_irq_lines_mut()[index]) != 0 {
+            failures = failures.saturating_add(1);
+            return failures;
+        }
+        // An orphan line never bound a hardware handler to this notification badge, so no stale
+        // event can remain queued and its bit does not need boot-lifetime quarantine.
+        remove_released_hosted_irq_line(index, false);
+    }
 }
 
 unsafe fn install_hosted_irq_connection(
     binding: HostedDeviceBinding,
     interrupt_id: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    if hosted_irq_connections().is_some_and(|connections| {
+    if clear_hosted_irq_orphan_lines_for_instance(
+        binding.projection_instance,
+        binding.projection_domain,
+    ) != 0
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    if let Some(existing) = hosted_irq_connections().and_then(|connections| {
         connections
             .iter()
-            .any(|connection| connection.interrupt_id == interrupt_id)
+            .copied()
+            .find(|connection| connection.interrupt_id == interrupt_id)
     }) {
-        return Ok(());
+        if existing.binding != binding {
+            return Err(nt_status::NtStatus::ACCESS_DENIED);
+        }
+        if existing.retiring {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        let lane_live = hosted_irq_lanes().is_some_and(|lanes| {
+            lanes.iter().any(|lane| {
+                lane.projection_instance == binding.projection_instance
+                    && lane.domain == binding.projection_domain
+                    && lane.identity.lane_generation == existing.lane_generation
+                    && lane.state == HostedIrqLaneState::Ready
+            })
+        });
+        return if lane_live {
+            Ok(())
+        } else {
+            Err(nt_status::NtStatus::DEVICE_BUSY)
+        };
     }
     let route = hosted_resource_manager_mut()
         .connected_interrupt_route(interrupt_id)
@@ -44688,7 +45578,6 @@ unsafe fn install_hosted_irq_connection(
     }
     let hardware_route = crate::resolve_platform_ioapic_gsi(route.line)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-
     if let Some(existing) = hosted_irq_lines().and_then(|lines| {
         lines
             .iter()
@@ -44700,6 +45589,7 @@ unsafe fn install_hosted_irq_connection(
             || existing.vector != route.translated_vector
             || existing.level_sensitive != !state.interrupt_latched
             || existing.active_low != state.interrupt_active_low
+            || existing.retiring
             || !existing.shared
             || route.share != nt_hal_abi::SHARE_SHARED
         {
@@ -44708,10 +45598,16 @@ unsafe fn install_hosted_irq_connection(
         hosted_irq_connections_mut()
             .try_reserve(1)
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        let lane_generation = ensure_hosted_irq_lane(
+            binding.projection_instance,
+            binding.projection_domain,
+        )?;
         hosted_irq_connections_mut().push(HostedIrqConnection {
             binding,
             interrupt_id,
             gsi: route.line,
+            lane_generation,
+            retiring: false,
         });
         return Ok(());
     }
@@ -44732,9 +45628,26 @@ unsafe fn install_hosted_irq_connection(
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let event_bit =
         allocate_hosted_irq_event_bit().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let lane_generation = ensure_hosted_irq_lane(
+        binding.projection_instance,
+        binding.projection_domain,
+    )?;
 
     let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << event_bit);
-    let notification_cap = crate::mint_executive_event_badge(badge)?;
+    let notification_cap = match crate::mint_executive_event_badge(badge) {
+        Ok(cap) => cap,
+        Err(status) => {
+            if retire_hosted_irq_lane_if_unreferenced(
+                binding.projection_instance,
+                binding.projection_domain,
+            )
+            .is_err()
+            {
+                return Err(nt_status::NtStatus::DEVICE_BUSY);
+            }
+            return Err(status);
+        }
+    };
     let handler_cap = match crate::issue_ioapic_irq_handler_checked(
         hardware_route.controller_ordinal as u64,
         hardware_route.local_pin as u64,
@@ -44744,11 +45657,40 @@ unsafe fn install_hosted_irq_connection(
     ) {
         Ok(cap) => cap,
         Err(status) => {
-            let _ = crate::delete_executive_event_badge(notification_cap);
-            return Err(status);
+            let notification_retained =
+                crate::delete_executive_event_badge(notification_cap).is_err();
+            if notification_retained {
+                hosted_irq_lines_mut().push(HostedIrqLine {
+                    owner_projection_instance: binding.projection_instance,
+                    owner_domain: binding.projection_domain,
+                    gsi: route.line,
+                    controller_ordinal: hardware_route.controller_ordinal,
+                    local_pin: hardware_route.local_pin,
+                    event_bit,
+                    vector: route.translated_vector,
+                    level_sensitive: !state.interrupt_latched,
+                    active_low: state.interrupt_active_low,
+                    shared: route.share == nt_hal_abi::SHARE_SHARED,
+                    handler_cap: 0,
+                    notification_cap,
+                    retiring: true,
+                });
+            }
+            let lane_retained = retire_hosted_irq_lane_if_unreferenced(
+                binding.projection_instance,
+                binding.projection_domain,
+            )
+            .is_err();
+            return Err(if notification_retained || lane_retained {
+                nt_status::NtStatus::DEVICE_BUSY
+            } else {
+                status
+            });
         }
     };
     hosted_irq_lines_mut().push(HostedIrqLine {
+        owner_projection_instance: binding.projection_instance,
+        owner_domain: binding.projection_domain,
         gsi: route.line,
         controller_ordinal: hardware_route.controller_ordinal,
         local_pin: hardware_route.local_pin,
@@ -44759,19 +45701,21 @@ unsafe fn install_hosted_irq_connection(
         shared: route.share == nt_hal_abi::SHARE_SHARED,
         handler_cap,
         notification_cap,
+        retiring: false,
     });
     hosted_irq_connections_mut().push(HostedIrqConnection {
         binding,
         interrupt_id,
         gsi: route.line,
+        lane_generation,
+        retiring: false,
     });
     if let Err(status) = crate::irq_handler_set_notification_checked(handler_cap, notification_cap)
     {
-        hosted_irq_connections_mut().retain(|connection| connection.interrupt_id != interrupt_id);
-        hosted_irq_lines_mut().retain(|line| line.handler_cap != handler_cap);
-        let _ = crate::clear_ioapic_irq_handler(handler_cap);
-        let _ = crate::delete_executive_event_badge(notification_cap);
-        return Err(status);
+        return match retire_hosted_irq_connection(binding, interrupt_id) {
+            Ok(()) => Err(status),
+            Err(rollback_status) => Err(rollback_status),
+        };
     }
     Ok(())
 }
@@ -44791,29 +45735,53 @@ unsafe fn retire_hosted_irq_connection(
     if connection.binding != binding {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    let last_on_line = hosted_irq_connections().is_none_or(|connections| {
+    let last_on_line = !connection.retiring && hosted_irq_connections().is_none_or(|connections| {
         connections
             .iter()
-            .filter(|candidate| candidate.gsi == connection.gsi)
+            .filter(|candidate| candidate.gsi == connection.gsi && !candidate.retiring)
             .count()
             == 1
     });
-    let line = if last_on_line {
+    let line_index = if last_on_line {
         hosted_irq_lines().and_then(|lines| {
             lines
                 .iter()
-                .copied()
-                .find(|line| line.gsi == connection.gsi)
+                .position(|line| line.gsi == connection.gsi)
         })
     } else {
         None
     };
-    if let Some(line) = line {
-        crate::clear_ioapic_irq_handler(line.handler_cap)?;
-        hosted_irq_lines_mut().retain(|candidate| candidate.gsi != line.gsi);
-        crate::delete_executive_event_badge(line.notification_cap)?;
+    if !connection.retiring && last_on_line && line_index.is_none() {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    hosted_irq_connections_mut().retain(|candidate| candidate.interrupt_id != interrupt_id);
+    if let Some(index) = line_index {
+        if release_hosted_irq_line_caps(&mut hosted_irq_lines_mut()[index]) != 0 {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+    }
+    if hosted_resource_manager_mut()
+        .connected_interrupt(interrupt_id)
+        .is_some()
+    {
+        hosted_resource_manager_mut()
+            .disconnect_interrupt(hosted_resource_owner(binding), interrupt_id)
+            .map_err(hosted_hal_status)?;
+    }
+    if let Some(index) = line_index {
+        remove_released_hosted_irq_line(index, true);
+    }
+    let Some(connection_index) = hosted_irq_connections_mut()
+        .iter()
+        .position(|candidate| candidate.interrupt_id == interrupt_id)
+    else {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    };
+    hosted_irq_connections_mut()[connection_index].retiring = true;
+    retire_hosted_irq_lane_if_unreferenced(
+        binding.projection_instance,
+        binding.projection_domain,
+    )?;
+    hosted_irq_connections_mut().remove(connection_index);
     Ok(())
 }
 
@@ -44827,18 +45795,21 @@ unsafe fn retire_hosted_irq_connections_for_binding(
                 .find(|connection| connection.binding == binding)
                 .map(|connection| connection.interrupt_id)
         }) else {
-            return Ok(());
+            return retire_hosted_irq_lane_if_unreferenced(
+                binding.projection_instance,
+                binding.projection_domain,
+            );
         };
         retire_hosted_irq_connection(binding, interrupt_id)?;
-        hosted_resource_manager_mut()
-            .disconnect_interrupt(hosted_resource_owner(binding), interrupt_id)
-            .map_err(hosted_hal_status)?;
     }
 }
 
 unsafe fn dispatch_hosted_irq_connection(
     connection: HostedIrqConnection,
 ) -> Result<bool, nt_status::NtStatus> {
+    if connection.retiring {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let binding = hosted_device_binding_by_device_id(connection.binding.device_id)
         .filter(|binding| *binding == connection.binding)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
@@ -44910,6 +45881,11 @@ unsafe fn service_hosted_irq_event(
                 .find(|line| line.event_bit == event_bit)
         })
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if line.retiring {
+        // Retirement deliberately leaves the handler unacknowledged while capability teardown is
+        // retried. Rearming a partially retired level line would reopen delivery into stale state.
+        return Ok(HostedIrqServiceOutcome::Serviced(0));
+    }
     let mut connections = Vec::new();
     if let Some(live) = hosted_irq_connections() {
         connections
@@ -47072,6 +48048,9 @@ pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvi
 }
 
 fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
+    if unsafe { retire_hosted_irq_connections_for_binding(binding) }.is_err() {
+        return false;
+    }
     let resource_state_exists =
         unsafe { hosted_device_resource_state_by_device_id(binding.device_id).is_some() };
     if resource_state_exists {
@@ -47336,6 +48315,37 @@ fn clear_hosted_device_bindings_for_instance(instance: usize) -> u64 {
         index += 1;
     }
     failures
+}
+
+fn clear_hosted_irq_lanes_for_instance(instance: usize) -> u64 {
+    unsafe {
+        let mut failures = 0u64;
+        loop {
+            let Some((projection_instance, domain)) = hosted_irq_lanes().and_then(|lanes| {
+                lanes
+                    .iter()
+                    .find(|lane| lane.projection_instance == instance)
+                    .map(|lane| (lane.projection_instance, lane.domain))
+            }) else {
+                return failures;
+            };
+            let referenced = hosted_irq_lanes().is_some_and(|lanes| {
+                lanes
+                    .iter()
+                    .find(|lane| {
+                        lane.projection_instance == projection_instance && lane.domain == domain
+                    })
+                    .is_some_and(|lane| hosted_irq_lane_has_connections(lane))
+            });
+            if referenced {
+                return failures.saturating_add(1);
+            }
+            if retire_hosted_irq_lane_if_unreferenced(projection_instance, domain).is_err() {
+                failures = failures.saturating_add(1);
+                return failures;
+            }
+        }
+    }
 }
 
 pub(crate) fn device_object_id(device_id: u64) -> u64 {
@@ -47716,6 +48726,20 @@ unsafe fn hosted_driver_thread_runtimes_mut() -> &'static mut Vec<HostedDriverTh
     slot.as_mut().unwrap()
 }
 
+unsafe fn allocate_hosted_driver_component_slot(instance: usize) -> Option<usize> {
+    let runtimes = hosted_driver_thread_runtimes_mut();
+    let mut candidate = FSD_IRQ_LANE_COMPONENT_SLOT.checked_add(1)?;
+    loop {
+        if runtimes
+            .iter()
+            .all(|runtime| runtime.instance != instance || runtime.component_slot != candidate)
+        {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(1)?;
+    }
+}
+
 unsafe fn hosted_driver_waiters_mut() -> &'static mut Vec<HostedDriverRawWaiter> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_WAITERS);
     if slot.is_none() {
@@ -47763,11 +48787,9 @@ unsafe fn hosted_driver_reply_pool_mut(instance: usize) -> &'static mut HostedDr
 }
 
 unsafe fn allocate_hosted_driver_reply_cap() -> Option<u64> {
-    let cap = alloc_slot();
-    if cap == 0 || untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) != 0 {
-        if cap != 0 {
-            recycle_deleted_root_slot(cap);
-        }
+    let cap = try_alloc_slot()?;
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap) != 0 {
+        recycle_deleted_root_slot(cap);
         return None;
     }
     Some(cap)
@@ -48578,6 +49600,37 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             print_str(b"\n");
         }
     }
+    // Physical sources and their execution lanes are the first runtime objects retired. If either
+    // fence fails, leave waits, workers, and resource mappings intact for the next exact retry.
+    let device_binding_failures = clear_hosted_device_bindings_for_instance(i);
+    if device_binding_failures != 0 {
+        print_str(b"[driver-launch] hosted device binding release failed inst=");
+        print_u64(i as u64);
+        print_str(b" failures=");
+        print_u64(device_binding_failures);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let orphan_line_failures = retiring_domain
+        .map(|domain| unsafe { clear_hosted_irq_orphan_lines_for_instance(i, domain) })
+        .unwrap_or(0);
+    if orphan_line_failures != 0 {
+        print_str(b"[driver-launch] hosted interrupt line release failed inst=");
+        print_u64(i as u64);
+        print_str(b" failures=");
+        print_u64(orphan_line_failures);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let irq_lane_failures = clear_hosted_irq_lanes_for_instance(i);
+    if irq_lane_failures != 0 {
+        print_str(b"[driver-launch] hosted interrupt lane release failed inst=");
+        print_u64(i as u64);
+        print_str(b" failures=");
+        print_u64(irq_lane_failures);
+        print_str(b"\n");
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     clear_hosted_driver_waits_for_instance(i);
     clear_hosted_driver_timers_for_instance(i);
     clear_hosted_driver_threads_for_instance(i);
@@ -48591,15 +49644,6 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             print_u64(failures);
             print_str(b"\n");
         }
-    }
-    let device_binding_failures = clear_hosted_device_bindings_for_instance(i);
-    if device_binding_failures != 0 {
-        teardown_blocked = true;
-        print_str(b"[driver-launch] hosted device binding release failed inst=");
-        print_u64(i as u64);
-        print_str(b" failures=");
-        print_u64(device_binding_failures);
-        print_str(b"\n");
     }
     unsafe {
         if let Some(domain) = retiring_domain {
@@ -49071,20 +50115,23 @@ pub(crate) fn service_hosted_driver_interrupt(
         },
         HOSTED_INTERRUPT_OP_DISCONNECT => unsafe {
             let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+            let retirement_pending = hosted_irq_connections().is_some_and(|connections| {
+                connections.iter().any(|connection| {
+                    connection.interrupt_id == interrupt_id
+                        && connection.binding == binding
+                        && connection.retiring
+                })
+            });
             if interrupt_id == 0
-                || hosted_resource_manager_mut()
-                    .connected_interrupt(interrupt_id)
-                    .is_none()
+                || (!retirement_pending
+                    && hosted_resource_manager_mut()
+                        .connected_interrupt(interrupt_id)
+                        .is_none())
             {
                 return (STATUS_INVALID_DEVICE_REQUEST, 0);
             }
             if let Err(status) = retire_hosted_irq_connection(binding, interrupt_id) {
                 return (status.raw(), 0);
-            }
-            if let Err(error) = hosted_resource_manager_mut()
-                .disconnect_interrupt(hosted_resource_owner(binding), interrupt_id)
-            {
-                return (hosted_hal_status(error).raw(), 0);
             }
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             refresh_hosted_device_resource_state(binding, sh);
@@ -50201,7 +51248,10 @@ pub(crate) fn service_hosted_driver_ps_create_system_thread(
             HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
             return (STATUS_INSUFFICIENT_RESOURCES, 0);
         };
-        let component_slot = table.len();
+        let Some(component_slot) = allocate_hosted_driver_component_slot(instance) else {
+            HOSTED_DRIVER_SYSTEM_THREAD_CREATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return (STATUS_INSUFFICIENT_RESOURCES, 0);
+        };
         let handle = match table.create(start_routine, start_context) {
             Ok(handle) => handle,
             Err(error) => {
@@ -52202,7 +53252,7 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let projection_inst = instance(binding.projection_instance)
-        .filter(|instance| instance.ready)
+        .filter(|instance| instance_domain_identity(*instance) == Some(binding.projection_domain))
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let projection = hosted_pool_allocation_exec_va(
         projection_inst.exec_pool_va,
@@ -52247,6 +53297,22 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
 
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     if existing != 0 {
+        if let Some(retiring) = hosted_irq_connections().and_then(|connections| {
+            connections
+                .iter()
+                .copied()
+                .find(|connection| connection.interrupt_id == existing && connection.retiring)
+        }) {
+            if retiring.binding != binding {
+                return Err(nt_status::NtStatus::ACCESS_DENIED);
+            }
+            retire_hosted_irq_connection(binding, existing)?;
+            write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
+            refresh_hosted_device_resource_state(binding, sh);
+        }
+    }
+    let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+    if existing != 0 {
         let tokens = hosted_resource_manager_mut()
             .connected_interrupt(existing)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
@@ -52278,8 +53344,22 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
     refresh_hosted_device_resource_state(binding, sh);
     if let Err(status) = install_hosted_irq_connection(binding, connected) {
-        let _ = hosted_resource_manager_mut()
-            .disconnect_interrupt(hosted_resource_owner(binding), connected);
+        if hosted_irq_connections().is_some_and(|connections| {
+            connections
+                .iter()
+                .any(|connection| connection.interrupt_id == connected)
+        }) {
+            refresh_hosted_device_resource_state(binding, sh);
+            return Err(status);
+        }
+        if hosted_resource_manager_mut()
+            .connected_interrupt(connected)
+            .is_some()
+        {
+            hosted_resource_manager_mut()
+                .disconnect_interrupt(hosted_resource_owner(binding), connected)
+                .map_err(hosted_hal_status)?;
+        }
         write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
         refresh_hosted_device_resource_state(binding, sh);
         return Err(status);
