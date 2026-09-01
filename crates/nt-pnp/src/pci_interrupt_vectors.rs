@@ -105,6 +105,31 @@ mod tests {
     }
 
     #[test]
+    fn active_sci_vector_is_excluded_from_pci_publication() {
+        let routes = [
+            route(0, 0),
+            route(1, 1),
+            route(2, 2),
+            route(3, 3),
+            route(4, 4),
+            route(5, 5),
+            route(6, 6),
+            route(7, 7),
+            route(8, 23),
+        ];
+        let assignments = allocate_pci_interrupt_vectors(&routes, 64, &[2, 9]).unwrap();
+
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|assignment| assignment.gsi == 23)
+                .map(|assignment| assignment.vector),
+            Some(11)
+        );
+        assert!(assignments.iter().all(|assignment| assignment.vector != 9));
+    }
+
+    #[test]
     fn allocation_rejects_invalid_limits_and_reserved_vectors() {
         assert_eq!(
             allocate_pci_interrupt_vectors(&[], 1, &[]),

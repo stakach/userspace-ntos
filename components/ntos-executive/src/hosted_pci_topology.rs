@@ -10,7 +10,6 @@ use nt_pnp::{
 };
 
 const HOSTED_INTERRUPT_VECTOR_LIMIT: u32 = 64;
-const HOSTED_KERNEL_INTERRUPT_VECTORS: [u32; 1] = [crate::DELAY_TIMER_IRQ as u32];
 
 struct HostedPciTopologyAuthority {
     inventory: PciInventory,
@@ -495,10 +494,11 @@ pub(crate) unsafe fn commit_hosted_pci_interrupt_routes(
     if !authority.dirty_relations.is_empty() || authority.route_blocked.is_some() {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    let reserved_vectors = crate::driver_launch::snapshot_hosted_reserved_interrupt_vectors()?;
     let interrupt_vectors = allocate_pci_interrupt_vectors(
         publication.routes(),
         HOSTED_INTERRUPT_VECTOR_LIMIT,
-        &HOSTED_KERNEL_INTERRUPT_VECTORS,
+        &reserved_vectors,
     )
     .map_err(vector_status)?;
     if interrupt_vectors

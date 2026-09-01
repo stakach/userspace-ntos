@@ -22618,7 +22618,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive source retains the old `_PIC` state machine or request builder. `nt-compat-exports`
     passes 42/42, `nt-acpi` passes 38/38, `nt-kernel-exec` passes 219/219, formatting and diff checks
     are clean, and the executive freestanding check is green at the established 214-warning
-    baseline. Serialized desktop acceptance remains pending.
+    baseline. The first serialized desktop run with the pinned provider reached genuine Explorer
+    chrome and the sentinel in about five minutes (`291/295`), proving the provider START and shell
+    path remain live. Its remaining hardware failure is narrower than the prior route diagnosis:
+    E1000 received the firmware-derived raw GSI 23, but PCI publication assigned translated vector
+    9 while the already-started ACPI SCI on GSI 9 still owned vector 9. The interrupt broker correctly
+    rejected that cross-line collision with `STATUS_ACCESS_DENIED`; receive, IRQ, and DPC gates then
+    remained false. The unrelated wait-timer disarm gate was the fourth failure.
+
+    Review adjustment: replace the static timer-only PCI vector exclusion with a fallible runtime
+    snapshot of every kernel vector and every active, draining, or quarantined hosted physical line.
+    Route publication must allocate against that exact snapshot and fail closed if it cannot retain
+    it. Re-run focused tests and desktop acceptance; require GSI 23 to receive a vector distinct from
+    the SCI, then require real E1000 connect/ISR/DPC/receive evidence before accepting this slice.
+    The BusRelations commit now also consumes the generic `route_reconciliation_ready` edge after
+    clearing its relation-query owner; the pump-tail start remains only the fallible redrive path.
+
+    Reference review also found a broader PnP-model correction to retain after this acceptance run:
+    NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
+    relation identity to each enumerated child, require its parent to remain Started through child
+    resource commit, and gate only an IRQ-bearing PCI child's arbitration on its exact current route.
+    Then remove the current global `hosted_pnp_enumeration_progress` coupling that stalls unrelated
+    and pinless children behind route reconciliation. Do not copy NT5's legacy PCI InterruptLine
+    fallback when `_PRT` is absent; this kernel keeps the child unassigned and fails closed.
 
     Review adjustment: after the rebuilt provider artifact is pinned, run the serialized desktop
     acceptance with PIT IRQ evidence, provider-initialization `_PIC(1)` success before the first real

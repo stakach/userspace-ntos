@@ -38364,12 +38364,17 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete(claim)
         .expect("published relation transaction lost its exact invalidation claim");
-    crate::hosted_pci_topology::note_hosted_pci_relation_completion(
+    let route_reconciliation_ready = crate::hosted_pci_topology::note_hosted_pci_relation_completion(
         relation_owner,
         invalidation_completion,
     )
     .expect("published relation transaction lost its PCI topology dirty claim");
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
+    if route_reconciliation_ready {
+        // Consume the exact catalog/inventory generation at the transaction boundary that made it
+        // ready. The pump-tail call remains the allocation/serialization redrive path.
+        let _ = start_hosted_acpi_pci_route_query();
+    }
     Ok(())
 }
 
@@ -44885,6 +44890,26 @@ unsafe fn hosted_irq_lines_mut() -> &'static mut Vec<HostedIrqLine> {
 
 unsafe fn hosted_irq_lines() -> Option<&'static Vec<HostedIrqLine>> {
     (*core::ptr::addr_of!(HOSTED_IRQ_LINES)).as_ref()
+}
+
+/// Snapshot every translated vector that still has a live kernel or hosted-line owner. PCI route
+/// publication uses this as an exclusion set, so an unrelated GSI cannot be assigned the SCI,
+/// timer, or a draining driver's vector while that physical-line lifetime is still retained.
+pub(crate) unsafe fn snapshot_hosted_reserved_interrupt_vectors(
+) -> Result<Vec<u32>, nt_status::NtStatus> {
+    let lines = hosted_irq_lines().map(Vec::as_slice).unwrap_or(&[]);
+    let mut vectors = Vec::new();
+    vectors
+        .try_reserve_exact(lines.len().saturating_add(1))
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    vectors.push(crate::DELAY_TIMER_IRQ as u32);
+    vectors.extend(lines.iter().filter_map(|line| {
+        (line.rundown.disposition() != InterruptLineDisposition::Released)
+            .then_some(line.vector)
+    }));
+    vectors.sort_unstable();
+    vectors.dedup();
+    Ok(vectors)
 }
 
 unsafe fn hosted_irq_connections() -> Option<&'static Vec<HostedIrqConnection>> {
