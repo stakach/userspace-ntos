@@ -374,6 +374,7 @@ pub const SH_RESOURCE_INTERRUPT_OBJECT: u64 = 0x3D8; // out: PKINTERRUPT project
 pub const SH_RESOURCE_INTERRUPT_ROUTINE: u64 = 0x3E0; // out: connected ISR routine
 pub const SH_RESOURCE_INTERRUPT_CONTEXT: u64 = 0x3E8; // out: connected ISR context
 pub const SH_RESOURCE_PDO_OBJECT: u64 = 0x3F0; // in: authenticated component PDO projection
+pub const SH_RESOURCE_INTERRUPT_POLICY: u64 = 0x3F8; // in: granted IRQL/mode/share bytes
 pub const SH_DMA_COMMON_VA: u64 = 0x400; // in: component VA for the granted common buffer
 pub const SH_DMA_COMMON_LEN: u64 = 0x408; // in: granted common-buffer length
 pub const SH_DMA_COMMON_LOGICAL: u64 = 0x410; // in: granted device logical address / IOVA
@@ -720,6 +721,26 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
 
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
+const HOSTED_KINTERRUPT_MAGIC: u64 = 0x4B49_4E54_5250_5431;
+const HOSTED_KINTERRUPT_SIZE: u64 = 0x48;
+const HOSTED_KINTERRUPT_VECTOR: u64 = 0x00;
+const HOSTED_KINTERRUPT_IRQL: u64 = 0x04;
+const HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL: u64 = 0x05;
+const HOSTED_KINTERRUPT_MODE: u64 = 0x06;
+const HOSTED_KINTERRUPT_SHARE: u64 = 0x07;
+const HOSTED_KINTERRUPT_ROUTINE: u64 = 0x08;
+const HOSTED_KINTERRUPT_CONTEXT: u64 = 0x10;
+const HOSTED_KINTERRUPT_ACTUAL_LOCK: u64 = 0x18;
+const HOSTED_KINTERRUPT_AFFINITY: u64 = 0x20;
+const HOSTED_KINTERRUPT_ID: u64 = 0x28;
+const HOSTED_KINTERRUPT_MAGIC_OFF: u64 = 0x30;
+const HOSTED_KINTERRUPT_PRIVATE_LOCK: u64 = 0x38;
+const HOSTED_KINTERRUPT_FLOATING_SAVE: u64 = 0x40;
+
+#[inline]
+const fn hosted_interrupt_policy(irql: u8, mode: u8, share: u8) -> u64 {
+    irql as u64 | (mode as u64) << 8 | (share as u64) << 16
+}
 
 const POOL_DATA_OFF: u64 = 0x1000;
 const FILE_OPENED_INFORMATION: u64 = 1;
@@ -9063,23 +9084,41 @@ extern "win64" fn s_io_connect_interrupt(
     interrupt_obj_out: *mut u64,
     service_routine: u64,
     service_context: u64,
-    _spin_lock: u64,
+    spin_lock: u64,
     vector: u32,
-    _irql: u8,
-    _sync_irql: u8,
-    _mode: u32,
-    _share: u8,
+    irql: u8,
+    sync_irql: u8,
+    mode: u32,
+    share: u8,
     affinity: u64,
-    _floating: u8,
+    floating_save: u8,
 ) -> i32 {
     unsafe {
         let granted_vector =
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
         let granted_affinity =
             read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_AFFINITY) as *const u64);
-        if granted_vector == 0
+        let granted_policy =
+            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_POLICY) as *const u64);
+        let granted_irql = granted_policy as u8;
+        let granted_mode = (granted_policy >> 8) as u8;
+        let granted_share = (granted_policy >> 16) as u8;
+        let effective_affinity = if granted_affinity == 0 {
+            1
+        } else {
+            granted_affinity
+        };
+        if interrupt_obj_out.is_null()
+            || service_routine == 0
+            || granted_vector == 0
             || vector != granted_vector
-            || (affinity != 0 && granted_affinity != 0 && affinity != granted_affinity)
+            || irql != granted_irql
+            || sync_irql < irql
+            || mode > u8::MAX as u32
+            || mode as u8 != granted_mode
+            || share > 1
+            || share != granted_share
+            || affinity != effective_affinity
         {
             let status = 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
             trace_hosted_io_connect_interrupt(
@@ -9095,7 +9134,7 @@ extern "win64" fn s_io_connect_interrupt(
             );
             return status;
         }
-        let projection = pool_alloc(0x20);
+        let projection = pool_alloc_zeroed(HOSTED_KINTERRUPT_SIZE);
         if projection == 0 {
             let status = 0xC000_009Au32 as i32; // STATUS_INSUFFICIENT_RESOURCES
             trace_hosted_io_connect_interrupt(
@@ -9111,12 +9150,44 @@ extern "win64" fn s_io_connect_interrupt(
             );
             return status;
         }
-        write_unaligned(projection as *mut u32, vector);
-        write_unaligned((projection + 8) as *mut u64, service_routine);
-        write_unaligned((projection + 16) as *mut u64, service_context);
-        if !interrupt_obj_out.is_null() {
-            write_unaligned(interrupt_obj_out, projection);
-        }
+        let actual_lock = if spin_lock == 0 {
+            projection + HOSTED_KINTERRUPT_PRIVATE_LOCK
+        } else {
+            spin_lock
+        };
+        write_unaligned((projection + HOSTED_KINTERRUPT_VECTOR) as *mut u32, vector);
+        write_unaligned((projection + HOSTED_KINTERRUPT_IRQL) as *mut u8, irql);
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *mut u8,
+            sync_irql,
+        );
+        write_unaligned((projection + HOSTED_KINTERRUPT_MODE) as *mut u8, mode as u8);
+        write_unaligned((projection + HOSTED_KINTERRUPT_SHARE) as *mut u8, share);
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_ROUTINE) as *mut u64,
+            service_routine,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_CONTEXT) as *mut u64,
+            service_context,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *mut u64,
+            actual_lock,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_AFFINITY) as *mut u64,
+            affinity,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_MAGIC_OFF) as *mut u64,
+            HOSTED_KINTERRUPT_MAGIC,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_FLOATING_SAVE) as *mut u8,
+            (floating_save != 0) as u8,
+        );
+        write_unaligned(interrupt_obj_out, projection);
         write_volatile(
             (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *mut u64,
             projection,
@@ -9173,6 +9244,10 @@ extern "win64" fn s_io_connect_interrupt(
         }
         write_volatile(
             (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *mut u64,
+            interrupt_id,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_ID) as *mut u64,
             interrupt_id,
         );
         trace_hosted_io_connect_interrupt(
@@ -12413,13 +12488,35 @@ extern "win64" fn s_ke_deregister_bug_check_callback(record: u64) -> u8 {
 }
 
 /// `BOOLEAN KeSynchronizeExecution(PKINTERRUPT, PKSYNCHRONIZE_ROUTINE, PVOID)`.
-extern "win64" fn s_ke_synchronize_execution(_interrupt: u64, routine: u64, context: u64) -> u8 {
-    if routine == 0 {
+extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, context: u64) -> u8 {
+    if interrupt == 0 || routine == 0 {
         return 0;
     }
     unsafe {
+        if component_pool_allocation_capacity(interrupt)
+            .is_none_or(|capacity| capacity < HOSTED_KINTERRUPT_SIZE)
+            || read_unaligned((interrupt + HOSTED_KINTERRUPT_MAGIC_OFF) as *const u64)
+                != HOSTED_KINTERRUPT_MAGIC
+        {
+            return 0;
+        }
+        let synchronize_irql =
+            read_unaligned((interrupt + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8);
+        let actual_lock =
+            read_unaligned((interrupt + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64);
+        if actual_lock == 0 || synchronize_irql < DISPATCH_LEVEL {
+            return 0;
+        }
+        let old_irql = hosted_raise_irql(synchronize_irql);
+        // The hosted ABI exposes one logical processor. Its KSPIN_LOCK operations are therefore
+        // IRQL exclusion plus barriers; use the exact ActualLock identity retained at connect time.
+        let _actual_lock_identity = actual_lock;
+        compiler_fence(Ordering::SeqCst);
         let f: extern "win64" fn(u64) -> u8 = core::mem::transmute(routine as *const ());
-        f(context)
+        let result = f(context);
+        compiler_fence(Ordering::SeqCst);
+        hosted_lower_irql(old_irql);
+        result
     }
 }
 
@@ -45039,6 +45136,7 @@ unsafe fn clear_hosted_resource_projection(
     write_volatile((sh + SH_RESOURCE_INTERRUPT_VECTOR) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_LINE) as *mut u32, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64, 0);
+    write_volatile((sh + SH_RESOURCE_INTERRUPT_POLICY) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_PHYS) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_MMIO_MAPPED_LEN) as *mut u64, 0);
     write_volatile((sh + SH_VIDEO_MEMORY_PHYS) as *mut u64, 0);
@@ -46584,6 +46682,22 @@ unsafe fn write_hosted_resource_state_projection(
     write_volatile(
         (sh + SH_RESOURCE_INTERRUPT_AFFINITY) as *mut u64,
         state.interrupt_affinity,
+    );
+    write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_POLICY) as *mut u64,
+        hosted_interrupt_policy(
+            evidence.interrupt_vector.min(0xF) as u8,
+            if state.interrupt_latched {
+                nt_hal_abi::INT_MODE_LATCHED
+            } else {
+                nt_hal_abi::INT_MODE_LEVEL_SENSITIVE
+            },
+            if state.interrupt_shared {
+                nt_hal_abi::SHARE_SHARED as u8
+            } else {
+                nt_hal_abi::SHARE_EXCLUSIVE as u8
+            },
+        ),
     );
     write_volatile(
         (sh + SH_RESOURCE_INTERFACE_TYPE) as *mut u32,
@@ -51796,6 +51910,22 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         interrupt_affinity,
     );
     write_volatile(
+        (sh + SH_RESOURCE_INTERRUPT_POLICY) as *mut u64,
+        hosted_interrupt_policy(
+            interrupt_vector.min(0xF) as u8,
+            if interrupt_latched {
+                nt_hal_abi::INT_MODE_LATCHED
+            } else {
+                nt_hal_abi::INT_MODE_LEVEL_SENSITIVE
+            },
+            if interrupt_shared {
+                nt_hal_abi::SHARE_SHARED as u8
+            } else {
+                nt_hal_abi::SHARE_EXCLUSIVE as u8
+            },
+        ),
+    );
+    write_volatile(
         (sh + SH_RESOURCE_INTERFACE_TYPE) as *mut u32,
         bus_identity.interface_type,
     );
@@ -52071,6 +52201,49 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     if interrupt_object == 0 || service_routine == 0 || interrupt_vector == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let projection_inst = instance(binding.projection_instance)
+        .filter(|instance| instance.ready)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let projection = hosted_pool_allocation_exec_va(
+        projection_inst.exec_pool_va,
+        interrupt_object,
+        HOSTED_KINTERRUPT_SIZE,
+    )
+    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if read_unaligned((projection + HOSTED_KINTERRUPT_MAGIC_OFF) as *const u64)
+        != HOSTED_KINTERRUPT_MAGIC
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let request = nt_resource_manager::InterruptConnectionRequest {
+        service_routine_token: read_unaligned(
+            (projection + HOSTED_KINTERRUPT_ROUTINE) as *const u64,
+        ),
+        service_context_token: read_unaligned(
+            (projection + HOSTED_KINTERRUPT_CONTEXT) as *const u64,
+        ),
+        actual_lock_token: read_unaligned(
+            (projection + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64,
+        ),
+        vector: read_unaligned((projection + HOSTED_KINTERRUPT_VECTOR) as *const u32),
+        irql: read_unaligned((projection + HOSTED_KINTERRUPT_IRQL) as *const u8),
+        synchronize_irql: read_unaligned(
+            (projection + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8,
+        ),
+        mode: read_unaligned((projection + HOSTED_KINTERRUPT_MODE) as *const u8),
+        share: read_unaligned((projection + HOSTED_KINTERRUPT_SHARE) as *const u8) as u16,
+        affinity: read_unaligned((projection + HOSTED_KINTERRUPT_AFFINITY) as *const u64),
+        floating_save: read_unaligned(
+            (projection + HOSTED_KINTERRUPT_FLOATING_SAVE) as *const u8,
+        ) != 0,
+    };
+    if request.service_routine_token != service_routine
+        || request.service_context_token != service_context
+        || request.actual_lock_token == 0
+        || request.vector != interrupt_vector
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
 
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     if existing != 0 {
@@ -52080,6 +52253,12 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         if tokens.vector != interrupt_vector
             || tokens.service_routine_token != service_routine
             || tokens.service_context_token != service_context
+            || tokens.actual_lock_token != request.actual_lock_token
+            || tokens.synchronize_irql != request.synchronize_irql
+            || tokens.mode != request.mode
+            || tokens.share != request.share
+            || tokens.affinity != request.affinity
+            || tokens.floating_save != request.floating_save
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -52091,7 +52270,7 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let owner = hosted_resource_owner(binding);
     let connected = hosted_resource_manager_mut()
-        .connect_interrupt(owner, interrupt_id, service_routine, service_context)
+        .connect_interrupt_exact(owner, interrupt_id, request)
         .map_err(hosted_hal_status)?;
     if connected == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);

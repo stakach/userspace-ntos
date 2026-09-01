@@ -22268,10 +22268,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     re-entrantly is forbidden. A second TCB in the same VSpace is also insufficient: hosted imports
     and provider callback marshalling still address the fixed `FSD_SHARED_VADDR`, so it would collide
     with the parked request even with a private stack. NDIS's ISR synchronously calls the dependent
-    miniport ISR, which can itself preempt an occupied dependent request bank. Add sibling provider
-    ISR and dependent callback execution lanes with aliased mutable image/heap/device frames but
-    private VSpaces, fixed-VA control banks, stacks, IPC buffers, endpoints, reply objects, and
-    command/result mailboxes. Neither lane may reuse `SH_REQ_*` or the normal component transport.
+    miniport ISR, which can itself preempt an occupied dependent request bank. Add provider ISR and
+    dependent callback execution lanes in their exact owning provider/dependent PML4s so opaque
+    pointers, generated thunks, and mutable globals retain one identity. Give each lane private
+    fixed-VA command frames, stacks, IPC buffers, CNodes, endpoints, reply objects, and mailboxes.
+    The owning domain's fixed shared/data/pool mappings remain shared, but neither lane may touch
+    `SH_REQ_*` or reuse the normal component transport; callback marshalling that still depends on
+    the occupied request bank must move to its lane-private command frame before cutover.
 
     B3 native interrupt-contract checkpoint (2026-09-02, focused host validation green; kernel
     wiring open): `nt-kernel-exec::InterruptTable` now retains the complete connection contract:
@@ -22280,6 +22283,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     preserving the ReactOS amd64 gap: level-sensitive chains stop at the first claimant; latched
     chains scan every handler and repeat until a full pass is unclaimed. Incompatible shared-line
     mode/sharing contracts fail closed. The focused suite passes 205/205.
+
+    B3 exact interrupt-connection checkpoint (2026-09-02, host and freestanding green): the hosted
+    `IoConnectInterrupt` projection is now typed and allocation-validated rather than a three-field
+    token. It retains vector, DIRQL, synchronization IRQL, trigger mode, sharing, affinity,
+    floating-save policy, caller-supplied or private actual lock, routine/context, canonical id, and
+    a projection magic. The component validates every requested field against its PnP grant; the
+    executive resolves that exact allocation through the owning projection-domain pool alias and
+    `nt-resource-manager::connect_interrupt_exact` validates and retains the complete contract.
+    Replays compare every immutable field. `KeSynchronizeExecution` no longer calls through
+    directly: it validates the live projection, raises to its retained synchronization IRQL, uses
+    the exact actual-lock identity under the hosted UP IRQL/barrier contract, invokes, and restores
+    IRQL. `nt-resource-manager` passes 18/18 and the freestanding executive check is green.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.

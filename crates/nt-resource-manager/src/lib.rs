@@ -141,9 +141,30 @@ struct Interrupt {
     owner: ResourceOwner,
     vector: u32,
     irql: u8,
+    synchronize_irql: u8,
+    mode: u8,
+    share: u16,
+    affinity: u64,
+    floating_save: bool,
+    actual_lock_token: u64,
     service_routine_token: u64,
     service_context_token: u64,
     connected: bool,
+}
+
+/// Exact policy supplied by `IoConnectInterrupt` after driver-host pointer validation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InterruptConnectionRequest {
+    pub service_routine_token: u64,
+    pub service_context_token: u64,
+    pub actual_lock_token: u64,
+    pub vector: u32,
+    pub irql: u8,
+    pub synchronize_irql: u8,
+    pub mode: u8,
+    pub share: u16,
+    pub affinity: u64,
+    pub floating_save: bool,
 }
 
 /// The result of a successful `map_io_space`.
@@ -162,7 +183,13 @@ pub struct InterruptTokens {
     pub interrupt_id: u64,
     pub service_routine_token: u64,
     pub service_context_token: u64,
+    pub actual_lock_token: u64,
     pub irql: u8,
+    pub synchronize_irql: u8,
+    pub mode: u8,
+    pub share: u16,
+    pub affinity: u64,
+    pub floating_save: bool,
     pub vector: u32,
 }
 
@@ -1208,6 +1235,33 @@ impl ResourceManager {
         service_routine_token: u64,
         service_context_token: u64,
     ) -> Result<u64, HalError> {
+        let resource = self
+            .interrupts_res
+            .iter()
+            .find(|resource| resource.resource_id == resource_id)
+            .ok_or(HalError::NotAssigned)?;
+        let request = InterruptConnectionRequest {
+            service_routine_token,
+            service_context_token,
+            actual_lock_token: 0,
+            vector: resource.vector,
+            irql: resource.irql,
+            synchronize_irql: resource.irql,
+            mode: resource.mode,
+            share: resource.share,
+            affinity: resource.affinity as u64,
+            floating_save: false,
+        };
+        self.connect_interrupt_exact(owner, resource_id, request)
+    }
+
+    /// Connect an ISR while retaining and validating the complete NT connection contract.
+    pub fn connect_interrupt_exact(
+        &mut self,
+        owner: ResourceOwner,
+        resource_id: u64,
+        request: InterruptConnectionRequest,
+    ) -> Result<u64, HalError> {
         let res = self
             .interrupts_res
             .iter()
@@ -1218,6 +1272,16 @@ impl ResourceManager {
         }
         if res.owner != owner {
             return Err(HalError::WrongOwner);
+        }
+        if request.vector != res.vector
+            || request.irql != res.irql
+            || request.synchronize_irql < request.irql
+            || request.mode != res.mode
+            || request.share != res.share
+            || request.affinity == 0
+            || request.affinity & res.affinity as u64 == 0
+        {
+            return Err(HalError::InvalidRange);
         }
         if self
             .connected
@@ -1234,8 +1298,14 @@ impl ResourceManager {
             owner,
             vector: res.vector,
             irql: res.irql,
-            service_routine_token,
-            service_context_token,
+            synchronize_irql: request.synchronize_irql,
+            mode: request.mode,
+            share: request.share,
+            affinity: request.affinity,
+            floating_save: request.floating_save,
+            actual_lock_token: request.actual_lock_token,
+            service_routine_token: request.service_routine_token,
+            service_context_token: request.service_context_token,
             connected: true,
         });
         Ok(interrupt_id)
@@ -1270,7 +1340,13 @@ impl ResourceManager {
                 interrupt_id: c.interrupt_id,
                 service_routine_token: c.service_routine_token,
                 service_context_token: c.service_context_token,
+                actual_lock_token: c.actual_lock_token,
                 irql: c.irql,
+                synchronize_irql: c.synchronize_irql,
+                mode: c.mode,
+                share: c.share,
+                affinity: c.affinity,
+                floating_save: c.floating_save,
                 vector: c.vector,
             })
     }
@@ -1287,7 +1363,13 @@ impl ResourceManager {
                 interrupt_id: c.interrupt_id,
                 service_routine_token: c.service_routine_token,
                 service_context_token: c.service_context_token,
+                actual_lock_token: c.actual_lock_token,
                 irql: c.irql,
+                synchronize_irql: c.synchronize_irql,
+                mode: c.mode,
+                share: c.share,
+                affinity: c.affinity,
+                floating_save: c.floating_save,
                 vector: c.vector,
             })
     }
@@ -1309,7 +1391,13 @@ impl ResourceManager {
                 interrupt_id: connection.interrupt_id,
                 service_routine_token: connection.service_routine_token,
                 service_context_token: connection.service_context_token,
+                actual_lock_token: connection.actual_lock_token,
                 irql: connection.irql,
+                synchronize_irql: connection.synchronize_irql,
+                mode: connection.mode,
+                share: connection.share,
+                affinity: connection.affinity,
+                floating_save: connection.floating_save,
                 vector: connection.vector,
             },
             resource_id: resource.resource_id,
@@ -1447,6 +1535,58 @@ mod tests {
         assert!(rm.inject_vector(5).is_none());
         // Disconnect again (stale) fails.
         assert_eq!(rm.disconnect_interrupt(owner, id), Err(HalError::StaleId));
+    }
+
+    #[test]
+    fn exact_interrupt_connection_retains_sync_contract() {
+        let (mut rm, owner) = rm();
+        let request = InterruptConnectionRequest {
+            service_routine_token: 0xAA,
+            service_context_token: 0xBB,
+            actual_lock_token: 0xCC,
+            vector: 5,
+            irql: 5,
+            synchronize_irql: 7,
+            mode: INT_MODE_LEVEL_SENSITIVE,
+            share: SHARE_EXCLUSIVE,
+            affinity: 1,
+            floating_save: false,
+        };
+        let id = rm.connect_interrupt_exact(owner, 200, request).unwrap();
+        let tokens = rm.connected_interrupt(id).unwrap();
+        assert_eq!(tokens.actual_lock_token, 0xCC);
+        assert_eq!(tokens.synchronize_irql, 7);
+        assert_eq!(tokens.mode, INT_MODE_LEVEL_SENSITIVE);
+        assert_eq!(tokens.share, SHARE_EXCLUSIVE);
+        assert_eq!(tokens.affinity, 1);
+    }
+
+    #[test]
+    fn exact_interrupt_connection_rejects_resource_mismatch() {
+        let (mut rm, owner) = rm();
+        let mut request = InterruptConnectionRequest {
+            service_routine_token: 0xAA,
+            service_context_token: 0xBB,
+            actual_lock_token: 0xCC,
+            vector: 5,
+            irql: 5,
+            synchronize_irql: 5,
+            mode: INT_MODE_LEVEL_SENSITIVE,
+            share: SHARE_EXCLUSIVE,
+            affinity: 1,
+            floating_save: false,
+        };
+        request.mode = INT_MODE_LATCHED;
+        assert_eq!(
+            rm.connect_interrupt_exact(owner, 200, request),
+            Err(HalError::InvalidRange)
+        );
+        request.mode = INT_MODE_LEVEL_SENSITIVE;
+        request.synchronize_irql = 4;
+        assert_eq!(
+            rm.connect_interrupt_exact(owner, 200, request),
+            Err(HalError::InvalidRange)
+        );
     }
 
     #[test]
