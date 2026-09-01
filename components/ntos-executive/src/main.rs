@@ -15570,6 +15570,58 @@ unsafe fn build_service_vspace(sub: u64, comp: u64, req: u64, rep: u64, heap_fra
 }
 
 const KERNEL_SERVICE_PRIORITY: u64 = 200;
+const SERVICE_LAUNCH_HEAP_MASK: u64 = u32::MAX as u64;
+static NEXT_SERVICE_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+/// The single-register bootstrap contract shared by isolated SURT authorities.
+///
+/// The executive owns incarnation allocation. Authorities use the nonzero
+/// incarnation to namespace any opaque tokens that must not survive a service
+/// restart; heap size remains an independently validated launch property.
+#[derive(Clone, Copy)]
+struct ServiceLaunchContext(u64);
+
+impl ServiceLaunchContext {
+    fn issue(heap_frames: u64) -> Option<Self> {
+        if heap_frames == 0
+            || heap_frames > allocator::HEAP_FRAMES
+            || heap_frames > SERVICE_LAUNCH_HEAP_MASK
+        {
+            return None;
+        }
+        let incarnation = NEXT_SERVICE_INCARNATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= u32::MAX as u64)
+            })
+            .ok()?;
+        Some(Self((incarnation << 32) | heap_frames))
+    }
+
+    fn decode(raw: u64) -> Option<Self> {
+        let context = Self(raw);
+        if context.incarnation() == 0
+            || context.heap_frames() == 0
+            || context.heap_frames() > allocator::HEAP_FRAMES
+        {
+            return None;
+        }
+        Some(context)
+    }
+
+    fn raw(self) -> u64 {
+        self.0
+    }
+
+    fn heap_frames(self) -> u64 {
+        self.0 & SERVICE_LAUNCH_HEAP_MASK
+    }
+
+    fn incarnation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
 
 /// Spawn one isolated service component at `entry`, seeded with `seeds`.
 unsafe fn spawn_service(
@@ -15581,6 +15633,8 @@ unsafe fn spawn_service(
     rep: u64,
     heap_frames: u64,
 ) {
+    let launch_context = ServiceLaunchContext::issue(heap_frames)
+        .unwrap_or_else(|| panic!("invalid or exhausted service launch context"));
     let pml4 = build_service_vspace(sub, comp, req, rep, heap_frames);
     let ipcbuf = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_4K_PAGE, PAGING_BITS, 1, ipcbuf);
@@ -15612,7 +15666,7 @@ unsafe fn spawn_service(
         0,
     );
     let stack_top = STACK_BASE + STACK_FRAMES * 0x1000 - 16;
-    let _ = tcb_write_registers(tcb, entry as u64, stack_top, heap_frames);
+    let _ = tcb_write_registers(tcb, entry as u64, stack_top, launch_context.raw());
     let _ = tcb_set_priority(tcb, KERNEL_SERVICE_PRIORITY);
     if let Err(e_sc) = attach_sched_context(tcb) {
         print_str(b"[thread-life] service SC attach failed tcb=0x");

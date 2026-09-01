@@ -12,7 +12,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr::{copy_nonoverlapping, null_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Base of the RW heap region the broker maps into each component. Sits just past the executive
 /// ELF + rust-micro's rootserver aux pages (guard + stack + IPC + BootInfo + extra-BootInfo), which
@@ -66,25 +65,25 @@ const CTR: usize = HEAP_BASE; // 8-byte bump offset, in the RW heap
 const FREE_HEAD: usize = HEAP_BASE + 8; // 8-byte address of the first free-list node
 /// Component-local metadata words available to modules that cannot use mutable image statics.
 pub const COMPONENT_LOCAL_WORD_BASE: usize = HEAP_BASE + 16;
-pub const COMPONENT_LOCAL_WORDS: usize = 6;
+pub const COMPONENT_LOCAL_WORDS: usize = 5;
 const MAPPED_HEAP_BYTES: usize =
-    COMPONENT_LOCAL_WORD_BASE + (COMPONENT_LOCAL_WORDS - 1) * size_of::<usize>();
-const TRANSIENT_CTR: usize = HEAP_BASE + 64; // bytes consumed downward from the mapped heap end
-const TRANSIENT_DEPTH: usize = HEAP_BASE + 72; // nested transient allocation scopes
-const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 80; // peak transient bytes consumed
+    COMPONENT_LOCAL_WORD_BASE + COMPONENT_LOCAL_WORDS * size_of::<usize>();
+const OOM_REPORTED: usize = HEAP_BASE + 64;
+const OOM_CONTEXT: usize = HEAP_BASE + 72;
+const OOM_SCOPE_PTR: usize = HEAP_BASE + 80;
+const OOM_SCOPE_LEN: usize = HEAP_BASE + 88;
+const TRANSIENT_CTR: usize = HEAP_BASE + 96; // bytes consumed downward from the mapped heap end
+const TRANSIENT_DEPTH: usize = HEAP_BASE + 104; // nested transient allocation scopes
+const TRANSIENT_HIGH_WATER: usize = HEAP_BASE + 112; // peak transient bytes consumed
 const DATA: usize = HEAP_BASE + 128; // allocations start past allocator/local metadata
-const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= TRANSIENT_CTR);
+const _: () = assert!(MAPPED_HEAP_BYTES + size_of::<usize>() <= OOM_REPORTED);
+const _: () = assert!(OOM_SCOPE_LEN + size_of::<usize>() <= TRANSIENT_CTR);
 const _: () = assert!(TRANSIENT_HIGH_WATER + size_of::<usize>() <= DATA);
 const WORD: usize = size_of::<usize>();
 const ALLOC_GRANULE: usize = align_of::<usize>();
 const FREE_NODE_SIZE: usize = WORD * 2; // { size, next } stored inside the freed block
 
 struct Bump;
-
-static OOM_REPORTED: AtomicBool = AtomicBool::new(false);
-static OOM_CONTEXT: AtomicU32 = AtomicU32::new(0);
-static OOM_SCOPE_PTR: AtomicUsize = AtomicUsize::new(0);
-static OOM_SCOPE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 pub const ALLOC_CTX_REGF_IMPORT: u32 = 1;
 pub const ALLOC_CTX_HIVE_ENCODE: u32 = 2;
@@ -120,14 +119,16 @@ pub struct DurableAllocScope {
 
 impl Drop for AllocContext {
     fn drop(&mut self) {
-        OOM_CONTEXT.store(self.previous, Ordering::Relaxed);
+        unsafe { write_word(OOM_CONTEXT, self.previous as usize) };
     }
 }
 
 impl Drop for AllocScope {
     fn drop(&mut self) {
-        OOM_SCOPE_PTR.store(self.previous_ptr, Ordering::Relaxed);
-        OOM_SCOPE_LEN.store(self.previous_len, Ordering::Relaxed);
+        unsafe {
+            write_word(OOM_SCOPE_PTR, self.previous_ptr);
+            write_word(OOM_SCOPE_LEN, self.previous_len);
+        }
     }
 }
 
@@ -156,13 +157,18 @@ impl Drop for DurableAllocScope {
 }
 
 pub fn enter_context(context: u32) -> AllocContext {
-    let previous = OOM_CONTEXT.swap(context, Ordering::Relaxed);
+    let previous = unsafe { read_word(OOM_CONTEXT) } as u32;
+    unsafe { write_word(OOM_CONTEXT, context as usize) };
     AllocContext { previous }
 }
 
 pub fn enter_scope(scope: &'static [u8]) -> AllocScope {
-    let previous_ptr = OOM_SCOPE_PTR.swap(scope.as_ptr() as usize, Ordering::Relaxed);
-    let previous_len = OOM_SCOPE_LEN.swap(scope.len(), Ordering::Relaxed);
+    let previous_ptr = unsafe { read_word(OOM_SCOPE_PTR) };
+    let previous_len = unsafe { read_word(OOM_SCOPE_LEN) };
+    unsafe {
+        write_word(OOM_SCOPE_PTR, scope.as_ptr() as usize);
+        write_word(OOM_SCOPE_LEN, scope.len());
+    }
     AllocScope {
         previous_ptr,
         previous_len,
@@ -265,9 +271,10 @@ fn debug_context(context: u32) {
 }
 
 fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end: usize) {
-    if OOM_REPORTED.swap(true, Ordering::Relaxed) {
+    if unsafe { read_word(OOM_REPORTED) } != 0 {
         return;
     }
+    unsafe { write_word(OOM_REPORTED, 1) };
     debug_bytes(b"[alloc-oom] size=");
     debug_usize(size);
     debug_bytes(b" align=");
@@ -280,13 +287,13 @@ fn report_oom(size: usize, align: usize, cur: usize, start: usize, requested_end
     debug_usize(requested_end);
     debug_bytes(b" cap=");
     debug_usize(heap_size());
-    let context = OOM_CONTEXT.load(Ordering::Relaxed);
+    let context = unsafe { read_word(OOM_CONTEXT) } as u32;
     if context != 0 {
         debug_bytes(b" ctx=");
         debug_context(context);
     }
-    let scope_ptr = OOM_SCOPE_PTR.load(Ordering::Relaxed);
-    let scope_len = OOM_SCOPE_LEN.load(Ordering::Relaxed);
+    let scope_ptr = unsafe { read_word(OOM_SCOPE_PTR) };
+    let scope_len = unsafe { read_word(OOM_SCOPE_LEN) };
     if scope_ptr != 0 && scope_len != 0 {
         debug_bytes(b" scope=");
         // SAFETY: scopes are static byte strings installed through `enter_scope`.
@@ -421,8 +428,8 @@ fn allocator_corruption(
     debug_hex_usize(next);
     debug_bytes(b" bump=");
     debug_usize(unsafe { read_word(CTR) });
-    let scope_ptr = OOM_SCOPE_PTR.load(Ordering::Relaxed);
-    let scope_len = OOM_SCOPE_LEN.load(Ordering::Relaxed);
+    let scope_ptr = unsafe { read_word(OOM_SCOPE_PTR) };
+    let scope_len = unsafe { read_word(OOM_SCOPE_LEN) };
     if scope_ptr != 0 && scope_len != 0 {
         debug_bytes(b" scope=");
         // SAFETY: scopes are static byte strings installed through `enter_scope`.

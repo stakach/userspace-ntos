@@ -3801,6 +3801,7 @@ mod tests {
     use alloc::format;
     use alloc::string::String;
     use alloc::vec;
+    use core::num::NonZeroU32;
     use nt_config_manager::{
         device_property, encode_multi_sz, encode_sz, ConfigManager, RegistryValueType,
         CRITICAL_DEVICE_DATABASE_PATH, ENUM_PATH, SERVICE_AUTO_START, SERVICE_BOOT_START,
@@ -3810,6 +3811,14 @@ mod tests {
     };
     use nt_config_server::CmServer;
     use nt_hive_core::{decode_image, encode_image, try_replay_log, Hive, HiveKind};
+
+    fn fresh_server() -> CmServer {
+        CmServer::new_for_incarnation(NonZeroU32::MIN)
+    }
+
+    fn seeded_server(cm: ConfigManager) -> CmServer {
+        CmServer::with_config_for_incarnation(cm, NonZeroU32::MIN)
+    }
 
     /// In-process backend: dispatch straight into the server (no ring).
     struct Direct {
@@ -3877,7 +3886,7 @@ mod tests {
     }
 
     fn client() -> ConfigClient<Direct> {
-        client_with_server(CmServer::new())
+        client_with_server(fresh_server())
     }
 
     fn client_with_server(server: CmServer) -> ConfigClient<Direct> {
@@ -3889,7 +3898,7 @@ mod tests {
         skew_first_close_generation: bool,
     ) -> ConfigClient<TrackingDirect> {
         ConfigClient::new(TrackingDirect {
-            server: CmServer::new(),
+            server: fresh_server(),
             successful_opens: 0,
             successful_closes: 0,
             skew_second_open_generation,
@@ -3950,7 +3959,7 @@ mod tests {
         assert!(image.len() > CM_HIVE_IMPORT_CHUNK_BYTES);
 
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::new(),
+            server: fresh_server(),
         });
         assert_eq!(client.import_system_hive(&image), Ok(1));
         let snapshot = client
@@ -4221,7 +4230,7 @@ mod tests {
         let mut replayed = hive.clone();
 
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::new(),
+            server: fresh_server(),
         });
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
 
@@ -4507,7 +4516,7 @@ mod tests {
         hive.finish_clean_import();
 
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::new(),
+            server: fresh_server(),
         });
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
         let interface_guid = "{4d36e972-e325-11ce-bfc1-08002be10318}";
@@ -4699,7 +4708,7 @@ mod tests {
         let image = encode_image(&hive);
 
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::new(),
+            server: fresh_server(),
         });
         assert_eq!(client.import_system_hive(&image), Ok(1));
         let mut corrupt = image.clone();
@@ -4745,7 +4754,7 @@ mod tests {
     #[test]
     fn owned_raw_value_query_uses_exact_reported_length() {
         let mut c = ConfigClient::new(Framed {
-            server: CmServer::new(),
+            server: fresh_server(),
         });
         let key = r"\Registry\Machine\Hardware\Description\System\CentralProcessor\0";
         let data = vec![0x5au8; 9_137];
@@ -4780,7 +4789,7 @@ mod tests {
             SERVICE_AUTO_START,
             1,
         );
-        let mut c = client_with_server(CmServer::with_config(cm));
+        let mut c = client_with_server(seeded_server(cm));
         let key = r"\Registry\Machine\System\CurrentControlSet\Services\RpcSs";
         assert!(c.open_key(key));
         assert_eq!(c.query_dword(key, "Type"), Ok(SERVICE_WIN32_SHARE_PROCESS));
@@ -4812,7 +4821,7 @@ mod tests {
             cm.register_devnode(&instance, Some("Pending"), None, &[hardware.as_str()], &[]);
         }
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::with_config(cm),
+            server: seeded_server(cm),
         });
 
         let service_key = r"\Registry\Machine\System\CurrentControlSet\Services\Pending";
@@ -4981,7 +4990,7 @@ mod tests {
             .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
         cm.registry_mut()
             .set_string(key, "FriendlyName", "Intel Test Adapter");
-        CmServer::with_config(cm)
+        seeded_server(cm)
     }
 
     #[test]
@@ -5051,7 +5060,7 @@ mod tests {
             expected.clone(),
         ));
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::with_config(cm),
+            server: seeded_server(cm),
         });
         let mut out = vec![0xa5; expected.len()];
         assert_eq!(
@@ -5102,7 +5111,7 @@ mod tests {
         hive.finish_clean_import();
 
         let mut client = ConfigClient::new(Framed {
-            server: CmServer::new(),
+            server: fresh_server(),
         });
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
         assert_eq!(client.next_device_action(), Ok(None));

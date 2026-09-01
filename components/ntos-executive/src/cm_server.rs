@@ -8,15 +8,20 @@
 
 use crate::*;
 
-use nt_config_server::CmServer;
+use alloc::rc::Rc;
+use core::num::NonZeroU32;
+use nt_config_server::{CmServer, DeviceActionClaimTokenSource};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
 
 #[no_mangle]
 #[link_section = ".text.cm_server_entry"]
-pub unsafe extern "C" fn cm_server_entry(heap_frames: u64) -> ! {
-    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
+    let Some(launch_context) = ServiceLaunchContext::decode(launch_context) else {
+        park();
+    };
+    if !unsafe { allocator::initialize_mapped_heap(launch_context.heap_frames()) } {
         park();
     }
     let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
@@ -30,7 +35,11 @@ pub unsafe extern "C" fn cm_server_entry(heap_frames: u64) -> ! {
     let wait_requests = Sel4Notify::new(&ENV, CT_N_SUB);
     let signal_completion = Sel4Notify::new(&ENV, CT_N_COMP);
 
-    let mut server = CmServer::new();
+    let Some(incarnation) = NonZeroU32::new(launch_context.incarnation()) else {
+        park();
+    };
+    let claim_tokens = Rc::new(DeviceActionClaimTokenSource::new(incarnation));
+    let mut server = CmServer::new_with_claim_token_source(claim_tokens);
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop orders the client's

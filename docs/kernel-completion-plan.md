@@ -21519,6 +21519,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     E1000 path is accepted, add a distinct nonresident driver profile to prove the Config Manager
     selected ensure-load path rather than inferring it from the resident target.
 
+    B3 isolated-CM claim-token fault checkpoint (2026-09-01, host and freestanding validation green;
+    runtime validation pending): the first serialized live-device-action run reached the installed
+    PlugPlay service and then stopped on a protection fault in isolated Configuration Manager TCB 3.
+    Symbolization and disassembly identify the exact write as the image-global
+    `NEXT_DEVICE_ACTION_CLAIM_TOKEN` atomic first exercised by device-action `BEGIN`. The service
+    image is intentionally shared read-only and has no fault endpoint; widening that mapping would
+    discard the component-isolation boundary.
+
+    The generic SURT authority launcher now allocates a nonzero component incarnation and carries it
+    with the validated private-heap size in the existing single-register bootstrap contract. CM
+    creates one private, heap-backed claim-token source for that incarnation and shares it with any
+    reconstructed `CmServer` objects. Tokens combine the incarnation with a checked process-lifetime
+    sequence. This preserves stale-token rejection across both object reconstruction and component
+    restart without writable image state, a fault-handler workaround, or broader service mappings.
+    There is no fixed-incarnation `CmServer::new` fallback: every authority is constructed with an
+    explicit incarnation or an explicitly shared process-lifetime token source.
+    Object, I/O, CM, and LPC entry points all fail closed on a malformed launch context; unrelated
+    driver and thread bootstrap ABIs are unchanged. The focused `nt-config-server` suite passes
+    28/28, including independent reconstruction and restart token assertions, and
+    `nt-config-client` passes 21/21. `git diff --check` is clean, and the freestanding executive
+    check remains green at the established 209-warning baseline. Rerun the same bounded
+    live-device-action lane and require the exact StartDevice proof rather than treating restored
+    progress as acceptance.
+
+    Review adjustment: the same audit found the allocator's one-shot OOM diagnostics in four
+    writable image atomics. They were not the observed fault, but an allocation failure while CM
+    encoded a device action would have hit the same isolation violation before returning null. The
+    allocator now keeps its report flag, context, and static scope pair in explicit component-local
+    words in the existing private RW heap header. The component-local module reservation remains
+    five words, allocator metadata has non-overlapping named slots, and durable allocation data
+    still begins at the unchanged `HEAP_BASE + 128`. No diagnostic is suppressed and no image page
+    becomes writable.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

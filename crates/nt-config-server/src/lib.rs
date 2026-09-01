@@ -14,9 +14,11 @@ mod key_lease;
 mod mutation;
 mod snapshot;
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::cell::Cell;
+use core::num::NonZeroU32;
 
 use key_lease::{SystemKeyLeaseBank, SystemKeyLeaseError};
 use mutation::{decode_mutation_journal, HiveMutation, MutationLeaseBank, MutationLeaseError};
@@ -895,15 +897,32 @@ struct DeviceActionClaim {
     complete: bool,
 }
 
-static NEXT_DEVICE_ACTION_CLAIM_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// Process-lifetime source for opaque device-action claim tokens.
+///
+/// A service incarnation owns one source and shares it with every reconstructed
+/// [`CmServer`]. The source is intentionally single-threaded: the CM dispatcher
+/// serializes access to its authority and never requires a writable image global.
+pub struct DeviceActionClaimTokenSource {
+    incarnation: NonZeroU32,
+    next_sequence: Cell<u32>,
+}
 
-fn take_device_action_claim_token() -> Option<u64> {
-    NEXT_DEVICE_ACTION_CLAIM_TOKEN
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
-            token.checked_add(1)
-        })
-        .ok()
-        .filter(|token| *token != 0)
+impl DeviceActionClaimTokenSource {
+    pub fn new(incarnation: NonZeroU32) -> Self {
+        Self {
+            incarnation,
+            next_sequence: Cell::new(1),
+        }
+    }
+
+    fn take(&self) -> Option<u64> {
+        let sequence = self.next_sequence.get();
+        if sequence == 0 {
+            return None;
+        }
+        self.next_sequence.set(sequence.checked_add(1).unwrap_or(0));
+        Some(((self.incarnation.get() as u64) << 32) | sequence as u64)
+    }
 }
 
 struct MountedSystemHive {
@@ -960,56 +979,41 @@ pub struct CmServer {
     network_adapter_plan_snapshots: SnapshotBank<u16>,
     device_action_journal: DeviceActionJournal,
     device_action_claim: Option<DeviceActionClaim>,
+    device_action_claim_tokens: Rc<DeviceActionClaimTokenSource>,
     raw_value_uploads: Vec<RawValueUpload>,
     next_raw_value_upload_token: u64,
     raw_value_snapshots: SnapshotPool<u32>,
 }
 
-impl Default for CmServer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CmServer {
-    pub fn new() -> Self {
-        Self {
-            cm: ConfigManager::new(),
-            device_property_snapshots: SnapshotBank::new(),
-            driver_service_snapshots: SnapshotBank::new(),
-            system_hive: None,
-            hive_imports: Vec::new(),
-            next_hive_import_token: 1,
-            system_mutation_leases: MutationLeaseBank::new(),
-            prepared_system_mutation: None,
-            prepared_system_checkpoint: None,
-            next_system_checkpoint_token: 1,
-            system_key_leases: SystemKeyLeaseBank::new(),
-            hive_key_snapshots: SnapshotPool::with_limits(
-                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
-                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
-            ),
-            hive_export_snapshots: SnapshotPool::with_limits(
-                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
-                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
-            ),
-            driver_launch_plan_snapshots: SnapshotBank::new(),
-            win32_service_launch_plan_snapshots: SnapshotBank::new(),
-            pnp_query_snapshots: SnapshotBank::new(),
-            network_adapter_plan_snapshots: SnapshotBank::new(),
-            device_action_journal: DeviceActionJournal::new(),
-            device_action_claim: None,
-            raw_value_uploads: Vec::new(),
-            next_raw_value_upload_token: 1,
-            raw_value_snapshots: SnapshotPool::with_limits(
-                MAX_OUTSTANDING_RAW_VALUE_SNAPSHOTS,
-                MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES,
-            ),
-        }
+    /// Build a fresh authority for one kernel-issued service incarnation.
+    ///
+    /// Device-action claims combine this incarnation with a server-owned
+    /// sequence, so a client cannot replay a pre-restart transfer token.
+    pub fn new_for_incarnation(incarnation: NonZeroU32) -> Self {
+        Self::new_with_claim_token_source(Rc::new(DeviceActionClaimTokenSource::new(incarnation)))
     }
 
-    /// Build a server around an already-seeded Configuration Manager.
-    pub fn with_config(cm: ConfigManager) -> Self {
+    /// Build a fresh authority sharing a process-lifetime claim-token source.
+    pub fn new_with_claim_token_source(
+        device_action_claim_tokens: Rc<DeviceActionClaimTokenSource>,
+    ) -> Self {
+        Self::with_config_and_claim_token_source(ConfigManager::new(), device_action_claim_tokens)
+    }
+
+    /// Build a seeded authority for one kernel-issued service incarnation.
+    pub fn with_config_for_incarnation(cm: ConfigManager, incarnation: NonZeroU32) -> Self {
+        Self::with_config_and_claim_token_source(
+            cm,
+            Rc::new(DeviceActionClaimTokenSource::new(incarnation)),
+        )
+    }
+
+    /// Build a seeded authority sharing a process-lifetime claim-token source.
+    pub fn with_config_and_claim_token_source(
+        cm: ConfigManager,
+        device_action_claim_tokens: Rc<DeviceActionClaimTokenSource>,
+    ) -> Self {
         Self {
             cm,
             device_property_snapshots: SnapshotBank::new(),
@@ -1036,6 +1040,7 @@ impl CmServer {
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
             device_action_claim: None,
+            device_action_claim_tokens,
             raw_value_uploads: Vec::new(),
             next_raw_value_upload_token: 1,
             raw_value_snapshots: SnapshotPool::with_limits(
@@ -1043,6 +1048,10 @@ impl CmServer {
                 MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES,
             ),
         }
+    }
+
+    fn take_device_action_claim_token(&mut self) -> Option<u64> {
+        self.device_action_claim_tokens.take()
     }
 
     /// Direct read access to the registry authority.
@@ -3399,7 +3408,7 @@ impl CmServer {
                 let Some(value) = encode_device_action_event(event) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
-                let Some(token) = take_device_action_claim_token() else {
+                let Some(token) = self.take_device_action_claim_token() else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
                 let needed = value.len();
@@ -4037,7 +4046,7 @@ mod tests {
             .set_string(key, "PdoName", r"\Device\NTPNP_PCI0001");
         cm.registry_mut()
             .set_string(key, "FriendlyName", "Intel Test Adapter");
-        CmServer::with_config(cm)
+        CmServer::with_config_for_incarnation(cm, NonZeroU32::MIN)
     }
 
     #[test]
@@ -4102,9 +4111,10 @@ mod tests {
     }
 
     #[test]
-    fn device_action_claim_is_exclusive_completed_and_restart_distinct() {
+    fn device_action_claim_is_exclusive_and_distinct_across_reconstruction_and_restart() {
         let image = encode_image(&selected_system_hive(1));
-        let mut server = CmServer::new();
+        let claim_tokens = Rc::new(DeviceActionClaimTokenSource::new(NonZeroU32::MIN));
+        let mut server = CmServer::new_with_claim_token_source(Rc::clone(&claim_tokens));
         assert_eq!(publish_hive(&mut server, &image), 1);
         publish_test_device_action(&mut server);
 
@@ -4188,7 +4198,7 @@ mod tests {
         assert_eq!(ack.status, STATUS_SUCCESS);
         assert_eq!(ack.information, 0);
 
-        let mut replacement = CmServer::new();
+        let mut replacement = CmServer::new_with_claim_token_source(claim_tokens);
         assert_eq!(publish_hive(&mut replacement, &image), 1);
         publish_test_device_action(&mut replacement);
         let replacement_begin = replacement.dispatch(
@@ -4198,6 +4208,7 @@ mod tests {
         );
         assert_eq!(replacement_begin.status, STATUS_SUCCESS);
         assert_ne!(replacement_begin.detail1, begin.detail1);
+        assert_eq!(replacement_begin.detail1 >> 32, 1);
         let stale_ack = replacement.dispatch(
             opcode::CM_OP_DEVICE_ACTION,
             device_action_request(device_action_transfer::ACK, 2, 1, begin.detail1, 0, 0)
@@ -4205,6 +4216,19 @@ mod tests {
             &mut [],
         );
         assert_eq!(stale_ack.status, STATUS_INVALID_PARAMETER);
+
+        let restart_incarnation = NonZeroU32::new(2).unwrap();
+        let mut restarted = CmServer::new_for_incarnation(restart_incarnation);
+        assert_eq!(publish_hive(&mut restarted, &image), 1);
+        publish_test_device_action(&mut restarted);
+        let restarted_begin = restarted.dispatch(
+            opcode::CM_OP_DEVICE_ACTION,
+            device_action_request(device_action_transfer::BEGIN, 0, 0, 0, 0, 4096).as_bytes(),
+            &mut [0u8; 4096],
+        );
+        assert_eq!(restarted_begin.status, STATUS_SUCCESS);
+        assert_eq!(restarted_begin.detail1 >> 32, 2);
+        assert_ne!(restarted_begin.detail1, replacement_begin.detail1);
     }
 
     #[test]
@@ -4429,7 +4453,7 @@ mod tests {
             let hardware = alloc::format!(r"ROOT\PENDING_{index:04}_{}", "H".repeat(64));
             cm.register_devnode(&instance, Some("Pending"), None, &[hardware.as_str()], &[]);
         }
-        let mut server = CmServer::with_config(cm);
+        let mut server = CmServer::with_config_for_incarnation(cm, NonZeroU32::MIN);
         let expected_binding = server
             .config_mut()
             .driver_service_binding("Pending")
@@ -4507,7 +4531,7 @@ mod tests {
         second.finish_clean_import();
         let second = encode_image(&second);
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         let first_token = begin_hive_import(&mut server, &first);
         let second_token = begin_hive_import(&mut server, &second);
         assert_ne!(first_token, second_token);
@@ -4547,7 +4571,7 @@ mod tests {
     fn prepared_system_mutation_blocks_mount_replacement() {
         let first = encode_image(&selected_system_hive(1));
         let second = encode_image(&selected_system_hive(2));
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &first), 1);
 
         server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
@@ -4606,7 +4630,7 @@ mod tests {
             vec![0x5a; CM_HIVE_CHECKPOINT_CHUNK_BYTES + 73],
         ));
         hive.finish_clean_import();
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
         let mutations = [HiveMutation::SetValue {
             path: String::from(r"\Registry\Machine\System\CurrentControlSet\Services\Checkpointed"),
@@ -4756,7 +4780,7 @@ mod tests {
         hive.set_dword(active, "Start", SERVICE_DEMAND_START);
         hive.finish_clean_import();
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
         let mounted = server.system_hive.as_ref().unwrap();
         assert_eq!(mounted.current_control_set.as_str(), "ControlSet002");
@@ -4809,7 +4833,7 @@ mod tests {
         stable.create_key(r"ControlSet001\Services\Stable");
         stable.finish_clean_import();
         let stable_image = encode_image(&stable);
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &stable_image), 1);
 
         let mut invalid = Hive::new(HiveKind::System);
@@ -4868,7 +4892,7 @@ mod tests {
         second.finish_clean_import();
         let second_image = encode_image(&second);
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &first_image), 1);
         let mounted = server.system_hive.as_ref().unwrap();
         let expected = encode_hive_key_snapshot(
@@ -4925,7 +4949,7 @@ mod tests {
         ));
         hive.finish_clean_import();
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
         let mut tokens = Vec::new();
         for _ in 0..MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS {
@@ -5035,7 +5059,7 @@ mod tests {
         assert!(hive.set_value(acpi, "Service", RegistryValueType::Sz, encode_sz("acpi"),));
         hive.finish_clean_import();
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
         let binding = server
             .config()
@@ -5082,7 +5106,7 @@ mod tests {
         ));
         hive.finish_clean_import();
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
         let inactive_update = [HiveMutation::SetValue {
             path: String::from(
@@ -5143,7 +5167,7 @@ mod tests {
         ));
         hive.finish_clean_import();
 
-        let mut server = CmServer::new();
+        let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &encode_image(&hive)), 1);
         let devnode = server.config().devnode(INSTANCE).unwrap().id;
         assert!(server.config_mut().set_legacy_property(

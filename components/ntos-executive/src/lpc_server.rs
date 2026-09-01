@@ -54,8 +54,11 @@ fn trace_create_port_name(in_buf: &[u8]) {
 
 #[no_mangle]
 #[link_section = ".text.lpc_server_entry"]
-pub unsafe extern "C" fn lpc_server_entry(heap_frames: u64) -> ! {
-    if !unsafe { allocator::initialize_mapped_heap(heap_frames) } {
+pub unsafe extern "C" fn lpc_server_entry(launch_context: u64) -> ! {
+    let Some(launch_context) = ServiceLaunchContext::decode(launch_context) else {
+        park();
+    };
+    if !unsafe { allocator::initialize_mapped_heap(launch_context.heap_frames()) } {
         park();
     }
     let mut submissions = match Consumer::<SurtSqe>::attach(SUB_RING_VADDR as *mut u8, RING_LEN) {
