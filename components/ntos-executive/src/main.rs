@@ -2479,8 +2479,8 @@ static mut THREAD_WAIT_PARKED: ThreadWaitParkTable = ThreadWaitParkTable::new();
 /// Compact identity for an NT object that can satisfy a native wait.
 ///
 /// Dispatcher namespace objects keep their historical raw encoding (the obj_ns index), so existing
-/// wait counters and debug-object proofs stay readable. Process/thread objects and win32k's
-/// client-visible event handles are tagged in the high bits.
+/// wait counters and debug-object proofs stay readable. Other waitable object identities are tagged
+/// in the high bits.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) struct WaitObject(u64);
 
@@ -2490,7 +2490,6 @@ impl WaitObject {
     pub(crate) const KIND_DISPATCHER: u64 = 0;
     pub(crate) const KIND_PROCESS: u64 = 1;
     pub(crate) const KIND_THREAD: u64 = 2;
-    pub(crate) const KIND_WIN32K_EVENT: u64 = 3;
     pub(crate) const KIND_FILE: u64 = 4;
     pub(crate) const KIND_FAT_FILE: u64 = 5;
     pub(crate) const KIND_FAT_DIRECTORY: u64 = 6;
@@ -2509,10 +2508,6 @@ impl WaitObject {
 
     pub(crate) const fn thread(tid: nt_process::ThreadId) -> Self {
         Self((Self::KIND_THREAD << Self::KIND_SHIFT) | tid as u64)
-    }
-
-    pub(crate) const fn win32k_event_body(body: u64) -> Self {
-        Self((Self::KIND_WIN32K_EVENT << Self::KIND_SHIFT) | (body & Self::ID_MASK))
     }
 
     pub(crate) const fn file(file_id: u64) -> Self {
@@ -2560,7 +2555,6 @@ impl WaitObject {
             Self::KIND_DISPATCHER => b"dispatcher",
             Self::KIND_PROCESS => b"process",
             Self::KIND_THREAD => b"thread",
-            Self::KIND_WIN32K_EVENT => b"win32k-event",
             Self::KIND_FILE => b"file",
             Self::KIND_FAT_FILE => b"fat-file",
             Self::KIND_FAT_DIRECTORY => b"fat-directory",

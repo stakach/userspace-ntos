@@ -2416,6 +2416,56 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
     true
 }
 
+/// Service one scalar win32k Event ownership request against the sole live executive handler.
+/// The nested component pump is serialized with native dispatch, so no second handler pointer or
+/// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
+pub(crate) unsafe fn service_win32k_event_request(
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+    const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler_ptr.is_null() {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    }
+    let handler = &mut *handler_ptr;
+    let pi = handler.pi;
+    match op {
+        crate::win32k_subsystem::W32_EVENT_OP_CREATE => handler
+            .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)
+            .map(|handle| (0, handle, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_REFERENCE => handler
+            .provider_reference_event(pi, arg1, arg3 as u32, arg2)
+            .map(|(body, metadata)| (0, body, metadata, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_CLOSE => handler
+            .provider_close_event(pi, arg1)
+            .map(|()| (0, 0, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_DEREFERENCE => handler
+            .provider_dereference_event(arg1)
+            .map(|count| (0, count as u64, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_DRAIN_RECLAIM => handler
+            .pending_event_provider_reclaim()
+            .map(|(id, body)| (0, id, body, 0))
+            .unwrap_or((0, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_ACK_RECLAIM => handler
+            .complete_event_provider_reclaim(arg1, arg2)
+            .map(|()| (0, 0, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_RETAIN_POINTER => handler
+            .provider_retain_event_pointer(arg1)
+            .map(|count| (0, count as u64, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
+    }
+}
+
 unsafe fn delay_timer_rearm_after_park(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,

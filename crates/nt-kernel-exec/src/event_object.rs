@@ -246,7 +246,11 @@ impl EventObjectRegistry {
     }
 
     fn allocate_event_slot(&mut self) -> Result<(usize, Generation), EventObjectError> {
-        if let Some(slot) = self.events.iter().position(|record| !record.live) {
+        if let Some(slot) = self
+            .events
+            .iter()
+            .position(|record| !record.live && record.provider_body.is_none())
+        {
             return Ok((slot, self.events[slot].generation.next()));
         }
         self.events
@@ -330,7 +334,7 @@ impl EventObjectRegistry {
             return Err(EventObjectError::InvalidProviderBody);
         }
         if self.events.iter().enumerate().any(|(slot, record)| {
-            record.live && record.provider_body == Some(body) && self.event_slot(id) != Ok(slot)
+            record.provider_body == Some(body) && self.event_slot(id) != Ok(slot)
         }) {
             return Err(EventObjectError::ProviderBodyInUse);
         }
@@ -381,6 +385,38 @@ impl EventObjectRegistry {
             .ok_or(EventObjectError::InvalidProviderBody)?;
         Self::increment(&mut self.events[slot].pointer_leases)?;
         Ok(body)
+    }
+
+    /// Retain the provider pointer, installing `proposed_body` only when this Event has no
+    /// projection yet. The install and pointer lease are one transaction: a failed retain leaves
+    /// no newly-published body for the component to mistake as owned.
+    pub fn retain_pointer_or_install(
+        &mut self,
+        id: EventObjectId,
+        proposed_body: u64,
+    ) -> Result<(u64, bool), EventObjectError> {
+        if proposed_body == 0 {
+            return Err(EventObjectError::InvalidProviderBody);
+        }
+        let slot = self.event_slot(id)?;
+        if let Some(body) = self.events[slot].provider_body {
+            Self::increment(&mut self.events[slot].pointer_leases)?;
+            return Ok((body, false));
+        }
+        if self
+            .events
+            .iter()
+            .enumerate()
+            .any(|(other, record)| other != slot && record.provider_body == Some(proposed_body))
+        {
+            return Err(EventObjectError::ProviderBodyInUse);
+        }
+        self.events[slot].provider_body = Some(proposed_body);
+        if let Err(error) = Self::increment(&mut self.events[slot].pointer_leases) {
+            self.events[slot].provider_body = None;
+            return Err(error);
+        }
+        Ok((proposed_body, true))
     }
 
     pub fn release_pointer_by_body(
@@ -530,6 +566,47 @@ impl EventObjectRegistry {
         let slot = self.event_slot(id)?;
         self.events[slot].delete_pending = true;
         Ok(self.try_retire(slot))
+    }
+
+    /// Return the oldest retired provider projection awaiting component-side pool reclamation.
+    /// The tombstone keeps its generation and prevents slot reuse until exact acknowledgement.
+    pub fn pending_provider_reclaim(&self) -> Option<(EventObjectId, u64)> {
+        self.events.iter().enumerate().find_map(|(slot, record)| {
+            (!record.live)
+                .then_some(record.provider_body)
+                .flatten()
+                .map(|body| {
+                    (
+                        EventObjectId(ObjectId::new(record.generation, slot as u64)),
+                        body,
+                    )
+                })
+        })
+    }
+
+    /// Acknowledge that win32k freed one exact retired provider body. Stale ids, live objects, and
+    /// mismatched bodies fail closed so a delayed acknowledgement cannot unlock a reused slot.
+    pub fn complete_provider_reclaim(
+        &mut self,
+        id: EventObjectId,
+        body: u64,
+    ) -> Result<(), EventObjectError> {
+        if id.is_null() || body == 0 {
+            return Err(EventObjectError::InvalidProviderBody);
+        }
+        let slot = usize::try_from(id.0.slot()).map_err(|_| EventObjectError::StaleObject)?;
+        let record = self
+            .events
+            .get_mut(slot)
+            .ok_or(EventObjectError::StaleObject)?;
+        if record.live || record.generation != id.0.generation() {
+            return Err(EventObjectError::StaleObject);
+        }
+        if record.provider_body != Some(body) {
+            return Err(EventObjectError::InvalidProviderBody);
+        }
+        record.provider_body = None;
+        Ok(())
     }
 
     fn try_retire(&mut self, slot: usize) -> Option<RetiredEventObject> {
@@ -683,6 +760,22 @@ mod tests {
     }
 
     #[test]
+    fn provider_body_install_and_pointer_retain_are_transactional() {
+        let mut registry = EventObjectRegistry::new();
+        let id = create(&mut registry, 13);
+        assert_eq!(
+            registry.retain_pointer_or_install(id, 0xD000),
+            Ok((0xD000, true))
+        );
+        assert_eq!(
+            registry.retain_pointer_or_install(id, 0xE000),
+            Ok((0xD000, false))
+        );
+        assert_eq!(registry.snapshot(id).unwrap().pointer_leases, 2);
+        assert_eq!(registry.provider_body(id), Ok(Some(0xD000)));
+    }
+
+    #[test]
     fn signals_coalesce_preserve_fifo_and_hold_lifetime_through_delivery() {
         let mut registry = EventObjectRegistry::new();
         let first = create(&mut registry, 20);
@@ -732,6 +825,30 @@ mod tests {
             registry.complete_signal(id),
             Err(EventObjectError::SignalNotDelivering)
         );
+    }
+
+    #[test]
+    fn retired_provider_body_blocks_slot_reuse_until_exact_reclaim_ack() {
+        let mut registry = EventObjectRegistry::new();
+        let old = create(&mut registry, 70);
+        registry.install_provider_body(old, 0x7000).unwrap();
+        registry.retain_pointer(old).unwrap();
+        registry.request_delete(old).unwrap();
+        let retired = registry.release_pointer_by_body(0x7000).unwrap().unwrap();
+        assert_eq!(registry.pending_provider_reclaim(), Some((old, 0x7000)));
+
+        let next = create(&mut registry, 71);
+        assert_ne!(old.0.slot(), next.0.slot());
+        assert_eq!(
+            registry.complete_provider_reclaim(old, 0x7100),
+            Err(EventObjectError::InvalidProviderBody)
+        );
+        registry.complete_provider_reclaim(old, 0x7000).unwrap();
+        assert_eq!(registry.pending_provider_reclaim(), None);
+        let reused = create(&mut registry, 72);
+        assert_eq!(old.0.slot(), reused.0.slot());
+        assert_ne!(old.0.generation(), reused.0.generation());
+        assert_eq!(retired.provider_body, Some(0x7000));
     }
 
     #[test]

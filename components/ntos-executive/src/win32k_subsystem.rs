@@ -797,6 +797,17 @@ pub const W32_LPC_LABEL: u64 = 0x776;
 /// A component-side registry request. The component stages bounded ASCII path/value bytes and the
 /// executive performs the operation through Configuration Manager using an opaque leased handle.
 pub const W32_REGISTRY_LABEL: u64 = 0x777;
+/// Pointer-free Event object ownership requests. The component passes only scalar process handles,
+/// generation-protected ids, and provider-body projections; the executive owns canonical identity.
+pub const W32_EVENT_LABEL: u64 = 0x778;
+
+pub const W32_EVENT_OP_CREATE: u64 = 1;
+pub const W32_EVENT_OP_REFERENCE: u64 = 2;
+pub const W32_EVENT_OP_CLOSE: u64 = 3;
+pub const W32_EVENT_OP_DEREFERENCE: u64 = 4;
+pub const W32_EVENT_OP_DRAIN_RECLAIM: u64 = 5;
+pub const W32_EVENT_OP_ACK_RECLAIM: u64 = 6;
+pub const W32_EVENT_OP_RETAIN_POINTER: u64 = 7;
 
 const VIDEO_IOCTL_HDEV: u64 = 0x00;
 const VIDEO_IOCTL_CODE: u64 = 0x08;
@@ -2713,39 +2724,6 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
     nt_object_manager::win32k_ob::classify(obj_type)
 }
 
-/// Model a real `Event` object for a win32k-visible event `handle` (winsrv's power/media request
-/// events). Allocates a genuine `KEVENT` (`nt_kernel_exec::kevent`, Synchronization / non-signalled)
-/// from the win32k pool and registers it in [`OBJ_TABLE`] under the external handle value, so
-/// [`s_ob_reference_object_by_handle`] resolves it to a typed `Event` (`ExEventObjectType`). A NULL
-/// or already-modelled handle is a no-op (the registry is idempotent). Runs in the win32k component
-/// (its pool + `OBJ_TABLE` are live here).
-unsafe fn register_event_object(handle: u64) {
-    use nt_object_manager::win32k_ob::ObKind;
-    let table = &mut *core::ptr::addr_of_mut!(OBJ_TABLE);
-    if handle == 0 || matches!(table.lookup(handle), Some((ObKind::Event, _))) {
-        return; // NULL, or already modelled (idempotent — don't leak a second KEVENT).
-    }
-    let body = pool_alloc(nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64);
-    if body == 0 {
-        return; // pool exhausted — leave unmodelled (ObRefByHandle will report no object).
-    }
-    nt_kernel_exec::kevent::init_kevent(
-        body as *mut u8,
-        nt_kernel_exec::kevent::EventKind::Synchronization,
-        false,
-    );
-    table.register_event(handle, body);
-}
-
-pub(crate) fn event_body_for_client_handle(handle: u64) -> Option<u64> {
-    use nt_object_manager::win32k_ob::ObKind;
-    let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
-    match table.lookup(handle) {
-        Some((ObKind::Event, body)) => Some(body),
-        _ => None,
-    }
-}
-
 pub(crate) fn event_body_ready(body: u64) -> bool {
     body != 0 && unsafe { nt_kernel_exec::kevent::kevent_read_state(body as *const u8) }
 }
@@ -2768,92 +2746,31 @@ pub(crate) fn event_body_consume(body: u64) -> bool {
     true
 }
 
-unsafe fn register_win32k_local_event_body(body: u64) -> Option<u64> {
-    if body == 0 {
-        return None;
-    }
-    let handle = WIN32K_LOCAL_EVENT_HANDLE_NEXT.fetch_add(4, Ordering::Relaxed);
-    if (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).register_event(handle, body) {
-        Some(handle)
-    } else {
-        None
-    }
-}
-
-unsafe fn create_win32k_local_queue_event() -> Option<(u64, u64)> {
-    let body = pool_alloc(nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64);
-    if body == 0 {
-        return None;
-    }
-    nt_kernel_exec::kevent::init_kevent(
-        body as *mut u8,
-        nt_kernel_exec::kevent::EventKind::Synchronization,
-        false,
-    );
-    register_win32k_local_event_body(body).map(|handle| (handle, body))
-}
-
-unsafe fn ensure_thread_queue_event(w32thread: u64) {
-    if w32thread == 0 {
-        return;
-    }
-    let handle_slot = (w32thread + THREADINFO_HEVENT_QUEUE_CLIENT_OFF) as *mut u64;
-    let server_slot = (w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *mut u64;
-    let handle = read_volatile(handle_slot);
-    let server = read_volatile(server_slot);
-    if handle != 0 && server != 0 {
-        return;
-    }
-
-    if server == 0 && handle != 0 {
-        if let Some(body) = event_body_for_client_handle(handle) {
-            write_volatile(server_slot, body);
-            return;
-        }
-    }
-
-    if handle == 0 && server != 0 {
-        if let Some(alias) = register_win32k_local_event_body(server) {
-            write_volatile(handle_slot, alias);
-            return;
-        }
-    }
-
-    if let Some((new_handle, new_server)) = create_win32k_local_queue_event() {
-        write_volatile(handle_slot, new_handle);
-        write_volatile(server_slot, new_server);
-        let n = WIN32K_THREAD_QUEUE_EVENT_SEEDS.fetch_add(1, Ordering::Relaxed);
-        if n < 16 {
-            print_str(b"[win32k-context] seeded message queue event pti=0x");
-            print_hex((w32thread >> 32) as u32);
-            print_hex(w32thread as u32);
-            print_str(b" handle=0x");
-            print_hex((new_handle >> 32) as u32);
-            print_hex(new_handle as u32);
-            print_str(b" server=0x");
-            print_hex((new_server >> 32) as u32);
-            print_hex(new_server as u32);
-            print_str(b"\n");
-        }
-    } else {
-        let n = WIN32K_THREAD_QUEUE_EVENT_SEEDS.fetch_add(1, Ordering::Relaxed);
-        if n < 16 {
-            print_str(b"[win32k-context] ERROR: could not seed message queue event pti=0x");
-            print_hex((w32thread >> 32) as u32);
-            print_hex(w32thread as u32);
-            print_str(b"\n");
-        }
-    }
-}
-
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
+    let (status, count, _, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_RETAIN_POINTER, object, 0, 0) };
+    if status == 0 {
+        return count;
+    }
     object
+}
+
+extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
+    let (status, count, _, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, object, 0, 0) };
+    if status == 0 {
+        if !unsafe { drain_retired_event_provider_bodies() } {
+            return 0;
+        }
+        return count;
+    }
+    0
 }
 
 extern "win64" fn s_zw_create_event(
     handle_out: *mut u64,
-    _desired_access: u64,
-    _object_attributes: u64,
+    desired_access: u64,
+    object_attributes: u64,
     event_type: u64,
     initial_state: u64,
 ) -> i32 {
@@ -2863,23 +2780,29 @@ extern "win64" fn s_zw_create_event(
     if event_type > 1 {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
+    if object_attributes != 0 {
+        return 0xC000_00BBu32 as i32; // STATUS_NOT_SUPPORTED until named provider creates are brokered.
+    }
     unsafe {
         write_unaligned(handle_out, 0);
-        let body = pool_alloc(nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64);
-        if body == 0 {
-            return STATUS_NO_MEMORY;
+        let (status, handle, _, _) = win32k_event_broker_call(
+            W32_EVENT_OP_CREATE,
+            desired_access,
+            event_type,
+            initial_state,
+        );
+        if status != 0 {
+            return status;
         }
-        let kind = if event_type == 1 {
-            nt_kernel_exec::kevent::EventKind::Synchronization
-        } else {
-            nt_kernel_exec::kevent::EventKind::Notification
-        };
-        nt_kernel_exec::kevent::init_kevent(body as *mut u8, kind, initial_state != 0);
-        let handle = WIN32K_LOCAL_EVENT_HANDLE_NEXT.fetch_add(4, Ordering::Relaxed);
-        if !(&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).register_event(handle, body) {
+        if handle == 0 {
             return STATUS_NO_MEMORY;
         }
         write_unaligned(handle_out, handle);
+        if !drain_retired_event_provider_bodies() {
+            let _ = win32k_event_broker_call(W32_EVENT_OP_CLOSE, handle, 0, 0);
+            write_unaligned(handle_out, 0);
+            return 0xC000_0001u32 as i32;
+        }
     }
     0
 }
@@ -3934,7 +3857,7 @@ const STATUS_OBJECT_TYPE_MISMATCH: i32 = 0xC000_0024u32 as i32;
 /// back to the broker instead of manufacturing a parallel object identity.
 extern "win64" fn s_ob_reference_object_by_handle(
     handle: u64,
-    _access: u64,
+    access: u64,
     obj_type: u64,
     _mode: u64,
     object_out: *mut u64,
@@ -3942,6 +3865,55 @@ extern "win64" fn s_ob_reference_object_by_handle(
 ) -> i32 {
     if !object_out.is_null() {
         unsafe { write_unaligned(object_out, 0) };
+    }
+    if obj_type == nt_object_manager::object_type::event_object_type_addr() {
+        if object_out.is_null() {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        let size = nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64;
+        let proposed = unsafe { pool_alloc(size) };
+        if proposed == 0 {
+            return STATUS_NO_MEMORY;
+        }
+        let (status, body, metadata, _) = unsafe {
+            win32k_event_broker_call(W32_EVENT_OP_REFERENCE, handle, proposed, access)
+        };
+        if status != 0 || body == 0 {
+            if !unsafe { provider_pool_release_owned(&[(proposed, size)]) } {
+                return 0xC000_0001u32 as i32;
+            }
+            return if status != 0 { status } else { STATUS_NO_MEMORY };
+        }
+        if body == proposed {
+            let kind = if metadata & 1 != 0 {
+                nt_kernel_exec::kevent::EventKind::Synchronization
+            } else {
+                nt_kernel_exec::kevent::EventKind::Notification
+            };
+            unsafe {
+                nt_kernel_exec::kevent::init_kevent(body as *mut u8, kind, metadata & 2 != 0)
+            };
+        } else if !unsafe { provider_pool_release_owned(&[(proposed, size)]) } {
+            let _ = unsafe {
+                win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, body, 0, 0)
+            };
+            return 0xC000_0001u32 as i32;
+        }
+        unsafe { write_unaligned(object_out, body) };
+        if !handle_info.is_null() {
+            unsafe {
+                write_unaligned(handle_info as *mut u32, 0);
+                write_unaligned(handle_info.add(4) as *mut u32, 0x001f_0003);
+            }
+        }
+        if !unsafe { drain_retired_event_provider_bodies() } {
+            let _ = unsafe {
+                win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, body, 0, 0)
+            };
+            unsafe { write_unaligned(object_out, 0) };
+            return 0xC000_0001u32 as i32;
+        }
+        return 0;
     }
     let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
     let (obj, granted_access) = match table.lookup(handle) {
@@ -3955,7 +3927,6 @@ extern "win64" fn s_ob_reference_object_by_handle(
                 // created with MAXIMUM_ALLOWED, and duplicate aliases preserve the same grant.
                 ObKind::WindowStation => 0x000f_037f,
                 ObKind::Desktop => 0x000f_01ff,
-                ObKind::Event => 0x001f_0003,
                 ObKind::Other => u32::MAX,
             };
             (body, access)
@@ -4194,6 +4165,15 @@ extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
     }
     if unsafe { close_token_handle(handle) } {
         return 0;
+    }
+    let (event_status, _, _, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_CLOSE, handle, 0, 0) };
+    if event_status == 0 {
+        return if unsafe { drain_retired_event_provider_bodies() } {
+            0
+        } else {
+            0xC000_0001u32 as i32
+        };
     }
     let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
     if table.close(handle) || table.lookup(handle).is_some() {
@@ -5793,7 +5773,6 @@ static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static SET_THREAD_DESKTOP_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_HANDLE_NEXT: AtomicU64 = AtomicU64::new(0x0000_0000_6E00_0000);
 const WIN32K_LOCAL_EVENT_SIGNAL_INITIAL_CAP: u64 = 128;
 static WIN32K_LOCAL_EVENT_SIGNAL_PTR: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_SIGNAL_HEAD: AtomicU64 = AtomicU64::new(0);
@@ -5802,7 +5781,6 @@ static WIN32K_LOCAL_EVENT_SIGNAL_CAP: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_SIGNAL_GROWTHS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 static WIN32K_LOCAL_EVENT_SIGNAL_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
-static WIN32K_THREAD_QUEUE_EVENT_SEEDS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
 
 unsafe fn ensure_local_event_signal_capacity(required: u64) -> bool {
@@ -5913,7 +5891,6 @@ pub(crate) unsafe fn current_thread_queue_event_body() -> Option<u64> {
     if w32thread == 0 {
         return None;
     }
-    ensure_thread_queue_event(w32thread);
     let body = read_volatile((w32thread + THREADINFO_PEVENT_QUEUE_SERVER_OFF) as *const u64);
     (body != 0).then_some(body)
 }
@@ -9753,6 +9730,63 @@ unsafe fn win32k_registry_broker_call(op: u64, arg: u64) -> (i32, u64, u64) {
     (status as u32 as i32, out1, out2)
 }
 
+unsafe fn win32k_event_broker_call(
+    op: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (i32, u64, u64, u64) {
+    let (_label, status, out1, out2, out3) =
+        crate::driver_launch::call_on4((W32_EVENT_LABEL << 12) | 4, op, arg1, arg2, arg3);
+    (status as u32 as i32, out1, out2, out3)
+}
+
+static WIN32K_EVENT_RECLAIM_ACK_ID: AtomicU64 = AtomicU64::new(0);
+static WIN32K_EVENT_RECLAIM_ACK_BODY: AtomicU64 = AtomicU64::new(0);
+
+unsafe fn drain_retired_event_provider_bodies() -> bool {
+    loop {
+        let pending_id = WIN32K_EVENT_RECLAIM_ACK_ID.load(Ordering::Acquire);
+        let pending_body = WIN32K_EVENT_RECLAIM_ACK_BODY.load(Ordering::Acquire);
+        if pending_id != 0 || pending_body != 0 {
+            if pending_id == 0 || pending_body == 0 {
+                return false;
+            }
+            let (status, _, _, _) = win32k_event_broker_call(
+                W32_EVENT_OP_ACK_RECLAIM,
+                pending_id,
+                pending_body,
+                0,
+            );
+            if status != 0 {
+                return false;
+            }
+            WIN32K_EVENT_RECLAIM_ACK_BODY.store(0, Ordering::Release);
+            WIN32K_EVENT_RECLAIM_ACK_ID.store(0, Ordering::Release);
+            continue;
+        }
+        let (status, id, body, _) =
+            win32k_event_broker_call(W32_EVENT_OP_DRAIN_RECLAIM, 0, 0, 0);
+        if status != 0 {
+            return false;
+        }
+        if id == 0 && body == 0 {
+            return true;
+        }
+        if id == 0
+            || body == 0
+            || !provider_pool_release_owned(&[(
+                body,
+                nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
+            )])
+        {
+            return false;
+        }
+        WIN32K_EVENT_RECLAIM_ACK_ID.store(id, Ordering::Release);
+        WIN32K_EVENT_RECLAIM_ACK_BODY.store(body, Ordering::Release);
+    }
+}
+
 unsafe fn open_cm_system_hive_target(path: &str) -> Result<Win32kRegHandleTarget, i32> {
     let opened = crate::config_manager_open_system_hive_key(path)?;
     Ok(Win32kRegHandleTarget::SystemHive {
@@ -10801,7 +10835,12 @@ fn register_trampolines() -> bool {
     reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
     reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
     reg.bind("ObReferenceObject", s_ob_reference_object as usize as u64);
-    reg.bind("ObDereferenceObject", s_void as usize as u64);
+    reg.bind("ObDereferenceObject", s_ob_dereference_object as usize as u64);
+    reg.bind("ObfReferenceObject", s_ob_reference_object as usize as u64);
+    reg.bind(
+        "ObfDereferenceObject",
+        s_ob_dereference_object as usize as u64,
+    );
     reg.bind("ZwDuplicateObject", s_zw_duplicate_object as usize as u64);
     reg.bind("NtDuplicateObject", s_zw_duplicate_object as usize as u64);
     reg.bind("ZwClose", s_zw_close as usize as u64);
@@ -12367,17 +12406,6 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             publish_thread_desktop_binding(t, hdesk, desk_body, pdeskinfo);
         }
     }
-    if ssn == SSN_NT_USER_INITIALIZE_REAL {
-        // NtUserInitialize(dwWinVersion, hPowerRequestEvent=a1, hMediaRequestEvent=a2). These are
-        // real Event handles winsrv created via NtCreateEvent; win32k's IntInitWin32PowerManagement
-        // references the power event by handle+type. MODEL them as real typed Event objects — a
-        // KEVENT body from the win32k pool + a win32k_ob registration keyed by the handle — so the
-        // subsequent ObReferenceObjectByHandle(handle, *ExEventObjectType) resolves + type-checks a
-        // genuine KEVENT (no fake-EPROCESS masking). Synchronization/non-signalled == winsrv's
-        // NtCreateEvent(SynchronizationEvent, FALSE).
-        register_event_object(a1);
-        register_event_object(a2);
-    }
     let result = if ssn == SSN_TEST_FAULT {
         // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
         // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed
@@ -13813,7 +13841,6 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     // this handle via NtUserxMsqSetWakeMask, and ReactOS signals the server KEVENT when queue bits
     // change. A hosted THREADINFO without these fields can still survive direct PeekMessage calls, but
     // it cannot participate in the real wait/wake path explorer uses while bringing up the desktop.
-    ensure_thread_queue_event(w32thread);
 }
 
 unsafe fn initialize_list_head(head: u64) {

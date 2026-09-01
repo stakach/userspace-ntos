@@ -22168,6 +22168,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Only after those imports use the broker should provider-body publication and final pool reclaim
     be enabled; the four-slot ring and repair path remain deletion targets, not fallback behavior.
 
+    Queue-event provider-broker checkpoint (2026-09-02, host and freestanding green; signal/GUI
+    integration pending): win32k now reaches the live executive through a dedicated Event broker
+    whose caller identity is derived from the routed provider context. Provider `ZwCreateEvent`
+    creates the canonical `EventStore` object and a real process-local typed handle;
+    `ObReferenceObjectByHandle` access-checks that handle, atomically installs-or-retains one exact
+    provider `KEVENT` projection, and initializes only a newly installed body. `ObCloseHandle`,
+    `ObReferenceObject`/`ObfReferenceObject`, and `ObDereferenceObject`/`ObfDereferenceObject` now
+    update the corresponding handle or pointer lease instead of returning synthetic results.
+
+    Retired provider bodies remain generation-fenced tombstones until win32k exact-frees the owned
+    `0x18` allocation and acknowledges the matching object id and body. Interrupted acknowledgement
+    retries cannot free the body twice. The old four-entry Event ring, provider-global fake handles,
+    `NtUserInitialize` queue-event repair, and the duplicate raw-body native-wait kind have been
+    deleted; native waits resolve the same typed handle and canonical EventStore identity as native
+    set/query operations. `cargo test -p nt-object-manager` passes 65/65,
+    `cargo test -p nt-kernel-exec` passes 199/199, and the freestanding executive check is green.
+
+    Review adjustment: the remaining raw provider-address signal FIFO and GUI GetMessage waiter
+    records still prevent runtime acceptance. Replace them with the registry's coalescing signal
+    lease and unique `GuiWait` lease, make `KeSetEvent` update canonical dispatcher state through
+    the broker, release every GUI lease on wake/cancel/teardown, and delete the raw FIFO. Only then
+    run the one-hour-capped desktop/churn gate and accept provider-body reclamation.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

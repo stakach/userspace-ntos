@@ -1346,6 +1346,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == crate::win32k_subsystem::W32_LPC_LABEL && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_EVENT_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -1942,6 +1944,25 @@ unsafe fn component_pump_loop(
             let (status, out1, out2) =
                 crate::win32k_subsystem::service_registry_request(msg.m0, msg.m1);
             pump_reply_recv4_into!(ch, *reply_cap, msg, 3, status as u32 as u64, out1, out2, 0);
+            continue;
+        } else if label == crate::win32k_subsystem::W32_EVENT_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, out1, out2, out3) = unsafe {
+                crate::service_sec_image::service_win32k_event_request(
+                    msg.m0, msg.m1, msg.m2, msg.m3,
+                )
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                4,
+                status as u32 as u64,
+                out1,
+                out2,
+                out3
+            );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PS_CREATE_SYSTEM_THREAD_LABEL
             && ch.caps.kind == ReqKind::Irp

@@ -11867,8 +11867,17 @@ impl ExecNtHandler {
 
     /// Mint a process-local event handle that references a shared executive event identity.
     pub(crate) fn mint_event_handle(&mut self, event_index: usize, access: u32) -> Option<u64> {
-        let pid = self.pm_pid_for_pi(self.pi)?;
-        let generation = self.hosted_process_generation(self.pi)?;
+        self.mint_event_handle_for_pi(self.pi, event_index, access)
+    }
+
+    fn mint_event_handle_for_pi(
+        &mut self,
+        pi: usize,
+        event_index: usize,
+        access: u32,
+    ) -> Option<u64> {
+        let pid = self.pm_pid_for_pi(pi)?;
+        let generation = self.hosted_process_generation(pi)?;
         let entry = self.obj_ns.get(event_index)?;
         if !entry.is_live()
             || entry.kind != OBJ_KIND_EVENT
@@ -11913,6 +11922,16 @@ impl ExecNtHandler {
         handle: u64,
         required_access: u32,
     ) -> Result<usize, u32> {
+        self.event_object_for_handle_in_pi(self.pi, handle, required_access)
+            .map(|(_, index)| index)
+    }
+
+    fn event_object_for_handle_in_pi(
+        &self,
+        pi: usize,
+        handle: u64,
+        required_access: u32,
+    ) -> Result<(nt_kernel_exec::EventObjectId, usize), u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
         const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
@@ -11923,7 +11942,7 @@ impl ExecNtHandler {
                 _ => Err(STATUS_INVALID_HANDLE),
             };
         }
-        let pid = self.pm_pid_for_pi(self.pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let pid = self.pm_pid_for_pi(pi).ok_or(STATUS_INVALID_HANDLE)?;
         let id = match self.pm.lookup_handle(pid, handle as nt_process::Handle) {
             Some(nt_process::HandleObject::Event(id)) => nt_kernel_exec::EventObjectId(id),
             Some(_) => return Err(STATUS_OBJECT_TYPE_MISMATCH),
@@ -11950,7 +11969,7 @@ impl ExecNtHandler {
                     && entry.kind == OBJ_KIND_EVENT
                     && self.events.contains(index as u64)
             })
-            .map(|_| index)
+            .map(|_| (id, index))
             .ok_or(STATUS_INVALID_HANDLE)
     }
 
@@ -12666,12 +12685,10 @@ impl ExecNtHandler {
             Err(STATUS_OBJECT_TYPE_MISMATCH) => {}
             Err(status) => return Err(status),
         }
-        self.win32k_event_wait_object(handle).or_else(|_| {
-            Err(if saw_invalid_handle {
-                STATUS_INVALID_HANDLE
-            } else {
-                STATUS_OBJECT_TYPE_MISMATCH
-            })
+        Err(if saw_invalid_handle {
+            STATUS_INVALID_HANDLE
+        } else {
+            STATUS_OBJECT_TYPE_MISMATCH
         })
     }
 
@@ -13054,13 +13071,6 @@ impl ExecNtHandler {
         }
     }
 
-    fn win32k_event_wait_object(&self, handle: u64) -> Result<WaitObject, u32> {
-        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-        crate::win32k_subsystem::event_body_for_client_handle(handle)
-            .map(WaitObject::win32k_event_body)
-            .ok_or(STATUS_INVALID_HANDLE)
-    }
-
     fn dispatcher_object_for_thread(
         &self,
         index: usize,
@@ -13211,9 +13221,6 @@ impl ExecNtHandler {
             WaitObject::KIND_THREAD => self
                 .pm
                 .retain_thread_wait_reference(object.id() as nt_process::ThreadId),
-            // win32k event bodies live in its non-reclaiming session pool. Resolution produced the
-            // body immediately before this serialized park, so the pool allocation is the root.
-            WaitObject::KIND_WIN32K_EVENT if object.id() != 0 => Ok(()),
             WaitObject::KIND_FILE => self.file_completion.retain_file(object.id()),
             WaitObject::KIND_FAT_FILE => self.readonly_file_opens.retain_io(object.id() as u32),
             WaitObject::KIND_FAT_DIRECTORY => self.directory_opens.retain_io(object.id() as u32),
@@ -13248,7 +13255,6 @@ impl ExecNtHandler {
                 }
                 Ok(())
             }
-            WaitObject::KIND_WIN32K_EVENT if object.id() != 0 => Ok(()),
             WaitObject::KIND_FILE => {
                 let release = self.file_completion.release_file(object.id())?;
                 self.complete_file_reference_release(object.id(), release);
@@ -13274,7 +13280,6 @@ impl ExecNtHandler {
             WaitObject::KIND_DISPATCHER => self.dispatcher_ready_for(object.id() as usize, thread),
             WaitObject::KIND_PROCESS => self.pm.is_process_signaled(object.id() as u32),
             WaitObject::KIND_THREAD => self.pm.is_thread_signaled(object.id() as u32),
-            WaitObject::KIND_WIN32K_EVENT => crate::win32k_subsystem::event_body_ready(object.id()),
             WaitObject::KIND_FILE => self
                 .file_completion
                 .is_signaled(object.id())
@@ -13315,13 +13320,6 @@ impl ExecNtHandler {
                 self.dispatcher_consume_for(object.id() as usize, thread)
             }
             WaitObject::KIND_PROCESS | WaitObject::KIND_THREAD => Consumed,
-            WaitObject::KIND_WIN32K_EVENT => {
-                if crate::win32k_subsystem::event_body_consume(object.id()) {
-                    Consumed
-                } else {
-                    NotReady
-                }
-            }
             WaitObject::KIND_FILE
             | WaitObject::KIND_FAT_FILE
             | WaitObject::KIND_FAT_DIRECTORY
@@ -25537,10 +25535,6 @@ impl ExecNtHandler {
         &mut self,
         retired: nt_kernel_exec::RetiredEventObject,
     ) {
-        assert!(
-            retired.provider_body.is_none(),
-            "provider KEVENT retirement must cross the win32k broker"
-        );
         let Ok(index) = usize::try_from(retired.native_identity) else {
             return;
         };
@@ -25601,6 +25595,123 @@ impl ExecNtHandler {
             }
             Err(_) => {}
         }
+    }
+
+    pub(crate) fn provider_create_event(
+        &mut self,
+        pi: usize,
+        desired_access: u32,
+        event_type: u32,
+        initial_state: bool,
+    ) -> Result<u64, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        if event_type > 1 || self.pm_pid_for_pi(pi).is_none() {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let index = self
+            .obj_create_anon_event(event_type == 1, initial_state)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        match self.mint_event_handle_for_pi(pi, index, desired_access) {
+            Some(handle) => Ok(handle),
+            None => {
+                self.rollback_new_event(index);
+                Err(STATUS_INSUFFICIENT_RESOURCES)
+            }
+        }
+    }
+
+    pub(crate) fn provider_reference_event(
+        &mut self,
+        pi: usize,
+        handle: u64,
+        desired_access: u32,
+        proposed_body: u64,
+    ) -> Result<(u64, u64), u32> {
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        let (id, index) = self.event_object_for_handle_in_pi(pi, handle, desired_access)?;
+        let body = self
+            .event_objects
+            .retain_pointer_or_install(id, proposed_body)
+            .map(|(body, _)| body)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let Some((kind, signaled)) = self.events.query_existing(index as u64) else {
+            let _ = self.event_objects.release_pointer_by_body(body);
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        };
+        let metadata = u64::from(matches!(kind, EventKind::Synchronization))
+            | (u64::from(signaled) << 1);
+        Ok((body, metadata))
+    }
+
+    pub(crate) fn provider_close_event(&mut self, pi: usize, handle: u64) -> Result<(), u32> {
+        const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        let pid = self.pm_pid_for_pi(pi).ok_or(STATUS_INVALID_HANDLE)?;
+        let handle32 = u32::try_from(handle).map_err(|_| STATUS_INVALID_HANDLE)?;
+        if !matches!(
+            self.pm.lookup_handle(pid, handle32),
+            Some(nt_process::HandleObject::Event(_))
+        ) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.close_process_handle_checked(pid, handle)?
+            .then_some(())
+            .ok_or(STATUS_INVALID_HANDLE)
+    }
+
+    pub(crate) fn provider_retain_event_pointer(&mut self, body: u64) -> Result<u32, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let id = self
+            .event_objects
+            .id_for_provider_body(body)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        self.event_objects
+            .retain_pointer(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        self.event_objects
+            .snapshot(id)
+            .map(|snapshot| snapshot.pointer_leases)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_dereference_event(&mut self, body: u64) -> Result<u32, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let id = self
+            .event_objects
+            .id_for_provider_body(body)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let retired = self
+            .event_objects
+            .release_pointer_by_body(body)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if let Some(retired) = retired {
+            self.finalize_retired_event_object(retired);
+            return Ok(0);
+        }
+        self.event_objects
+            .snapshot(id)
+            .map(|snapshot| snapshot.pointer_leases)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn pending_event_provider_reclaim(&self) -> Option<(u64, u64)> {
+        self.event_objects
+            .pending_provider_reclaim()
+            .map(|(id, body)| (id.0 .0, body))
+    }
+
+    pub(crate) fn complete_event_provider_reclaim(
+        &mut self,
+        raw_id: u64,
+        body: u64,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        self.event_objects
+            .complete_provider_reclaim(
+                nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id)),
+                body,
+            )
+            .map_err(|_| STATUS_INVALID_PARAMETER)
     }
 
     fn obj_delete_name_check(&mut self, index: usize) {
