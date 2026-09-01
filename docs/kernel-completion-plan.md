@@ -21249,6 +21249,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     devnodes out of the production generated hive into an explicit integration-test fixture. Do not
     weaken pending START coverage or synthesize a terminal result while making this split.
 
+    B3 native-load/PnP ownership split checkpoint (2026-09-01, implementation and host validation
+    green; runtime pending): `NtLoadDriver` now terminates after the registry-selected image is
+    validated, the hosted driver instance and `DRIVER_OBJECT` are published, and the real
+    `DriverEntry` returns. It propagates the exact loader or `DriverEntry` status and no longer
+    reserves a PnP batch, calls `AddDevice`, assigns resources, sends START, owns a pending START
+    continuation, or unloads a successfully loaded driver because a later device start failed.
+    Loaded PnP capability is derived from the driver's published dispatch/AddDevice contract rather
+    than the post-AddDevice `ready` state. The old native-START reply owner, detached continuation,
+    and coupled batch report have been deleted.
+
+    The SCM boundary has a separate exact reply ledger. Every terminal `NtLoadDriver` result is
+    paired in order with the status actually delivered through its bound seL4 Reply object; count
+    and ordered digests must agree, pending is forbidden, and send, protocol, or outstanding-reply
+    failures are terminal gate failures. `rust-micro` commits `b02ec89` and `16ed855` expose
+    composite-send failure instead of entering receive or letting the syscall tail overwrite the
+    failure result. Zero native loads are legal in production; the explicit integration profile
+    requires one successful `1/1/1` load/reply row.
+
+    Generated hives now default to a production profile with no `PendingStartTest` service, devnode,
+    or staged image. The `pending-start` integration profile adds two demand-selected
+    `PendingStartTest` root devnodes for independent PnP pending-completion coverage and a separate
+    load-only `NativeLoadTest` SCM service. `scripts/run-pending-start-integration.sh` selects that
+    profile, enforces a 15-minute operational timeout within the hard one-hour boot ceiling, and
+    requires the native-load reply proof, both genuine timer/DPC pending START completions, Explorer
+    paint, and the final sentinel. Profile parsing fails closed and the build/image profile marker
+    prevents stale generated hives from being staged under another profile.
+
+    Focused validation passes all 16 generated-hive tests, the freestanding executive check at the
+    established 209-warning baseline, the `rust-micro` production and spec target checks, the
+    standalone microkernel spec check, shell syntax checks, and `git diff --check`. Review
+    adjustment: run the pending-start integration lane and then the ordinary production desktop
+    lane serially. Before closing this ownership correction, replace the aggregate PnP report with
+    one immutable terminal proof row per genuinely pending devnode, keyed by exact IRP/devnode/
+    dispatch/device/driver generations and proving validated completion, lifecycle commit, exact IRP
+    retirement, terminal publication, and exact observation with no duplicate or retained owner.
+    Boot-profile rows may be replyless; live device-action rows must additionally retain their exact
+    syscall-reply result and eventual action retirement. The historical eager demand-PnP launch and
+    permissive `PlugPlayControlStartDevice` no-action success remain explicit follow-up debt; neither
+    may be treated as the final live Config Manager device-action boundary.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

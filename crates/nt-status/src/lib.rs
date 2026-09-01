@@ -89,6 +89,8 @@ statuses! {
     INVALID_HANDLE = 0xC000_0008u32;
     /// A parameter was invalid.
     INVALID_PARAMETER = 0xC000_000Du32;
+    /// The image is not a valid executable image for this loader.
+    INVALID_IMAGE_FORMAT = 0xC000_007Bu32;
     /// A captured SID is structurally invalid.
     INVALID_SID = 0xC000_0078u32;
     /// A variable-length quota entry chain is malformed.

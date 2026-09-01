@@ -2087,6 +2087,8 @@ const ISR_DONE_BADGE: u64 = 0x80;
 // `SysReplyRecv` — reply to a pending fault + receive the next, in one syscall.
 const SYS_REPLY_RECV: i64 = -2;
 pub const SYS_NB_SEND_RECV: i64 = -3;
+/// rust-micro's fail-closed marker when the send half of `SYS_NB_SEND_RECV` fails before Recv.
+pub const COMPOSITE_SEND_ERROR_BADGE: u64 = u64::MAX;
 pub const SYS_NB_RECV: i64 = -8;
 pub(crate) const SYS_REPLY_HANDOFF_MAGIC: u64 = 0x4e54_4f53_5245_5431;
 /// `X86IRQIssueIRQHandlerIOAPIC` invocation label — issues an IRQ-handler cap AND
@@ -23490,7 +23492,7 @@ struct ExecNtHandler {
     /// START IRP remains pending.
     pending_driver_starts: nt_driver_start::PendingOperationTable<PendingDriverStart>,
     boot_driver_start_reports: BootDriverStartReports,
-    native_driver_start_report: NativeDriverStartReport,
+    native_driver_load_report: NativeDriverLoadReport,
     pending_driver_start_transfer: Option<PendingDriverStartTransfer>,
     pending_pnp_operations: nt_driver_start::PendingOperationTable<PendingPnpOperation>,
     pending_pnp_operation_transfer: Option<PendingPnpOperationTransfer>,
@@ -23681,7 +23683,7 @@ unsafe fn launch_boot_driver_service(
         } else {
             None
         };
-    let Some(dc) = load_driver(
+    let Ok(dc) = load_driver(
         fs,
         spec.image_path.as_bytes(),
         spec.class,
@@ -23885,101 +23887,134 @@ fn report_deferred_generic_hardware_checks(
 }
 
 #[derive(Clone, Copy, Default)]
-struct NativeDriverStartReport {
+struct NativeDriverLoadReport {
     load_calls: u64,
-    pending_batches: u64,
-    completed_batches: u64,
+    terminal_returns: u64,
     replies: u64,
-    attempted: u64,
-    terminal: u64,
-    started: u64,
+    reply_failures: u64,
+    protocol_errors: u64,
+    pending_returns: u64,
+    succeeded: u64,
+    already_loaded: u64,
     failed: u64,
-    pending_observed: u64,
     last_status: u32,
+    last_reply_status: u32,
+    terminal_digest: u64,
+    reply_digest: u64,
+    expected_reply_status: u32,
+    reply_outstanding: bool,
 }
 
-impl NativeDriverStartReport {
-    fn record_terminal(&mut self, report: HostedPnpStartReport, status: u32) {
-        self.completed_batches = self.completed_batches.saturating_add(1);
-        self.attempted = self.attempted.saturating_add(report.attempted);
-        self.terminal = self.terminal.saturating_add(report.terminal);
-        self.started = self.started.saturating_add(report.started);
-        self.failed = self.failed.saturating_add(report.failed);
-        self.pending_observed = self
-            .pending_observed
-            .saturating_add(report.pending_observed);
+impl NativeDriverLoadReport {
+    fn fold_status(digest: u64, sequence: u64, status: u32) -> u64 {
+        digest.rotate_left(9)
+            ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(status)
+    }
+
+    fn record_terminal(&mut self, status: u32) {
+        const STATUS_IMAGE_ALREADY_LOADED: u32 = 0xC000_010E;
+
+        if self.reply_outstanding {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+        }
+        self.terminal_returns = self.terminal_returns.saturating_add(1);
+        self.terminal_digest = Self::fold_status(
+            self.terminal_digest,
+            self.terminal_returns,
+            status,
+        );
+        self.expected_reply_status = status;
+        self.reply_outstanding = true;
+        if status == nt_status::NtStatus::PENDING.raw() as u32 {
+            self.pending_returns = self.pending_returns.saturating_add(1);
+        }
+        if status == nt_status::NtStatus::SUCCESS.raw() as u32 {
+            self.succeeded = self.succeeded.saturating_add(1);
+        } else if status == STATUS_IMAGE_ALREADY_LOADED {
+            self.already_loaded = self.already_loaded.saturating_add(1);
+        } else {
+            self.failed = self.failed.saturating_add(1);
+        }
         self.last_status = status;
+    }
+
+    fn record_reply(&mut self, status: u32, delivered: bool) {
+        if !delivered {
+            self.reply_failures = self.reply_failures.saturating_add(1);
+            return;
+        }
+        self.replies = self.replies.saturating_add(1);
+        self.reply_digest = Self::fold_status(self.reply_digest, self.replies, status);
+        if !self.reply_outstanding || self.expected_reply_status != status {
+            self.protocol_errors = self.protocol_errors.saturating_add(1);
+        }
+        self.reply_outstanding = false;
+        self.last_reply_status = status;
     }
 }
 
-fn report_native_driver_start_check(report: NativeDriverStartReport, passed: &mut u64) {
-    print_str(b"[native-driver-start] NtLoadDriver calls=");
+fn report_native_driver_load_check(report: NativeDriverLoadReport, passed: &mut u64) {
+    print_str(b"[native-driver-load] NtLoadDriver calls/terminal/replied=");
     print_u64(report.load_calls);
-    print_str(b" pending/completed/replied=");
-    print_u64(report.pending_batches);
     print_str(b"/");
-    print_u64(report.completed_batches);
+    print_u64(report.terminal_returns);
     print_str(b"/");
     print_u64(report.replies);
-    print_str(b" attempted/terminal/started/failed/pending-observed=");
-    print_u64(report.attempted);
+    print_str(b" reply-failures/protocol-errors/pending=");
+    print_u64(report.reply_failures);
     print_str(b"/");
-    print_u64(report.terminal);
+    print_u64(report.protocol_errors);
     print_str(b"/");
-    print_u64(report.started);
+    print_u64(report.pending_returns);
+    print_str(b" success/already-loaded/failed=");
+    print_u64(report.succeeded);
+    print_str(b"/");
+    print_u64(report.already_loaded);
     print_str(b"/");
     print_u64(report.failed);
-    print_str(b"/");
-    print_u64(report.pending_observed);
-    print_str(b" last-status=0x");
+    print_str(b" last-status/reply=0x");
     print_hex(report.last_status);
+    print_str(b"/0x");
+    print_hex(report.last_reply_status);
     print_str(b"\n");
     check(
-        b"exec_native_driver_pending_start_replied",
-        report.load_calls >= report.pending_batches
-            && report.pending_batches != 0
-            && report.completed_batches == report.pending_batches
-            && report.replies == report.pending_batches
-            && report.attempted >= 2
-            && report.terminal == report.attempted
-            && report.started == report.terminal
-            && report.failed == 0
-            && report.pending_observed >= 2
-            && report.last_status == 0,
+        b"exec_native_driver_load_replied_terminal",
+        report.terminal_returns == report.load_calls
+            && report.replies == report.terminal_returns
+            && report.reply_failures == 0
+            && report.protocol_errors == 0
+            && report.pending_returns == 0
+            && !report.reply_outstanding
+            && report.terminal_digest == report.reply_digest
+            && report.succeeded + report.already_loaded + report.failed == report.terminal_returns
+            && (report.terminal_returns == 0 || report.last_reply_status == report.last_status),
         passed,
     );
 }
 
-struct NativeDriverStartReply {
+struct PendingPnpSyscallReply {
     tid: u64,
     badge: u64,
     reply_cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
-#[derive(Clone, Copy)]
-enum PendingDriverStartTransferKind {
-    Native,
-    DeviceAction(nt_pnp_manager::DeviceActionClaimIdentity),
-}
-
 struct PendingDriverStartTransfer {
     batch: OwnedHostedPnpStartBatch,
     reservation: nt_driver_start::PendingOperationReservation,
-    kind: PendingDriverStartTransferKind,
+    identity: nt_pnp_manager::DeviceActionClaimIdentity,
 }
 
 enum PendingDriverStartOwner {
-    Native(NativeDriverStartReply),
     DeviceAction {
         identity: nt_pnp_manager::DeviceActionClaimIdentity,
-        reply: Option<NativeDriverStartReply>,
+        reply: Option<PendingPnpSyscallReply>,
     },
     Boot {
         target: BootDriverStartReportTarget,
         report_published: bool,
     },
-    Detached,
 }
 
 struct PendingDriverStart {
@@ -24056,11 +24091,11 @@ struct PendingPnpOperationTransfer {
 }
 
 enum PendingPnpOperationOwner {
-    User(Option<NativeDriverStartReply>),
+    User(Option<PendingPnpSyscallReply>),
     DeviceAction {
         identity: nt_pnp_manager::DeviceActionClaimIdentity,
         operation: nt_pnp_manager::DeviceActionLifecycleOperation,
-        reply: Option<NativeDriverStartReply>,
+        reply: Option<PendingPnpSyscallReply>,
     },
 }
 
@@ -24081,13 +24116,13 @@ impl PendingPnpOperationOwner {
         }
     }
 
-    fn reply(&self) -> Option<&NativeDriverStartReply> {
+    fn reply(&self) -> Option<&PendingPnpSyscallReply> {
         match self {
             Self::User(reply) | Self::DeviceAction { reply, .. } => reply.as_ref(),
         }
     }
 
-    fn take_reply(&mut self) -> Option<NativeDriverStartReply> {
+    fn take_reply(&mut self) -> Option<PendingPnpSyscallReply> {
         match self {
             Self::User(reply) | Self::DeviceAction { reply, .. } => reply.take(),
         }
@@ -32150,7 +32185,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             print_str(b" object=");
             print_str(proof_driver_spec.driver_object_path.as_bytes());
             print_str(b"\n");
-            if let Some(dc) = load_driver(
+            if let Ok(dc) = load_driver(
                 &fs,
                 &proof_driver_spec.image_path,
                 proof_driver_spec.class,
@@ -32719,7 +32754,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         ntfaults,
                         sssn,
                         final_driver_start_reports,
-                        native_driver_start_report,
+                        native_driver_load_report,
                     ) = service_sec_image(
                         si_fault,
                         spawn.pml4,
@@ -32770,7 +32805,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                             &mut passed,
                         );
                     }
-                    report_native_driver_start_check(native_driver_start_report, &mut passed);
+                    report_native_driver_load_check(native_driver_load_report, &mut passed);
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
                     print_u64(sfaults);
                     print_str(b" page(s) (");

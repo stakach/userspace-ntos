@@ -5,10 +5,10 @@
 
 use nt_config_manager::{
     encode_multi_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_FILE_SYSTEM_DRIVER,
-    SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
+    SERVICE_DEMAND_START, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
 };
 #[cfg(test)]
-use nt_config_manager::{SERVICE_BOOT_START, SERVICE_DEMAND_START};
+use nt_config_manager::SERVICE_BOOT_START;
 #[cfg(test)]
 use nt_hive_core::reactos_network_ipv4_defaults_for_interface;
 use nt_hive_core::{
@@ -38,6 +38,35 @@ const BOCHS_DRIVER_KEY_INDEX: &str = "0000";
 const BOCHS_PDO_NAME: &str = r"\Device\NTPNP_PCI0002";
 #[cfg(test)]
 const GENERATED_HIVE_STORAGE_WINDOW: usize = 7 * 4096;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GeneratedHiveProfile {
+    #[default]
+    Production,
+    PendingStartIntegration,
+}
+
+fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "production" => Some(GeneratedHiveProfile::Production),
+        "pending-start" => Some(GeneratedHiveProfile::PendingStartIntegration),
+        _ => None,
+    }
+}
+
+fn generated_hive_profile_from_env() -> GeneratedHiveProfile {
+    match std::env::var("NTOS_IMAGE_PROFILE") {
+        Ok(value) => generated_hive_profile_from_name(&value).unwrap_or_else(|| {
+            panic!(
+                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start"
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => GeneratedHiveProfile::Production,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("NTOS_IMAGE_PROFILE must be valid UTF-8")
+        }
+    }
+}
 
 struct GeneratedNetworkAdapter {
     service_name: String,
@@ -1062,6 +1091,7 @@ fn install_root_pnp_fixture(hive: &mut Hive, fixture: GeneratedRootPnpFixture<'_
 fn build_hive_with_configuration(
     network_adapters: Vec<GeneratedNetworkAdapter>,
     display_mode: GeneratedDisplayMode,
+    profile: GeneratedHiveProfile,
 ) -> Hive {
     let mut hive = Hive::new(HiveKind::System);
     let select = hive.create_key("Select");
@@ -1088,21 +1118,31 @@ fn build_hive_with_configuration(
     hive.set_dword(key, "Start", SERVICE_SYSTEM_START);
     hive.set_dword(key, "ErrorControl", 0x1);
 
-    // PendingStartTest is an explicit lifecycle test lane. Synthetic hardware fixtures do not
-    // belong in the production boot hive; real device services are installed from enumerated bus
-    // identities and their driver metadata.
-    install_root_pnp_fixture(
-        &mut hive,
-        GeneratedRootPnpFixture {
-            service_name: "PendingStartTest",
-            image_path: r"system32\drivers\PendingStartTest.sys",
-            start: SERVICE_AUTO_START,
-            hardware_id: r"ROOT\USERSPACE_NTOS_PENDING_START",
-            compatible_ids: &[],
-            pdo_name_prefix: "NTPNP_PENDING",
-            instance_count: 2,
-        },
-    );
+    if profile == GeneratedHiveProfile::PendingStartIntegration {
+        let native_load = hive.create_key(r"ControlSet001\Services\NativeLoadTest");
+        hive.set_value(
+            native_load,
+            "ImagePath",
+            RegistryValueType::ExpandSz,
+            utf16le_sz(r"system32\drivers\IrpFsdTest.sys"),
+        );
+        hive.set_dword(native_load, "Type", SERVICE_FILE_SYSTEM_DRIVER);
+        hive.set_dword(native_load, "Start", SERVICE_AUTO_START);
+        hive.set_dword(native_load, "ErrorControl", 0x1);
+
+        install_root_pnp_fixture(
+            &mut hive,
+            GeneratedRootPnpFixture {
+                service_name: "PendingStartTest",
+                image_path: r"system32\drivers\PendingStartTest.sys",
+                start: SERVICE_DEMAND_START,
+                hardware_id: r"ROOT\USERSPACE_NTOS_PENDING_START",
+                compatible_ids: &[],
+                pdo_name_prefix: "NTPNP_PENDING",
+                instance_count: 2,
+            },
+        );
+    }
 
     install_generated_network_adapters(&mut hive, &network_adapters);
     seed_generated_network_setup(&mut hive);
@@ -1116,7 +1156,11 @@ fn build_hive_with_configuration(
 
 #[cfg(test)]
 fn build_hive_with_network_adapters(network_adapters: Vec<GeneratedNetworkAdapter>) -> Hive {
-    build_hive_with_configuration(network_adapters, GeneratedDisplayMode::DEFAULT)
+    build_hive_with_configuration(
+        network_adapters,
+        GeneratedDisplayMode::DEFAULT,
+        GeneratedHiveProfile::Production,
+    )
 }
 
 #[cfg(test)]
@@ -1131,6 +1175,7 @@ fn main() {
     let hive = build_hive_with_configuration(
         generated_network_adapters_from_env(),
         generated_display_mode_from_env(),
+        generated_hive_profile_from_env(),
     );
     let bytes = encode_image(&hive);
     std::fs::write(&out, &bytes).expect("write hive image");
@@ -1152,6 +1197,20 @@ mod tests {
         assert_eq!(hive.query_dword(select, "Default"), Some(1));
         assert_eq!(hive.query_dword(select, "LastKnownGood"), Some(1));
         assert_eq!(hive.query_dword(select, "Failed"), Some(0));
+    }
+
+    #[test]
+    fn generated_hive_profile_parser_is_exact_and_fail_closed() {
+        assert_eq!(
+            generated_hive_profile_from_name("production"),
+            Some(GeneratedHiveProfile::Production)
+        );
+        assert_eq!(
+            generated_hive_profile_from_name("pending-start"),
+            Some(GeneratedHiveProfile::PendingStartIntegration)
+        );
+        assert_eq!(generated_hive_profile_from_name("pending"), None);
+        assert_eq!(generated_hive_profile_from_name(""), None);
     }
 
     #[test]
@@ -1183,19 +1242,54 @@ mod tests {
     }
 
     #[test]
-    fn generated_hive_declares_two_pending_start_devnodes() {
+    fn production_hive_omits_pending_start_fixture() {
         let hive = build_hive();
+        assert!(hive
+            .open_key(r"ControlSet001\Services\NativeLoadTest")
+            .is_none());
+        assert!(hive
+            .open_key(r"ControlSet001\Services\PendingStartTest")
+            .is_none());
+        for instance in ["0001", "0002"] {
+            assert!(hive
+                .open_key(&format!(
+                    r"ControlSet001\Enum\ROOT\USERSPACE_NTOS_PENDING_START\{}",
+                    instance
+                ))
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn pending_start_profile_declares_two_demand_start_devnodes() {
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1),
+            GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::PendingStartIntegration,
+        );
         let key = hive
             .open_key(r"ControlSet001\Services\PendingStartTest")
             .expect("service key");
         assert_eq!(hive.query_dword(key, "Type"), Some(SERVICE_KERNEL_DRIVER));
-        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_AUTO_START));
+        assert_eq!(hive.query_dword(key, "Start"), Some(SERVICE_DEMAND_START));
         assert_eq!(
             hive.query_value(key, "ImagePath"),
             Some((
                 RegistryValueType::ExpandSz,
                 utf16le_sz(r"system32\drivers\PendingStartTest.sys").as_slice()
             ))
+        );
+
+        let native_load = hive
+            .open_key(r"ControlSet001\Services\NativeLoadTest")
+            .expect("native-load integration service");
+        assert_eq!(
+            hive.query_dword(native_load, "Type"),
+            Some(SERVICE_FILE_SYSTEM_DRIVER)
+        );
+        assert_eq!(
+            hive.query_dword(native_load, "Start"),
+            Some(SERVICE_AUTO_START)
         );
 
         for (instance, pdo_name) in [
@@ -1221,15 +1315,17 @@ mod tests {
             );
         }
 
-        let mut cm = import_generated_hive_config_manager(&hive);
+        let cm = import_generated_hive_config_manager(&hive);
         assert!(cm
             .boot_system_pnp_driver_bindings()
             .iter()
             .all(|binding| binding.service.name != "PendingStartTest"));
-        let binding = cm
-            .driver_service_binding("PendingStartTest")
-            .expect("SCM auto-start driver binding");
-        assert_eq!(binding.service.start_type, SERVICE_AUTO_START);
+        let demand = cm.demand_start_pnp_driver_bindings();
+        let binding = demand
+            .iter()
+            .find(|binding| binding.service.name == "PendingStartTest")
+            .expect("demand-start driver binding");
+        assert_eq!(binding.service.start_type, Some(SERVICE_DEMAND_START));
         assert_eq!(binding.devnodes.len(), 2);
         assert_eq!(
             binding.devnodes[0].instance_id,
@@ -1745,7 +1841,11 @@ mod tests {
             height: 600,
             refresh_hz: 75,
         };
-        let hive = build_hive_with_configuration(generated_e1000_adapters(1), mode);
+        let hive = build_hive_with_configuration(
+            generated_e1000_adapters(1),
+            mode,
+            GeneratedHiveProfile::Production,
+        );
         let device0 = hive
             .open_key(r"ControlSet001\Services\bochsmp\Device0")
             .expect("display Device0");
@@ -1770,9 +1870,21 @@ mod tests {
 
     #[test]
     fn generated_hive_image_decodes_and_fits_storage_window() {
+        for profile in [
+            GeneratedHiveProfile::Production,
+            GeneratedHiveProfile::PendingStartIntegration,
+        ] {
+            let bytes = encode_image(&build_hive_with_configuration(
+                generated_e1000_adapters(1),
+                GeneratedDisplayMode::DEFAULT,
+                profile,
+            ));
+            assert!(bytes.len() <= GENERATED_HIVE_STORAGE_WINDOW);
+            decode_image(&bytes).expect("generated hive profile decodes");
+        }
+
         let bytes = encode_image(&build_hive());
-        assert!(bytes.len() <= GENERATED_HIVE_STORAGE_WINDOW);
-        let hive = decode_image(&bytes).expect("generated hive decodes");
+        let hive = decode_image(&bytes).expect("production generated hive decodes");
         let linkage = hive
             .open_key(
                 r"ControlSet001\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}\0000\Linkage",

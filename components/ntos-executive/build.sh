@@ -25,5 +25,7 @@ echo "ntos-executive staged: rust-micro/.tmp/rootserver.elf"
 # the Config Manager can read it off the FS. Host tool (std); the nt-hive-core lib stays
 # no_std, and it lives in the main workspace (not this component's), so run it from there.
 HIVE_OUT="$(cd ../../rust-micro/.tmp && pwd)/hive.dat"
-( cd ../../crates/nt-hive-core && cargo run -q --release --bin gen_hive -- "$HIVE_OUT" )
+IMAGE_PROFILE="${NTOS_IMAGE_PROFILE:-production}"
+( cd ../../crates/nt-hive-core && NTOS_IMAGE_PROFILE="$IMAGE_PROFILE" cargo run -q --release --bin gen_hive -- "$HIVE_OUT" )
+printf '%s\n' "$IMAGE_PROFILE" > ../../rust-micro/.tmp/image-profile
 echo "registry hive staged: rust-micro/.tmp/hive.dat"

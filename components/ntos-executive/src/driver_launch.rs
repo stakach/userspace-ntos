@@ -34686,26 +34686,26 @@ pub(crate) unsafe fn load_driver(
     path: &[u8],
     class: DriverClass,
     driver_object_path: &str,
-) -> Option<DriverComponent> {
+) -> Result<DriverComponent, nt_status::NtStatus> {
     let (caps, _wants_device_caps) = caps_and_layout_for(class);
     if !caps.dispatch_server {
         // The GUI syscall server (win32k) is NOT routed through the general IRP path.
-        return None;
+        return Err(nt_status::NtStatus::NOT_SUPPORTED);
     }
     if parse_nt_path(driver_object_path).is_none() {
         print_str(b"[driver-launch] invalid driver object path ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
 
     let Some(instance) = reserve_instance_slot() else {
         print_str(b"[driver-launch] instance reservation failed\n");
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
 
     let loaded = load_driver_reserved(fs, path, driver_object_path, instance);
-    if loaded.is_none() {
+    if loaded.is_err() {
         let _ = clear_instance(instance);
     }
     loaded
@@ -34716,16 +34716,17 @@ unsafe fn load_driver_reserved(
     path: &[u8],
     driver_object_path: &str,
     instance: usize,
-) -> Option<DriverComponent> {
+) -> Result<DriverComponent, nt_status::NtStatus> {
     let Some(win) = ExecVaWindow::try_for_instance(instance) else {
         print_str(b"[driver-launch] instance VA window exhausted inst=");
         print_u64(instance as u64);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     };
 
     // 1. Load the .sys bytes by-path into the executive's pool.
-    let (src_va, src_size) = load_file_to_pool(fs, path)?;
+    let (src_va, src_size) =
+        load_file_to_pool(fs, path).ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     print_str(b"[driver-launch] loaded ");
     print_str(path);
     print_str(b" size=");
@@ -34735,7 +34736,8 @@ unsafe fn load_driver_reserved(
     print_str(b"\n");
 
     let primary_is_provider = hosted_provider_leaf_from_path(path).is_some();
-    let planned_images = plan_hosted_images(fs, src_va, src_size, primary_is_provider)?;
+    let planned_images = plan_hosted_images(fs, src_va, src_size, primary_is_provider)
+        .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
 
     // The image RUNS at the fixed component VA (FSD_CODE_VA) in its own VSpace; the executive loads
     // its bytes at the per-instance window (win.code_va) so two instances don't collide executive-side.
@@ -34749,7 +34751,7 @@ unsafe fn load_driver_reserved(
         print_str(b" capacity=");
         print_u64(image_capacity);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
 
     // 2. Executive-side frames: CODE (mapped RW to load into), POOL in its own PT span, and DATA +
@@ -34759,27 +34761,33 @@ unsafe fn load_driver_reserved(
     while cpt_i < code_pts {
         let cpt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, cpt);
-        map_instance_exec_pt(instance, cpt, code_va + cpt_i * 0x20_0000)?;
+        map_instance_exec_pt(instance, cpt, code_va + cpt_i * 0x20_0000)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         cpt_i += 1;
     }
     let mut image_frame_caps_vec = Vec::new();
     image_frame_caps_vec
         .try_reserve_exact(img_frames as usize)
-        .ok()?;
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let mut rights_vec = Vec::new();
-    rights_vec.try_reserve_exact(img_frames as usize).ok()?;
+    rights_vec
+        .try_reserve_exact(img_frames as usize)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for _ in 0..img_frames {
         image_frame_caps_vec.push(0);
         rights_vec.push(RW_NX);
     }
-    let image_frame_base = alloc_driver_frame_run(instance, b"image", img_frames)?;
+    let image_frame_base = alloc_driver_frame_run(instance, b"image", img_frames)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let mut i = 0u64;
     while i < img_frames {
         if image_frame_caps_vec[i as usize] == 0 {
             image_frame_caps_vec[i as usize] = image_frame_base + i;
         }
-        let cap = copy_driver_cap(instance, b"exec-image", image_frame_caps_vec[i as usize])?;
-        map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)?;
+        let cap = copy_driver_cap(instance, b"exec-image", image_frame_caps_vec[i as usize])
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        map_instance_exec_frame(instance, cap, code_va + i * 0x1000, RW_NX)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         i += 1;
     }
     if planned_images.executable_thunk_frames != 0 {
@@ -34787,7 +34795,7 @@ unsafe fn load_driver_reserved(
             || planned_images.executable_thunk_frames != HOSTED_EXECUTABLE_THUNK_FRAMES
         {
             print_str(b"[driver-launch] hosted executable thunk table layout invalid\n");
-            return None;
+            return Err(nt_status::NtStatus::INVALID_IMAGE_FORMAT);
         }
         let thunk_frame = planned_images.executable_thunk_offset / 0x1000;
         if thunk_frame
@@ -34796,7 +34804,7 @@ unsafe fn load_driver_reserved(
             .is_none()
         {
             print_str(b"[driver-launch] hosted executable thunk table outside image window\n");
-            return None;
+            return Err(nt_status::NtStatus::INVALID_IMAGE_FORMAT);
         }
         let mut frame = 0u64;
         while frame < planned_images.executable_thunk_frames {
@@ -34810,37 +34818,51 @@ unsafe fn load_driver_reserved(
     }
     let image_frame_caps = Box::leak(image_frame_caps_vec.into_boxed_slice());
     let rights = Box::leak(rights_vec.into_boxed_slice());
-    let pool_base = alloc_driver_frame_run(instance, b"pool", FSD_POOL_FRAMES)?;
+    let pool_base = alloc_driver_frame_run(instance, b"pool", FSD_POOL_FRAMES)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let pool_pts = pts_for(FSD_POOL_FRAMES);
     let mut pool_pt_index = 0u64;
     while pool_pt_index < pool_pts {
         let ppt = alloc_slot();
         let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, ppt);
-        map_instance_exec_pt(instance, ppt, win.pool_va + pool_pt_index * 0x20_0000)?;
+        map_instance_exec_pt(instance, ppt, win.pool_va + pool_pt_index * 0x20_0000)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         pool_pt_index += 1;
     }
     for i in 0..FSD_POOL_FRAMES {
-        let cap = copy_driver_cap(instance, b"exec-pool", pool_base + i)?;
-        map_instance_exec_frame(instance, cap, win.pool_va + i * 0x1000, RW_NX)?;
+        let cap = copy_driver_cap(instance, b"exec-pool", pool_base + i)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        map_instance_exec_frame(instance, cap, win.pool_va + i * 0x1000, RW_NX)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     // DATA + SHARED + ARG: caps + an aux PT in the executive VSpace.
-    let data_base = alloc_driver_frame_run(instance, b"data", FSD_DATA_FRAMES)?;
-    let shared_base = alloc_driver_frame_run(instance, b"shared", FSD_SHARED_FRAMES)?;
-    let arg_base = alloc_driver_frame_run(instance, b"arg", FSD_ARG_FRAMES)?;
+    let data_base = alloc_driver_frame_run(instance, b"data", FSD_DATA_FRAMES)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let shared_base = alloc_driver_frame_run(instance, b"shared", FSD_SHARED_FRAMES)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let arg_base = alloc_driver_frame_run(instance, b"arg", FSD_ARG_FRAMES)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let apt = alloc_slot();
     let _ = untyped_retype(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, apt);
-    map_instance_exec_pt(instance, apt, win.aux_pt_va)?;
+    map_instance_exec_pt(instance, apt, win.aux_pt_va)
+        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     for i in 0..FSD_DATA_FRAMES {
-        let cap = copy_driver_cap(instance, b"exec-data", data_base + i)?;
-        map_instance_exec_frame(instance, cap, win.data_va + i * 0x1000, RW_NX)?;
+        let cap = copy_driver_cap(instance, b"exec-data", data_base + i)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        map_instance_exec_frame(instance, cap, win.data_va + i * 0x1000, RW_NX)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     for i in 0..FSD_SHARED_FRAMES {
-        let cap = copy_driver_cap(instance, b"exec-shared", shared_base + i)?;
-        map_instance_exec_frame(instance, cap, win.shared_va + i * 0x1000, RW_NX)?;
+        let cap = copy_driver_cap(instance, b"exec-shared", shared_base + i)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        map_instance_exec_frame(instance, cap, win.shared_va + i * 0x1000, RW_NX)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     for i in 0..FSD_ARG_FRAMES {
-        let cap = copy_driver_cap(instance, b"exec-arg", arg_base + i)?;
-        map_instance_exec_frame(instance, cap, win.arg_va + i * 0x1000, RW_NX)?;
+        let cap = copy_driver_cap(instance, b"exec-arg", arg_base + i)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        map_instance_exec_frame(instance, cap, win.arg_va + i * 0x1000, RW_NX)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     }
     initialize_hosted_driver_data_exports(win.data_va);
 
@@ -34864,16 +34886,17 @@ unsafe fn load_driver_reserved(
         img_frames,
         rights,
         executable_thunk_writer.as_mut(),
-    )?;
+    )
+    .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     if planned_images.primary_offset & 0xfff != 0 {
-        return None;
+        return Err(nt_status::NtStatus::INVALID_IMAGE_FORMAT);
     }
     let primary_frame_offset = planned_images.primary_offset / 0x1000;
     if primary_frame_offset >= img_frames {
         print_str(b"[driver-launch] primary image window exhausted offset=0x");
         print_hex(planned_images.primary_offset as u32);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::INVALID_IMAGE_FORMAT);
     }
     let primary_exec_va = code_va + planned_images.primary_offset;
     let primary_run_va = run_va + planned_images.primary_offset;
@@ -34889,7 +34912,8 @@ unsafe fn load_driver_reserved(
         primary_frames,
         primary_rights,
         &mut resolver,
-    )?;
+    )
+    .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     let _ = register_system_module(path, primary_exec_va, image_len);
     print_str(b"[driver-launch] DriverEntry rva=0x");
     print_hex(entry_rva);
@@ -34900,7 +34924,8 @@ unsafe fn load_driver_reserved(
     print_str(b"\n");
     let primary_entry_rva = planned_images
         .primary_offset
-        .checked_add(entry_rva as u64)?;
+        .checked_add(entry_rva as u64)
+        .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?;
     write_volatile(
         (win.shared_va + SH_ENTRY_RVA) as *mut u64,
         primary_entry_rva,
@@ -34908,7 +34933,7 @@ unsafe fn load_driver_reserved(
     let tsc_frequency_hz = crate::platform_tsc_frequency_hz();
     if tsc_frequency_hz == 0 {
         print_str(b"[driver-launch] calibrated TSC authority unavailable\n");
-        return None;
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     write_volatile(
         (win.shared_va + SH_TSC_FREQUENCY_HZ) as *mut u64,
@@ -34954,9 +34979,10 @@ unsafe fn load_driver_reserved(
     // NT publishes the canonical driver object before DriverEntry can run. Reserve that identity
     // before resuming the component so imports serviced during DriverEntry can project it into a
     // provider domain without relying on component scheduling order.
-    let domain = crate::driver_launch::instance(instance)?;
+    let domain = crate::driver_launch::instance(instance)
+        .ok_or(nt_status::NtStatus::UNSUCCESSFUL)?;
     if domain.hosted_domain_id == 0 || domain.hosted_domain_cookie == 0 {
-        return None;
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     let driver_id = register_io_driver(driver_object_path, instance)?;
     driver_instances_mut()[instance].driver_id = driver_id;
@@ -35001,7 +35027,7 @@ unsafe fn load_driver_reserved(
         print_str(b"[driver-launch] stack alias map failed inst=");
         print_u64(instance as u64);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     if !initialize_hosted_physical_map(
         win.data_va,
@@ -35017,7 +35043,7 @@ unsafe fn load_driver_reserved(
         print_str(b"[driver-launch] physical mapping publication failed inst=");
         print_u64(instance as u64);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     // ★ This instance's DEDICATED MCS reply object — the server-side binding of the `Call`
     // transport. One per component is enough at any depth (one TCB ⇒ at most one outstanding Call).
@@ -35026,16 +35052,22 @@ unsafe fn load_driver_reserved(
         print_str(b"[driver-launch] reply cap allocation failed inst=");
         print_u64(instance as u64);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
     }
     let main_thread_id = {
-        let table = hosted_driver_thread_table_mut(instance)?;
+        let table = hosted_driver_thread_table_mut(instance)
+            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         let handle = table
-            .create(primary_run_va.checked_add(entry_rva as u64)?, 0)
-            .ok()?;
+            .create(
+                primary_run_va
+                    .checked_add(entry_rva as u64)
+                    .ok_or(nt_status::NtStatus::INVALID_IMAGE_FORMAT)?,
+                0,
+            )
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         if table.attach_tcb(handle, tcb).is_err() {
             let _ = table.remove(handle);
-            return None;
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
         handle
     };
@@ -35078,7 +35110,7 @@ unsafe fn load_driver_reserved(
         print_str(b" label=");
         print_u64(resume_error);
         print_str(b"\n");
-        return None;
+        return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     // 5. Drive the DriverEntry init fault-recv loop THROUGH THE SHARED HARNESS PUMP: demand-map
     //    benign pages, wall on a low/in-image fault or the 512 demand cap, wait for the dispatch-ready
@@ -35160,12 +35192,16 @@ unsafe fn load_driver_reserved(
     print_hex(driver_unload as u32);
     print_str(b"\n");
 
-    if !finished || de_status != 0 {
+    if !finished || !nt_status::NtStatus(de_status).is_success() {
         print_str(b"[driver-launch] DriverEntry failed; removing ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
         clear_driver_object_extensions_for_driver_object(drvobj);
-        return None;
+        return Err(if finished {
+            nt_status::NtStatus(de_status)
+        } else {
+            nt_status::NtStatus::UNSUCCESSFUL
+        });
     }
     if let Some(provider) = hosted_provider_leaf_from_path(path) {
         record_hosted_provider_load(
@@ -35177,7 +35213,7 @@ unsafe fn load_driver_reserved(
         if planned_images.primary_offset == 0 && planned_images.dependencies.is_empty() {
             let Some(singleton_image_frames) = frames_for_image_len(image_len as u64) else {
                 clear_driver_object_extensions_for_driver_object(drvobj);
-                return None;
+                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             };
             if !register_hosted_provider_singleton(
                 provider,
@@ -35191,13 +35227,13 @@ unsafe fn load_driver_reserved(
                 FSD_POOL_FRAMES,
             ) {
                 clear_driver_object_extensions_for_driver_object(drvobj);
-                return None;
+                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
             }
         }
     }
 
     if let Err(status) = io_manager_mut().bind_hosted_driver_identity(
-        instance_domain_identity(domain)?,
+        instance_domain_identity(domain).ok_or(nt_status::NtStatus::UNSUCCESSFUL)?,
         drvobj,
         DriverId(driver_id),
     ) {
@@ -35206,7 +35242,7 @@ unsafe fn load_driver_reserved(
         print_str(b" for ");
         print_str(driver_object_path.as_bytes());
         print_str(b"\n");
-        return None;
+        return Err(status);
     }
     driver_instances_mut()[instance].driver_object = drvobj;
     let dc = DriverComponent {
@@ -35254,7 +35290,7 @@ unsafe fn load_driver_reserved(
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
             clear_driver_object_extensions_for_driver_object(drvobj);
-            return None;
+            return Err(status);
         }
     };
     print_str(b"[driver-launch] canonical devices=");
@@ -35262,7 +35298,7 @@ unsafe fn load_driver_reserved(
     print_str(b"\n");
     // Record the live instance and publish canonical driver/device route ids for callers.
     register_instance(&dc);
-    Some(dc)
+    Ok(dc)
 }
 
 /// Spawn the isolated FSD component: image W^X, pool, stack, IPC-buf, DATA/SHARED arena/ARG windows,
@@ -40800,8 +40836,12 @@ fn dispatch_external_irp_to_device_record_result_exact(
     }
 }
 
-fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> {
-    let name = parse_nt_path(driver_object_path)?;
+fn register_io_driver(
+    driver_object_path: &str,
+    instance: usize,
+) -> Result<u64, nt_status::NtStatus> {
+    let name =
+        parse_nt_path(driver_object_path).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let io = io_manager_mut();
     let mut dispatch = MajorFunctionTable::new();
     dispatch.set_all(DispatchTarget::DriverPeer(DriverPeerId(0)));
@@ -40810,14 +40850,14 @@ fn register_io_driver(driver_object_path: &str, instance: usize) -> Option<u64> 
         Box::new(HostedDriverBackend { instance }),
         dispatch,
     ) {
-        Ok(driver_id) => Some(driver_id.raw()),
+        Ok(driver_id) => Ok(driver_id.raw()),
         Err(status) => {
             print_str(b"[driver-launch] IoManager driver publish failed status=0x");
             print_hex(status.raw() as u32);
             print_str(b" for ");
             print_str(driver_object_path.as_bytes());
             print_str(b"\n");
-            None
+            Err(status)
         }
     }
 }
@@ -40844,9 +40884,12 @@ pub(crate) fn driver_id_by_name(path: &str) -> Option<u64> {
 pub(crate) fn loaded_driver_pnp_start_context(path: &str) -> Option<(u64, bool)> {
     let driver_id = driver_id_by_name(path)?;
     let (_, inst) = instance_by_driver_id(driver_id)?;
-    let ready_for_pnp =
-        inst.ready && (inst.add_device != 0 || hosted_driver_video_port_initialized(driver_id));
-    Some((driver_id, ready_for_pnp))
+    // A successfully loaded PnP driver is eligible for its first AddDevice before it has a
+    // committed device stack. `inst.ready` remains false until that stack is published and only
+    // gates ordinary device dispatch, not PnP capability discovery.
+    let supports_add_device =
+        inst.add_device != 0 || hosted_driver_video_port_initialized(driver_id);
+    Some((driver_id, supports_add_device))
 }
 
 #[inline(never)]
