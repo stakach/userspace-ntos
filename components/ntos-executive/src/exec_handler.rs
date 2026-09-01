@@ -3869,10 +3869,7 @@ impl ExecNtHandler {
         write_field!(pending_file_io_reservation, None);
         write_field!(pending_driver_starts, driver_starts.pending);
         write_field!(boot_driver_start_reports, driver_starts.reports);
-        write_field!(
-            native_driver_load_report,
-            NativeDriverLoadReport::default()
-        );
+        write_field!(native_driver_load_report, NativeDriverLoadReport::default());
         write_field!(pending_driver_start_transfer, None);
         write_field!(
             pending_pnp_operations,
@@ -4264,62 +4261,30 @@ impl ExecNtHandler {
     /// text-mode/live setup (`SetupType=1`, `SystemSetupInProgress=1`, `CmdLine=setup -mini`).
     /// By this point our boot image has already materialised the installed pieces that setup would
     /// have produced for the current frontier: writable profiles, a user hive, locale, and SOFTWARE
-    /// profile state. Write those setup values into the live mutable SYSTEM hive so services.exe's
-    /// real `CheckForLiveCD` path observes a normal installed boot and reaches `ScmAutoStartServices`.
+    /// profile state. Commit the complete one-time installed-state transition, including setup's
+    /// persisted PlugPlay auto-start selection, so services.exe's real `CheckForLiveCD` path reaches
+    /// `ScmAutoStartServices`. Once the setup markers are canonical, later service configuration is
+    /// administrator-owned and remains untouched.
     fn provision_normal_system_setup_state(&mut self) {
-        const REG_SZ: u32 = 1;
-        const REG_DWORD: u32 = 4;
-        const SETUP_KEY: &str = r"\Registry\Machine\System\Setup";
-        let setup_type = 0u32.to_le_bytes();
-        let setup_in_progress = 0u32.to_le_bytes();
-        let cmd_line = registry_sz_bytes("");
-        let snapshot = match unsafe { crate::config_manager_query_system_hive_key(SETUP_KEY) } {
-            Ok(snapshot) => snapshot,
+        let mut target = CollectSystemSetupSeedTarget::new();
+        let seed = nt_hive_core::seed_reactos_installed_boot_state_into_target(&mut target);
+        let mutations = match target.finish_required() {
+            Ok(mutations) => mutations,
             Err(status) => {
-                print_str(b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup query failed status=0x");
-                print_hex(status as u32);
+                print_str(b"[setup-state] installed-boot registry query failed status=0x");
+                print_hex(status);
                 print_str(b"\n");
                 return;
             }
         };
-        let matches = |name: &str, value_type: u32, data: &[u8]| {
-            snapshot.values.iter().any(|value| {
-                value.name.eq_ignore_ascii_case(name)
-                    && value.value_type == value_type
-                    && value.data == data
-            })
+        let stats = match seed {
+            Ok(stats) => stats,
+            Err(nt_hive_core::ReactOsInstalledBootSeedError::PlugPlayServiceMissing) => {
+                panic!("installed-system transition requires the ReactOS PlugPlay service")
+            }
         };
-        let setup_type_changed = !matches("SetupType", REG_DWORD, &setup_type);
-        let setup_in_progress_changed =
-            !matches("SystemSetupInProgress", REG_DWORD, &setup_in_progress);
-        let cmd_line_changed = !matches("CmdLine", REG_SZ, &cmd_line);
-        let mut mutations = alloc::vec::Vec::new();
-        if setup_type_changed {
-            mutations.push(OwnedSystemHiveMutation::SetValue {
-                path: SETUP_KEY.into(),
-                name: "SetupType".into(),
-                value_type: nt_hive_core::RegistryValueType::Dword,
-                data: setup_type.to_vec(),
-            });
-        }
-        if setup_in_progress_changed {
-            mutations.push(OwnedSystemHiveMutation::SetValue {
-                path: SETUP_KEY.into(),
-                name: "SystemSetupInProgress".into(),
-                value_type: nt_hive_core::RegistryValueType::Dword,
-                data: setup_in_progress.to_vec(),
-            });
-        }
-        if cmd_line_changed {
-            mutations.push(OwnedSystemHiveMutation::SetValue {
-                path: SETUP_KEY.into(),
-                name: "CmdLine".into(),
-                value_type: nt_hive_core::RegistryValueType::Sz,
-                data: cmd_line,
-            });
-        }
         if mutations.is_empty() {
-            print_str(b"[setup-state] HKLM\\SYSTEM\\Setup already in normal installed state\n");
+            print_str(b"[setup-state] installed SYSTEM state already canonical\n");
             return;
         }
         let generation = match self
@@ -4333,13 +4298,13 @@ impl ExecNtHandler {
                 return;
             }
         };
-        if setup_type_changed || setup_in_progress_changed || cmd_line_changed {
-            print_str(
-                b"[setup-state] HKLM\\SYSTEM\\Setup normal installed boot values committed through CM generation ",
-            );
-            print_u64(generation);
-            print_str(b" with durable journal ownership\n");
-        }
+        print_str(b"[setup-state] ReactOS installed-boot values committed setup/service=");
+        print_u64(stats.setup_values as u64);
+        print_str(b"/");
+        print_u64(stats.service_values as u64);
+        print_str(b" through CM generation ");
+        print_u64(generation);
+        print_str(b" with durable journal ownership\n");
     }
 
     fn should_expose_sam_setup_phase(&self, key_path: Option<&str>, value_name: &str) -> bool {

@@ -21358,6 +21358,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     state machine and deletion of the eager demand-PnP and no-action-success machinery identified
     above.
 
+    B3 installed PlugPlay service transition checkpoint (2026-09-01, implementation and host
+    validation green; runtime pending): the first live-device-action run reached a fully painted
+    Explorer desktop in 114 guest seconds with 298/298 executive gates, but correctly failed its
+    external predicate because Config Manager retained the second NIC action without any
+    `NtGetPlugPlayEvent` caller. The staged ReactOS hive is a pre-setup template: PlugPlay is
+    demand-start. ReactOS `syssetup` changes that existing shared service to auto-start, starts it,
+    and treats failure as fatal before committing `SetupType=0`. Normal SCM boot has no separate
+    demand-start caller; DcomLaunch svchost group membership registers the dispatcher name but does
+    not invoke PlugPlay's `ServiceMain`.
+
+    The pure `nt-hive-core` installed-boot transition now couples the three setup-marker mutations
+    with the persisted `PlugPlay\\Start=SERVICE_AUTO_START` mutation. It runs only while converting
+    the LiveCD setup markers, preserves later administrator service configuration, requires the
+    existing PlugPlay service `Start` metadata instead of fabricating a partial service, and emits
+    one mutation set for CM's durable journal. The executive no longer assembles those registry
+    values itself. Focused and full `nt-hive-core` validation pass 107/107 tests, including exact
+    one-time replay, administrator override preservation, and missing-service rejection; the
+    freestanding executive check remains green at the established 209-warning baseline.
+
+    Review adjustment: run the serialized 900-second live-device-action lane and require real SCM
+    activation of `umpnpmgr.dll` plus `NtGetPlugPlayEvent`. Before accepting the broader boundary,
+    remove the mutable boot-devnode cursor from `NtGetPlugPlayEvent`: ReactOS boot enumeration uses
+    the user-mode Config Manager device list, while the native syscall dequeues only explicit kernel
+    events. Record `empty_after_ack` directly from the exact CM ACK's `has_more` result, include the
+    CM pending-action bit in generic coherence so a zero-row/unclaimed queue cannot pass, and allow
+    an ordered nonzero sequence of root/bus/leaf actions while locating the target NIC by instance
+    rather than ordinal. A live START must ensure-load the registry-selected driver before
+    `AddDevice`/resources/START when it is not already loaded. Also stop the generated overlay from
+    replacing the installed full `ServiceGroupOrder\\List` with six entries; all generated groups
+    already exist in the base order, so preserving that authority is the correct default.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

@@ -11,8 +11,8 @@ use alloc::{format, string::String, vec::Vec};
 
 use crate::{canon_path, MutableHiveSet, RegistryOverlay, RegistryValueType};
 use nt_config_manager::{
-    CONTROL_CLASS_PATH, SERVICES_PATH, SERVICE_BOOT_START, SERVICE_KERNEL_DRIVER,
-    SERVICE_SYSTEM_START,
+    CONTROL_CLASS_PATH, SERVICES_PATH, SERVICE_AUTO_START, SERVICE_BOOT_START,
+    SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
 };
 
 pub const REACTOS_EXPLORER_SHELL_COM_CLASS_MASK_START_MENU: u64 = 1 << 0;
@@ -35,6 +35,23 @@ pub struct ReactOsPrintSetupSeedStats {
     pub environment_values: u32,
     pub print_processor_values: u32,
     pub monitor_values: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReactOsInstalledBootSeedStats {
+    pub setup_values: u32,
+    pub service_values: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactOsInstalledBootSeedError {
+    PlugPlayServiceMissing,
+}
+
+impl ReactOsInstalledBootSeedStats {
+    pub fn total_values(self) -> u32 {
+        self.setup_values + self.service_values
+    }
 }
 
 impl ReactOsPrintSetupSeedStats {
@@ -702,6 +719,56 @@ fn set_setup_expand_sz<T: ReactOsSetupSeedTarget>(
     value: &str,
 ) -> bool {
     target.set_value(path, name, RegistryValueType::ExpandSz, utf16le_sz(value))
+}
+
+/// Materialize the persistent SYSTEM-hive changes made by the ReactOS installed-system setup path.
+///
+/// The staged boot media is LiveCD-derived. ReactOS setup clears the live-setup markers before the
+/// first installed boot and changes the user-mode Plug and Play manager to auto-start before
+/// starting it. Keeping the complete transition here makes the policy host-testable and leaves the
+/// executive responsible only for committing the resulting Configuration Manager mutations. A
+/// canonical installed setup state makes this a no-op so later service configuration remains under
+/// administrator control.
+pub fn seed_reactos_installed_boot_state_into_target<T: ReactOsSetupSeedTarget>(
+    target: &mut T,
+) -> Result<ReactOsInstalledBootSeedStats, ReactOsInstalledBootSeedError> {
+    const SETUP_PATH: &str = r"\Registry\Machine\System\Setup";
+    const PLUGPLAY_SERVICE_PATH: &str =
+        r"\Registry\Machine\System\CurrentControlSet\Services\PlugPlay";
+
+    let installed_setup_state = target.value_matches(
+        SETUP_PATH,
+        "SetupType",
+        RegistryValueType::Dword,
+        &0u32.to_le_bytes(),
+    ) && target.value_matches(
+        SETUP_PATH,
+        "SystemSetupInProgress",
+        RegistryValueType::Dword,
+        &0u32.to_le_bytes(),
+    ) && target.value_matches(
+        SETUP_PATH,
+        "CmdLine",
+        RegistryValueType::Sz,
+        &utf16le_sz(""),
+    );
+    if installed_setup_state {
+        return Ok(ReactOsInstalledBootSeedStats::default());
+    }
+    if !target.has_value(PLUGPLAY_SERVICE_PATH, "Start") {
+        return Err(ReactOsInstalledBootSeedError::PlugPlayServiceMissing);
+    }
+
+    let mut stats = ReactOsInstalledBootSeedStats::default();
+    if target.create_key(SETUP_PATH) {
+        stats.setup_values += set_setup_dword(target, SETUP_PATH, "SetupType", 0) as u32;
+        stats.setup_values +=
+            set_setup_dword(target, SETUP_PATH, "SystemSetupInProgress", 0) as u32;
+        stats.setup_values += set_setup_sz(target, SETUP_PATH, "CmdLine", "") as u32;
+    }
+    stats.service_values +=
+        set_setup_dword(target, PLUGPLAY_SERVICE_PATH, "Start", SERVICE_AUTO_START) as u32;
+    Ok(stats)
 }
 
 fn decode_setup_multi_sz(bytes: &[u8]) -> Vec<String> {
@@ -1945,6 +2012,12 @@ pub fn seed_reactos_print_setup_in_mutable_hives(
     seed_reactos_print_setup_into_target(&mut MutableHiveRgsSeedTarget { hives })
 }
 
+pub fn seed_reactos_installed_boot_state_in_mutable_hives(
+    hives: &mut MutableHiveSet,
+) -> Result<ReactOsInstalledBootSeedStats, ReactOsInstalledBootSeedError> {
+    seed_reactos_installed_boot_state_into_target(&mut MutableHiveRgsSeedTarget { hives })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1979,6 +2052,125 @@ mod tests {
             .expect("backing hive")
             .query_dword(key.key, value)
             .expect("seeded dword value")
+    }
+
+    #[test]
+    fn installed_boot_state_replays_setup_and_plugplay_transition_exactly_once() {
+        let mut hives = MutableHiveSet::new();
+        let mut system = mountable_system_hive();
+        let setup = system.create_key("Setup");
+        system.set_dword(setup, "SetupType", 1);
+        system.set_dword(setup, "SystemSetupInProgress", 1);
+        system.set_value(
+            setup,
+            "CmdLine",
+            RegistryValueType::Sz,
+            utf16le_sz("setup -mini"),
+        );
+        let plugplay = system.create_key(r"ControlSet001\Services\PlugPlay");
+        system.set_dword(plugplay, "Start", nt_config_manager::SERVICE_DEMAND_START);
+        system.set_dword(
+            plugplay,
+            "Type",
+            nt_config_manager::SERVICE_WIN32_SHARE_PROCESS,
+        );
+        hives.mount(r"\Registry\Machine\System", 1, system).unwrap();
+
+        assert_eq!(
+            seed_reactos_installed_boot_state_in_mutable_hives(&mut hives),
+            Ok(ReactOsInstalledBootSeedStats {
+                setup_values: 3,
+                service_values: 1,
+            })
+        );
+        assert_eq!(
+            hive_dword(&hives, r"\Registry\Machine\System\Setup", "SetupType"),
+            0
+        );
+        assert_eq!(
+            hive_dword(
+                &hives,
+                r"\Registry\Machine\System\Setup",
+                "SystemSetupInProgress"
+            ),
+            0
+        );
+        assert_eq!(
+            hive_value_bytes(&hives, r"\Registry\Machine\System\Setup", "CmdLine"),
+            (RegistryValueType::Sz, utf16le_sz("").as_slice())
+        );
+        assert_eq!(
+            hive_dword(
+                &hives,
+                r"\Registry\Machine\System\CurrentControlSet\Services\PlugPlay",
+                "Start"
+            ),
+            SERVICE_AUTO_START
+        );
+        assert_eq!(
+            hive_dword(
+                &hives,
+                r"\Registry\Machine\System\CurrentControlSet\Services\PlugPlay",
+                "Type"
+            ),
+            nt_config_manager::SERVICE_WIN32_SHARE_PROCESS
+        );
+        assert_eq!(
+            seed_reactos_installed_boot_state_in_mutable_hives(&mut hives),
+            Ok(ReactOsInstalledBootSeedStats::default())
+        );
+
+        let plugplay = hives
+            .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services\PlugPlay")
+            .unwrap();
+        assert!(hives.set_value(
+            plugplay,
+            "Start",
+            RegistryValueType::Dword,
+            nt_config_manager::SERVICE_DEMAND_START
+                .to_le_bytes()
+                .to_vec()
+        ));
+        assert_eq!(
+            seed_reactos_installed_boot_state_in_mutable_hives(&mut hives),
+            Ok(ReactOsInstalledBootSeedStats::default())
+        );
+        assert_eq!(
+            hive_dword(
+                &hives,
+                r"\Registry\Machine\System\CurrentControlSet\Services\PlugPlay",
+                "Start"
+            ),
+            nt_config_manager::SERVICE_DEMAND_START
+        );
+    }
+
+    #[test]
+    fn installed_boot_transition_requires_existing_plugplay_service_metadata() {
+        let mut hives = MutableHiveSet::new();
+        let mut system = mountable_system_hive();
+        let setup = system.create_key("Setup");
+        system.set_dword(setup, "SetupType", 1);
+        system.set_dword(setup, "SystemSetupInProgress", 1);
+        system.set_value(
+            setup,
+            "CmdLine",
+            RegistryValueType::Sz,
+            utf16le_sz("setup -mini"),
+        );
+        hives.mount(r"\Registry\Machine\System", 1, system).unwrap();
+
+        assert_eq!(
+            seed_reactos_installed_boot_state_in_mutable_hives(&mut hives),
+            Err(ReactOsInstalledBootSeedError::PlugPlayServiceMissing)
+        );
+        assert_eq!(
+            hive_dword(&hives, r"\Registry\Machine\System\Setup", "SetupType"),
+            1
+        );
+        assert!(hives
+            .resolve_key(r"\Registry\Machine\System\CurrentControlSet\Services\PlugPlay")
+            .is_none());
     }
 
     fn hives_with_time_zone_database() -> MutableHiveSet {
