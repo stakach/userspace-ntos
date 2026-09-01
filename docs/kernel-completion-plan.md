@@ -21588,6 +21588,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     proof and the full desktop gate. Boot attempts retain a hard one-hour maximum; focused
     integration runs default to 900 seconds, and fixed panic loops are terminated immediately.
 
+    Dynamic CNode backing checkpoint (2026-09-01, accepted): rust-micro commits `e81e744`,
+    `3684abc`, and `522681d` replace fixed derivation side tables and production CNode CTE arrays
+    with capability-owned MDB metadata plus descriptors for the exact physical span consumed from
+    the source Untyped. Retyped CNodes are zeroed in and addressed from that span, reclaim returns
+    the same extent, and the external root task's radix-18 CSpace now owns a separate aligned 8 MiB
+    boot-RAM reservation that is neither exposed as an Untyped nor embedded in the kernel ELF. The
+    obsolete XL CNode pool and production big/small CNode arrays are removed; direct-index arrays
+    remain only in the standalone/spec profile that tests those allocators.
+
+    Serialized validation passes the full rust-micro spec suite after the removal, including exact
+    dynamic backing, retype/revoke, repeated allocation/reclamation, and CNode Move derivation
+    ownership. An optimized external-rootserver image also boots through Endpoint retype, IPC, IRQ,
+    isolated VSpace, and MCS demonstrations with the root CNode reserved at
+    `0x02000000..0x02800000`, disjoint from the root Untyped at
+    `0x20000000..0x40000000`. The production BOOTBOOT-loaded kernel text is 2,207,744 bytes; the
+    boot/spec sentinels were reached in seconds and QEMU was terminated when each intentional
+    post-gate scheduler loop began. The one-hour deadline is an absolute boot ceiling, not an
+    expected runtime: successful proof lanes stop at their gate, and non-progress/panic loops stop
+    immediately.
+
+    Review adjustment: fixed CNode-capacity exhaustion and the BOOTBOOT image-size coupling are
+    closed. Before the desktop rerun, remove the remaining depth-bounded CNode finalization path so
+    delete/revoke cannot discard nested capability state, and replace every Untyped retype path
+    that consumes memory then publishes `Cap::Null` on a fixed object-pool allocation failure with
+    preflighted or dynamically backed object ownership. Then rebuild the actual executive image and
+    rerun the pending File-owner/full Explorer desktop gate under the same serialized deadline.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
