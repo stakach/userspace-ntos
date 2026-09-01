@@ -25,6 +25,10 @@ require_fixed() {
 }
 
 instance='PCI\VEN_8086&DEV_100E\3&11583659&0&20'
+require_fixed '[setup-state] ReactOS installed-boot values committed setup/service=' \
+  'fresh-media installed-state transition did not commit'
+require_fixed '[scm-select] PlugPlay auto/demand=1/0 from installed SYSTEM generation' \
+  'SCM did not classify PlugPlay from the installed SYSTEM generation'
 require_fixed "[pnp-live-action] claimed " 'CM action was not claimed'
 require_fixed "[pnp-live-action] delivered " 'user-mode PnP did not receive the action'
 require_fixed "[pnp-live-action] retired " 'responded notification was not acknowledged to CM'
@@ -41,6 +45,21 @@ import sys
 
 log_path, target_instance = sys.argv[1:]
 lines = open(log_path, encoding="utf-8", errors="replace").read().splitlines()
+
+setup_index = next(
+    (index for index, line in enumerate(lines)
+     if line.startswith("[setup-state] ReactOS installed-boot values committed setup/service=")),
+    None,
+)
+scm_index = next(
+    (index for index, line in enumerate(lines)
+     if line == "[scm-select] PlugPlay auto/demand=1/0 from installed SYSTEM generation"),
+    None,
+)
+if setup_index is None or scm_index is None or setup_index >= scm_index:
+    raise SystemExit(
+        "live-device-action integration failure: installed-state commit must precede SCM selection"
+    )
 
 identity = r"(?P<generation>[0-9]+)/(?P<sequence>[0-9]+)/(?P<token>[0-9]+)"
 claim_re = re.compile(

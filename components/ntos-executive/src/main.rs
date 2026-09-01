@@ -24485,12 +24485,19 @@ unsafe fn reset_exec_nt_handler(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     driver_starts: DriverStartBootstrap,
     require_boot_system: bool,
+    bootstrap_system_journal_records: u32,
 ) -> &'static mut ExecNtHandler {
     let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
     // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the
     // service loop exits. Reinitializing this slot intentionally leaks the previous bump-heap-backed
     // contents, matching the rest of the rootserver bootstrap allocator model.
-    ExecNtHandler::initialize_in(slot, hosted_images, driver_starts, require_boot_system)
+    ExecNtHandler::initialize_in(
+        slot,
+        hosted_images,
+        driver_starts,
+        require_boot_system,
+        bootstrap_system_journal_records,
+    )
 }
 
 type ExecIoCompletionPortTable = nt_io_completion::CompletionPortTable<TP_WORKER_PI_COUNT, 8>;
@@ -29627,6 +29634,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 BOOT_SEC_IMAGE_SCRATCH_BASE,
                 None,
                 DriverStartBootstrap::with_capacity(PENDING_DRIVER_LOAD_INITIAL_CAPACITY),
+                0,
             );
             let _ = tcb_suspend_r(spawn.main_tcb);
             si_verdict = v;
@@ -31741,6 +31749,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         }
     }
 
+    let installed_state = exec_handler::provision_reactos_installed_boot_state()
+        .unwrap_or_else(|status| {
+            print_str(b"[setup-state] installed-boot transaction failed status=0x");
+            print_hex(status);
+            print_str(b"\n");
+            panic!("commit ReactOS installed state before SCM selection");
+        });
+    match installed_state.generation {
+        Some(generation) => {
+            print_str(b"[setup-state] ReactOS installed-boot values committed setup/service=");
+            print_u64(installed_state.stats.setup_values as u64);
+            print_str(b"/");
+            print_u64(installed_state.stats.service_values as u64);
+            print_str(b" through CM generation ");
+            print_u64(generation);
+            print_str(b" before SCM selection; pending durable records=");
+            print_u64(installed_state.journal_records as u64);
+            print_str(b"\n");
+        }
+        None => print_str(b"[setup-state] installed SYSTEM state canonical before SCM selection\n"),
+    }
+
     if let Err(status) = publish_acpi_root_devnode_from_registry_policy() {
         print_str(b"[acpi-platform] root devnode publication failed status=");
         print_hex(status.raw() as u32);
@@ -31763,6 +31793,25 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         nt_config_abi::win32_service_plan_kind::DEMAND_START,
     )
     .expect("query live demand-start Win32 service launch plan");
+    let plugplay_auto = auto_win32_service_snapshot
+        .launches
+        .iter()
+        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
+    let plugplay_demand = demand_win32_service_snapshot
+        .launches
+        .iter()
+        .any(|launch| launch.service_name.eq_ignore_ascii_case("PlugPlay"));
+    print_str(b"[scm-select] PlugPlay auto/demand=");
+    print_u64(plugplay_auto as u64);
+    print_str(b"/");
+    print_u64(plugplay_demand as u64);
+    print_str(b" from installed SYSTEM generation\n");
+    if installed_state.generation.is_some() {
+        assert!(
+            plugplay_auto && !plugplay_demand,
+            "installed-state transition must classify PlugPlay as auto-start before SCM selection"
+        );
+    }
     let proof_driver_spec = config_hive_boot_system_driver_launch_spec(&boot_driver_snapshot);
     let system_boot_driver_plan = system_hive_boot_driver_launch_plan(&boot_driver_snapshot);
     let config_pnp_plan = config_hive_boot_system_pnp_driver_launch_plan(&boot_driver_snapshot);
@@ -33209,6 +33258,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         SCRATCH_BASE,
                         Some((NTDLL_BASE, smss_ntdll_pe)),
                         driver_start_bootstrap,
+                        installed_state.journal_records,
                     );
                     let final_config = final_driver_start_reports.config_pnp;
                     let final_boot = final_driver_start_reports.boot_service;

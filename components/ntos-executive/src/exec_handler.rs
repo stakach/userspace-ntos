@@ -3586,6 +3586,56 @@ pub(crate) fn win32_job_callout_selftest() -> u64 {
     proof
 }
 
+/// Commit the one-time ReactOS installed-state transition before any SCM launch-plan snapshot.
+///
+/// The staged media describes a LiveCD setup. The transition changes the existing PlugPlay service
+/// to auto-start together with the setup markers, and Config Manager persists and publishes that
+/// mutation atomically. Calling this while constructing the later syscall handler would leave SCM
+/// with a stale demand-start view until the next boot.
+pub(crate) struct ReactOsInstalledBootProvision {
+    pub stats: nt_hive_core::ReactOsInstalledBootSeedStats,
+    pub generation: Option<u64>,
+    pub journal_records: u32,
+}
+
+pub(crate) fn provision_reactos_installed_boot_state(
+) -> Result<ReactOsInstalledBootProvision, u32> {
+    let mut target = CollectSystemSetupSeedTarget::new();
+    let seed = nt_hive_core::seed_reactos_installed_boot_state_into_target(&mut target);
+    let mutations = target.finish_required()?;
+    let stats = seed.map_err(|error| match error {
+        nt_hive_core::ReactOsInstalledBootSeedError::PlugPlayServiceMissing => {
+            STATUS_OBJECT_NAME_NOT_FOUND
+        }
+    })?;
+    if mutations.is_empty() {
+        return Ok(ReactOsInstalledBootProvision {
+            stats,
+            generation: None,
+            journal_records: 0,
+        });
+    }
+
+    let client_mutations: alloc::vec::Vec<_> = mutations
+        .iter()
+        .map(OwnedSystemHiveMutation::as_client_mutation)
+        .collect();
+    let outcome = unsafe { crate::persist_and_publish_system_hive_mutation(&client_mutations) }?;
+    assert!(
+        outcome.journaled,
+        "nonempty installed-state mutation must own a durable journal record"
+    );
+    assert!(
+        !outcome.wake_device_action,
+        "installed setup/service values cannot publish a PnP topology action"
+    );
+    Ok(ReactOsInstalledBootProvision {
+        stats,
+        generation: Some(outcome.generation),
+        journal_records: mutations.len().min(u32::MAX as usize) as u32,
+    })
+}
+
 impl ExecNtHandler {
     unsafe fn reserve_pending_file_io_owner(&mut self) -> bool {
         assert!(
@@ -3610,6 +3660,7 @@ impl ExecNtHandler {
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts: DriverStartBootstrap,
         require_boot_system: bool,
+        bootstrap_system_journal_records: u32,
     ) -> &'static mut Self {
         // The REAL SECURITY + SAM hives the storage host read BY PATH off
         // `\reactos\system32\config\{security,sam}`. Borrow the staged bytes (no copy) and parse
@@ -3780,7 +3831,10 @@ impl ExecNtHandler {
         write_field!(mutable_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(cm_system_key_handles, alloc::vec::Vec::with_capacity(256));
         write_field!(cm_runtime_key_handles, alloc::vec::Vec::with_capacity(64));
-        write_field!(mutable_hive_journal_pending_records, 0);
+        write_field!(
+            mutable_hive_journal_pending_records,
+            bootstrap_system_journal_records
+        );
         write_field!(mutable_hive_journal_pending_boot_mask, 0);
         write_field!(mutable_hive_journal_dirty_boot_mask, 0);
         write_field!(boot_hive_checkpoints_refreshed, false);
@@ -3921,8 +3975,11 @@ impl ExecNtHandler {
         write_field!(job_token_policies, nt_security::JobTokenPolicyStore::new());
         write_field!(anonymous_logon_tokens, anonymous_logon_tokens);
         write_field!(overlay, nt_hive_core::RegistryOverlay::with_capacity(64));
-        write_field!(writable_fs_dirty, false);
-        write_field!(writable_fs_commit_required, false);
+        write_field!(writable_fs_dirty, bootstrap_system_journal_records != 0);
+        write_field!(
+            writable_fs_commit_required,
+            bootstrap_system_journal_records != 0
+        );
         let handler = &mut *slot;
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
@@ -4000,9 +4057,6 @@ impl ExecNtHandler {
             trace_setup_provision_phase(b"profile-image-begin", 0);
             handler.provision_default_user_ntuser_dat_image();
             trace_setup_provision_phase(b"profile-image-end", 0);
-            trace_setup_provision_phase(b"setup-state-begin", 0);
-            handler.provision_normal_system_setup_state();
-            trace_setup_provision_phase(b"setup-state-end", 0);
             trace_setup_provision_phase(b"network-begin", 0);
             handler.provision_reactos_network_setup();
             trace_setup_provision_phase(b"network-end", 0);
@@ -4258,58 +4312,6 @@ impl ExecNtHandler {
         print_u64(generation);
         print_str(b"\n");
         Ok(outcome)
-    }
-
-    /// Put the mounted SYSTEM hive into the normal installed-boot setup state.
-    ///
-    /// The staged ReactOS media is LiveCD-derived, so its real `SYSTEM\Setup` values describe
-    /// text-mode/live setup (`SetupType=1`, `SystemSetupInProgress=1`, `CmdLine=setup -mini`).
-    /// By this point our boot image has already materialised the installed pieces that setup would
-    /// have produced for the current frontier: writable profiles, a user hive, locale, and SOFTWARE
-    /// profile state. Commit the complete one-time installed-state transition, including setup's
-    /// persisted PlugPlay auto-start selection, so services.exe's real `CheckForLiveCD` path reaches
-    /// `ScmAutoStartServices`. Once the setup markers are canonical, later service configuration is
-    /// administrator-owned and remains untouched.
-    fn provision_normal_system_setup_state(&mut self) {
-        let mut target = CollectSystemSetupSeedTarget::new();
-        let seed = nt_hive_core::seed_reactos_installed_boot_state_into_target(&mut target);
-        let mutations = match target.finish_required() {
-            Ok(mutations) => mutations,
-            Err(status) => {
-                print_str(b"[setup-state] installed-boot registry query failed status=0x");
-                print_hex(status);
-                print_str(b"\n");
-                return;
-            }
-        };
-        let stats = match seed {
-            Ok(stats) => stats,
-            Err(nt_hive_core::ReactOsInstalledBootSeedError::PlugPlayServiceMissing) => {
-                panic!("installed-system transition requires the ReactOS PlugPlay service")
-            }
-        };
-        if mutations.is_empty() {
-            print_str(b"[setup-state] installed SYSTEM state already canonical\n");
-            return;
-        }
-        let generation = match self
-            .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
-        {
-            Ok(generation) => generation,
-            Err(status) => {
-                print_str(b"[setup-state] CM-owned HKLM\\SYSTEM\\Setup commit failed status=0x");
-                print_hex(status);
-                print_str(b"\n");
-                return;
-            }
-        };
-        print_str(b"[setup-state] ReactOS installed-boot values committed setup/service=");
-        print_u64(stats.setup_values as u64);
-        print_str(b"/");
-        print_u64(stats.service_values as u64);
-        print_str(b" through CM generation ");
-        print_u64(generation);
-        print_str(b" with durable journal ownership\n");
     }
 
     fn should_expose_sam_setup_phase(&self, key_path: Option<&str>, value_name: &str) -> bool {

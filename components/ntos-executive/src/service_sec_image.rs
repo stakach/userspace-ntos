@@ -5584,6 +5584,7 @@ pub(crate) unsafe fn service_sec_image(
     scratch_base: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
     driver_starts: DriverStartBootstrap,
+    bootstrap_system_journal_records: u32,
 ) -> (
     u64,
     u64,
@@ -5812,6 +5813,7 @@ pub(crate) unsafe fn service_sec_image(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
         live_service,
+        bootstrap_system_journal_records,
     );
     if live_service {
         print_str(b"[sec-init] handler-ready\n");

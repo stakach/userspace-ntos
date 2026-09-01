@@ -21707,6 +21707,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     under the 3,600-second hard limit, followed by exact selftest Process Manager object teardown if
     the runtime confirms the frame-conflict and Dbgk gates are green.
 
+    Fresh desktop acceptance review (2026-09-01, implementation complete; serialized validation
+    pending): `.tmp/run-desktop-20260901-165519.log` reached genuine userinit and Explorer, completed
+    675 real api0 callbacks with zero callback failures, painted the full 1,024x768 framebuffer, and
+    passed every Dbgk and VM-headroom proof. The final result was 297/298 because the exact live PnP
+    notification ledger remained at zero while CM retained one pending action. The gate is correct:
+    early boot AddDevice/START rows are a separate ownership plane and must not be copied into the
+    user-mode notification ledger.
+
+    Two independent regressions combined. First, SCM launch-plan snapshots classified PlugPlay as
+    demand-start before the LiveCD-to-installed SYSTEM transition ran during handler construction.
+    The transition is now a fail-closed boot phase before every driver/service snapshot, its Config
+    Manager generation is used by those snapshots, and the late duplicate machinery is removed. A
+    fresh transition requires PlugPlay auto/not-demand; an already canonical installed system still
+    preserves later administrator-owned service policy. The pre-handler transaction carries its
+    exact durable journal-record count into `ExecNtHandler`, so the first service-loop ownership
+    barrier checkpoints the writable volume instead of losing the pending snapshot obligation.
+    The live-device-action integration gate now requires the transition to precede SCM selection.
+
+    Second, rust-micro commit `e81e744` made every `CNode_Move` scan all registered CTEs to reparent
+    descendants. Hosted USER/GDI frame caps are leaves, but each of roughly 2,500 ProcessConnect
+    moves scanned the radix-18, 262,144-slot root CSpace; service-host initialization therefore took
+    30-39 seconds and missed ReactOS SCM's genuine 30-second pipe deadline before `umpnpmgr.dll`
+    could load. Move and delete/splice now use the exact per-CTE child count: zero-child operations
+    perform no registry walk, while nonleaf operations retain the exhaustive checked reparenting
+    path. Focused specs cover zero-scan leaf moves and direct-child reparenting. Graphics QEMU keeps
+    the explicit isa-debug-exit verdict and shares the headless complete-log validator, eliminating
+    the former intentional post-sentinel spin. Boot readiness remains capped at 3,600 seconds and is
+    disarmed only after the real Explorer paint proof; an explicit completed verdict terminates both
+    lanes. Next acceptance must show PlugPlay `1/0`, real `umpnpmgr` load, nonzero exact
+    claim/deliver/retire rows, CM pending zero, full Explorer pixels, and all checks passing before
+    Process Manager selftest teardown starts.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
