@@ -4,16 +4,6 @@ const HOSTED_ACPI_ROUTE_MAX_EVAL_BYTES: usize = 12 + 4 + u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedAcpiPciRoutePhase {
-    DispatchPic,
-    DecodeInlinePic {
-        status: nt_status::NtStatus,
-        information: u64,
-    },
-    AwaitingPicCompletion,
-    AwaitingPicAck {
-        status: nt_status::NtStatus,
-        information: u64,
-    },
     DispatchPrt { query_index: usize, output_len: usize },
     DecodeInlinePrt {
         query_index: usize,
@@ -78,7 +68,6 @@ enum HostedAcpiPciRoutePhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedAcpiPciRouteOperation {
     Begin,
-    Pic,
     Prt,
     PrtPdoRelative,
     PrtProviderAbsolute,
@@ -224,7 +213,6 @@ unsafe fn record_hosted_acpi_pci_route_driver_result(
 fn print_hosted_acpi_pci_route_operation(operation: HostedAcpiPciRouteOperation) {
     print_str(match operation {
         HostedAcpiPciRouteOperation::Begin => b"begin",
-        HostedAcpiPciRouteOperation::Pic => b"_PIC",
         HostedAcpiPciRouteOperation::Prt => b"_PRT",
         HostedAcpiPciRouteOperation::PrtPdoRelative => b"pdo-relative-_PRT",
         HostedAcpiPciRouteOperation::PrtProviderAbsolute => b"absolute-_PRT",
@@ -446,8 +434,7 @@ unsafe fn cancel_stale_hosted_acpi_pci_route_query() -> Result<bool, nt_status::
     };
     if !matches!(
         phase,
-        HostedAcpiPciRoutePhase::AwaitingPicCompletion
-            | HostedAcpiPciRoutePhase::AwaitingPrtCompletion { .. }
+        HostedAcpiPciRoutePhase::AwaitingPrtCompletion { .. }
             | HostedAcpiPciRoutePhase::AwaitingCrsFilterCompletion { .. }
             | HostedAcpiPciRoutePhase::AwaitingLinkCompletion { .. }
     ) {
@@ -503,134 +490,6 @@ unsafe fn hosted_acpi_pci_prt_query(
         return None;
     };
     discovery.queries().get(query_index)
-}
-
-unsafe fn hosted_acpi_pci_pic_endpoint() -> Option<nt_pnp::AcpiPciProviderEndpoint> {
-    let query = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).as_ref()?;
-    let HostedAcpiPciRoutePolicy::Routing(discovery) = query.policy.as_ref()? else {
-        return None;
-    };
-    discovery.queries().first().map(|query| query.relation_owner)
-}
-
-unsafe fn apply_hosted_acpi_pic_result(
-    status: nt_status::NtStatus,
-    information: u64,
-) {
-    let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-        .as_mut()
-        .expect("ACPI PCI route query disappeared while applying _PIC result");
-    if query
-        .policy
-        .as_ref()
-        .is_none_or(|policy| !hosted_acpi_pci_route_policy_current(policy))
-    {
-        retry_and_clear_hosted_acpi_pci_route_query();
-        return;
-    }
-    if status.raw() == STATUS_SUCCESS && information == 0 {
-        query.phase = HostedAcpiPciRoutePhase::DispatchPrt {
-            query_index: 0,
-            output_len: nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN,
-        };
-    } else {
-        query.phase = HostedAcpiPciRoutePhase::Barrier;
-        query.barrier_status = Some(if status.raw() == STATUS_SUCCESS {
-            nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        } else {
-            status
-        });
-    }
-}
-
-unsafe fn dispatch_hosted_acpi_pic() -> bool {
-    let Some(endpoint) = hosted_acpi_pci_pic_endpoint() else {
-        let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-            .as_mut()
-            .unwrap();
-        query.phase = HostedAcpiPciRoutePhase::Barrier;
-        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        return true;
-    };
-    let Some(device_id) = hosted_acpi_pci_route_endpoint_device(endpoint) else {
-        let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-            .as_mut()
-            .unwrap();
-        query.phase = HostedAcpiPciRoutePhase::Barrier;
-        query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-        return true;
-    };
-    let input = match nt_acpi::eval_method_input_integer_ex("\\_PIC", 1) {
-        Ok(input) => input,
-        Err(_) => {
-            let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                .as_mut()
-                .unwrap();
-            query.phase = HostedAcpiPciRoutePhase::Barrier;
-            query.barrier_status = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-            return true;
-        }
-    };
-    record_hosted_acpi_pci_route_operation(HostedAcpiPciRouteOperation::Pic, 0, 0);
-    let mut output = [];
-    let result = match io_manager_mut().buffered_device_control_exact_device_payload(
-        ClientId(IO_MANAGER_COMPONENT_ID),
-        device_id,
-        nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX,
-        &input,
-        &mut output,
-    ) {
-        Ok(result) => result,
-        Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES) => return false,
-        Err(status) => {
-            let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                .as_mut()
-                .unwrap();
-            query.phase = HostedAcpiPciRoutePhase::Barrier;
-            query.barrier_status = Some(status);
-            return true;
-        }
-    };
-    match result {
-        ExternalDispatchResult::Completed {
-            status,
-            information,
-            ..
-        } => {
-            record_hosted_acpi_pci_route_driver_result(status, information);
-            let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                .as_mut()
-                .unwrap();
-            query.phase = HostedAcpiPciRoutePhase::DecodeInlinePic {
-                status,
-                information,
-            };
-        }
-        ExternalDispatchResult::Pending { irp_id } => {
-            let identities = io_manager_mut().irp(irp_id).and_then(|irp| {
-                let current = irp.current_stack()?;
-                matches!(
-                    &current.parameters,
-                    IoParameters::DeviceControl(parameters)
-                        if parameters.ioctl_code == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
-                            && parameters.input_len as usize == input.len()
-                            && parameters.output_len == 0
-                )
-                .then_some((irp.origin_driver_id, current.driver_id, current.device_id))
-            });
-            let (origin_driver_id, completion_driver_id, completion_device_id) =
-                identities.unwrap_or((DriverId(0), DriverId(0), nt_io_manager::DeviceId(0)));
-            let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                .as_mut()
-                .unwrap();
-            query.irp_id = irp_id;
-            query.origin_driver_id = origin_driver_id;
-            query.completion_driver_id = completion_driver_id;
-            query.completion_device_id = completion_device_id;
-            query.phase = HostedAcpiPciRoutePhase::AwaitingPicCompletion;
-        }
-    }
-    true
 }
 
 fn classify_hosted_acpi_variable_eval_result(
@@ -966,7 +825,10 @@ unsafe fn start_hosted_acpi_pci_route_query() -> usize {
     let phase = if discovery.queries().is_empty() {
         HostedAcpiPciRoutePhase::AcceptTables
     } else {
-        HostedAcpiPciRoutePhase::DispatchPic
+        HostedAcpiPciRoutePhase::DispatchPrt {
+            query_index: 0,
+            output_len: nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN,
+        }
     };
     *core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY) = Some(HostedAcpiPciRouteQuery {
         policy: Some(HostedAcpiPciRoutePolicy::Routing(discovery)),
@@ -1010,9 +872,7 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
         if !current
             && !matches!(
                 phase,
-                HostedAcpiPciRoutePhase::AwaitingPicCompletion
-                    | HostedAcpiPciRoutePhase::AwaitingPicAck { .. }
-                    | HostedAcpiPciRoutePhase::AwaitingPrtCompletion { .. }
+                HostedAcpiPciRoutePhase::AwaitingPrtCompletion { .. }
                     | HostedAcpiPciRoutePhase::AwaitingPrtCopy { .. }
                     | HostedAcpiPciRoutePhase::AwaitingPrtAck { .. }
                     | HostedAcpiPciRoutePhase::AwaitingCrsFilterCompletion { .. }
@@ -1028,95 +888,6 @@ unsafe fn drain_hosted_acpi_pci_route_query() -> usize {
             return progress.saturating_add(1);
         }
         match phase {
-            HostedAcpiPciRoutePhase::DispatchPic => {
-                if !dispatch_hosted_acpi_pic() {
-                    return progress;
-                }
-                progress = progress.saturating_add(1);
-            }
-            HostedAcpiPciRoutePhase::DecodeInlinePic {
-                status,
-                information,
-            } => {
-                apply_hosted_acpi_pic_result(status, information);
-                progress = progress.saturating_add(1);
-            }
-            HostedAcpiPciRoutePhase::AwaitingPicCompletion => {
-                let query = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                    .as_ref()
-                    .unwrap();
-                let expected_device_id = hosted_acpi_pci_pic_endpoint()
-                    .and_then(|endpoint| hosted_acpi_pci_route_endpoint_device(endpoint));
-                let input = nt_acpi::eval_method_input_integer_ex("\\_PIC", 1).ok();
-                let request_fingerprint_valid = input.as_ref().is_some_and(|input| {
-                    hosted_acpi_route_request_input_is(query.irp_id, input)
-                });
-                let Some(completion) = io_manager_mut().completed_irp(query.irp_id) else {
-                    return progress;
-                };
-                let request_valid = io_manager_mut().irp(query.irp_id).is_some_and(|irp| {
-                    irp.current_stack().is_some_and(|stack| {
-                        stack.driver_id == query.completion_driver_id
-                            && stack.device_id == query.completion_device_id
-                            && matches!(
-                                &stack.parameters,
-                                IoParameters::DeviceControl(parameters)
-                                    if parameters.ioctl_code
-                                        == nt_acpi::IOCTL_ACPI_EVAL_METHOD_EX
-                                        && parameters.input_len as usize
-                                            == nt_acpi::ACPI_EVAL_INPUT_BUFFER_SIMPLE_INTEGER_EX_LEN
-                                        && parameters.output_len == 0
-                            )
-                    })
-                });
-                let identity_valid = completion.id == query.irp_id
-                    && completion.client_id == ClientId(IO_MANAGER_COMPONENT_ID)
-                    && completion.file_id.is_none()
-                    && completion.driver_id == query.origin_driver_id
-                    && Some(completion.device_id) == expected_device_id
-                    && completion.major == major::IRP_MJ_DEVICE_CONTROL
-                    && completion.minor == 0
-                    && completion.completion_driver_id == query.completion_driver_id
-                    && completion.completion_device_id == query.completion_device_id
-                    && completion.user_data == 0
-                    && completion.requestor_tid == 0
-                    && completion.completion_origin == IrpCompletionOrigin::Driver
-                    && request_valid
-                    && request_fingerprint_valid;
-                let (status, information) = if identity_valid {
-                    (completion.status, completion.information)
-                } else {
-                    (nt_status::NtStatus::INVALID_DEVICE_REQUEST, 0)
-                };
-                record_hosted_acpi_pci_route_driver_result(status, information);
-                let query = (*core::ptr::addr_of_mut!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                    .as_mut()
-                    .unwrap();
-                query.phase = HostedAcpiPciRoutePhase::AwaitingPicAck {
-                    status,
-                    information,
-                };
-                progress = progress.saturating_add(1);
-            }
-            HostedAcpiPciRoutePhase::AwaitingPicAck {
-                status,
-                information,
-            } => {
-                let irp_id = (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY))
-                    .as_ref()
-                    .unwrap()
-                    .irp_id;
-                match io_manager_mut().acknowledge_completed_irp_strict(irp_id) {
-                    Ok(_) => {
-                        apply_hosted_acpi_pic_result(status, information);
-                        progress = progress.saturating_add(1);
-                    }
-                    Err(ack_status) => {
-                        retain_hosted_acpi_pci_route_indeterminate_irp(irp_id, ack_status);
-                        return progress.saturating_add(1);
-                    }
-                }
-            }
             HostedAcpiPciRoutePhase::DispatchPrt {
                 query_index,
                 output_len,

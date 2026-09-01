@@ -36,6 +36,11 @@ pub const HAL: &[ExportDescriptor] = &[
         Partial,
         "executive monotonic 100ns clock with a matching 10MHz frequency",
     ),
+    e(
+        "HalAcpiQueryInterruptModel",
+        Implemented,
+        "hosted ACPI provider query backed by firmware-validated platform topology",
+    ),
     // Bus/hardware access (fail-fast).
     e("HalGetBusData", Unsupported, ""),
     e("HalSetBusData", Unsupported, ""),

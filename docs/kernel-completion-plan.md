@@ -22586,16 +22586,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lifecycle. Reusing the executive event notification now checks tracked bind ownership instead of
     attempting a second TCB bind against a notification that is already live.
 
-    PCI routing now invokes the standard extended simple-integer `\\_PIC(1)` method at the ACPI
-    namespace root through an authenticated provider endpoint before evaluating any `_PRT`. Inline
-    and pending results require exact success with zero result bytes; pending IRPs additionally
-    validate the request fingerprint, IOCTL/input/output shape, provider identities, completion
-    origin, and strict acknowledgement. There is no PIC-mode `_PRT` fallback. `nt-acpi` passes
-    40/40, `nt-kernel-exec` passes 219/219, formatting is clean, and the executive freestanding
-    check is green.
+    B3 ACPI interrupt-model ownership correction (2026-09-02, implementation complete; provider
+    artifact and runtime acceptance pending): reference review rejected both attempted executive
+    transports. A BusRelations `relation_owner` is an FDO with no method-evaluation dispatch, while
+    sending root `\\_PIC` through a child PDO would violate the standard PDO namespace boundary and
+    work only because the patched provider currently accepts absolute paths. All executive `_PIC`
+    operation, endpoint, IRP, completion, acknowledgement, retry, and barrier machinery has therefore
+    been deleted. Executive PCI-route reconciliation begins directly with each authenticated `_PRT`.
 
-    Review adjustment: run the serialized desktop acceptance with PIT IRQ evidence, `_PIC(1)`
-    success, Q35 E1000 GSI 23 publication, genuine NIC delivery, Explorer framebuffer proof, and the
+    The ordered ReactOS provider overlay now makes `acpi.sys` own root `_PIC(model)` during ACPICA
+    initialization, after `AcpiEnableSubsystem` and before `AcpiInitializeObjects` can execute
+    `_REG`, `_STA`, or `_INI`. A missing `_PIC` remains valid; failure to query the HAL, an invalid
+    model, or failure of a present method aborts START, and the FDO is not marked Started until real
+    namespace PDO enumeration succeeds. This matches the NT5 ownership direction without importing
+    its large power-management dispatch surface.
+
+    The narrow hosted `hal.dll!HalAcpiQueryInterruptModel` import crosses the isolated-driver service
+    endpoint rather than touching executive data from provider VSpace. The component pump
+    authenticates the live driver channel and reply capability, and the executive reports IOAPIC
+    mode only after BootInfo controller extents exactly match the checksum-validated MADT and at
+    least one controller exists. There is no literal route-owner policy in `acpi.sys`, no shared-data
+    mapping assumption, and no PIC-mode fallback. rust-micro commit `7dfc98f` records overlay patch
+    0002 plus ordered source verification. Provider build run `33571154579` succeeded and produced the
+    amd64 MSVC Debug artifact with canonical SHA-256
+    `937a7db09703d8f805766a2376768ea4621e7aa7c408df66f82b950a1defc768` and 453120-byte size;
+    rust-micro commit `fd489d7` pins that artifact, its build-run identity, and both patch hashes.
+    PE inspection confirms the artifact imports `hal.dll!HalAcpiQueryInterruptModel`, and the overlay
+    verifier accepts its exact source and binary provenance.
+
+    The rejected Rust integer-method encoders and their `_PIC` ABI fixtures were also deleted; no
+    executive source retains the old `_PIC` state machine or request builder. `nt-compat-exports`
+    passes 42/42, `nt-acpi` passes 38/38, `nt-kernel-exec` passes 219/219, formatting and diff checks
+    are clean, and the executive freestanding check is green at the established 214-warning
+    baseline. Serialized desktop acceptance remains pending.
+
+    Review adjustment: after the rebuilt provider artifact is pinned, run the serialized desktop
+    acceptance with PIT IRQ evidence, provider-initialization `_PIC(1)` success before the first real
+    `_PRT`, Q35 E1000 GSI 23 publication, genuine NIC delivery, Explorer framebuffer proof, and the
     full gate sentinel. After acceptance, add one generation-owned physical-line authority shared by
     SCI and hosted PCI publication; invalidation must fence new admissions while retaining physical
     claims until old connection leases drain. Then complete the private interrupt arena cutover and

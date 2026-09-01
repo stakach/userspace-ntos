@@ -6,7 +6,7 @@
 
 use crate::*;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const PAGE_SIZE: u64 = nt_acpi::ACPI_PAGE_SIZE;
 const MAX_CANONICAL_PAGES: u64 = 4096;
@@ -21,6 +21,7 @@ const EMPTY_IOAPIC_EXTENT: nt_acpi::IoApicRouteExtent = nt_acpi::IoApicRouteExte
 };
 
 static PLATFORM_IOAPIC_COUNT: AtomicU32 = AtomicU32::new(0);
+static PLATFORM_IOAPIC_FIRMWARE_VALIDATED: AtomicBool = AtomicBool::new(false);
 static mut PLATFORM_IOAPICS: [nt_acpi::IoApicRouteExtent; sel4_rt::MAX_BOOT_IOAPICS] =
     [EMPTY_IOAPIC_EXTENT; sel4_rt::MAX_BOOT_IOAPICS];
 static LOADER_ACPI_ROOT_PADDR: AtomicU64 = AtomicU64::new(0);
@@ -119,12 +120,22 @@ pub(crate) fn resolve_platform_ioapic_gsi(gsi: u32) -> Option<nt_acpi::ResolvedI
     nt_acpi::resolve_ioapic_gsi(controllers, gsi).ok()
 }
 
+pub(crate) fn platform_acpi_interrupt_model() -> Option<u32> {
+    const ACPI_IRQ_MODEL_IOAPIC: u32 = 1;
+
+    (PLATFORM_IOAPIC_FIRMWARE_VALIDATED.load(Ordering::Acquire)
+        && PLATFORM_IOAPIC_COUNT.load(Ordering::Acquire) != 0)
+        .then_some(ACPI_IRQ_MODEL_IOAPIC)
+}
+
 fn validate_platform_ioapic_firmware(
     controllers: &[nt_acpi::MadtIoApic],
 ) -> Result<(), nt_status::NtStatus> {
+    PLATFORM_IOAPIC_FIRMWARE_VALIDATED.store(false, Ordering::Release);
     let count = PLATFORM_IOAPIC_COUNT.load(Ordering::Acquire) as usize;
     let kernel = unsafe { &PLATFORM_IOAPICS[..count] };
-    if nt_acpi::validate_ioapic_route_extents(controllers, kernel).is_ok() {
+    if !kernel.is_empty() && nt_acpi::validate_ioapic_route_extents(controllers, kernel).is_ok() {
+        PLATFORM_IOAPIC_FIRMWARE_VALIDATED.store(true, Ordering::Release);
         return Ok(());
     }
     print_str(b"[acpi-platform] IOAPIC topology mismatch firmware/kernel-count=");

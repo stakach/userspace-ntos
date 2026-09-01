@@ -180,6 +180,10 @@ mod tests {
             reg.resolve("hal.dll", "KfRaiseIrql"),
             ImportOutcome::Available(ExportStatus::Partial)
         );
+        assert_eq!(
+            reg.resolve("hal.dll", "HalAcpiQueryInterruptModel"),
+            ImportOutcome::Available(ExportStatus::Implemented)
+        );
     }
 
     #[test]

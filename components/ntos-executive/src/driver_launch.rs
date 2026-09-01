@@ -688,6 +688,7 @@ pub const FSD_SERVICE_PCI_CONFIG_LABEL: u64 = 0x784;
 pub const FSD_SERVICE_INTERRUPT_LABEL: u64 = 0x785;
 pub const FSD_IRQ_LANE_COMPLETION_LABEL: u64 = 0x786;
 pub const FSD_IRQ_LANE_FAULT_LABEL: u64 = 0x787;
+pub const FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL: u64 = 0x788;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
@@ -727,6 +728,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_PS_GET_CURRENT_THREAD_ID_LABEL
             | FSD_SERVICE_PCI_CONFIG_LABEL
             | FSD_SERVICE_INTERRUPT_LABEL
+            | FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
     )
 }
 
@@ -14183,6 +14185,29 @@ extern "win64" fn s_hal_get_interrupt_vector(
         );
         granted_vector
     }
+}
+
+extern "win64" fn s_hal_acpi_query_interrupt_model(interrupt_model_out: u64) -> i32 {
+    if interrupt_model_out == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let (_label, status, interrupt_model, _, _) = unsafe {
+        call_on4(
+            FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL << 12,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    let status = status as u32 as i32;
+    if status != STATUS_SUCCESS {
+        return status;
+    }
+    unsafe {
+        write_unaligned(interrupt_model_out as *mut u32, interrupt_model as u32);
+    }
+    STATUS_SUCCESS
 }
 
 unsafe fn hosted_pci_device_function() -> (u32, u32, u32) {
@@ -31208,6 +31233,10 @@ fn register_fsd_trampolines() -> bool {
     reg.bind(
         "HalGetInterruptVector",
         s_hal_get_interrupt_vector as *const () as usize as u64,
+    );
+    reg.bind(
+        "HalAcpiQueryInterruptModel",
+        s_hal_acpi_query_interrupt_model as *const () as usize as u64,
     );
     reg.bind(
         "HalGetBusData",
@@ -50639,6 +50668,19 @@ fn instance_for_pump_channel(
         return None;
     }
     Some((instance, inst))
+}
+
+pub(crate) fn service_hosted_hal_acpi_interrupt_model(
+    ch: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
+) -> (i32, u64) {
+    if instance_for_pump_channel(ch, active_reply_cap).is_none() {
+        return (STATUS_ACCESS_DENIED, 0);
+    }
+    match platform_acpi_interrupt_model() {
+        Some(interrupt_model) => (STATUS_SUCCESS, interrupt_model as u64),
+        None => (STATUS_DEVICE_NOT_READY, 0),
+    }
 }
 
 pub(crate) fn service_hosted_driver_pci_config(
