@@ -1639,6 +1639,10 @@ pub(crate) fn service_dll_pe_store_stats() -> DllPeStoreStats {
 /// The allocator retains live storage through ownership and `Drop`; this boundary exists only for
 /// state whose user-visible success requires publishing a writable-filesystem checkpoint.
 fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
+    // Object Manager references can reach zero in handle, wait, debug, LPC, or teardown paths. The
+    // serialized ownership barrier is the single convergence point for exact-generation final
+    // process deletion; individual release sites may still make an eager attempt for low latency.
+    let _ = nt_handler.drain_hosted_process_deletion_candidates();
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
     let writable_fs_touched =

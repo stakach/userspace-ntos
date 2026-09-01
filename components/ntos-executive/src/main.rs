@@ -24338,6 +24338,10 @@ struct ExecNtHandler {
     /// Allocation-free hosted process mechanism slots keyed by NT PID/TID/badge. Backed by BSS;
     /// the handler owns only the exclusive wrapper while it is live.
     process_mechanisms: ExecProcessMechanisms,
+    /// Exact-generation Object Manager deletion retries for terminated hosted processes. Ps exit
+    /// can precede the last process/thread handle or dispatcher reference; this bounded table keeps
+    /// that final delete work owned until the common service-loop boundary observes zero refs.
+    process_deletion_candidates: nt_user_host::ProcessDeletionCandidateTable<MAX_PI>,
     /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,

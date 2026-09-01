@@ -4023,6 +4023,10 @@ impl ExecNtHandler {
             nt_memory_manager::ProcessCommitLedger::new()
         );
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
+        write_field!(
+            process_deletion_candidates,
+            nt_user_host::ProcessDeletionCandidateTable::new()
+        );
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
         write_field!(process_vspace_caps, empty_process_vspace_caps_vec());
@@ -21791,14 +21795,43 @@ impl ExecNtHandler {
         assert_eq!(released, Some(endpoint));
     }
 
-    /// Complete the Object Manager's EPROCESS delete procedure after hosted mechanism/VM teardown
-    /// and the last process/thread handle or wait reference. Ps removes ETHREADs and job membership;
-    /// the executive returns only the external Security Manager and LPC references from the deletion
-    /// record, then frees the pi identity for a later genuine process.
+    /// Queue and, when currently ready, complete the Object Manager's EPROCESS delete procedure.
+    /// Ps exit can run before another process closes its last process/thread handle or releases a
+    /// dispatcher wait reference, so every unsuccessful exact attempt remains owned by the common
+    /// service-loop drain rather than relying on the release site that happens to remove the last
+    /// reference.
     pub(crate) fn try_delete_hosted_process_object(&mut self, pid: nt_process::ProcessId) -> bool {
         let Some(pi) = self.process_mechanisms.pi_for_pid(pid) else {
             return false;
         };
+        let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
+            return false;
+        };
+        let candidate = nt_user_host::ProcessDeletionCandidate::from_mechanism(process_mechanism);
+        if self.process_deletion_candidates.queue(candidate).is_err() {
+            return false;
+        }
+        let deleted = self.try_delete_hosted_process_object_exact(candidate);
+        if deleted {
+            self.process_deletion_candidates
+                .remove_exact(candidate)
+                .expect("successful exact process deletion must retire its retry owner");
+        }
+        deleted
+    }
+
+    fn try_delete_hosted_process_object_exact(
+        &mut self,
+        candidate: nt_user_host::ProcessDeletionCandidate,
+    ) -> bool {
+        let pi = candidate.pi;
+        let pid = candidate.pid;
+        let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
+            return false;
+        };
+        if !candidate.matches_mechanism(process_mechanism) {
+            return false;
+        }
         if self.process_vspaces.get(pi).copied().unwrap_or(1) != 0
             || self
                 .process_vspace_caps
@@ -21809,9 +21842,6 @@ impl ExecNtHandler {
             return false;
         }
 
-        let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
-            return false;
-        };
         let dynamic_retirement = if pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI {
             let Some(image) = self.hosted_process_image(pi) else {
                 return false;
@@ -21931,6 +21961,32 @@ impl ExecNtHandler {
         self.drain_job_destructions();
         self.refresh_process_manager_gates();
         true
+    }
+
+    /// Retry every exact hosted-process deletion candidate once. A missing or replacement process
+    /// mechanism makes an old candidate stale and removes only that exact retry token; a still-live
+    /// Object Manager reference keeps the candidate queued for the next ownership boundary.
+    pub(crate) fn drain_hosted_process_deletion_candidates(&mut self) -> usize {
+        let mut deleted = 0usize;
+        for pi in 0..MAX_PI {
+            let Some(candidate) = self.process_deletion_candidates.get(pi) else {
+                continue;
+            };
+            let current = self.process_mechanisms.get(pi);
+            if !current.is_some_and(|mechanism| candidate.matches_mechanism(mechanism)) {
+                self.process_deletion_candidates
+                    .remove_exact(candidate)
+                    .expect("candidate remains exact until this serialized stale retirement");
+                continue;
+            }
+            if self.try_delete_hosted_process_object_exact(candidate) {
+                self.process_deletion_candidates
+                    .remove_exact(candidate)
+                    .expect("successful exact process deletion must retire its retry owner");
+                deleted += 1;
+            }
+        }
+        deleted
     }
 
     pub(crate) fn duplicate_process_handle_with_access(

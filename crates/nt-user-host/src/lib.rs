@@ -18,8 +18,8 @@ mod services;
 use alloc::vec::Vec;
 
 pub use mechanism::{
-    MechanismError, ProcessMechanism, ProcessMechanismTable, ThreadMechanism, ThreadMechanismKind,
-    ThreadMechanismTable,
+    MechanismError, ProcessDeletionCandidate, ProcessDeletionCandidateTable, ProcessMechanism,
+    ProcessMechanismTable, ThreadMechanism, ThreadMechanismKind, ThreadMechanismTable,
 };
 pub use ntdll::{NtdllExport, NtdllImage};
 pub use profile::{

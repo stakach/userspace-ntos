@@ -21826,6 +21826,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     VM/cap releases converge on final deletion without pid-only or one-shot retry sites. Then resume
     the dedicated real-provider GetClassInfo integration client.
 
+    Runtime review adjustment (2026-09-01): `.tmp/run-desktop-20260901-210253.log` reached the real
+    Explorer desktop and launched a genuine `rundll32.exe` at dynamic pi 23. That process completed
+    provider-owned GUI rundown, released 589 registered frames, 854 shared mappings, 2,962 win32k
+    client caps with zero failures, 22 DLL views, and its final TCB/VSpace. Its EPROCESS was still
+    referenced at that instant, however, so the one-shot final-delete attempt reported
+    `reclaimed=0`; subsequent PnP install actions exhausted the dynamic window with
+    `err=6 max_pi=24`, and the post-quiesce Dbgk target-block test could not allocate its second
+    target. QEMU was stopped after the deterministic `dw1` wall. This proves the exact deletion
+    retry owner is a prerequisite for, rather than a follow-up to, the churn acceptance run.
+
+    Exact deletion-candidate checkpoint (2026-09-01, implementation green; runtime acceptance
+    pending): `nt-user-host` now owns a fixed-capacity, allocation-free candidate table indexed by
+    process mechanism slot and fenced by exact `{pi, pid, generation}` identity. The first final
+    delete attempt queues its owner before consulting reference state. Every service-loop ownership
+    boundary retries all live candidates; successful deletion retires the exact candidate after
+    process mechanism, runtime, image, and catalog retirement, while a missing or replacement
+    mechanism discards only the stale generation. Existing handle, wait, debug, and termination
+    release sites retain eager low-latency attempts, but correctness no longer depends on any one of
+    them being the final reference release. `nt-user-host` passes 15 unit tests plus 3 real-ntdll
+    integration tests, and the freestanding executive check is green.
+
+    Review adjustment: run the serialized desktop churn proof again under the one-hour ceiling.
+    Require an exact dynamic pi generation to be reclaimed and reused by a later real
+    `rundll32.exe`, no `err=6`, successful Dbgk `dw2` and full target-block proof, zero provider/cap
+    teardown failures, and the complete Explorer framebuffer/sentinel gates. If a candidate remains
+    queued despite repeated ownership barriers, add a typed Process Manager blocker census and fix
+    the reference owner; do not force deletion or enlarge the process window. Only after this proof
+    passes should work move to a reclaiming provider pool if normal win32k frees prove bump-only,
+    then the dedicated real-provider GetClassInfo integration client.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

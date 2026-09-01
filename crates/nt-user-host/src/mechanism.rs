@@ -25,6 +25,117 @@ pub struct ProcessMechanism {
     pub generation: u64,
 }
 
+/// Exact hosted-process identity retained while Object Manager references drain after Ps exit.
+///
+/// A process index can be reused after final deletion, so neither `pi` nor PID alone is a safe
+/// retry key. The generation is the process-host publication token and fences a late retry from a
+/// replacement that has already claimed the same mechanism slot.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessDeletionCandidate {
+    pub pi: usize,
+    pub pid: u32,
+    pub generation: u64,
+}
+
+impl ProcessDeletionCandidate {
+    pub const fn empty() -> Self {
+        Self {
+            pi: 0,
+            pid: 0,
+            generation: 0,
+        }
+    }
+
+    pub const fn from_mechanism(mechanism: ProcessMechanism) -> Self {
+        Self {
+            pi: mechanism.pi,
+            pid: mechanism.pid,
+            generation: mechanism.generation,
+        }
+    }
+
+    pub const fn is_live(self) -> bool {
+        self.pid != 0
+    }
+
+    pub const fn matches_mechanism(self, mechanism: ProcessMechanism) -> bool {
+        self.pi == mechanism.pi
+            && self.pid == mechanism.pid
+            && self.generation == mechanism.generation
+    }
+}
+
+/// One allocation-free final-deletion retry owner per process mechanism slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessDeletionCandidateTable<const N: usize> {
+    slots: [ProcessDeletionCandidate; N],
+}
+
+impl<const N: usize> Default for ProcessDeletionCandidateTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> ProcessDeletionCandidateTable<N> {
+    pub const fn new() -> Self {
+        Self {
+            slots: [ProcessDeletionCandidate::empty(); N],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for slot in self.slots.iter_mut() {
+            *slot = ProcessDeletionCandidate::empty();
+        }
+    }
+
+    /// Queue an exact identity. `Ok(false)` means that identity was already pending.
+    pub fn queue(&mut self, candidate: ProcessDeletionCandidate) -> Result<bool, MechanismError> {
+        if candidate.pi >= N {
+            return Err(MechanismError::SlotOutOfRange);
+        }
+        if candidate.pid == 0 || candidate.generation == 0 {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        let slot = &mut self.slots[candidate.pi];
+        if *slot == candidate {
+            return Ok(false);
+        }
+        if slot.is_live() {
+            return Err(MechanismError::SlotOccupied);
+        }
+        *slot = candidate;
+        Ok(true)
+    }
+
+    pub fn get(&self, pi: usize) -> Option<ProcessDeletionCandidate> {
+        self.slots.get(pi).copied().filter(|slot| slot.is_live())
+    }
+
+    pub fn remove_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let Some(slot) = self.slots.get_mut(expected.pi) else {
+            return Err(MechanismError::SlotOutOfRange);
+        };
+        if !slot.is_live() {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        if *slot != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        let removed = *slot;
+        *slot = ProcessDeletionCandidate::empty();
+        Ok(removed)
+    }
+
+    pub fn live_len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_live()).count()
+    }
+}
+
 impl ProcessMechanism {
     pub const fn empty() -> Self {
         Self {
@@ -520,6 +631,71 @@ mod tests {
         assert_eq!(table.release_exact(old), Err(MechanismError::StaleIdentity));
         assert_eq!(table.get(1), Some(replacement));
         assert_eq!(table.release_exact(replacement), Ok(replacement));
+    }
+
+    #[test]
+    fn deletion_candidates_are_exact_generation_and_allocation_free() {
+        let old = ProcessMechanism {
+            pi: 1,
+            pid: 12,
+            main_tid: 20,
+            top_badge: 2,
+            generation: 7,
+        };
+        let candidate = ProcessDeletionCandidate::from_mechanism(old);
+        let mut table = ProcessDeletionCandidateTable::<4>::new();
+        assert_eq!(table.queue(candidate), Ok(true));
+        assert_eq!(table.queue(candidate), Ok(false));
+        assert_eq!(table.get(1), Some(candidate));
+        assert!(candidate.matches_mechanism(old));
+
+        let replacement = ProcessMechanism {
+            pid: 13,
+            main_tid: 21,
+            generation: 8,
+            ..old
+        };
+        assert!(!candidate.matches_mechanism(replacement));
+        assert_eq!(
+            table.queue(ProcessDeletionCandidate::from_mechanism(replacement)),
+            Err(MechanismError::SlotOccupied)
+        );
+        assert_eq!(table.remove_exact(candidate), Ok(candidate));
+        assert_eq!(table.live_len(), 0);
+        assert_eq!(
+            table.queue(ProcessDeletionCandidate::from_mechanism(replacement)),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn deletion_candidates_reject_stale_and_invalid_removal() {
+        let mut table = ProcessDeletionCandidateTable::<2>::new();
+        let candidate = ProcessDeletionCandidate {
+            pi: 1,
+            pid: 12,
+            generation: 3,
+        };
+        table.queue(candidate).unwrap();
+        assert_eq!(
+            table.remove_exact(ProcessDeletionCandidate {
+                generation: 4,
+                ..candidate
+            }),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(
+            table.queue(ProcessDeletionCandidate { pi: 2, ..candidate }),
+            Err(MechanismError::SlotOutOfRange)
+        );
+        assert_eq!(
+            table.queue(ProcessDeletionCandidate {
+                pid: 0,
+                ..candidate
+            }),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(table.get(1), Some(candidate));
     }
 
     #[test]
