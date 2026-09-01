@@ -55,8 +55,7 @@ pub const INTERFACE_TYPE_PCI_BUS: u32 = 5;
 pub const INTERFACE_TYPE_PNP_BUS: u32 = 15;
 pub const DEVICE_ADDRESS_UNAVAILABLE: u32 = u32::MAX;
 
-/// Exact CM claim held by the kernel PnP action owner until both user notification and kernel
-/// lifecycle work have completed.
+/// Exact CM claim held until the user-mode notification response has been delivered.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DeviceActionClaimIdentity {
     pub mount_generation: u64,
@@ -71,25 +70,9 @@ pub enum DeviceActionNotificationState {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DeviceActionLifecycleOperation {
-    Start,
-    Rebalance,
-    Remove,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DeviceActionLifecycleState {
-    AwaitingAction,
-    InFlight {
-        operation: DeviceActionLifecycleOperation,
-        owner_slot: usize,
-    },
-    Terminal {
-        status: u32,
-    },
-    Barrier {
-        status: u32,
-    },
+pub enum DeviceActionResponseState {
+    AwaitingResponse,
+    Terminal { status: u32 },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -105,7 +88,6 @@ pub enum DeviceActionOwnerError {
     InvalidIdentity,
     DuplicateResponse,
     WrongPhase,
-    WrongOwner,
     ReplyFailed,
     NotAcknowledgeable,
 }
@@ -121,7 +103,9 @@ pub enum ExistingDeviceStartDisposition {
 /// Classify a synchronous StartDevice request against the canonical devnode state.
 ///
 /// A Config Manager instance alone is not evidence that its device stack has started. Callers may
-/// report success without a new action owner only for a canonical `Started` devnode.
+/// report success without dispatch only for a canonical `Started` devnode. Absence from the hosted
+/// PnP manager means the first AddDevice/START transaction is still required; CM existence is
+/// validated by the caller before this classification.
 pub const fn existing_device_start_disposition(
     state: Option<DeviceState>,
 ) -> ExistingDeviceStartDisposition {
@@ -133,21 +117,21 @@ pub const fn existing_device_start_disposition(
             | DeviceState::QueryRemovePending
             | DeviceState::RemovePending,
         ) => ExistingDeviceStartDisposition::Busy,
-        Some(DeviceState::Removed) | None => ExistingDeviceStartDisposition::NoSuchDevice,
-        Some(_) => ExistingDeviceStartDisposition::RequiresAction,
+        Some(DeviceState::Removed) => ExistingDeviceStartDisposition::NoSuchDevice,
+        Some(_) | None => ExistingDeviceStartDisposition::RequiresAction,
     }
 }
 
-/// Pure coordinator for one live CM device action.
+/// Pure coordinator for one live CM notification.
 ///
-/// A ReactOS `PlugPlayControlUserResponse` acknowledges only delivery to user mode. CM retirement
-/// is legal after that response and a terminal kernel lifecycle result. Pending or ownership-lost
-/// driver work therefore retains the exact claim instead of advancing the journal.
+/// `PlugPlayControlUserResponse` retires the notification independently of the later device-install
+/// worker and its `PlugPlayControlStartDevice` transaction. This owner therefore tracks only the
+/// exact notification response and its syscall reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceActionOwner {
     identity: DeviceActionClaimIdentity,
     notification: DeviceActionNotificationState,
-    lifecycle: DeviceActionLifecycleState,
+    response: DeviceActionResponseState,
     reply: DeviceActionReplyState,
 }
 
@@ -159,7 +143,7 @@ impl DeviceActionOwner {
         Ok(Self {
             identity,
             notification: DeviceActionNotificationState::Pending,
-            lifecycle: DeviceActionLifecycleState::AwaitingAction,
+            response: DeviceActionResponseState::AwaitingResponse,
             reply: DeviceActionReplyState::NotReady,
         })
     }
@@ -172,8 +156,8 @@ impl DeviceActionOwner {
         self.notification
     }
 
-    pub const fn lifecycle(&self) -> DeviceActionLifecycleState {
-        self.lifecycle
+    pub const fn response_state(&self) -> DeviceActionResponseState {
+        self.response
     }
 
     pub const fn reply(&self) -> DeviceActionReplyState {
@@ -188,46 +172,11 @@ impl DeviceActionOwner {
         Ok(())
     }
 
-    pub fn begin(
-        &mut self,
-        operation: DeviceActionLifecycleOperation,
-        owner_slot: usize,
-    ) -> Result<(), DeviceActionOwnerError> {
-        if self.lifecycle != DeviceActionLifecycleState::AwaitingAction {
+    pub fn complete_without_dispatch(&mut self, status: u32) -> Result<(), DeviceActionOwnerError> {
+        if self.response != DeviceActionResponseState::AwaitingResponse {
             return Err(DeviceActionOwnerError::WrongPhase);
         }
-        self.lifecycle = DeviceActionLifecycleState::InFlight {
-            operation,
-            owner_slot,
-        };
-        Ok(())
-    }
-
-    pub fn complete(
-        &mut self,
-        operation: DeviceActionLifecycleOperation,
-        owner_slot: usize,
-        status: u32,
-    ) -> Result<(), DeviceActionOwnerError> {
-        match self.lifecycle {
-            DeviceActionLifecycleState::InFlight {
-                operation: expected_operation,
-                owner_slot: expected,
-            } if expected_operation == operation && expected == owner_slot => {
-                self.lifecycle = DeviceActionLifecycleState::Terminal { status };
-                self.reply = DeviceActionReplyState::Awaiting { status };
-                Ok(())
-            }
-            DeviceActionLifecycleState::InFlight { .. } => Err(DeviceActionOwnerError::WrongOwner),
-            _ => Err(DeviceActionOwnerError::WrongPhase),
-        }
-    }
-
-    pub fn complete_without_start(&mut self, status: u32) -> Result<(), DeviceActionOwnerError> {
-        if self.lifecycle != DeviceActionLifecycleState::AwaitingAction {
-            return Err(DeviceActionOwnerError::WrongPhase);
-        }
-        self.lifecycle = DeviceActionLifecycleState::Terminal { status };
+        self.response = DeviceActionResponseState::Terminal { status };
         self.reply = DeviceActionReplyState::Awaiting { status };
         Ok(())
     }
@@ -248,24 +197,12 @@ impl DeviceActionOwner {
         Ok(())
     }
 
-    pub fn retain_barrier(&mut self, status: u32) -> Result<(), DeviceActionOwnerError> {
-        if matches!(
-            self.lifecycle,
-            DeviceActionLifecycleState::Terminal { .. }
-                | DeviceActionLifecycleState::Barrier { .. }
-        ) {
-            return Err(DeviceActionOwnerError::WrongPhase);
-        }
-        self.lifecycle = DeviceActionLifecycleState::Barrier { status };
-        Ok(())
-    }
-
     pub const fn ready_to_acknowledge(&self) -> bool {
         matches!(
-            (self.notification, self.lifecycle, self.reply),
+            (self.notification, self.response, self.reply),
             (
                 DeviceActionNotificationState::Responded,
-                DeviceActionLifecycleState::Terminal { status },
+                DeviceActionResponseState::Terminal { status },
                 DeviceActionReplyState::Delivered {
                     status: reply_status
                 }
@@ -2386,29 +2323,16 @@ mod tests {
         );
         assert_eq!(
             existing_device_start_disposition(None),
-            ExistingDeviceStartDisposition::NoSuchDevice
+            ExistingDeviceStartDisposition::RequiresAction
         );
     }
 
     #[test]
-    fn device_action_ack_requires_response_and_terminal_lifecycle() {
+    fn device_action_ack_requires_response_and_delivered_syscall_reply() {
         let mut response_first = DeviceActionOwner::new(action_identity()).unwrap();
         response_first.respond().unwrap();
         assert!(!response_first.ready_to_acknowledge());
-        response_first
-            .begin(DeviceActionLifecycleOperation::Start, 3)
-            .unwrap();
-        assert_eq!(
-            response_first.complete(DeviceActionLifecycleOperation::Start, 2, 0),
-            Err(DeviceActionOwnerError::WrongOwner)
-        );
-        assert_eq!(
-            response_first.complete(DeviceActionLifecycleOperation::Rebalance, 3, 0),
-            Err(DeviceActionOwnerError::WrongOwner)
-        );
-        response_first
-            .complete(DeviceActionLifecycleOperation::Start, 3, 0)
-            .unwrap();
+        response_first.complete_without_dispatch(0).unwrap();
         assert!(!response_first.ready_to_acknowledge());
         assert_eq!(
             response_first.reply(),
@@ -2419,7 +2343,7 @@ mod tests {
         assert_eq!(response_first.acknowledge(), Ok(action_identity()));
 
         let mut terminal_first = DeviceActionOwner::new(action_identity()).unwrap();
-        terminal_first.complete_without_start(0).unwrap();
+        terminal_first.complete_without_dispatch(0).unwrap();
         assert_eq!(
             terminal_first.clone().acknowledge(),
             Err(DeviceActionOwnerError::NotAcknowledgeable)
@@ -2428,62 +2352,38 @@ mod tests {
         assert!(!terminal_first.ready_to_acknowledge());
         terminal_first.respond().unwrap();
         assert!(terminal_first.ready_to_acknowledge());
+
+        let mut terminal_error = DeviceActionOwner::new(action_identity()).unwrap();
+        terminal_error
+            .complete_without_dispatch(0xc000_0034)
+            .unwrap();
+        terminal_error.record_reply(0xc000_0034, true).unwrap();
+        terminal_error.respond().unwrap();
+        assert!(terminal_error.ready_to_acknowledge());
+        assert_eq!(terminal_error.acknowledge(), Ok(action_identity()));
     }
 
     #[test]
-    fn device_action_pending_and_barrier_retain_exact_claim() {
+    fn device_action_response_cannot_be_completed_twice() {
         let mut pending = DeviceActionOwner::new(action_identity()).unwrap();
-        pending
-            .begin(DeviceActionLifecycleOperation::Remove, 9)
-            .unwrap();
         pending.respond().unwrap();
+        pending.complete_without_dispatch(0).unwrap();
         assert_eq!(
-            pending.clone().acknowledge(),
-            Err(DeviceActionOwnerError::NotAcknowledgeable)
-        );
-        assert_eq!(pending.identity(), action_identity());
-
-        pending.retain_barrier(0xc000_0001).unwrap();
-        assert_eq!(
-            pending.lifecycle(),
-            DeviceActionLifecycleState::Barrier {
-                status: 0xc000_0001
-            }
-        );
-        assert!(!pending.ready_to_acknowledge());
-        assert_eq!(
-            pending.complete(DeviceActionLifecycleOperation::Remove, 9, 0),
+            pending.complete_without_dispatch(0xc000_0001),
             Err(DeviceActionOwnerError::WrongPhase)
         );
-    }
-
-    #[test]
-    fn device_action_rebalance_retires_only_the_exact_owner() {
-        let mut owner = DeviceActionOwner::new(action_identity()).unwrap();
-        owner.respond().unwrap();
-        owner
-            .begin(DeviceActionLifecycleOperation::Rebalance, 7)
-            .unwrap();
+        assert_eq!(pending.identity(), action_identity());
         assert_eq!(
-            owner.complete(DeviceActionLifecycleOperation::Start, 7, 0),
-            Err(DeviceActionOwnerError::WrongOwner)
+            pending.response_state(),
+            DeviceActionResponseState::Terminal { status: 0 }
         );
-        assert_eq!(
-            owner.complete(DeviceActionLifecycleOperation::Rebalance, 8, 0),
-            Err(DeviceActionOwnerError::WrongOwner)
-        );
-        owner
-            .complete(DeviceActionLifecycleOperation::Rebalance, 7, 0)
-            .unwrap();
-        owner.record_reply(0, true).unwrap();
-        assert!(owner.ready_to_acknowledge());
-        assert_eq!(owner.acknowledge(), Ok(action_identity()));
+        assert!(!pending.ready_to_acknowledge());
     }
 
     #[test]
     fn device_action_reply_must_match_the_terminal_result() {
         let mut mismatch = DeviceActionOwner::new(action_identity()).unwrap();
-        mismatch.complete_without_start(0).unwrap();
+        mismatch.complete_without_dispatch(0).unwrap();
         assert_eq!(
             mismatch.record_reply(0xc000_0001, true),
             Err(DeviceActionOwnerError::ReplyFailed)
@@ -2497,7 +2397,7 @@ mod tests {
         assert!(!mismatch.ready_to_acknowledge());
 
         let mut undelivered = DeviceActionOwner::new(action_identity()).unwrap();
-        undelivered.complete_without_start(0).unwrap();
+        undelivered.complete_without_dispatch(0).unwrap();
         assert_eq!(
             undelivered.record_reply(0, false),
             Err(DeviceActionOwnerError::ReplyFailed)

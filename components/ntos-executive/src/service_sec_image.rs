@@ -15763,8 +15763,8 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
-            // Live PnP actions retain the exact START cursor and syscall reply until their devnode
-            // is terminal. Publication precedes Reply-object rotation.
+            // A pending StartDevice syscall transfers its reply independently of the notification
+            // stream. Publication precedes Reply-object rotation.
             if let Some((transfer, reply)) = transfer_pending_driver_start.take() {
                 pending_driver_start_transfer(&mut nt_handler, transfer, reply);
                 trace_indefinite_wait_park(
@@ -16037,7 +16037,7 @@ pub(crate) unsafe fn service_sec_image(
                 let delivered = nb != COMPOSITE_SEND_ERROR_BADGE;
                 nt_handler
                     .pnp_record_live_action_reply(identity, status, delivered)
-                    .expect("live PnP action reply did not match its terminal lifecycle result");
+                    .expect("live PnP notification reply did not match its UserResponse result");
             }
             badge = nb;
             mi = nmi;
@@ -22514,11 +22514,7 @@ unsafe fn pending_driver_start_transfer(
     transfer: PendingDriverStartTransfer,
     reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
-    let PendingDriverStartTransfer {
-        batch,
-        reservation,
-        identity,
-    } = transfer;
+    let PendingDriverStartTransfer { batch, reservation } = transfer;
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
         stolen, 0,
@@ -22532,10 +22528,7 @@ unsafe fn pending_driver_start_transfer(
         reply_cap: stolen,
         reply,
     };
-    let owner = PendingDriverStartOwner::DeviceAction {
-        identity,
-        reply: Some(reply),
-    };
+    let owner = PendingDriverStartOwner::User(Some(reply));
     nt_handler
         .pending_driver_starts
         .publish(reservation, PendingDriverStart { batch, owner })
@@ -22552,7 +22545,6 @@ unsafe fn pending_pnp_operation_transfer(
     let PendingPnpOperationTransfer {
         operation,
         reservation,
-        kind,
     } = transfer;
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     assert_ne!(
@@ -22567,20 +22559,9 @@ unsafe fn pending_pnp_operation_transfer(
         reply_cap: stolen,
         reply,
     });
-    let owner = match kind {
-        PendingPnpOperationTransferKind::User => PendingPnpOperationOwner::User(reply),
-        PendingPnpOperationTransferKind::DeviceAction {
-            identity,
-            operation,
-        } => PendingPnpOperationOwner::DeviceAction {
-            identity,
-            operation,
-            reply,
-        },
-    };
     nt_handler
         .pending_pnp_operations
-        .publish(reservation, PendingPnpOperation { operation, owner })
+        .publish(reservation, PendingPnpOperation { operation, reply })
         .expect("reserved PnP continuation rejected its exact operation");
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
@@ -22615,50 +22596,24 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     Ok(_) => nt_status::NtStatus::SUCCESS.raw() as u32,
                     Err(failure) => failure.status.raw() as u32,
                 };
-                let device_action_identity =
-                    nt_handler
-                        .pending_driver_starts
-                        .get(slot)
-                        .and_then(|pending| match &pending.owner {
-                            PendingDriverStartOwner::DeviceAction { identity, .. } => {
-                                Some(*identity)
-                            }
-                            _ => None,
-                        });
-                if let Some(identity) = device_action_identity {
-                    nt_handler
-                        .pnp_complete_live_start(identity, slot, status)
-                        .expect("terminal live START lost its exact action owner");
-                }
                 let mut pending = nt_handler
                     .pending_driver_starts
                     .take(slot)
                     .expect("completed driver START continuation disappeared");
-                match &pending.owner {
+                match &mut pending.owner {
                     PendingDriverStartOwner::Boot { target, .. } => nt_handler
                         .boot_driver_start_reports
                         .merge(*target, pending.batch.report()),
-                    PendingDriverStartOwner::DeviceAction { .. } => {
-                        let reply = match &mut pending.owner {
-                            PendingDriverStartOwner::DeviceAction { reply, .. } => reply.take(),
-                            _ => unreachable!(),
-                        };
+                    PendingDriverStartOwner::User(reply) => {
+                        let reply = reply.take();
                         if let Some(reply) = reply {
-                            let delivered = pending_driver_start_reply_owner(
+                            pending_driver_start_reply_owner(
                                 nt_handler,
                                 reply.reply_cap,
                                 reply.reply,
                                 reply.badge,
                                 status,
                             );
-                            nt_handler
-                                .pnp_record_live_action_reply(
-                                    device_action_identity
-                                        .expect("live START reply has no exact action identity"),
-                                    status,
-                                    delivered,
-                                )
-                                .expect("live START reply did not match its terminal result");
                         }
                     }
                 }
@@ -22667,7 +22622,6 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
                 let status = failure.status.raw() as u32;
                 let mut boot_report = None;
-                let mut device_action_identity = None;
                 let reply = {
                     let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
                         continue;
@@ -22683,17 +22637,9 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                             }
                             None
                         }
-                        PendingDriverStartOwner::DeviceAction { identity, reply } => {
-                            device_action_identity = Some(*identity);
-                            reply.take()
-                        }
+                        PendingDriverStartOwner::User(reply) => reply.take(),
                     }
                 };
-                if let Some(identity) = device_action_identity {
-                    nt_handler
-                        .pnp_retain_live_start_barrier(identity, status)
-                        .expect("lost live START ownership lost its exact action claim");
-                }
                 if let Some((target, report)) = boot_report {
                     nt_handler.boot_driver_start_reports.merge(target, report);
                 }
@@ -22725,49 +22671,26 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
         match progress {
             OwnedPendingPnpOperationProgress::AwaitingCompletion => {}
             OwnedPendingPnpOperationProgress::Complete(status) => {
-                let device_action = nt_handler
-                    .pending_pnp_operations
-                    .get(slot)
-                    .and_then(|pending| pending.owner.device_action());
-                if let Some((identity, operation)) = device_action {
-                    nt_handler
-                        .pnp_complete_live_operation(identity, operation, slot, status)
-                        .expect("terminal live PnP operation lost its exact action owner");
-                }
                 let mut pending = nt_handler
                     .pending_pnp_operations
                     .take(slot)
                     .expect("completed PnP operation continuation disappeared");
-                if let Some(reply) = pending.owner.take_reply() {
-                    let delivered = pending_driver_start_reply_owner(
+                if let Some(reply) = pending.reply.take() {
+                    pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
                         reply.reply,
                         reply.badge,
                         status,
                     );
-                    if let Some((identity, _)) = device_action {
-                        nt_handler
-                            .pnp_record_live_action_reply(identity, status, delivered)
-                            .expect("live PnP reply did not match its terminal result");
-                    }
                 }
                 completed = completed.saturating_add(1);
             }
             OwnedPendingPnpOperationProgress::OwnershipLost(status) => {
-                let device_action = nt_handler
-                    .pending_pnp_operations
-                    .get(slot)
-                    .and_then(|pending| pending.owner.device_action());
-                if let Some((identity, operation)) = device_action {
-                    nt_handler
-                        .pnp_retain_live_operation_barrier(identity, operation, status)
-                        .expect("lost live PnP ownership lost its exact action claim");
-                }
                 let reply = nt_handler
                     .pending_pnp_operations
                     .get_mut(slot)
-                    .and_then(|pending| pending.owner.take_reply());
+                    .and_then(|pending| pending.reply.take());
                 if let Some(reply) = reply {
                     pending_driver_start_reply_owner(
                         nt_handler,
@@ -22847,21 +22770,18 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
         let Some(pending) = nt_handler.pending_driver_starts.get_mut(slot) else {
             continue;
         };
-        let PendingDriverStartOwner::DeviceAction {
-            reply: Some(reply), ..
-        } = &pending.owner
-        else {
+        let PendingDriverStartOwner::User(Some(reply)) = &pending.owner else {
             continue;
         };
         if reply.tid != tid || reply.reply_cap == 0 {
             continue;
         }
-        let PendingDriverStartOwner::DeviceAction { reply, .. } = &mut pending.owner else {
+        let PendingDriverStartOwner::User(reply) = &mut pending.owner else {
             unreachable!()
         };
         let reply = reply
             .take()
-            .expect("live START reply disappeared during abandonment");
+            .expect("user START reply disappeared during abandonment");
         let cap = reply.reply_cap;
         let deleted = cnode_delete_r(cap);
         let retyped = if deleted == 0 {
@@ -22879,7 +22799,7 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
         let matches = nt_handler
             .pending_pnp_operations
             .get(slot)
-            .and_then(|pending| pending.owner.reply())
+            .and_then(|pending| pending.reply.as_ref())
             .is_some_and(|reply| reply.tid == tid && reply.reply_cap != 0);
         if !matches {
             continue;
@@ -22888,8 +22808,8 @@ pub(crate) unsafe fn pending_driver_start_abandon_thread(
             .pending_pnp_operations
             .get_mut(slot)
             .expect("PnP operation owner disappeared during abandonment")
-            .owner
-            .take_reply()
+            .reply
+            .take()
             .expect("PnP operation reply disappeared during abandonment");
         let cap = reply.reply_cap;
         let deleted = cnode_delete_r(cap);

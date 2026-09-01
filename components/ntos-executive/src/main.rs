@@ -20331,7 +20331,7 @@ struct LiveDeviceActionTerminalRecord {
     identity: nt_pnp_manager::DeviceActionClaimIdentity,
     kind: nt_config_client::DeviceActionKind,
     instance_id: alloc::string::String,
-    status: u32,
+    response_status: u32,
     reply_status: u32,
     empty_after_ack: bool,
 }
@@ -20340,19 +20340,19 @@ struct LiveDeviceActionTerminalRecord {
 struct LiveDeviceActionReport {
     claims: u64,
     terminal_rows: u64,
-    successful: u64,
+    responded: u64,
     failed: u64,
     empty_after_ack: u64,
     active: u64,
-    reply_tail_active: u64,
+    response_tail_active: u64,
     cm_pending: u64,
 }
 
 impl LiveDeviceActionReport {
     fn coherent(self) -> bool {
         self.claims == self.terminal_rows + self.active
-            && self.successful + self.failed == self.terminal_rows
-            && self.reply_tail_active == 0
+            && self.responded + self.failed == self.terminal_rows
+            && self.response_tail_active == 0
             && self.cm_pending == 0
             && (self.terminal_rows == 0 || self.empty_after_ack != 0)
     }
@@ -20363,13 +20363,15 @@ fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionR
         claims: handler.pnp_live_action_claims,
         terminal_rows: handler.pnp_live_action_terminals.len() as u64,
         active: handler.pnp_live_action.is_some() as u64,
-        reply_tail_active: handler.pnp_live_action_reply_tail.is_some() as u64,
+        response_tail_active: handler.pnp_live_action_reply_tail.is_some() as u64,
         cm_pending: config_manager_device_action_pending() as u64,
         ..LiveDeviceActionReport::default()
     };
     for row in &handler.pnp_live_action_terminals {
-        if nt_status::NtStatus(row.status as i32).is_success() && row.status == row.reply_status {
-            report.successful = report.successful.saturating_add(1);
+        if nt_status::NtStatus(row.response_status as i32).is_success()
+            && row.response_status == row.reply_status
+        {
+            report.responded = report.responded.saturating_add(1);
         } else {
             report.failed = report.failed.saturating_add(1);
         }
@@ -20388,8 +20390,8 @@ fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionR
             nt_config_client::DeviceActionKind::Change => b"change",
             nt_config_client::DeviceActionKind::Removal => b"removal",
         });
-        print_str(b" status/reply=");
-        print_hex(row.status);
+        print_str(b" response/reply=");
+        print_hex(row.response_status);
         print_str(b"/");
         print_hex(row.reply_status);
         print_str(b" empty-after-ack=");
@@ -20398,20 +20400,20 @@ fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionR
         print_str(row.instance_id.as_bytes());
         print_str(b"\n");
     }
-    print_str(b"[pnp-live-proof] summary claims/rows/success/failed=");
+    print_str(b"[pnp-live-proof] summary claims/rows/responded/failed=");
     print_u64(report.claims);
     print_str(b"/");
     print_u64(report.terminal_rows);
     print_str(b"/");
-    print_u64(report.successful);
+    print_u64(report.responded);
     print_str(b"/");
     print_u64(report.failed);
-    print_str(b" empty-after-ack/active/reply-tail/cm-pending=");
+    print_str(b" empty-after-ack/active/response-tail/cm-pending=");
     print_u64(report.empty_after_ack);
     print_str(b"/");
     print_u64(report.active);
     print_str(b"/");
-    print_u64(report.reply_tail_active);
+    print_u64(report.response_tail_active);
     print_str(b"/");
     print_u64(report.cm_pending);
     print_str(b"\n");
@@ -21582,8 +21584,20 @@ pub(crate) unsafe fn live_config_existing_device_launch_spec(
     instance_id: &str,
     max_start: u32,
 ) -> Result<DriverServiceLaunchSpec, i32> {
-    let service_name = driver_launch::hosted_device_service_name_for_instance(instance_id)
-        .map_err(|status| status.raw())?;
+    let mut enum_path = alloc::string::String::from(nt_config_manager::ENUM_PATH);
+    enum_path
+        .try_reserve_exact(instance_id.len().saturating_add(1))
+        .map_err(|_| 0xC000_009Au32 as i32)?;
+    enum_path.push('\\');
+    enum_path.push_str(instance_id);
+    let (value_type, service_data) = config_manager_query_value_owned(&enum_path, "Service")
+        .map_err(|error| error.status)?;
+    if value_type != nt_hive_core::RegistryValueType::Sz as u32 {
+        return Err(0xC000_000Du32 as i32);
+    }
+    let service_bytes = registry_utf16_ascii_vec(&service_data).ok_or(0xC000_0034u32 as i32)?;
+    let service_name = alloc::string::String::from_utf8(service_bytes)
+        .map_err(|_| 0xC000_0034u32 as i32)?;
     let binding = config_manager_query_driver_service(&service_name)?;
     let mut spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start)
         .ok_or(0xC000_0034u32 as i32)?;
@@ -21596,37 +21610,6 @@ pub(crate) unsafe fn live_config_existing_device_launch_spec(
     spec.devnodes.clear();
     spec.devnodes.push(devnode);
     Ok(spec)
-}
-
-pub(crate) unsafe fn live_config_device_action_launch_spec(
-    event: &nt_config_client::DeviceActionEvent,
-    max_start: u32,
-) -> Result<Option<DriverServiceLaunchSpec>, i32> {
-    let Some(service_name) = event.publication.service_name.as_deref() else {
-        return Ok(None);
-    };
-    let binding = config_manager_query_driver_service(service_name)?;
-    if !binding.service_name.eq_ignore_ascii_case(service_name)
-        || !binding.devnodes.iter().any(|devnode| {
-            devnode
-                .instance_id
-                .eq_ignore_ascii_case(&event.publication.instance_id)
-        })
-    {
-        return Err(0xC000_0225u32 as i32);
-    }
-    let mut spec = owned_driver_launch_spec_from_live_config_binding(binding, max_start)
-        .ok_or(0xC000_0034u32 as i32)?;
-    spec.devnodes.clear();
-    spec.devnodes.push(DriverServiceDevnodeSpec {
-        instance_id: event.publication.instance_id.clone(),
-        pdo_name: event.publication.pdo_name.clone(),
-        driver_key: event.publication.driver_key.clone(),
-        linkage_export: event.publication.linkage_export.clone(),
-        hardware_ids: event.publication.hardware_ids.clone(),
-        compatible_ids: event.publication.compatible_ids.clone(),
-    });
-    Ok(Some(spec))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -23616,8 +23599,8 @@ struct ExecNtHandler {
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,
-    /// Exclusive live CM action claim retained across user notification, asynchronous START, and
-    /// CM acknowledgement retries.
+    /// Exclusive live CM notification claim retained through UserResponse reply delivery and CM
+    /// acknowledgement retries. Device installation and StartDevice have independent owners.
     pnp_live_action: Option<LiveDeviceActionState>,
     pnp_live_action_reply_tail: Option<nt_pnp_manager::DeviceActionClaimIdentity>,
     pnp_live_action_claims: u64,
@@ -24008,9 +23991,7 @@ struct NativeDriverLoadReport {
 
 impl NativeDriverLoadReport {
     fn fold_status(digest: u64, sequence: u64, status: u32) -> u64 {
-        digest.rotate_left(9)
-            ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ u64::from(status)
+        digest.rotate_left(9) ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ u64::from(status)
     }
 
     fn record_terminal(&mut self, status: u32) {
@@ -24020,11 +24001,8 @@ impl NativeDriverLoadReport {
             self.protocol_errors = self.protocol_errors.saturating_add(1);
         }
         self.terminal_returns = self.terminal_returns.saturating_add(1);
-        self.terminal_digest = Self::fold_status(
-            self.terminal_digest,
-            self.terminal_returns,
-            status,
-        );
+        self.terminal_digest =
+            Self::fold_status(self.terminal_digest, self.terminal_returns, status);
         self.expected_reply_status = status;
         self.reply_outstanding = true;
         if status == nt_status::NtStatus::PENDING.raw() as u32 {
@@ -24104,14 +24082,10 @@ struct PendingPnpSyscallReply {
 struct PendingDriverStartTransfer {
     batch: OwnedHostedPnpStartBatch,
     reservation: nt_driver_start::PendingOperationReservation,
-    identity: nt_pnp_manager::DeviceActionClaimIdentity,
 }
 
 enum PendingDriverStartOwner {
-    DeviceAction {
-        identity: nt_pnp_manager::DeviceActionClaimIdentity,
-        reply: Option<PendingPnpSyscallReply>,
-    },
+    User(Option<PendingPnpSyscallReply>),
     Boot {
         target: BootDriverStartReportTarget,
         report_published: bool,
@@ -24176,63 +24150,14 @@ impl OwnedPendingPnpOperation {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PendingPnpOperationTransferKind {
-    User,
-    DeviceAction {
-        identity: nt_pnp_manager::DeviceActionClaimIdentity,
-        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
-    },
-}
-
 struct PendingPnpOperationTransfer {
     operation: OwnedPendingPnpOperation,
     reservation: nt_driver_start::PendingOperationReservation,
-    kind: PendingPnpOperationTransferKind,
-}
-
-enum PendingPnpOperationOwner {
-    User(Option<PendingPnpSyscallReply>),
-    DeviceAction {
-        identity: nt_pnp_manager::DeviceActionClaimIdentity,
-        operation: nt_pnp_manager::DeviceActionLifecycleOperation,
-        reply: Option<PendingPnpSyscallReply>,
-    },
-}
-
-impl PendingPnpOperationOwner {
-    fn device_action(
-        &self,
-    ) -> Option<(
-        nt_pnp_manager::DeviceActionClaimIdentity,
-        nt_pnp_manager::DeviceActionLifecycleOperation,
-    )> {
-        match self {
-            Self::DeviceAction {
-                identity,
-                operation,
-                ..
-            } => Some((*identity, *operation)),
-            Self::User(_) => None,
-        }
-    }
-
-    fn reply(&self) -> Option<&PendingPnpSyscallReply> {
-        match self {
-            Self::User(reply) | Self::DeviceAction { reply, .. } => reply.as_ref(),
-        }
-    }
-
-    fn take_reply(&mut self) -> Option<PendingPnpSyscallReply> {
-        match self {
-            Self::User(reply) | Self::DeviceAction { reply, .. } => reply.take(),
-        }
-    }
 }
 
 struct PendingPnpOperation {
     operation: OwnedPendingPnpOperation,
-    owner: PendingPnpOperationOwner,
+    reply: Option<PendingPnpSyscallReply>,
 }
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =

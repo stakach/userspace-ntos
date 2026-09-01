@@ -21425,6 +21425,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     driver is not resident, then carry exact action identity into that lifecycle's terminal proof
     before rerunning the serialized live-device-action boot.
 
+    B3 native PnP notification/lifecycle ownership correction (2026-09-01, implementation and host
+    validation green; runtime pending): ReactOS' PnP event thread processes an event, queues
+    `DeviceInstallEvent` work, and
+    then calls `PlugPlayControlUserResponse` only to dequeue the delivered notification
+    (`references/reactos/base/services/umpnpmgr/event.c`). Its independent install thread later
+    reaches `PlugPlayControlStartDevice`. The executive now mirrors that boundary. The exact CM
+    generation/sequence/claim token is retained only through event copyout, UserResponse, delivery
+    of that syscall result, and exact CM acknowledgement. It no longer owns AddDevice, START,
+    rebalance, removal, their continuation slots, or their syscall replies.
+
+    `StartDevice` is an independent instance-addressed transaction. It first validates the live CM
+    instance and canonical devnode disposition, resolves the current Enum `Service` value and
+    driver launch specification from Config Manager rather than a notification or hosted-image
+    cache, reuses an exact usable driver route, and synchronously ensure-loads the selected driver
+    only when no route exists. A present but unusable route fails closed. Real AddDevice/resource/
+    START dispatch follows, and a pending IRP parks only the calling StartDevice syscall. The old
+    action-owned START, rebalance, removal, barrier, and transfer variants plus the action-specific
+    launch-spec helper and hosted service-name fallback are deleted. ResetDevice and
+    QueryAndRemoveDevice retain their ordinary user-owned lifecycle continuations. Change and
+    removal notifications no longer execute lifecycle work from UserResponse; the bus/kernel
+    producer must own any live rebalance or surprise-removal transition independently.
+
+    This checkpoint supersedes the earlier combined-claim language requiring CM retirement after a
+    terminal devnode lifecycle and the proposed action-token-to-IRP causal row. Notification proof
+    is keyed by CM action identity; lifecycle proof is keyed independently by canonical instance,
+    device, dispatch, and IRP identity. The live report and verifier use `response/reply`,
+    `responded`, and `response-tail`, require one ordered nonempty claim/delivery/retirement stream,
+    one final draining ACK, and no active response or CM owner. They separately require exactly one
+    AddDevice followed by one successful START for the target instance and deliberately impose no
+    ordering between notification retirement and the independent install thread. A transient CM
+    ACK failure after response delivery retains the exact ready claim for retry instead of panicking
+    or fabricating retirement.
+
+    Focused `nt-pnp-manager` validation passes 52/52, the freestanding executive check remains green
+    at the established 209-warning baseline, and the shell/Python verifier syntax, stale-symbol
+    search, and `git diff --check` pass. Review adjustment: add a separate per-instance StartDevice
+    terminal/reply row before claiming final generic lifecycle closure. The existing two-E1000 live
+    profile exercises the resident-driver path because the boot NIC already loads E1000; runtime
+    ensure-load acceptance requires a distinct nonresident target. Run the resulting live lane with
+    its 900-second operational timeout under the hard one-hour boot ceiling, never an unbounded QEMU
+    process.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

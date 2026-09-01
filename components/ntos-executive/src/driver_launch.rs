@@ -39796,23 +39796,6 @@ pub(crate) unsafe fn hosted_function_device_context_for_instance(
     Ok((device_id, binding.driver_id))
 }
 
-pub(crate) unsafe fn hosted_device_service_name_for_instance(
-    instance_id: &str,
-) -> Result<String, nt_status::NtStatus> {
-    let devnode_id = hosted_pnp_manager_mut()
-        .devnode_for_instance(instance_id)
-        .ok_or(nt_status::NtStatus(0xC000_000Eu32 as i32))?;
-    let service = hosted_pnp_manager_mut()
-        .service(devnode_id)
-        .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    let mut owned = String::new();
-    owned
-        .try_reserve_exact(service.len())
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    owned.push_str(service);
-    Ok(owned)
-}
-
 pub(crate) unsafe fn hosted_pnp_device_state_for_instance(
     instance_id: &str,
 ) -> Option<nt_pnp_manager::DeviceState> {

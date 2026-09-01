@@ -27,7 +27,7 @@ require_fixed() {
 instance='PCI\VEN_8086&DEV_100E\3&11583659&0&20'
 require_fixed "[pnp-live-action] claimed " 'CM action was not claimed'
 require_fixed "[pnp-live-action] delivered " 'user-mode PnP did not receive the action'
-require_fixed "[pnp-live-action] retired " 'terminal action was not acknowledged to CM'
+require_fixed "[pnp-live-action] retired " 'responded notification was not acknowledged to CM'
 require_fixed "[driver-launch] demand AddDevice service=E1000 devnode=$instance" \
   'the dynamically reported NIC did not execute real AddDevice'
 require_fixed "[driver-launch] demand StartDevice service=E1000 devnode=$instance status=0x00000000" \
@@ -49,20 +49,20 @@ claim_re = re.compile(
 )
 retired_re = re.compile(
     rf"^\[pnp-live-action\] retired generation/sequence/token={identity} "
-    rf"status/reply=(?P<status>0x[0-9a-fA-F]+)/(?P<reply>0x[0-9a-fA-F]+) "
+    rf"response/reply=(?P<response>0x[0-9a-fA-F]+)/(?P<reply>0x[0-9a-fA-F]+) "
     rf"instance=(?P<instance>.+)$"
 )
 proof_re = re.compile(
     rf"^\[pnp-live-proof\] generation/sequence/token={identity} "
     rf"kind=(?P<kind>arrival|change|removal) "
-    rf"status/reply=(?P<status>0x[0-9a-fA-F]+)/(?P<reply>0x[0-9a-fA-F]+) "
+    rf"response/reply=(?P<response>0x[0-9a-fA-F]+)/(?P<reply>0x[0-9a-fA-F]+) "
     rf"empty-after-ack=(?P<empty>[01]) instance=(?P<instance>.+)$"
 )
 summary_re = re.compile(
-    r"^\[pnp-live-proof\] summary claims/rows/success/failed="
-    r"(?P<claims>[0-9]+)/(?P<rows>[0-9]+)/(?P<success>[0-9]+)/(?P<failed>[0-9]+) "
-    r"empty-after-ack/active/reply-tail/cm-pending="
-    r"(?P<empty>[0-9]+)/(?P<active>[0-9]+)/(?P<reply_tail>[0-9]+)/(?P<pending>[0-9]+)$"
+    r"^\[pnp-live-proof\] summary claims/rows/responded/failed="
+    r"(?P<claims>[0-9]+)/(?P<rows>[0-9]+)/(?P<responded>[0-9]+)/(?P<failed>[0-9]+) "
+    r"empty-after-ack/active/response-tail/cm-pending="
+    r"(?P<empty>[0-9]+)/(?P<active>[0-9]+)/(?P<response_tail>[0-9]+)/(?P<pending>[0-9]+)$"
 )
 
 phases = {"claimed": [], "delivered": [], "retired": []}
@@ -84,14 +84,14 @@ for line_number, line in enumerate(lines):
         phases[match["phase"]].append(key)
         positions.setdefault(key, []).append((match["phase"], line_number))
     elif match := retired_re.match(line):
-        if int(match["status"], 16) != 0 or int(match["reply"], 16) != 0:
+        if int(match["response"], 16) != 0 or int(match["reply"], 16) != 0:
             raise SystemExit(f"live-device-action integration failure: non-success retirement: {line}")
         key = row_key(match)
         phases["retired"].append(key)
         positions.setdefault(key, []).append(("retired", line_number))
     elif match := proof_re.match(line):
         proofs.append((row_key(match), match["kind"], int(match["empty"])))
-        if int(match["status"], 16) != 0 or int(match["reply"], 16) != 0:
+        if int(match["response"], 16) != 0 or int(match["reply"], 16) != 0:
             raise SystemExit(f"live-device-action integration failure: non-success proof row: {line}")
     elif match := summary_re.match(line):
         summaries.append({name: int(value) for name, value in match.groupdict().items()})
@@ -127,16 +127,20 @@ start_line = (
     f"[driver-launch] demand StartDevice service=E1000 devnode={target_instance} "
     "status=0x00000000"
 )
-if sum(line.startswith(add_prefix) for line in lines) != 1:
+add_positions = [index for index, line in enumerate(lines) if line.startswith(add_prefix)]
+start_positions = [index for index, line in enumerate(lines) if line == start_line]
+if len(add_positions) != 1:
     raise SystemExit("live-device-action integration failure: target NIC AddDevice count is not exact")
-if sum(line == start_line for line in lines) != 1:
+if len(start_positions) != 1:
     raise SystemExit("live-device-action integration failure: target NIC START count is not exact")
+if add_positions[0] >= start_positions[0]:
+    raise SystemExit("live-device-action integration failure: target NIC START preceded AddDevice")
 if not (
-    summary["claims"] == summary["rows"] == summary["success"] == count
+    summary["claims"] == summary["rows"] == summary["responded"] == count
     and summary["failed"] == 0
     and summary["empty"] == 1
     and summary["active"] == 0
-    and summary["reply_tail"] == 0
+    and summary["response_tail"] == 0
     and summary["pending"] == 0
 ):
     raise SystemExit(f"live-device-action integration failure: incoherent final summary: {summary}")
