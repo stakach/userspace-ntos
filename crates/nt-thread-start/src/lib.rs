@@ -52,8 +52,8 @@ pub const INITIAL_TEB_STACK_BASE_OFFSET: u64 = 0x10;
 pub const INITIAL_TEB_STACK_LIMIT_OFFSET: u64 = 0x18;
 pub const INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET: u64 = 0x20;
 
-pub const CALL_TRAMPOLINE_LEN: usize = 34;
-pub const LOADER_TRAMPOLINE_LEN: usize = 85;
+pub const CALL_TRAMPOLINE_LEN: usize = 42;
+pub const LOADER_TRAMPOLINE_LEN: usize = 93;
 pub const AMD64_HW_BREAKPOINT_SLOTS: usize = 4;
 pub const AMD64_DR6_INITIAL: u64 = 0xFFFF_0FF0;
 pub const AMD64_DR7_RESERVED_ONE: u64 = 0x0000_0400;
@@ -91,14 +91,16 @@ impl Amd64ThreadContext {
 
     pub fn call_trampoline(self) -> [u8; CALL_TRAMPOLINE_LEN] {
         let mut code = [0u8; CALL_TRAMPOLINE_LEN];
-        code[0..2].copy_from_slice(&[0x48, 0xb9]);
-        code[2..10].copy_from_slice(&self.rcx.to_le_bytes());
-        code[10..12].copy_from_slice(&[0x48, 0xba]);
-        code[12..20].copy_from_slice(&self.rdx.to_le_bytes());
-        code[20..22].copy_from_slice(&[0x48, 0xb8]);
-        code[22..30].copy_from_slice(&self.rip.to_le_bytes());
-        code[30..32].copy_from_slice(&[0xff, 0xd0]);
-        code[32..34].copy_from_slice(&[0xeb, 0xfe]);
+        code[0..4].copy_from_slice(&[0x48, 0x83, 0xec, 0x20]); // sub rsp, 32-byte home space
+        code[4..6].copy_from_slice(&[0x48, 0xb9]);
+        code[6..14].copy_from_slice(&self.rcx.to_le_bytes());
+        code[14..16].copy_from_slice(&[0x48, 0xba]);
+        code[16..24].copy_from_slice(&self.rdx.to_le_bytes());
+        code[24..26].copy_from_slice(&[0x48, 0xb8]);
+        code[26..34].copy_from_slice(&self.rip.to_le_bytes());
+        code[34..36].copy_from_slice(&[0xff, 0xd0]);
+        code[36..40].copy_from_slice(&[0x48, 0x83, 0xc4, 0x20]);
+        code[40..42].copy_from_slice(&[0xeb, 0xfe]);
         code
     }
 
@@ -125,7 +127,9 @@ impl Amd64ThreadContext {
         emit(&context_va.to_le_bytes());
         emit(&[0x48, 0xb8]); // movabs rax, loader_va
         emit(&loader_va.to_le_bytes());
+        emit(&[0x48, 0x83, 0xec, 0x20]); // Win64 caller home space
         emit(&[0xff, 0xd0]); // call rax
+        emit(&[0x48, 0x83, 0xc4, 0x20]);
 
         emit(&[0x48, 0xb8]); // movabs rax, context_va
         emit(&context_va.to_le_bytes());
@@ -702,22 +706,26 @@ mod tests {
             rdx: 0xfeed_face_cafe_beef,
         }
         .call_trampoline();
-        assert_eq!(&code[0..2], &[0x48, 0xb9]);
+        assert_eq!(&code[0..4], &[0x48, 0x83, 0xec, 0x20]);
+        assert_eq!(&code[4..6], &[0x48, 0xb9]);
         assert_eq!(
-            u64::from_le_bytes(code[2..10].try_into().unwrap()),
+            u64::from_le_bytes(code[6..14].try_into().unwrap()),
             0x1020_3040_5060_7080
         );
-        assert_eq!(&code[10..12], &[0x48, 0xba]);
+        assert_eq!(&code[14..16], &[0x48, 0xba]);
         assert_eq!(
-            u64::from_le_bytes(code[12..20].try_into().unwrap()),
+            u64::from_le_bytes(code[16..24].try_into().unwrap()),
             0xfeed_face_cafe_beef
         );
-        assert_eq!(&code[20..22], &[0x48, 0xb8]);
+        assert_eq!(&code[24..26], &[0x48, 0xb8]);
         assert_eq!(
-            u64::from_le_bytes(code[22..30].try_into().unwrap()),
+            u64::from_le_bytes(code[26..34].try_into().unwrap()),
             0x8877_6655_4433_2211
         );
-        assert_eq!(&code[30..], &[0xff, 0xd0, 0xeb, 0xfe]);
+        assert_eq!(
+            &code[34..],
+            &[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x20, 0xeb, 0xfe]
+        );
     }
 
     #[test]
@@ -739,17 +747,19 @@ mod tests {
         );
         assert_eq!(&code[33..35], &[0x48, 0xb8]);
         assert_eq!(u64::from_le_bytes(code[35..43].try_into().unwrap()), loader);
-        assert_eq!(&code[43..45], &[0xff, 0xd0]);
-        assert_eq!(&code[45..47], &[0x48, 0xb8]);
+        assert_eq!(&code[43..47], &[0x48, 0x83, 0xec, 0x20]);
+        assert_eq!(&code[47..49], &[0xff, 0xd0]);
+        assert_eq!(&code[49..53], &[0x48, 0x83, 0xc4, 0x20]);
+        assert_eq!(&code[53..55], &[0x48, 0xb8]);
         assert_eq!(
-            u64::from_le_bytes(code[47..55].try_into().unwrap()),
+            u64::from_le_bytes(code[55..63].try_into().unwrap()),
             context
         );
-        assert_eq!(&code[55..62], &[0x48, 0x8b, 0x88, 0x80, 0, 0, 0]);
-        assert_eq!(&code[62..69], &[0x48, 0x8b, 0x90, 0x88, 0, 0, 0]);
-        assert_eq!(&code[69..76], &[0x48, 0x8b, 0xa0, 0x98, 0, 0, 0]);
-        assert_eq!(&code[76..83], &[0x48, 0x8b, 0x80, 0xf8, 0, 0, 0]);
-        assert_eq!(&code[83..85], &[0xff, 0xe0]);
+        assert_eq!(&code[63..70], &[0x48, 0x8b, 0x88, 0x80, 0, 0, 0]);
+        assert_eq!(&code[70..77], &[0x48, 0x8b, 0x90, 0x88, 0, 0, 0]);
+        assert_eq!(&code[77..84], &[0x48, 0x8b, 0xa0, 0x98, 0, 0, 0]);
+        assert_eq!(&code[84..91], &[0x48, 0x8b, 0x80, 0xf8, 0, 0, 0]);
+        assert_eq!(&code[91..93], &[0xff, 0xe0]);
     }
 
     #[test]

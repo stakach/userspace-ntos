@@ -22305,6 +22305,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The crate passes 76/76 and the executive still checks freestanding. Map one such frame into each
     real lane next; do not recreate this state with ad hoc `SH_REQ_*` fields.
 
+    Worker-start ABI correction (2026-09-02, host and freestanding green): the shared AMD64 call and
+    loader trampolines now reserve and restore the mandatory 32-byte Win64 caller home space. The
+    old trampoline called directly from a synthetic TCB entry stack and allowed callees that homed
+    RCX/RDX to overwrite the stack boundary. This fixes existing hosted `PsCreateSystemThread`
+    workers as well as the forthcoming interrupt lanes. `nt-thread-start` passes 14/14 and the
+    freestanding executive check remains green.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after
