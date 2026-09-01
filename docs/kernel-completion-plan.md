@@ -21615,6 +21615,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     preflighted or dynamically backed object ownership. Then rebuild the actual executive image and
     rerun the pending File-owner/full Explorer desktop gate under the same serialized deadline.
 
+    Arbitrary-depth CNode finalization checkpoint (2026-09-01, accepted): rust-micro commit
+    `9b7c3ce` removes the depth-four deletion path and the old structural derivation/reclaim
+    approximation. Mapping validation and object finalization now use a registry-capacity-exact,
+    iterative CNode worklist held in BKL-serialized kernel scratch storage, avoiding both truncated
+    traversal and growth on the 4 KiB per-TCB kernel stack. Delete and revoke splice surviving direct
+    descendants to the removed CTE's parent, matching seL4 MDB descendant-survival semantics; exact
+    child counts are checked before descriptor reuse, and releasing a child decrements only its
+    immediate parent rather than incorrectly freeing an ancestor while an intermediate Untyped is
+    still live. Final CNode release requires null contents, no parent or child metadata, no revoke
+    marks, zero capability references, and no inbound MDB edge.
+
+    The full rust-micro spec suite passes with new regressions for delete-splice survival, non-final
+    CNode aliases, eight-level nested finalization, and external descendant reparenting across CNode
+    descriptor reuse. QEMU was terminated immediately after `All specs passed!` when it entered the
+    intentional post-gate scheduler loop. The remaining no-fallback blocker before the desktop rerun
+    is atomic Untyped retype allocation. First make Endpoint, SchedContext, TCB, Notification, Reply,
+    and CNode availability accounting exact; then perform pool-capacity preflight only after all
+    ABI/source/destination validation; publish no destination cap and consume no source bytes on
+    `seL4_NotEnoughMemory`; and commit the source through the already resolved exact CTE rather than
+    a best-effort second lookup. Exhaustion, partial-capacity, exact-fit, and release/reuse specs must
+    pass for every pooled object type before the production image and Explorer desktop gate rerun.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
