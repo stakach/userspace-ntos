@@ -58,6 +58,14 @@ impl InterruptConnection {
 pub enum InterruptConnectError {
     InvalidParameter,
     SharingViolation,
+    AlreadyConnected,
+    OutOfMemory,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InterruptScanBuildError {
+    InvalidContract,
+    OutOfMemory,
 }
 
 /// The Driver Host's connected interrupts, retained in deterministic connection order.
@@ -115,13 +123,19 @@ impl InterruptTable {
         }
         if let Some(entry) = self
             .interrupts
-            .iter_mut()
+            .iter()
             .find(|entry| entry.interrupt == connection.interrupt)
         {
-            *entry = connection;
-        } else {
-            self.interrupts.push(connection);
+            return if *entry == connection {
+                Ok(())
+            } else {
+                Err(InterruptConnectError::AlreadyConnected)
+            };
         }
+        self.interrupts
+            .try_reserve(1)
+            .map_err(|_| InterruptConnectError::OutOfMemory)?;
+        self.interrupts.push(connection);
         Ok(())
     }
 
@@ -157,14 +171,29 @@ impl InterruptTable {
     }
 
     /// Snapshot a vector's ordered ISR chain for invocation without a table borrow.
-    pub fn begin_scan(&self, vector: u32) -> Option<InterruptScan> {
-        let entries: Vec<_> = self
+    pub fn begin_scan(
+        &self,
+        vector: u32,
+    ) -> Result<Option<InterruptScan>, InterruptScanBuildError> {
+        let count = self
             .interrupts
             .iter()
-            .copied()
             .filter(|entry| entry.vector == vector)
-            .collect();
-        InterruptScan::new(entries)
+            .count();
+        if count == 0 {
+            return Ok(None);
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| InterruptScanBuildError::OutOfMemory)?;
+        entries.extend(
+            self.interrupts
+                .iter()
+                .copied()
+                .filter(|entry| entry.vector == vector),
+        );
+        InterruptScan::try_from_connections(entries).map(Some)
     }
 }
 
@@ -200,6 +229,30 @@ pub struct InterruptScan {
 }
 
 impl InterruptScan {
+    /// Consume an already fallibly allocated ISR-chain snapshot without allocating again.
+    pub fn try_from_connections(
+        entries: Vec<InterruptConnection>,
+    ) -> Result<Self, InterruptScanBuildError> {
+        let Some(first) = entries.first().copied() else {
+            return Err(InterruptScanBuildError::InvalidContract);
+        };
+        if !first.valid()
+            || entries.iter().enumerate().any(|(index, entry)| {
+                !entry.valid()
+                    || entry.vector != first.vector
+                    || entry.mode != first.mode
+                    || (entry.interrupt != first.interrupt
+                        && (!entry.share_vector || !first.share_vector))
+                    || entries[..index]
+                        .iter()
+                        .any(|previous| previous.interrupt == entry.interrupt)
+            })
+        {
+            return Err(InterruptScanBuildError::InvalidContract);
+        }
+        Self::new(entries).ok_or(InterruptScanBuildError::InvalidContract)
+    }
+
     fn new(entries: Vec<InterruptConnection>) -> Option<Self> {
         let mode = entries.first()?.mode;
         debug_assert!(entries.iter().all(|entry| entry.mode == mode));
@@ -313,6 +366,21 @@ mod tests {
     }
 
     #[test]
+    fn connected_identity_allows_only_exact_idempotent_replay() {
+        let mut table = InterruptTable::new();
+        let exact = connection(1, InterruptMode::LevelSensitive, false);
+        table.connect_exact(exact).unwrap();
+        assert_eq!(table.connect_exact(exact), Ok(()));
+        let mut changed = exact;
+        changed.service_context += 1;
+        assert_eq!(
+            table.connect_exact(changed),
+            Err(InterruptConnectError::AlreadyConnected)
+        );
+        assert_eq!(table.connection(1), Some(exact));
+    }
+
+    #[test]
     fn level_scan_stops_at_first_claimant() {
         let mut table = InterruptTable::new();
         for ptr in [1, 2, 3] {
@@ -320,7 +388,7 @@ mod tests {
                 .connect_exact(connection(ptr, InterruptMode::LevelSensitive, true))
                 .unwrap();
         }
-        let mut scan = table.begin_scan(0x30).unwrap();
+        let mut scan = table.begin_scan(0x30).unwrap().unwrap();
         assert_eq!(scan.next_isr().unwrap().interrupt, 1);
         assert_eq!(scan.complete_isr(false), InterruptScanProgress::Continue);
         assert_eq!(scan.next_isr().unwrap().interrupt, 2);
@@ -342,7 +410,7 @@ mod tests {
                 .connect_exact(connection(ptr, InterruptMode::Latched, true))
                 .unwrap();
         }
-        let mut scan = table.begin_scan(0x30).unwrap();
+        let mut scan = table.begin_scan(0x30).unwrap().unwrap();
         let results = [(1, true), (2, false), (1, false), (2, false)];
         for (index, (interrupt, claimed)) in results.into_iter().enumerate() {
             assert_eq!(scan.next_isr().unwrap().interrupt, interrupt);

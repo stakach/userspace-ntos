@@ -22449,6 +22449,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     dependent lanes, and implement the nested provider-callback/import service exchange, actual-lock
     ownership, line scan semantics, and generation-backed deferred DPC registry.
 
+    B3 interrupt rundown and physical-mask checkpoint (2026-09-02, host, freestanding, and
+    microkernel-spec green; desktop acceptance pending): `nt-kernel-exec` now owns allocation-free,
+    generation-exact connection and physical-line lifecycle records. A line delivery and every
+    connection in its ordered ISR snapshot hold checked, nonzero sequence leases. Retirement blocks
+    new admission immediately, drains only exact leases, and cannot release a connection until its
+    callback lease is gone. Last-on-line retirement additionally requires checked permanent hardware
+    mask confirmation before notification, grant, lane, or object authority can be released. Line
+    and connection sequence exhaustion quarantine rather than wrap, and stale, wrong-generation,
+    duplicate, early-ACK, early-release, and pre-mask aborts fail closed. The crate passes 216/216
+    tests. `InterruptTable` connection publication and scan snapshots now reserve fallibly, connected
+    identities permit exact idempotent replay only, and production consumes one already-reserved scan
+    vector without a second allocation.
+
+    The executive retains those lifecycle records directly in `HostedIrqConnection` and
+    `HostedIrqLine`; the old IRQ-specific `retiring` booleans are deleted. It pre-leases the complete
+    active chain before the first ISR, applies the NT5 level-sensitive stop-first-claim and latched
+    repeat-until-clear rules through `InterruptScan`, and acknowledges exactly once only after a
+    successful terminal scan. Re-entrant non-last disconnect waits behind the retained connection
+    lease without disturbing the physical line. Re-entrant last disconnect masks the line, lets the
+    current callback unwind, and never acknowledges it. Grant, PnP lease, KINTERRUPT projection,
+    lane generation, and physical-line checks remain mandatory. Allocation, grant, projection,
+    worker, scan, or bookkeeping failure quarantines the full line, performs full-pass lease cleanup,
+    and never converts a failed transport into an unclaimed ISR or rearms it. Failed permanent mask
+    or cap deletion retains reconstructible line state for monotonic retry.
+
+    `rust-micro` commit `a583d06` makes the lower boundary match that contract: IRQ notification
+    delivery treats an unmaskable route as a kernel invariant violation, ACK rearms the IOAPIC before
+    clearing software pending state, SetNotification rolls back if initial unmask fails, and Clear
+    reports mask failure before removing the binding. Final IRQ-cap deletion also refuses to discard
+    a live unmaskable route. A fresh bare-metal spec build passed the complete kernel suite, including
+    IRQ invocation and IRQ-to-notification integration; its post-verdict scheduler demo was terminated
+    after `All specs passed!` because it intentionally has no exit sentinel. The executive
+    freestanding check, formatting, and diff checks are green. An earlier invocation of the runner
+    against a stale staged image was discarded and QEMU was stopped after serial silence; it is not
+    acceptance evidence.
+
+    Review adjustment: physical-line scan/rundown semantics are now closed ahead of v2 transport
+    cutover. The old `FSD_DISPATCH_INTERRUPT` request-bank call and its busy deferral remain one
+    temporary transport and must still be deleted atomically, not kept as a fallback. The next slice
+    is lane-private KPCR/IRQL selection, exact actual-lock ownership shared with
+    `KeSynchronizeExecution`, provider plus dependent lane retention, and nested provider
+    callback/import exchange. Then add the generation-backed DPC registry and move live ISR/DPC work
+    to the private arena in one cutover. A serialized desktop run remains required after that cutover;
+    deterministic stalls must terminate immediately and readiness remains capped at 3,600 seconds.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after

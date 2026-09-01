@@ -22,6 +22,7 @@ mod event_object;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod interrupt;
+mod interrupt_rundown;
 mod irql;
 pub mod kevent;
 mod lookaside;
@@ -65,7 +66,14 @@ pub use event_object::{
 };
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,
-    InterruptScanProgress, InterruptTable, ReadyIsr, SYNTHETIC_DIRQL,
+    InterruptScanBuildError, InterruptScanProgress, InterruptTable, ReadyIsr, SYNTHETIC_DIRQL,
+};
+pub use interrupt_rundown::{
+    InterruptConnectionDisposition, InterruptConnectionIdentity, InterruptConnectionLease,
+    InterruptConnectionLeaseError, InterruptConnectionRundown, InterruptLineDelivery,
+    InterruptLineDeliveryPhase, InterruptLineDisposition, InterruptLineError,
+    InterruptLineIdentity, InterruptLineMask, InterruptLineRundown, InterruptLineScanCompletion,
+    InterruptRundownState,
 };
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use lookaside::{
