@@ -36045,6 +36045,7 @@ unsafe fn hosted_relation_allocation_instance(driver_id: DriverId) -> Option<usi
 unsafe fn retain_hosted_relation_query_barrier(
     claim: nt_pnp_manager::DeviceRelationInvalidation,
     status: nt_status::NtStatus,
+    origin: HostedRelationBarrierOrigin,
 ) {
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = Some(HostedDeviceRelationQuery {
         claim,
@@ -36061,6 +36062,7 @@ unsafe fn retain_hosted_relation_query_barrier(
         last_child_index: usize::MAX,
         last_selector: 0,
         barrier_status: Some(status),
+        barrier_origin: origin,
         child_pdo_objects: Vec::new(),
         relation_domain: None,
         reported_children: Vec::new(),
@@ -36079,10 +36081,14 @@ unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelatio
         HostedDeviceRelationQueryDisposition::Copied => {
             query.phase = HostedDeviceRelationQueryPhase::RelationsCopied;
             query.barrier_status = None;
+            query.barrier_origin = HostedRelationBarrierOrigin::None;
         }
         HostedDeviceRelationQueryDisposition::Barrier(status) => {
             query.phase = HostedDeviceRelationQueryPhase::Barrier;
             query.barrier_status = Some(status);
+            if query.barrier_origin == HostedRelationBarrierOrigin::None {
+                query.barrier_origin = HostedRelationBarrierOrigin::DriverResult;
+            }
         }
     }
 }
@@ -39393,7 +39399,11 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         .is_none()
         || io_manager_mut().device(pdo_device_id).is_none()
     {
-        retain_hosted_relation_query_barrier(claim, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        retain_hosted_relation_query_barrier(
+            claim,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            HostedRelationBarrierOrigin::ClaimTarget,
+        );
         return 1;
     }
 
@@ -39412,7 +39422,11 @@ unsafe fn start_hosted_device_relation_query() -> usize {
             return 0;
         }
         Err(status) => {
-            retain_hosted_relation_query_barrier(claim, status);
+            retain_hosted_relation_query_barrier(
+                claim,
+                status,
+                HostedRelationBarrierOrigin::PrepareIrp,
+            );
             return 1;
         }
     };
@@ -39433,7 +39447,11 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         io_manager_mut()
             .discard_prepared_external_pnp(prepared)
             .expect("prepared hosted relation IRP could not be discarded");
-        retain_hosted_relation_query_barrier(claim, nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        retain_hosted_relation_query_barrier(
+            claim,
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+            HostedRelationBarrierOrigin::DispatchIdentity,
+        );
         return 1;
     };
 
@@ -39452,6 +39470,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         last_child_index: usize::MAX,
         last_selector: claim.relation_type as u64,
         barrier_status: None,
+        barrier_origin: HostedRelationBarrierOrigin::None,
         child_pdo_objects: Vec::new(),
         relation_domain: None,
         reported_children: Vec::new(),
@@ -40330,7 +40349,12 @@ impl DriverDispatchBackend for HostedDriverBackend {
         let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
             .filter(|binding| binding.instance == route_instance);
         if let Some(binding) = binding {
-            if unsafe { hosted_instance_video_port_initialized(route_inst) } {
+            let video_port_intercepts_minor = irp.minor
+                == nt_pnp_abi::IRP_MN_FILTER_RESOURCE_REQUIREMENTS
+                || irp.minor == IRP_MN_START_DEVICE as u8;
+            if video_port_intercepts_minor
+                && unsafe { hosted_instance_video_port_initialized(route_inst) }
+            {
                 return unsafe {
                     dispatch_video_pnp_irp_for_instance(
                         route_instance,
@@ -41620,6 +41644,15 @@ enum HostedDeviceRelationQueryDisposition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedRelationBarrierOrigin {
+    None,
+    ClaimTarget,
+    PrepareIrp,
+    DispatchIdentity,
+    DriverResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedAcpiPciRootMethod {
     Segment,
     BaseBus,
@@ -42048,6 +42081,7 @@ struct HostedDeviceRelationQuery {
     last_child_index: usize,
     last_selector: u64,
     barrier_status: Option<nt_status::NtStatus>,
+    barrier_origin: HostedRelationBarrierOrigin,
     child_pdo_objects: Vec<u64>,
     relation_domain: Option<HostedDomainIdentity>,
     reported_children: Vec<nt_pnp_manager::BusReportedChild>,
@@ -42935,6 +42969,18 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
     print_u64(query.acpi_pci_link_candidates.len() as u64);
     print_str(b"/");
     print_u64(query.acpi_pci_catalog_update.is_some() as u64);
+    print_str(b" owner/irp/drivers/device/alloc=");
+    print_u64(query.claim.pdo_device_id);
+    print_str(b"/");
+    print_u64(query.irp_id.raw());
+    print_str(b"/");
+    print_u64(query.origin_driver_id.raw());
+    print_str(b"/");
+    print_u64(query.completion_driver_id.raw());
+    print_str(b"/");
+    print_u64(query.completion_device_id.raw());
+    print_str(b"/");
+    print_u64(query.allocation_instance as u64);
     print_str(b" last-op=");
     print_str(match query.last_operation {
         HostedRelationQueryOperation::Relations => b"relations".as_slice(),
@@ -42961,6 +43007,14 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
             .unwrap_or(nt_status::NtStatus::SUCCESS)
             .raw() as u32,
     );
+    print_str(b" origin=");
+    print_str(match query.barrier_origin {
+        HostedRelationBarrierOrigin::None => b"none",
+        HostedRelationBarrierOrigin::ClaimTarget => b"claim-target",
+        HostedRelationBarrierOrigin::PrepareIrp => b"prepare-irp",
+        HostedRelationBarrierOrigin::DispatchIdentity => b"dispatch-identity",
+        HostedRelationBarrierOrigin::DriverResult => b"driver-result",
+    });
     print_str(b" driver-status=");
     match query.driver_status {
         Some(status) => print_hex(status.raw() as u32),

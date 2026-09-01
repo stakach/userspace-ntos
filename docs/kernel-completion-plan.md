@@ -21210,6 +21210,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     be considered lifecycle-complete; that omission did not cause this zero-frame failure because
     hardware demonstrably resolved the newly installed IOVA.
 
+    B3 VideoPort PnP dispatch-boundary checkpoint (2026-09-01, implementation and runtime green):
+    the remaining native pending-START failure was not in the syscall continuation. A successful
+    bochsmp START queued the required initial `BusRelations` query, but the bespoke VideoPort
+    adapter intercepted every PnP minor after VideoPort initialization. Its resource-filter and
+    START-only parameter decoder rejected `IRP_MN_QUERY_DEVICE_RELATIONS` before the real ReactOS
+    VideoPort dispatch routine could receive it. The relation owner correctly retained that
+    transport loss as a global topology barrier, which fenced the later SCM-started device batch.
+
+    The VideoPort adapter now intercepts only `IRP_MN_FILTER_RESOURCE_REQUIREMENTS` and
+    `IRP_MN_START_DEVICE`. Every other PnP minor falls through to the existing exact native dispatch
+    path, which resolves the authenticated provider instance and driver object and retains normal
+    IRP pending/completion ownership. No driver, image, service, or device identity is consulted;
+    the relation barrier is not cleared or reinterpreted. Generic relation evidence now records the
+    exact claim PDO, IRP, origin/completion driver, completion device, allocation instance, and the
+    lifecycle stage that produced a retained barrier.
+
+    The diagnostic run `.tmp/run-headless-pnp-barrier-origin-20260901.log` proved the rejected query
+    had a real canonical IRP and exact provider identities with `origin=driver-result`,
+    `STATUS_INVALID_DEVICE_REQUEST`, and no driver return. After the routing correction, serialized
+    run `.tmp/run-headless-video-pnp-fallthrough-20260901.log` completed in about two minutes and
+    exited QEMU at the sentinel. Both registry-selected PendingStartTest devnodes ran real
+    `AddDevice`, returned START as pending, and completed through their timer/DPC with
+    `STATUS_SUCCESS`; the parked native reply completed exactly once. The relation owner is empty,
+    the native proof is `1/1/1` batches and `2/2/2/0/2` attempted/terminal/started/failed/pending,
+    the genuine NDIS receive/ARP path remains live, and Explorer retains a fully painted
+    786432-pixel framebuffer with at least 32 colours. Final readiness is 296/296. The freestanding
+    executive check remains green at the established 209-warning baseline and `git diff --check`
+    passes.
+
+    Review adjustment: close the retained BusRelations and native pending-START regression. The
+    next ownership correction is architectural: NT5 and ReactOS complete `NtLoadDriver` after the
+    image, driver object, and `DriverEntry` reach one terminal load result; the independent PnP
+    device-action state machine owns `AddDevice`, resource assignment, START IRPs, pending
+    completion, and devnode state. Replace the current coupled production proof with two generic
+    proofs: one exact SCM native-load reply and one per-devnode PnP lifecycle proof with no leaked
+    IRP, reply, lifecycle, or unload reference. Move PendingStartTest and its two forced-pending
+    devnodes out of the production generated hive into an explicit integration-test fixture. Do not
+    weaken pending START coverage or synthesize a terminal result while making this split.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
