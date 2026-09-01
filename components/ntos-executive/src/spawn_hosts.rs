@@ -1055,8 +1055,11 @@ pub(crate) struct PumpChannel {
     /// and `R_fsd[inst]` (`REPLY_FSD`) are distinct from the hosted-user wait reply pool. FSD worker
     /// parking needs driver-owned rotation around this active object.
     pub reply_cap: u64,
-    /// win32k only (0 for the FSD): the client process-index for `client_attach`/foreign-frame sharing.
+    /// win32k only (0 for the FSD): the exact client identity captured when this dispatch was routed.
+    /// Event-object broker calls consume both fields from this scoped channel rather than consulting
+    /// ambient last-writer state, so a nested GUI dispatch cannot change the outer caller's owner.
     pub client_pi: u64,
+    pub client_generation: u64,
     /// The win32k capability gates (all-false for the FSD).
     pub caps: HostCaps,
 }
@@ -1064,6 +1067,8 @@ pub(crate) struct PumpChannel {
 #[derive(Clone, Copy)]
 pub(crate) struct UserCallbackClient {
     pub pi: u32,
+    /// Process-manager generation paired with `pi`; callback nesting must retain the exact lifetime.
+    pub generation: u64,
     pub pid: u64,
     pub badge: u64,
     pub tid: u64,
@@ -1432,6 +1437,7 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         m2,
         m3,
         m4,
+        scheduler_yield: false,
     })
 }
 
@@ -1444,6 +1450,7 @@ struct PumpMessage {
     m2: u64,
     m3: u64,
     m4: u64,
+    scheduler_yield: bool,
 }
 
 impl PumpMessage {
@@ -1462,6 +1469,21 @@ impl PumpMessage {
             m2: 0,
             m3: 0,
             m4: 0,
+            scheduler_yield: false,
+        }
+    }
+
+    #[inline]
+    const fn scheduler_yield() -> Self {
+        Self {
+            badge: 0,
+            mi: 0,
+            m0: 0,
+            m1: 0,
+            m2: 0,
+            m3: 0,
+            m4: 0,
+            scheduler_yield: true,
         }
     }
 }
@@ -1508,6 +1530,7 @@ macro_rules! pump_reply_recv4_into {
 struct PumpLoopOutcome {
     completed: bool,
     callback_suspended: bool,
+    scheduler_yielded: bool,
     wall_ip: u64,
     wall_addr: u64,
     wall_label: u64,
@@ -1524,6 +1547,7 @@ impl PumpLoopOutcome {
         Self {
             completed: false,
             callback_suspended: false,
+            scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -1596,6 +1620,9 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
+            if ch.caps.kind == ReqKind::Irp {
+                return PumpMessage::scheduler_yield();
+            }
             if timer {
                 if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
                     crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
@@ -1623,6 +1650,7 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             m2,
             m3,
             m4,
+            scheduler_yield: false,
         };
     }
 }
@@ -1674,6 +1702,9 @@ unsafe fn pump_reply_recv4(
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
+        if ch.caps.kind == ReqKind::Irp {
+            return PumpMessage::scheduler_yield();
+        }
         if timer {
             if let Some(polled) = pump_try_recv_after_timer(ch, reply_cap) {
                 crate::PUMP_TIMER_TICKS_ABSORBED.fetch_add(1, Ordering::Relaxed);
@@ -1701,6 +1732,7 @@ unsafe fn pump_reply_recv4(
         m2,
         m3,
         m4,
+        scheduler_yield: false,
     }
 }
 
@@ -1760,6 +1792,9 @@ pub(crate) struct PumpResult {
     pub reply_cap: u64,
     pub completed: bool,
     pub callback_suspended: bool,
+    /// The component request is still live, but hosted scheduler work must run before its pump
+    /// continues. The caller resumes with `RecvFirst` on this same reply object.
+    pub scheduler_yielded: bool,
     /// Wall diagnostics (only meaningful when `!completed`).
     pub wall_ip: u64,
     pub wall_addr: u64,
@@ -1885,6 +1920,10 @@ unsafe fn component_pump_loop(
     let mut outcome = PumpLoopOutcome::new();
     let mut skips = 0u64; // win32k int-0x2c asserts skipped this dispatch (bounded -> wall).
     loop {
+        if msg.scheduler_yield {
+            outcome.scheduler_yielded = true;
+            break;
+        }
         let label = msg.label();
         if label == ch.dispatch_label {
             // ★ There is nothing to check. This message is the return half of the component's OWN
@@ -1950,7 +1989,12 @@ unsafe fn component_pump_loop(
         {
             let (status, out1, out2, out3) = unsafe {
                 crate::service_sec_image::service_win32k_event_request(
-                    msg.m0, msg.m1, msg.m2, msg.m3,
+                    ch.client_pi,
+                    ch.client_generation,
+                    msg.m0,
+                    msg.m1,
+                    msg.m2,
+                    msg.m3,
                 )
             };
             pump_reply_recv4_into!(
@@ -2871,7 +2915,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
     // pumps it a second time (`dispatch_irp` → `register_instance_ready(inst,false)`;
     // `win32k_dispatch_wide` → `WIN32K_RETIRED`). A walled component is dead, and it now says so.
     // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
-    if !outcome.completed && !outcome.callback_suspended {
+    if !outcome.completed && !outcome.callback_suspended && !outcome.scheduler_yielded {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
         pump_wall_state_diag(ch, outcome);
         let e = if ch.tcb != 0 {
@@ -2928,7 +2972,7 @@ unsafe fn pump_result_from_outcome(
                 (result as u32 as i32, result)
             }
         }
-    } else if outcome.callback_suspended {
+    } else if outcome.callback_suspended || outcome.scheduler_yielded {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
     } else {
@@ -2941,6 +2985,7 @@ unsafe fn pump_result_from_outcome(
         reply_cap,
         completed: outcome.completed,
         callback_suspended: outcome.callback_suspended,
+        scheduler_yielded: outcome.scheduler_yielded,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,

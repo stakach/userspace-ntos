@@ -2636,6 +2636,7 @@ unsafe fn register_service_delay_drain_context(
 unsafe fn clear_service_delay_drain_context() {
     SERVICE_DELAY_DRAIN_QUEUE.store(0, Ordering::Release);
     SERVICE_DELAY_DRAIN_HANDLER.store(0, Ordering::Release);
+    W32_CLIENT_PI.store(u64::MAX, Ordering::Release);
     SERVICE_CRASH_PARKED_MASK.store(0, Ordering::Release);
 }
 
@@ -2659,6 +2660,8 @@ pub(crate) unsafe fn rearm_registered_delay_timer() -> bool {
 /// The nested component pump is serialized with native dispatch, so no second handler pointer or
 /// lock domain is introduced. GUI redrive remains deferred until the outer dispatch can resume.
 pub(crate) unsafe fn service_win32k_event_request(
+    client_pi: u64,
+    client_generation: u64,
     op: u64,
     arg1: u64,
     arg2: u64,
@@ -2671,7 +2674,15 @@ pub(crate) unsafe fn service_win32k_event_request(
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
     let handler = &mut *handler_ptr;
-    let pi = handler.pi;
+    let Ok(pi) = usize::try_from(client_pi) else {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    };
+    if client_generation == 0
+        || handler.pm_pid_for_pi(pi).is_none()
+        || handler.hosted_process_generation(pi) != Some(client_generation)
+    {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    }
     match op {
         crate::win32k_subsystem::W32_EVENT_OP_CREATE => handler
             .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)

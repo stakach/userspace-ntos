@@ -420,6 +420,7 @@ impl Win32kClientContext {
     fn callback_client(self) -> crate::spawn_hosts::UserCallbackClient {
         crate::spawn_hosts::UserCallbackClient {
             pi: self.pi,
+            generation: self.generation,
             pid: self.pid,
             badge: self.badge,
             tid: self.tid,
@@ -444,7 +445,7 @@ fn win32k_client_context_from_callback_client(
 ) -> Win32kClientContext {
     Win32kClientContext {
         pi: client.pi,
-        generation: 0,
+        generation: client.generation,
         pid: client.pid,
         badge: client.badge,
         tid: client.tid,
@@ -2559,6 +2560,11 @@ fn callback_client_from_frame(
     token_user_sid.copy_from_slice(frame.client_token_user_sid());
     crate::spawn_hosts::UserCallbackClient {
         pi: request.client_pi,
+        generation: unsafe {
+            user_callback_client_for_request(&request)
+                .map(|client| client.generation)
+                .unwrap_or(0)
+        },
         pid: frame.client_pid(),
         badge: request.client_badge,
         tid: request.client_tid,
@@ -2611,6 +2617,7 @@ unsafe fn resume_suspended_user_callback_component(
             reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
             completed: false,
             callback_suspended: false,
+            scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -2665,6 +2672,7 @@ unsafe fn resume_suspended_user_callback_component(
             reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
             completed: false,
             callback_suspended: false,
+            scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
             wall_label: 0,
@@ -2695,6 +2703,7 @@ unsafe fn resume_suspended_user_callback_component(
         tcb: WIN32K_TCB.load(Ordering::Relaxed),
         reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
         client_pi: client.pi as u64,
+        client_generation: client.generation,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
@@ -4392,10 +4401,10 @@ unsafe fn w32_map_registered_client_frame_copy_checked(
 /// signal for userinit, shell, and service descendants.
 pub(crate) static W32_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
-/// The pi of the client whose call `win32k_dispatch` is currently servicing (set by the forward arm
-/// before each dispatch; defaults to csrss so bring-up/self-test dispatches attach to pi 1). Read by
-/// `win32k_dispatch` at entry to drive `w32_client_attach`.
-pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(1);
+/// The process index whose call `win32k_dispatch` is currently servicing. The service bootstrap
+/// publishes the dynamically discovered Win32-subsystem process before starting the component;
+/// every later forward arm replaces it with the exact routed client identity.
+pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[derive(Clone, Copy)]
 struct W32AttachMapping {
@@ -5974,6 +5983,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
         tcb: WIN32K_TCB.load(Ordering::Relaxed),
         reply_cap: rw,
         client_pi,
+        client_generation: client.generation,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,

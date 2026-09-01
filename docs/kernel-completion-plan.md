@@ -22236,6 +22236,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     202/202, `cargo test -p nt-process` passes 151/151, and the freestanding executive check is
     green. Run the serialized desktop/churn acceptance under the 3,600-second hard ceiling next.
 
+    Runtime correction checkpoint (2026-09-02, host and freestanding green; runtime pending): the
+    first serialized gate after this checkpoint exited normally in 29 seconds but stopped at
+    224/298. The earliest causal failure was win32k `InitThreadCallback` receiving a failure from its
+    real `ZwCreateEvent`; the Event broker had attributed the nested component request to
+    `ExecNtHandler::pi`, which is a native-dispatch cursor rather than provider caller identity. The
+    attempted ambient `W32_CLIENT_PI` correction was also rejected: it is last-writer state across
+    nested dispatches and cannot prove an exact process lifetime.
+
+    Every win32k `PumpChannel` now captures the routed `(process index, Process Manager generation)`
+    pair. Callback-client registration retains that generation across arbitrary callback nesting,
+    and each Event request carries the scoped pair directly to the broker. The broker accepts it only
+    while both the process and exact generation remain live. The static `pi == 1` default is gone;
+    pre-process bootstrap probes carry generation zero and fail closed instead of creating an Event
+    in a fabricated owner process. Remove those historical post-DriverEntry client/callout probes
+    once the first real CSRSS dispatch owns win32k initialization; do not make them pass by restoring
+    a bootstrap identity.
+
+    The next serialized attempt exposed an independent hosted scheduler race during NDIS/E1000
+    startup. IRQ notification bits received by a nested component pump were latched but serviced only
+    at the outer service-loop boundary, while rust-micro correctly kept the IOAPIC source masked until
+    acknowledgement. Hosted pumps now preserve their live request/reply continuation across an
+    explicit scheduler yield. A dynamic call-stack ledger owns request banks, timer-DPC activation
+    selects any idle target bank instead of consulting one global dispatch flag, deferred shared IRQ
+    lines remain pending and unacknowledged, nested diagnostic ownership restores the outer dispatch,
+    and ring-channel waits no longer absorb IRQ badges. Focused validation still passes
+    `nt-kernel-exec` 202/202, `nt-process` 151/151, and the freestanding executive check.
+
+    Runtime acceptance remains open. An interrupt projected through a provider can target the same
+    NDIS request bank already occupied by a miniport/protocol callback chain; rewriting that bank
+    re-entrantly is forbidden. Add a dedicated kernel-owned hosted interrupt worker/context per
+    executing driver domain, with a private command/result frame and no `SH_REQ_*` reuse, so same-bank
+    ISR execution can preempt the main hosted component context and queue its DPC correctly. Extend
+    per-line received/deferred/dispatched/claimed/acknowledged and per-bank owner/depth diagnostics,
+    then run one serialized `./run.sh --desktop` attempt under the hard 3,600-second readiness limit.
+    Kill deterministic stalls immediately; uptime beyond one hour is meaningful only after readiness.
+
     Review adjustment: this closes handle-side and hosted GUI queue-event ownership, but does not
     close the provider pointer-wait ABI. The current `KeWaitForSingleObject` import still lacks a
     real blocked component continuation and `KeWaitForMultipleObjects` remains unbound. Replace the

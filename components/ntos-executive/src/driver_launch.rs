@@ -856,6 +856,64 @@ static FSD_ACTIVE_DISPATCH_FID: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_IN: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_OUT: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_DISPATCH_STARTED_100NS: AtomicU64 = AtomicU64::new(0);
+
+struct ActiveHostedDispatchDiagnosticGuard {
+    seq: u64,
+    instance: u64,
+    major: u64,
+    fsctl: u64,
+    fid: u64,
+    input_len: u64,
+    output_len: u64,
+    started_100ns: u64,
+}
+
+impl ActiveHostedDispatchDiagnosticGuard {
+    fn enter(
+        seq: u64,
+        instance: usize,
+        major: u64,
+        fsctl: u64,
+        fid: u64,
+        input_len: usize,
+        output_len: usize,
+    ) -> Self {
+        let previous = Self {
+            seq: FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Relaxed),
+            instance: FSD_ACTIVE_DISPATCH_INST.load(Ordering::Relaxed),
+            major: FSD_ACTIVE_DISPATCH_MAJOR.load(Ordering::Relaxed),
+            fsctl: FSD_ACTIVE_DISPATCH_FSCTL.load(Ordering::Relaxed),
+            fid: FSD_ACTIVE_DISPATCH_FID.load(Ordering::Relaxed),
+            input_len: FSD_ACTIVE_DISPATCH_IN.load(Ordering::Relaxed),
+            output_len: FSD_ACTIVE_DISPATCH_OUT.load(Ordering::Relaxed),
+            started_100ns: FSD_ACTIVE_DISPATCH_STARTED_100NS.load(Ordering::Relaxed),
+        };
+        FSD_ACTIVE_DISPATCH_INST.store(instance as u64, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_MAJOR.store(major, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_FSCTL.store(fsctl, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_FID.store(fid, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_IN.store(input_len as u64, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_OUT.store(output_len as u64, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_STARTED_100NS.store(monotonic_time_100ns(), Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_SEQ.store(seq, Ordering::Release);
+        previous
+    }
+}
+
+impl Drop for ActiveHostedDispatchDiagnosticGuard {
+    fn drop(&mut self) {
+        FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Release);
+        FSD_ACTIVE_DISPATCH_INST.store(self.instance, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_MAJOR.store(self.major, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_FSCTL.store(self.fsctl, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_FID.store(self.fid, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_IN.store(self.input_len, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_OUT.store(self.output_len, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_STARTED_100NS.store(self.started_100ns, Ordering::Relaxed);
+        FSD_ACTIVE_DISPATCH_SEQ.store(self.seq, Ordering::Release);
+    }
+}
+
 static FSD_ACTIVE_WRITE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSD_ACTIVE_COMPLETE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Bounded failure provenance for device-control requests crossing a hosted driver boundary.
@@ -11951,9 +12009,7 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
             }
         }
     }
-    if FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Acquire) == 0 {
-        delivered = delivered.saturating_add(drain_hosted_driver_dpc_activations());
-    }
+    delivered = delivered.saturating_add(drain_hosted_driver_dpc_activations());
     delivered
 }
 
@@ -11965,23 +12021,17 @@ pub(crate) fn hosted_driver_dpc_activation_pending() -> bool {
     }
 }
 
-/// Dispatch timer-DPC activations only after the current component has released
-/// its shared request bank. The snapshot budget prevents a periodic timer that
-/// re-arms during its own DPC from monopolising the executive; newly queued work
-/// runs at the next safe scheduler boundary.
+/// Dispatch timer-DPC activations whose target request bank is idle. A busy driver no longer blocks
+/// unrelated NICs or timer owners; its activation is rotated to the back and remains queued. The
+/// snapshot budget prevents a periodic timer that re-arms during its own DPC from monopolising the
+/// executive, so newly queued work runs at the next scheduler boundary.
 pub(crate) unsafe fn drain_hosted_driver_dpc_activations() -> u64 {
-    if FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Acquire) != 0 {
-        return 0;
-    }
     let budget = (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
         .as_ref()
         .map(Vec::len)
         .unwrap_or(0);
     let mut delivered = 0u64;
     for _ in 0..budget {
-        if FSD_ACTIVE_DISPATCH_SEQ.load(Ordering::Acquire) != 0 {
-            break;
-        }
         let activation = {
             let activations = hosted_driver_dpc_activations_mut();
             if activations.is_empty() {
@@ -11989,6 +12039,12 @@ pub(crate) unsafe fn drain_hosted_driver_dpc_activations() -> u64 {
             }
             activations.remove(0)
         };
+        if instance(activation.instance)
+            .is_some_and(|inst| hosted_component_bank_active(inst.exec_shared_va))
+        {
+            hosted_driver_dpc_activations_mut().push(activation);
+            continue;
+        }
         let mut no_output = [];
         if dispatch_irp_for_instance(
             activation.instance,
@@ -16478,6 +16534,11 @@ const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_CAPACITY_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_CAPACITY_TRACE_CAP: u64 = 8;
 static HOSTED_COMPONENT_PUMP_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// Request banks currently owned by live hosted-component pumps. This is a call-stack ledger, not a
+/// driver identity table: nested dispatch may use any idle bank, while IRQ/DPC work targeting an
+/// occupied bank remains queued until its owner returns.
+static mut ACTIVE_HOSTED_COMPONENT_BANKS: Option<Vec<u64>> = None;
+static HOSTED_COMPONENT_SCHEDULER_YIELDS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_WORK_QUEUE_DRAIN_ACTIVE: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_TRACE_CAP: u64 = 24;
 static mut HOSTED_PROVIDER_POINTER_ALLOCATIONS: Option<Vec<HostedProviderPointerAllocation>> = None;
@@ -27415,27 +27476,71 @@ unsafe fn trace_provider_io_port_range_export(
     print_str(b"\n");
 }
 
-struct HostedComponentPumpDepthGuard;
+struct HostedComponentPumpDepthGuard {
+    bank_depth: usize,
+}
 
 impl HostedComponentPumpDepthGuard {
-    fn enter() -> Self {
+    unsafe fn enter(shared_va: u64) -> Self {
+        let slot = &mut *core::ptr::addr_of_mut!(ACTIVE_HOSTED_COMPONENT_BANKS);
+        if slot.is_none() {
+            *slot = Some(Vec::new());
+        }
+        let banks = slot.as_mut().unwrap();
+        let bank_depth = banks.len();
+        banks.push(shared_va);
         HOSTED_COMPONENT_PUMP_DEPTH.fetch_add(1, Ordering::AcqRel);
-        Self
+        Self { bank_depth }
     }
 }
 
 impl Drop for HostedComponentPumpDepthGuard {
     fn drop(&mut self) {
-        let previous = HOSTED_COMPONENT_PUMP_DEPTH.fetch_sub(1, Ordering::Release);
-        assert!(previous != 0, "hosted component pump depth underflow");
+        unsafe {
+            let banks = (*core::ptr::addr_of_mut!(ACTIVE_HOSTED_COMPONENT_BANKS))
+                .as_mut()
+                .expect("hosted component bank stack disappeared");
+            assert_eq!(banks.len(), self.bank_depth + 1);
+            banks.pop();
+            let previous = HOSTED_COMPONENT_PUMP_DEPTH.fetch_sub(1, Ordering::Release);
+            assert!(previous != 0, "hosted component pump depth underflow");
+        }
     }
+}
+
+unsafe fn hosted_component_bank_active(shared_va: u64) -> bool {
+    (*core::ptr::addr_of!(ACTIVE_HOSTED_COMPONENT_BANKS))
+        .as_ref()
+        .is_some_and(|banks| banks.contains(&shared_va))
 }
 
 unsafe fn hosted_component_pump(
     ch: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
-    let _depth = HostedComponentPumpDepthGuard::enter();
-    crate::spawn_hosts::component_pump(ch)
+    let _depth = HostedComponentPumpDepthGuard::enter(ch.shared_va);
+    let mut active = *ch;
+    loop {
+        let result = crate::spawn_hosts::component_pump(&active);
+        if !result.scheduler_yielded {
+            return result;
+        }
+        let yield_number = HOSTED_COMPONENT_SCHEDULER_YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
+        let irq_lines = drain_pending_hosted_irqs_for_scheduler_yield();
+        let dpcs = drain_hosted_driver_dpc_activations();
+        if yield_number <= 16 {
+            print_str(b"[hosted-scheduler] resume component bank=0x");
+            print_hex64(active.shared_va);
+            print_str(b" after yield #");
+            print_u64(yield_number);
+            print_str(b" irq-lines=");
+            print_u64(irq_lines);
+            print_str(b" dpcs=");
+            print_u64(dpcs);
+            print_str(b"\n");
+        }
+        active.initial = crate::spawn_hosts::InitialAction::RecvFirst;
+        active.reply_cap = result.reply_cap;
+    }
 }
 
 pub(crate) unsafe fn service_hosted_provider_export(
@@ -27671,6 +27776,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         tcb: provider_inst.tcb,
         reply_cap: provider_inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -27911,6 +28017,7 @@ unsafe fn dispatch_hosted_component_target(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -35138,6 +35245,7 @@ unsafe fn load_driver_reserved(
         tcb,
         reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -41859,6 +41967,10 @@ static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>>
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static HOSTED_IRQ_PENDING_EVENTS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_EVENTS_SERVICED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_EVENTS_DEFERRED_BUSY: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_EVENTS_ACKNOWLEDGED: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
 static mut HOSTED_PNP_PENDING_PROOFS: Option<nt_driver_start::PendingStartProofLedger> = None;
@@ -44436,6 +44548,7 @@ pub(crate) fn hosted_irq_routes_active() -> bool {
 pub(crate) fn latch_hosted_irq_badge(badge: u64) -> u64 {
     let events = crate::hosted_irq_lines_from_badge(badge);
     if events != 0 {
+        HOSTED_IRQ_EVENTS_RECEIVED.fetch_add(events.count_ones() as u64, Ordering::Relaxed);
         HOSTED_IRQ_PENDING_EVENTS.fetch_or(events, Ordering::AcqRel);
     }
     events
@@ -44672,7 +44785,26 @@ unsafe fn dispatch_hosted_irq_connection(
     Ok(information != 0)
 }
 
-unsafe fn service_hosted_irq_event(event_bit: u8) -> Result<u64, nt_status::NtStatus> {
+enum HostedIrqServiceOutcome {
+    Serviced(u64),
+    DeferredBusy,
+}
+
+unsafe fn hosted_irq_connection_targets_active_bank(connection: HostedIrqConnection) -> bool {
+    let Some(binding) = hosted_device_binding_by_device_id(connection.binding.device_id)
+        .filter(|binding| *binding == connection.binding)
+    else {
+        return false;
+    };
+    [binding.instance, binding.projection_instance]
+        .into_iter()
+        .filter_map(instance)
+        .any(|inst| hosted_component_bank_active(inst.exec_shared_va))
+}
+
+unsafe fn service_hosted_irq_event(
+    event_bit: u8,
+) -> Result<HostedIrqServiceOutcome, nt_status::NtStatus> {
     let line = hosted_irq_lines()
         .and_then(|lines| {
             lines
@@ -44692,6 +44824,13 @@ unsafe fn service_hosted_irq_event(event_bit: u8) -> Result<u64, nt_status::NtSt
                 .filter(|connection| connection.gsi == line.gsi),
         );
     }
+    if connections
+        .iter()
+        .copied()
+        .any(|connection| hosted_irq_connection_targets_active_bank(connection))
+    {
+        return Ok(HostedIrqServiceOutcome::DeferredBusy);
+    }
     let mut claimed = 0u64;
     let mut first_error = None;
     for connection in connections {
@@ -44703,35 +44842,64 @@ unsafe fn service_hosted_irq_event(event_bit: u8) -> Result<u64, nt_status::NtSt
         }
     }
     crate::acknowledge_ioapic_irq_handler(line.handler_cap);
+    HOSTED_IRQ_EVENTS_ACKNOWLEDGED.fetch_add(1, Ordering::Relaxed);
     match first_error {
         Some(status) => Err(status),
-        None => Ok(claimed),
+        None => Ok(HostedIrqServiceOutcome::Serviced(claimed)),
     }
 }
 
-pub(crate) unsafe fn drain_pending_hosted_irqs() -> u64 {
+unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
     let mut serviced = 0u64;
-    loop {
-        let pending = HOSTED_IRQ_PENDING_EVENTS.swap(0, Ordering::AcqRel);
-        if pending == 0 {
-            return serviced;
-        }
-        let mut bits = pending;
-        while bits != 0 {
-            let event_bit = bits.trailing_zeros() as u8;
-            bits &= !(1u64 << event_bit);
-            match service_hosted_irq_event(event_bit) {
-                Ok(_) => serviced += 1,
-                Err(status) => {
-                    print_str(b"[hosted-irq] dispatch failed event=");
+    let pending = HOSTED_IRQ_PENDING_EVENTS.swap(0, Ordering::AcqRel);
+    let mut deferred = 0u64;
+    let mut bits = pending;
+    while bits != 0 {
+        let event_bit = bits.trailing_zeros() as u8;
+        let event = 1u64 << event_bit;
+        bits &= !event;
+        match service_hosted_irq_event(event_bit) {
+            Ok(HostedIrqServiceOutcome::Serviced(claimed)) => {
+                HOSTED_IRQ_EVENTS_SERVICED.fetch_add(1, Ordering::Relaxed);
+                serviced += 1;
+                if claimed != 0 && serviced <= 16 {
+                    print_str(b"[hosted-irq] serviced event=");
                     print_u64(event_bit as u64);
-                    print_str(b" status=0x");
-                    print_hex(status.raw() as u32);
+                    print_str(b" claimed=");
+                    print_u64(claimed);
                     print_str(b"\n");
                 }
             }
+            Ok(HostedIrqServiceOutcome::DeferredBusy) => {
+                let count = HOSTED_IRQ_EVENTS_DEFERRED_BUSY.fetch_add(1, Ordering::Relaxed) + 1;
+                deferred |= event;
+                if count <= 16 {
+                    print_str(b"[hosted-irq] deferred busy request bank event=");
+                    print_u64(event_bit as u64);
+                    print_str(b"\n");
+                }
+            }
+            Err(status) => {
+                print_str(b"[hosted-irq] dispatch failed event=");
+                print_u64(event_bit as u64);
+                print_str(b" status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+            }
         }
     }
+    if deferred != 0 {
+        HOSTED_IRQ_PENDING_EVENTS.fetch_or(deferred, Ordering::AcqRel);
+    }
+    serviced
+}
+
+unsafe fn drain_pending_hosted_irqs_for_scheduler_yield() -> u64 {
+    drain_pending_hosted_irqs_snapshot()
+}
+
+pub(crate) unsafe fn drain_pending_hosted_irqs() -> u64 {
+    drain_pending_hosted_irqs_snapshot()
 }
 
 unsafe fn hosted_dma_manager_mut() -> &'static mut HostedDmaManager {
@@ -50187,6 +50355,7 @@ unsafe fn dispatch_driver_unload_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -50242,6 +50411,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -50371,6 +50541,7 @@ unsafe fn dispatch_video_add_device_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -50443,6 +50614,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
         tcb: provider_inst.tcb,
         reply_cap: provider_inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -50521,6 +50693,7 @@ unsafe fn dispatch_add_device_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -52089,6 +52262,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -52271,6 +52445,7 @@ unsafe fn dispatch_video_initialize_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -52337,6 +52512,7 @@ unsafe fn dispatch_video_start_io_for_instance(
         tcb: inst.tcb,
         reply_cap: inst.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -53547,6 +53723,7 @@ unsafe fn dispatch_irp_for_instance_exact(
         tcb: d.tcb,
         reply_cap: d.reply_cap,
         client_pi: 0,
+        client_generation: 0,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -53611,14 +53788,15 @@ unsafe fn dispatch_irp_for_instance_exact(
     // component, so an `ENTER` with no matching `EXIT` is the signature of a driver that never
     // returned.
     let dispatch_seq = FSD_DISPATCH_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    FSD_ACTIVE_DISPATCH_SEQ.store(dispatch_seq, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_INST.store(dispatch_index as u64, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_MAJOR.store(major, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_FSCTL.store(fsctl, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_FID.store(file_id, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_IN.store(in_data.len() as u64, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_OUT.store(out.len() as u64, Ordering::Relaxed);
-    FSD_ACTIVE_DISPATCH_STARTED_100NS.store(monotonic_time_100ns(), Ordering::Relaxed);
+    let active_dispatch = ActiveHostedDispatchDiagnosticGuard::enter(
+        dispatch_seq,
+        dispatch_index,
+        major,
+        fsctl,
+        file_id,
+        in_data.len(),
+        out.len(),
+    );
     let trace_dispatch = dispatch_seq <= FSD_DISPATCH_TRACE_CAP;
     if trace_dispatch {
         print_str(b"[fsd-svc] ENTER inst=");
@@ -53641,7 +53819,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     }
     let pr = hosted_component_pump(&ch);
     drop(transfer_guard);
-    FSD_ACTIVE_DISPATCH_SEQ.store(0, Ordering::Relaxed);
+    drop(active_dispatch);
     if trace_dispatch {
         print_str(b"[fsd-svc] EXIT inst=");
         print_u64(dispatch_index as u64);

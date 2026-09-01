@@ -15922,6 +15922,9 @@ impl RingChannel<'_> {
         let (_rax, badge, _info, _payload) = ep_recv(self.wait_cptr);
         let timer = badge_has_delay_timer(badge);
         let irq_lines = driver_launch::latch_hosted_irq_badge(badge);
+        if irq_lines != 0 {
+            let _ = driver_launch::drain_pending_hosted_irqs();
+        }
         if EXEC_DEADMAN_WATCHDOG {
             if timer {
                 watchdog_on_tick();
@@ -31995,6 +31998,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 tcb: WIN32K_TCB.load(Ordering::Relaxed),
                 reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
                 client_pi: 0,
+                client_generation: 0,
                 // DriverEntry runs before any client exists: no client_attach (its faults are its
                 // OWN pages, zero-filled), no usermode callbacks, no assert-skip — the same set the
                 // bespoke loop implemented inline.
