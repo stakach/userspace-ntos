@@ -21637,6 +21637,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     a best-effort second lookup. Exhaustion, partial-capacity, exact-fit, and release/reuse specs must
     pass for every pooled object type before the production image and Explorer desktop gate rerun.
 
+    Atomic Untyped Retype checkpoint (2026-09-01, accepted): rust-micro commit `a01827c` makes pooled
+    identity ownership explicit and Retype two-phase. Endpoint, Notification, SchedContext, Reply,
+    dynamic CNode, and capability-backed TCB availability now count the same identities their
+    allocators can claim. Idle Endpoint state and unconfigured SchedContext state no longer imply
+    freedom; TCB identity zero is reserved for the non-capability bootstrap context; and the
+    bootstrap TCB no longer aliases the rootserver's real initial SC through a fake `SC 0` binding.
+    Historical Endpoint/Notification/SC/Reply bump cursors are removed, with ownership bitmaps as the
+    sole allocation authority.
+
+    Untyped layout planning now validates every generated pointer, device/type constraint, alignment,
+    physical extent, destination window, and exact invoked source CTE before memory is cleared.
+    Internal pool capacity is checked only after those pure checks. The commit path cannot emit
+    `Cap::Null`: every allocation is an invariant-backed consequence of the BKL-serialized preflight,
+    destination CTEs and MDB edges are published only for real objects, and the source watermark is
+    committed through the single saved CTE rather than a silent best-effort lookup. Malformed
+    upstream Retype messages without the complete six-word/extra-cap contract fail as
+    `seL4_TruncatedMessage` before stale IPC registers are consumed.
+
+    The full rust-micro spec suite passes, including an exhaustion/one-free/exact-fit/delete-reuse
+    matrix for all six pooled types, exact leftmost child-Untyped source identity, and allocator-level
+    ownership checks. The production `extern-rootserver` compile is green. QEMU was terminated
+    immediately after `All specs passed!`; the post-gate H/B loop was not treated as a boot hang.
+    The two no-fallback prerequisites from the preceding review are closed. Rebuild the actual
+    executive image and rerun the pending File-owner/full Explorer desktop proof under the enforced
+    one-hour maximum. Independently retain follow-up lifecycle work for final Endpoint/Notification
+    deletion with live waiters and complete seL4 Retype error-detail precedence; neither is licensed
+    as a fallback or a reason to weaken the desktop gate.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
