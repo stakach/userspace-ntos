@@ -21707,8 +21707,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     under the 3,600-second hard limit, followed by exact selftest Process Manager object teardown if
     the runtime confirms the frame-conflict and Dbgk gates are green.
 
-    Fresh desktop acceptance review (2026-09-01, implementation complete; serialized validation
-    pending): `.tmp/run-desktop-20260901-165519.log` reached genuine userinit and Explorer, completed
+    Fresh desktop acceptance review (2026-09-01, accepted):
+    `.tmp/run-desktop-20260901-165519.log` reached genuine userinit and Explorer, completed
     675 real api0 callbacks with zero callback failures, painted the full 1,024x768 framebuffer, and
     passed every Dbgk and VM-headroom proof. The final result was 297/298 because the exact live PnP
     notification ledger remained at zero while CM retained one pending action. The gate is correct:
@@ -21735,9 +21735,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the explicit isa-debug-exit verdict and shares the headless complete-log validator, eliminating
     the former intentional post-sentinel spin. Boot readiness remains capped at 3,600 seconds and is
     disarmed only after the real Explorer paint proof; an explicit completed verdict terminates both
-    lanes. Next acceptance must show PlugPlay `1/0`, real `umpnpmgr` load, nonzero exact
-    claim/deliver/retire rows, CM pending zero, full Explorer pixels, and all checks passing before
-    Process Manager selftest teardown starts.
+    lanes.
+
+    The serialized acceptance run `.tmp/run-desktop-20260901-182653.log` committed the installed
+    SYSTEM transition before SCM selection, classified PlugPlay auto/demand `1/0`, loaded the real
+    user-mode PnP provider, and completed 33 exact claim/deliver/retire rows with zero failures and CM
+    pending zero. It reached quiescence at 255,726 ms, completed 686 real Explorer api0 callbacks
+    with zero callback failures, retained the full 1,024x768 framebuffer with at least 32 non-background
+    colors, and passed all 298/298 executive checks including real shell chrome paint. The graphics
+    runner's obsolete `-no-shutdown` flag was then removed so isa-debug-exit's completed verdict
+    closes Cocoa QEMU instead of pausing it after the sentinel. The host wrapper now treats desktop
+    readiness and validation completion as separate markers: readiness disarms the one-hour boot
+    deadline, while completion permits a short natural QEMU exit and then terminates the process
+    group if a display backend remains alive. A runner without a completion policy can still own an
+    intentional long-uptime session.
+
+    Post-acceptance lifecycle adjustment: after Explorer became idle, real `umpnpmgr` attempted a
+    `rundll32.exe` install action for each enumerated device, but later admissions failed with
+    `err=6 max_pi=24`, and ReactOS logged `InstallDevice failed`. Do not raise `MAX_PI` or reserve
+    more static hosted identities. Make the next Process Manager step reclaim terminated dynamic
+    identities and every attached process/thread, VSpace, client-frame, handle, runtime, and image
+    ownership record transactionally, then prove the reclaimed identity can host subsequent
+    `rundll32.exe` launches without aliasing stale state. Fold exact post-quiesce Dbgk selftest
+    teardown into the same lifecycle work. The following frontier remains the dedicated
+    real-provider GetClassInfo integration client.
 
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 

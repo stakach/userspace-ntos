@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one command in its own process group with a boot-readiness deadline."""
+"""Run one command with independent boot-readiness and completion policies."""
 
 from __future__ import annotations
 
@@ -67,6 +67,9 @@ def main() -> int:
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--ready-file")
     parser.add_argument("--ready-text")
+    parser.add_argument("--completion-file")
+    parser.add_argument("--completion-text")
+    parser.add_argument("--completion-grace-seconds", type=float, default=5.0)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -74,6 +77,10 @@ def main() -> int:
         parser.error("a positive timeout and command are required")
     if bool(args.ready_file) != bool(args.ready_text):
         parser.error("--ready-file and --ready-text must be specified together")
+    if bool(args.completion_file) != bool(args.completion_text):
+        parser.error("--completion-file and --completion-text must be specified together")
+    if args.completion_grace_seconds < 0:
+        parser.error("--completion-grace-seconds cannot be negative")
 
     ready_path = Path(args.ready_file) if args.ready_file else None
     ready_marker = args.ready_text.encode() if args.ready_text else None
@@ -82,6 +89,13 @@ def main() -> int:
     except FileNotFoundError:
         ready_offset = 0
     ready_tail = b""
+    completion_path = Path(args.completion_file) if args.completion_file else None
+    completion_marker = args.completion_text.encode() if args.completion_text else None
+    try:
+        completion_offset = completion_path.stat().st_size if completion_path else 0
+    except FileNotFoundError:
+        completion_offset = 0
+    completion_tail = b""
 
     def forward_signal(signum: int, _frame: object) -> None:
         raise ForwardedSignal(signum)
@@ -94,12 +108,36 @@ def main() -> int:
     }
 
     process = subprocess.Popen(command, cwd=args.cwd, start_new_session=True)
-    deadline = time.monotonic() + args.seconds
+    deadline: float | None = time.monotonic() + args.seconds
     try:
         while True:
             result = process.poll()
             if result is not None:
                 return result
+
+            if completion_path is not None and completion_marker is not None:
+                completed, completion_offset, completion_tail = ready_marker_observed(
+                    completion_path,
+                    completion_marker,
+                    completion_offset,
+                    completion_tail,
+                )
+                if completed:
+                    print(
+                        "completion marker observed; awaiting process exit",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    try:
+                        return process.wait(timeout=args.completion_grace_seconds)
+                    except subprocess.TimeoutExpired:
+                        print(
+                            "completion exit grace expired; terminating process group",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        terminate_and_wait(process, signal.SIGTERM)
+                        return 0
 
             if ready_path is not None and ready_marker is not None:
                 ready, ready_offset, ready_tail = ready_marker_observed(
@@ -111,18 +149,23 @@ def main() -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-                    return process.wait()
+                    ready_path = None
+                    ready_marker = None
+                    deadline = None
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                print(
-                    f"boot validation exceeded {args.seconds}s; terminating process group",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                terminate_and_wait(process, signal.SIGTERM)
-                return 124
-            time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(
+                        f"boot validation exceeded {args.seconds}s; terminating process group",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    terminate_and_wait(process, signal.SIGTERM)
+                    return 124
+                time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+            else:
+                time.sleep(POLL_INTERVAL_SECONDS)
     except ForwardedSignal as forwarded:
         terminate_and_wait(process, signal.Signals(forwarded.signum))
         return 128 + forwarded.signum

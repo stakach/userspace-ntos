@@ -48,6 +48,8 @@ run_boot_lane() {
   python3 "$ROOT/scripts/run_with_timeout.py" \
     --seconds "$BOOT_TIMEOUT_SECONDS" \
     --cwd "$RM" \
+    --completion-file "$RUN_LOG" \
+    --completion-text '[microtest sentinel matched -- exiting QEMU]' \
     -- "$@"
 }
 
@@ -57,6 +59,8 @@ run_desktop_boot_lane() {
     --cwd "$RM" \
     --ready-file "$RUN_LOG" \
     --ready-text 'PASS exec_explorer_shell_chrome_painted' \
+    --completion-file "$RUN_LOG" \
+    --completion-text '[microtest sentinel matched -- exiting QEMU]' \
     -- "$@"
 }
 

@@ -13,7 +13,12 @@ SCRIPT = Path(__file__).resolve().parents[1] / "run_with_timeout.py"
 
 class RunWithTimeoutTests(unittest.TestCase):
     def run_helper(
-        self, seconds: int, command: list[str], ready_file: Path | None = None
+        self,
+        seconds: int,
+        command: list[str],
+        ready_file: Path | None = None,
+        completion_file: Path | None = None,
+        completion_grace_seconds: float = 5.0,
     ) -> subprocess.CompletedProcess[str]:
         args = [
             sys.executable,
@@ -26,6 +31,17 @@ class RunWithTimeoutTests(unittest.TestCase):
         if ready_file is not None:
             args.extend(
                 ["--ready-file", str(ready_file), "--ready-text", "DESKTOP_READY"]
+            )
+        if completion_file is not None:
+            args.extend(
+                [
+                    "--completion-file",
+                    str(completion_file),
+                    "--completion-text",
+                    "BOOT_COMPLETE",
+                    "--completion-grace-seconds",
+                    str(completion_grace_seconds),
+                ]
             )
         args.extend(["--", *command])
         return subprocess.run(args, capture_output=True, text=True, timeout=8)
@@ -79,6 +95,60 @@ class RunWithTimeoutTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 124)
         self.assertNotIn("deadline disarmed", result.stderr)
+
+    def test_completion_marker_ends_a_ready_but_running_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            marker_file = Path(temporary_directory) / "serial.log"
+            marker_file.touch()
+            program = (
+                "import pathlib,time; "
+                f"p=pathlib.Path({str(marker_file)!r}); "
+                "time.sleep(.2); p.write_text('DESKTOP_READY'); "
+                "time.sleep(.2); p.open('a').write('BOOT_COMPLETE'); "
+                "time.sleep(30)"
+            )
+            started = time.monotonic()
+            result = self.run_helper(
+                1,
+                [sys.executable, "-c", program],
+                marker_file,
+                marker_file,
+                0.1,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("deadline disarmed", result.stderr)
+        self.assertIn("completion marker observed", result.stderr)
+        self.assertIn("grace expired", result.stderr)
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_completion_marker_preserves_a_prompt_child_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            completion_file = Path(temporary_directory) / "serial.log"
+            completion_file.touch()
+            program = (
+                "import pathlib,sys,time; "
+                f"pathlib.Path({str(completion_file)!r}).write_text('BOOT_COMPLETE'); "
+                "time.sleep(.2); sys.exit(3)"
+            )
+            result = self.run_helper(
+                1,
+                [sys.executable, "-c", program],
+                completion_file=completion_file,
+            )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("completion marker observed", result.stderr)
+
+    def test_stale_completion_marker_does_not_end_the_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            completion_file = Path(temporary_directory) / "serial.log"
+            completion_file.write_text("BOOT_COMPLETE")
+            result = self.run_helper(
+                1,
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                completion_file=completion_file,
+            )
+        self.assertEqual(result.returncode, 124)
+        self.assertNotIn("completion marker observed", result.stderr)
 
 
 if __name__ == "__main__":
