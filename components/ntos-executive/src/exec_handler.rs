@@ -3887,6 +3887,9 @@ impl ExecNtHandler {
         write_field!(anon_event_seq, 0);
         write_field!(pnp_boot_event_cursor, 0);
         write_field!(pnp_live_action, None);
+        write_field!(pnp_live_action_reply_tail, None);
+        write_field!(pnp_live_action_claims, 0);
+        write_field!(pnp_live_action_terminals, alloc::vec::Vec::new());
         write_field!(pnp_notify_event, 0);
         write_field!(pnp_status, PnpRuntimeStatusTable::new());
         write_field!(lpc_receive_park, None);
@@ -19648,13 +19651,29 @@ impl ExecNtHandler {
         if self.pnp_live_action.is_some() {
             return Ok(true);
         }
+        self.pnp_live_action_terminals
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let Some(event) =
             crate::config_manager_next_device_action().map_err(|status| status as u32)?
         else {
+            if let Some(last) = self.pnp_live_action_terminals.last_mut() {
+                last.empty_after_ack = true;
+            }
             return Ok(false);
         };
+        print_str(b"[pnp-live-action] claimed generation/sequence/token=");
+        print_u64(event.mount_generation);
+        print_str(b"/");
+        print_u64(event.sequence);
+        print_str(b"/");
+        print_u64(event.claim_token);
+        print_str(b" instance=");
+        print_str(event.publication.instance_id.as_bytes());
+        print_str(b"\n");
         self.pnp_live_action =
             Some(LiveDeviceActionState::new(event).map_err(|()| STATUS_INVALID_PARAMETER)?);
+        self.pnp_live_action_claims = self.pnp_live_action_claims.saturating_add(1);
         Ok(true)
     }
 
@@ -19662,7 +19681,7 @@ impl ExecNtHandler {
         let Some(state) = self.pnp_live_action.as_ref() else {
             return Ok(false);
         };
-        if !state.owner.ready_to_acknowledge() {
+        if !state.delivered || !state.owner.ready_to_acknowledge() {
             return Ok(false);
         }
         let identity = state
@@ -19675,11 +19694,90 @@ impl ExecNtHandler {
         }
         let has_more = crate::config_manager_acknowledge_device_action(&state.event)
             .map_err(|status| status as u32)?;
-        self.pnp_live_action = None;
+        let state = self
+            .pnp_live_action
+            .take()
+            .expect("acknowledged live PnP action disappeared");
+        let status = match state.owner.lifecycle() {
+            nt_pnp_manager::DeviceActionLifecycleState::Terminal { status } => status,
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        };
+        let reply_status = match state.owner.reply() {
+            nt_pnp_manager::DeviceActionReplyState::Delivered { status } => status,
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        };
+        let instance_id = state.event.publication.instance_id;
+        print_str(b"[pnp-live-action] retired generation/sequence/token=");
+        print_u64(identity.mount_generation);
+        print_str(b"/");
+        print_u64(identity.sequence);
+        print_str(b"/");
+        print_u64(identity.claim_token);
+        print_str(b" status/reply=");
+        print_hex(status);
+        print_str(b"/");
+        print_hex(reply_status);
+        print_str(b" instance=");
+        print_str(instance_id.as_bytes());
+        print_str(b"\n");
+        self.pnp_live_action_terminals
+            .push(LiveDeviceActionTerminalRecord {
+                identity,
+                kind: state.event.kind,
+                instance_id,
+                status,
+                reply_status,
+                empty_after_ack: false,
+            });
         if has_more {
             self.pnp_signal_pending_action();
         }
         Ok(true)
+    }
+
+    fn pnp_stage_live_action_reply_tail(
+        &mut self,
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+    ) -> Result<(), u32> {
+        let state = self
+            .pnp_live_action
+            .as_ref()
+            .filter(|state| state.matches(identity))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if !matches!(
+            state.owner.reply(),
+            nt_pnp_manager::DeviceActionReplyState::Awaiting { .. }
+        ) || self.pnp_live_action_reply_tail.is_some()
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.pnp_live_action_reply_tail = Some(identity);
+        Ok(())
+    }
+
+    pub(crate) fn pnp_take_live_action_reply_tail(
+        &mut self,
+    ) -> Option<nt_pnp_manager::DeviceActionClaimIdentity> {
+        self.pnp_live_action_reply_tail.take()
+    }
+
+    pub(crate) unsafe fn pnp_record_live_action_reply(
+        &mut self,
+        identity: nt_pnp_manager::DeviceActionClaimIdentity,
+        status: u32,
+        delivered: bool,
+    ) -> Result<(), u32> {
+        let state = self
+            .pnp_live_action
+            .as_mut()
+            .filter(|state| state.matches(identity))
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        state
+            .owner
+            .record_reply(status, delivered)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let _ = self.pnp_try_acknowledge_live_action()?;
+        Ok(())
     }
 
     pub(crate) fn pnp_complete_live_start(
@@ -19868,10 +19966,20 @@ impl ExecNtHandler {
             let _ = self.events.reset_existing(self.pnp_notify_event);
         }
         if boot_instance.is_none() {
-            self.pnp_live_action
+            let state = self
+                .pnp_live_action
                 .as_mut()
-                .expect("live PnP event disappeared during delivery")
-                .delivered = true;
+                .expect("live PnP event disappeared during delivery");
+            state.delivered = true;
+            print_str(b"[pnp-live-action] delivered generation/sequence/token=");
+            print_u64(state.owner.identity().mount_generation);
+            print_str(b"/");
+            print_u64(state.owner.identity().sequence);
+            print_str(b"/");
+            print_u64(state.owner.identity().claim_token);
+            print_str(b" instance=");
+            print_str(state.event.publication.instance_id.as_bytes());
+            print_str(b"\n");
         }
         0
     }
@@ -19946,17 +20054,33 @@ impl ExecNtHandler {
             Err(status) => return status,
         }
 
-        let Some(state) = self.pnp_live_action.as_ref() else {
-            return 0;
-        };
-        if !state
-            .event
-            .publication
-            .instance_id
-            .eq_ignore_ascii_case(&instance)
-        {
-            return 0;
+        let matching_live_action = self.pnp_live_action.as_ref().is_some_and(|state| {
+            state
+                .event
+                .publication
+                .instance_id
+                .eq_ignore_ascii_case(&instance)
+        });
+        if !matching_live_action {
+            return match nt_pnp_manager::existing_device_start_disposition(
+                driver_launch::hosted_pnp_device_state_for_instance(&instance),
+            ) {
+                nt_pnp_manager::ExistingDeviceStartDisposition::AlreadyStarted => 0,
+                nt_pnp_manager::ExistingDeviceStartDisposition::Busy => {
+                    nt_status::NtStatus::DEVICE_BUSY.raw() as u32
+                }
+                nt_pnp_manager::ExistingDeviceStartDisposition::RequiresAction => {
+                    STATUS_DEVICE_NOT_READY
+                }
+                nt_pnp_manager::ExistingDeviceStartDisposition::NoSuchDevice => {
+                    STATUS_NO_SUCH_DEVICE
+                }
+            };
         }
+        let state = self
+            .pnp_live_action
+            .as_ref()
+            .expect("matching live PnP action disappeared");
         if state.event.kind != nt_config_client::DeviceActionKind::Arrival {
             return STATUS_NOT_SUPPORTED;
         }
@@ -19980,7 +20104,9 @@ impl ExecNtHandler {
                 if state.owner.complete_without_start(0).is_err() {
                     return STATUS_INVALID_PARAMETER;
                 }
-                let _ = self.pnp_try_acknowledge_live_action();
+                if self.pnp_stage_live_action_reply_tail(identity).is_err() {
+                    return STATUS_INVALID_PARAMETER;
+                }
                 return 0;
             }
             Err(status) => return status as u32,
@@ -20050,7 +20176,9 @@ impl ExecNtHandler {
                 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                let _ = self.pnp_try_acknowledge_live_action();
+                if self.pnp_stage_live_action_reply_tail(identity).is_err() {
+                    return STATUS_INVALID_PARAMETER;
+                }
                 status
             }
             OwnedHostedPnpStartProgress::OwnershipLost(failure) => {
@@ -20158,7 +20286,9 @@ impl ExecNtHandler {
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    let _ = self.pnp_try_acknowledge_live_action();
+                    if self.pnp_stage_live_action_reply_tail(identity).is_err() {
+                        return STATUS_INVALID_PARAMETER;
+                    }
                 }
                 status
             }
@@ -20290,7 +20420,9 @@ impl ExecNtHandler {
                     {
                         return STATUS_INVALID_PARAMETER;
                     }
-                    let _ = self.pnp_try_acknowledge_live_action();
+                    if self.pnp_stage_live_action_reply_tail(identity).is_err() {
+                        return STATUS_INVALID_PARAMETER;
+                    }
                 }
                 status
             }

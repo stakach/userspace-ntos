@@ -5645,6 +5645,7 @@ pub(crate) unsafe fn service_sec_image(
     u64,
     BootDriverStartReports,
     NativeDriverLoadReport,
+    LiveDeviceActionReport,
 ) {
     let live_service = ntdll.is_some();
     loader_trace_clear();
@@ -15974,10 +15975,18 @@ pub(crate) unsafe fn service_sec_image(
             }
             let redirected_user_control =
                 redirected_user_callback || redirected_user_apc || redirected_context_continue;
-            let native_load_reply_status = (native_call_transport
-                && m0 == SSN_NT_LOAD_DRIVER
+            let native_load_reply_status =
+                (native_call_transport && m0 == SSN_NT_LOAD_DRIVER && !redirected_user_control)
+                    .then_some(result as u32);
+            let live_action_reply = (native_call_transport
+                && m0 == SSN_NT_PLUG_PLAY_CONTROL
                 && !redirected_user_control)
-                .then_some(result as u32);
+                .then(|| {
+                    nt_handler
+                        .pnp_take_live_action_reply_tail()
+                        .map(|identity| (identity, result as u32))
+                })
+                .flatten();
             let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
                 let (r0, r1, r2, r3) = stage_serviced_syscall_reply(
@@ -16023,6 +16032,12 @@ pub(crate) unsafe fn service_sec_image(
                     .native_driver_load_report
                     .record_reply(status, delivered);
                 assert!(delivered, "NtLoadDriver bound reply failed before receive");
+            }
+            if let Some((identity, status)) = live_action_reply {
+                let delivered = nb != COMPOSITE_SEND_ERROR_BADGE;
+                nt_handler
+                    .pnp_record_live_action_reply(identity, status, delivered)
+                    .expect("live PnP action reply did not match its terminal lifecycle result");
             }
             badge = nb;
             mi = nmi;
@@ -20055,6 +20070,7 @@ pub(crate) unsafe fn service_sec_image(
     // The live path's primary is SMSS; the early SEC_IMAGE proof uses a dynamic diagnostic process.
     let boot_driver_start_reports = pending_driver_start_reports_snapshot(&nt_handler);
     let native_driver_load_report = nt_handler.native_driver_load_report;
+    let live_device_action_report = print_live_device_action_report(&nt_handler);
     (
         verdict,
         procs[primary_pi].faults,
@@ -20064,6 +20080,7 @@ pub(crate) unsafe fn service_sec_image(
         stop_ssn,
         boot_driver_start_reports,
         native_driver_load_report,
+        live_device_action_report,
     )
 }
 
@@ -22575,10 +22592,11 @@ unsafe fn pending_driver_start_reply_owner(
     reply: nt_syscall_abi::ParkedSyscallReply,
     badge: u64,
     status: u32,
-) {
-    let _ = reply_parked_syscall(cap, reply, status as u64);
+) -> bool {
+    let delivered = reply_parked_syscall(cap, reply, status as u64);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_badge_ready(nt_handler, badge);
+    delivered
 }
 
 unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
@@ -22611,7 +22629,6 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                     nt_handler
                         .pnp_complete_live_start(identity, slot, status)
                         .expect("terminal live START lost its exact action owner");
-                    let _ = nt_handler.pnp_try_acknowledge_live_action();
                 }
                 let mut pending = nt_handler
                     .pending_driver_starts
@@ -22627,13 +22644,21 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                             _ => unreachable!(),
                         };
                         if let Some(reply) = reply {
-                            pending_driver_start_reply_owner(
+                            let delivered = pending_driver_start_reply_owner(
                                 nt_handler,
                                 reply.reply_cap,
                                 reply.reply,
                                 reply.badge,
                                 status,
                             );
+                            nt_handler
+                                .pnp_record_live_action_reply(
+                                    device_action_identity
+                                        .expect("live START reply has no exact action identity"),
+                                    status,
+                                    delivered,
+                                )
+                                .expect("live START reply did not match its terminal result");
                         }
                     }
                 }
@@ -22708,20 +22733,24 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
                     nt_handler
                         .pnp_complete_live_operation(identity, operation, slot, status)
                         .expect("terminal live PnP operation lost its exact action owner");
-                    let _ = nt_handler.pnp_try_acknowledge_live_action();
                 }
                 let mut pending = nt_handler
                     .pending_pnp_operations
                     .take(slot)
                     .expect("completed PnP operation continuation disappeared");
                 if let Some(reply) = pending.owner.take_reply() {
-                    pending_driver_start_reply_owner(
+                    let delivered = pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
                         reply.reply,
                         reply.badge,
                         status,
                     );
+                    if let Some((identity, _)) = device_action {
+                        nt_handler
+                            .pnp_record_live_action_reply(identity, status, delivered)
+                            .expect("live PnP reply did not match its terminal result");
+                    }
                 }
                 completed = completed.saturating_add(1);
             }

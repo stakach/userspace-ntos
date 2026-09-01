@@ -39813,6 +39813,13 @@ pub(crate) unsafe fn hosted_device_service_name_for_instance(
     Ok(owned)
 }
 
+pub(crate) unsafe fn hosted_pnp_device_state_for_instance(
+    instance_id: &str,
+) -> Option<nt_pnp_manager::DeviceState> {
+    let devnode_id = hosted_pnp_manager_mut().devnode_for_instance(instance_id)?;
+    hosted_pnp_manager_mut().state(devnode_id)
+}
+
 unsafe fn drain_hosted_pnp_completions() -> usize {
     let mut progress = 0usize;
     let mut index = 0usize;

@@ -20327,6 +20327,96 @@ struct LiveDeviceActionState {
     delivered: bool,
 }
 
+struct LiveDeviceActionTerminalRecord {
+    identity: nt_pnp_manager::DeviceActionClaimIdentity,
+    kind: nt_config_client::DeviceActionKind,
+    instance_id: alloc::string::String,
+    status: u32,
+    reply_status: u32,
+    empty_after_ack: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LiveDeviceActionReport {
+    claims: u64,
+    terminal_rows: u64,
+    successful: u64,
+    failed: u64,
+    empty_after_ack: u64,
+    active: u64,
+    reply_tail_active: u64,
+}
+
+impl LiveDeviceActionReport {
+    fn coherent(self) -> bool {
+        self.claims == self.terminal_rows + self.active
+            && self.successful + self.failed == self.terminal_rows
+            && self.reply_tail_active == 0
+            && (self.terminal_rows == 0 || self.empty_after_ack != 0)
+    }
+}
+
+fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionReport {
+    let mut report = LiveDeviceActionReport {
+        claims: handler.pnp_live_action_claims,
+        terminal_rows: handler.pnp_live_action_terminals.len() as u64,
+        active: handler.pnp_live_action.is_some() as u64,
+        reply_tail_active: handler.pnp_live_action_reply_tail.is_some() as u64,
+        ..LiveDeviceActionReport::default()
+    };
+    for row in &handler.pnp_live_action_terminals {
+        if nt_status::NtStatus(row.status as i32).is_success() && row.status == row.reply_status {
+            report.successful = report.successful.saturating_add(1);
+        } else {
+            report.failed = report.failed.saturating_add(1);
+        }
+        report.empty_after_ack = report
+            .empty_after_ack
+            .saturating_add(row.empty_after_ack as u64);
+        print_str(b"[pnp-live-proof] generation/sequence/token=");
+        print_u64(row.identity.mount_generation);
+        print_str(b"/");
+        print_u64(row.identity.sequence);
+        print_str(b"/");
+        print_u64(row.identity.claim_token);
+        print_str(b" kind=");
+        print_str(match row.kind {
+            nt_config_client::DeviceActionKind::Arrival => b"arrival",
+            nt_config_client::DeviceActionKind::Change => b"change",
+            nt_config_client::DeviceActionKind::Removal => b"removal",
+        });
+        print_str(b" status/reply=");
+        print_hex(row.status);
+        print_str(b"/");
+        print_hex(row.reply_status);
+        print_str(b" empty-after-ack=");
+        print_u64(row.empty_after_ack as u64);
+        print_str(b" instance=");
+        print_str(row.instance_id.as_bytes());
+        print_str(b"\n");
+    }
+    print_str(b"[pnp-live-proof] summary claims/rows/success/failed=");
+    print_u64(report.claims);
+    print_str(b"/");
+    print_u64(report.terminal_rows);
+    print_str(b"/");
+    print_u64(report.successful);
+    print_str(b"/");
+    print_u64(report.failed);
+    print_str(b" empty-after-ack/active/reply-tail=");
+    print_u64(report.empty_after_ack);
+    print_str(b"/");
+    print_u64(report.active);
+    print_str(b"/");
+    print_u64(report.reply_tail_active);
+    print_str(b"\n");
+    report
+}
+
+fn report_live_device_action_check(report: LiveDeviceActionReport, passed: &mut u64) {
+    check(b"exec_live_device_actions_exact", report.coherent(), passed);
+}
+
 impl LiveDeviceActionState {
     fn new(event: nt_config_client::DeviceActionEvent) -> Result<Self, ()> {
         let owner =
@@ -23527,6 +23617,9 @@ struct ExecNtHandler {
     /// Exclusive live CM action claim retained across user notification, asynchronous START, and
     /// CM acknowledgement retries.
     pnp_live_action: Option<LiveDeviceActionState>,
+    pnp_live_action_reply_tail: Option<nt_pnp_manager::DeviceActionClaimIdentity>,
+    pnp_live_action_claims: u64,
+    pnp_live_action_terminals: alloc::vec::Vec<LiveDeviceActionTerminalRecord>,
     /// Dispatcher event used to park `NtGetPlugPlayEvent` callers once the CM-backed stream drains.
     /// Zero means the event has not been allocated yet.
     pnp_notify_event: u64,
@@ -29181,7 +29274,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
         let _ = tcb_resume(spawn.main_tcb);
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
-            let (v, f, _, _, _, _, _, _) = service_sec_image(
+            let (v, f, _, _, _, _, _, _, _) = service_sec_image(
                 si_fault,
                 spawn.pml4,
                 spawn.main_tcb,
@@ -32761,6 +32854,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         sssn,
                         final_driver_start_reports,
                         native_driver_load_report,
+                        live_device_action_report,
                     ) = service_sec_image(
                         si_fault,
                         spawn.pml4,
@@ -32812,6 +32906,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         );
                     }
                     report_native_driver_load_check(native_driver_load_report, &mut passed);
+                    report_live_device_action_check(live_device_action_report, &mut passed);
                     print_str(b"[ntos-exec] LIVE ReactOS smss+env: faulted ");
                     print_u64(sfaults);
                     print_str(b" page(s) (");

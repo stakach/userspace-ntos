@@ -13,6 +13,7 @@ use nt_config_manager::SERVICE_BOOT_START;
 use nt_hive_core::reactos_network_ipv4_defaults_for_interface;
 use nt_hive_core::{
     encode_image, import_control_set_class_into_config_manager,
+    import_control_set_critical_device_database_into_config_manager,
     import_control_set_enum_into_config_manager, import_control_set_network_into_config_manager,
     import_control_set_services_into_config_manager,
     seed_reactos_network_bindings_from_config_manager_into_target,
@@ -44,12 +45,14 @@ enum GeneratedHiveProfile {
     #[default]
     Production,
     PendingStartIntegration,
+    LiveDeviceActionIntegration,
 }
 
 fn generated_hive_profile_from_name(name: &str) -> Option<GeneratedHiveProfile> {
     match name.trim().to_ascii_lowercase().as_str() {
         "production" => Some(GeneratedHiveProfile::Production),
         "pending-start" => Some(GeneratedHiveProfile::PendingStartIntegration),
+        "live-device-action" => Some(GeneratedHiveProfile::LiveDeviceActionIntegration),
         _ => None,
     }
 }
@@ -58,7 +61,7 @@ fn generated_hive_profile_from_env() -> GeneratedHiveProfile {
     match std::env::var("NTOS_IMAGE_PROFILE") {
         Ok(value) => generated_hive_profile_from_name(&value).unwrap_or_else(|| {
             panic!(
-                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start"
+                "unsupported NTOS_IMAGE_PROFILE '{value}'; supported: production, pending-start, live-device-action"
             )
         }),
         Err(std::env::VarError::NotPresent) => GeneratedHiveProfile::Production,
@@ -481,7 +484,7 @@ fn generated_display_mode_from_env() -> GeneratedDisplayMode {
     .validate()
 }
 
-fn install_generated_network_adapter(hive: &mut Hive, adapter: &GeneratedNetworkAdapter) {
+fn install_generated_network_adapter_policy(hive: &mut Hive, adapter: &GeneratedNetworkAdapter) {
     let key = hive.create_key(&format!(r"ControlSet001\Services\{}", adapter.service_name));
     set_expand_sz(hive, key, "ImagePath", adapter.service_image_path);
     hive.set_dword(key, "Type", SERVICE_KERNEL_DRIVER);
@@ -495,6 +498,55 @@ fn install_generated_network_adapter(hive: &mut Hive, adapter: &GeneratedNetwork
         utf16le_sz(NET_CLASS_GUID),
     );
 
+    for hardware_id in adapter.hardware_ids {
+        let policy_key = hardware_id.replace('\\', "#");
+        let policy = hive.create_key(&format!(
+            r"ControlSet001\Control\CriticalDeviceDatabase\{}",
+            policy_key
+        ));
+        hive.set_value(
+            policy,
+            "ClassGUID",
+            RegistryValueType::Sz,
+            utf16le_sz(NET_CLASS_GUID),
+        );
+        hive.set_value(
+            policy,
+            "Service",
+            RegistryValueType::Sz,
+            utf16le_sz(&adapter.service_name),
+        );
+    }
+
+    let class_key = hive.create_key(&format!(
+        r"ControlSet001\Control\Class\{}",
+        adapter.driver_key
+    ));
+    hive.set_value(
+        class_key,
+        "DriverDesc",
+        RegistryValueType::Sz,
+        utf16le_sz(adapter.driver_desc),
+    );
+    let linkage = hive.create_key(&format!(
+        r"ControlSet001\Control\Class\{}\Linkage",
+        adapter.driver_key
+    ));
+    hive.set_value(
+        linkage,
+        "Export",
+        RegistryValueType::Sz,
+        utf16le_sz(&adapter.export_name),
+    );
+    hive.set_value(
+        linkage,
+        "RootDevice",
+        RegistryValueType::Sz,
+        utf16le_sz(&adapter.root_device),
+    );
+}
+
+fn install_generated_network_adapter_devnode(hive: &mut Hive, adapter: &GeneratedNetworkAdapter) {
     let devnode = hive.create_key(&format!(r"ControlSet001\Enum\{}", adapter.instance_id));
     hive.set_value(
         devnode,
@@ -526,38 +578,19 @@ fn install_generated_network_adapter(hive: &mut Hive, adapter: &GeneratedNetwork
         RegistryValueType::MultiSz,
         encode_multi_sz(adapter.compatible_ids),
     );
-
-    let class_key = hive.create_key(&format!(
-        r"ControlSet001\Control\Class\{}",
-        adapter.driver_key
-    ));
-    hive.set_value(
-        class_key,
-        "DriverDesc",
-        RegistryValueType::Sz,
-        utf16le_sz(adapter.driver_desc),
-    );
-    let linkage = hive.create_key(&format!(
-        r"ControlSet001\Control\Class\{}\Linkage",
-        adapter.driver_key
-    ));
-    hive.set_value(
-        linkage,
-        "Export",
-        RegistryValueType::Sz,
-        utf16le_sz(&adapter.export_name),
-    );
-    hive.set_value(
-        linkage,
-        "RootDevice",
-        RegistryValueType::Sz,
-        utf16le_sz(&adapter.root_device),
-    );
 }
 
-fn install_generated_network_adapters(hive: &mut Hive, adapters: &[GeneratedNetworkAdapter]) {
-    for adapter in adapters {
-        install_generated_network_adapter(hive, adapter);
+fn install_generated_network_adapters(
+    hive: &mut Hive,
+    adapters: &[GeneratedNetworkAdapter],
+    initial_devnodes: usize,
+) {
+    assert!(initial_devnodes <= adapters.len());
+    for (index, adapter) in adapters.iter().enumerate() {
+        install_generated_network_adapter_policy(hive, adapter);
+        if index < initial_devnodes {
+            install_generated_network_adapter_devnode(hive, adapter);
+        }
     }
 }
 
@@ -570,6 +603,11 @@ fn import_generated_hive_config_manager(hive: &Hive) -> ConfigManager {
     );
     let _ =
         import_control_set_enum_into_config_manager(hive, &mut cm, GENERATED_OVERLAY_CONTROL_SET);
+    let _ = import_control_set_critical_device_database_into_config_manager(
+        hive,
+        &mut cm,
+        GENERATED_OVERLAY_CONTROL_SET,
+    );
     let _ =
         import_control_set_class_into_config_manager(hive, &mut cm, GENERATED_OVERLAY_CONTROL_SET);
     let _ = import_control_set_network_into_config_manager(
@@ -1144,7 +1182,19 @@ fn build_hive_with_configuration(
         );
     }
 
-    install_generated_network_adapters(&mut hive, &network_adapters);
+    let initial_network_devnodes = match profile {
+        GeneratedHiveProfile::Production | GeneratedHiveProfile::PendingStartIntegration => {
+            network_adapters.len()
+        }
+        GeneratedHiveProfile::LiveDeviceActionIntegration => {
+            assert!(
+                network_adapters.len() >= 2,
+                "live-device-action profile requires at least two generated NICs"
+            );
+            1
+        }
+    };
+    install_generated_network_adapters(&mut hive, &network_adapters, initial_network_devnodes);
     seed_generated_network_setup(&mut hive);
 
     let bochs = bochs_display_install_from_staged_inf()
@@ -1208,6 +1258,10 @@ mod tests {
         assert_eq!(
             generated_hive_profile_from_name("pending-start"),
             Some(GeneratedHiveProfile::PendingStartIntegration)
+        );
+        assert_eq!(
+            generated_hive_profile_from_name("live-device-action"),
+            Some(GeneratedHiveProfile::LiveDeviceActionIntegration)
         );
         assert_eq!(generated_hive_profile_from_name("pending"), None);
         assert_eq!(generated_hive_profile_from_name(""), None);
@@ -1338,6 +1392,54 @@ mod tests {
     }
 
     #[test]
+    fn live_device_action_profile_withholds_only_unreported_nic_devnodes() {
+        let adapters = generated_e1000_adapters(2);
+        let first_instance = adapters[0].instance_id.clone();
+        let second_instance = adapters[1].instance_id.clone();
+        let second_driver_key = adapters[1].driver_key.clone();
+        let hive = build_hive_with_configuration(
+            adapters,
+            GeneratedDisplayMode::DEFAULT,
+            GeneratedHiveProfile::LiveDeviceActionIntegration,
+        );
+
+        assert!(hive
+            .open_key(&format!(r"ControlSet001\Enum\{}", first_instance))
+            .is_some());
+        assert!(hive
+            .open_key(&format!(r"ControlSet001\Enum\{}", second_instance))
+            .is_none());
+        assert!(hive
+            .open_key(&format!(
+                r"ControlSet001\Control\Class\{}\Linkage",
+                second_driver_key
+            ))
+            .is_some());
+
+        let policy = hive
+            .open_key(r"ControlSet001\Control\CriticalDeviceDatabase\PCI#VEN_8086&DEV_100E")
+            .expect("generated E1000 critical-device policy");
+        assert_eq!(
+            hive.query_value(policy, "Service"),
+            Some((RegistryValueType::Sz, utf16le_sz("E1000").as_slice()))
+        );
+        assert_eq!(
+            hive.query_value(policy, "ClassGUID"),
+            Some((RegistryValueType::Sz, utf16le_sz(NET_CLASS_GUID).as_slice()))
+        );
+
+        let cm = import_generated_hive_config_manager(&hive);
+        assert!(cm.devnode(&first_instance).is_some());
+        assert!(cm.devnode(&second_instance).is_none());
+        let binding = cm
+            .resolve_critical_device_id(r"PCI\VEN_8086&DEV_100E")
+            .expect("valid generated hardware id")
+            .expect("generated E1000 policy resolves");
+        assert_eq!(binding.service_name.as_deref(), Some("E1000"));
+        assert_eq!(binding.class_guid, NET_CLASS_GUID);
+    }
+
+    #[test]
     fn generated_hive_declares_registry_selected_e1000_pci_driver() {
         let hive = build_hive();
         let key = hive
@@ -1428,7 +1530,7 @@ mod tests {
         ]);
         let mut hive = Hive::new(HiveKind::System);
         install_service_group_order(&mut hive);
-        install_generated_network_adapters(&mut hive, &adapters);
+        install_generated_network_adapters(&mut hive, &adapters, adapters.len());
         seed_generated_network_setup(&mut hive);
 
         let service = hive
@@ -1696,7 +1798,7 @@ mod tests {
         let adapters = generated_e1000_adapters(2);
         let mut hive = Hive::new(HiveKind::System);
         install_service_group_order(&mut hive);
-        install_generated_network_adapters(&mut hive, &adapters);
+        install_generated_network_adapters(&mut hive, &adapters, adapters.len());
         seed_generated_network_setup(&mut hive);
 
         let tcpip_linkage = hive
@@ -1870,12 +1972,13 @@ mod tests {
 
     #[test]
     fn generated_hive_image_decodes_and_fits_storage_window() {
-        for profile in [
-            GeneratedHiveProfile::Production,
-            GeneratedHiveProfile::PendingStartIntegration,
+        for (profile, count) in [
+            (GeneratedHiveProfile::Production, 1),
+            (GeneratedHiveProfile::PendingStartIntegration, 1),
+            (GeneratedHiveProfile::LiveDeviceActionIntegration, 2),
         ] {
             let bytes = encode_image(&build_hive_with_configuration(
-                generated_e1000_adapters(1),
+                generated_e1000_adapters(count),
                 GeneratedDisplayMode::DEFAULT,
                 profile,
             ));
