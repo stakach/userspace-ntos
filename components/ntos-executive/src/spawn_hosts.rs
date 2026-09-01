@@ -2524,6 +2524,15 @@ unsafe fn pump_service_generic_fault(
     if addr < 0x10000 || in_image || demand >= ch.demand_cap {
         return false;
     }
+    if crate::driver_launch::hosted_published_dma_aperture_contains(ch.pml4, addr) {
+        crate::print_str(b"[svc] refusing private page in published DMA aperture addr=0x");
+        crate::print_hex((addr >> 32) as u32);
+        crate::print_hex(addr as u32);
+        crate::print_str(b" pml4=0x");
+        crate::print_hex(ch.pml4 as u32);
+        crate::print_str(b"\n");
+        return false;
+    }
     let page = addr & !0xFFF;
     if ch.caps.sparse_vspace {
         if !crate::win32k_glue::ensure_w32_client_paging(page, ch.pml4) {

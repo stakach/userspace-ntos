@@ -21166,6 +21166,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     after the sentinel. If receive becomes live, move its proof from process-global counters to the
     exact current NDIS miniport/open-binding generation before closing the frontier.
 
+    Serialized runtime `.tmp/run-headless-pci-command-20260901.log` completed at guest time 115
+    seconds, exited QEMU, and retained full Explorer paint. PCI command ownership is therefore
+    runtime green: the passive netdev capture grew from an empty header to one hardware-transmitted
+    60-byte frame. The frame was all zeroes, however, and no receive indication followed. The
+    transmit descriptor address and length were valid; the zero payload exposed a distinct DMA
+    projection defect rather than a remaining PCI command problem.
+
+    B3 generation-owned DMA projection alias checkpoint (2026-09-01, implementation and runtime
+    green): ReactOS NDIS calls `GetScatterGatherList` from the provider domain with
+    `WriteToDevice=TRUE`, while the PnP grant previously mapped the device DMA frames only into the
+    dependent miniport domain. The provider's write to the projected DMA VA consequently entered
+    generic demand paging, which installed a new private frame. VT-d continued to point at the
+    original grant frame, so E1000 transmitted untouched zeroes.
+
+    Resource grants now map the exact same generation-owned DMA frame run into both legitimate
+    execution domains: the dependent driver and, when distinct, its authenticated provider
+    projection. Every mapping cap records the actual target instance/domain, device, and exact PnP
+    context lease; rollback, STOP, and removal revoke both aliases before DMA ownership is released.
+    Published DMA apertures are also excluded from generic private demand paging, so a missing
+    resource alias fails explicitly instead of silently creating a false DMA view. The mechanism
+    uses no NIC, image, or service identity and each device retains its independently reserved VA
+    span and VT-d domain.
+
+    Focused validation keeps the freestanding executive at the established 209-warning baseline and
+    `git diff --check` passes. Serialized run
+    `.tmp/run-headless-dma-projection-alias-20260901.log` reached final quiescence at guest time 119
+    seconds and QEMU exited immediately after the sentinel. There is no private fault at the DMA
+    aperture. Passive capture `.tmp/ndis-dma-projection-alias-20260901.pcap` contains the exact real
+    ARP request from `52:54:00:12:34:56` for `10.0.2.2`, followed by QEMU's ARP reply from
+    `52:55:0a:00:02:02`. The receive interrupt/DPC traversed E1000 and NDIS, the current protocol
+    receive gate passes, and canonical hardware evidence advanced to `live-irq/dpc=1/3`.
+
+    Explorer acceptance is retained: the final framebuffer is 786432/786432 non-background pixels
+    with at least 32 colors and `exec_explorer_shell_chrome_painted` passes. Readiness is now
+    295/296; the only failure is the independent demand-loaded native pending-START proof.
+
+    Review adjustment: close the single-NIC NDIS receive frontier and proceed to the native
+    demand-loaded pending-START frontier. Multi-NIC completion still requires moving the allocation
+    cursor and transfer records out of singleton provider shared state into the
+    adapter/device-generation authority in `nt-dma-manager`. Separately, `rust-micro` must add
+    ordered VT-d context-cache and IOTLB invalidation before dynamic mapping reuse or teardown can
+    be considered lifecycle-complete; that omission did not cause this zero-frame failure because
+    hardware demonstrably resolved the newly installed IOVA.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

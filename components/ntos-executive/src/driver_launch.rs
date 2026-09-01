@@ -35373,6 +35373,7 @@ struct HostedResourceMapCap {
     instance: usize,
     domain: HostedDomainIdentity,
     device_id: u64,
+    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
     cap: u64,
 }
 
@@ -35514,6 +35515,7 @@ unsafe fn record_hosted_resource_map_cap(
     instance: usize,
     domain: HostedDomainIdentity,
     device_id: u64,
+    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
     cap: u64,
 ) {
     if cap == 0 {
@@ -35523,14 +35525,84 @@ unsafe fn record_hosted_resource_map_cap(
         instance,
         domain,
         device_id,
+        pnp_context_lease,
         cap,
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn map_hosted_resource_frame_run(
+    instance_index: usize,
+    inst: DriverInstance,
+    domain: HostedDomainIdentity,
+    device_id: u64,
+    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
+    component_va: u64,
+    frame_base: u64,
+    pages: u64,
+    rights: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let bytes = pages
+        .checked_mul(0x1000)
+        .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if component_va == 0
+        || component_va & 0xFFF != 0
+        || component_va.checked_add(bytes).is_none()
+        || frame_base == 0
+        || pages == 0
+        || frame_base.checked_add(pages - 1).is_none()
+    {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    for window in 0..pages.div_ceil(512).max(1) {
+        let page = component_va
+            .checked_add(
+                window
+                    .checked_mul(HOSTED_PAGING_PT_SPAN)
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+            )
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if !ensure_paging(page, inst.pml4, domain) {
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+    }
+    let mut page = 0u64;
+    while page < pages {
+        let source_cap = frame_base
+            .checked_add(page)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        let map_va = component_va
+            .checked_add(
+                page.checked_mul(0x1000)
+                    .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?,
+            )
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        let (map_cap, copy_error) = copy_cap_r(source_cap);
+        if copy_error != 0 {
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        let error = page_map_r(map_cap, map_va, rights, inst.pml4);
+        if error != 0 {
+            let _ = cnode_delete_recycle_r(map_cap);
+            return Err(nt_status::NtStatus::UNSUCCESSFUL);
+        }
+        record_hosted_resource_map_cap(
+            instance_index,
+            domain,
+            device_id,
+            pnp_context_lease,
+            map_cap,
+        );
+        page += 1;
+    }
+    Ok(())
 }
 
 unsafe fn clear_hosted_resource_map_caps(
     instance: usize,
     domain: HostedDomainIdentity,
     device_id: Option<u64>,
+    pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
 ) -> u64 {
     let Some(caps) = (*core::ptr::addr_of_mut!(HOSTED_RESOURCE_MAP_CAPS)).as_mut() else {
         return 0;
@@ -35539,10 +35611,14 @@ unsafe fn clear_hosted_resource_map_caps(
     let mut index = caps.len();
     while index != 0 {
         index -= 1;
-        if caps[index].instance == instance
+        let owned = caps[index].instance == instance
             && caps[index].domain == domain
-            && device_id.is_none_or(|device_id| caps[index].device_id == device_id)
+            && device_id.is_none_or(|device_id| caps[index].device_id == device_id);
+        if owned
+            && pnp_context_lease.is_some_and(|lease| caps[index].pnp_context_lease != lease)
         {
+            failures += 1;
+        } else if owned {
             if caps[index].cap != 0 && cnode_delete_recycle_r(caps[index].cap) != 0 {
                 failures += 1;
             } else {
@@ -35557,18 +35633,24 @@ unsafe fn clear_hosted_resource_map_caps_for_instance(
     instance: usize,
     domain: HostedDomainIdentity,
 ) -> u64 {
-    clear_hosted_resource_map_caps(instance, domain, None)
+    clear_hosted_resource_map_caps(instance, domain, None, None)
 }
 
 unsafe fn clear_hosted_resource_map_caps_for_device(
     instance: usize,
     domain: HostedDomainIdentity,
     device_id: u64,
+    pnp_context_lease: Option<nt_pnp_context::ContextLeaseIdentity>,
 ) -> u64 {
     if device_id == 0 {
         return 0;
     }
-    clear_hosted_resource_map_caps(instance, domain, Some(device_id))
+    clear_hosted_resource_map_caps(
+        instance,
+        domain,
+        Some(device_id),
+        pnp_context_lease,
+    )
 }
 
 /// Ensure the paging hierarchy covering `page` exists in a hosted driver's `pml4`.
@@ -44080,7 +44162,8 @@ unsafe fn clear_hosted_resource_projection(
     // Mask and retire the physical route before revoking the generation's resource assignment or
     // component mappings. A live device must never target a stale ISR projection.
     retire_hosted_irq_connections_for_binding(binding)?;
-    if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
+    let resource_state = hosted_device_resource_state_by_device_id(binding.device_id);
+    if let Some(state) = resource_state {
         if state.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS && state.pci_command_owned_bits != 0
         {
             crate::pnp::release_pci_command_for_resources(
@@ -44099,20 +44182,33 @@ unsafe fn clear_hosted_resource_projection(
             }
         }
     }
-    if let Some((instance, inst)) = instance_by_driver_id(binding.driver_id) {
+    let targets = [binding.instance, binding.projection_instance];
+    for (position, target_index) in targets.into_iter().enumerate() {
+        if position != 0 && target_index == targets[0] {
+            continue;
+        }
+        let Some(target) = instance(target_index) else {
+            return Err(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND);
+        };
+        let Some(target_domain) = instance_domain_identity(target) else {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        };
         let failures = clear_hosted_resource_map_caps_for_device(
-            instance,
-            binding.projection_domain,
+            target_index,
+            target_domain,
             binding.device_id,
+            resource_state.and_then(|state| state.pnp_context_lease),
         );
         if failures != 0 {
             print_str(b"[driver-launch] hosted resource map release failed inst=");
-            print_u64(instance as u64);
+            print_u64(target_index as u64);
             print_str(b" failures=");
             print_u64(failures);
             print_str(b"\n");
             return Err(nt_status::NtStatus::UNSUCCESSFUL);
         }
+    }
+    if let Some((_instance, inst)) = instance_by_driver_id(binding.driver_id) {
         if inst.cnode != 0 {
             if let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) {
                 let mut resource_index = 0usize;
@@ -47881,6 +47977,50 @@ pub(crate) fn hosted_domain_identity_for_pml4(pml4: u64) -> Option<HostedDomainI
     resolved
 }
 
+pub(crate) fn hosted_published_dma_aperture_contains(pml4: u64, address: u64) -> bool {
+    let Some((instance_index, instance_domain)) = (unsafe { driver_instances() }).and_then(|table| {
+        table
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, inst)| inst.used && inst.pml4 == pml4)
+            .and_then(|(index, inst)| instance_domain_identity(inst).map(|domain| (index, domain)))
+    }) else {
+        return false;
+    };
+    let Some(bindings) = (unsafe { hosted_device_bindings() }) else {
+        return false;
+    };
+    bindings.iter().copied().any(|binding| {
+        if !binding.used
+            || (instance_index != binding.instance
+                && instance_index != binding.projection_instance)
+            || (instance_index == binding.projection_instance
+                && instance_domain != binding.projection_domain)
+        {
+            return false;
+        }
+        let Some(state) = (unsafe {
+            hosted_device_resource_state_by_device_id(binding.device_id)
+        }) else {
+            return false;
+        };
+        let start = state.evidence.dma_common_va;
+        let length = state.evidence.dma_common_len;
+        let Some(end) = start.checked_add(length) else {
+            return false;
+        };
+        state.driver_id == binding.driver_id
+            && state.instance == binding.instance
+            && state.projection_domain == binding.projection_domain
+            && state.pnp_context_lease.is_some()
+            && start != 0
+            && length != 0
+            && address >= start
+            && address < end
+    })
+}
+
 fn instance_by_driver_id(driver_id: u64) -> Option<(usize, DriverInstance)> {
     let t = unsafe { driver_instances()? };
     t.iter()
@@ -50366,6 +50506,18 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     let paging_domain =
         instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    let projection_dma_target = if binding.projection_instance == instance_index {
+        None
+    } else {
+        let projection_inst = instance(binding.projection_instance)
+            .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+        let projection_domain = instance_domain_identity(projection_inst)
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+        if projection_domain != binding.projection_domain {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        Some((binding.projection_instance, projection_inst, projection_domain))
+    };
     if video_memory.is_some() && !hosted_instance_video_port_initialized(inst) {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
@@ -50394,6 +50546,13 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         .iter()
         .try_fold(0u64, |count, grant| count.checked_add(grant.map_pages))
         .and_then(|count| count.checked_add(if has_dma { dma_pages } else { 0 }))
+        .and_then(|count| {
+            count.checked_add(if has_dma && projection_dma_target.is_some() {
+                dma_pages
+            } else {
+                0
+            })
+        })
         .and_then(|count| usize::try_from(count).ok())
         .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     reserve_hosted_resource_map_caps(map_cap_count)?;
@@ -50477,8 +50636,9 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             }
             record_hosted_resource_map_cap(
                 instance_index,
-                binding.projection_domain,
+                paging_domain,
                 device_id,
+                pnp_context_lease,
                 map_cap,
             );
             page += 1;
@@ -50527,56 +50687,47 @@ pub(crate) unsafe fn grant_hosted_device_resources(
             );
             return Err(nt_status::NtStatus::INVALID_PARAMETER);
         }
-        for window in 0..dma_pages.div_ceil(512).max(1) {
-            if !ensure_paging(dma_va + window * 0x20_0000, inst.pml4, paging_domain) {
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-        }
-        let mut page = 0u64;
-        while page < dma_pages {
-            let Some(source_cap) = dma_frame_base.checked_add(page) else {
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::INVALID_PARAMETER);
-            };
-            let (map_cap, copy_error) = copy_cap_r(source_cap);
-            if copy_error != 0 {
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-            let error = page_map_r(map_cap, dma_va + page * 0x1000, RW_NX, inst.pml4);
-            if error != 0 {
-                let _ = cnode_delete_recycle_r(map_cap);
-                rollback_staged_hosted_resource_grant(
-                    binding,
-                    instance_index,
-                    inst,
-                    &mut issued_port_caps,
-                );
-                return Err(nt_status::NtStatus::UNSUCCESSFUL);
-            }
-            record_hosted_resource_map_cap(
+        if let Err(status) = map_hosted_resource_frame_run(
+            instance_index,
+            inst,
+            paging_domain,
+            device_id,
+            pnp_context_lease,
+            dma_va,
+            dma_frame_base,
+            dma_pages,
+            RW_NX,
+        ) {
+            rollback_staged_hosted_resource_grant(
+                binding,
                 instance_index,
-                binding.projection_domain,
-                device_id,
-                map_cap,
+                inst,
+                &mut issued_port_caps,
             );
-            page += 1;
+            return Err(status);
+        }
+        if let Some((projection_instance, projection_inst, projection_domain)) =
+            projection_dma_target
+        {
+            if let Err(status) = map_hosted_resource_frame_run(
+                projection_instance,
+                projection_inst,
+                projection_domain,
+                device_id,
+                pnp_context_lease,
+                dma_va,
+                dma_frame_base,
+                dma_pages,
+                RW_NX,
+            ) {
+                rollback_staged_hosted_resource_grant(
+                    binding,
+                    instance_index,
+                    inst,
+                    &mut issued_port_caps,
+                );
+                return Err(status);
+            }
         }
         dma_adapter_id = hosted_dma_manager_mut().register_adapter(
             hosted_dma_owner(binding),
