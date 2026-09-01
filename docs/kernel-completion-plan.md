@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 
 ## Objective
 
@@ -22419,6 +22419,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     freestanding check is green. Until live grant, interrupt-lock, lane-local IRQL, and nested service
     handling are wired, receiving a command is a fatal protocol wall rather than a fabricated result.
     No QEMU run was made for this fail-closed bootstrap checkpoint.
+
+    B3 generation-fenced interrupt-grant checkpoint (2026-09-02, host and freestanding green; live
+    dispatch open): `nt-resource-manager` now assigns every interrupt connection a checked, nonzero
+    grant generation in addition to its monotonic interrupt id. Connect atomically returns the full
+    token grant, and the old ID-only production resolver is removed. Production route resolution and
+    disconnect require the exact `(owner domain, interrupt id, grant generation)` tuple; wrong-owner,
+    stale-generation, disconnected, revoked, reassigned, and exhausted-counter cases fail closed.
+    `ResourceManager::default()` now has the same nonzero allocator invariants as `new()`, and failed
+    reserve or sequence exhaustion cannot publish a partial connection.
+
+    The HAL/service projections retain the generation beside the opaque interrupt id and return it
+    on connect. The executive's connection ledger retains the corresponding arena grant identity,
+    immutable canonical route and callback tokens, component KINTERRUPT object, PnP context lease,
+    and lane generation. Install replay, hardware delivery, and teardown re-resolve the exact grant;
+    replay and delivery also require a live PnP lease, exact projection-domain binding, live lane
+    generation, and an unchanged typed KINTERRUPT projection. Mutable shared interrupt evidence is
+    still projected for the old ISR transport and diagnostics but no longer authorizes delivery.
+    Initial retention, replay, and delivery require the exact current live PnP lease. Retirement
+    tombstones the connection before touching either physical cap, and replay requires the exact live
+    non-retiring line, so partial teardown can only resume retirement. Grant validation precedes
+    physical line teardown, so a stale request cannot partially dismantle a live route.
+
+    Focused validation passes `nt-resource-manager` 21/21, all six affected freestanding HAL/PnP and
+    driver-host workspace checks, the executive freestanding check, formatting, and diff checks. No
+    QEMU run was made because the v2 worker remains intentionally fail-closed and live ISR delivery
+    still uses the old request bank. Before cutover, add explicit connection/line in-flight leases
+    and quarantine, initialize a lane-private KPCR context selector, retain both provider and
+    dependent lanes, and implement the nested provider-callback/import service exchange, actual-lock
+    ownership, line scan semantics, and generation-backed deferred DPC registry.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.

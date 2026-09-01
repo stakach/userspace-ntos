@@ -137,6 +137,7 @@ struct Mapping {
 
 struct Interrupt {
     interrupt_id: u64,
+    grant_generation: u64,
     resource_id: u64,
     owner: ResourceOwner,
     vector: u32,
@@ -150,6 +151,25 @@ struct Interrupt {
     service_routine_token: u64,
     service_context_token: u64,
     connected: bool,
+}
+
+impl Interrupt {
+    fn tokens(&self) -> InterruptTokens {
+        InterruptTokens {
+            interrupt_id: self.interrupt_id,
+            grant_generation: self.grant_generation,
+            service_routine_token: self.service_routine_token,
+            service_context_token: self.service_context_token,
+            actual_lock_token: self.actual_lock_token,
+            irql: self.irql,
+            synchronize_irql: self.synchronize_irql,
+            mode: self.mode,
+            share: self.share,
+            affinity: self.affinity,
+            floating_save: self.floating_save,
+            vector: self.vector,
+        }
+    }
 }
 
 /// Exact policy supplied by `IoConnectInterrupt` after driver-host pointer validation.
@@ -181,6 +201,7 @@ pub struct Granted {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InterruptTokens {
     pub interrupt_id: u64,
+    pub grant_generation: u64,
     pub service_routine_token: u64,
     pub service_context_token: u64,
     pub actual_lock_token: u64,
@@ -240,7 +261,6 @@ fn range_contains_range(
 }
 
 /// The canonical resource assignment store.
-#[derive(Default)]
 pub struct ResourceManager {
     memory: Vec<MemoryResource>,
     ports: Vec<PortResource>,
@@ -249,15 +269,27 @@ pub struct ResourceManager {
     connected: Vec<Interrupt>,
     next_mapping_id: u64,
     next_interrupt_id: u64,
+    next_interrupt_generation: u64,
+}
+
+impl Default for ResourceManager {
+    fn default() -> Self {
+        Self {
+            memory: Vec::new(),
+            ports: Vec::new(),
+            interrupts_res: Vec::new(),
+            mappings: Vec::new(),
+            connected: Vec::new(),
+            next_mapping_id: 1,
+            next_interrupt_id: 1,
+            next_interrupt_generation: 1,
+        }
+    }
 }
 
 impl ResourceManager {
     pub fn new() -> Self {
-        Self {
-            next_mapping_id: 1,
-            next_interrupt_id: 1,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// The static fixture for the `MmioInterruptTest` device (spec §7.3): a memory
@@ -1226,7 +1258,8 @@ impl ResourceManager {
     }
 
     /// `IoConnectInterrupt` (spec §9.3): connect an ISR to the interrupt resource
-    /// `resource_id` assigned to `owner`. Exclusive — a second connect fails.
+    /// `resource_id` assigned to `owner`. The returned tokens are the complete connection grant;
+    /// exclusive resources reject a second connect.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_interrupt(
         &mut self,
@@ -1234,7 +1267,7 @@ impl ResourceManager {
         resource_id: u64,
         service_routine_token: u64,
         service_context_token: u64,
-    ) -> Result<u64, HalError> {
+    ) -> Result<InterruptTokens, HalError> {
         let resource = self
             .interrupts_res
             .iter()
@@ -1261,7 +1294,7 @@ impl ResourceManager {
         owner: ResourceOwner,
         resource_id: u64,
         request: InterruptConnectionRequest,
-    ) -> Result<u64, HalError> {
+    ) -> Result<InterruptTokens, HalError> {
         let res = self
             .interrupts_res
             .iter()
@@ -1291,9 +1324,23 @@ impl ResourceManager {
             return Err(HalError::AlreadyConnected);
         }
         let interrupt_id = self.next_interrupt_id;
-        self.next_interrupt_id += 1;
-        self.connected.push(Interrupt {
+        let grant_generation = self.next_interrupt_generation;
+        let next_interrupt_id = interrupt_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(HalError::InsufficientResources)?;
+        let next_interrupt_generation = grant_generation
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(HalError::InsufficientResources)?;
+        self.connected
+            .try_reserve(1)
+            .map_err(|_| HalError::InsufficientResources)?;
+        self.next_interrupt_id = next_interrupt_id;
+        self.next_interrupt_generation = next_interrupt_generation;
+        let connection = Interrupt {
             interrupt_id,
+            grant_generation,
             resource_id,
             owner,
             vector: res.vector,
@@ -1307,8 +1354,10 @@ impl ResourceManager {
             service_routine_token: request.service_routine_token,
             service_context_token: request.service_context_token,
             connected: true,
-        });
-        Ok(interrupt_id)
+        };
+        let tokens = connection.tokens();
+        self.connected.push(connection);
+        Ok(tokens)
     }
 
     /// `IoDisconnectInterrupt` (spec §9.6).
@@ -1316,6 +1365,7 @@ impl ResourceManager {
         &mut self,
         owner: ResourceOwner,
         interrupt_id: u64,
+        grant_generation: u64,
     ) -> Result<(), HalError> {
         let c = self
             .connected
@@ -1324,6 +1374,9 @@ impl ResourceManager {
             .ok_or(HalError::StaleId)?;
         if c.owner != owner {
             return Err(HalError::WrongOwner);
+        }
+        if c.grant_generation != grant_generation {
+            return Err(HalError::StaleId);
         }
         c.connected = false;
         Ok(())
@@ -1336,70 +1389,42 @@ impl ResourceManager {
         self.connected
             .iter()
             .find(|c| c.connected && c.vector == vector)
-            .map(|c| InterruptTokens {
-                interrupt_id: c.interrupt_id,
-                service_routine_token: c.service_routine_token,
-                service_context_token: c.service_context_token,
-                actual_lock_token: c.actual_lock_token,
-                irql: c.irql,
-                synchronize_irql: c.synchronize_irql,
-                mode: c.mode,
-                share: c.share,
-                affinity: c.affinity,
-                floating_save: c.floating_save,
-                vector: c.vector,
-            })
+            .map(Interrupt::tokens)
     }
 
-    /// Resolve a live connection by canonical `interrupt_id`.
-    ///
-    /// Hardware delivery and test stimulus share this ownership lookup, but the resource manager
-    /// does not manufacture either one. The caller must already possess the interrupt authority.
-    pub fn connected_interrupt(&self, interrupt_id: u64) -> Option<InterruptTokens> {
-        self.connected
-            .iter()
-            .find(|c| c.connected && c.interrupt_id == interrupt_id)
-            .map(|c| InterruptTokens {
-                interrupt_id: c.interrupt_id,
-                service_routine_token: c.service_routine_token,
-                service_context_token: c.service_context_token,
-                actual_lock_token: c.actual_lock_token,
-                irql: c.irql,
-                synchronize_irql: c.synchronize_irql,
-                mode: c.mode,
-                share: c.share,
-                affinity: c.affinity,
-                floating_save: c.floating_save,
-                vector: c.vector,
-            })
-    }
-
-    /// Resolve a live connection together with the exact hardware route retained by its assigned
-    /// PnP resource. This is the production delivery lookup; it never creates an interrupt.
-    pub fn connected_interrupt_route(&self, interrupt_id: u64) -> Option<ConnectedInterrupt> {
+    /// Resolve an exact live interrupt grant together with its assigned hardware route.
+    /// Production delivery must carry the generation retained at connection time; a stale grant
+    /// can never bind to a later connection even if an ID allocation policy changes.
+    pub fn resolve_interrupt_grant(
+        &self,
+        owner: ResourceOwner,
+        interrupt_id: u64,
+        grant_generation: u64,
+    ) -> Result<ConnectedInterrupt, HalError> {
         let connection = self
             .connected
             .iter()
-            .find(|connection| connection.connected && connection.interrupt_id == interrupt_id)?;
-        let resource = self.interrupts_res.iter().find(|resource| {
-            !resource.revoked
-                && resource.resource_id == connection.resource_id
-                && resource.owner == connection.owner
-        })?;
-        Some(ConnectedInterrupt {
-            tokens: InterruptTokens {
-                interrupt_id: connection.interrupt_id,
-                service_routine_token: connection.service_routine_token,
-                service_context_token: connection.service_context_token,
-                actual_lock_token: connection.actual_lock_token,
-                irql: connection.irql,
-                synchronize_irql: connection.synchronize_irql,
-                mode: connection.mode,
-                share: connection.share,
-                affinity: connection.affinity,
-                floating_save: connection.floating_save,
-                vector: connection.vector,
-            },
+            .find(|connection| connection.connected && connection.interrupt_id == interrupt_id)
+            .ok_or(HalError::StaleId)?;
+        if connection.owner != owner {
+            return Err(HalError::WrongOwner);
+        }
+        if grant_generation == 0 || connection.grant_generation != grant_generation {
+            return Err(HalError::StaleId);
+        }
+        let resource = self
+            .interrupts_res
+            .iter()
+            .find(|resource| resource.resource_id == connection.resource_id)
+            .ok_or(HalError::NotAssigned)?;
+        if resource.revoked {
+            return Err(HalError::Revoked);
+        }
+        if resource.owner != owner {
+            return Err(HalError::WrongOwner);
+        }
+        Ok(ConnectedInterrupt {
+            tokens: connection.tokens(),
             resource_id: resource.resource_id,
             line: resource.line,
             translated_vector: resource.translated_vector,
@@ -1410,7 +1435,10 @@ impl ResourceManager {
 
     /// Fixture-only compatibility alias for the isolated HAL/component tests.
     pub fn inject_interrupt(&self, interrupt_id: u64) -> Option<InterruptTokens> {
-        self.connected_interrupt(interrupt_id)
+        self.connected
+            .iter()
+            .find(|connection| connection.connected && connection.interrupt_id == interrupt_id)
+            .map(Interrupt::tokens)
     }
 
     /// Device removal cleanup: revoke every assignment, mapping, and interrupt owned by one
@@ -1518,7 +1546,7 @@ mod tests {
     #[test]
     fn connect_disconnect_interrupt() {
         let (mut rm, owner) = rm();
-        let id = rm.connect_interrupt(owner, 200, 0xAA, 0xBB).unwrap();
+        let grant = rm.connect_interrupt(owner, 200, 0xAA, 0xBB).unwrap();
         // Exclusive: a second connect fails.
         assert_eq!(
             rm.connect_interrupt(owner, 200, 0, 0),
@@ -1529,12 +1557,17 @@ mod tests {
         assert_eq!(t.service_routine_token, 0xAA);
         assert_eq!(t.service_context_token, 0xBB);
         assert_eq!(t.irql, 5);
+        assert_ne!(t.grant_generation, 0);
 
-        rm.disconnect_interrupt(owner, id).unwrap();
+        rm.disconnect_interrupt(owner, grant.interrupt_id, grant.grant_generation)
+            .unwrap();
         // Injection after disconnect is dropped.
         assert!(rm.inject_vector(5).is_none());
         // Disconnect again (stale) fails.
-        assert_eq!(rm.disconnect_interrupt(owner, id), Err(HalError::StaleId));
+        assert_eq!(
+            rm.disconnect_interrupt(owner, grant.interrupt_id, grant.grant_generation),
+            Err(HalError::StaleId)
+        );
     }
 
     #[test]
@@ -1552,8 +1585,7 @@ mod tests {
             affinity: 1,
             floating_save: false,
         };
-        let id = rm.connect_interrupt_exact(owner, 200, request).unwrap();
-        let tokens = rm.connected_interrupt(id).unwrap();
+        let tokens = rm.connect_interrupt_exact(owner, 200, request).unwrap();
         assert_eq!(tokens.actual_lock_token, 0xCC);
         assert_eq!(tokens.synchronize_irql, 7);
         assert_eq!(tokens.mode, INT_MODE_LEVEL_SENSITIVE);
@@ -1786,9 +1818,13 @@ mod tests {
             nt_hal_abi::INT_MODE_LEVEL_SENSITIVE,
         );
 
-        assert!(rm.inject_interrupt(old_interrupt).is_none());
+        assert!(rm.inject_interrupt(old_interrupt.interrupt_id).is_none());
         assert_eq!(
-            rm.disconnect_interrupt(old_owner, old_interrupt),
+            rm.disconnect_interrupt(
+                old_owner,
+                old_interrupt.interrupt_id,
+                old_interrupt.grant_generation,
+            ),
             Err(HalError::StaleId)
         );
         assert_eq!(
@@ -1797,7 +1833,7 @@ mod tests {
         );
 
         let new_interrupt = rm.connect_interrupt(new_owner, 200, 0xCC, 0xDD).unwrap();
-        let tokens = rm.inject_interrupt(new_interrupt).unwrap();
+        let tokens = rm.inject_interrupt(new_interrupt.interrupt_id).unwrap();
         assert_eq!(tokens.vector, 7);
         assert_eq!(tokens.service_routine_token, 0xCC);
     }
@@ -1811,7 +1847,7 @@ mod tests {
         assert_eq!(rm.revoke_owner(owner), (1, 0, 1, 1, 1));
 
         assert!(!rm.mapping_valid(mapping.mapping_id));
-        assert!(rm.inject_interrupt(interrupt).is_none());
+        assert!(rm.inject_interrupt(interrupt.interrupt_id).is_none());
         assert_eq!(
             rm.map_io_space(owner, 0x1000_0000, 0x1000, 0),
             Err(HalError::Revoked)
@@ -1839,7 +1875,7 @@ mod tests {
         );
         assert_eq!(rm.revoke_owner(stale), (0, 0, 0, 0, 0));
         assert!(rm.mapping_valid(mapping.mapping_id));
-        assert!(rm.inject_interrupt(interrupt).is_some());
+        assert!(rm.inject_interrupt(interrupt.interrupt_id).is_some());
     }
 
     fn batch_memory(id: u64, raw: u64, translated: u64, length: u64) -> HalResourceDescriptor {
@@ -1884,10 +1920,12 @@ mod tests {
         descriptor.raw_start = 0;
         rm.replace_owner_assignments(owner, &[descriptor]).unwrap();
 
-        let interrupt_id = rm
+        let grant = rm
             .connect_interrupt(owner, descriptor.resource_id, 0xAA, 0xBB)
             .unwrap();
-        let route = rm.connected_interrupt_route(interrupt_id).unwrap();
+        let route = rm
+            .resolve_interrupt_grant(owner, grant.interrupt_id, grant.grant_generation)
+            .unwrap();
         assert_eq!(route.resource_id, descriptor.resource_id);
         assert_eq!(route.line, 0);
         assert_eq!(route.translated_vector, 0x51);
@@ -1897,8 +1935,81 @@ mod tests {
         assert_eq!(route.mode, INT_MODE_LEVEL_SENSITIVE);
         assert_eq!(route.share, SHARE_SHARED);
 
-        rm.disconnect_interrupt(owner, interrupt_id).unwrap();
-        assert!(rm.connected_interrupt_route(interrupt_id).is_none());
+        rm.disconnect_interrupt(owner, grant.interrupt_id, grant.grant_generation)
+            .unwrap();
+        assert_eq!(
+            rm.resolve_interrupt_grant(owner, grant.interrupt_id, grant.grant_generation),
+            Err(HalError::StaleId)
+        );
+    }
+
+    #[test]
+    fn interrupt_grants_reject_wrong_owner_and_generation() {
+        let (mut rm, owner) = rm();
+        let grant = rm.connect_interrupt(owner, 200, 0xAA, 0xBB).unwrap();
+        let other = ResourceOwner::new(2, 200, 20);
+
+        assert_eq!(
+            rm.resolve_interrupt_grant(other, grant.interrupt_id, grant.grant_generation),
+            Err(HalError::WrongOwner)
+        );
+        assert_eq!(
+            rm.resolve_interrupt_grant(owner, grant.interrupt_id, grant.grant_generation + 1),
+            Err(HalError::StaleId)
+        );
+        assert_eq!(
+            rm.disconnect_interrupt(other, grant.interrupt_id, grant.grant_generation),
+            Err(HalError::WrongOwner)
+        );
+        assert_eq!(
+            rm.disconnect_interrupt(owner, grant.interrupt_id, grant.grant_generation + 1),
+            Err(HalError::StaleId)
+        );
+        assert!(rm
+            .resolve_interrupt_grant(owner, grant.interrupt_id, grant.grant_generation)
+            .is_ok());
+    }
+
+    #[test]
+    fn reconnected_interrupt_gets_a_distinct_grant() {
+        let (mut rm, owner) = rm();
+        let first = rm.connect_interrupt(owner, 200, 0xAA, 0xBB).unwrap();
+        rm.disconnect_interrupt(owner, first.interrupt_id, first.grant_generation)
+            .unwrap();
+
+        let second = rm.connect_interrupt(owner, 200, 0xCC, 0xDD).unwrap();
+        assert_ne!(second.interrupt_id, first.interrupt_id);
+        assert_ne!(second.grant_generation, first.grant_generation);
+        assert_eq!(
+            rm.resolve_interrupt_grant(owner, first.interrupt_id, first.grant_generation),
+            Err(HalError::StaleId)
+        );
+        assert!(rm
+            .resolve_interrupt_grant(owner, second.interrupt_id, second.grant_generation)
+            .is_ok());
+    }
+
+    #[test]
+    fn interrupt_grant_counter_exhaustion_does_not_publish() {
+        let (mut rm, owner) = rm();
+        rm.next_interrupt_generation = u64::MAX;
+        assert_eq!(
+            rm.connect_interrupt(owner, 200, 0xAA, 0xBB),
+            Err(HalError::InsufficientResources)
+        );
+        assert!(rm.connected.is_empty());
+        assert_eq!(rm.next_interrupt_id, 1);
+        assert_eq!(rm.next_interrupt_generation, u64::MAX);
+
+        rm.next_interrupt_generation = 1;
+        rm.next_interrupt_id = u64::MAX;
+        assert_eq!(
+            rm.connect_interrupt(owner, 200, 0xAA, 0xBB),
+            Err(HalError::InsufficientResources)
+        );
+        assert!(rm.connected.is_empty());
+        assert_eq!(rm.next_interrupt_id, u64::MAX);
+        assert_eq!(rm.next_interrupt_generation, 1);
     }
 
     #[test]
@@ -1956,7 +2067,7 @@ mod tests {
         );
         assert_eq!(rm.query_resources(owner), before);
         assert!(rm.mapping_valid(mapping.mapping_id));
-        assert!(rm.inject_interrupt(interrupt).is_some());
+        assert!(rm.inject_interrupt(interrupt.interrupt_id).is_some());
     }
 
     #[test]
@@ -1975,6 +2086,6 @@ mod tests {
 
         assert_eq!(rm.replace_owner_assignments(owner, &descriptors), Ok(()));
         assert!(rm.mapping_valid(mapping.mapping_id));
-        assert!(rm.inject_interrupt(interrupt).is_some());
+        assert!(rm.inject_interrupt(interrupt.interrupt_id).is_some());
     }
 }

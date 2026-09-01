@@ -39,9 +39,10 @@ use nt_hosted_runtime::{
     plan_hosted_driver_image, plan_hosted_provider_import_binding,
     plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedOneShotCallbackError,
     HostedOneShotCallbackState, HostedOneShotCallbackToken, HostedProviderArgumentMarshal,
-    HostedProviderCallbackThunkPlan, HostedProviderDomainDescriptor, HostedProviderDomainError,
-    HostedProviderDomainStatus, HostedProviderExportCallPlan, HostedProviderExportMarshalPolicy,
-    HostedProviderExportResultSemantics, HostedProviderExportSideEffect,
+    HostedIrqGrantIdentity, HostedProviderCallbackThunkPlan, HostedProviderDomainDescriptor,
+    HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderExportCallPlan,
+    HostedProviderExportMarshalPolicy, HostedProviderExportResultSemantics,
+    HostedProviderExportSideEffect,
     HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
     HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
     HostedThunkLeaseRelease, HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry,
@@ -41965,10 +41966,38 @@ struct HostedDeviceResourceState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedIrqConnection {
     binding: HostedDeviceBinding,
-    interrupt_id: u64,
-    gsi: u32,
+    grant: HostedIrqGrantIdentity,
+    route: nt_resource_manager::ConnectedInterrupt,
+    interrupt_object: u64,
+    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
     lane_generation: u64,
     retiring: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HostedIrqConnectionAuthority {
+    grant: HostedIrqGrantIdentity,
+    route: nt_resource_manager::ConnectedInterrupt,
+    interrupt_object: u64,
+    pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
+}
+
+impl HostedIrqConnectionAuthority {
+    fn bind(
+        self,
+        binding: HostedDeviceBinding,
+        lane_generation: u64,
+    ) -> HostedIrqConnection {
+        HostedIrqConnection {
+            binding,
+            grant: self.grant,
+            route: self.route,
+            interrupt_object: self.interrupt_object,
+            pnp_context_lease: self.pnp_context_lease,
+            lane_generation,
+            retiring: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42092,6 +42121,10 @@ enum HostedInterruptConnectionRejection {
     TriggerMode = 9,
     Sharing = 10,
     RouteAuthority = 11,
+    InterruptId = 12,
+    InterruptObject = 13,
+    PnpContextLease = 14,
+    GrantIdentity = 15,
 }
 
 impl HostedInterruptConnectionRejection {
@@ -42108,6 +42141,10 @@ impl HostedInterruptConnectionRejection {
             Self::TriggerMode => b"trigger-mode",
             Self::Sharing => b"sharing",
             Self::RouteAuthority => b"route-authority",
+            Self::InterruptId => b"interrupt-id",
+            Self::InterruptObject => b"interrupt-object",
+            Self::PnpContextLease => b"pnp-context-lease",
+            Self::GrantIdentity => b"grant-identity",
         }
     }
 }
@@ -42128,6 +42165,9 @@ fn validate_hosted_interrupt_connection(
     }
     if state.interrupt_line != route.line {
         return Err(HostedInterruptConnectionRejection::Line);
+    }
+    if state.evidence.interrupt_id != route.tokens.interrupt_id {
+        return Err(HostedInterruptConnectionRejection::InterruptId);
     }
     if state.evidence.interrupt_vector != route.translated_vector {
         return Err(HostedInterruptConnectionRejection::Vector);
@@ -42151,6 +42191,36 @@ fn validate_hosted_interrupt_connection(
         return Err(HostedInterruptConnectionRejection::RouteAuthority);
     }
     Ok(())
+}
+
+fn retain_hosted_irq_connection_authority(
+    binding: HostedDeviceBinding,
+    state: HostedDeviceResourceState,
+    route: nt_resource_manager::ConnectedInterrupt,
+) -> Result<HostedIrqConnectionAuthority, HostedInterruptConnectionRejection> {
+    validate_hosted_interrupt_connection(binding, state, route)?;
+    if state.evidence.interrupt_object == 0 {
+        return Err(HostedInterruptConnectionRejection::InterruptObject);
+    }
+    let pnp_context_lease = state
+        .pnp_context_lease
+        .ok_or(HostedInterruptConnectionRejection::PnpContextLease)?;
+    if !unsafe { crate::hosted_pnp_context_lease_is_live(pnp_context_lease) } {
+        return Err(HostedInterruptConnectionRejection::PnpContextLease);
+    }
+    let grant = HostedIrqGrantIdentity::new(
+        binding.projection_domain.domain_id.raw(),
+        binding.projection_domain.cookie,
+        route.tokens.interrupt_id,
+        route.tokens.grant_generation,
+    )
+    .ok_or(HostedInterruptConnectionRejection::GrantIdentity)?;
+    Ok(HostedIrqConnectionAuthority {
+        grant,
+        route,
+        interrupt_object: state.evidence.interrupt_object,
+        pnp_context_lease,
+    })
 }
 
 unsafe fn trace_hosted_interrupt_broker_rejection(
@@ -45542,7 +45612,7 @@ unsafe fn clear_hosted_irq_orphan_lines_for_instance(
                     && hosted_irq_connections().is_none_or(|connections| {
                         connections
                             .iter()
-                            .all(|connection| connection.gsi != line.gsi)
+                            .all(|connection| connection.route.line != line.gsi)
                     })
             })
         }) else {
@@ -45558,9 +45628,21 @@ unsafe fn clear_hosted_irq_orphan_lines_for_instance(
     }
 }
 
+unsafe fn hosted_irq_connection_line_live(connection: HostedIrqConnection) -> bool {
+    hosted_irq_lines().is_some_and(|lines| {
+        lines.iter().any(|line| {
+            line.gsi == connection.route.line
+                && line.vector == connection.route.translated_vector
+                && line.handler_cap != 0
+                && line.notification_cap != 0
+                && !line.retiring
+        })
+    })
+}
+
 unsafe fn install_hosted_irq_connection(
     binding: HostedDeviceBinding,
-    interrupt_id: u64,
+    tokens: nt_resource_manager::InterruptTokens,
 ) -> Result<(), nt_status::NtStatus> {
     if clear_hosted_irq_orphan_lines_for_instance(
         binding.projection_instance,
@@ -45573,13 +45655,30 @@ unsafe fn install_hosted_irq_connection(
         connections
             .iter()
             .copied()
-            .find(|connection| connection.interrupt_id == interrupt_id)
+            .find(|connection| connection.route.tokens.interrupt_id == tokens.interrupt_id)
     }) {
         if existing.binding != binding {
             return Err(nt_status::NtStatus::ACCESS_DENIED);
         }
-        if existing.retiring {
+        if existing.retiring || existing.route.tokens != tokens {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
+        }
+        let route = hosted_resource_manager_mut()
+            .resolve_interrupt_grant(
+                hosted_resource_owner(binding),
+                existing.route.tokens.interrupt_id,
+                existing.grant.grant_generation,
+            )
+            .map_err(hosted_hal_status)?;
+        let lease_current = hosted_device_resource_state_by_device_id(binding.device_id)
+            .is_some_and(|state| state.pnp_context_lease == Some(existing.pnp_context_lease));
+        if route != existing.route
+            || !lease_current
+            || !crate::hosted_pnp_context_lease_is_live(existing.pnp_context_lease)
+            || !hosted_irq_projection_matches(existing)
+            || !hosted_irq_connection_line_live(existing)
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         let lane_live = hosted_irq_lanes().is_some_and(|lanes| {
             lanes.iter().any(|lane| {
@@ -45596,18 +45695,27 @@ unsafe fn install_hosted_irq_connection(
         };
     }
     let route = hosted_resource_manager_mut()
-        .connected_interrupt_route(interrupt_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let state = hosted_device_resource_state_by_device_id(binding.device_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if let Err(rejection) = validate_hosted_interrupt_connection(binding, state, route) {
-        trace_hosted_interrupt_broker_rejection(
-            rejection.name(),
-            Some(binding),
-            Some(binding.projection_instance),
-        );
+        .resolve_interrupt_grant(
+            hosted_resource_owner(binding),
+            tokens.interrupt_id,
+            tokens.grant_generation,
+        )
+        .map_err(hosted_hal_status)?;
+    if route.tokens != tokens {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let state = hosted_device_resource_state_by_device_id(binding.device_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let authority = retain_hosted_irq_connection_authority(binding, state, route).map_err(
+        |rejection| {
+            trace_hosted_interrupt_broker_rejection(
+                rejection.name(),
+                Some(binding),
+                Some(binding.projection_instance),
+            );
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        },
+    )?;
     let hardware_route = crate::resolve_platform_ioapic_gsi(route.line)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     if let Some(existing) = hosted_irq_lines().and_then(|lines| {
@@ -45634,13 +45742,7 @@ unsafe fn install_hosted_irq_connection(
             binding.projection_instance,
             binding.projection_domain,
         )?;
-        hosted_irq_connections_mut().push(HostedIrqConnection {
-            binding,
-            interrupt_id,
-            gsi: route.line,
-            lane_generation,
-            retiring: false,
-        });
+        hosted_irq_connections_mut().push(authority.bind(binding, lane_generation));
         return Ok(());
     }
 
@@ -45664,6 +45766,7 @@ unsafe fn install_hosted_irq_connection(
         binding.projection_instance,
         binding.projection_domain,
     )?;
+    let connection = authority.bind(binding, lane_generation);
 
     let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << event_bit);
     let notification_cap = match crate::mint_executive_event_badge(badge) {
@@ -45735,16 +45838,10 @@ unsafe fn install_hosted_irq_connection(
         notification_cap,
         retiring: false,
     });
-    hosted_irq_connections_mut().push(HostedIrqConnection {
-        binding,
-        interrupt_id,
-        gsi: route.line,
-        lane_generation,
-        retiring: false,
-    });
+    hosted_irq_connections_mut().push(connection);
     if let Err(status) = crate::irq_handler_set_notification_checked(handler_cap, notification_cap)
     {
-        return match retire_hosted_irq_connection(binding, interrupt_id) {
+        return match retire_hosted_irq_connection(binding, tokens.interrupt_id) {
             Ok(()) => Err(status),
             Err(rollback_status) => Err(rollback_status),
         };
@@ -45756,29 +45853,39 @@ unsafe fn retire_hosted_irq_connection(
     binding: HostedDeviceBinding,
     interrupt_id: u64,
 ) -> Result<(), nt_status::NtStatus> {
-    let connection = hosted_irq_connections()
+    let connection_index = hosted_irq_connections()
         .and_then(|connections| {
             connections
                 .iter()
-                .copied()
-                .find(|connection| connection.interrupt_id == interrupt_id)
+                .position(|connection| connection.route.tokens.interrupt_id == interrupt_id)
         })
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let connection = hosted_irq_connections_mut()[connection_index];
     if connection.binding != binding {
         return Err(nt_status::NtStatus::ACCESS_DENIED);
     }
-    let last_on_line = !connection.retiring && hosted_irq_connections().is_none_or(|connections| {
-        connections
-            .iter()
-            .filter(|candidate| candidate.gsi == connection.gsi && !candidate.retiring)
-            .count()
-            == 1
+    match hosted_resource_manager_mut().resolve_interrupt_grant(
+        hosted_resource_owner(binding),
+        interrupt_id,
+        connection.grant.grant_generation,
+    ) {
+        Ok(route) if route == connection.route => {}
+        Ok(_) => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+        Err(HalError::StaleId | HalError::Revoked | HalError::NotAssigned) => {}
+        Err(error) => return Err(hosted_hal_status(error)),
+    }
+    let last_on_line = hosted_irq_connections().is_none_or(|connections| {
+        connections.iter().enumerate().all(|(index, candidate)| {
+            index == connection_index
+                || candidate.route.line != connection.route.line
+                || candidate.retiring
+        })
     });
     let line_index = if last_on_line {
         hosted_irq_lines().and_then(|lines| {
             lines
                 .iter()
-                .position(|line| line.gsi == connection.gsi)
+                .position(|line| line.gsi == connection.route.line)
         })
     } else {
         None
@@ -45786,29 +45893,23 @@ unsafe fn retire_hosted_irq_connection(
     if !connection.retiring && last_on_line && line_index.is_none() {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    hosted_irq_connections_mut()[connection_index].retiring = true;
     if let Some(index) = line_index {
         if release_hosted_irq_line_caps(&mut hosted_irq_lines_mut()[index]) != 0 {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
     }
-    if hosted_resource_manager_mut()
-        .connected_interrupt(interrupt_id)
-        .is_some()
-    {
-        hosted_resource_manager_mut()
-            .disconnect_interrupt(hosted_resource_owner(binding), interrupt_id)
-            .map_err(hosted_hal_status)?;
+    match hosted_resource_manager_mut().disconnect_interrupt(
+        hosted_resource_owner(binding),
+        interrupt_id,
+        connection.grant.grant_generation,
+    ) {
+        Ok(()) | Err(HalError::StaleId) => {}
+        Err(error) => return Err(hosted_hal_status(error)),
     }
     if let Some(index) = line_index {
         remove_released_hosted_irq_line(index, true);
     }
-    let Some(connection_index) = hosted_irq_connections_mut()
-        .iter()
-        .position(|candidate| candidate.interrupt_id == interrupt_id)
-    else {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    };
-    hosted_irq_connections_mut()[connection_index].retiring = true;
     retire_hosted_irq_lane_if_unreferenced(
         binding.projection_instance,
         binding.projection_domain,
@@ -45825,7 +45926,7 @@ unsafe fn retire_hosted_irq_connections_for_binding(
             connections
                 .iter()
                 .find(|connection| connection.binding == binding)
-                .map(|connection| connection.interrupt_id)
+                .map(|connection| connection.route.tokens.interrupt_id)
         }) else {
             return retire_hosted_irq_lane_if_unreferenced(
                 binding.projection_instance,
@@ -45834,6 +45935,43 @@ unsafe fn retire_hosted_irq_connections_for_binding(
         };
         retire_hosted_irq_connection(binding, interrupt_id)?;
     }
+}
+
+unsafe fn hosted_irq_projection_matches(connection: HostedIrqConnection) -> bool {
+    let Some(projection_inst) = instance(connection.binding.projection_instance).filter(|inst| {
+        instance_domain_identity(*inst) == Some(connection.binding.projection_domain)
+    }) else {
+        return false;
+    };
+    let Some(projection) = hosted_pool_allocation_exec_va(
+        projection_inst.exec_pool_va,
+        connection.interrupt_object,
+        HOSTED_KINTERRUPT_SIZE,
+    ) else {
+        return false;
+    };
+    read_unaligned((projection + HOSTED_KINTERRUPT_MAGIC_OFF) as *const u64)
+        == HOSTED_KINTERRUPT_MAGIC
+        && read_unaligned((projection + HOSTED_KINTERRUPT_ROUTINE) as *const u64)
+            == connection.route.tokens.service_routine_token
+        && read_unaligned((projection + HOSTED_KINTERRUPT_CONTEXT) as *const u64)
+            == connection.route.tokens.service_context_token
+        && read_unaligned((projection + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64)
+            == connection.route.tokens.actual_lock_token
+        && read_unaligned((projection + HOSTED_KINTERRUPT_VECTOR) as *const u32)
+            == connection.route.tokens.vector
+        && read_unaligned((projection + HOSTED_KINTERRUPT_IRQL) as *const u8)
+            == connection.route.tokens.irql
+        && read_unaligned((projection + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8)
+            == connection.route.tokens.synchronize_irql
+        && read_unaligned((projection + HOSTED_KINTERRUPT_MODE) as *const u8)
+            == connection.route.tokens.mode
+        && read_unaligned((projection + HOSTED_KINTERRUPT_SHARE) as *const u8) as u16
+            == connection.route.tokens.share
+        && read_unaligned((projection + HOSTED_KINTERRUPT_AFFINITY) as *const u64)
+            == connection.route.tokens.affinity
+        && (read_unaligned((projection + HOSTED_KINTERRUPT_FLOATING_SAVE) as *const u8) != 0)
+            == connection.route.tokens.floating_save
 }
 
 unsafe fn dispatch_hosted_irq_connection(
@@ -45845,23 +45983,47 @@ unsafe fn dispatch_hosted_irq_connection(
     let binding = hosted_device_binding_by_device_id(connection.binding.device_id)
         .filter(|binding| *binding == connection.binding)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let expected_grant = HostedIrqGrantIdentity::new(
+        binding.projection_domain.domain_id.raw(),
+        binding.projection_domain.cookie,
+        connection.route.tokens.interrupt_id,
+        connection.route.tokens.grant_generation,
+    )
+    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if connection.grant != expected_grant {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
     let route = hosted_resource_manager_mut()
-        .connected_interrupt_route(connection.interrupt_id)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if route.line != connection.gsi {
+        .resolve_interrupt_grant(
+            hosted_resource_owner(binding),
+            connection.route.tokens.interrupt_id,
+            connection.grant.grant_generation,
+        )
+        .map_err(hosted_hal_status)?;
+    let lease_current = hosted_device_resource_state_by_device_id(binding.device_id)
+        .is_some_and(|state| state.pnp_context_lease == Some(connection.pnp_context_lease));
+    if route != connection.route
+        || !lease_current
+        || !crate::hosted_pnp_context_lease_is_live(connection.pnp_context_lease)
+        || !hosted_irq_projection_matches(connection)
+        || !hosted_irq_connection_line_live(connection)
+    {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let (_, inst) = instance_by_driver_id(binding.driver_id)
         .filter(|(_, inst)| inst.ready)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let sh = inst.exec_shared_va;
-    let state = restore_hosted_device_resource_state(binding, sh, true)?;
-    if state.interrupt_line != route.line
-        || state.evidence.interrupt_id != route.tokens.interrupt_id
-        || state.evidence.interrupt_vector != route.tokens.vector
-        || state.evidence.interrupt_routine != route.tokens.service_routine_token
-        || state.evidence.interrupt_context != route.tokens.service_context_token
-    {
+    restore_hosted_device_resource_state(binding, sh, true)?;
+    let lane_live = hosted_irq_lanes().is_some_and(|lanes| {
+        lanes.iter().any(|lane| {
+            lane.projection_instance == binding.projection_instance
+                && lane.domain == binding.projection_domain
+                && lane.identity.lane_generation == connection.lane_generation
+                && lane.state == HostedIrqLaneState::Ready
+        })
+    });
+    if !lane_live {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let mut output = [];
@@ -45926,7 +46088,7 @@ unsafe fn service_hosted_irq_event(
         connections.extend(
             live.iter()
                 .copied()
-                .filter(|connection| connection.gsi == line.gsi),
+                .filter(|connection| connection.route.line == line.gsi),
         );
     }
     if connections
@@ -48050,7 +48212,9 @@ pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvi
             continue;
         };
         let evidence = state.evidence;
-        if evidence.interrupt_id != connection.interrupt_id || !evidence.interrupt_connected() {
+        if evidence.interrupt_id != connection.route.tokens.interrupt_id
+            || !evidence.interrupt_connected()
+        {
             continue;
         }
         let delivered = evidence.interrupt_delivered();
@@ -50147,19 +50311,13 @@ pub(crate) fn service_hosted_driver_interrupt(
         },
         HOSTED_INTERRUPT_OP_DISCONNECT => unsafe {
             let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
-            let retirement_pending = hosted_irq_connections().is_some_and(|connections| {
+            let connection_present = hosted_irq_connections().is_some_and(|connections| {
                 connections.iter().any(|connection| {
-                    connection.interrupt_id == interrupt_id
+                    connection.route.tokens.interrupt_id == interrupt_id
                         && connection.binding == binding
-                        && connection.retiring
                 })
             });
-            if interrupt_id == 0
-                || (!retirement_pending
-                    && hosted_resource_manager_mut()
-                        .connected_interrupt(interrupt_id)
-                        .is_none())
-            {
+            if interrupt_id == 0 || !connection_present {
                 return (STATUS_INVALID_DEVICE_REQUEST, 0);
             }
             if let Err(status) = retire_hosted_irq_connection(binding, interrupt_id) {
@@ -53333,7 +53491,9 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             connections
                 .iter()
                 .copied()
-                .find(|connection| connection.interrupt_id == existing && connection.retiring)
+                .find(|connection| {
+                    connection.route.tokens.interrupt_id == existing && connection.retiring
+                })
         }) {
             if retiring.binding != binding {
                 return Err(nt_status::NtStatus::ACCESS_DENIED);
@@ -53345,8 +53505,17 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     }
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     if existing != 0 {
-        let tokens = hosted_resource_manager_mut()
-            .connected_interrupt(existing)
+        let tokens = hosted_irq_connections()
+            .and_then(|connections| {
+                connections
+                    .iter()
+                    .find(|connection| {
+                        connection.binding == binding
+                            && !connection.retiring
+                            && connection.route.tokens.interrupt_id == existing
+                    })
+                    .map(|connection| connection.route.tokens)
+            })
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         if tokens.vector != interrupt_vector
             || tokens.service_routine_token != service_routine
@@ -53361,36 +53530,37 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
         refresh_hosted_device_resource_state(binding, sh);
-        return install_hosted_irq_connection(binding, existing);
+        return install_hosted_irq_connection(binding, tokens);
     }
 
     let interrupt_id = hosted_interrupt_resource_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let owner = hosted_resource_owner(binding);
-    let connected = hosted_resource_manager_mut()
+    let connected_tokens = hosted_resource_manager_mut()
         .connect_interrupt_exact(owner, interrupt_id, request)
         .map_err(hosted_hal_status)?;
+    let connected = connected_tokens.interrupt_id;
     if connected == 0 {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, connected);
     refresh_hosted_device_resource_state(binding, sh);
-    if let Err(status) = install_hosted_irq_connection(binding, connected) {
+    if let Err(status) = install_hosted_irq_connection(binding, connected_tokens) {
         if hosted_irq_connections().is_some_and(|connections| {
             connections
                 .iter()
-                .any(|connection| connection.interrupt_id == connected)
+                .any(|connection| connection.route.tokens.interrupt_id == connected)
         }) {
             refresh_hosted_device_resource_state(binding, sh);
             return Err(status);
         }
-        if hosted_resource_manager_mut()
-            .connected_interrupt(connected)
-            .is_some()
-        {
-            hosted_resource_manager_mut()
-                .disconnect_interrupt(hosted_resource_owner(binding), connected)
-                .map_err(hosted_hal_status)?;
+        match hosted_resource_manager_mut().disconnect_interrupt(
+            hosted_resource_owner(binding),
+            connected,
+            connected_tokens.grant_generation,
+        ) {
+            Ok(()) | Err(HalError::StaleId) => {}
+            Err(error) => return Err(hosted_hal_status(error)),
         }
         write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
         refresh_hosted_device_resource_state(binding, sh);

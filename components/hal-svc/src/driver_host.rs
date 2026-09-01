@@ -215,7 +215,7 @@ extern "win64" fn ntos_io_connect_interrupt(
 ) -> i32 {
     // SAFETY: single-threaded; fresh state borrows.
     unsafe {
-        let (status, interrupt_id, _) = hal_call(
+        let (status, interrupt_id, grant_generation) = hal_call(
             HAL_OP_CONNECT_INTERRUPT,
             INT_RESOURCE_ID,
             service_routine,
@@ -225,6 +225,7 @@ extern "win64" fn ntos_io_connect_interrupt(
         if status == 0 {
             let proj = alloc_obj();
             core::ptr::write_unaligned(proj as *mut u64, interrupt_id);
+            core::ptr::write_unaligned((proj + 8) as *mut u64, grant_generation);
             st().interrupt_id = interrupt_id;
             st().interrupt_projection = proj;
             st().isr_routine = service_routine;
@@ -243,10 +244,17 @@ extern "win64" fn ntos_io_disconnect_interrupt(pkinterrupt: u64) {
     if pkinterrupt == 0 {
         return;
     }
-    // SAFETY: `pkinterrupt` is a projection we allocated (interrupt_id@0).
+    // SAFETY: `pkinterrupt` is a projection we allocated (interrupt_id@0, generation@8).
     unsafe {
         let interrupt_id = core::ptr::read_unaligned(pkinterrupt as *const u64);
-        let _ = hal_call(HAL_OP_DISCONNECT_INTERRUPT, interrupt_id, 0, 0, 0);
+        let grant_generation = core::ptr::read_unaligned((pkinterrupt + 8) as *const u64);
+        let _ = hal_call(
+            HAL_OP_DISCONNECT_INTERRUPT,
+            interrupt_id,
+            grant_generation,
+            0,
+            0,
+        );
         st().interrupt_id = 0;
     }
 }

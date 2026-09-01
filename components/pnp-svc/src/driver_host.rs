@@ -273,9 +273,14 @@ extern "win64" fn ntos_io_connect_interrupt(
             .rm
             .connect_interrupt(owner(), INT_RESOURCE_ID, service_routine, service_context)
         {
-            Ok(interrupt_id) => {
+            Ok(tokens) => {
+                let interrupt_id = tokens.interrupt_id;
                 let proj = alloc_blob();
                 core::ptr::write_unaligned(proj as *mut u64, interrupt_id);
+                core::ptr::write_unaligned(
+                    (proj + 8) as *mut u64,
+                    tokens.grant_generation,
+                );
                 st().interrupt_id = interrupt_id;
                 st().interrupt_projection = proj;
                 st().isr_routine = service_routine;
@@ -294,10 +299,13 @@ extern "win64" fn ntos_io_disconnect_interrupt(pkinterrupt: u64) {
     if pkinterrupt == 0 {
         return;
     }
-    // SAFETY: `pkinterrupt` is a projection we allocated (interrupt_id@0).
+    // SAFETY: `pkinterrupt` is a projection we allocated (interrupt_id@0, generation@8).
     unsafe {
         let interrupt_id = core::ptr::read_unaligned(pkinterrupt as *const u64);
-        let _ = st().rm.disconnect_interrupt(owner(), interrupt_id);
+        let grant_generation = core::ptr::read_unaligned((pkinterrupt + 8) as *const u64);
+        let _ = st()
+            .rm
+            .disconnect_interrupt(owner(), interrupt_id, grant_generation);
         st().interrupt_id = 0;
     }
 }

@@ -64,12 +64,12 @@ unsafe fn serve(sqe: &SurtSqe) -> (i32, u64, u64) {
         x if x == HAL_OP_CONNECT_INTERRUPT => {
             // arg0 = resource_id, arg1 = routine_token, arg2 = context_token.
             match rm().connect_interrupt(owner(), sqe.arg0, sqe.arg1, sqe.arg2) {
-                Ok(interrupt_id) => (ok, interrupt_id, 0),
+                Ok(tokens) => (ok, tokens.interrupt_id, tokens.grant_generation),
                 Err(_) => (fail, 0, 0),
             }
         }
         x if x == HAL_OP_DISCONNECT_INTERRUPT => {
-            match rm().disconnect_interrupt(owner(), sqe.arg0) {
+            match rm().disconnect_interrupt(owner(), sqe.arg0, sqe.arg1) {
                 Ok(()) => (ok, 0, 0),
                 Err(_) => (fail, 0, 0),
             }

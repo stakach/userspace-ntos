@@ -603,6 +603,13 @@ pub(crate) unsafe fn hosted_pnp_context_description<'a>(
         .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)
 }
 
+pub(crate) unsafe fn hosted_pnp_context_lease_is_live(lease: ContextLeaseIdentity) -> bool {
+    hosted_pnp_context_authority_mut()
+        .registry
+        .description_by_identity(lease)
+        .is_ok()
+}
+
 pub(crate) unsafe fn release_hosted_pnp_context_lease(
     lease: ContextLeaseIdentity,
 ) -> Result<(), nt_status::NtStatus> {
