@@ -3,12 +3,12 @@
 //! (a host tool); the nt-hive-core *library* stays `no_std` — cargo builds bins only for the
 //! host, and path-dep builds (the executive) don't build bins, so this is invisible there.
 
-use nt_config_manager::{
-    encode_multi_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_FILE_SYSTEM_DRIVER,
-    SERVICE_DEMAND_START, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
-};
 #[cfg(test)]
 use nt_config_manager::SERVICE_BOOT_START;
+use nt_config_manager::{
+    encode_multi_sz, ConfigManager, SERVICE_AUTO_START, SERVICE_DEMAND_START,
+    SERVICE_FILE_SYSTEM_DRIVER, SERVICE_KERNEL_DRIVER, SERVICE_SYSTEM_START,
+};
 #[cfg(test)]
 use nt_hive_core::reactos_network_ipv4_defaults_for_interface;
 use nt_hive_core::{
@@ -95,15 +95,6 @@ enum GeneratedNetworkAdapterKind {
     E1000,
     Dc21x4,
 }
-
-const GENERATED_SERVICE_GROUP_ORDER: &[&str] = &[
-    "Video",
-    "File System",
-    "NDIS Wrapper",
-    "PNP_TDI",
-    "NDIS",
-    "TDI",
-];
 
 #[derive(Debug)]
 struct InfEntry {
@@ -252,16 +243,6 @@ impl ReactOsSetupSeedTarget for GeneratedHiveSetupSeedTarget<'_> {
             .and_then(|key| self.hive.query_value(key, name))
             .map(|(value_type, data)| (value_type, data.to_vec()))
     }
-}
-
-fn install_service_group_order(hive: &mut Hive) {
-    let key = hive.create_key(r"ControlSet001\Control\ServiceGroupOrder");
-    hive.set_value(
-        key,
-        "List",
-        RegistryValueType::MultiSz,
-        encode_multi_sz(GENERATED_SERVICE_GROUP_ORDER),
-    );
 }
 
 fn generated_pci_request(adapter_index: usize) -> u8 {
@@ -1141,8 +1122,6 @@ fn build_hive_with_configuration(
     let key = hive.create_key(r"ControlSet001\Services\NtosTest");
     hive.set_dword(key, "Answer", 42);
 
-    install_service_group_order(&mut hive);
-
     // Driver-launch proof fixture. The executive must discover this through service metadata just
     // like a boot/system driver, not through a compiled-in driver list.
     let key = hive.create_key(r"ControlSet001\Services\IrpFsdTest");
@@ -1235,7 +1214,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nt_hive_core::decode_image;
+    use nt_hive_core::{compose_system_hive_overlay, decode_image};
+
+    const TEST_INSTALLED_SERVICE_GROUP_ORDER: &[&str] = &[
+        "Video",
+        "File System",
+        "PlugPlay",
+        "NDIS Wrapper",
+        "PNP_TDI",
+        "NDIS",
+        "TDI",
+    ];
 
     #[test]
     fn generated_hive_declares_its_source_control_set() {
@@ -1529,7 +1518,6 @@ mod tests {
             GeneratedNetworkAdapterKind::Dc21x4,
         ]);
         let mut hive = Hive::new(HiveKind::System);
-        install_service_group_order(&mut hive);
         install_generated_network_adapters(&mut hive, &adapters, adapters.len());
         seed_generated_network_setup(&mut hive);
 
@@ -1631,16 +1619,9 @@ mod tests {
     #[test]
     fn generated_hive_declares_network_stack_driver_services() {
         let hive = build_hive();
-        let group_key = hive
+        assert!(hive
             .open_key(r"ControlSet001\Control\ServiceGroupOrder")
-            .expect("service group order");
-        assert_eq!(
-            hive.query_value(group_key, "List"),
-            Some((
-                RegistryValueType::MultiSz,
-                encode_multi_sz(GENERATED_SERVICE_GROUP_ORDER).as_slice()
-            ))
-        );
+            .is_none());
 
         let ndis = hive
             .open_key(r"ControlSet001\Services\Ndis")
@@ -1758,7 +1739,14 @@ mod tests {
 
     #[test]
     fn generated_hive_orders_network_drivers_through_config_manager() {
-        let hive = build_hive();
+        let mut hive = build_hive();
+        let group_key = hive.create_key(r"ControlSet001\Control\ServiceGroupOrder");
+        hive.set_value(
+            group_key,
+            "List",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(TEST_INSTALLED_SERVICE_GROUP_ORDER),
+        );
         let mut cm = nt_config_manager::ConfigManager::new();
         assert_ne!(
             nt_hive_core::import_control_set_services_into_config_manager(
@@ -1794,10 +1782,42 @@ mod tests {
     }
 
     #[test]
+    fn generated_overlay_preserves_installed_service_group_order() {
+        let generated = build_hive();
+        assert!(generated
+            .open_key(r"ControlSet001\Control\ServiceGroupOrder")
+            .is_none());
+
+        let mut installed = Hive::new(HiveKind::System);
+        let select = installed.create_key("Select");
+        installed.set_dword(select, "Current", 2);
+        let group_key = installed.create_key(r"ControlSet002\Control\ServiceGroupOrder");
+        installed.set_value(
+            group_key,
+            "List",
+            RegistryValueType::MultiSz,
+            encode_multi_sz(TEST_INSTALLED_SERVICE_GROUP_ORDER),
+        );
+        installed.finish_clean_import();
+
+        let composed = compose_system_hive_overlay(&installed, &generated)
+            .expect("compose generated SYSTEM overlay");
+        let group_key = composed
+            .open_key(r"ControlSet002\Control\ServiceGroupOrder")
+            .expect("installed service group order retained");
+        assert_eq!(
+            composed.query_value(group_key, "List"),
+            Some((
+                RegistryValueType::MultiSz,
+                encode_multi_sz(TEST_INSTALLED_SERVICE_GROUP_ORDER).as_slice()
+            ))
+        );
+    }
+
+    #[test]
     fn generated_network_setup_derives_multiple_adapter_bindings() {
         let adapters = generated_e1000_adapters(2);
         let mut hive = Hive::new(HiveKind::System);
-        install_service_group_order(&mut hive);
         install_generated_network_adapters(&mut hive, &adapters, adapters.len());
         seed_generated_network_setup(&mut hive);
 

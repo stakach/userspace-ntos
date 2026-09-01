@@ -21412,6 +21412,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     verifier accepts a synthetic exact lifecycle, `git diff --check` passes, and the freestanding
     executive check remains green at the established 209-warning baseline.
 
+    B3 installed service-order authority checkpoint (2026-09-01, implementation and host
+    validation green): the generated SYSTEM overlay no longer creates or replaces
+    `Control\\ServiceGroupOrder\\List`. Its six-entry list was an old standalone-hive fixture that
+    overlaid the installed ReactOS list and silently discarded groups such as `PlugPlay`. Generated
+    services retain their registry `Group` metadata, while the installed or persisted SYSTEM hive
+    remains the sole production ordering authority. The ordering fixture now exists only inside the
+    focused Config Manager test. A composition regression rebases the generated `ControlSet001`
+    overlay onto an installed `ControlSet002` and proves the installed multi-string is preserved
+    byte-for-byte. Full `nt-hive-core` validation passes 108/108 tests and `git diff --check` is
+    clean. Review adjustment: implement ensure-load for a live arrival whose registry-selected
+    driver is not resident, then carry exact action identity into that lifecycle's terminal proof
+    before rerunning the serialized live-device-action boot.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
