@@ -21899,6 +21899,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     proof, audit whether normal provider pool frees are reclaiming; then build the dedicated real-
     provider GetClassInfo integration client.
 
+    ASID-publication correction (2026-09-01, microkernel specs green): the first acceptance attempt
+    with final-cap derivation enforced, `.tmp/run-desktop-20260901-221627.log`, stopped at the early
+    SEC_IMAGE proof when copying its PML4 correctly returned `IllegalOperation`. rust-micro had
+    assigned a nonzero ASID while preserving the fresh PML4 cap's old `mapped=false` bit. Upstream
+    ASID assignment publishes a mapped vspace-root cap. rust-micro commit `67efbc7` now sets
+    `mapped=true` atomically with the assigned ASID. The focused spec derives a second PML4 alias,
+    verifies both preserve the exact ASID mapping, proves deletion of one alias retains publication,
+    and proves final alias deletion removes it. The complete kernel spec suite passes. The failed
+    desktop attempt was terminated at the deterministic SEC_IMAGE spawn barrier; it was not allowed
+    to consume the one-hour ceiling. Repeat the same serialized churn acceptance with `67efbc7`.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
