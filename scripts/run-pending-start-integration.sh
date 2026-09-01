@@ -30,20 +30,6 @@ require_fixed() {
   fi
 }
 
-require_line_parts() {
-  local prefix="$1"
-  local suffix="$2"
-  local description="$3"
-  local line
-  while IFS= read -r line; do
-    if [[ "$line" == *"$prefix"*"$suffix"* ]]; then
-      return 0
-    fi
-  done < "$RUN_LOG"
-  printf 'pending-start integration failure: %s\nlog: %s\n' "$description" "$RUN_LOG" >&2
-  exit 1
-}
-
 require_log \
   '\[native-driver-load\] NtLoadDriver calls/terminal/replied=1/1/1 .*reply-failures/protocol-errors/pending=0/0/0 .*success/already-loaded/failed=1/0/0' \
   'SCM did not receive one exact successful load-only NtLoadDriver reply'
@@ -51,16 +37,26 @@ require_log \
 for instance in 0001 0002; do
   devnode="ROOT\\USERSPACE_NTOS_PENDING_START\\$instance"
   require_fixed \
-    "[driver-launch] config PnP StartDevice pending service=PendingStartTest devnode=$devnode" \
-    "fixture devnode $instance did not return real STATUS_PENDING"
-  require_fixed \
-    "[driver-launch] config PnP StartDevice service=PendingStartTest devnode=$devnode status=0x00000000" \
-    "fixture devnode $instance did not complete with STATUS_SUCCESS"
-  require_line_parts \
-    "[driver-launch] config PnP evidence service=PendingStartTest devnode=$devnode " \
-    'dpc=1' \
-    "fixture devnode $instance did not complete through its timer/DPC"
+    "[driver-launch] config PnP AddDevice service=PendingStartTest devnode=$devnode" \
+    "fixture devnode $instance was not presented to the generic PnP path"
 done
+
+proof_rows=0
+while IFS= read -r line; do
+  if [[ "$line" == *'[pnp-pending-proof] irp='* \
+    && "$line" == *' status=0x00000000 stages=0x0000007f irp-retired=1 observed=1'* ]]; then
+    proof_rows=$((proof_rows + 1))
+  fi
+done < "$RUN_LOG"
+if [[ "$proof_rows" -ne 2 ]]; then
+  printf 'pending-start integration failure: expected two exact successful generic proof rows, got %s\nlog: %s\n' \
+    "$proof_rows" "$RUN_LOG" >&2
+  exit 1
+fi
+
+require_fixed \
+  '[pnp-pending-proof] summary rows/success/failed/incomplete=2/2/0/0 active/retained-irps/violations/duplicates=0/0/0/0' \
+  'generic per-devnode pending START ledger was not exact and leak-free'
 
 require_log \
   'final config PnP summary .*terminal/failed/pending/pending-observed/indeterminate=[0-9]+/0/0/2/0' \

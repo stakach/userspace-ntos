@@ -191,6 +191,232 @@ impl DriverStartBatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingStartIdentity {
+    pub irp_id: u64,
+    pub devnode_id: u64,
+    pub devnode_generation: u64,
+    pub dispatch_generation: u64,
+    pub pdo_device_id: u64,
+    pub fdo_device_id: u64,
+    pub origin_driver_id: u64,
+    pub completion_driver_id: u64,
+    pub completion_device_id: u64,
+}
+
+impl PendingStartIdentity {
+    const fn is_valid(self) -> bool {
+        self.irp_id != 0
+            && self.devnode_id != 0
+            && self.devnode_generation != 0
+            && self.dispatch_generation != 0
+            && self.pdo_device_id != 0
+            && self.fdo_device_id != 0
+            && self.origin_driver_id != 0
+            && self.completion_driver_id != 0
+            && self.completion_device_id != 0
+    }
+}
+
+const PROOF_RETURNED_PENDING: u8 = 1 << 0;
+const PROOF_COMPLETION_IDENTITY: u8 = 1 << 1;
+const PROOF_LIFECYCLE_COMMITTED: u8 = 1 << 2;
+const PROOF_IRP_ACKNOWLEDGED: u8 = 1 << 3;
+const PROOF_IRP_RETIRED: u8 = 1 << 4;
+const PROOF_PUBLICATION_COMMITTED: u8 = 1 << 5;
+const PROOF_OBSERVED: u8 = 1 << 6;
+pub const PENDING_START_PROOF_COMPLETE_MASK: u8 = PROOF_RETURNED_PENDING
+    | PROOF_COMPLETION_IDENTITY
+    | PROOF_LIFECYCLE_COMMITTED
+    | PROOF_IRP_ACKNOWLEDGED
+    | PROOF_IRP_RETIRED
+    | PROOF_PUBLICATION_COMMITTED
+    | PROOF_OBSERVED;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingStartProofError {
+    InvalidIdentity,
+    WrongStage,
+    Duplicate,
+    AllocationFailed,
+}
+
+/// Ordered proof state for one START IRP that genuinely returned `STATUS_PENDING`.
+///
+/// Runtime owners advance this tracker only after the corresponding external operation succeeds.
+/// The tracker deliberately knows nothing about services or image names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingStartProofTracker {
+    identity: PendingStartIdentity,
+    terminal_status: Option<i32>,
+    stages: u8,
+}
+
+impl PendingStartProofTracker {
+    pub fn returned_pending(
+        identity: PendingStartIdentity,
+    ) -> Result<Self, PendingStartProofError> {
+        if !identity.is_valid() {
+            return Err(PendingStartProofError::InvalidIdentity);
+        }
+        Ok(Self {
+            identity,
+            terminal_status: None,
+            stages: PROOF_RETURNED_PENDING,
+        })
+    }
+
+    pub const fn identity(&self) -> PendingStartIdentity {
+        self.identity
+    }
+
+    pub const fn stage_mask(&self) -> u8 {
+        self.stages
+    }
+
+    pub fn completion_identity_validated(&mut self) -> Result<(), PendingStartProofError> {
+        self.advance(PROOF_RETURNED_PENDING, PROOF_COMPLETION_IDENTITY)
+    }
+
+    pub fn lifecycle_committed(
+        &mut self,
+        terminal_status: i32,
+    ) -> Result<(), PendingStartProofError> {
+        if self.terminal_status.is_some() {
+            return Err(PendingStartProofError::WrongStage);
+        }
+        self.advance(
+            PROOF_RETURNED_PENDING | PROOF_COMPLETION_IDENTITY,
+            PROOF_LIFECYCLE_COMMITTED,
+        )?;
+        self.terminal_status = Some(terminal_status);
+        Ok(())
+    }
+
+    pub fn irp_acknowledged(&mut self) -> Result<(), PendingStartProofError> {
+        self.advance(
+            PROOF_RETURNED_PENDING | PROOF_COMPLETION_IDENTITY | PROOF_LIFECYCLE_COMMITTED,
+            PROOF_IRP_ACKNOWLEDGED,
+        )
+    }
+
+    pub fn irp_retired(&mut self) -> Result<(), PendingStartProofError> {
+        self.advance(
+            PROOF_RETURNED_PENDING
+                | PROOF_COMPLETION_IDENTITY
+                | PROOF_LIFECYCLE_COMMITTED
+                | PROOF_IRP_ACKNOWLEDGED,
+            PROOF_IRP_RETIRED,
+        )
+    }
+
+    pub fn publication_committed(&mut self) -> Result<(), PendingStartProofError> {
+        self.advance(
+            PROOF_RETURNED_PENDING
+                | PROOF_COMPLETION_IDENTITY
+                | PROOF_LIFECYCLE_COMMITTED
+                | PROOF_IRP_ACKNOWLEDGED
+                | PROOF_IRP_RETIRED,
+            PROOF_PUBLICATION_COMMITTED,
+        )
+    }
+
+    pub fn terminal_proof(&self) -> Result<PendingStartTerminalProof, PendingStartProofError> {
+        let required = PENDING_START_PROOF_COMPLETE_MASK & !PROOF_OBSERVED;
+        if self.stages != required {
+            return Err(PendingStartProofError::WrongStage);
+        }
+        Ok(PendingStartTerminalProof {
+            identity: self.identity,
+            terminal_status: self
+                .terminal_status
+                .ok_or(PendingStartProofError::WrongStage)?,
+            stages: self.stages | PROOF_OBSERVED,
+        })
+    }
+
+    fn advance(&mut self, required: u8, stage: u8) -> Result<(), PendingStartProofError> {
+        if self.stages != required || self.stages & stage != 0 {
+            return Err(PendingStartProofError::WrongStage);
+        }
+        self.stages |= stage;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingStartTerminalProof {
+    identity: PendingStartIdentity,
+    terminal_status: i32,
+    stages: u8,
+}
+
+impl PendingStartTerminalProof {
+    pub const fn identity(self) -> PendingStartIdentity {
+        self.identity
+    }
+
+    pub const fn terminal_status(self) -> i32 {
+        self.terminal_status
+    }
+
+    pub const fn stage_mask(self) -> u8 {
+        self.stages
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.stages == PENDING_START_PROOF_COMPLETE_MASK
+    }
+}
+
+/// Immutable terminal rows for pending STARTs that reached exact observation.
+#[derive(Default)]
+pub struct PendingStartProofLedger {
+    rows: Vec<PendingStartTerminalProof>,
+}
+
+impl PendingStartProofLedger {
+    pub const fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    pub fn publish(
+        &mut self,
+        proof: PendingStartTerminalProof,
+    ) -> Result<(), PendingStartProofError> {
+        if !proof.is_complete() {
+            return Err(PendingStartProofError::WrongStage);
+        }
+        let identity = proof.identity();
+        if self.rows.iter().any(|row| {
+            let current = row.identity();
+            current.irp_id == identity.irp_id
+                || (current.devnode_id == identity.devnode_id
+                    && current.devnode_generation == identity.devnode_generation
+                    && current.dispatch_generation == identity.dispatch_generation)
+        }) {
+            return Err(PendingStartProofError::Duplicate);
+        }
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| PendingStartProofError::AllocationFailed)?;
+        self.rows.push(proof);
+        Ok(())
+    }
+
+    pub fn rows(&self) -> &[PendingStartTerminalProof] {
+        self.rows.as_slice()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingOperationReservation {
     slot: usize,
     generation: u64,
@@ -427,5 +653,67 @@ mod tests {
         assert_eq!(table.slot_count(), 2);
         assert_eq!(table.get(0), Some(&5));
         assert_eq!(table.get(1), Some(&6));
+    }
+
+    fn pending_identity(irp_id: u64, dispatch_generation: u64) -> PendingStartIdentity {
+        PendingStartIdentity {
+            irp_id,
+            devnode_id: 7,
+            devnode_generation: 3,
+            dispatch_generation,
+            pdo_device_id: 70,
+            fdo_device_id: 71,
+            origin_driver_id: 8,
+            completion_driver_id: 9,
+            completion_device_id: 71,
+        }
+    }
+
+    #[test]
+    fn pending_start_proof_requires_every_external_stage_in_order() {
+        let mut tracker =
+            PendingStartProofTracker::returned_pending(pending_identity(101, 4)).unwrap();
+        assert_eq!(
+            tracker.lifecycle_committed(0),
+            Err(PendingStartProofError::WrongStage)
+        );
+        tracker.completion_identity_validated().unwrap();
+        tracker.lifecycle_committed(0).unwrap();
+        tracker.irp_acknowledged().unwrap();
+        tracker.irp_retired().unwrap();
+        assert_eq!(
+            tracker.terminal_proof(),
+            Err(PendingStartProofError::WrongStage)
+        );
+        tracker.publication_committed().unwrap();
+        let proof = tracker.terminal_proof().unwrap();
+        assert!(proof.is_complete());
+        assert_eq!(proof.terminal_status(), 0);
+    }
+
+    #[test]
+    fn pending_start_ledger_rejects_duplicate_irp_and_dispatch_identity() {
+        fn terminal(identity: PendingStartIdentity) -> PendingStartTerminalProof {
+            let mut tracker = PendingStartProofTracker::returned_pending(identity).unwrap();
+            tracker.completion_identity_validated().unwrap();
+            tracker.lifecycle_committed(-1).unwrap();
+            tracker.irp_acknowledged().unwrap();
+            tracker.irp_retired().unwrap();
+            tracker.publication_committed().unwrap();
+            tracker.terminal_proof().unwrap()
+        }
+
+        let mut ledger = PendingStartProofLedger::new();
+        ledger.publish(terminal(pending_identity(101, 4))).unwrap();
+        assert_eq!(
+            ledger.publish(terminal(pending_identity(101, 5))),
+            Err(PendingStartProofError::Duplicate)
+        );
+        assert_eq!(
+            ledger.publish(terminal(pending_identity(102, 4))),
+            Err(PendingStartProofError::Duplicate)
+        );
+        ledger.publish(terminal(pending_identity(102, 5))).unwrap();
+        assert_eq!(ledger.len(), 2);
     }
 }

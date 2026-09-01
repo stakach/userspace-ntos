@@ -21310,6 +21310,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     runtime accepted. The next slice remains the exact generic per-devnode terminal ledger described
     above; do not close the broader live device-action boundary on aggregate counters.
 
+    B3 exact pending-START terminal-ledger checkpoint (2026-09-01, implementation and host
+    validation green; runtime pending): a genuinely pending START now creates an owned proof tracker
+    from the opaque PnP dispatch token and immutable IRP/devnode/generation/PDO/FDO/origin-driver
+    identity. Completion must match the exact completing driver and device before the manager may
+    commit lifecycle state. The proof then requires the exact lifecycle result with no dispatch in
+    flight, strict IRP acknowledgement, canonical IRP retirement, terminal publication, and exact
+    observation/removal in that order. Duplicate IRP or devnode-generation-dispatch identities and
+    any skipped or repeated stage fail the ledger. Terminal rows are retained independently of the
+    mutable transaction table, so final readiness can prove that every aggregate pending observation
+    has one complete immutable identity row and no active transaction, retained IRP, violation, or
+    duplicate owner. A production boot with no pending START remains a coherent zero-row result.
+
+    `nt-driver-start` passes 8/8 tests, including ordered-stage and duplicate-identity rejection;
+    `nt-pnp-manager` passes 51/51 tests with a read-only dispatch-identity contract; the freestanding
+    executive check remains green at 209 warnings; the integration runner is syntax-clean and now
+    requires exactly two generic successful `0x7f` terminal rows plus a coherent `2/2/0/0` summary.
+    Review adjustment: run the 15-minute bounded pending-start integration profile and production
+    profile serially. If accepted, close the boot-profile pending ledger and move to the live Config
+    Manager device-action path, where each action must retain its exact syscall reply/result and be
+    retired only after the corresponding terminal devnode proof. Remove the eager demand-PnP launch
+    and permissive `PlugPlayControlStartDevice` no-action success as that path replaces them.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

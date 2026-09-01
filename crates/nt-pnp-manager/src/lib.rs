@@ -429,6 +429,29 @@ pub struct PnpDispatchToken {
     minor: PnpMinor,
 }
 
+/// Read-only identity of a dispatch authority. This does not permit callers to forge or complete a
+/// dispatch; the opaque token remains required for lifecycle mutation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PnpDispatchIdentity {
+    pub devnode_id: u64,
+    pub devnode_generation: u64,
+    pub dispatch_generation: u64,
+    pub canonical_irp_id: u64,
+    pub minor: PnpMinor,
+}
+
+impl PnpDispatchToken {
+    pub const fn identity(&self) -> PnpDispatchIdentity {
+        PnpDispatchIdentity {
+            devnode_id: self.devnode_id,
+            devnode_generation: self.devnode_generation,
+            dispatch_generation: self.dispatch_generation,
+            canonical_irp_id: self.canonical_irp_id,
+            minor: self.minor,
+        }
+    }
+}
+
 /// Exact authority to publish `Removed` after the returned REMOVE IRP's external teardown commits.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PnpRemovalToken {
@@ -2030,6 +2053,16 @@ mod tests {
         assert!(!p.pnp_dispatch_in_flight(id));
         assert_eq!(p.next_dispatch_gen, 1);
         let token = begin_pnp(&mut p, pdo, PnpMinor::StartDevice).unwrap();
+        assert_eq!(
+            token.identity(),
+            PnpDispatchIdentity {
+                devnode_id: id,
+                devnode_generation: p.generation(id).unwrap(),
+                dispatch_generation: 1,
+                canonical_irp_id: token.canonical_irp_id,
+                minor: PnpMinor::StartDevice,
+            }
+        );
         let duplicate = PnpDispatchToken {
             devnode_id: token.devnode_id,
             devnode_generation: token.devnode_generation,

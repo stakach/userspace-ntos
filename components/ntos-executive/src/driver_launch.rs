@@ -39865,10 +39865,30 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     index += 1;
                     continue;
                 }
-                if let Err(lifecycle_status) =
-                    complete_hosted_pnp_lifecycle(irp_id, completion.status)
+                if let Err(proof_status) = mark_pending_start_completion_identity(irp_id) {
+                    set_hosted_pnp_indeterminate(irp_id, proof_status)
+                        .expect("hosted PnP completion-proof failure lost its transaction");
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
+                let lifecycle_state = match complete_hosted_pnp_lifecycle(irp_id, completion.status)
                 {
-                    set_hosted_pnp_indeterminate(irp_id, lifecycle_status)
+                    Ok(state) => state,
+                    Err(lifecycle_status) => {
+                        set_hosted_pnp_indeterminate(irp_id, lifecycle_status)
+                            .expect("hosted PnP lifecycle failure lost its transaction");
+                        progress = progress.saturating_add(1);
+                        index += 1;
+                        continue;
+                    }
+                };
+                if let Err(proof_status) = mark_pending_start_lifecycle_committed(
+                    irp_id,
+                    completion.status,
+                    lifecycle_state,
+                ) {
+                    set_hosted_pnp_indeterminate(irp_id, proof_status)
                         .expect("hosted PnP lifecycle failure lost its transaction");
                     progress = progress.saturating_add(1);
                     index += 1;
@@ -39891,12 +39911,26 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
                     index += 1;
                     continue;
                 }
+                if let Err(status) = mark_pending_start_irp_retired(irp_id) {
+                    set_hosted_pnp_indeterminate(irp_id, status)
+                        .expect("hosted PnP retirement-proof failure lost its transaction");
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
                 if finish_hosted_pnp_publication(irp_id).is_err() {
                     transition_hosted_pnp_transaction_phase(
                         irp_id,
                         HostedPnpTransactionPhase::PostPublicationRepair,
                     )
                     .expect("hosted PnP repair transition lost its transaction");
+                    progress = progress.saturating_add(1);
+                    index += 1;
+                    continue;
+                }
+                if let Err(status) = mark_pending_start_publication_committed(irp_id) {
+                    set_hosted_pnp_indeterminate(irp_id, status)
+                        .expect("hosted PnP publication-proof failure lost its transaction");
                     progress = progress.saturating_add(1);
                     index += 1;
                     continue;
@@ -39911,6 +39945,13 @@ unsafe fn drain_hosted_pnp_completions() -> usize {
             }
             HostedPnpTransactionPhase::PostPublicationRepair => {
                 if finish_hosted_pnp_publication(irp_id).is_ok() {
+                    if let Err(status) = mark_pending_start_publication_committed(irp_id) {
+                        set_hosted_pnp_indeterminate(irp_id, status)
+                            .expect("hosted PnP repaired proof failure lost its transaction");
+                        progress = progress.saturating_add(1);
+                        index += 1;
+                        continue;
+                    }
                     transition_hosted_pnp_transaction_phase(
                         irp_id,
                         HostedPnpTransactionPhase::Terminal,
@@ -39939,18 +39980,25 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     let irp_id = IrpId(irp_id);
-    let transactions = hosted_pnp_transactions_mut();
-    let index = transactions
+    let (minor, phase) = hosted_pnp_transactions_mut()
         .iter()
-        .position(|transaction| transaction.irp_id == irp_id)
+        .find(|transaction| transaction.irp_id == irp_id)
+        .map(|transaction| (transaction.minor, transaction.phase))
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
-    let minor = transactions[index].minor;
-    let phase = transactions[index].phase;
     if minor != nt_pnp_manager::PnpMinor::StartDevice {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     match phase {
         HostedPnpTransactionPhase::Terminal => {
+            publish_pending_start_terminal_proof(irp_id)?;
+            let transactions = hosted_pnp_transactions_mut();
+            let index = transactions
+                .iter()
+                .position(|transaction| transaction.irp_id == irp_id)
+                .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+            if transactions[index].phase != HostedPnpTransactionPhase::Terminal {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
             let transaction = transactions.remove(index);
             Ok(HostedPnpStartObservation::Terminal {
                 driver_status: transaction
@@ -39958,11 +40006,14 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
                     .expect("terminal hosted PnP START has no driver status"),
             })
         }
-        HostedPnpTransactionPhase::Indeterminate => Ok(HostedPnpStartObservation::Indeterminate {
-            transport_status: transactions[index]
-                .barrier_status
-                .expect("indeterminate hosted PnP START has no barrier status"),
-        }),
+        HostedPnpTransactionPhase::Indeterminate => {
+            let transport_status = hosted_pnp_transactions_mut()
+                .iter()
+                .find(|transaction| transaction.irp_id == irp_id)
+                .and_then(|transaction| transaction.barrier_status)
+                .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
+            Ok(HostedPnpStartObservation::Indeterminate { transport_status })
+        }
         HostedPnpTransactionPhase::Prepared
         | HostedPnpTransactionPhase::Dispatching
         | HostedPnpTransactionPhase::AwaitingCompletion
@@ -39971,6 +40022,78 @@ pub(crate) unsafe fn observe_hosted_pnp_start(
             Ok(HostedPnpStartObservation::AwaitingCompletion)
         }
     }
+}
+
+pub(crate) unsafe fn print_hosted_pnp_pending_proofs() -> HostedPnpPendingProofReport {
+    let rows = hosted_pnp_pending_proofs_mut().rows();
+    let mut report = HostedPnpPendingProofReport {
+        rows: rows.len() as u64,
+        active_transactions: hosted_pnp_transactions_mut()
+            .iter()
+            .filter(|transaction| transaction.pending_start_proof.is_some())
+            .count() as u64,
+        violations: HOSTED_PNP_PENDING_PROOF_VIOLATIONS.load(Ordering::Relaxed),
+        duplicates: HOSTED_PNP_PENDING_PROOF_DUPLICATES.load(Ordering::Relaxed),
+        ..HostedPnpPendingProofReport::default()
+    };
+    for proof in rows.iter().copied() {
+        let identity = proof.identity();
+        if proof.is_complete() {
+            if nt_status::NtStatus(proof.terminal_status()).is_success() {
+                report.successful = report.successful.saturating_add(1);
+            } else {
+                report.failed = report.failed.saturating_add(1);
+            }
+        } else {
+            report.incomplete = report.incomplete.saturating_add(1);
+        }
+        if io_manager_mut().irp(IrpId(identity.irp_id)).is_some() {
+            report.retained_irps = report.retained_irps.saturating_add(1);
+        }
+        print_str(b"[pnp-pending-proof] irp=");
+        print_u64(identity.irp_id);
+        print_str(b" devnode/gen/dispatch=");
+        print_u64(identity.devnode_id);
+        print_str(b"/");
+        print_u64(identity.devnode_generation);
+        print_str(b"/");
+        print_u64(identity.dispatch_generation);
+        print_str(b" pdo/fdo=");
+        print_u64(identity.pdo_device_id);
+        print_str(b"/");
+        print_u64(identity.fdo_device_id);
+        print_str(b" origin/completion-driver/device=");
+        print_u64(identity.origin_driver_id);
+        print_str(b"/");
+        print_u64(identity.completion_driver_id);
+        print_str(b"/");
+        print_u64(identity.completion_device_id);
+        print_str(b" status=");
+        print_hex(proof.terminal_status() as u32);
+        print_str(b" stages=");
+        print_hex(proof.stage_mask() as u32);
+        print_str(b" irp-retired=");
+        print_u64((io_manager_mut().irp(IrpId(identity.irp_id)).is_none()) as u64);
+        print_str(b" observed=1\n");
+    }
+    print_str(b"[pnp-pending-proof] summary rows/success/failed/incomplete=");
+    print_u64(report.rows);
+    print_str(b"/");
+    print_u64(report.successful);
+    print_str(b"/");
+    print_u64(report.failed);
+    print_str(b"/");
+    print_u64(report.incomplete);
+    print_str(b" active/retained-irps/violations/duplicates=");
+    print_u64(report.active_transactions);
+    print_str(b"/");
+    print_u64(report.retained_irps);
+    print_str(b"/");
+    print_u64(report.violations);
+    print_str(b"/");
+    print_u64(report.duplicates);
+    print_str(b"\n");
+    report
 }
 
 pub(crate) unsafe fn observe_hosted_pnp_lifecycle(
@@ -41666,6 +41789,9 @@ static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static HOSTED_IRQ_PENDING_EVENTS: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
+static mut HOSTED_PNP_PENDING_PROOFS: Option<nt_driver_start::PendingStartProofLedger> = None;
+static HOSTED_PNP_PENDING_PROOF_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PNP_PENDING_PROOF_DUPLICATES: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_FILTER_REQUIREMENTS_TRANSACTIONS: Option<
     Vec<HostedFilterRequirementsTransaction>,
 > = None;
@@ -42177,6 +42303,8 @@ struct HostedPnpTransaction {
     phase: HostedPnpTransactionPhase,
     driver_status: Option<nt_status::NtStatus>,
     barrier_status: Option<nt_status::NtStatus>,
+    pending_start_proof: Option<nt_driver_start::PendingStartProofTracker>,
+    pending_start_proof_violation_recorded: bool,
     mmio_usage_published: bool,
     interrupt_usage_published: bool,
     dma_usage_published: bool,
@@ -42273,6 +42401,29 @@ pub(crate) enum HostedPnpStartObservation {
     Indeterminate {
         transport_status: nt_status::NtStatus,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HostedPnpPendingProofReport {
+    pub(crate) rows: u64,
+    pub(crate) successful: u64,
+    pub(crate) failed: u64,
+    pub(crate) incomplete: u64,
+    pub(crate) active_transactions: u64,
+    pub(crate) retained_irps: u64,
+    pub(crate) violations: u64,
+    pub(crate) duplicates: u64,
+}
+
+impl HostedPnpPendingProofReport {
+    pub(crate) const fn coherent(self) -> bool {
+        self.rows == self.successful + self.failed
+            && self.incomplete == 0
+            && self.active_transactions == 0
+            && self.retained_irps == 0
+            && self.violations == 0
+            && self.duplicates == 0
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -43340,6 +43491,237 @@ unsafe fn hosted_pnp_transactions_mut() -> &'static mut Vec<HostedPnpTransaction
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_pnp_pending_proofs_mut() -> &'static mut nt_driver_start::PendingStartProofLedger {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PNP_PENDING_PROOFS);
+    if slot.is_none() {
+        *slot = Some(nt_driver_start::PendingStartProofLedger::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn pending_start_proof_status(
+    error: nt_driver_start::PendingStartProofError,
+) -> nt_status::NtStatus {
+    if error == nt_driver_start::PendingStartProofError::AllocationFailed {
+        nt_status::NtStatus::INSUFFICIENT_RESOURCES
+    } else {
+        nt_status::NtStatus::INVALID_DEVICE_REQUEST
+    }
+}
+
+unsafe fn record_pending_start_proof_violation(
+    irp_id: IrpId,
+    error: nt_driver_start::PendingStartProofError,
+) -> nt_status::NtStatus {
+    if let Some(transaction) = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+    {
+        if !transaction.pending_start_proof_violation_recorded {
+            transaction.pending_start_proof_violation_recorded = true;
+            HOSTED_PNP_PENDING_PROOF_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+            if error == nt_driver_start::PendingStartProofError::Duplicate {
+                HOSTED_PNP_PENDING_PROOF_DUPLICATES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else {
+        HOSTED_PNP_PENDING_PROOF_VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+        if error == nt_driver_start::PendingStartProofError::Duplicate {
+            HOSTED_PNP_PENDING_PROOF_DUPLICATES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pending_start_proof_status(error)
+}
+
+unsafe fn begin_pending_start_proof(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    let (binding, origin_driver_id, completion_driver_id, completion_device_id, token_identity) = {
+        let transaction = hosted_pnp_transactions_mut()
+            .iter()
+            .find(|transaction| transaction.irp_id == irp_id)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        if transaction.minor != nt_pnp_manager::PnpMinor::StartDevice
+            || transaction.pending_start_proof.is_some()
+        {
+            return Err(record_pending_start_proof_violation(
+                irp_id,
+                nt_driver_start::PendingStartProofError::WrongStage,
+            ));
+        }
+        let token_identity = transaction
+            .token
+            .as_ref()
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+            .identity();
+        (
+            transaction.binding,
+            transaction.origin_driver_id,
+            transaction.completion_driver_id,
+            transaction.completion_device_id,
+            token_identity,
+        )
+    };
+    let manager_identity_valid = token_identity.canonical_irp_id == irp_id.raw()
+        && token_identity.minor == nt_pnp_manager::PnpMinor::StartDevice
+        && hosted_pnp_manager_mut().generation(token_identity.devnode_id)
+            == Some(token_identity.devnode_generation)
+        && hosted_pnp_manager_mut().pdo(token_identity.devnode_id) == Some(binding.pdo_device_id)
+        && hosted_pnp_manager_mut().fdo(token_identity.devnode_id) == Some(binding.device_id);
+    if !manager_identity_valid {
+        return Err(record_pending_start_proof_violation(
+            irp_id,
+            nt_driver_start::PendingStartProofError::InvalidIdentity,
+        ));
+    }
+    let identity = nt_driver_start::PendingStartIdentity {
+        irp_id: irp_id.raw(),
+        devnode_id: token_identity.devnode_id,
+        devnode_generation: token_identity.devnode_generation,
+        dispatch_generation: token_identity.dispatch_generation,
+        pdo_device_id: binding.pdo_device_id,
+        fdo_device_id: binding.device_id,
+        origin_driver_id: origin_driver_id.raw(),
+        completion_driver_id: completion_driver_id.raw(),
+        completion_device_id: completion_device_id.raw(),
+    };
+    let tracker = nt_driver_start::PendingStartProofTracker::returned_pending(identity)
+        .map_err(|error| record_pending_start_proof_violation(irp_id, error))?;
+    hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?
+        .pending_start_proof = Some(tracker);
+    Ok(())
+}
+
+unsafe fn mark_pending_start_completion_identity(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    let result = match hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.pending_start_proof.as_mut())
+    {
+        Some(proof) => proof.completion_identity_validated(),
+        None => return Ok(()),
+    };
+    result.map_err(|error| record_pending_start_proof_violation(irp_id, error))
+}
+
+unsafe fn mark_pending_start_lifecycle_committed(
+    irp_id: IrpId,
+    status: nt_status::NtStatus,
+    state: nt_pnp_manager::DeviceState,
+) -> Result<(), nt_status::NtStatus> {
+    let Some((identity, token_identity)) = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| {
+            transaction.pending_start_proof.as_ref().map(|proof| {
+                (
+                    proof.identity(),
+                    transaction
+                        .token
+                        .as_ref()
+                        .expect("pending START proof lost its PnP token")
+                        .identity(),
+                )
+            })
+        })
+    else {
+        return Ok(());
+    };
+    let expected_state = if status.is_success() {
+        nt_pnp_manager::DeviceState::Started
+    } else {
+        nt_pnp_manager::DeviceState::Failed
+    };
+    let lifecycle_valid = state == expected_state
+        && token_identity.devnode_id == identity.devnode_id
+        && token_identity.devnode_generation == identity.devnode_generation
+        && token_identity.dispatch_generation == identity.dispatch_generation
+        && token_identity.canonical_irp_id == identity.irp_id
+        && !hosted_pnp_manager_mut().pnp_dispatch_in_flight(identity.devnode_id)
+        && hosted_pnp_manager_mut().state(identity.devnode_id) == Some(expected_state)
+        && hosted_pnp_manager_mut().generation(identity.devnode_id)
+            == Some(identity.devnode_generation)
+        && hosted_pnp_manager_mut().pdo(identity.devnode_id) == Some(identity.pdo_device_id)
+        && hosted_pnp_manager_mut().fdo(identity.devnode_id) == Some(identity.fdo_device_id);
+    if !lifecycle_valid {
+        return Err(record_pending_start_proof_violation(
+            irp_id,
+            nt_driver_start::PendingStartProofError::InvalidIdentity,
+        ));
+    }
+    let result = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.pending_start_proof.as_mut())
+        .expect("validated pending START proof disappeared")
+        .lifecycle_committed(status.raw());
+    result.map_err(|error| record_pending_start_proof_violation(irp_id, error))
+}
+
+unsafe fn mark_pending_start_irp_retired(irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
+    let Some(proof) = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.pending_start_proof.as_mut())
+    else {
+        return Ok(());
+    };
+    if let Err(error) = proof.irp_acknowledged() {
+        return Err(record_pending_start_proof_violation(irp_id, error));
+    }
+    if io_manager_mut().irp(irp_id).is_some() {
+        return Err(record_pending_start_proof_violation(
+            irp_id,
+            nt_driver_start::PendingStartProofError::WrongStage,
+        ));
+    }
+    let result = hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.pending_start_proof.as_mut())
+        .expect("acknowledged pending START proof disappeared")
+        .irp_retired();
+    result.map_err(|error| record_pending_start_proof_violation(irp_id, error))
+}
+
+unsafe fn mark_pending_start_publication_committed(
+    irp_id: IrpId,
+) -> Result<(), nt_status::NtStatus> {
+    let result = match hosted_pnp_transactions_mut()
+        .iter_mut()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.pending_start_proof.as_mut())
+    {
+        Some(proof) => proof.publication_committed(),
+        None => return Ok(()),
+    };
+    result.map_err(|error| record_pending_start_proof_violation(irp_id, error))
+}
+
+unsafe fn publish_pending_start_terminal_proof(irp_id: IrpId) -> Result<bool, nt_status::NtStatus> {
+    let Some(tracker) = hosted_pnp_transactions_mut()
+        .iter()
+        .find(|transaction| transaction.irp_id == irp_id)
+        .and_then(|transaction| transaction.pending_start_proof)
+    else {
+        return Ok(false);
+    };
+    if io_manager_mut().irp(irp_id).is_some() {
+        return Err(record_pending_start_proof_violation(
+            irp_id,
+            nt_driver_start::PendingStartProofError::WrongStage,
+        ));
+    }
+    let proof = tracker
+        .terminal_proof()
+        .map_err(|error| record_pending_start_proof_violation(irp_id, error))?;
+    hosted_pnp_pending_proofs_mut()
+        .publish(proof)
+        .map_err(|error| record_pending_start_proof_violation(irp_id, error))?;
+    Ok(true)
+}
+
 unsafe fn reserve_hosted_pnp_transaction(
     transaction: HostedPnpTransaction,
 ) -> Result<(), nt_status::NtStatus> {
@@ -43476,7 +43858,7 @@ unsafe fn set_hosted_pnp_indeterminate(
 unsafe fn complete_hosted_pnp_lifecycle(
     irp_id: IrpId,
     status: nt_status::NtStatus,
-) -> Result<(), nt_status::NtStatus> {
+) -> Result<nt_pnp_manager::DeviceState, nt_status::NtStatus> {
     let transactions = hosted_pnp_transactions_mut();
     let transaction = transactions
         .iter()
@@ -43488,7 +43870,6 @@ unsafe fn complete_hosted_pnp_lifecycle(
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     hosted_pnp_manager_mut()
         .complete_pnp_dispatch(token, irp_id.raw(), status.is_success())
-        .map(|_| ())
         .map_err(hosted_pnp_status)
 }
 
@@ -52169,6 +52550,8 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
         barrier_status: None,
+        pending_start_proof: None,
+        pending_start_proof_violation_recorded: false,
         mmio_usage_published: false,
         interrupt_usage_published: false,
         dma_usage_published: false,
@@ -52373,6 +52756,8 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         phase: HostedPnpTransactionPhase::Prepared,
         driver_status: None,
         barrier_status: None,
+        pending_start_proof: None,
+        pending_start_proof_violation_recorded: false,
         mmio_usage_published: false,
         interrupt_usage_published: false,
         dma_usage_published: false,
@@ -52457,6 +52842,14 @@ pub(crate) unsafe fn start_hosted_device_canonical(
                 HostedPnpTransactionPhase::AwaitingCompletion,
             )
             .expect("pending hosted PnP START lost its transaction");
+            if let Err(transport_status) = begin_pending_start_proof(irp_id) {
+                set_hosted_pnp_indeterminate(irp_id, transport_status)
+                    .expect("pending hosted PnP proof failure lost its transaction");
+                return Ok(HostedPnpStartOutcome::Indeterminate {
+                    irp_id: irp_id.raw(),
+                    transport_status,
+                });
+            }
             Ok(HostedPnpStartOutcome::Pending {
                 irp_id: irp_id.raw(),
             })
