@@ -60,6 +60,27 @@ run_desktop_boot_lane() {
     -- "$@"
 }
 
+complete_boot_verdict() {
+  local log="$1" rc="$2" summary passed total
+  summary="$(sed -n \
+    's/.*\[ntos-exec summary: \([0-9][0-9]*\)\/\([0-9][0-9]*\) executive->isolated-service checks passed\].*/\1 \2/p' \
+    "$log" | tail -n 1)"
+  passed=""
+  total=""
+  read -r passed total <<< "$summary"
+  if grep -q 'PASS exec_explorer_shell_chrome_painted' "$log" \
+     && ! grep -q 'FAIL exec_explorer_shell_chrome_painted' "$log" \
+     && ! grep -q '^  FAIL ' "$log" \
+     && grep -q '\[microtest sentinel matched -- exiting QEMU\]' "$log" \
+     && [ -n "$passed" ] \
+     && [ "$passed" = "$total" ] \
+     && { [ "$rc" = 1 ] || [ "$rc" = 3 ] || [ "$rc" = 0 ]; }; then
+    printf '%s %s\n' "$passed" "$total"
+    return 0
+  fi
+  return 1
+}
+
 BOOT_IMAGE="$RM/.tmp/disk.img"
 
 ensure_no_qemu_lane_running() {
@@ -223,9 +244,7 @@ if [ "$GRAPHICS" = 1 ]; then
   : > "$RUN_LOG"
   say "      Serial log streams here and to: $RUN_LOG"
   say "      Boot readiness timeout: ${BOOT_TIMEOUT_SECONDS}s (disarmed after Explorer paint)."
-  say "      Close the QEMU window to quit."
-  # In graphics mode run_specs drops isa-debug-exit, so QEMU stays alive with the
-  # painted desktop until the user closes the window (exit status is the window's).
+  say "      QEMU exits after the guest's complete validation verdict."
   set +e
   if [ "${#PASSTHRU[@]}" -gt 0 ]; then
     run_desktop_boot_lane env GRAPHICS=1 ./scripts/run_specs.sh "${PASSTHRU[@]}" 2>&1 | tee -a "$RUN_LOG"
@@ -234,7 +253,21 @@ if [ "$GRAPHICS" = 1 ]; then
   fi
   rc=${PIPESTATUS[0]}
   set -e
-  exit "$rc"
+  echo
+  if [ "$rc" = 124 ]; then
+    err "FAILED — desktop boot readiness exceeded ${BOOT_TIMEOUT_SECONDS}s; QEMU was terminated."
+    err "         Log: $RUN_LOG"
+    exit 124
+  fi
+  if verdict="$(complete_boot_verdict "$RUN_LOG" "$rc")"; then
+    read -r passed total <<< "$verdict"
+    say "SUCCESS — the visible ReactOS desktop completed its full gate ($passed/$total checks)."
+    say "         Log: $RUN_LOG"
+    exit 0
+  fi
+  err "FAILED — desktop QEMU exited $rc without the complete Explorer shell proof."
+  err "         Log: $RUN_LOG"
+  exit 1
 fi
 
 say "[5/5] booting QEMU (headless serial gate)..."
@@ -260,19 +293,8 @@ if [ "$rc" = 124 ]; then
   err "         Log: $RUN_LOG"
   exit 124
 fi
-summary="$(sed -n \
-  's/.*\[ntos-exec summary: \([0-9][0-9]*\)\/\([0-9][0-9]*\) executive->isolated-service checks passed\].*/\1 \2/p' \
-  "$RUN_LOG" | tail -n 1)"
-passed=""
-total=""
-read -r passed total <<< "$summary"
-if grep -q 'PASS exec_explorer_shell_chrome_painted' "$RUN_LOG" \
-   && ! grep -q 'FAIL exec_explorer_shell_chrome_painted' "$RUN_LOG" \
-   && ! grep -q '^  FAIL ' "$RUN_LOG" \
-   && grep -q '\[microtest sentinel matched -- exiting QEMU\]' "$RUN_LOG" \
-   && [ -n "$passed" ] \
-   && [ "$passed" = "$total" ] \
-   && { [ "$rc" = 1 ] || [ "$rc" = 3 ] || [ "$rc" = 0 ]; }; then
+if verdict="$(complete_boot_verdict "$RUN_LOG" "$rc")"; then
+  read -r passed total <<< "$verdict"
   say "SUCCESS — the ReactOS stack booted and Explorer painted the complete shell ($passed/$total checks)."
   say "         Log: $RUN_LOG"
   say "         Run ./run.sh --desktop to view it."
