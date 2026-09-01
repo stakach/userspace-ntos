@@ -18121,7 +18121,7 @@ pub(crate) unsafe fn service_sec_image(
                     let target = nt_handler.pm.create_process("dbgk-block.exe", None, None);
                     nt_handler.pm.set_image_base(target, 0x0000_0001_9000_0000);
                     let main = nt_handler.pm.create_thread(target, 0x5100, 0, false).ok();
-                    let _keepalive = nt_handler.pm.create_thread(target, 0x5200, 0, false).ok();
+                    let keepalive = nt_handler.pm.create_thread(target, 0x5200, 0, false).ok();
                     let target_claim = nt_handler.claim_temporary_process_slot(target, 0).ok();
                     let blk_test_pi = target_claim
                         .map(TemporaryProcessSlotClaim::pi)
@@ -18914,23 +18914,30 @@ pub(crate) unsafe fn service_sec_image(
                     // executive's REAL fault endpoint bound to REPLY_MAIN, so the PRODUCTION
                     // `wait_park` steals its reply capability exactly as the service loop does. The
                     // client cannot progress until a queue-side post runs `wait_wake_dispatcher_set`.
-                    let dcode = selftests::dbgk_debugger_client_code();
-                    let (dbg_pml4, dbg_tcb, _dbg_ep) = selftests::dbgk_client_spawn(
-                        &dcode,
-                        shared_d,
-                        write_scratch_d,
-                        fault_ep,
-                        &mut slots,
-                        &mut nslots,
-                    );
-                    let win_d = {
+                    let dphase_ready = target_registered && attached && keepalive.is_some();
+                    let (dbg_pml4, dbg_tcb, _dbg_ep) = if dphase_ready {
+                        let dcode = selftests::dbgk_debugger_client_code();
+                        selftests::dbgk_client_spawn(
+                            &dcode,
+                            shared_d,
+                            write_scratch_d,
+                            fault_ep,
+                            &mut slots,
+                            &mut nslots,
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
+                    let win_d = if dphase_ready {
                         let s = copy_cap(shared_d);
                         slots[nslots] = s;
                         nslots += 1;
                         s
+                    } else {
+                        0
                     };
-                    let win_d_ok =
-                        page_map_r(win_d, marker_win_d, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
+                    let win_d_ok = dphase_ready
+                        && page_map_r(win_d, marker_win_d, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
                     let marker_d = || {
                         if win_d_ok {
                             core::ptr::read_volatile(marker_win_d as *const u64)
@@ -18940,7 +18947,7 @@ pub(crate) unsafe fn service_sec_image(
                     };
                     // Drain anything still queued so the wait genuinely finds nothing to report.
                     let mut drain_guard = 0;
-                    while drain_guard < 16 {
+                    while dphase_ready && drain_guard < 16 {
                         drain_guard += 1;
                         if sysc!(
                             SSN_NT_WAIT_FOR_DEBUG_EVENT,
@@ -18979,7 +18986,7 @@ pub(crate) unsafe fn service_sec_image(
                     let mut w_m2 = 0u64;
                     let mut w_m3 = 0u64;
                     let mut select_guard = 0;
-                    while select_guard < 8 {
+                    while dphase_ready && select_guard < 8 {
                         select_guard += 1;
                         let (_wb, mi_r, m0_r, m1_r, m2_r, m3_r) =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -19006,10 +19013,15 @@ pub(crate) unsafe fn service_sec_image(
                     // The handler's own park REQUEST (NULL *Timeout, empty queue) — the exact arm a
                     // hosted debugger would take.
                     nt_handler.wait_park_event = -1;
-                    let wait_status =
-                        sysc!(SSN_NT_WAIT_FOR_DEBUG_EVENT, &[dbg_handle, 0, 0, A_STATE]);
+                    let wait_status = if dphase_ready {
+                        sysc!(SSN_NT_WAIT_FOR_DEBUG_EVENT, &[dbg_handle, 0, 0, A_STATE])
+                    } else {
+                        nt_process::STATUS_INSUFFICIENT_RESOURCES
+                    };
                     let park_index = nt_handler.wait_park_event;
-                    let live_parked = dbg_pml4 != 0
+                    let live_parked = target_registered
+                        && attached
+                        && dbg_pml4 != 0
                         && (w_mi >> 12) == 2
                         && w_m0 == 0xD1
                         && wait_status == 0x102
@@ -19025,21 +19037,24 @@ pub(crate) unsafe fn service_sec_image(
                         && marker_d() == 0;
                     // A queue-side post through the very entry the fault path uses SETS the
                     // object's EventsPresent dispatcher event and wakes the parked client.
-                    let _ = nt_handler.dbgk_forward_exception(
-                        blk_test_pi,
-                        main_tid as u64,
-                        dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x9999),
-                        true,
-                    );
+                    let wake_posted = live_parked
+                        && nt_handler.dbgk_forward_exception(
+                            blk_test_pi,
+                            keepalive.unwrap_or(0) as u64,
+                            dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x9999),
+                            true,
+                        );
                     // GUARD: only recv again when the client was really parked (else nothing
                     // could ever resume it and the recv would block forever).
-                    if live_parked {
+                    if live_parked && wake_posted {
                         let (_wb2, w2_mi, w2_m0, _x1, _x2, _x3) =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         dbgk_blk_trace(b"dw2", w2_mi, w2_m0, 0, marker_d());
                         if (w2_mi >> 12) == 2 && w2_m0 == 0xD2 && marker_d() == 1 {
                             bk_ok |= 0x0100;
                         }
+                    } else if live_parked {
+                        wait_cancel_thread(&mut nt_handler, 0xD1D1_0001);
                     }
 
                     // 0x0080 — ★ THE ESCAPE HATCH. Leave a reporter blocked and destroy the debug
@@ -19074,7 +19089,9 @@ pub(crate) unsafe fn service_sec_image(
                     // selftest-private, so their root slots can be returned to the allocator before
                     // the next post-loop selftest starts.
                     let _ = tcb_suspend_r(client_tcb);
-                    let _ = tcb_suspend_r(dbg_tcb);
+                    if dbg_tcb != 0 {
+                        let _ = tcb_suspend_r(dbg_tcb);
+                    }
                     if client_runtime_registered {
                         let _ = nt_handler.release_hosted_thread_runtime(main_tid as u64);
                     }
@@ -19091,9 +19108,13 @@ pub(crate) unsafe fn service_sec_image(
                         let _ = cnode_delete_recycle_r(s);
                     }
                     let _ = cnode_delete_recycle_r(client_tcb);
-                    let _ = cnode_delete_recycle_r(dbg_tcb);
+                    if dbg_tcb != 0 {
+                        let _ = cnode_delete_recycle_r(dbg_tcb);
+                    }
                     let _ = cnode_delete_recycle_r(client_pml4);
-                    let _ = cnode_delete_recycle_r(dbg_pml4);
+                    if dbg_pml4 != 0 {
+                        let _ = cnode_delete_recycle_r(dbg_pml4);
+                    }
                     if let Some(claim) = target_claim {
                         let _ = nt_handler.release_temporary_process_slot(claim);
                     }

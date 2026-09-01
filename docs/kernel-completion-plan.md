@@ -21856,6 +21856,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     passes should work move to a reclaiming provider pool if normal win32k frees prove bump-only,
     then the dedicated real-provider GetClassInfo integration client.
 
+    Paging-finalization and blocker-census checkpoint (2026-09-01, microkernel specs and host checks
+    green; desktop churn acceptance pending): `.tmp/run-desktop-20260901-212343.log` reached genuine
+    Explorer in roughly four minutes, then consumed dynamic pi values 7 through 23 while terminated
+    `rundll32.exe` generations remained quarantined. Their Process Manager teardown had progressed,
+    but the VSpace ledger consistently ended at `private-pts=1/1 vspace-released=0`; later launches
+    correctly failed closed with `err=6 max_pi=24`. The post-quiesce Dbgk debugger-client proof then
+    had no temporary pi to claim and stopped at `dw1`. QEMU was terminated at that deterministic
+    barrier rather than left running.
+
+    The stranded capability was a rust-micro semantic defect, not a reason to enlarge the hosted
+    process window. `CNode_Delete` rejected a mapped page-table cap after its parent directory or
+    ASID edge had already been detached. Upstream seL4 instead finalizes only the final paging-
+    structure capability and treats the hardware unmap as best-effort; a missing exact parent edge
+    is a no-op and capability deletion still succeeds. rust-micro commit `81bc6d8` now implements
+    that contract for PT/PD/PDPT deletion, preserves mapping state when deriving mapped paging caps,
+    rejects derivation of unmapped paging structures, and requires `RevokeFirst` for an explicit
+    unmap through a non-final alias. Focused specs cover mapped aliases, final deletion after a
+    detached parent, explicit final-cap unmap, and unmapped-derivation rejection; the standalone
+    kernel build and complete spec suite pass. The perpetual post-spec scheduler demo was stopped
+    after `All specs passed!` rather than retained as an unbounded QEMU process.
+
+    `nt-process` now exposes an allocation-free typed deletion-blocker snapshot covering process
+    state, dispatcher waits, debug attachment, own handles, external process/thread handle owners,
+    missing or live ETHREADs, thread waits, termination ports, and impersonation. Bound but not yet
+    published handle transactions count as real Object Manager references. The executive queues
+    deletion candidates only for terminated EPROCESS objects, emits the exact blocker census once
+    per newly queued generation, and reports successful `{pi,pid,generation}` retirement. The Dbgk
+    debugger-client selftest now starts its blocking phase only after a real temporary pi claim,
+    attachment, and keepalive ETHREAD exist; it posts through that live keepalive identity, cancels a
+    parked wait if posting fails, and never performs the second receive without a proven wake. Local
+    validation passes all 150 `nt-process` tests, the freestanding executive check, formatting, and
+    diff checks.
+
+    Review adjustment: run one serialized `./run.sh --desktop` churn proof under the 3,600-second
+    ceiling with rust-micro `81bc6d8`. Require `[process-delete]` retirement followed by reuse of the
+    same dynamic pi at a newer generation, no admission `err=6`, no residual private paging cap,
+    successful Dbgk `dw2` and complete target-block proof, zero provider/cap teardown failures, and
+    the genuine Explorer framebuffer plus final sentinel. If Process Manager blockers remain, fix
+    their typed owner. If VSpace deletion still remains partial, fix the exact capability owner in
+    rust-micro or the executive ledger. Do not add capacity or fallback behavior. After that green
+    proof, audit whether normal provider pool frees are reclaiming; then build the dedicated real-
+    provider GetClassInfo integration client.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

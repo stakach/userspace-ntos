@@ -685,6 +685,45 @@ pub struct ProcessObjectDeletion {
     pub deleted_threads: usize,
 }
 
+/// Exact reasons the Process object type's delete procedure cannot yet run.
+///
+/// Termination signals EPROCESS/ETHREAD dispatcher objects; it does not delete them. This snapshot
+/// exposes the Object Manager references that must drain before deletion without leaking the
+/// process manager's private handle-table representation into the executive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessObjectDeleteBlockers {
+    pub state: Option<ProcessState>,
+    pub process_wait_references: u32,
+    pub debug_port_present: bool,
+    pub own_handle_slots: usize,
+    pub external_process_handles: usize,
+    pub first_external_process_handle_owner: Option<ProcessId>,
+    pub missing_threads: usize,
+    pub live_threads: usize,
+    pub thread_wait_references: u32,
+    pub thread_termination_ports: usize,
+    pub thread_impersonations: usize,
+    pub external_thread_handles: usize,
+    pub first_external_thread_handle_owner: Option<ProcessId>,
+    pub first_external_thread_handle_target: Option<ThreadId>,
+}
+
+impl ProcessObjectDeleteBlockers {
+    pub const fn delete_ready(self) -> bool {
+        matches!(self.state, Some(ProcessState::Terminated))
+            && self.process_wait_references == 0
+            && !self.debug_port_present
+            && self.own_handle_slots == 0
+            && self.external_process_handles == 0
+            && self.missing_threads == 0
+            && self.live_threads == 0
+            && self.thread_wait_references == 0
+            && self.thread_termination_ports == 0
+            && self.thread_impersonations == 0
+            && self.external_thread_handles == 0
+    }
+}
+
 impl NtProcess {
     /// `EPROCESS.DebugPort`.
     pub fn debug_port(&self) -> Option<DebugObjectId> {
@@ -801,6 +840,16 @@ impl HandleSlot {
         match self {
             Self::Occupied(entry) => Some(entry),
             Self::Free | Self::Reserved(_) | Self::Bound { .. } => None,
+        }
+    }
+
+    /// Any object reference already bound to this slot. A Bound entry is intentionally invisible
+    /// to user-mode lookup until publication, but it owns the target object just as an Occupied
+    /// handle does.
+    fn reference_entry(&self) -> Option<&HandleEntry> {
+        match self {
+            Self::Bound { entry, .. } | Self::Occupied(entry) => Some(entry),
+            Self::Free | Self::Reserved(_) => None,
         }
     }
 
@@ -3501,30 +3550,71 @@ impl ProcessManager {
     /// run. The debug port is detached here once its final event has been continued.
     pub fn process_object_delete_ready(&mut self, pid: ProcessId) -> bool {
         let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);
-        let Some(process) = self.processes.get(&pid) else {
-            return false;
+        self.process_object_delete_blockers(pid)
+            .is_some_and(ProcessObjectDeleteBlockers::delete_ready)
+    }
+
+    /// Snapshot every predicate used by [`Self::process_object_delete_ready`]. The scan is
+    /// allocation-free and reports the first external owner for process/thread handles so the host
+    /// can diagnose a reference leak without reaching into private Object Manager tables.
+    pub fn process_object_delete_blockers(
+        &self,
+        pid: ProcessId,
+    ) -> Option<ProcessObjectDeleteBlockers> {
+        let process = self.processes.get(&pid)?;
+        let mut blockers = ProcessObjectDeleteBlockers {
+            state: Some(process.state),
+            process_wait_references: process.wait_references,
+            debug_port_present: process.debug_port.is_some(),
+            own_handle_slots: process
+                .handles
+                .iter()
+                .filter(|slot| !slot.is_free())
+                .count(),
+            ..ProcessObjectDeleteBlockers::default()
         };
-        if process.state != ProcessState::Terminated
-            || process.wait_references != 0
-            || process.debug_port.is_some()
-            || process.handles.iter().any(|slot| !slot.is_free())
-            || self.handle_object_count(HandleObject::Process(pid)) != 0
-        {
-            return false;
-        }
-        for tid in &process.threads {
-            let Some(thread) = self.threads.get(tid) else {
-                return false;
-            };
-            if thread.state != ThreadState::Terminated
-                || thread.wait_references != 0
-                || !thread.termination_ports.is_empty()
-                || self.handle_object_count(HandleObject::Thread(*tid)) != 0
-            {
-                return false;
+
+        for (&owner_pid, owner) in self.processes.iter() {
+            for slot in &owner.handles {
+                let Some(entry) = slot.reference_entry() else {
+                    continue;
+                };
+                match entry.object {
+                    HandleObject::Process(target) if target == pid => {
+                        blockers.external_process_handles += 1;
+                        blockers
+                            .first_external_process_handle_owner
+                            .get_or_insert(owner_pid);
+                    }
+                    HandleObject::Thread(target)
+                        if process.threads.iter().any(|tid| *tid == target) =>
+                    {
+                        blockers.external_thread_handles += 1;
+                        if blockers.first_external_thread_handle_owner.is_none() {
+                            blockers.first_external_thread_handle_owner = Some(owner_pid);
+                            blockers.first_external_thread_handle_target = Some(target);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        true
+
+        for tid in &process.threads {
+            let Some(thread) = self.threads.get(tid) else {
+                blockers.missing_threads += 1;
+                continue;
+            };
+            blockers.live_threads += usize::from(thread.state != ThreadState::Terminated);
+            blockers.thread_wait_references = blockers
+                .thread_wait_references
+                .saturating_add(thread.wait_references);
+            blockers.thread_termination_ports = blockers
+                .thread_termination_ports
+                .saturating_add(thread.termination_ports.len());
+            blockers.thread_impersonations += usize::from(thread.impersonation.is_some());
+        }
+        Some(blockers)
     }
 
     pub fn job_active_process_ids_owned(&self, id: job::JobId) -> Result<Vec<ProcessId>, u32> {
@@ -4385,7 +4475,7 @@ impl ProcessManager {
         let object = {
             let process = self.processes.get(&pid)?;
             if process.state != ProcessState::Terminated
-                || self.handle_object_count(HandleObject::Process(pid)) != 0
+                || self.handle_object_reference_count(HandleObject::Process(pid)) != 0
             {
                 return None;
             }
@@ -4770,6 +4860,24 @@ impl ProcessManager {
                     .handles
                     .iter()
                     .filter(|entry| entry.entry().is_some_and(|entry| entry.object == object))
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Count every committed Object Manager reference, including handles bound into an invisible
+    /// publication transaction. Bare reservations do not yet name an object and are excluded.
+    pub fn handle_object_reference_count(&self, object: HandleObject) -> usize {
+        self.processes
+            .values()
+            .map(|process| {
+                process
+                    .handles
+                    .iter()
+                    .filter(|slot| {
+                        slot.reference_entry()
+                            .is_some_and(|entry| entry.object == object)
+                    })
                     .count()
             })
             .sum()

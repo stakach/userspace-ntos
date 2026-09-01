@@ -21801,6 +21801,9 @@ impl ExecNtHandler {
     /// service-loop drain rather than relying on the release site that happens to remove the last
     /// reference.
     pub(crate) fn try_delete_hosted_process_object(&mut self, pid: nt_process::ProcessId) -> bool {
+        if !self.pm.is_process_signaled(pid) {
+            return false;
+        }
         let Some(pi) = self.process_mechanisms.pi_for_pid(pid) else {
             return false;
         };
@@ -21808,8 +21811,12 @@ impl ExecNtHandler {
             return false;
         };
         let candidate = nt_user_host::ProcessDeletionCandidate::from_mechanism(process_mechanism);
-        if self.process_deletion_candidates.queue(candidate).is_err() {
-            return false;
+        let newly_queued = match self.process_deletion_candidates.queue(candidate) {
+            Ok(newly_queued) => newly_queued,
+            Err(_) => return false,
+        };
+        if newly_queued {
+            self.trace_hosted_process_delete_blockers(candidate);
         }
         let deleted = self.try_delete_hosted_process_object_exact(candidate);
         if deleted {
@@ -21818,6 +21825,80 @@ impl ExecNtHandler {
                 .expect("successful exact process deletion must retire its retry owner");
         }
         deleted
+    }
+
+    fn trace_hosted_process_delete_blockers(
+        &self,
+        candidate: nt_user_host::ProcessDeletionCandidate,
+    ) {
+        let pi = candidate.pi;
+        let blockers = self.pm.process_object_delete_blockers(candidate.pid);
+        print_str(b"[process-delete-pending] pi=");
+        print_u64(pi as u64);
+        print_str(b" pid=");
+        print_u64(candidate.pid as u64);
+        print_str(b" generation=");
+        print_u64(candidate.generation);
+        print_str(b" vspace=");
+        print_u64(self.process_vspaces.get(pi).copied().unwrap_or(1));
+        print_str(b" vspace-cap=");
+        print_u64(
+            self.process_vspace_caps
+                .get(pi)
+                .is_none_or(Option::is_some) as u64,
+        );
+        print_str(b" w32p=");
+        print_u64(self.pm.process_win32(candidate.pid).is_some() as u64);
+        if let Some(blockers) = blockers {
+            print_str(b" state=");
+            print_u64(match blockers.state {
+                Some(nt_process::ProcessState::Terminated) => 5,
+                Some(nt_process::ProcessState::Exiting) => 4,
+                Some(nt_process::ProcessState::Running) => 3,
+                Some(nt_process::ProcessState::Ready) => 2,
+                Some(nt_process::ProcessState::LoadingImage) => 1,
+                Some(nt_process::ProcessState::Created) | None => 0,
+            });
+            print_str(b" wait=");
+            print_u64(blockers.process_wait_references as u64);
+            print_str(b" debug=");
+            print_u64(blockers.debug_port_present as u64);
+            print_str(b" own-handles=");
+            print_u64(blockers.own_handle_slots as u64);
+            print_str(b" process-handles=");
+            print_u64(blockers.external_process_handles as u64);
+            print_str(b" process-owner=");
+            print_u64(
+                blockers
+                    .first_external_process_handle_owner
+                    .unwrap_or(0) as u64,
+            );
+            print_str(b" live-threads=");
+            print_u64(blockers.live_threads as u64);
+            print_str(b" missing-threads=");
+            print_u64(blockers.missing_threads as u64);
+            print_str(b" thread-wait=");
+            print_u64(blockers.thread_wait_references as u64);
+            print_str(b" term-ports=");
+            print_u64(blockers.thread_termination_ports as u64);
+            print_str(b" impersonations=");
+            print_u64(blockers.thread_impersonations as u64);
+            print_str(b" thread-handles=");
+            print_u64(blockers.external_thread_handles as u64);
+            print_str(b" thread-owner/target=");
+            print_u64(
+                blockers
+                    .first_external_thread_handle_owner
+                    .unwrap_or(0) as u64,
+            );
+            print_str(b"/");
+            print_u64(
+                blockers
+                    .first_external_thread_handle_target
+                    .unwrap_or(0) as u64,
+            );
+        }
+        print_str(b"\n");
     }
 
     fn try_delete_hosted_process_object_exact(
@@ -21913,6 +21994,7 @@ impl ExecNtHandler {
         let Some(deletion) = self.pm.delete_process_object_if_unreferenced(pid) else {
             return false;
         };
+        let deleted_threads = deletion.deleted_threads;
         if let Some(token) = deletion.primary_token {
             let _ = self.token_store.release(token);
         }
@@ -21960,6 +22042,15 @@ impl ExecNtHandler {
         self.pool_used[pi] = 0;
         self.drain_job_destructions();
         self.refresh_process_manager_gates();
+        print_str(b"[process-delete] retired pi=");
+        print_u64(pi as u64);
+        print_str(b" pid=");
+        print_u64(pid as u64);
+        print_str(b" generation=");
+        print_u64(candidate.generation);
+        print_str(b" threads=");
+        print_u64(deleted_threads as u64);
+        print_str(b"\n");
         true
     }
 

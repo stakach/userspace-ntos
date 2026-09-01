@@ -3745,6 +3745,78 @@ fn final_process_object_deletion_releases_job_membership() {
 }
 
 #[test]
+fn process_object_delete_blockers_report_exact_reference_owners() {
+    let mut pm = ProcessManager::new();
+    let owner = pm.create_process("owner.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    let tid = pm.create_thread(target, 0x1000, 0, false).unwrap();
+    let process_handle = pm
+        .insert_handle(owner, HandleObject::Process(target), PROCESS_ALL_ACCESS)
+        .unwrap();
+    let thread_handle = pm
+        .insert_handle(owner, HandleObject::Thread(tid), THREAD_ALL_ACCESS)
+        .unwrap();
+    pm.retain_process_wait_reference(target).unwrap();
+    pm.retain_thread_wait_reference(tid).unwrap();
+    pm.terminate_process(target, 0x55).unwrap();
+
+    let blockers = pm.process_object_delete_blockers(target).unwrap();
+    assert_eq!(blockers.state, Some(ProcessState::Terminated));
+    assert_eq!(blockers.process_wait_references, 1);
+    assert_eq!(blockers.thread_wait_references, 1);
+    assert_eq!(blockers.external_process_handles, 1);
+    assert_eq!(blockers.first_external_process_handle_owner, Some(owner));
+    assert_eq!(blockers.external_thread_handles, 1);
+    assert_eq!(blockers.first_external_thread_handle_owner, Some(owner));
+    assert_eq!(blockers.first_external_thread_handle_target, Some(tid));
+    assert!(!blockers.delete_ready());
+
+    pm.release_process_wait_reference(target).unwrap();
+    pm.release_thread_wait_reference(tid).unwrap();
+    pm.close_handle(owner, process_handle).unwrap();
+    pm.close_handle(owner, thread_handle).unwrap();
+    assert!(pm
+        .process_object_delete_blockers(target)
+        .unwrap()
+        .delete_ready());
+}
+
+#[test]
+fn bound_unpublished_process_handle_is_a_delete_reference() {
+    let mut pm = ProcessManager::new();
+    let owner = pm.create_process("owner.exe", None, None);
+    let target = pm.create_process("target.exe", None, None);
+    pm.create_thread(target, 0x1000, 0, false).unwrap();
+    let reservation = pm.try_reserve_handle_slot(owner).unwrap();
+    pm.bind_reserved_handle(
+        reservation,
+        HandleObject::Process(target),
+        PROCESS_ALL_ACCESS,
+    )
+    .unwrap();
+    pm.terminate_process(target, 0x55).unwrap();
+
+    assert_eq!(pm.handle_object_count(HandleObject::Process(target)), 0);
+    assert_eq!(
+        pm.handle_object_reference_count(HandleObject::Process(target)),
+        1
+    );
+    assert_eq!(
+        pm.process_object_delete_blockers(target)
+            .unwrap()
+            .external_process_handles,
+        1
+    );
+    assert!(!pm.process_object_delete_ready(target));
+
+    assert_eq!(
+        pm.cancel_bound_handle(reservation),
+        Ok(HandleObject::Process(target))
+    );
+    assert!(pm.process_object_delete_ready(target));
+}
+
+#[test]
 fn scheduler_cpu_publication_enforces_per_process_job_limit_once() {
     let mut pm = ProcessManager::new();
     let process = pm.create_process("limited.exe", None, None);
