@@ -253,15 +253,19 @@ const GUI_MESSAGE_WAITER_INITIAL_RESERVE: usize = 16;
 struct GuiMessageWaiter {
     used: bool,
     pi: u32,
+    process_generation: u64,
     badge: u64,
     tid: u64,
-    queue_event_body: u64,
+    queue_event: nt_kernel_exec::EventObjectId,
+    queue_event_lease: nt_kernel_exec::EventLeaseId,
+    event_selected: bool,
     msg_ptr: u64,
     hwnd_filter: u64,
     filter_min: u64,
     filter_max: u64,
     caller_sp: u64,
     reply_cap: u64,
+    reply_deleted: bool,
     reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
@@ -269,15 +273,19 @@ impl GuiMessageWaiter {
     const EMPTY: Self = Self {
         used: false,
         pi: 0,
+        process_generation: 0,
         badge: 0,
         tid: 0,
-        queue_event_body: 0,
+        queue_event: nt_kernel_exec::EventObjectId::NULL,
+        queue_event_lease: nt_kernel_exec::EventLeaseId::NULL,
+        event_selected: false,
         msg_ptr: 0,
         hwnd_filter: 0,
         filter_min: 0,
         filter_max: 0,
         caller_sp: 0,
         reply_cap: 0,
+        reply_deleted: false,
         reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
     };
 }
@@ -530,6 +538,9 @@ unsafe fn reset_deferred_user_callback_returns() {
 #[inline(never)]
 unsafe fn reset_gui_message_waiters() -> bool {
     let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    if waiters.iter().any(|waiter| waiter.used) {
+        return false;
+    }
     waiters.clear();
     if waiters.capacity() < GUI_MESSAGE_WAITER_INITIAL_RESERVE {
         let reserve = GUI_MESSAGE_WAITER_INITIAL_RESERVE - waiters.capacity();
@@ -823,6 +834,7 @@ pub(crate) fn gui_message_waiter_stats() -> (usize, usize, usize, u64, u64) {
 unsafe fn gui_message_waiter_alloc_slot() -> Option<usize> {
     let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
     if let Some(slot) = waiters.iter().position(|waiter| !waiter.used) {
+        assert!(waiters[slot].queue_event_lease.is_null());
         return Some(slot);
     }
     if waiters.len() == waiters.capacity() && waiters.try_reserve(1).is_err() {
@@ -840,13 +852,228 @@ unsafe fn gui_message_waiter_record(slot: usize) -> Option<GuiMessageWaiter> {
         .copied()
 }
 
-unsafe fn gui_message_waiter_clear_slot(slot: usize, reply_cap: u64) {
+unsafe fn gui_message_waiter_clear_slot(
+    slot: usize,
+    reply_cap: u64,
+    lease: nt_kernel_exec::EventLeaseId,
+) -> bool {
     let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
     if let Some(waiter) = waiters.get_mut(slot) {
-        if waiter.used && waiter.reply_cap == reply_cap {
+        if waiter.used && waiter.reply_cap == reply_cap && waiter.queue_event_lease == lease {
             *waiter = GuiMessageWaiter::EMPTY;
+            return true;
         }
     }
+    false
+}
+
+unsafe fn gui_message_waiter_unselect(slot: usize, lease: nt_kernel_exec::EventLeaseId) {
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    if let Some(waiter) = waiters.get_mut(slot) {
+        if waiter.used && waiter.queue_event_lease == lease {
+            waiter.event_selected = false;
+        }
+    }
+}
+
+unsafe fn gui_message_waiter_mark_reply_deleted(
+    slot: usize,
+    reply_cap: u64,
+    lease: nt_kernel_exec::EventLeaseId,
+) -> bool {
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    let Some(waiter) = waiters.get_mut(slot) else {
+        return false;
+    };
+    if !waiter.used || waiter.reply_cap != reply_cap || waiter.queue_event_lease != lease {
+        return false;
+    }
+    waiter.reply_deleted = true;
+    true
+}
+
+unsafe fn gui_message_wait_has_selected(event: nt_kernel_exec::EventObjectId) -> bool {
+    (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
+        .iter()
+        .any(|waiter| waiter.used && waiter.queue_event == event && waiter.event_selected)
+}
+
+unsafe fn gui_message_wait_reassign_selected(event: nt_kernel_exec::EventObjectId) -> bool {
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    let Some(waiter) = waiters.iter_mut().find(|waiter| {
+        waiter.used && waiter.queue_event == event && !waiter.event_selected
+    }) else {
+        return false;
+    };
+    waiter.event_selected = true;
+    true
+}
+
+unsafe fn gui_message_waiter_cancel_slot(
+    nt_handler: &mut ExecNtHandler,
+    slot: usize,
+    waiter: GuiMessageWaiter,
+    reconcile_signal: bool,
+) -> bool {
+    if !waiter.used || waiter.reply_cap == 0 || waiter.queue_event_lease.is_null() {
+        return false;
+    }
+    if !waiter.reply_deleted {
+        if cnode_delete_r(waiter.reply_cap) != 0 {
+            return false;
+        }
+        assert!(gui_message_waiter_mark_reply_deleted(
+            slot,
+            waiter.reply_cap,
+            waiter.queue_event_lease,
+        ));
+    }
+    if untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, waiter.reply_cap) != 0 {
+        return false;
+    }
+    release_reply_pool_cap(waiter.reply_cap);
+    assert!(gui_message_waiter_clear_slot(
+        slot,
+        waiter.reply_cap,
+        waiter.queue_event_lease
+    ));
+    if reconcile_signal && waiter.event_selected {
+        if !gui_message_wait_has_selected(waiter.queue_event)
+            && !gui_message_wait_reassign_selected(waiter.queue_event)
+        {
+            nt_handler
+                .cancel_event_signal(waiter.queue_event)
+                .expect("cancelled GUI waiter lost its selected signal lease");
+        }
+    }
+    nt_handler
+        .release_gui_event_wait(waiter.queue_event_lease)
+        .expect("cancelled GUI waiter lost its Event lease");
+    thread_wait_state_clear_badge(waiter.badge);
+    true
+}
+
+pub(crate) unsafe fn gui_message_wait_abandon_thread(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> bool {
+    let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
+    for slot in 0..waiter_count {
+        let Some(waiter) = gui_message_waiter_record(slot) else {
+            continue;
+        };
+        if waiter.used
+            && waiter.tid == tid
+            && !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, true)
+        {
+            return false;
+        }
+    }
+    thread_wait_state_clear_tid(nt_handler, tid);
+    true
+}
+
+pub(crate) unsafe fn gui_message_wait_abandon_process(
+    nt_handler: &mut ExecNtHandler,
+    pi: usize,
+    process_generation: u64,
+) -> bool {
+    let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
+    for slot in 0..waiter_count {
+        let Some(waiter) = gui_message_waiter_record(slot) else {
+            continue;
+        };
+        if !waiter.used || waiter.pi as usize != pi {
+            continue;
+        }
+        if waiter.process_generation != process_generation
+            || !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, true)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) unsafe fn gui_message_wait_select_level(
+    nt_handler: &mut ExecNtHandler,
+    event: nt_kernel_exec::EventObjectId,
+) -> bool {
+    gui_message_wait_select_level_inner(nt_handler, event, true)
+}
+
+unsafe fn gui_message_wait_select_level_inner(
+    nt_handler: &mut ExecNtHandler,
+    event: nt_kernel_exec::EventObjectId,
+    queue_signal: bool,
+) -> bool {
+    if event.is_null() {
+        return false;
+    }
+    let Ok((kind, signaled)) = nt_handler.event_ready_by_id(event) else {
+        return false;
+    };
+    if !matches!(kind, nt_kernel_exec::EventKind::Synchronization) || !signaled {
+        return false;
+    }
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    let already_selected = waiters
+        .iter()
+        .any(|waiter| waiter.used && waiter.queue_event == event && waiter.event_selected);
+    let Some(waiter) = waiters.iter_mut().find(|waiter| {
+        waiter.used && waiter.queue_event == event && !waiter.event_selected
+    }) else {
+        if already_selected && queue_signal {
+            nt_handler
+                .queue_event_signal(event)
+                .expect("selected GUI Event lost its registry identity");
+        }
+        return already_selected;
+    };
+    waiter.event_selected = true;
+    nt_handler
+        .consume_event_by_id(event)
+        .expect("selected GUI synchronization Event was not signaled");
+    if queue_signal {
+        nt_handler
+            .queue_event_signal(event)
+            .expect("selected GUI Event lost its registry identity");
+    }
+    true
+}
+
+pub(crate) unsafe fn gui_message_wait_select_pulse(
+    nt_handler: &mut ExecNtHandler,
+    event: nt_kernel_exec::EventObjectId,
+) -> bool {
+    if event.is_null() {
+        return false;
+    }
+    let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
+    let Some(waiter) = waiters
+        .iter_mut()
+        .find(|waiter| waiter.used && waiter.queue_event == event && !waiter.event_selected)
+    else {
+        return false;
+    };
+    waiter.event_selected = true;
+    nt_handler
+        .queue_event_signal(event)
+        .expect("selected GUI pulse lost its registry identity");
+    true
+}
+
+unsafe fn gui_message_wait_select_published(
+    nt_handler: &mut ExecNtHandler,
+    slot: usize,
+) -> bool {
+    let Some(waiter) = gui_message_waiter_record(slot) else {
+        return false;
+    };
+    if !waiter.used || waiter.event_selected {
+        return false;
+    }
+    gui_message_wait_select_level(nt_handler, waiter.queue_event)
 }
 
 /// Steal the reply object bound to the caller currently being serviced and rotate a fresh pool
@@ -1167,6 +1394,7 @@ unsafe fn drain_deferred_user_callback_returns(
             deferred.reply.resume_flags(),
         );
         let mut effects_ok;
+        let mut outer_dispatch_completed = false;
         if let Some(completion) = completion {
             let completion_pi = deferred.pi as usize;
             effects_ok = completion_pi < MAX_PI;
@@ -1211,6 +1439,7 @@ unsafe fn drain_deferred_user_callback_returns(
                             completion_scratch_base,
                         )
                     };
+                    outer_dispatch_completed = effects_ok;
                 }
             }
         } else {
@@ -1224,6 +1453,16 @@ unsafe fn drain_deferred_user_callback_returns(
             print_str(b" tid=");
             print_u64(deferred.tid);
             print_str(b"\n");
+        } else if outer_dispatch_completed {
+            pfilled[current_pi] = *current_filled_pages;
+            let (_, woken, safe) =
+                drain_selected_gui_event_signals(nt_handler, pfilled, procs);
+            if woken != 0 {
+                bump_progress();
+            }
+            if !safe {
+                print_str(b"[gui-msg-wait] deferred callback drain aborted unsafe redrive\n");
+            }
         }
         client_reply_on(deferred.reply_cap, 0, 0, 0, 0, 0);
         release_reply_pool_cap(deferred.reply_cap);
@@ -2440,7 +2679,7 @@ pub(crate) unsafe fn service_win32k_event_request(
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         crate::win32k_subsystem::W32_EVENT_OP_REFERENCE => handler
             .provider_reference_event(pi, arg1, arg3 as u32, arg2)
-            .map(|(body, metadata)| (0, body, metadata, 0))
+            .map(|(body, metadata, granted_access)| (0, body, metadata, granted_access as u64))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         crate::win32k_subsystem::W32_EVENT_OP_CLOSE => handler
             .provider_close_event(pi, arg1)
@@ -2461,6 +2700,50 @@ pub(crate) unsafe fn service_win32k_event_request(
         crate::win32k_subsystem::W32_EVENT_OP_RETAIN_POINTER => handler
             .provider_retain_event_pointer(arg1)
             .map(|count| (0, count as u64, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_SET => {
+            match handler.provider_set_event(arg1) {
+                Ok((previous, _id, index, _kind)) => {
+                    if !previous {
+                        let _ = crate::wait_wake_event_set(index, handler);
+                        let current = handler
+                            .provider_read_event(arg1)
+                            .expect("newly signalled provider Event lost its canonical identity");
+                        (0, u64::from(previous), u64::from(current), 0)
+                    } else {
+                        (0, 1, 1, 0)
+                    }
+                }
+                Err(status) => (status as i32, 0, 0, 0),
+            }
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_RESET => handler
+            .provider_reset_event(arg1)
+            .map(|previous| (0, u64::from(previous), 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_CLEAR => handler
+            .provider_clear_event(arg1)
+            .map(|()| (0, 0, 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_PULSE => {
+            match handler.provider_pulse_event(arg1) {
+                Ok((previous, _id, index, _kind)) => {
+                    if previous {
+                        handler
+                            .provider_reset_event(arg1)
+                            .expect("provider pulse lost its canonical Event identity");
+                        (0, 1, 0, 0)
+                    } else {
+                        let _ = crate::wait_wake_event_pulse(index, handler);
+                        (0, 0, 0, 0)
+                    }
+                }
+                Err(status) => (status as i32, 0, 0, 0),
+            }
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_READ => handler
+            .provider_read_event(arg1)
+            .map(|signaled| (0, u64::from(signaled), 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
     }
@@ -9213,6 +9496,7 @@ pub(crate) unsafe fn service_sec_image(
                                     b"[win32k-context] ERROR: callback completion could not publish Ps identity\n",
                                 );
                             }
+                            let mut outer_dispatch_completed = false;
                             if let Some(dispatch) = completion.outer_dispatch {
                                 if !process_completed_user_callback_outer_dispatch(
                                     nt_handler,
@@ -9231,6 +9515,22 @@ pub(crate) unsafe fn service_sec_image(
                                         dispatch.ssn,
                                         dispatch.args[1]
                                     );
+                                } else {
+                                    outer_dispatch_completed = true;
+                                }
+                            }
+                            if outer_dispatch_completed {
+                                pfilled[pi] = *filled_pages;
+                                let (_, woken, safe) = drain_selected_gui_event_signals(
+                                    &mut nt_handler,
+                                    pfilled,
+                                    procs,
+                                );
+                                if woken != 0 {
+                                    bump_progress();
+                                }
+                                if !safe {
+                                    print_str(b"[gui-msg-wait] callback drain aborted unsafe redrive\n");
                                 }
                             }
                             drain_deferred_user_callback_returns(
@@ -14854,23 +15154,19 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
-                if !gui_message_wait_park_request {
-                    let mut local_event_signals = 0u64;
-                    let mut gui_message_waits_woken = 0u64;
-                    while let Some(event_body) = win32k_subsystem::take_local_event_signal_body() {
-                        local_event_signals += 1;
-                        gui_message_waits_woken += gui_message_wait_redrive_event(
-                            &mut nt_handler,
-                            event_body,
-                            pfilled,
-                            procs,
-                        );
+                if !gui_message_wait_park_request
+                    && ok
+                    && !callback_suspended
+                    && !redirected_user_callback
+                {
+                    let (_, gui_message_waits_woken, drain_safe) =
+                        drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
+                    if gui_message_waits_woken != 0 {
+                        bump_progress();
                     }
-                    if local_event_signals != 0 {
-                        let _ = wait_wake_dispatcher_set(&mut nt_handler);
-                        if gui_message_waits_woken != 0 {
-                            bump_progress();
-                        }
+                    if !drain_safe {
+                        ok = false;
+                        st = 0xC000_0001;
                     }
                 }
                 // Throttle the status line for the same hot class-loop SSNs. Real provider walls
@@ -15271,8 +15567,15 @@ pub(crate) unsafe fn service_sec_image(
             pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             if gui_message_wait_park_request {
-                if reply_main != 0
+                let (_, already_woken, prepark_safe) =
+                    drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
+                if already_woken != 0 {
+                    bump_progress();
+                }
+                if prepark_safe
+                    && reply_main != 0
                     && gui_message_wait_park(
+                        &mut nt_handler,
                         pi as u32,
                         badge,
                         current_tid,
@@ -15285,39 +15588,15 @@ pub(crate) unsafe fn service_sec_image(
                         parked_syscall_reply,
                     )
                 {
-                    let mut local_event_signals = 0u64;
-                    let mut gui_message_waits_woken = 0u64;
-                    while let Some(event_body) = win32k_subsystem::take_local_event_signal_body() {
-                        local_event_signals += 1;
-                        gui_message_waits_woken += gui_message_wait_redrive_event(
-                            &mut nt_handler,
-                            event_body,
-                            pfilled,
-                            procs,
-                        );
-                    }
-                    if gui_message_wait_queue_event_body != 0
-                        && win32k_subsystem::event_body_ready(gui_message_wait_queue_event_body)
-                    {
+                    let (event_signals, gui_message_waits_woken, _drain_safe) =
+                        drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
+                    if event_signals != 0 {
                         GUI_MESSAGE_WAIT_READY_REDRIVES.fetch_add(1, Ordering::Relaxed);
-                        gui_message_waits_woken += gui_message_wait_redrive_event(
-                            &mut nt_handler,
-                            gui_message_wait_queue_event_body,
-                            pfilled,
-                            procs,
-                        );
                     }
-                    if local_event_signals != 0 || gui_message_waits_woken != 0 {
-                        let _ = wait_wake_dispatcher_set(&mut nt_handler);
-                        if gui_message_waits_woken != 0 {
-                            bump_progress();
-                        }
+                    if gui_message_waits_woken != 0 {
+                        bump_progress();
                     }
-                    if gui_message_wait_was_replied(
-                        gui_message_wait_queue_event_body,
-                        pi as u32,
-                        badge,
-                    ) {
+                    if gui_message_wait_was_replied(pi as u32, badge) {
                         let _ = finalize_service_loop_state(&mut nt_handler);
                         let received =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
@@ -21767,6 +22046,7 @@ pub(crate) unsafe fn lpc_request_wait_abandon_thread(
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn gui_message_wait_park(
+    nt_handler: &mut ExecNtHandler,
     pi: u32,
     badge: u64,
     tid: u64,
@@ -21791,23 +22071,47 @@ unsafe fn gui_message_wait_park(
     let Some((fresh_index, fresh)) = wait_reply_pool_find_free() else {
         return false;
     };
+    let pi_index = pi as usize;
+    let Some(process_generation) = nt_handler.hosted_process_generation(pi_index) else {
+        return false;
+    };
+    let Some(process_id) = nt_handler.pm_pid_for_pi(pi_index) else {
+        return false;
+    };
+    if !nt_handler
+        .pm
+        .thread(tid as nt_process::ThreadId)
+        .is_some_and(|thread| thread.process_id == process_id && thread.exit_status.is_none())
+    {
+        return false;
+    }
+    let Ok((queue_event, queue_event_lease)) =
+        nt_handler.acquire_gui_event_wait(queue_event_body)
+    else {
+        return false;
+    };
     {
         let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
         table[slot] = GuiMessageWaiter {
             used: true,
             pi,
+            process_generation,
             badge,
             tid,
-            queue_event_body,
+            queue_event,
+            queue_event_lease,
+            event_selected: false,
             msg_ptr,
             hwnd_filter,
             filter_min,
             filter_max,
             caller_sp,
             reply_cap: stolen,
+            reply_deleted: false,
             reply,
         };
     }
+    let _ = gui_message_wait_select_published(nt_handler, slot);
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
     let n = GUI_MESSAGE_WAIT_PARKED.fetch_add(1, Ordering::Relaxed);
@@ -21827,24 +22131,36 @@ unsafe fn gui_message_wait_park(
     true
 }
 
-unsafe fn gui_message_wait_was_replied(queue_event_body: u64, pi: u32, badge: u64) -> bool {
+unsafe fn gui_message_wait_was_replied(pi: u32, badge: u64) -> bool {
     let table = &*core::ptr::addr_of!(GUI_MESSAGE_WAITERS);
-    !table.iter().any(|waiter| {
-        waiter.used
-            && waiter.queue_event_body == queue_event_body
-            && waiter.pi == pi
-            && waiter.badge == badge
-    })
+    !table
+        .iter()
+        .any(|waiter| waiter.used && waiter.pi == pi && waiter.badge == badge)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GuiEventRedriveDisposition {
+    Complete,
+    Retry,
+    Unsafe,
+}
+
+struct GuiEventRedriveResult {
+    woken: u64,
+    disposition: GuiEventRedriveDisposition,
 }
 
 unsafe fn gui_message_wait_redrive_event(
     nt_handler: &mut ExecNtHandler,
-    event_body: u64,
+    event: nt_kernel_exec::EventObjectId,
     pfilled: &[[u64; 512]],
     procs: &[ProcExec],
-) -> u64 {
-    if event_body == 0 {
-        return 0;
+) -> GuiEventRedriveResult {
+    if event.is_null() {
+        return GuiEventRedriveResult {
+            woken: 0,
+            disposition: GuiEventRedriveDisposition::Complete,
+        };
     }
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -21862,17 +22178,38 @@ unsafe fn gui_message_wait_redrive_event(
     let saved_flags = nt_handler.current_flags;
     let saved_ctx = nt_handler.loop_ctx.take();
     let mut woken = 0u64;
+    let mut disposition = GuiEventRedriveDisposition::Complete;
 
     let waiter_count = (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).len();
     for slot in 0..waiter_count {
         let Some(waiter) = gui_message_waiter_record(slot) else {
             continue;
         };
-        if !waiter.used || waiter.queue_event_body != event_body {
+        if !waiter.used || waiter.queue_event != event || !waiter.event_selected {
+            continue;
+        }
+        if waiter.reply_deleted {
+            if !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, false) {
+                disposition = GuiEventRedriveDisposition::Retry;
+                break;
+            }
             continue;
         }
         let pi = waiter.pi as usize;
-        if pi >= MAX_PI {
+        let live_identity = pi < MAX_PI
+            && nt_handler.hosted_process_generation(pi) == Some(waiter.process_generation)
+            && nt_handler
+                .pm
+                .thread(waiter.tid as nt_process::ThreadId)
+                .is_some_and(|thread| {
+                    thread.exit_status.is_none()
+                        && nt_handler.pm_pid_for_pi(pi) == Some(thread.process_id)
+                });
+        if !live_identity {
+            if !gui_message_waiter_cancel_slot(nt_handler, slot, waiter, false) {
+                disposition = GuiEventRedriveDisposition::Retry;
+                break;
+            }
             continue;
         }
         GUI_MESSAGE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
@@ -21923,7 +22260,7 @@ unsafe fn gui_message_wait_redrive_event(
             client,
         );
         if win32k_glue::take_user_callback_pump_suspended() {
-            let _ = win32k_glue::cancel_suspended_user_callback();
+            let (_, stack_ok) = win32k_glue::cancel_suspended_user_callback();
             let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
                 print_str(b"[gui-msg-wait] callback during PeekMessage redrive pi=");
@@ -21932,9 +22269,26 @@ unsafe fn gui_message_wait_redrive_event(
                 print_u64(waiter.badge);
                 print_str(b" -> keep parked\n");
             }
-            continue;
+            disposition = if stack_ok {
+                GuiEventRedriveDisposition::Retry
+            } else {
+                GuiEventRedriveDisposition::Unsafe
+            };
+            break;
         }
-        if !peek.1 || peek.0 == 0 {
+        if !peek.1 {
+            let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[gui-msg-wait] PeekMessage redrive WALL pi=");
+                print_u64(waiter.pi as u64);
+                print_str(b" badge=");
+                print_u64(waiter.badge);
+                print_str(b" -> keep parked\n");
+            }
+            disposition = GuiEventRedriveDisposition::Unsafe;
+            break;
+        }
+        if peek.0 == 0 {
             let n = GUI_MESSAGE_WAIT_STILL_EMPTY.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
                 print_str(b"[gui-msg-wait] redrive still empty pi=");
@@ -21942,9 +22296,10 @@ unsafe fn gui_message_wait_redrive_event(
                 print_str(b" badge=");
                 print_u64(waiter.badge);
                 print_str(b" queue-event=0x");
-                print_hex_u64(event_body);
+                print_hex_u64(event.0 .0);
                 print_str(b"\n");
             }
+            gui_message_waiter_unselect(slot, waiter.queue_event_lease);
             continue;
         }
 
@@ -21961,7 +22316,7 @@ unsafe fn gui_message_wait_redrive_event(
             client,
         );
         if win32k_glue::take_user_callback_pump_suspended() {
-            let _ = win32k_glue::cancel_suspended_user_callback();
+            let (_, stack_ok) = win32k_glue::cancel_suspended_user_callback();
             let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
                 print_str(b"[gui-msg-wait] callback during GetMessage redrive pi=");
@@ -21970,7 +22325,12 @@ unsafe fn gui_message_wait_redrive_event(
                 print_u64(waiter.badge);
                 print_str(b" -> keep parked\n");
             }
-            continue;
+            disposition = if stack_ok {
+                GuiEventRedriveDisposition::Retry
+            } else {
+                GuiEventRedriveDisposition::Unsafe
+            };
+            break;
         }
         if !get.1 {
             let n = GUI_MESSAGE_WAIT_TRACE.fetch_add(1, Ordering::Relaxed);
@@ -21981,7 +22341,8 @@ unsafe fn gui_message_wait_redrive_event(
                 print_u64(waiter.badge);
                 print_str(b" -> keep parked\n");
             }
-            continue;
+            disposition = GuiEventRedriveDisposition::Unsafe;
+            break;
         }
 
         let staged_message = core::ptr::read_unaligned((arg + 8) as *const u32);
@@ -21995,6 +22356,7 @@ unsafe fn gui_message_wait_redrive_event(
                 print_u64(waiter.badge);
                 print_str(b"\n");
             }
+            gui_message_waiter_unselect(slot, waiter.queue_event_lease);
             continue;
         }
         let output = core::slice::from_raw_parts(arg as *const u8, WIN32K_MSG_BYTES);
@@ -22007,11 +22369,17 @@ unsafe fn gui_message_wait_redrive_event(
             scratch_base,
         );
         let status = if copy_ok { get.0 } else { u64::MAX };
-        win32k_subsystem::event_body_consume(event_body);
         reply_parked_syscall(waiter.reply_cap, waiter.reply, status);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
-        gui_message_waiter_clear_slot(slot, waiter.reply_cap);
+        assert!(gui_message_waiter_clear_slot(
+            slot,
+            waiter.reply_cap,
+            waiter.queue_event_lease
+        ));
+        nt_handler
+            .release_gui_event_wait(waiter.queue_event_lease)
+            .expect("completed GUI waiter lost its Event lease");
         woken += 1;
         let n = GUI_MESSAGE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
         if n < 32 {
@@ -22045,7 +22413,47 @@ unsafe fn gui_message_wait_redrive_event(
     nt_handler.current_sp = saved_sp;
     nt_handler.current_flags = saved_flags;
     nt_handler.loop_ctx = saved_ctx;
-    woken
+    GuiEventRedriveResult {
+        woken,
+        disposition,
+    }
+}
+
+unsafe fn drain_selected_gui_event_signals(
+    nt_handler: &mut ExecNtHandler,
+    pfilled: &[[u64; 512]],
+    procs: &[ProcExec],
+) -> (u64, u64, bool) {
+    let mut signals = 0u64;
+    let mut woken = 0u64;
+    let budget = nt_handler.queued_event_signal_count();
+    let mut safe = true;
+    for _ in 0..budget {
+        let Some(signal) = nt_handler.take_event_signal() else {
+            break;
+        };
+        signals += 1;
+        if !gui_message_wait_has_selected(signal.id) {
+            let _ = gui_message_wait_select_level_inner(nt_handler, signal.id, false);
+        }
+        let result = gui_message_wait_redrive_event(nt_handler, signal.id, pfilled, procs);
+        woken += result.woken;
+        match result.disposition {
+            GuiEventRedriveDisposition::Complete => nt_handler
+                .complete_event_signal(signal.id)
+                .expect("delivered GUI Event signal lost its registry lease"),
+            GuiEventRedriveDisposition::Retry | GuiEventRedriveDisposition::Unsafe => {
+                nt_handler
+                    .retry_event_signal(signal.id)
+                    .expect("incomplete GUI Event delivery lost its registry lease");
+                if result.disposition == GuiEventRedriveDisposition::Unsafe {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+    }
+    (signals, woken, safe)
 }
 
 unsafe fn io_completion_park(

@@ -2578,6 +2578,7 @@ const WAITER_MAX_EVENTS: usize = 64;
 #[derive(Clone, Copy)]
 struct ObjectWaiterRecord {
     objects: [WaitObject; WAITER_MAX_EVENTS],
+    event_leases: [nt_kernel_exec::EventLeaseId; WAITER_MAX_EVENTS],
     result_indices: [u8; WAITER_MAX_EVENTS],
     count: u8,
     wait_all: bool,
@@ -2599,6 +2600,7 @@ impl ObjectWaiterRecord {
     const fn empty() -> Self {
         Self {
             objects: [WaitObject::FREE; WAITER_MAX_EVENTS],
+            event_leases: [nt_kernel_exec::EventLeaseId::NULL; WAITER_MAX_EVENTS],
             result_indices: [0; WAITER_MAX_EVENTS],
             count: 0,
             wait_all: false,
@@ -2624,6 +2626,7 @@ impl ObjectWaiterRecord {
     #[allow(clippy::too_many_arguments)]
     fn new(
         objects: &[WaitObject],
+        event_leases: &[nt_kernel_exec::EventLeaseId],
         result_indices: &[u8],
         wait_all: bool,
         alertable: bool,
@@ -2640,6 +2643,7 @@ impl ObjectWaiterRecord {
         let mut record = Self::empty();
         for (index, object) in objects.iter().copied().enumerate() {
             record.objects[index] = object;
+            record.event_leases[index] = event_leases[index];
             record.result_indices[index] = result_indices[index];
         }
         record.count = objects.len() as u8;
@@ -18432,13 +18436,9 @@ unsafe fn wait_park(
 }
 
 fn release_wait_object_references(handler: &mut ExecNtHandler, record: ObjectWaiterRecord) {
-    for object in record.objects[..record.count as usize]
-        .iter()
-        .copied()
-        .rev()
-    {
+    for index in (0..record.count as usize).rev() {
         handler
-            .release_wait_object_reference(object)
+            .release_wait_object_reference(record.objects[index], record.event_leases[index])
             .expect("parked wait lost its retained object reference");
     }
 }
@@ -19295,6 +19295,9 @@ unsafe fn terminate_hosted_thread_mechanism(
         Some(_) => return false,
     };
     notify_thread_termination_ports(tid, handler);
+    if !crate::service_sec_image::gui_message_wait_abandon_thread(handler, tid) {
+        return false;
+    }
     if !release_hosted_thread_win32_context(tid, handler) {
         return false;
     }
@@ -19572,22 +19575,28 @@ unsafe fn wait_park_multi(
     // before the waiter record becomes visible. If any retain fails, roll the partial set back in
     // reverse order and leave the caller's reply object untouched.
     let mut retained = 0usize;
+    let mut event_leases = [nt_kernel_exec::EventLeaseId::NULL; WAITER_MAX_EVENTS];
     for object in objects.iter().copied() {
-        if handler.retain_wait_object_reference(object).is_err() {
-            for retained_object in objects[..retained].iter().copied().rev() {
-                handler
-                    .release_wait_object_reference(retained_object)
-                    .expect("wait-reference rollback lost its retained object");
+        let lease = match handler.retain_wait_object_reference(object) {
+            Ok(lease) => lease,
+            Err(_) => {
+                for index in (0..retained).rev() {
+                    handler
+                        .release_wait_object_reference(objects[index], event_leases[index])
+                        .expect("wait-reference rollback lost its retained object");
+                }
+                WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
+                return false;
             }
-            WAIT_PARK_INVALID_SET.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
+        };
+        event_leases[retained] = lease;
         retained += 1;
     }
     // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
     if !object_waiter_park(ObjectWaiterRecord::new(
         objects,
+        &event_leases[..objects.len()],
         result_indices,
         wait_all,
         alertable,
@@ -19601,9 +19610,9 @@ unsafe fn wait_park_multi(
         deadline,
         reply,
     )) {
-        for object in objects.iter().copied().rev() {
+        for index in (0..objects.len()).rev() {
             handler
-                .release_wait_object_reference(object)
+                .release_wait_object_reference(objects[index], event_leases[index])
                 .expect("failed waiter publication lost its retained object");
         }
         WAIT_PARK_NO_WAITER_SLOT.fetch_add(1, Ordering::Relaxed);
@@ -19618,7 +19627,13 @@ unsafe fn wait_park_multi(
 /// Wake every waiter whose NT wait-object condition is satisfied. Synchronization events and
 /// semaphore tokens are consumed in waiter-slot order; process/thread objects are level-signalled.
 unsafe fn wait_wake_dispatcher_set(handler: &mut ExecNtHandler) -> u64 {
-    wait_wake_dispatcher(handler, None)
+    wait_wake_dispatcher(handler, None).woken
+}
+
+#[derive(Clone, Copy)]
+struct DispatcherWakeResult {
+    woken: u64,
+    pulse_event_consumed: bool,
 }
 
 /// Close the readiness-to-registration window between native syscall dispatch and reply-cap
@@ -19631,11 +19646,37 @@ unsafe fn wait_recheck_after_park(handler: &mut ExecNtHandler, tid: u64) -> bool
 }
 
 /// Pulse uses the same waiter selection, but clears the event before any parked thread resumes.
-unsafe fn wait_wake_dispatcher_pulse(just_set: usize, handler: &mut ExecNtHandler) -> u64 {
+unsafe fn wait_wake_dispatcher_pulse(
+    just_set: usize,
+    handler: &mut ExecNtHandler,
+) -> DispatcherWakeResult {
     wait_wake_dispatcher(handler, Some(just_set))
 }
 
-unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<usize>) -> u64 {
+/// Complete one false-to-true Event transition across native and hosted-GUI wait owners.
+unsafe fn wait_wake_event_set(index: usize, handler: &mut ExecNtHandler) -> u64 {
+    let woken = wait_wake_dispatcher_set(handler);
+    if let Some(id) = handler.event_id_for_index(index) {
+        crate::service_sec_image::gui_message_wait_select_level(handler, id);
+    }
+    woken
+}
+
+/// Complete one pulse selection before the transient Event state can reach a late waiter.
+unsafe fn wait_wake_event_pulse(index: usize, handler: &mut ExecNtHandler) -> u64 {
+    let result = wait_wake_dispatcher_pulse(index, handler);
+    if !result.pulse_event_consumed {
+        if let Some(id) = handler.event_id_for_index(index) {
+            crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
+        }
+    }
+    result.woken
+}
+
+unsafe fn wait_wake_dispatcher(
+    handler: &mut ExecNtHandler,
+    pulse_event: Option<usize>,
+) -> DispatcherWakeResult {
     object_waiter_clear_pending_wakes();
     let waiter_count = object_waiter_len();
     for i in 0..waiter_count {
@@ -19726,6 +19767,14 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
         object_waiter_mark_pending_wake(i, wake_index, wake_object);
     }
 
+    let pulse_event_consumed = pulse_event.is_some_and(|index| {
+        handler
+            .events
+            .query_existing(index as u64)
+            .is_some_and(|(kind, signaled)| {
+                matches!(kind, nt_kernel_exec::EventKind::Synchronization) && !signaled
+            })
+    });
     if let Some(index) = pulse_event {
         let _ = handler.events.reset_existing(index as u64);
     }
@@ -19773,7 +19822,10 @@ unsafe fn wait_wake_dispatcher(handler: &mut ExecNtHandler, pulse_event: Option<
         // Free the slot.
         object_waiter_clear_slot(i);
     }
-    woken
+    DispatcherWakeResult {
+        woken,
+        pulse_event_consumed,
+    }
 }
 
 unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {

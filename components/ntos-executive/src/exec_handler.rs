@@ -12033,7 +12033,7 @@ impl ExecNtHandler {
         if !previous {
             // SAFETY: native dispatch is serialized; the signal and waiter selection are one
             // executive transition.
-            unsafe { wait_wake_dispatcher_set(self) };
+            unsafe { wait_wake_event_set(index, self) };
         }
         0
     }
@@ -12738,6 +12738,12 @@ impl ExecNtHandler {
         &mut self,
         object: nt_kernel_exec::DispatcherSignalObject,
     ) -> u32 {
+        let transitioned_event = match object {
+            nt_kernel_exec::DispatcherSignalObject::Event(identity) => {
+                (!self.events.read_state(identity)).then_some(identity as usize)
+            }
+            _ => None,
+        };
         match nt_kernel_exec::signal_dispatcher_for_wait(
             &mut self.events,
             &mut self.semaphores,
@@ -12749,7 +12755,12 @@ impl ExecNtHandler {
                 // caller's wait below are one executive transition, so no signal-state mutation can
                 // interleave between the two halves of NtSignalAndWaitForSingleObject.
                 unsafe {
-                    wait_wake_dispatcher_set(self);
+                    let _ = wait_wake_dispatcher_set(self);
+                    if let Some(index) = transitioned_event {
+                        if let Some(id) = self.event_id_for_index(index) {
+                            crate::service_sec_image::gui_message_wait_select_level(self, id);
+                        }
+                    }
                 }
                 0
             }
@@ -13209,33 +13220,86 @@ impl ExecNtHandler {
 
     /// Pin the exact object identity stored in a published wait record. Handle capture has already
     /// enforced access; these owner-specific references only prevent destruction or slot reuse.
-    pub(crate) fn retain_wait_object_reference(&mut self, object: WaitObject) -> Result<(), u32> {
+    pub(crate) fn retain_wait_object_reference(
+        &mut self,
+        object: WaitObject,
+    ) -> Result<nt_kernel_exec::EventLeaseId, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         match object.kind() {
-            WaitObject::KIND_DISPATCHER => {
-                self.retain_dispatcher_wait_reference(object.id() as usize)
-            }
+            WaitObject::KIND_DISPATCHER => match self
+                .event_objects
+                .id_for_native(object.id())
+            {
+                Some(id) => self
+                    .event_objects
+                    .acquire_wait(id, nt_kernel_exec::EventLeaseKind::NativeWait)
+                    .map_err(|_| STATUS_INVALID_HANDLE),
+                None => self
+                    .retain_dispatcher_wait_reference(object.id() as usize)
+                    .map(|()| nt_kernel_exec::EventLeaseId::NULL),
+            },
             WaitObject::KIND_PROCESS => self
                 .pm
-                .retain_process_wait_reference(object.id() as nt_process::ProcessId),
+                .retain_process_wait_reference(object.id() as nt_process::ProcessId)
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
             WaitObject::KIND_THREAD => self
                 .pm
-                .retain_thread_wait_reference(object.id() as nt_process::ThreadId),
-            WaitObject::KIND_FILE => self.file_completion.retain_file(object.id()),
-            WaitObject::KIND_FAT_FILE => self.readonly_file_opens.retain_io(object.id() as u32),
-            WaitObject::KIND_FAT_DIRECTORY => self.directory_opens.retain_io(object.id() as u32),
+                .retain_thread_wait_reference(object.id() as nt_process::ThreadId)
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
+            WaitObject::KIND_FILE => self
+                .file_completion
+                .retain_file(object.id())
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
+            WaitObject::KIND_FAT_FILE => self
+                .readonly_file_opens
+                .retain_io(object.id() as u32)
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
+            WaitObject::KIND_FAT_DIRECTORY => self
+                .directory_opens
+                .retain_io(object.id() as u32)
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
             WaitObject::KIND_OVERLAY_FILE => unsafe {
                 crate::writable_fs::retain_io_reference(object.id())
-            },
+            }
+            .map(|()| nt_kernel_exec::EventLeaseId::NULL),
             WaitObject::KIND_JOB => self
                 .pm
-                .retain_job_wait_reference(object.id() as nt_process::job::JobId),
+                .retain_job_wait_reference(object.id() as nt_process::job::JobId)
+                .map(|()| nt_kernel_exec::EventLeaseId::NULL),
             _ => Err(STATUS_INVALID_HANDLE),
         }
     }
 
-    pub(crate) fn release_wait_object_reference(&mut self, object: WaitObject) -> Result<(), u32> {
+    pub(crate) fn release_wait_object_reference(
+        &mut self,
+        object: WaitObject,
+        event_lease: nt_kernel_exec::EventLeaseId,
+    ) -> Result<(), u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+        if !event_lease.is_null() {
+            if object.kind() != WaitObject::KIND_DISPATCHER {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            let id = self
+                .event_objects
+                .event_for_lease(event_lease, nt_kernel_exec::EventLeaseKind::NativeWait)
+                .map_err(|_| STATUS_INVALID_HANDLE)?;
+            let snapshot = self
+                .event_objects
+                .snapshot(id)
+                .map_err(|_| STATUS_INVALID_HANDLE)?;
+            if snapshot.native_identity != object.id() {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+            if let Some(retired) = self
+                .event_objects
+                .release_wait(event_lease, nt_kernel_exec::EventLeaseKind::NativeWait)
+                .map_err(|_| STATUS_INVALID_HANDLE)?
+            {
+                self.finalize_retired_event_object(retired);
+            }
+            return Ok(());
+        }
         match object.kind() {
             WaitObject::KIND_DISPATCHER => {
                 self.release_dispatcher_wait_reference(object.id() as usize)
@@ -21985,6 +22049,15 @@ impl ExecNtHandler {
         {
             return false;
         }
+        if !unsafe {
+            crate::service_sec_image::gui_message_wait_abandon_process(
+                self,
+                pi,
+                process_mechanism.generation,
+            )
+        } {
+            return false;
+        }
         if self.process_vspaces.get(pi).copied().unwrap_or(0) != 0
             || self
                 .process_vspace_caps
@@ -25546,6 +25619,9 @@ impl ExecNtHandler {
         }
         self.events.remove_existing(index as u64);
         self.obj_ns[index].unlink();
+        if retired.provider_body.is_some() {
+            unsafe { crate::win32k_subsystem::mark_event_provider_reclaim_pending() };
+        }
     }
 
     /// Remove a nonpermanent Event from name lookup once its last handle closes, then request
@@ -25627,21 +25703,227 @@ impl ExecNtHandler {
         handle: u64,
         desired_access: u32,
         proposed_body: u64,
-    ) -> Result<(u64, u64), u32> {
+    ) -> Result<(u64, u64, u32), u32> {
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         let (id, index) = self.event_object_for_handle_in_pi(pi, handle, desired_access)?;
+        let pid = self
+            .pm_pid_for_pi(pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let granted_access = self
+            .pm
+            .handle_access(pid, handle as nt_process::Handle)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let body = self
             .event_objects
             .retain_pointer_or_install(id, proposed_body)
             .map(|(body, _)| body)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
         let Some((kind, signaled)) = self.events.query_existing(index as u64) else {
-            let _ = self.event_objects.release_pointer_by_body(body);
+            if let Ok(Some(retired)) = self.event_objects.release_pointer_by_body(body) {
+                self.finalize_retired_event_object(retired);
+            }
             return Err(nt_process::STATUS_INVALID_HANDLE);
         };
         let metadata = u64::from(matches!(kind, EventKind::Synchronization))
             | (u64::from(signaled) << 1);
-        Ok((body, metadata))
+        Ok((body, metadata, granted_access))
+    }
+
+    fn provider_event_identity(
+        &self,
+        body: u64,
+    ) -> Result<
+        (
+            nt_kernel_exec::EventObjectId,
+            usize,
+            nt_kernel_exec::EventKind,
+            bool,
+        ),
+        u32,
+    > {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let id = self
+            .event_objects
+            .id_for_provider_body(body)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let index = usize::try_from(snapshot.native_identity).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let (kind, signaled) = self
+            .events
+            .query_existing(index as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((id, index, kind, signaled))
+    }
+
+    pub(crate) fn provider_set_event(
+        &mut self,
+        body: u64,
+    ) -> Result<(bool, nt_kernel_exec::EventObjectId, usize, nt_kernel_exec::EventKind), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (id, index, kind, _) = self.provider_event_identity(body)?;
+        let previous = self
+            .events
+            .set_existing(index as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((previous, id, index, kind))
+    }
+
+    pub(crate) fn provider_reset_event(&mut self, body: u64) -> Result<bool, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (_, index, _, _) = self.provider_event_identity(body)?;
+        self.events
+            .reset_existing(index as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_clear_event(&mut self, body: u64) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (_, index, _, _) = self.provider_event_identity(body)?;
+        self.events
+            .clear_existing(index as u64)
+            .then_some(())
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_pulse_event(
+        &mut self,
+        body: u64,
+    ) -> Result<(bool, nt_kernel_exec::EventObjectId, usize, nt_kernel_exec::EventKind), u32> {
+        self.provider_set_event(body)
+    }
+
+    pub(crate) fn provider_read_event(&self, body: u64) -> Result<bool, u32> {
+        self.provider_event_identity(body)
+            .map(|(_, _, _, signaled)| signaled)
+    }
+
+    pub(crate) fn acquire_gui_event_wait(
+        &mut self,
+        body: u64,
+    ) -> Result<(nt_kernel_exec::EventObjectId, nt_kernel_exec::EventLeaseId), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (id, _, kind, _) = self.provider_event_identity(body)?;
+        if !matches!(kind, nt_kernel_exec::EventKind::Synchronization) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let lease = self
+            .event_objects
+            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::GuiWait)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        Ok((id, lease))
+    }
+
+    pub(crate) fn release_gui_event_wait(
+        &mut self,
+        lease: nt_kernel_exec::EventLeaseId,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if let Some(retired) = self
+            .event_objects
+            .release_wait(lease, nt_kernel_exec::EventLeaseKind::GuiWait)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?
+        {
+            self.finalize_retired_event_object(retired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn event_ready_by_id(
+        &self,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<(nt_kernel_exec::EventKind, bool), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        self.events
+            .query_existing(snapshot.native_identity)
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn consume_event_by_id(
+        &mut self,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<bool, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        self.events
+            .consume_existing(snapshot.native_identity)
+            .then_some(true)
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn queue_event_signal(
+        &mut self,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        self.event_objects
+            .queue_signal(id)
+            .map(|_| ())
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn take_event_signal(&mut self) -> Option<nt_kernel_exec::PendingEventSignal> {
+        self.event_objects.take_next_signal()
+    }
+
+    pub(crate) fn queued_event_signal_count(&self) -> usize {
+        self.event_objects.queued_signal_count()
+    }
+
+    pub(crate) fn retry_event_signal(
+        &mut self,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        self.event_objects
+            .retry_signal(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn cancel_event_signal(
+        &mut self,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if let Some(retired) = self
+            .event_objects
+            .cancel_signal(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?
+        {
+            self.finalize_retired_event_object(retired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn event_id_for_index(
+        &self,
+        index: usize,
+    ) -> Option<nt_kernel_exec::EventObjectId> {
+        self.event_objects.id_for_native(index as u64)
+    }
+
+    pub(crate) fn complete_event_signal(
+        &mut self,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if let Some(retired) = self
+            .event_objects
+            .complete_signal(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?
+        {
+            self.finalize_retired_event_object(retired);
+        }
+        Ok(())
     }
 
     pub(crate) fn provider_close_event(&mut self, pi: usize, handle: u64) -> Result<(), u32> {
@@ -37772,7 +38054,7 @@ impl ExecNtHandler {
                         if !previous {
                             // SAFETY: native dispatch is serialized; event transition and waiter
                             // selection remain in this executive turn.
-                            unsafe { wait_wake_dispatcher_pulse(index, self) };
+                            unsafe { wait_wake_event_pulse(index, self) };
                         }
                         if previous {
                             let _ = self.events.reset_existing(index as u64);
@@ -37905,7 +38187,7 @@ impl ExecNtHandler {
                         // are one executive transition.
                         let mut woken = 0;
                         if !previous {
-                            woken = unsafe { wait_wake_dispatcher_set(self) };
+                            woken = unsafe { wait_wake_event_set(index, self) };
                         }
                         trace_tp_worker_event_transition(
                             self,
@@ -40839,11 +41121,10 @@ impl ExecNtHandler {
                             apc_status
                         };
                         if let Some(index) = event_index {
-                            if self.events.set_existing(index as u64).is_none() {
+                            if self.signal_event_index(index) != 0 {
                                 self.finish_local_file_io(file_object, synchronous, index as u64);
                                 return nt_fs::STATUS_INVALID_HANDLE;
                             }
-                            let _ = wait_wake_dispatcher(self, None);
                         }
                         self.finish_local_file_io(
                             file_object,
@@ -40977,11 +41258,10 @@ impl ExecNtHandler {
                     apc_status
                 };
                 if let Some(index) = event_index {
-                    if self.events.set_existing(index as u64).is_none() {
+                    if self.signal_event_index(index) != 0 {
                         self.finish_local_file_io(file_object, synchronous, index as u64);
                         return nt_fs::STATUS_INVALID_HANDLE;
                     }
-                    let _ = wait_wake_dispatcher(self, None);
                 }
                 self.finish_local_file_io(
                     file_object,

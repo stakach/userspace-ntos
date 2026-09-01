@@ -280,6 +280,7 @@ pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size 
                                     // after deriving the exact arity from win32k's registered SSPT/KiArgumentTable.
 pub const SH_REQ_A4: u64 = 0x90; // in:  handler arg4 (1st stack arg)
 pub const SH_REQ_NARGS: u64 = 0xF0; // in:  total arg count staged in SH_REQ_A4.., or 0 for caller-stack args
+pub const SH_EVENT_RECLAIM_PENDING: u64 = 0x100; // executive->provider reclaim work hint
 pub const WIN32K_MAX_SERVICE_ARGS: u64 = 16;
 pub const WIN32K_STACK_TAIL_ARGS: usize = (WIN32K_MAX_SERVICE_ARGS - 4) as usize;
 // Compile-time invariants for the stack-arg-tail region (host-verified at build):
@@ -288,6 +289,7 @@ pub const WIN32K_STACK_TAIL_ARGS: usize = (WIN32K_MAX_SERVICE_ARGS - 4) as usize
 //    END exactly at SH_REQ_NARGS with no overlap — i.e. NARGS = A4 + 12*8.
 const _: () = assert!(SH_REQ_A4 > SH_FONT_SIZE);
 const _: () = assert!(SH_REQ_NARGS == SH_REQ_A4 + WIN32K_STACK_TAIL_ARGS as u64 * 8);
+const _: () = assert!(SH_EVENT_RECLAIM_PENDING + 8 <= SH_SAS_AHELIST);
 
 // The USER handle table (gSharedInfo.aheList) server VA — the executive captures it from the
 // USERCONNECT during NtUserProcessConnect and publishes it here so win32k's WM_CREATE callback bridge
@@ -808,6 +810,36 @@ pub const W32_EVENT_OP_DEREFERENCE: u64 = 4;
 pub const W32_EVENT_OP_DRAIN_RECLAIM: u64 = 5;
 pub const W32_EVENT_OP_ACK_RECLAIM: u64 = 6;
 pub const W32_EVENT_OP_RETAIN_POINTER: u64 = 7;
+pub const W32_EVENT_OP_SET: u64 = 8;
+pub const W32_EVENT_OP_RESET: u64 = 9;
+pub const W32_EVENT_OP_CLEAR: u64 = 10;
+pub const W32_EVENT_OP_PULSE: u64 = 11;
+pub const W32_EVENT_OP_READ: u64 = 12;
+
+static mut WIN32K_EVENT_PROJECTIONS: nt_kernel_exec::ProviderEventProjectionCatalog =
+    nt_kernel_exec::ProviderEventProjectionCatalog::new();
+
+fn provider_event_projection_contains(body: u64) -> bool {
+    unsafe { (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).contains(body) }
+}
+
+unsafe fn provider_event_projection_reserve() -> bool {
+    (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
+        .reserve_one()
+        .is_ok()
+}
+
+unsafe fn provider_event_projection_register_reserved(body: u64) -> bool {
+    (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
+        .register_reserved(body)
+        .is_ok()
+}
+
+unsafe fn provider_event_projection_remove(body: u64) -> bool {
+    (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
+        .remove(body)
+        .is_ok()
+}
 
 const VIDEO_IOCTL_HDEV: u64 = 0x00;
 const VIDEO_IOCTL_CODE: u64 = 0x08;
@@ -2724,47 +2756,25 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
     nt_object_manager::win32k_ob::classify(obj_type)
 }
 
-pub(crate) fn event_body_ready(body: u64) -> bool {
-    body != 0 && unsafe { nt_kernel_exec::kevent::kevent_read_state(body as *const u8) }
-}
-
-pub(crate) fn event_body_consume(body: u64) -> bool {
-    if body == 0 {
-        return false;
-    }
-    unsafe {
-        if !nt_kernel_exec::kevent::kevent_read_state(body as *const u8) {
-            return false;
-        }
-        if matches!(
-            nt_kernel_exec::kevent::kevent_kind(body as *const u8),
-            nt_kernel_exec::kevent::EventKind::Synchronization
-        ) {
-            nt_kernel_exec::kevent::kevent_reset(body as *mut u8);
-        }
-    }
-    true
-}
-
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
+    if !provider_event_projection_contains(object) {
+        return object;
+    }
     let (status, count, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_RETAIN_POINTER, object, 0, 0) };
-    if status == 0 {
-        return count;
-    }
-    object
+    assert_eq!(status, 0, "projected Event reference failed");
+    count
 }
 
 extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
+    if !provider_event_projection_contains(object) {
+        return 0;
+    }
     let (status, count, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, object, 0, 0) };
-    if status == 0 {
-        if !unsafe { drain_retired_event_provider_bodies() } {
-            return 0;
-        }
-        return count;
-    }
-    0
+    assert_eq!(status, 0, "projected Event dereference failed");
+    assert!(unsafe { drain_retired_event_provider_bodies() });
+    count
 }
 
 extern "win64" fn s_zw_create_event(
@@ -2799,7 +2809,9 @@ extern "win64" fn s_zw_create_event(
         }
         write_unaligned(handle_out, handle);
         if !drain_retired_event_provider_bodies() {
-            let _ = win32k_event_broker_call(W32_EVENT_OP_CLOSE, handle, 0, 0);
+            let (close_status, _, _, _) =
+                win32k_event_broker_call(W32_EVENT_OP_CLOSE, handle, 0, 0);
+            assert_eq!(close_status, 0, "provider Event create rollback failed");
             write_unaligned(handle_out, 0);
             return 0xC000_0001u32 as i32;
         }
@@ -2830,12 +2842,26 @@ extern "win64" fn s_ke_initialize_event(event: u64, event_type: u64, initial_sta
     }
 }
 
+unsafe fn mirror_projected_event_state(event: u64, signaled: bool) {
+    if signaled {
+        nt_kernel_exec::kevent::kevent_set(event as *mut u8);
+    } else {
+        nt_kernel_exec::kevent::kevent_reset(event as *mut u8);
+    }
+}
+
 extern "win64" fn s_ke_set_event(event: u64, _increment: u64, _wait: u64) -> i32 {
     if event == 0 {
         return 0;
     }
-    let previous = unsafe { nt_kernel_exec::kevent::kevent_set(event as *mut u8) };
-    record_local_event_signal(event);
+    assert_eq!(_wait, 0, "KeSetEvent(Wait=TRUE) requires atomic signal-and-wait");
+    if !provider_event_projection_contains(event) {
+        return unsafe { nt_kernel_exec::kevent::kevent_set(event as *mut u8) as i32 };
+    }
+    let (status, previous, current, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_SET, event, _increment, _wait) };
+    assert_eq!(status, 0, "projected KeSetEvent broker failed");
+    unsafe { mirror_projected_event_state(event, current != 0) };
     previous as i32
 }
 
@@ -2843,21 +2869,44 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
     if event == 0 {
         return 0;
     }
-    unsafe { nt_kernel_exec::kevent::kevent_reset(event as *mut u8) as i32 }
+    if !provider_event_projection_contains(event) {
+        return unsafe { nt_kernel_exec::kevent::kevent_reset(event as *mut u8) as i32 };
+    }
+    let (status, previous, _, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_RESET, event, 0, 0) };
+    assert_eq!(status, 0, "projected KeResetEvent broker failed");
+    unsafe { mirror_projected_event_state(event, false) };
+    previous as i32
 }
 
 extern "win64" fn s_ke_clear_event(event: u64) {
-    if event != 0 {
-        unsafe { nt_kernel_exec::kevent::kevent_clear(event as *mut u8) };
+    if event == 0 {
+        return;
     }
+    if !provider_event_projection_contains(event) {
+        unsafe { nt_kernel_exec::kevent::kevent_clear(event as *mut u8) };
+        return;
+    }
+    let (status, _, _, _) = unsafe { win32k_event_broker_call(W32_EVENT_OP_CLEAR, event, 0, 0) };
+    assert_eq!(status, 0, "projected KeClearEvent broker failed");
+    unsafe { mirror_projected_event_state(event, false) };
 }
 
 extern "win64" fn s_ke_pulse_event(event: u64, _increment: u64, _wait: u64) -> i32 {
     if event == 0 {
         return 0;
     }
-    let previous = unsafe { nt_kernel_exec::kevent::kevent_pulse(event as *mut u8) };
-    record_local_event_signal(event);
+    assert_eq!(
+        _wait, 0,
+        "KePulseEvent(Wait=TRUE) requires atomic signal-and-wait"
+    );
+    if !provider_event_projection_contains(event) {
+        return unsafe { nt_kernel_exec::kevent::kevent_pulse(event as *mut u8) as i32 };
+    }
+    let (status, previous, _, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_PULSE, event, _increment, _wait) };
+    assert_eq!(status, 0, "projected KePulseEvent broker failed");
+    unsafe { mirror_projected_event_state(event, false) };
     previous as i32
 }
 
@@ -2865,7 +2914,14 @@ extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
     if event == 0 {
         return 0;
     }
-    unsafe { nt_kernel_exec::kevent::kevent_read_state(event as *const u8) as i32 }
+    if !provider_event_projection_contains(event) {
+        return unsafe { nt_kernel_exec::kevent::kevent_read_state(event as *const u8) as i32 };
+    }
+    let (status, signaled, _, _) =
+        unsafe { win32k_event_broker_call(W32_EVENT_OP_READ, event, 0, 0) };
+    assert_eq!(status, 0, "projected KeReadStateEvent broker failed");
+    unsafe { mirror_projected_event_state(event, signaled != 0) };
+    signaled as i32
 }
 
 extern "win64" fn s_ke_wait_for_single_object(
@@ -3870,12 +3926,15 @@ extern "win64" fn s_ob_reference_object_by_handle(
         if object_out.is_null() {
             return STATUS_ACCESS_VIOLATION_I32;
         }
+        if !unsafe { provider_event_projection_reserve() } {
+            return STATUS_NO_MEMORY;
+        }
         let size = nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64;
         let proposed = unsafe { pool_alloc(size) };
         if proposed == 0 {
             return STATUS_NO_MEMORY;
         }
-        let (status, body, metadata, _) = unsafe {
+        let (status, body, metadata, granted_access) = unsafe {
             win32k_event_broker_call(W32_EVENT_OP_REFERENCE, handle, proposed, access)
         };
         if status != 0 || body == 0 {
@@ -3894,22 +3953,25 @@ extern "win64" fn s_ob_reference_object_by_handle(
                 nt_kernel_exec::kevent::init_kevent(body as *mut u8, kind, metadata & 2 != 0)
             };
         } else if !unsafe { provider_pool_release_owned(&[(proposed, size)]) } {
-            let _ = unsafe {
+            let (release_status, _, _, _) = unsafe {
                 win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, body, 0, 0)
             };
+            assert_eq!(release_status, 0, "provider Event reference rollback failed");
             return 0xC000_0001u32 as i32;
         }
+        assert!(unsafe { provider_event_projection_register_reserved(body) });
         unsafe { write_unaligned(object_out, body) };
         if !handle_info.is_null() {
             unsafe {
                 write_unaligned(handle_info as *mut u32, 0);
-                write_unaligned(handle_info.add(4) as *mut u32, 0x001f_0003);
+                write_unaligned(handle_info.add(4) as *mut u32, granted_access as u32);
             }
         }
         if !unsafe { drain_retired_event_provider_bodies() } {
-            let _ = unsafe {
+            let (release_status, _, _, _) = unsafe {
                 win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, body, 0, 0)
             };
+            assert_eq!(release_status, 0, "provider Event publication rollback failed");
             unsafe { write_unaligned(object_out, 0) };
             return 0xC000_0001u32 as i32;
         }
@@ -5773,118 +5835,7 @@ static WIN32K_CLIENT_SYSTEM_FONT_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_SYSTEM_FONT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SET_THREAD_DESKTOP_PREPARES: AtomicU64 = AtomicU64::new(0);
 static SET_THREAD_DESKTOP_WINDOW_LIST_RESET_DONE: AtomicU64 = AtomicU64::new(0);
-const WIN32K_LOCAL_EVENT_SIGNAL_INITIAL_CAP: u64 = 128;
-static WIN32K_LOCAL_EVENT_SIGNAL_PTR: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_HEAD: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_LEN: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_CAP: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_GROWTHS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
-static WIN32K_LOCAL_EVENT_SIGNAL_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TICK_COUNT: AtomicU64 = AtomicU64::new(1);
-
-unsafe fn ensure_local_event_signal_capacity(required: u64) -> bool {
-    let cap = WIN32K_LOCAL_EVENT_SIGNAL_CAP.load(Ordering::Relaxed);
-    if required <= cap {
-        return true;
-    }
-    let mut new_cap = if cap == 0 {
-        WIN32K_LOCAL_EVENT_SIGNAL_INITIAL_CAP
-    } else {
-        cap.saturating_mul(2)
-    };
-    while new_cap < required {
-        let Some(next) = new_cap.checked_mul(2) else {
-            return false;
-        };
-        new_cap = next;
-    }
-    let Some(bytes) = new_cap.checked_mul(8) else {
-        return false;
-    };
-    let new_base = pool_alloc(bytes);
-    if new_base == 0 {
-        return false;
-    }
-
-    let old_base = WIN32K_LOCAL_EVENT_SIGNAL_PTR.load(Ordering::Relaxed);
-    let old_cap = cap;
-    let old_head = WIN32K_LOCAL_EVENT_SIGNAL_HEAD.load(Ordering::Relaxed);
-    let len = WIN32K_LOCAL_EVENT_SIGNAL_LEN.load(Ordering::Relaxed);
-    let mut i = 0u64;
-    while i < len {
-        let value = if old_base != 0 && old_cap != 0 {
-            let old_index = (old_head + i) % old_cap;
-            read_volatile((old_base + old_index * 8) as *const u64)
-        } else {
-            0
-        };
-        write_volatile((new_base + i * 8) as *mut u64, value);
-        i += 1;
-    }
-    WIN32K_LOCAL_EVENT_SIGNAL_PTR.store(new_base, Ordering::Relaxed);
-    WIN32K_LOCAL_EVENT_SIGNAL_CAP.store(new_cap, Ordering::Relaxed);
-    WIN32K_LOCAL_EVENT_SIGNAL_HEAD.store(0, Ordering::Relaxed);
-    WIN32K_LOCAL_EVENT_SIGNAL_GROWTHS.fetch_add(1, Ordering::Relaxed);
-    true
-}
-
-fn record_local_event_signal(event: u64) {
-    if event == 0 {
-        return;
-    }
-    unsafe {
-        let len = WIN32K_LOCAL_EVENT_SIGNAL_LEN.load(Ordering::Relaxed);
-        let required = len.saturating_add(1);
-        if !ensure_local_event_signal_capacity(required) {
-            let failures =
-                WIN32K_LOCAL_EVENT_SIGNAL_RECORD_FAILURES.fetch_add(1, Ordering::Relaxed);
-            if failures < 16 {
-                print_str(b"[win32k-event] ERROR: queue-event signal allocation failed event=0x");
-                print_hex((event >> 32) as u32);
-                print_hex(event as u32);
-                print_str(b" pending=");
-                print_u64(len);
-                print_str(b"\n");
-            }
-            return;
-        }
-        let base = WIN32K_LOCAL_EVENT_SIGNAL_PTR.load(Ordering::Relaxed);
-        let cap = WIN32K_LOCAL_EVENT_SIGNAL_CAP.load(Ordering::Relaxed);
-        if base == 0 || cap == 0 {
-            return;
-        }
-        let head = WIN32K_LOCAL_EVENT_SIGNAL_HEAD.load(Ordering::Relaxed);
-        let slot = (head + len) % cap;
-        write_volatile((base + slot * 8) as *mut u64, event);
-        WIN32K_LOCAL_EVENT_SIGNAL_LEN.store(required, Ordering::Relaxed);
-        let high = WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER.load(Ordering::Relaxed);
-        if required > high {
-            WIN32K_LOCAL_EVENT_SIGNAL_HIGH_WATER.store(required, Ordering::Relaxed);
-        }
-    }
-}
-
-pub(crate) fn take_local_event_signal_body() -> Option<u64> {
-    unsafe {
-        let len = WIN32K_LOCAL_EVENT_SIGNAL_LEN.load(Ordering::Relaxed);
-        if len == 0 {
-            return None;
-        }
-        let base = WIN32K_LOCAL_EVENT_SIGNAL_PTR.load(Ordering::Relaxed);
-        let cap = WIN32K_LOCAL_EVENT_SIGNAL_CAP.load(Ordering::Relaxed);
-        if base == 0 || cap == 0 {
-            WIN32K_LOCAL_EVENT_SIGNAL_LEN.store(0, Ordering::Relaxed);
-            return None;
-        }
-        let head = WIN32K_LOCAL_EVENT_SIGNAL_HEAD.load(Ordering::Relaxed);
-        let body = read_volatile((base + head * 8) as *const u64);
-        write_volatile((base + head * 8) as *mut u64, 0);
-        WIN32K_LOCAL_EVENT_SIGNAL_HEAD.store((head + 1) % cap, Ordering::Relaxed);
-        WIN32K_LOCAL_EVENT_SIGNAL_LEN.store(len - 1, Ordering::Relaxed);
-        (body != 0).then_some(body)
-    }
-}
 
 pub(crate) unsafe fn current_thread_queue_event_body() -> Option<u64> {
     let w32thread = current_w32thread();
@@ -9744,6 +9695,13 @@ unsafe fn win32k_event_broker_call(
 static WIN32K_EVENT_RECLAIM_ACK_ID: AtomicU64 = AtomicU64::new(0);
 static WIN32K_EVENT_RECLAIM_ACK_BODY: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) unsafe fn mark_event_provider_reclaim_pending() {
+    write_volatile(
+        (WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *mut u64,
+        1,
+    );
+}
+
 unsafe fn drain_retired_event_provider_bodies() -> bool {
     loop {
         let pending_id = WIN32K_EVENT_RECLAIM_ACK_ID.load(Ordering::Acquire);
@@ -9771,15 +9729,23 @@ unsafe fn drain_retired_event_provider_bodies() -> bool {
             return false;
         }
         if id == 0 && body == 0 {
+            write_volatile(
+                (WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *mut u64,
+                0,
+            );
             return true;
         }
         if id == 0
             || body == 0
+            || !provider_event_projection_contains(body)
             || !provider_pool_release_owned(&[(
                 body,
                 nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64,
             )])
         {
+            return false;
+        }
+        if !provider_event_projection_remove(body) {
             return false;
         }
         WIN32K_EVENT_RECLAIM_ACK_ID.store(id, Ordering::Release);
@@ -12241,6 +12207,12 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
 /// `(low32, full_result)` — win32k uses pointer-width syscall returns, with the low 32 bits kept as
 /// status-compatible data for legacy harness readers.
 unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
+    if read_volatile((WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *const u64) != 0
+        && !drain_retired_event_provider_bodies()
+    {
+        let status = 0xC000_0001u32;
+        return (status as i32, status as u64);
+    }
     let ssn = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64);
     let a0 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *const u64);
     let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);

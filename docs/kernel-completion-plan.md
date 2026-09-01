@@ -22191,6 +22191,67 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the broker, release every GUI lease on wake/cancel/teardown, and delete the raw FIFO. Only then
     run the one-hour-capped desktop/churn gate and accept provider-body reclamation.
 
+    Queue-event wait/signal integration checkpoint (2026-09-02, host and freestanding green;
+    runtime pending): native Event waiter records now retain one unique `NativeWait` lease for each
+    captured Event member and store that token beside the original wait object. Publication rollback,
+    wake, timeout, APC cancellation, and thread teardown release the exact token; timers and other
+    dispatcher objects continue through their own established reference owners. The old duplicate
+    raw-body `WaitObject` kind and coarse Event namespace wait counter are no longer used for typed
+    Event handles.
+
+    Provider `KeSetEvent`, `KeResetEvent`, `KeClearEvent`, `KePulseEvent`, and `KeReadStateEvent`
+    reverse-resolve a projected body through the broker and mutate the same canonical `EventStore`
+    state observed by user handles. A component-side growable projection catalog explicitly
+    distinguishes those bodies from embedded/local win32k Events; broker failure is no longer used
+    as a type test or converted into local success. False-to-true set performs native waiter
+    selection immediately, then selects a GUI queue waiter only if that exact synchronization Event
+    remains signaled. Native `NtSetEvent`, `NtPulseEvent`, signal-and-wait, I/O event completion, and
+    provider Set/Pulse all use the same exact Event transition helpers. The provider header is
+    mirrored only from an authoritative broker result. `Wait=TRUE` fails fast because no current
+    win32ss caller uses it and silently separating its atomic signal-and-wait contract is forbidden.
+
+    GUI GetMessage waits publish `(EventObjectId, GuiWait lease, process generation)` rather than a
+    provider address. The special bridge accepts only the synchronization Event type ReactOS uses
+    for message queues. Selection is committed while servicing Set/Pulse or the post-publication
+    level-state check; deferred redrive only services exact selected records. Late waiters cannot
+    consume an earlier pulse. Redrive now returns `Complete`, `Retry`, or `Unsafe`: retry preserves
+    both the selected waiter and signal lease for a later safe boundary, callback-unwind failure
+    stops further component calls, and every exit restores the executive's prior client context.
+    The drain processes only the signal budget present on entry, so a reentrant Set schedules a new
+    epoch without creating an immediate retry loop.
+
+    Wake, copyout failure, stale-generation cancellation, thread teardown, and the pre-VM process
+    sweep release the exact GUI lease. Reply-cap cancellation records the successful delete phase
+    before attempting retype, making allocator-pressure retries monotonic rather than permanently
+    deleting the same cap twice. Cancelling a selected waiter transfers its committed signal to
+    another exact waiter or cancels the now-ownerless signal lease. Provider-body retirement raises
+    a shared reclaim hint; the next provider dispatch, including final process teardown, performs
+    exact free and generation acknowledgement before handling new work. Callback-generated signals
+    drain only after the outer provider dispatch completes; chained/suspended callbacks cannot
+    re-enter the blocked win32k component.
+
+    The leaking component-side raw-address signal FIFO, direct provider-body ready/consume helpers,
+    and post-publication raw replay are deleted. `ObReferenceObjectByHandle` now reports the actual
+    process-handle grant rather than a hardcoded Event mask. `cargo test -p nt-kernel-exec` passes
+    202/202, `cargo test -p nt-process` passes 151/151, and the freestanding executive check is
+    green. Run the serialized desktop/churn acceptance under the 3,600-second hard ceiling next.
+
+    Review adjustment: this closes handle-side and hosted GUI queue-event ownership, but does not
+    close the provider pointer-wait ABI. The current `KeWaitForSingleObject` import still lacks a
+    real blocked component continuation and `KeWaitForMultipleObjects` remains unbound. Replace the
+    old immediate-success body with one shared executive waiter arbiter covering projected Events,
+    local Events, process/thread/File dispatcher bodies, WaitAny/WaitAll, timeout, APC, and exact
+    cancellation. Remove the GetMessage-specific park only when the real provider wait continuation
+    can resume the correct win32k client dispatch without monopolizing the single component TCB.
+
+    The same follow-up must replace the current native-first/special-GUI arbitration with one
+    monotonically ordered dispatcher wait list; two separate reusable Vec slot orders are not NT
+    wait-block order. Non-Event `ObReferenceObject`/`ObDereferenceObject` also still need typed
+    provider object pointer counts instead of their historical session-lifetime no-op behavior.
+    Finally, move every fallible hosted-process deletion preflight ahead of VM reclaim and represent
+    post-reclaim/provider finalization as explicit monotonic phases so a `false` retry result never
+    describes an already-partially-deleted process.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

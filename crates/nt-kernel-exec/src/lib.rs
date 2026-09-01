@@ -60,8 +60,8 @@ pub use driver_thread::{
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
 pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
-    EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, RetiredEventObject,
-    SignalQueueResult,
+    EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
+    ProviderEventProjectionError, RetiredEventObject, SignalQueueResult,
 };
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};

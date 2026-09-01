@@ -79,6 +79,70 @@ pub enum EventObjectError {
     SignalNotDelivering,
 }
 
+/// Component-side ownership errors for projected provider Event bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderEventProjectionError {
+    InvalidBody,
+    MissingBody,
+    OutOfMemory,
+}
+
+/// Exact membership for Event bodies projected into a hosted kernel provider.
+///
+/// Embedded provider `KEVENT`s never enter this catalog. Import shims can therefore distinguish
+/// local dispatcher storage from an executive-owned projection without interpreting a failed
+/// broker call as a type test.
+#[derive(Debug, Default)]
+pub struct ProviderEventProjectionCatalog {
+    bodies: Vec<u64>,
+}
+
+impl ProviderEventProjectionCatalog {
+    pub const fn new() -> Self {
+        Self { bodies: Vec::new() }
+    }
+
+    pub fn reserve_one(&mut self) -> Result<(), ProviderEventProjectionError> {
+        self.bodies
+            .try_reserve(1)
+            .map_err(|_| ProviderEventProjectionError::OutOfMemory)
+    }
+
+    pub fn register_reserved(&mut self, body: u64) -> Result<bool, ProviderEventProjectionError> {
+        if body == 0 {
+            return Err(ProviderEventProjectionError::InvalidBody);
+        }
+        if self.contains(body) {
+            return Ok(false);
+        }
+        if self.bodies.len() == self.bodies.capacity() {
+            return Err(ProviderEventProjectionError::OutOfMemory);
+        }
+        self.bodies.push(body);
+        Ok(true)
+    }
+
+    pub fn contains(&self, body: u64) -> bool {
+        body != 0 && self.bodies.contains(&body)
+    }
+
+    pub fn remove(&mut self, body: u64) -> Result<(), ProviderEventProjectionError> {
+        let Some(index) = self.bodies.iter().position(|candidate| *candidate == body) else {
+            return Err(ProviderEventProjectionError::MissingBody);
+        };
+        self.bodies.swap_remove(index);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+}
+
 /// State useful to the executive's lifetime diagnostics and acceptance gates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventObjectSnapshot {
@@ -122,7 +186,7 @@ pub struct PendingEventSignal {
 enum SignalState {
     None,
     Queued(u64),
-    Delivering(u64),
+    Delivering { sequence: u64, retriggered: bool },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -509,8 +573,16 @@ impl EventObjectRegistry {
         id: EventObjectId,
     ) -> Result<SignalQueueResult, EventObjectError> {
         let slot = self.event_slot(id)?;
-        if !matches!(self.events[slot].signal, SignalState::None) {
-            return Ok(SignalQueueResult::Coalesced);
+        match self.events[slot].signal {
+            SignalState::None => {}
+            SignalState::Queued(_) => return Ok(SignalQueueResult::Coalesced),
+            SignalState::Delivering { sequence, .. } => {
+                self.events[slot].signal = SignalState::Delivering {
+                    sequence,
+                    retriggered: true,
+                };
+                return Ok(SignalQueueResult::Coalesced);
+            }
         }
         let sequence = self.next_signal_sequence.max(1);
         self.next_signal_sequence = sequence.wrapping_add(1).max(1);
@@ -529,11 +601,33 @@ impl EventObjectRegistry {
                 _ => None,
             })
             .min_by_key(|(_, sequence)| *sequence)?;
-        self.events[slot].signal = SignalState::Delivering(sequence);
+        self.events[slot].signal = SignalState::Delivering {
+            sequence,
+            retriggered: false,
+        };
         Some(PendingEventSignal {
             id: EventObjectId(ObjectId::new(self.events[slot].generation, slot as u64)),
             native_identity: self.events[slot].native_identity,
         })
+    }
+
+    pub fn queued_signal_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|record| matches!(record.signal, SignalState::Queued(_)))
+            .count()
+    }
+
+    /// Return an incomplete delivery to the queue without releasing its signal lease.
+    pub fn retry_signal(&mut self, id: EventObjectId) -> Result<(), EventObjectError> {
+        let slot = self.event_slot(id)?;
+        if !matches!(self.events[slot].signal, SignalState::Delivering { .. }) {
+            return Err(EventObjectError::SignalNotDelivering);
+        }
+        let sequence = self.next_signal_sequence.max(1);
+        self.next_signal_sequence = sequence.wrapping_add(1).max(1);
+        self.events[slot].signal = SignalState::Queued(sequence);
+        Ok(())
     }
 
     /// Finish one selected delivery and release its signal lease.
@@ -542,8 +636,14 @@ impl EventObjectRegistry {
         id: EventObjectId,
     ) -> Result<Option<RetiredEventObject>, EventObjectError> {
         let slot = self.event_slot(id)?;
-        if !matches!(self.events[slot].signal, SignalState::Delivering(_)) {
+        let SignalState::Delivering { retriggered, .. } = self.events[slot].signal else {
             return Err(EventObjectError::SignalNotDelivering);
+        };
+        if retriggered {
+            let sequence = self.next_signal_sequence.max(1);
+            self.next_signal_sequence = sequence.wrapping_add(1).max(1);
+            self.events[slot].signal = SignalState::Queued(sequence);
+            return Ok(None);
         }
         self.events[slot].signal = SignalState::None;
         Ok(self.try_retire(slot))
@@ -793,6 +893,53 @@ mod tests {
         assert!(registry.complete_signal(first).unwrap().is_some());
         assert_eq!(registry.take_next_signal().unwrap().id, second);
         registry.complete_signal(second).unwrap();
+    }
+
+    #[test]
+    fn signal_during_delivery_requeues_without_dropping_the_lease() {
+        let mut registry = EventObjectRegistry::new();
+        let id = create(&mut registry, 22);
+        registry.queue_signal(id).unwrap();
+        assert_eq!(registry.take_next_signal().unwrap().id, id);
+        assert_eq!(registry.queue_signal(id), Ok(SignalQueueResult::Coalesced));
+        assert_eq!(registry.complete_signal(id), Ok(None));
+        assert_eq!(registry.snapshot(id).unwrap().signal_leases, 1);
+        assert_eq!(registry.take_next_signal().unwrap().id, id);
+        assert_eq!(registry.complete_signal(id), Ok(None));
+        assert_eq!(registry.snapshot(id).unwrap().signal_leases, 0);
+    }
+
+    #[test]
+    fn incomplete_delivery_requeues_without_releasing_the_signal_lease() {
+        let mut registry = EventObjectRegistry::new();
+        let id = create(&mut registry, 23);
+        registry.queue_signal(id).unwrap();
+        assert_eq!(registry.queued_signal_count(), 1);
+        assert_eq!(registry.take_next_signal().unwrap().id, id);
+        assert_eq!(registry.queued_signal_count(), 0);
+        registry.retry_signal(id).unwrap();
+        assert_eq!(registry.queued_signal_count(), 1);
+        assert_eq!(registry.snapshot(id).unwrap().signal_leases, 1);
+        assert_eq!(registry.take_next_signal().unwrap().id, id);
+        registry.complete_signal(id).unwrap();
+        assert_eq!(registry.snapshot(id).unwrap().signal_leases, 0);
+    }
+
+    #[test]
+    fn provider_projection_catalog_distinguishes_local_and_projected_bodies() {
+        let mut catalog = ProviderEventProjectionCatalog::new();
+        catalog.reserve_one().unwrap();
+        assert_eq!(catalog.register_reserved(0x1000), Ok(true));
+        assert_eq!(catalog.register_reserved(0x1000), Ok(false));
+        assert!(catalog.contains(0x1000));
+        assert!(!catalog.contains(0x2000));
+        assert_eq!(catalog.len(), 1);
+        catalog.remove(0x1000).unwrap();
+        assert!(catalog.is_empty());
+        assert_eq!(
+            catalog.remove(0x1000),
+            Err(ProviderEventProjectionError::MissingBody)
+        );
     }
 
     #[test]
