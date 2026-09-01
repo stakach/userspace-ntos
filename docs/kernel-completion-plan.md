@@ -21976,7 +21976,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The allocator alone does not close provider lifetime debt. Context records still need explicit
     provenance before freeing locally allocated callout TEBs, primary tokens, EPROCESS/ETHREAD
     bodies, and superseded context-table backing; retirement must first clear exact KPCR/shared/token
-    publications. Queue events require a growable, process-generation-fenced registry with separate
+    publications.
+
+    Provider context-lifetime frontier (2026-09-01, in progress): add explicit owned-versus-borrowed
+    provenance to every process and thread context row, validate exact live allocation headers before
+    retirement, clear only matching KPCR, compatibility-slot, shared-context, and token-handle
+    publications, and reclaim component-owned storage after the row is tombstoned. Superseded
+    process/thread/token-handle table backing must be released immediately after atomic publication
+    of its replacement. Add a separate provider command for a terminating thread that has a context
+    row but never acquired a ReactOS W32THREAD; process teardown must not be the first chance to
+    reclaim it. Executive lifecycle routing must issue thread and final-process retirement even when
+    Process Manager has no W32 object, after callback frames have been unwound or proven absent.
+    Accept this slice only with focused allocator tests, the freestanding check, and serialized
+    desktop/process-generation churn showing balanced context retirement, zero invalid frees or
+    corruptions, and a complete sentinel under the one-hour ceiling.
+
+    Queue events then require a growable, process-generation-fenced registry with separate
     handle, pointer, native-wait, GUI-wait, and signal leases. The current four-entry evicting event
     ring, no-op dereference path, raw wait/signal pointers, and synthetic queue-event repair must be
     removed as that typed lifetime model is wired. Only after repeated-generation live bytes settle

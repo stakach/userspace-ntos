@@ -1915,6 +1915,16 @@ fn win32_process_thread_context_slots() {
     assert!(pm.set_process_window_station(pid, 0xFFFF_9E00_9ABC_0000));
     assert_eq!(pm.process_kernel_object(pid), Some(0xFFFF_8000_1000_0000));
     assert_eq!(pm.thread_kernel_object(tid), Some(0xFFFF_8000_2000_0000));
+    assert!(!pm.clear_process_kernel_object_exact(pid, 0));
+    assert!(!pm.clear_process_kernel_object_exact(pid, 0xFFFF_8000_1000_0001));
+    assert!(!pm.clear_thread_kernel_object_exact(tid, 0));
+    assert!(!pm.clear_thread_kernel_object_exact(tid, 0xFFFF_8000_2000_0001));
+    assert!(pm.clear_thread_kernel_object_exact(tid, 0xFFFF_8000_2000_0000));
+    assert_eq!(pm.thread_kernel_object(tid), None);
+    assert!(pm.set_thread_kernel_object(tid, 0xFFFF_8000_2000_0000));
+    assert!(pm.clear_process_kernel_object_exact(pid, 0xFFFF_8000_1000_0000));
+    assert_eq!(pm.process_kernel_object(pid), None);
+    assert!(pm.set_process_kernel_object(pid, 0xFFFF_8000_1000_0000));
     assert_eq!(
         pm.pid_for_kernel_process_object(0xFFFF_8000_1000_0000),
         Some(pid)

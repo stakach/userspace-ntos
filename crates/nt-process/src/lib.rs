@@ -2062,6 +2062,21 @@ impl ProcessManager {
             .and_then(|p| p.kernel_process_object)
     }
 
+    /// Clear an EPROCESS publication only when it still names the exact provider-owned object being
+    /// retired. A stale lifecycle completion must not detach a newer process generation.
+    pub fn clear_process_kernel_object_exact(&mut self, pid: ProcessId, expected: u64) -> bool {
+        if expected == 0 {
+            return false;
+        }
+        match self.processes.get_mut(&pid) {
+            Some(process) if process.kernel_process_object == Some(expected) => {
+                process.kernel_process_object = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Reverse-map an `EPROCESS` body pointer to the owning PID.
     pub fn pid_for_kernel_process_object(&self, eprocess: u64) -> Option<ProcessId> {
         if eprocess == 0 {
@@ -2150,6 +2165,21 @@ impl ProcessManager {
     /// Read back the parked `ETHREAD` body pointer.
     pub fn thread_kernel_object(&self, tid: ThreadId) -> Option<u64> {
         self.threads.get(&tid).and_then(|t| t.kernel_thread_object)
+    }
+
+    /// Clear an ETHREAD publication only when it still names the exact provider-owned object being
+    /// retired. This generation-fences provider storage reclamation.
+    pub fn clear_thread_kernel_object_exact(&mut self, tid: ThreadId, expected: u64) -> bool {
+        if expected == 0 {
+            return false;
+        }
+        match self.threads.get_mut(&tid) {
+            Some(thread) if thread.kernel_thread_object == Some(expected) => {
+                thread.kernel_thread_object = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Reverse-map an `ETHREAD` body pointer to the owning TID.

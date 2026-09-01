@@ -121,6 +121,33 @@ pub fn is_initialized<M: PoolMemory>(memory: &M) -> bool {
     initialized(memory)
 }
 
+/// Return the aligned capacity of an exact live allocation without mutating allocator state.
+/// Embedders use this to validate typed ownership before clearing the final published pointer.
+pub fn allocation_capacity<M: PoolMemory>(memory: &M, payload: u64) -> Result<u64, PoolError> {
+    if !initialized(memory) {
+        return Err(PoolError::NotInitialized);
+    }
+    if payload < DATA_OFFSET + HEADER_SIZE
+        || payload >= memory.len()
+        || payload & (ALIGNMENT - 1) != 0
+    {
+        return Err(PoolError::InvalidPointer);
+    }
+    validate_free_list(memory)?;
+    let header = payload - HEADER_SIZE;
+    let capacity = read(memory, header)?;
+    let marker = read(memory, header + 8)?;
+    let end = header
+        .checked_add(HEADER_SIZE)
+        .and_then(|value| value.checked_add(capacity))
+        .ok_or(PoolError::Corrupt)?;
+    let bump = read(memory, BUMP_OFFSET)?;
+    if marker != ALLOC_MARKER || capacity == 0 || capacity & (ALIGNMENT - 1) != 0 || end > bump {
+        return Err(PoolError::NotAllocated);
+    }
+    Ok(capacity)
+}
+
 fn note_corruption<M: PoolMemory>(memory: &mut M) -> PoolError {
     add_stat(memory, STATS_CORRUPTION, 1);
     PoolError::Corrupt
@@ -479,10 +506,22 @@ mod tests {
         let mut memory = arena();
         let allocation = allocate(&mut memory, 64, false).unwrap();
         assert_eq!(
+            allocation_capacity(&memory, allocation.payload_offset),
+            Ok(allocation.capacity)
+        );
+        assert_eq!(
+            allocation_capacity(&memory, allocation.payload_offset + 16),
+            Err(PoolError::NotAllocated)
+        );
+        assert_eq!(
             free(&mut memory, allocation.payload_offset + 16),
             Err(PoolError::NotAllocated)
         );
         free(&mut memory, allocation.payload_offset).unwrap();
+        assert_eq!(
+            allocation_capacity(&memory, allocation.payload_offset),
+            Err(PoolError::NotAllocated)
+        );
         assert_eq!(
             free(&mut memory, allocation.payload_offset),
             Err(PoolError::NotAllocated)

@@ -10476,6 +10476,33 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(w32_ctx_thread_growths);
     print_str(b"/");
     print_u64(w32_ctx_thread_fails);
+    let context_lifetime = win32k_subsystem::win32k_context_lifetime_census();
+    print_str(b" w32-ctx-life=");
+    print_u64(context_lifetime.process_rows_live);
+    print_str(b"/");
+    print_u64(context_lifetime.thread_rows_live);
+    print_str(b" ep=");
+    print_u64(context_lifetime.eprocess_allocations);
+    print_str(b"/");
+    print_u64(context_lifetime.eprocess_frees);
+    print_str(b" et=");
+    print_u64(context_lifetime.ethread_allocations);
+    print_str(b"/");
+    print_u64(context_lifetime.ethread_frees);
+    print_str(b" token=");
+    print_u64(context_lifetime.token_allocations);
+    print_str(b"/");
+    print_u64(context_lifetime.token_frees);
+    print_str(b" teb=");
+    print_u64(context_lifetime.callout_teb_allocations);
+    print_str(b"/");
+    print_u64(context_lifetime.callout_teb_frees);
+    print_str(b" backing/handles/fail=");
+    print_u64(context_lifetime.backing_frees);
+    print_str(b"/");
+    print_u64(context_lifetime.token_handle_releases);
+    print_str(b"/");
+    print_u64(context_lifetime.retirement_failures);
     let provider_pool = win32k_subsystem::provider_pool_census();
     print_str(b" w32-provider-pool=");
     print_u64(provider_pool.live_bytes >> 10);
@@ -19173,14 +19200,11 @@ unsafe fn release_hosted_thread_win32_context(
     let final_mechanism = hosted_process_has_one_mechanism_left(pid, handler);
     let thread_win32 = handler.pm.thread_win32(tid as nt_process::ThreadId);
     let process_win32 = final_mechanism.then(|| handler.pm.process_win32(pid)).flatten();
-    if thread_win32.is_none() && process_win32.is_none() {
-        if final_mechanism {
-            let _ = win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid));
-        }
-        return true;
-    }
     let Some(client) = win32k_lifecycle_client(tid, handler) else {
-        return false;
+        return thread_win32.is_none()
+            && process_win32.is_none()
+            && (!final_mechanism
+                || win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid)));
     };
 
     if handler
@@ -19189,7 +19213,18 @@ unsafe fn release_hosted_thread_win32_context(
         .is_some_and(|process| process.state == nt_process::ProcessState::Terminated)
     {
         let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
+        if win32k_glue::client_has_active_callback_frames(pi as u32) {
+            return false;
+        }
     } else if win32k_glue::client_has_active_callback_frames(pi as u32) {
+        return false;
+    }
+
+    let provider_process = client.eprocess != 0;
+    let provider_thread = provider_process && client.ethread != 0;
+    if (thread_win32.is_some() && !provider_thread)
+        || (process_win32.is_some() && !provider_process)
+    {
         return false;
     }
 
@@ -19221,6 +19256,29 @@ unsafe fn release_hosted_thread_win32_context(
         }
     }
 
+    if !final_mechanism && provider_thread {
+        let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
+            win32k_subsystem::PS_WIN32_PROVIDER_RETIRE_THREAD_CONTEXT,
+            0,
+            0,
+            client,
+        );
+        if !completed || status as u32 != 0 {
+            print_str(b"[ps-win32-exit] thread context retirement failed tid=");
+            print_u64(tid);
+            print_str(b" status=0x");
+            print_hex(if completed { status as u32 } else { STATUS_DEVICE_NOT_READY });
+            print_str(b"\n");
+            return false;
+        }
+        if !handler
+            .pm
+            .clear_thread_kernel_object_exact(tid as nt_process::ThreadId, client.ethread)
+        {
+            return false;
+        }
+    }
+
     if let Some(expected) = process_win32 {
         if handler
             .remove_process_win32_job_membership(pid, expected)
@@ -19246,10 +19304,40 @@ unsafe fn release_hosted_thread_win32_context(
             return false;
         }
     }
-    if final_mechanism
-        && !win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid))
-    {
-        return false;
+
+    if final_mechanism {
+        if provider_process {
+            let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
+                win32k_subsystem::PS_WIN32_PROVIDER_RETIRE_PROCESS_CONTEXT,
+                0,
+                0,
+                client,
+            );
+            if !completed || status as u32 != 0 {
+                print_str(b"[ps-win32-exit] process context retirement failed pid=");
+                print_u64(u64::from(pid));
+                print_str(b" status=0x");
+                print_hex(if completed { status as u32 } else { STATUS_DEVICE_NOT_READY });
+                print_str(b"\n");
+                return false;
+            }
+            if provider_thread
+                && !handler
+                    .pm
+                    .clear_thread_kernel_object_exact(tid as nt_process::ThreadId, client.ethread)
+            {
+                return false;
+            }
+            if !handler
+                .pm
+                .clear_process_kernel_object_exact(pid, client.eprocess)
+            {
+                return false;
+            }
+        }
+        if !win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid)) {
+            return false;
+        }
     }
     true
 }
