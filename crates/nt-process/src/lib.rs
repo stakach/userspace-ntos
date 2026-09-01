@@ -2035,6 +2035,21 @@ impl ProcessManager {
         }
     }
 
+    /// Clear the parked W32PROCESS only when it still names the provider object whose delete
+    /// callout just completed. A stale completion must not detach a newer provider generation.
+    pub fn clear_process_win32_exact(&mut self, pid: ProcessId, expected: u64) -> bool {
+        if expected == 0 {
+            return false;
+        }
+        match self.processes.get_mut(&pid) {
+            Some(process) if process.win32_process == Some(expected) => {
+                process.win32_process = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// `PsGetProcessWin32Process`: read back the parked `W32PROCESS` pointer
     /// (`0`/`None` if win32k has not attached to `pid`).
     pub fn process_win32(&self, pid: ProcessId) -> Option<u64> {
@@ -2049,6 +2064,20 @@ impl ProcessManager {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Clear the parked W32THREAD only after an exact provider ThreadCallout(Exit) completion.
+    pub fn clear_thread_win32_exact(&mut self, tid: ThreadId, expected: u64) -> bool {
+        if expected == 0 {
+            return false;
+        }
+        match self.threads.get_mut(&tid) {
+            Some(thread) if thread.win32_thread == Some(expected) => {
+                thread.win32_thread = None;
+                true
+            }
+            _ => false,
         }
     }
 

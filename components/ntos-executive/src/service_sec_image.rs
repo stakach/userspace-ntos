@@ -2587,6 +2587,10 @@ fn win32k_client_context_for_thread(
     let token = win32k_token_context(nt_handler, pi);
     win32k_glue::Win32kClientContext {
         pi: pi as u32,
+        generation: nt_handler
+            .hosted_process_image(pi)
+            .map(|image| image.generation)
+            .unwrap_or(0),
         pid: pid as u64,
         badge,
         tid,
@@ -2792,6 +2796,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
 
 unsafe fn post_winlogon_second_sas_after_welcome_drain(
     pi: usize,
+    generation: u64,
     badge: u64,
     current_tid: u64,
     current_tcb: u64,
@@ -2874,6 +2879,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
         &[],
         win32k_glue::Win32kClientContext {
             pi: pi as u32,
+            generation,
             pid,
             badge,
             tid: current_tid,
@@ -9741,9 +9747,6 @@ pub(crate) unsafe fn service_sec_image(
                             }
                         }
                         if final_process_teardown {
-                            let _ = win32k_glue::unwind_dead_client_user_callbacks(
-                                process_index as u32,
-                            );
                             if let Some(pid) = nt_handler.pm_pid_for_pi(process_index as usize) {
                                 let _ = nt_handler.try_delete_hosted_process_object(pid);
                             }
@@ -10354,6 +10357,7 @@ pub(crate) unsafe fn service_sec_image(
                             .unwrap_or(0);
                         if post_winlogon_second_sas_after_welcome_drain(
                             pi,
+                            nt_handler.hosted_process_generation(pi).unwrap_or(0),
                             badge,
                             current_tid,
                             hosted_thread_tcb_or_zero(&nt_handler, current_tid),
@@ -14501,6 +14505,7 @@ pub(crate) unsafe fn service_sec_image(
                             .unwrap_or(0);
                         let _ = post_winlogon_second_sas_after_welcome_drain(
                             pi,
+                            nt_handler.hosted_process_generation(pi).unwrap_or(0),
                             badge,
                             current_tid,
                             hosted_thread_tcb_or_zero(&nt_handler, current_tid),

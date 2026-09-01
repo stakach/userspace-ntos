@@ -1927,6 +1927,14 @@ fn win32_process_thread_context_slots() {
     assert_eq!(pm.thread_win32(tid), Some(0xFFFF_9E00_5678_0000));
     assert_eq!(pm.process_window_station(pid), Some(0xFFFF_9E00_9ABC_0000));
 
+    assert!(!pm.clear_thread_win32_exact(tid, 0xFFFF_9E00_5678_0001));
+    assert!(!pm.clear_process_win32_exact(pid, 0xFFFF_9E00_1234_0001));
+    assert!(pm.clear_thread_win32_exact(tid, 0xFFFF_9E00_5678_0000));
+    assert!(pm.clear_process_win32_exact(pid, 0xFFFF_9E00_1234_0000));
+    assert_eq!(pm.thread_win32(tid), None);
+    assert_eq!(pm.process_win32(pid), None);
+    assert!(pm.set_process_win32(pid, 0xFFFF_9E00_1234_0000));
+
     // Setting NULL clears the slot (win32k detaches on process/thread teardown).
     assert!(pm.set_process_kernel_object(pid, 0));
     assert!(pm.set_thread_kernel_object(tid, 0));

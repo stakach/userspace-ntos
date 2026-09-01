@@ -398,6 +398,7 @@ pub(crate) enum UserCallbackDisposition {
 #[derive(Clone, Copy)]
 pub(crate) struct Win32kClientContext {
     pub pi: u32,
+    pub generation: u64,
     pub pid: u64,
     pub badge: u64,
     pub tid: u64,
@@ -443,6 +444,7 @@ fn win32k_client_context_from_callback_client(
 ) -> Win32kClientContext {
     Win32kClientContext {
         pi: client.pi,
+        generation: 0,
         pid: client.pid,
         badge: client.badge,
         tid: client.tid,
@@ -3035,6 +3037,22 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
     unwound
 }
 
+/// Retire callback-transport state after the exact process generation has completed provider and
+/// VM rundown. The service loop is serialized, so clearing the per-pi death latch here occurs
+/// before that pi can be admitted for a replacement generation.
+pub(crate) unsafe fn retire_dead_user_callback_client(client_pi: u32, pid: u64) -> bool {
+    if client_pi == 0 || client_pi >= 64 || pid == 0 || client_has_active_callback_frames(client_pi)
+    {
+        return false;
+    }
+    let registry = user_callback_client_registry_mut();
+    registry.retain(|record| record.client.pi != client_pi || record.client.pid != pid);
+    let suspended = suspended_published_contexts_mut();
+    suspended.retain(|record| record.pi != client_pi || record.pid != pid);
+    USER_CALLBACK_DEAD_CLIENTS.fetch_and(!(1u64 << client_pi), Ordering::Relaxed);
+    true
+}
+
 pub(crate) unsafe fn complete_controlled_user_callback(
     client_pi: u32,
     client_badge: u64,
@@ -5561,6 +5579,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         &[],
         Win32kClientContext {
             pi,
+            generation: 0,
             pid: 0,
             badge: 0,
             tid: 0,
@@ -5665,6 +5684,55 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     output_stage: Option<nt_user_callback::DispatchOutputStage>,
     client: Win32kClientContext,
 ) -> (u64, bool) {
+    win32k_dispatch_wide_with_completion_args_and_kind(
+        ssn,
+        a0,
+        a1,
+        a2,
+        a3,
+        caller_sp,
+        stack_args,
+        completion_args,
+        output_stage,
+        client,
+        win32k_subsystem::WIN32K_REQUEST_SSDT,
+    )
+}
+
+pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
+    command: u64,
+    expected_provider_state: u64,
+    flags: u64,
+    client: Win32kClientContext,
+) -> (u64, bool) {
+    win32k_dispatch_wide_with_completion_args_and_kind(
+        0,
+        command,
+        expected_provider_state,
+        flags,
+        0,
+        0,
+        &[],
+        [command, expected_provider_state, flags, 0],
+        None,
+        client,
+        win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
+    )
+}
+
+unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    client: Win32kClientContext,
+    request_kind: u64,
+) -> (u64, bool) {
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
     let debug_flags = WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.swap(0, Ordering::Relaxed);
@@ -5688,7 +5756,8 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     clear_published_win32k_context();
     let dispatch_id = USER_CALLBACK_DISPATCH_IDS.fetch_add(1, Ordering::Relaxed) + 1;
     let callback_client = client.callback_client();
-    let callback_capable = user_callback_client_can_register(callback_client);
+    let callback_capable = request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT
+        && user_callback_client_can_register(callback_client);
     if callback_capable && !register_user_callback_client_for_dispatch(dispatch_id, callback_client)
     {
         print_str(b"[user-callback] callback client registry full for dispatch\n");
@@ -5741,6 +5810,10 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
         nt_user_callback::CallbackHeader::idle(dispatch_id, client.pi, client.tid, client.badge),
     );
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_SSN) as *mut u64, ssn);
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_KIND) as *mut u64,
+        request_kind,
+    );
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A0) as *mut u64, a0);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A1) as *mut u64, a1);
     core::ptr::write_volatile((sh + win32k_subsystem::SH_REQ_A2) as *mut u64, a2);
@@ -5756,6 +5829,10 @@ pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_CLIENT_PI) as *mut u64,
         client.pi as u64,
+    );
+    core::ptr::write_volatile(
+        (sh + win32k_subsystem::SH_REQ_GENERATION) as *mut u64,
+        client.generation,
     );
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_CLIENT_TEB) as *mut u64,

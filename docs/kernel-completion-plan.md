@@ -21794,6 +21794,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     frames, callback ownership, or capability-delete failures. Do not raise `MAX_PI`. After that
     runtime proof, proceed to the dedicated real-provider GetClassInfo integration client.
 
+    Provider-owned GUI rundown checkpoint (2026-09-01, implementation green; runtime acceptance
+    pending): Ps teardown now enters win32k through a typed provider-control request class rather
+    than a synthetic SSDT selector. The request carries exact `pi`, PID, TID, EPROCESS, ETHREAD, and
+    hosted generation identity; the component resolves existing records only and cannot allocate or
+    re-run GUI conversion during exit. Each live W32THREAD receives the registered
+    `ThreadCallout(Exit=1)` while its TEB, ETHREAD, client mapping, and mechanism remain intact. The
+    final hosted mechanism then removes win32 job membership, calls the registered
+    `ProcessCallout(FALSE)`, and retires all provider context rows only after both authoritative
+    object fields and provider caches are zero. The Process Manager mirrors those clears with
+    exact-old operations, so a stale completion cannot detach a replacement generation. Failed
+    provider dispatch or postcondition validation leaves the TCB, VSpace, and dynamic identity
+    quarantined for retry.
+
+    The same boundary now marks a provider process terminating before the final callout, rejects a
+    late W32PROCESS reattach with `STATUS_PROCESS_IS_TERMINATING`, reuses only retired provider
+    context slots, and clears the per-pi dead-callback latch plus suspended publications before pi
+    reuse. The obsolete post-VM callback unwind was removed because it could poison the replacement
+    generation. `PsEstablishWin32Callouts` now copies the exact NT5 x64 0x80-byte callout table
+    instead of over-reading 0x100 bytes. `nt-process` passes 148 tests including exact W32 context
+    clearing, and the freestanding executive check is green.
+
+    Review adjustment: run the serialized desktop churn proof next under the one-hour ceiling and
+    require multiple real `rundll32.exe` device-install generations to exit through thread then
+    process callouts, reclaim one or more dynamic pi values, and relaunch without `err=6`, stale
+    callback state, win32k pool exhaustion, or capability-delete failure. If provider exit reveals
+    that ReactOS' normal THREADINFO/PROCESSINFO frees still land on the bump-only pool path, move
+    those churn allocations to a provider-owned reclaiming pool rather than weakening the rundown
+    gate. After runtime acceptance, add an exact-generation deletion-candidate queue at the common
+    service-loop release boundary so late owner-handle, debug-detach, termination-port, and retryable
+    VM/cap releases converge on final deletion without pid-only or one-shot retry sites. Then resume
+    the dedicated real-provider GetClassInfo integration client.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

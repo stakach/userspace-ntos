@@ -274,6 +274,7 @@ pub const SH_REQ_A1: u64 = 0x60; // in:  handler arg1 (rdx)
 pub const SH_REQ_A2: u64 = 0x68; // in:  handler arg2 (r8)
 pub const SH_REQ_A3: u64 = 0x70; // in:  handler arg3 (r9)
 pub const SH_REQ_STATUS: u64 = 0x78; // out: handler return value (u64; low i32 remains NTSTATUS-compatible)
+pub const SH_REQ_KIND: u64 = 0x80; // in: request class; SSDT dispatch or executive Ps control
 pub const SH_FONT_SIZE: u64 = 0x88; // in:  staged system-font (.ttf) byte size at FONTBUF_VADDR (u32)
                                     // STACK-ARG TAIL for executive-originated win32k SSNs. Real client syscalls pass their caller RSP in
                                     // SH_REQ_CALLER_SP and the component reads the required tail directly from the attached client stack,
@@ -329,6 +330,13 @@ pub const SH_GDI_LOAD_LEAF_LEN: u64 = 0x1D0; // in: ASCII driver leaf byte lengt
 pub const SH_GDI_LOAD_STATUS: u64 = 0x1D8; // out: executive load NTSTATUS
 pub const SH_GDI_LOAD_LEAF: u64 = 0x1E0; // in: lower-case ASCII driver leaf bytes
 pub const SH_GDI_LOAD_LEAF_CAP: usize = 24;
+pub const SH_REQ_GENERATION: u64 = 0x1F8; // in: exact hosted-process identity generation
+pub const WIN32K_REQUEST_SSDT: u64 = 0;
+pub const WIN32K_REQUEST_PS_PROVIDER: u64 = 1;
+pub const PS_WIN32_PROVIDER_THREAD_EXIT: u64 = 1;
+pub const PS_WIN32_PROVIDER_PROCESS_EXIT: u64 = 2;
+pub const PS_WIN32_PROVIDER_RETIRE_PROCESS_CONTEXT: u64 = 3;
+pub const PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT: u64 = 1;
 pub const SH_REQ_DEBUG_ATL_REPLAY: u64 = 0x0000_0001;
 const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 /// Phase 2A callback rendezvous frame. The fixed, pointer-free ABI occupies the otherwise-unused
@@ -336,6 +344,7 @@ const _: () = assert!(SH_SAS_AHELIST > SH_REQ_NARGS);
 pub const SH_USER_CALLBACK: u64 = 0x200;
 const _: () = assert!(SH_REQ_TOKEN_USER_SID_PTR + 8 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_GDI_LOAD_LEAF + SH_GDI_LOAD_LEAF_CAP as u64 <= SH_USER_CALLBACK);
+const _: () = assert!(SH_REQ_GENERATION + 8 <= SH_USER_CALLBACK);
 const _: () = assert!(SH_USER_CALLBACK as usize + nt_user_callback::CALLBACK_FRAME_SIZE <= 0x1000);
 /// Provider-owned `WIN32_CALLOUTS_FPNS` metadata copied out by `PsEstablishWin32Callouts`. These
 /// pointers remain provider VAs and are invoked only by dispatching back into this component.
@@ -2196,6 +2205,11 @@ extern "win64" fn s_set_win32process(process: u64, w32process: u64, old: u64) ->
             return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
         }
         let context_index = process_context_index_for_eprocess(process);
+        if w32process != 0
+            && context_index.is_some_and(|index| process_ctx_terminating(index) != 0)
+        {
+            return 0xC000_010Au32 as i32; // STATUS_PROCESS_IS_TERMINATING
+        }
         let field = (process + EPROCESS_WIN32PROCESS_OFF) as *mut u64;
         let previous = read_volatile(field);
         if w32process != 0 {
@@ -2420,7 +2434,8 @@ extern "win64" fn s_establish_win32_callouts(callout_data: u64) -> i32 {
     if callout_data != 0 {
         unsafe {
             let _ = win32_job_ui_policy();
-            for i in 0..(0x100u64 / 8) {
+            // NT5/ReactOS WIN32_CALLOUTS_FPNS contains sixteen pointers on x64.
+            for i in 0..(0x80u64 / 8) {
                 let v = read_volatile((callout_data + i * 8) as *const u64);
                 write_volatile((WIN32_CALLOUTS + i * 8) as *mut u64, v);
             }
@@ -5456,8 +5471,10 @@ const WIN32K_THREAD_CTX_INITIAL_CAP: u64 = 64;
 struct Win32kProcessContextRecord {
     pid: u64,
     pi: u64,
+    generation: u64,
     eprocess: u64,
     w32process: u64,
+    terminating: u64,
     client_peb: u64,
     token_authentication_id: u64,
     primary_token: u64,
@@ -5468,6 +5485,7 @@ struct Win32kThreadContextRecord {
     tid: u64,
     pid: u64,
     pi: u64,
+    generation: u64,
     teb: u64,
     callout_teb: u64,
     ethread: u64,
@@ -5758,15 +5776,19 @@ macro_rules! thread_ctx_setter {
 
 process_ctx_getter!(process_ctx_pid, pid);
 process_ctx_getter!(process_ctx_pi, pi);
+process_ctx_getter!(process_ctx_generation, generation);
 process_ctx_getter!(process_ctx_eprocess, eprocess);
 process_ctx_getter!(process_ctx_w32process, w32process);
+process_ctx_getter!(process_ctx_terminating, terminating);
 process_ctx_getter!(process_ctx_client_peb, client_peb);
 process_ctx_getter!(process_ctx_token_authentication_id, token_authentication_id);
 process_ctx_getter!(process_ctx_primary_token, primary_token);
 process_ctx_setter!(set_process_ctx_pid, pid);
 process_ctx_setter!(set_process_ctx_pi, pi);
+process_ctx_setter!(set_process_ctx_generation, generation);
 process_ctx_setter!(set_process_ctx_eprocess, eprocess);
 process_ctx_setter!(set_process_ctx_w32process, w32process);
+process_ctx_setter!(set_process_ctx_terminating, terminating);
 process_ctx_setter!(set_process_ctx_client_peb, client_peb);
 process_ctx_setter!(
     set_process_ctx_token_authentication_id,
@@ -5777,6 +5799,7 @@ process_ctx_setter!(set_process_ctx_primary_token, primary_token);
 thread_ctx_getter!(thread_ctx_tid, tid);
 thread_ctx_getter!(thread_ctx_pid, pid);
 thread_ctx_getter!(thread_ctx_pi, pi);
+thread_ctx_getter!(thread_ctx_generation, generation);
 thread_ctx_getter!(thread_ctx_teb, teb);
 thread_ctx_getter!(thread_ctx_callout_teb, callout_teb);
 thread_ctx_getter!(thread_ctx_ethread, ethread);
@@ -5784,6 +5807,7 @@ thread_ctx_getter!(thread_ctx_w32thread, w32thread);
 thread_ctx_setter!(set_thread_ctx_tid, tid);
 thread_ctx_setter!(set_thread_ctx_pid, pid);
 thread_ctx_setter!(set_thread_ctx_pi, pi);
+thread_ctx_setter!(set_thread_ctx_generation, generation);
 thread_ctx_setter!(set_thread_ctx_teb, teb);
 thread_ctx_setter!(set_thread_ctx_callout_teb, callout_teb);
 thread_ctx_setter!(set_thread_ctx_ethread, ethread);
@@ -5870,6 +5894,11 @@ unsafe fn ensure_thread_ctx_capacity(required: u64) -> bool {
 }
 
 unsafe fn reserve_process_ctx_record() -> Option<usize> {
+    for index in 0..process_ctx_len() {
+        if process_ctx_pid(index) == 0 {
+            return Some(index);
+        }
+    }
     let len = WIN32K_PROCESS_CTX_LEN.load(Ordering::Relaxed);
     let required = len.checked_add(1)?;
     if !ensure_process_ctx_capacity(required) {
@@ -5894,10 +5923,18 @@ unsafe fn commit_process_ctx_record(index: usize, record: Win32kProcessContextRe
         return;
     }
     write_volatile(process_ctx_record_ptr(base, index), record);
-    WIN32K_PROCESS_CTX_LEN.store(index as u64 + 1, Ordering::Relaxed);
+    let len = WIN32K_PROCESS_CTX_LEN.load(Ordering::Relaxed);
+    if index as u64 == len {
+        WIN32K_PROCESS_CTX_LEN.store(len + 1, Ordering::Relaxed);
+    }
 }
 
 unsafe fn reserve_thread_ctx_record() -> Option<usize> {
+    for index in 0..thread_ctx_len() {
+        if thread_ctx_tid(index) == 0 {
+            return Some(index);
+        }
+    }
     let len = WIN32K_THREAD_CTX_LEN.load(Ordering::Relaxed);
     let required = len.checked_add(1)?;
     if !ensure_thread_ctx_capacity(required) {
@@ -5922,7 +5959,47 @@ unsafe fn commit_thread_ctx_record(index: usize, record: Win32kThreadContextReco
         return;
     }
     write_volatile(thread_ctx_record_ptr(base, index), record);
-    WIN32K_THREAD_CTX_LEN.store(index as u64 + 1, Ordering::Relaxed);
+    let len = WIN32K_THREAD_CTX_LEN.load(Ordering::Relaxed);
+    if index as u64 == len {
+        WIN32K_THREAD_CTX_LEN.store(len + 1, Ordering::Relaxed);
+    }
+}
+
+unsafe fn retire_thread_ctx_record(index: usize) {
+    if let Some(ptr) = thread_ctx_ptr(index) {
+        write_volatile(
+            ptr,
+            Win32kThreadContextRecord {
+                tid: 0,
+                pid: 0,
+                pi: 0,
+                generation: 0,
+                teb: 0,
+                callout_teb: 0,
+                ethread: 0,
+                w32thread: 0,
+            },
+        );
+    }
+}
+
+unsafe fn retire_process_ctx_record(index: usize) {
+    if let Some(ptr) = process_ctx_ptr(index) {
+        write_volatile(
+            ptr,
+            Win32kProcessContextRecord {
+                pid: 0,
+                pi: 0,
+                generation: 0,
+                eprocess: 0,
+                w32process: 0,
+                terminating: 0,
+                client_peb: 0,
+                token_authentication_id: 0,
+                primary_token: 0,
+            },
+        );
+    }
 }
 
 unsafe fn process_context_object_matches_or_empty(index: usize, supplied: u64) -> bool {
@@ -7169,6 +7246,7 @@ unsafe fn restore_current_context_for_user_callback_resume_inner(
 unsafe fn ensure_process_context(
     pi: usize,
     pid: u64,
+    generation: u64,
     supplied_eprocess: u64,
     client_peb: u64,
 ) -> Option<usize> {
@@ -7176,7 +7254,14 @@ unsafe fn ensure_process_context(
         return None;
     }
     if let Some(index) = process_context_index_for_pid(pid) {
+        let recorded_generation = process_ctx_generation(index);
+        if generation != 0 && recorded_generation != 0 && generation != recorded_generation {
+            return None;
+        }
         set_process_ctx_pi(index, pi as u64);
+        if recorded_generation == 0 {
+            set_process_ctx_generation(index, generation);
+        }
         if !process_context_object_matches_or_empty(index, supplied_eprocess) {
             print_str(b"[win32k-context] ERROR: supplied EPROCESS mismatch for pid=");
             print_u64(pid);
@@ -7203,8 +7288,10 @@ unsafe fn ensure_process_context(
         Win32kProcessContextRecord {
             pid,
             pi: pi as u64,
+            generation,
             eprocess,
             w32process: 0,
+            terminating: 0,
             client_peb,
             token_authentication_id: 0,
             primary_token: 0,
@@ -7218,6 +7305,7 @@ unsafe fn ensure_thread_context(
     pi: usize,
     pid: u64,
     tid: u64,
+    generation: u64,
     teb: u64,
     supplied_ethread: u64,
 ) -> Option<usize> {
@@ -7228,7 +7316,14 @@ unsafe fn ensure_thread_context(
         if thread_ctx_pid(index) != pid {
             return None;
         }
+        let recorded_generation = thread_ctx_generation(index);
+        if generation != 0 && recorded_generation != 0 && generation != recorded_generation {
+            return None;
+        }
         set_thread_ctx_pi(index, pi as u64);
+        if recorded_generation == 0 {
+            set_thread_ctx_generation(index, generation);
+        }
         if teb != 0 {
             set_thread_ctx_teb(index, teb);
         }
@@ -7256,6 +7351,7 @@ unsafe fn ensure_thread_context(
             tid,
             pid,
             pi: pi as u64,
+            generation,
             teb,
             callout_teb: 0,
             ethread,
@@ -7402,6 +7498,7 @@ unsafe fn select_win32k_client_context(
     pi: u64,
     process_id: u64,
     thread_id: u64,
+    generation: u64,
     client_teb: u64,
     supplied_eprocess: u64,
     supplied_ethread: u64,
@@ -7428,7 +7525,7 @@ unsafe fn select_win32k_client_context(
         }
     }
     let client_peb = client_peb_from_teb(client_teb);
-    let process_index = ensure_process_context(pi, pid, supplied_eprocess, client_peb)?;
+    let process_index = ensure_process_context(pi, pid, generation, supplied_eprocess, client_peb)?;
     if !record_process_token_context(
         process_index,
         token_authentication_id,
@@ -7437,7 +7534,8 @@ unsafe fn select_win32k_client_context(
     ) {
         return None;
     }
-    let thread_index = ensure_thread_context(pi, pid, tid, client_teb, supplied_ethread)?;
+    let thread_index =
+        ensure_thread_context(pi, pid, tid, generation, client_teb, supplied_ethread)?;
     let eprocess = process_ctx_eprocess(process_index);
     let ethread = thread_ctx_ethread(thread_index);
     record_process_client_peb(process_index, client_peb);
@@ -7468,6 +7566,7 @@ unsafe fn ensure_bootstrap_win32k_context() -> Option<(usize, usize)> {
         0,
         0,
         0,
+        0,
         HOSTED_PROCESS_ROLE_NONE,
         nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_LOW as u64
             | ((nt_security::se_exports::SYSTEM_AUTHENTICATION_LUID_HIGH as u32 as u64) << 32),
@@ -7478,6 +7577,9 @@ unsafe fn ensure_bootstrap_win32k_context() -> Option<(usize, usize)> {
 
 unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64) -> bool {
     if !process_ctx_index_valid(process_index) {
+        return false;
+    }
+    if process_ctx_terminating(process_index) != 0 {
         return false;
     }
     if process_ctx_w32process(process_index) == 0 {
@@ -11248,6 +11350,243 @@ unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
     setup_dispatch_context();
 }
 
+unsafe fn select_existing_ps_provider_context(
+    require_thread: bool,
+) -> Result<(usize, Option<usize>), u32> {
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+    const STATUS_INVALID_CID: u32 = 0xC000_000B;
+    let sh = WIN32K_SHARED_VADDR;
+    let pi = read_volatile((sh + SH_REQ_CLIENT_PI) as *const u64);
+    let pid = read_volatile((sh + SH_REQ_PROCESS_ID) as *const u64);
+    let tid = read_volatile((sh + SH_REQ_THREAD_ID) as *const u64);
+    let generation = read_volatile((sh + SH_REQ_GENERATION) as *const u64);
+    let supplied_eprocess = read_volatile((sh + SH_REQ_EPROCESS) as *const u64);
+    let supplied_ethread = read_volatile((sh + SH_REQ_ETHREAD) as *const u64);
+    if checked_client_index(pi).is_none()
+        || pid == 0
+        || generation == 0
+        || supplied_eprocess == 0
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let process_index = process_context_index_for_pid(pid).ok_or(STATUS_INVALID_CID)?;
+    if process_ctx_pi(process_index) != pi
+        || process_ctx_generation(process_index) != generation
+        || process_ctx_eprocess(process_index) != supplied_eprocess
+    {
+        return Err(STATUS_INVALID_CID);
+    }
+
+    let thread_index = if tid == 0 {
+        None
+    } else {
+        let Some(index) = thread_context_index_for_tid(tid) else {
+            if require_thread {
+                return Err(STATUS_INVALID_CID);
+            }
+            return install_existing_ps_provider_process_context(process_index, pi, pid, supplied_eprocess);
+        };
+        if thread_ctx_pid(index) != pid
+            || thread_ctx_pi(index) != pi
+            || thread_ctx_generation(index) != generation
+            || supplied_ethread == 0
+            || thread_ctx_ethread(index) != supplied_ethread
+        {
+            return Err(STATUS_INVALID_CID);
+        }
+        Some(index)
+    };
+
+    WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
+    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
+    WIN32K_CURRENT_THREAD_ID.store(tid, Ordering::Relaxed);
+    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, supplied_eprocess);
+    write_volatile(
+        SLOT_W32PROCESS as *mut u64,
+        process_ctx_w32process(process_index),
+    );
+    if let Some(thread_index) = thread_index {
+        let recorded_teb = thread_ctx_teb(thread_index);
+        let supplied_teb = read_volatile((sh + SH_REQ_CLIENT_TEB) as *const u64);
+        if supplied_teb != 0 && recorded_teb != 0 && supplied_teb != recorded_teb {
+            return Err(STATUS_INVALID_CID);
+        }
+        let teb = if supplied_teb != 0 {
+            supplied_teb
+        } else if recorded_teb != 0 {
+            recorded_teb
+        } else {
+            thread_ctx_callout_teb(thread_index)
+        };
+        if teb == 0 {
+            return Err(STATUS_INVALID_CID);
+        }
+        write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, teb);
+        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, supplied_ethread);
+        write_volatile(
+            SLOT_W32THREAD as *mut u64,
+            thread_ctx_w32thread(thread_index),
+        );
+        publish_selected_context(process_index, thread_index);
+    } else {
+        write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
+        write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
+        write_volatile(SLOT_W32THREAD as *mut u64, 0);
+        write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
+        write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, 0);
+        write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, supplied_eprocess);
+        write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, 0);
+        write_volatile(
+            (sh + SH_CTX_W32PROCESS) as *mut u64,
+            process_ctx_w32process(process_index),
+        );
+        write_volatile((sh + SH_CTX_W32THREAD) as *mut u64, 0);
+    }
+    Ok((process_index, thread_index))
+}
+
+unsafe fn install_existing_ps_provider_process_context(
+    process_index: usize,
+    pi: u64,
+    pid: u64,
+    eprocess: u64,
+) -> Result<(usize, Option<usize>), u32> {
+    let sh = WIN32K_SHARED_VADDR;
+    WIN32K_CURRENT_CLIENT_PI.store(pi, Ordering::Relaxed);
+    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
+    WIN32K_CURRENT_THREAD_ID.store(0, Ordering::Relaxed);
+    write_volatile((WIN32K_KPCR_VA + 0x30) as *mut u64, WIN32K_KPCR_VA);
+    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, 0);
+    write_volatile(
+        SLOT_W32PROCESS as *mut u64,
+        process_ctx_w32process(process_index),
+    );
+    write_volatile(SLOT_W32THREAD as *mut u64, 0);
+    write_volatile((sh + SH_CTX_PROCESS_ID) as *mut u64, pid);
+    write_volatile((sh + SH_CTX_THREAD_ID) as *mut u64, 0);
+    write_volatile((sh + SH_CTX_EPROCESS) as *mut u64, eprocess);
+    write_volatile((sh + SH_CTX_ETHREAD) as *mut u64, 0);
+    write_volatile(
+        (sh + SH_CTX_W32PROCESS) as *mut u64,
+        process_ctx_w32process(process_index),
+    );
+    write_volatile((sh + SH_CTX_W32THREAD) as *mut u64, 0);
+    Ok((process_index, None))
+}
+
+unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) -> u64 {
+    const STATUS_SUCCESS: u64 = 0;
+    const STATUS_UNSUCCESSFUL: u64 = 0xC000_0001u32 as u64;
+    const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
+    const STATUS_DEVICE_NOT_READY: u64 = 0xC000_00A3u32 as u64;
+    let Ok((process_index, thread_index)) =
+        select_existing_ps_provider_context(command == PS_WIN32_PROVIDER_THREAD_EXIT)
+    else {
+        return 0xC000_000Bu32 as u64;
+    };
+    let pid = process_ctx_pid(process_index);
+
+    match command {
+        PS_WIN32_PROVIDER_THREAD_EXIT => {
+            let Some(thread_index) = thread_index else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let ethread = thread_ctx_ethread(thread_index);
+            if expected == 0
+                || thread_ctx_w32thread(thread_index) != expected
+                || read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != expected
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            if flags & PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT != 0 {
+                set_process_ctx_terminating(process_index, 1);
+            }
+            let routine = read_volatile((WIN32_CALLOUTS + 8) as *const u64);
+            if routine == 0 {
+                return STATUS_DEVICE_NOT_READY;
+            }
+            let callout: extern "win64" fn(u64, u64) -> i32 =
+                core::mem::transmute(routine as *const ());
+            let status = callout(ethread, 1);
+            if status < 0 {
+                return status as u32 as u64;
+            }
+            if thread_ctx_w32thread(thread_index) != 0
+                || read_volatile((ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != 0
+                || read_volatile(SLOT_W32THREAD as *const u64) != 0
+            {
+                return STATUS_UNSUCCESSFUL;
+            }
+            publish_selected_context(process_index, thread_index);
+            if flags & PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT == 0 {
+                retire_thread_ctx_record(thread_index);
+            }
+            STATUS_SUCCESS
+        }
+        PS_WIN32_PROVIDER_PROCESS_EXIT => {
+            let eprocess = process_ctx_eprocess(process_index);
+            if expected == 0
+                || process_ctx_w32process(process_index) != expected
+                || read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64) != expected
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            for index in 0..thread_ctx_len() {
+                if thread_ctx_pid(index) == pid && thread_ctx_w32thread(index) != 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+            set_process_ctx_terminating(process_index, 1);
+            let routine = read_volatile(WIN32_CALLOUTS as *const u64);
+            if routine == 0 {
+                return STATUS_DEVICE_NOT_READY;
+            }
+            let callout: extern "win64" fn(u64, u64) -> i32 =
+                core::mem::transmute(routine as *const ());
+            let status = callout(eprocess, 0);
+            if status < 0 {
+                return status as u32 as u64;
+            }
+            if process_ctx_w32process(process_index) != 0
+                || read_volatile((eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64) != 0
+                || read_volatile(SLOT_W32PROCESS as *const u64) != 0
+            {
+                return STATUS_UNSUCCESSFUL;
+            }
+            if let Some(thread_index) = thread_index {
+                publish_selected_context(process_index, thread_index);
+            }
+            for index in 0..thread_ctx_len() {
+                if thread_ctx_pid(index) == pid {
+                    if thread_ctx_w32thread(index) != 0 {
+                        return STATUS_UNSUCCESSFUL;
+                    }
+                    retire_thread_ctx_record(index);
+                }
+            }
+            retire_process_ctx_record(process_index);
+            STATUS_SUCCESS
+        }
+        PS_WIN32_PROVIDER_RETIRE_PROCESS_CONTEXT => {
+            if expected != 0 || process_ctx_w32process(process_index) != 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            for index in 0..thread_ctx_len() {
+                if thread_ctx_pid(index) == pid {
+                    if thread_ctx_w32thread(index) != 0 {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    retire_thread_ctx_record(index);
+                }
+            }
+            retire_process_ctx_record(process_index);
+            STATUS_SUCCESS
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
 /// The win32k `dispatch` closure plugged into [`crate::spawn_hosts::component_main`]. This is the EXACT
 /// per-request body the retired inline `dispatch_loop` ran (minus the send_done/recv_req/status-writeback,
 /// which the harness owns): the SetThreadDesktop WindowListHead compatibility reset + BATCH-43
@@ -11262,6 +11601,14 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let a1 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A1) as *const u64);
     let a2 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A2) as *const u64);
     let a3 = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_A3) as *const u64);
+    let request_kind = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_KIND) as *const u64);
+    if request_kind == WIN32K_REQUEST_PS_PROVIDER {
+        let result = dispatch_ps_provider_command(a0, a1, a2);
+        return (result as u32 as i32, result);
+    }
+    if request_kind != WIN32K_REQUEST_SSDT {
+        return (0xC000_000Du32 as i32, 0xC000_000Du32 as u64);
+    }
     // Ps invokes the registered JobCallout as an executive-to-provider operation. It owns no
     // calling GUI thread and must not inherit or manufacture a client win32 context merely to
     // update win32k-owned job policy.
@@ -11286,6 +11633,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     let client_pi = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_PI) as *const u64);
     let client_teb = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_CLIENT_TEB) as *const u64);
     let thread_id = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_THREAD_ID) as *const u64);
+    let generation = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_GENERATION) as *const u64);
     let supplied_eprocess = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_EPROCESS) as *const u64);
     let supplied_ethread = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_ETHREAD) as *const u64);
     let process_role = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_PROCESS_ROLE) as *const u64);
@@ -11309,6 +11657,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         client_pi,
         process_id,
         thread_id,
+        generation,
         client_teb,
         supplied_eprocess,
         supplied_ethread,

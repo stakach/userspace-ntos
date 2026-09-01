@@ -10330,6 +10330,10 @@ impl ExecNtHandler {
             .map(|runtime| runtime.pi)
     }
 
+    pub(crate) fn hosted_thread_pi_for_tid(&self, tid: u64) -> Option<usize> {
+        self.thread_runtime.get_by_tid(tid).map(|runtime| runtime.pi)
+    }
+
     pub(crate) fn hosted_thread_tid_for_badge(&self, badge: u64) -> Option<u64> {
         self.thread_runtime
             .get_by_badge(badge)
@@ -10544,6 +10548,12 @@ impl ExecNtHandler {
 
     pub(crate) fn hosted_process_role(&self, pi: usize) -> Option<nt_exe_image::HostedProcessRole> {
         self.hosted_process_image(pi).map(|image| image.role)
+    }
+
+    pub(crate) fn hosted_process_generation(&self, pi: usize) -> Option<u64> {
+        self.process_mechanisms
+            .get(pi)
+            .map(|mechanism| mechanism.generation)
     }
 
     pub(crate) fn primary_token_authentication_id_for_pi(
@@ -21842,15 +21852,6 @@ impl ExecNtHandler {
             None
         };
 
-        if let Some(w32process) = self.pm.process_win32(pid) {
-            if self
-                .remove_process_win32_job_membership(pid, w32process)
-                .is_err()
-            {
-                return false;
-            }
-        }
-
         let thread_count = self
             .pm
             .process(pid)
@@ -25574,7 +25575,7 @@ impl ExecNtHandler {
         )
     }
 
-    fn remove_process_win32_job_membership(
+    pub(crate) fn remove_process_win32_job_membership(
         &mut self,
         pid: nt_process::ProcessId,
         w32process: u64,

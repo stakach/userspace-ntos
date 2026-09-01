@@ -19078,11 +19078,177 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
     }
 }
 
+fn hosted_process_has_one_mechanism_left(
+    pid: nt_process::ProcessId,
+    handler: &ExecNtHandler,
+) -> bool {
+    let Some(process) = handler.pm.process(pid) else {
+        return false;
+    };
+    process.state == nt_process::ProcessState::Terminated
+        && process
+            .threads
+            .iter()
+            .copied()
+            .filter(|tid| handler.hosted_thread_tcb(u64::from(*tid)).is_some_and(|tcb| tcb > 1))
+            .count()
+            == 1
+}
+
+fn win32k_lifecycle_client(
+    tid: u64,
+    handler: &ExecNtHandler,
+) -> Option<win32k_glue::Win32kClientContext> {
+    let pi = handler.hosted_thread_pi_for_tid(tid)?;
+    let pid = handler.pm_pid_for_pi(pi)?;
+    let badge = handler.hosted_thread_badge_for_tid(tid)?;
+    let tcb = handler.hosted_thread_tcb(tid)?;
+    let teb = handler.pm.thread_teb(tid as nt_process::ThreadId)?;
+    let generation = handler.hosted_process_generation(pi)?;
+    if generation == 0 {
+        return None;
+    }
+    let authentication_id = handler
+        .primary_token_authentication_id_for_pi(pi)
+        .map(|luid| luid.low as u64 | ((luid.high as u32 as u64) << 32))
+        .unwrap_or(0);
+    let mut user_sid = [0u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX];
+    let user_sid_len = handler
+        .primary_token_user_sid_for_pi(pi, &mut user_sid)
+        .unwrap_or(0) as u32;
+    Some(win32k_glue::Win32kClientContext {
+        pi: pi as u32,
+        generation,
+        pid: u64::from(pid),
+        badge,
+        tid,
+        tcb,
+        eprocess: handler.pm.process_kernel_object(pid).unwrap_or(0),
+        ethread: handler
+            .pm
+            .thread_kernel_object(tid as nt_process::ThreadId)
+            .unwrap_or(0),
+        role: handler.hosted_thread_role(tid),
+        process_role: handler.hosted_process_role(pi),
+        top_badge: handler.hosted_process_top_badge(pi).unwrap_or(0),
+        teb,
+        peb_mirror: 0,
+        scratch_base: EXECUTIVE_WIN32K_SCRATCH_BASE,
+        token_authentication_id: authentication_id,
+        token_user_sid: user_sid,
+        token_user_sid_len: user_sid_len,
+    })
+}
+
+unsafe fn release_hosted_thread_win32_context(
+    tid: u64,
+    handler: &mut ExecNtHandler,
+) -> bool {
+    const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
+    let Some(pi) = handler.hosted_thread_pi_for_tid(tid) else {
+        return false;
+    };
+    let Some(pid) = handler.pm_pid_for_pi(pi) else {
+        return false;
+    };
+    let final_mechanism = hosted_process_has_one_mechanism_left(pid, handler);
+    let thread_win32 = handler.pm.thread_win32(tid as nt_process::ThreadId);
+    let process_win32 = final_mechanism.then(|| handler.pm.process_win32(pid)).flatten();
+    if thread_win32.is_none() && process_win32.is_none() {
+        if final_mechanism {
+            let _ = win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid));
+        }
+        return true;
+    }
+    let Some(client) = win32k_lifecycle_client(tid, handler) else {
+        return false;
+    };
+
+    if handler
+        .pm
+        .process(pid)
+        .is_some_and(|process| process.state == nt_process::ProcessState::Terminated)
+    {
+        let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
+    } else if win32k_glue::client_has_active_callback_frames(pi as u32) {
+        return false;
+    }
+
+    if let Some(expected) = thread_win32 {
+        let flags = if final_mechanism {
+            win32k_subsystem::PS_WIN32_PROVIDER_RETAIN_THREAD_CONTEXT
+        } else {
+            0
+        };
+        let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
+            win32k_subsystem::PS_WIN32_PROVIDER_THREAD_EXIT,
+            expected,
+            flags,
+            client,
+        );
+        if !completed || status as u32 != 0 {
+            print_str(b"[ps-win32-exit] thread callout failed tid=");
+            print_u64(tid);
+            print_str(b" status=0x");
+            print_hex(if completed { status as u32 } else { STATUS_DEVICE_NOT_READY });
+            print_str(b"\n");
+            return false;
+        }
+        if !handler
+            .pm
+            .clear_thread_win32_exact(tid as nt_process::ThreadId, expected)
+        {
+            return false;
+        }
+    }
+
+    if let Some(expected) = process_win32 {
+        if handler
+            .remove_process_win32_job_membership(pid, expected)
+            .is_err()
+        {
+            return false;
+        }
+        let (status, completed) = win32k_glue::win32k_dispatch_ps_provider_command(
+            win32k_subsystem::PS_WIN32_PROVIDER_PROCESS_EXIT,
+            expected,
+            0,
+            client,
+        );
+        if !completed || status as u32 != 0 {
+            print_str(b"[ps-win32-exit] process callout failed pid=");
+            print_u64(u64::from(pid));
+            print_str(b" status=0x");
+            print_hex(if completed { status as u32 } else { STATUS_DEVICE_NOT_READY });
+            print_str(b"\n");
+            return false;
+        }
+        if !handler.pm.clear_process_win32_exact(pid, expected) {
+            return false;
+        }
+    }
+    if final_mechanism
+        && !win32k_glue::retire_dead_user_callback_client(pi as u32, u64::from(pid))
+    {
+        return false;
+    }
+    true
+}
+
 unsafe fn terminate_hosted_thread_mechanism(
     tid: u64,
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> bool {
+    let tcb = match handler.hosted_thread_tcb(tid) {
+        Some(tcb) if tcb > 1 => tcb,
+        None => return false,
+        Some(_) => return false,
+    };
+    notify_thread_termination_ports(tid, handler);
+    if !release_hosted_thread_win32_context(tid, handler) {
+        return false;
+    }
     delay_cancel_thread(delay_queue, handler, tid);
     io_completion_cancel_thread(handler, tid);
     let _ = handler.user_timer_cancel_thread(tid);
@@ -19099,12 +19265,6 @@ unsafe fn terminate_hosted_thread_mechanism(
         print_u64(abandoned_mutants);
         print_str(b"\n");
     }
-    notify_thread_termination_ports(tid, handler);
-    let tcb = match handler.hosted_thread_tcb(tid) {
-        Some(tcb) if tcb > 1 => tcb,
-        None => return false,
-        Some(_) => return false,
-    };
     let suspend = tcb_suspend_r(tcb);
     let delete = if suspend == 0 {
         cnode_delete_recycle_r(tcb)
@@ -19306,7 +19466,6 @@ unsafe fn teardown_job_terminated_processes(
         let reclaimed =
             terminate_hosted_process_mechanisms(process_index, None, delay_queue, handler);
         let vm_reclaim = reclaim_final_process_vm(process_index, handler);
-        let _ = win32k_glue::unwind_dead_client_user_callbacks(process_index as u32);
         if let Some(pid) = handler.pm_pid_for_pi(process_index as usize) {
             let _ = handler.try_delete_hosted_process_object(pid);
         }
