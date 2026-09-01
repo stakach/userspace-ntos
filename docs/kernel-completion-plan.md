@@ -21389,6 +21389,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     replacing the installed full `ServiceGroupOrder\\List` with six entries; all generated groups
     already exist in the base order, so preserving that authority is the correct default.
 
+    B3 native live-event stream correction (2026-09-01, implementation and host validation green;
+    runtime pending): the
+    installed-state runtime reached real SCM activation of `umpnpmgr.dll`, created its PlugPlay pipe,
+    and began processing `HTREE\\ROOT\\0`. That exposed the executive's obsolete boot-devnode
+    replay directly: `NtGetPlugPlayEvent` delivered CM discovery history as native kernel events and
+    the service faulted before claiming the real live journal. The bounded run was stopped after it
+    ceased forward progress; QEMU was not left running.
+
+    `NtGetPlugPlayEvent` now claims only explicit CM device actions. The boot cursor, its synthetic
+    install-event enumeration, and its user-response advancement path are deleted. Each terminal row
+    records drain state directly from the exact CM acknowledgement's `has_more` result, and the
+    generic report includes the CM pending bit so an unclaimed queue cannot pass as an empty ledger.
+    The live integration verifier accepts an ordered nonempty batch, requires identical claim,
+    delivery, retirement, and proof identity sequences, enforces one final draining ACK with no
+    active reply or CM owner, and locates the new NIC by its instance identity. Review adjustment:
+    validate this slice before the next serialized boot, then preserve the installed
+    `ServiceGroupOrder` authority and add ensure-load to live START before runtime acceptance. The
+    current driver lifecycle traces correlate by instance only; carry the action claim identity and
+    canonical driver/device/IRP results into the immutable terminal row before treating that trace
+    correlation as the final causal proof. The integration script is syntax-clean, its embedded
+    verifier accepts a synthetic exact lifecycle, `git diff --check` passes, and the freestanding
+    executive check remains green at the established 209-warning baseline.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

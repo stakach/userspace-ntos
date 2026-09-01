@@ -20345,6 +20345,7 @@ struct LiveDeviceActionReport {
     empty_after_ack: u64,
     active: u64,
     reply_tail_active: u64,
+    cm_pending: u64,
 }
 
 impl LiveDeviceActionReport {
@@ -20352,6 +20353,7 @@ impl LiveDeviceActionReport {
         self.claims == self.terminal_rows + self.active
             && self.successful + self.failed == self.terminal_rows
             && self.reply_tail_active == 0
+            && self.cm_pending == 0
             && (self.terminal_rows == 0 || self.empty_after_ack != 0)
     }
 }
@@ -20362,6 +20364,7 @@ fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionR
         terminal_rows: handler.pnp_live_action_terminals.len() as u64,
         active: handler.pnp_live_action.is_some() as u64,
         reply_tail_active: handler.pnp_live_action_reply_tail.is_some() as u64,
+        cm_pending: config_manager_device_action_pending() as u64,
         ..LiveDeviceActionReport::default()
     };
     for row in &handler.pnp_live_action_terminals {
@@ -20403,12 +20406,14 @@ fn print_live_device_action_report(handler: &ExecNtHandler) -> LiveDeviceActionR
     print_u64(report.successful);
     print_str(b"/");
     print_u64(report.failed);
-    print_str(b" empty-after-ack/active/reply-tail=");
+    print_str(b" empty-after-ack/active/reply-tail/cm-pending=");
     print_u64(report.empty_after_ack);
     print_str(b"/");
     print_u64(report.active);
     print_str(b"/");
     print_u64(report.reply_tail_active);
+    print_str(b"/");
+    print_u64(report.cm_pending);
     print_str(b"\n");
     report
 }
@@ -23611,9 +23616,6 @@ struct ExecNtHandler {
     /// Monotonic counter for anonymous (unnamed) event objects (rpcrt4's server_ready_event/mgr_event).
     /// Each anon event gets a unique synthetic name so no two dedup. See `obj_create_anon_event`.
     anon_event_seq: u32,
-    /// Cursor over the historical CM-indexed boot device-install stream. The seeded baseline is
-    /// discovery history, not a runtime arrival journal.
-    pnp_boot_event_cursor: usize,
     /// Exclusive live CM action claim retained across user notification, asynchronous START, and
     /// CM acknowledgement retries.
     pnp_live_action: Option<LiveDeviceActionState>,

@@ -3882,7 +3882,6 @@ impl ExecNtHandler {
         write_field!(dbgk_block_request, false);
         write_field!(pipe_endpoint_progress, false);
         write_field!(anon_event_seq, 0);
-        write_field!(pnp_boot_event_cursor, 0);
         write_field!(pnp_live_action, None);
         write_field!(pnp_live_action_reply_tail, None);
         write_field!(pnp_live_action_claims, 0);
@@ -19622,9 +19621,6 @@ impl ExecNtHandler {
         let Some(event) =
             crate::config_manager_next_device_action().map_err(|status| status as u32)?
         else {
-            if let Some(last) = self.pnp_live_action_terminals.last_mut() {
-                last.empty_after_ack = true;
-            }
             return Ok(false);
         };
         print_str(b"[pnp-live-action] claimed generation/sequence/token=");
@@ -19692,7 +19688,7 @@ impl ExecNtHandler {
                 instance_id,
                 status,
                 reply_status,
-                empty_after_ack: false,
+                empty_after_ack: !has_more,
             });
         if has_more {
             self.pnp_signal_pending_action();
@@ -19873,39 +19869,25 @@ impl ExecNtHandler {
             return STATUS_PRIVILEGE_NOT_HELD;
         }
 
-        let boot_instance = match Self::pnp_query(
-            nt_config_abi::pnp_query_kind::ENUMERATE_DEVNODE,
-            self.pnp_boot_event_cursor.min(u32::MAX as usize) as u32,
-            "",
-            &[],
-        ) {
-            Ok(snapshot) if snapshot.strings.len() == 1 && snapshot.payload.is_empty() => {
-                Some(snapshot.strings.into_iter().next().unwrap())
+        if self.pnp_live_action.is_some() {
+            if let Err(status) = self.pnp_try_acknowledge_live_action() {
+                return status;
             }
-            Err(STATUS_NO_MORE_ENTRIES) => {
-                if self.pnp_live_action.is_some() {
-                    let _ = self.pnp_try_acknowledge_live_action();
-                }
-                match self.pnp_claim_live_action() {
-                    Ok(true) => None,
-                    Ok(false) => {
-                        let Ok(object) = self.pnp_event_wait_object() else {
-                            return STATUS_DEVICE_NOT_READY;
-                        };
-                        self.wait_park_event = object.raw() as i64;
-                        self.wait_timeout = PendingWaitTimeout::none();
-                        return nt_status::NtStatus::PENDING.raw() as u32;
-                    }
-                    Err(status) => return status,
-                }
+        }
+        match self.pnp_claim_live_action() {
+            Ok(true) => {}
+            Ok(false) => {
+                let Ok(object) = self.pnp_event_wait_object() else {
+                    return STATUS_DEVICE_NOT_READY;
+                };
+                self.wait_park_event = object.raw() as i64;
+                self.wait_timeout = PendingWaitTimeout::none();
+                return nt_status::NtStatus::PENDING.raw() as u32;
             }
             Err(status) => return status,
-            _ => return STATUS_INVALID_PARAMETER,
-        };
+        }
 
-        let event = if let Some(instance) = boot_instance.as_deref() {
-            Self::pnp_encode_device_install_event(instance)
-        } else {
+        let event = {
             let Some(state) = self.pnp_live_action.as_ref() else {
                 return STATUS_DEVICE_NOT_READY;
             };
@@ -19930,22 +19912,20 @@ impl ExecNtHandler {
         if self.pnp_notify_event != 0 {
             let _ = self.events.reset_existing(self.pnp_notify_event);
         }
-        if boot_instance.is_none() {
-            let state = self
-                .pnp_live_action
-                .as_mut()
-                .expect("live PnP event disappeared during delivery");
-            state.delivered = true;
-            print_str(b"[pnp-live-action] delivered generation/sequence/token=");
-            print_u64(state.owner.identity().mount_generation);
-            print_str(b"/");
-            print_u64(state.owner.identity().sequence);
-            print_str(b"/");
-            print_u64(state.owner.identity().claim_token);
-            print_str(b" instance=");
-            print_str(state.event.publication.instance_id.as_bytes());
-            print_str(b"\n");
-        }
+        let state = self
+            .pnp_live_action
+            .as_mut()
+            .expect("live PnP event disappeared during delivery");
+        state.delivered = true;
+        print_str(b"[pnp-live-action] delivered generation/sequence/token=");
+        print_u64(state.owner.identity().mount_generation);
+        print_str(b"/");
+        print_u64(state.owner.identity().sequence);
+        print_str(b"/");
+        print_u64(state.owner.identity().claim_token);
+        print_str(b" instance=");
+        print_str(state.event.publication.instance_id.as_bytes());
+        print_str(b"\n");
         0
     }
 
@@ -20549,24 +20529,12 @@ impl ExecNtHandler {
             if state.owner.respond().is_err() {
                 return STATUS_INVALID_PARAMETER;
             }
-            let _ = self.pnp_try_acknowledge_live_action();
-            return 0;
+            return match self.pnp_try_acknowledge_live_action() {
+                Ok(_) => 0,
+                Err(status) => status,
+            };
         }
-        self.pnp_boot_event_cursor = self.pnp_boot_event_cursor.saturating_add(1);
-        if Self::pnp_query(
-            nt_config_abi::pnp_query_kind::ENUMERATE_DEVNODE,
-            self.pnp_boot_event_cursor.min(u32::MAX as usize) as u32,
-            "",
-            &[],
-        )
-        .is_ok()
-        {
-            if self.pnp_notify_event != 0 {
-                let _ = self.events.set_existing(self.pnp_notify_event);
-                unsafe { wait_wake_dispatcher_set(self) };
-            }
-        }
-        0
+        STATUS_INVALID_PARAMETER
     }
 
     unsafe fn pnp_write_sized_output(
