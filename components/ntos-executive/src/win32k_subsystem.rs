@@ -646,7 +646,13 @@ const THREADINFO_PDESKINFO_OFF: u64 = 0x80;
 /// THREADINFO->pClientInfo offset (win32.h, after pDeskInfo). `IntSetThreadDesktop` also updates the
 /// client-side `pci->pDeskInfo` (desktop.c:3434) from this.
 const THREADINFO_PCLIENTINFO_OFF: u64 = 0x88;
+const THREADINFO_FLAGS_OFF: u64 = 0x90;
 const THREADINFO_PCTI_OFF: u64 = 0x70;
+/// THREADINFO.cti, the embedded CLIENTTHREADINFO used while a thread has no desktop. ReactOS
+/// initializes `pcti = &cti` and only replaces it with desktop-heap storage in IntSetThreadDesktop.
+const THREADINFO_EMBEDDED_CTI_OFF: u64 = 0x2A8;
+const TIF_SYSTEMTHREAD: u32 = 0x0000_0004;
+const TIF_CSRSSTHREAD: u32 = 0x0000_0008;
 const CLIENTTHREADINFO_SIZE: u64 = 0x20;
 const CLIENTINFO_PDESKINFO_OFF: u64 = 0x20;
 const CLIENTINFO_ULCLIENTDELTA_OFF: u64 = 0x28;
@@ -1460,7 +1466,6 @@ unsafe fn ensure_primary_token_object(process_index: usize) -> u64 {
         }
         write_volatile(allocated as *mut u64, WIN32K_PRIMARY_TOKEN_MAGIC);
         set_process_ctx_primary_token(process_index, allocated);
-        add_process_ctx_ownership(process_index, PROCESS_CTX_OWNS_PRIMARY_TOKEN);
         WIN32K_CONTEXT_TOKEN_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         allocated
     };
@@ -4468,11 +4473,14 @@ unsafe fn heap_free(p: u64) -> bool {
 
 unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
     let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
-    let arena_end = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
+    let arena_bytes = WIN32K_HEAP_FRAMES * 0x1000;
+    let arena_end = WIN32K_HEAP_VADDR + arena_bytes;
     let reserve_size = (reserve_size + 0xFFF) & !0xFFF;
     if base < arena_start
         || reserve_size < POOL_DATA_OFF + HEAP_HDR_SIZE
-        || base + reserve_size > arena_end
+        || base.checked_add(reserve_size).is_none_or(|end| end > arena_end)
+        || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, base)
+            .is_none_or(|capacity| capacity < reserve_size)
     {
         return 0;
     }
@@ -4488,15 +4496,24 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
 
 unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
     let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
-    let arena_end = WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000;
-    if heap < arena_start || heap + HEAP_HANDLE_SIZE_OFF + 8 > arena_end {
+    let arena_bytes = WIN32K_HEAP_FRAMES * 0x1000;
+    let arena_end = WIN32K_HEAP_VADDR + arena_bytes;
+    if heap < arena_start
+        || heap
+            .checked_add(HEAP_HANDLE_SIZE_OFF + 8)
+            .is_none_or(|end| end > arena_end)
+    {
         return None;
     }
     if read_volatile((heap + HEAP_HANDLE_MAGIC_OFF) as *const u64) != HEAP_HANDLE_MAGIC {
         return None;
     }
     let size = read_volatile((heap + HEAP_HANDLE_SIZE_OFF) as *const u64);
-    if size < POOL_DATA_OFF + HEAP_HDR_SIZE || heap + size > arena_end {
+    if size < POOL_DATA_OFF + HEAP_HDR_SIZE
+        || heap.checked_add(size).is_none_or(|end| end > arena_end)
+        || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, heap)
+            .is_none_or(|capacity| capacity < size)
+    {
         return None;
     }
     Some((heap, size))
@@ -4586,6 +4603,16 @@ unsafe fn ensure_process_desktop_heap_mapping(ppi: u64, desk_body: u64) -> Optio
             write_volatile((mapping + W32HEAP_MAPPING_USER_OFF) as *mut u64, user_base);
             write_volatile((mapping + W32HEAP_MAPPING_LIMIT_OFF) as *mut u64, limit);
             if read_volatile((mapping + W32HEAP_MAPPING_COUNT_OFF) as *const u32) == 0 {
+                let section = read_volatile((desk_body + DESKTOP_HSECTION_OFF) as *const u64);
+                let (mapped_base, mapped_size) = section_view(section, limit);
+                if mapped_base != kernel_base || mapped_size < limit {
+                    if mapped_base != 0 {
+                        let _ = unmap_section(section as *mut u8, mapped_base, |base| {
+                            heap_free(base)
+                        });
+                    }
+                    return None;
+                }
                 write_volatile((mapping + W32HEAP_MAPPING_COUNT_OFF) as *mut u32, 1);
             }
             return Some((kernel_base, user_base, limit));
@@ -4598,8 +4625,20 @@ unsafe fn ensure_process_desktop_heap_mapping(ppi: u64, desk_body: u64) -> Optio
         return None;
     }
 
-    let mapping = heap_alloc(W32HEAP_MAPPING_SIZE, true);
+    // A W32HEAP mapping row is a real client-view lease. Acquire the matching section view before
+    // publishing Count=1 so IntUnmapDesktopView cannot consume the permanent session mapping.
+    let section = read_volatile((desk_body + DESKTOP_HSECTION_OFF) as *const u64);
+    let (mapped_base, mapped_size) = section_view(section, limit);
+    if mapped_base != kernel_base || mapped_size < limit {
+        if mapped_base != 0 {
+            let _ = unmap_section(section as *mut u8, mapped_base, |base| heap_free(base));
+        }
+        return None;
+    }
+    let user_heap = read_volatile((head + W32HEAP_MAPPING_KERNEL_OFF) as *const u64);
+    let mapping = s_rtl_allocate_heap(user_heap, HEAP_ZERO_MEMORY, W32HEAP_MAPPING_SIZE);
     if mapping == 0 {
+        let _ = unmap_section(section as *mut u8, mapped_base, |base| heap_free(base));
         return None;
     }
     write_volatile((mapping + W32HEAP_MAPPING_NEXT_OFF) as *mut u64, 0);
@@ -4623,7 +4662,9 @@ unsafe fn ensure_thread_desktop_pcti(pti: u64, desk_body: u64) -> u64 {
         return 0;
     };
     let pcti = read_volatile((pti + THREADINFO_PCTI_OFF) as *const u64);
-    if pcti >= kernel_base && pcti < kernel_base + limit {
+    if heap_block_capacity_in(kernel_base, limit, pcti)
+        .is_some_and(|capacity| capacity >= CLIENTTHREADINFO_SIZE)
+    {
         return pcti;
     }
     let pcti = s_rtl_allocate_heap(pheap, HEAP_ZERO_MEMORY, CLIENTTHREADINFO_SIZE);
@@ -5674,11 +5715,6 @@ static WIN32K_CURRENT_THREAD_ID: AtomicU64 = AtomicU64::new(WIN32K_BOOTSTRAP_TID
 static WIN32K_CURRENT_CLIENT_PI: AtomicU64 = AtomicU64::new(WIN32K_BOOTSTRAP_PI as u64);
 const WIN32K_PROCESS_CTX_INITIAL_CAP: u64 = 8;
 const WIN32K_THREAD_CTX_INITIAL_CAP: u64 = 64;
-const PROCESS_CTX_OWNS_EPROCESS: u64 = 1 << 0;
-const PROCESS_CTX_OWNS_PRIMARY_TOKEN: u64 = 1 << 1;
-const THREAD_CTX_OWNS_ETHREAD: u64 = 1 << 0;
-const THREAD_CTX_OWNS_CALLOUT_TEB: u64 = 1 << 1;
-
 #[derive(Clone, Copy)]
 struct Win32kProcessContextRecord {
     pid: u64,
@@ -5690,7 +5726,6 @@ struct Win32kProcessContextRecord {
     client_peb: u64,
     token_authentication_id: u64,
     primary_token: u64,
-    ownership: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -5703,7 +5738,6 @@ struct Win32kThreadContextRecord {
     callout_teb: u64,
     ethread: u64,
     w32thread: u64,
-    ownership: u64,
 }
 
 static WIN32K_PROCESS_CTX_PTR: AtomicU64 = AtomicU64::new(0);
@@ -6011,7 +6045,6 @@ process_ctx_getter!(process_ctx_terminating, terminating);
 process_ctx_getter!(process_ctx_client_peb, client_peb);
 process_ctx_getter!(process_ctx_token_authentication_id, token_authentication_id);
 process_ctx_getter!(process_ctx_primary_token, primary_token);
-process_ctx_getter!(process_ctx_ownership, ownership);
 process_ctx_setter!(set_process_ctx_pid, pid);
 process_ctx_setter!(set_process_ctx_pi, pi);
 process_ctx_setter!(set_process_ctx_generation, generation);
@@ -6024,7 +6057,6 @@ process_ctx_setter!(
     token_authentication_id
 );
 process_ctx_setter!(set_process_ctx_primary_token, primary_token);
-process_ctx_setter!(set_process_ctx_ownership, ownership);
 
 thread_ctx_getter!(thread_ctx_tid, tid);
 thread_ctx_getter!(thread_ctx_pid, pid);
@@ -6034,8 +6066,6 @@ thread_ctx_getter!(thread_ctx_teb, teb);
 thread_ctx_getter!(thread_ctx_callout_teb, callout_teb);
 thread_ctx_getter!(thread_ctx_ethread, ethread);
 thread_ctx_getter!(thread_ctx_w32thread, w32thread);
-thread_ctx_getter!(thread_ctx_ownership, ownership);
-thread_ctx_setter!(set_thread_ctx_tid, tid);
 thread_ctx_setter!(set_thread_ctx_pid, pid);
 thread_ctx_setter!(set_thread_ctx_pi, pi);
 thread_ctx_setter!(set_thread_ctx_generation, generation);
@@ -6043,19 +6073,23 @@ thread_ctx_setter!(set_thread_ctx_teb, teb);
 thread_ctx_setter!(set_thread_ctx_callout_teb, callout_teb);
 thread_ctx_setter!(set_thread_ctx_ethread, ethread);
 thread_ctx_setter!(set_thread_ctx_w32thread, w32thread);
-thread_ctx_setter!(set_thread_ctx_ownership, ownership);
-
-unsafe fn add_process_ctx_ownership(index: usize, ownership: u64) {
-    set_process_ctx_ownership(index, process_ctx_ownership(index) | ownership);
-}
-
-unsafe fn add_thread_ctx_ownership(index: usize, ownership: u64) {
-    set_thread_ctx_ownership(index, thread_ctx_ownership(index) | ownership);
-}
 
 unsafe fn provider_allocation_has_capacity(pointer: u64, required: u64) -> bool {
     pointer != 0
         && provider_pool_allocation_capacity(pointer).is_some_and(|capacity| capacity >= required)
+}
+
+/// Return whether `pointer` is provider-owned storage. Pointers outside the provider arena are
+/// borrowed native objects; pointers inside it must name an exact live allocation of sufficient
+/// size, otherwise the ownership boundary is corrupt and finalization must fail closed.
+unsafe fn provider_storage_owned(pointer: u64, required: u64) -> Result<bool, ()> {
+    if !provider_pool_contains(pointer) {
+        return Ok(false);
+    }
+    provider_pool_allocation_capacity(pointer)
+        .filter(|&capacity| capacity >= required)
+        .map(|_| true)
+        .ok_or(())
 }
 
 unsafe fn release_replaced_context_backing(pointer: u64) {
@@ -6261,18 +6295,34 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
     if record.ethread == 0
         || record.w32thread != 0
         || read_volatile((record.ethread + KTHREAD_WIN32THREAD_OFF) as *const u64) != 0
-        || record.ownership & !(THREAD_CTX_OWNS_ETHREAD | THREAD_CTX_OWNS_CALLOUT_TEB) != 0
     {
         return note_context_retirement_failure(b"thread", record.tid);
     }
 
+    let owns_ethread = match provider_storage_owned(record.ethread, WIN32K_ETHREAD_BYTES) {
+        Ok(owned) => owned,
+        Err(()) => {
+            return note_context_retirement_failure(b"thread-ethread-storage", record.tid)
+        }
+    };
+    let owns_callout_teb = if record.callout_teb == 0 {
+        false
+    } else {
+        match provider_storage_owned(record.callout_teb, 0x1000) {
+            Ok(true) => true,
+            Ok(false) | Err(()) => {
+                return note_context_retirement_failure(b"thread-teb-storage", record.tid)
+            }
+        }
+    };
+
     let mut owned = [(0u64, 0u64); 2];
     let mut owned_len = 0usize;
-    if record.ownership & THREAD_CTX_OWNS_CALLOUT_TEB != 0 {
+    if owns_callout_teb {
         owned[owned_len] = (record.callout_teb, 0x1000);
         owned_len += 1;
     }
-    if record.ownership & THREAD_CTX_OWNS_ETHREAD != 0 {
+    if owns_ethread {
         owned[owned_len] = (record.ethread, WIN32K_ETHREAD_BYTES);
         owned_len += 1;
     }
@@ -6304,10 +6354,10 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
     if owned_len != 0 && !provider_pool_release_owned(&owned[..owned_len]) {
         return note_context_retirement_failure(b"thread-owned-storage-free", record.tid);
     }
-    if record.ownership & THREAD_CTX_OWNS_CALLOUT_TEB != 0 {
+    if owns_callout_teb {
         WIN32K_CONTEXT_CALLOUT_TEB_FREES.fetch_add(1, Ordering::Relaxed);
     }
-    if record.ownership & THREAD_CTX_OWNS_ETHREAD != 0 {
+    if owns_ethread {
         WIN32K_CONTEXT_ETHREAD_FREES.fetch_add(1, Ordering::Relaxed);
     }
     write_volatile(
@@ -6321,7 +6371,6 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
             callout_teb: 0,
             ethread: 0,
             w32thread: 0,
-            ownership: 0,
         },
     );
     true
@@ -6364,19 +6413,35 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
     if record.eprocess == 0
         || record.w32process != 0
         || read_volatile((record.eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64) != 0
-        || record.ownership & !(PROCESS_CTX_OWNS_EPROCESS | PROCESS_CTX_OWNS_PRIMARY_TOKEN) != 0
         || (0..thread_ctx_len()).any(|thread| thread_ctx_pid(thread) == record.pid)
     {
         return note_context_retirement_failure(b"process", record.pid);
     }
 
+    let owns_eprocess = match provider_storage_owned(record.eprocess, WIN32K_EPROCESS_BYTES) {
+        Ok(owned) => owned,
+        Err(()) => {
+            return note_context_retirement_failure(b"process-eprocess-storage", record.pid)
+        }
+    };
+    let owns_primary_token = if record.primary_token == 0 {
+        false
+    } else {
+        match provider_storage_owned(record.primary_token, WIN32K_PRIMARY_TOKEN_BYTES) {
+            Ok(true) => true,
+            Ok(false) | Err(()) => {
+                return note_context_retirement_failure(b"process-token-storage", record.pid)
+            }
+        }
+    };
+
     let mut owned = [(0u64, 0u64); 2];
     let mut owned_len = 0usize;
-    if record.ownership & PROCESS_CTX_OWNS_PRIMARY_TOKEN != 0 {
+    if owns_primary_token {
         owned[owned_len] = (record.primary_token, WIN32K_PRIMARY_TOKEN_BYTES);
         owned_len += 1;
     }
-    if record.ownership & PROCESS_CTX_OWNS_EPROCESS != 0 {
+    if owns_eprocess {
         owned[owned_len] = (record.eprocess, WIN32K_EPROCESS_BYTES);
         owned_len += 1;
     }
@@ -6410,10 +6475,10 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
     if owned_len != 0 && !provider_pool_release_owned(&owned[..owned_len]) {
         return note_context_retirement_failure(b"process-owned-storage-free", record.pid);
     }
-    if record.ownership & PROCESS_CTX_OWNS_PRIMARY_TOKEN != 0 {
+    if owns_primary_token {
         WIN32K_CONTEXT_TOKEN_FREES.fetch_add(1, Ordering::Relaxed);
     }
-    if record.ownership & PROCESS_CTX_OWNS_EPROCESS != 0 {
+    if owns_eprocess {
         WIN32K_CONTEXT_EPROCESS_FREES.fetch_add(1, Ordering::Relaxed);
     }
     write_volatile(
@@ -6428,7 +6493,6 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
             client_peb: 0,
             token_authentication_id: 0,
             primary_token: 0,
-            ownership: 0,
         },
     );
     true
@@ -6463,7 +6527,6 @@ unsafe fn process_context_object_or_allocate(
     }
     set_process_ctx_eprocess(index, object);
     if supplied == 0 {
-        add_process_ctx_ownership(index, PROCESS_CTX_OWNS_EPROCESS);
         WIN32K_CONTEXT_EPROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
     Some(object)
@@ -6484,7 +6547,6 @@ unsafe fn thread_context_object_or_allocate(index: usize, supplied: u64, size: u
     }
     set_thread_ctx_ethread(index, object);
     if supplied == 0 {
-        add_thread_ctx_ownership(index, THREAD_CTX_OWNS_ETHREAD);
         WIN32K_CONTEXT_ETHREAD_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
     Some(object)
@@ -7382,7 +7444,6 @@ unsafe fn seed_win32k_callout_teb(thread_index: usize) -> Option<u64> {
         let allocated = pool_alloc(0x1000);
         if allocated != 0 {
             set_thread_ctx_callout_teb(thread_index, allocated);
-            add_thread_ctx_ownership(thread_index, THREAD_CTX_OWNS_CALLOUT_TEB);
             WIN32K_CONTEXT_CALLOUT_TEB_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             allocated
         } else {
@@ -7767,12 +7828,9 @@ unsafe fn ensure_process_context(
     if eprocess == 0 {
         return None;
     }
-    let ownership = if supplied_eprocess == 0 {
+    if supplied_eprocess == 0 {
         WIN32K_CONTEXT_EPROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        PROCESS_CTX_OWNS_EPROCESS
-    } else {
-        0
-    };
+    }
     commit_process_ctx_record(
         index,
         Win32kProcessContextRecord {
@@ -7785,7 +7843,6 @@ unsafe fn ensure_process_context(
             client_peb,
             token_authentication_id: 0,
             primary_token: 0,
-            ownership,
         },
     );
     initialize_eprocess_body(eprocess, pid, client_peb);
@@ -7836,12 +7893,9 @@ unsafe fn ensure_thread_context(
     if ethread == 0 {
         return None;
     }
-    let ownership = if supplied_ethread == 0 {
+    if supplied_ethread == 0 {
         WIN32K_CONTEXT_ETHREAD_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        THREAD_CTX_OWNS_ETHREAD
-    } else {
-        0
-    };
+    }
     commit_thread_ctx_record(
         index,
         Win32kThreadContextRecord {
@@ -7853,7 +7907,6 @@ unsafe fn ensure_thread_context(
             callout_teb: 0,
             ethread,
             w32thread: 0,
-            ownership,
         },
     );
     Some(index)
@@ -7892,7 +7945,7 @@ unsafe fn derive_client_identity(
     Some((pid, tid))
 }
 
-unsafe fn adopt_bootstrap_csrss_context(
+unsafe fn adopt_bootstrap_csrss_process(
     pi: usize,
     pid: u64,
     tid: u64,
@@ -7922,20 +7975,6 @@ unsafe fn adopt_bootstrap_csrss_context(
         return None;
     }
 
-    let thread_index = if let Some(existing) = thread_context_index_for_tid(tid) {
-        existing
-    } else {
-        thread_context_index_for_tid(WIN32K_BOOTSTRAP_TID)?
-    };
-    let ethread = thread_ctx_ethread(thread_index);
-    let thread_generation = thread_ctx_generation(thread_index);
-    if ethread == 0
-        || (thread_generation != 0 && thread_generation != generation)
-        || (supplied_ethread != 0 && supplied_ethread != ethread)
-    {
-        return None;
-    }
-
     set_process_ctx_pid(process_index, pid);
     set_process_ctx_pi(process_index, pi as u64);
     set_process_ctx_generation(process_index, generation);
@@ -7957,16 +7996,25 @@ unsafe fn adopt_bootstrap_csrss_context(
         write_volatile((ppi + W32PROCESS_W32PID_OFF) as *mut u32, pid as u32);
     }
 
-    set_thread_ctx_tid(thread_index, tid);
-    set_thread_ctx_pid(thread_index, pid);
-    set_thread_ctx_pi(thread_index, pi as u64);
-    set_thread_ctx_generation(thread_index, generation);
-    let effective_teb = if teb != 0 {
-        set_thread_ctx_teb(thread_index, teb);
-        seed_win32k_callout_teb(thread_index)?
-    } else {
-        seed_win32k_callout_teb(thread_index)?
-    };
+    // ReactOS runs DesktopThreadMain on a dedicated, non-terminating CSRSS GUI thread. The
+    // bootstrap THREADINFO is that thread: retain its distinct TID and link it to the re-keyed CSRSS
+    // process instead of aliasing it to CSRSS's main thread. Otherwise the real main-thread exit
+    // callout sees the only PROCESSINFO thread, destroys the process system classes, and leaves
+    // subsequent desktop creation unable to find WC_DESKTOP.
+    let desktop_thread_index = thread_context_index_for_tid(WIN32K_BOOTSTRAP_TID)?;
+    if thread_ctx_ethread(desktop_thread_index) == 0
+        || (thread_ctx_pid(desktop_thread_index) != FAKE_PROCESS_HANDLE
+            && thread_ctx_pid(desktop_thread_index) != pid)
+    {
+        return None;
+    }
+    set_thread_ctx_pid(desktop_thread_index, pid);
+    set_thread_ctx_pi(desktop_thread_index, pi as u64);
+    set_thread_ctx_generation(desktop_thread_index, generation);
+
+    let thread_index = ensure_thread_context(pi, pid, tid, generation, teb, supplied_ethread)?;
+    let ethread = thread_ctx_ethread(thread_index);
+    let effective_teb = seed_win32k_callout_teb(thread_index)?;
     prepare_ethread_for_win32k_callout(thread_index, effective_teb);
 
     WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -7985,10 +8033,12 @@ unsafe fn adopt_bootstrap_csrss_context(
     publish_selected_context(process_index, thread_index);
 
     if WIN32K_CSRSS_BOOTSTRAP_REKEYS.fetch_add(1, Ordering::Relaxed) < 4 {
-        print_str(b"[win32k-context] adopted bootstrap CSRSS context pid=");
+        print_str(b"[win32k-context] adopted bootstrap CSRSS process pid=");
         print_u64(pid);
-        print_str(b" tid=");
+        print_str(b" main-tid=");
         print_u64(tid);
+        print_str(b" desktop-tid=");
+        print_u64(WIN32K_BOOTSTRAP_TID);
         print_str(b" pi=");
         print_u64(pi as u64);
         print_str(b" eprocess=0x");
@@ -8019,7 +8069,7 @@ unsafe fn select_win32k_client_context(
     let pi = checked_client_index(pi)?;
     let (pid, tid) = derive_client_identity(pi, process_id, thread_id, client_teb)?;
     if process_role == HOSTED_PROCESS_ROLE_WIN32_SUBSYSTEM {
-        if let Some(adopted) = adopt_bootstrap_csrss_context(
+        if let Some(adopted) = adopt_bootstrap_csrss_process(
             pi,
             pid,
             tid,
@@ -8141,7 +8191,9 @@ unsafe fn ensure_win32k_process_attached(process_index: usize, process_role: u64
         process_ctx_w32process(process_index),
     );
     link_processinfo_to_eprocess(process_index);
-    if hosted_process_role_is_noninteractive_service_class(process_role) {
+    if process_role == HOSTED_PROCESS_ROLE_WIN32_SUBSYSTEM
+        || hosted_process_role_is_noninteractive_service_class(process_role)
+    {
         let n = WIN32K_NONINTERACTIVE_WINSTA_RESOLVES.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
             let pi = process_ctx_pi(process_index);
@@ -8276,16 +8328,16 @@ unsafe fn ensure_desktop_runtime_fields(desk_body: u64) -> Option<u64> {
         return None;
     }
     let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
-    if pheap == 0 || hosted_heap_bounds(pheap).is_none() {
-        return None;
-    }
+    let (heap_base, heap_size) = hosted_heap_bounds(pheap)?;
     let pdeskinfo = read_volatile((desk_body + 0x08) as *const u64);
-    if pdeskinfo == 0 {
+    if !heap_block_capacity_in(heap_base, heap_size, pdeskinfo)
+        .is_some_and(|capacity| capacity >= DESKTOPINFO_MIN_ALLOC)
+    {
         return None;
     }
     let desktop_base = read_volatile(pdeskinfo as *const u64);
     let desktop_limit = read_volatile((pdeskinfo + 0x08) as *const u64);
-    if desktop_base == 0 || desktop_limit <= desktop_base {
+    if desktop_base != heap_base || desktop_limit != heap_base.checked_add(heap_size)? {
         return None;
     }
     Some(pdeskinfo)
@@ -8320,6 +8372,13 @@ unsafe fn selected_thread_desktop(
     if current_body != 0 && current_info != 0 {
         let current_hdesk = read_volatile((pti + THREADINFO_HDESK_OFF) as *const u64);
         return Some((current_hdesk, current_body, current_info));
+    }
+
+    // ReactOS marks CSRSS GUI threads TIF_CSRSSTHREAD and explicitly excludes them from automatic
+    // window-station/desktop assignment. DesktopThreadMain is the distinct permanent owner.
+    let flags = read_volatile((pti + THREADINFO_FLAGS_OFF) as *const u32);
+    if flags & (TIF_SYSTEMTHREAD | TIF_CSRSSTHREAD) != 0 {
+        return None;
     }
 
     let shell_client = process_role == HOSTED_PROCESS_ROLE_INTERACTIVE_SHELL_BOOTSTRAP
@@ -13745,10 +13804,10 @@ unsafe fn init_threadinfo_placeholder(w32thread: u64) {
     // fsWakeMask@0xA, timeLastRead@0xC). Real win32k points pcti at the desktop-heap CLIENTTHREADINFO
     // (or the embedded pti->cti when there is no desktop).
     if read_volatile((w32thread + 0x70) as *const u64) == 0 {
-        let pcti = pool_alloc(0x20);
-        if pcti != 0 {
-            write_volatile((w32thread + 0x70) as *mut u64, pcti);
-        }
+        write_volatile(
+            (w32thread + THREADINFO_PCTI_OFF) as *mut u64,
+            w32thread + THREADINFO_EMBEDDED_CTI_OFF,
+        );
     }
     // hEventQueueClient / pEventQueueServer: user32's MsgWaitForMultipleObjectsEx asks win32k for
     // this handle via NtUserxMsqSetWakeMask, and ReactOS signals the server KEVENT when queue bits
@@ -14030,7 +14089,10 @@ unsafe fn build_object_attributes(name: &[u16]) -> u64 {
 /// lazy co_IntInitializeDesktopGraphics — that stays winlogon's to drive.
 unsafe fn create_winsta_and_desktop() {
     const MAXIMUM_ALLOWED: u64 = 0x0200_0000;
-    if !bind_desktop_thread_to_current_context(true, b"default-desktop") {
+    // DesktopThreadMain is already represented by the permanent bootstrap THREADINFO. CSRSS's
+    // current main thread shares its PROCESSINFO, so system-class registration is process-correct
+    // without replacing gptiDesktopThread and making those classes mortal with the main thread.
+    if !bind_desktop_thread_to_current_context(false, b"default-desktop") {
         return;
     }
 
@@ -14153,7 +14215,7 @@ unsafe fn create_winsta_and_desktop() {
         print_hex(spwnd as u32);
         print_str(b")\n");
 
-        // ★ BIND THE DISPATCH THREAD TO THE DESKTOP — the `IntSetThreadDesktop` state contract.
+        // Bind the permanent DesktopThreadMain context to the desktop.
         //
         // The switch above sets the GLOBAL `gpdeskInputDesktop`, but does NOT connect the CURRENT
         // thread's win32k `THREADINFO` (`pti`) to the desktop. In real Windows that connection is done
@@ -14162,11 +14224,10 @@ unsafe fn create_winsta_and_desktop() {
         //     pti->rpdesk    = pdesk;                    // desktop.c:3428
         //     pti->pDeskInfo = pti->rpdesk->pDeskInfo;   // desktop.c:3430
         //     pci->pDeskInfo = pti->pDeskInfo - ulClientDelta;   // desktop.c:3434
-        // Our host merges winlogon's interactive thread onto the single shared dispatch W32THREAD
-        // (`SLOT_W32THREAD`). This bootstrap path can run before winlogon's own SetThreadDesktop has a
-        // chance to restate the same fields, so keep THREADINFO, PROCESSINFO.HeapMappings, and
-        // CLIENTINFO coherent with ReactOS' real desktop-heap mapping model.
-        let pti = current_w32thread();
+        // This bootstrap path runs before winlogon's own SetThreadDesktop. Keep the permanent
+        // THREADINFO, PROCESSINFO.HeapMappings, and CLIENTINFO coherent with ReactOS' desktop-heap
+        // mapping model while CSRSS's main/system thread remains unbound.
+        let pti = read_volatile((WIN32K_CODE_VA + GPTI_DESKTOP_THREAD_RVA) as *const u64);
         let desk_pdeskinfo = read_volatile((desk_body + 0x08) as *const u64); // DESKTOP.pDeskInfo
         let pti_link = pti + THREADINFO_PTI_LINK_OFF;
         let link_flink = read_volatile(pti_link as *const u64);

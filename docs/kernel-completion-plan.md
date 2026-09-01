@@ -22027,6 +22027,99 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     green. Next run the serialized desktop/churn acceptance and correct any finalizer or VM retry
     ordering exposed by live process generations before closing this frontier.
 
+    Runtime/correction review (2026-09-02, correction host/freestanding green; rerun pending): the
+    first serialized acceptance attempt stopped before CSRSS when the E1000 transmit-completion
+    interrupt never arrived. QEMU was terminated after deterministic serial silence rather than
+    consuming the one-hour ceiling. A clean rerun crossed that barrier and completed its failing
+    gate in roughly 30 seconds, but winlogon's second `NtUserCreateDesktop` failed while initializing
+    the `Winlogon` desktop, before any new provider finalizer ran. Comparison with the last 298/298
+    desktop proof showed every provider allocation displaced by exactly `0x240`: the combined size
+    of the newly added host-only ownership words in the initial process and thread context tables.
+    That changed win32k's live allocation stream and exposed a layout-sensitive desktop-creation
+    failure.
+
+    Explicit provenance is therefore retained without enlarging either provider context record.
+    Finalization now derives owned-versus-borrowed storage from the provider arena's exact live
+    allocation headers. An outside-arena EPROCESS or ETHREAD is borrowed; an inside-arena pointer
+    must identify an exact allocation with sufficient capacity or teardown fails closed. Provider
+    callout TEB and primary-token mirrors are always locally allocated and must likewise resolve to
+    exact live allocations before the batch can be freed and its context row tombstoned. The compact
+    record layout and original allocation order are restored; formatting, diff checks, and the
+    freestanding executive check pass. Repeat the serialized desktop/churn proof next with
+    `BOOT_TIMEOUT_SECONDS=3600`, require the second and third desktop creations to return real
+    handles again, then require balanced exact-generation provider finalization and the full sentinel.
+
+    Desktop-thread ownership correction (2026-09-02, implementation/freestanding green; runtime
+    pending): compact-layout run `.tmp/run-desktop-20260902-010450.log` reproduced the second desktop
+    failure with the original context-table addresses, disproving residual record displacement as
+    the cause. Its first divergence from the last 298/298 run was CSRSS main tid 20's now-successful
+    genuine W32 thread-exit callout. The prior green run had incorrectly returned
+    `STATUS_INVALID_CID`, preserving the context and masking a lifecycle defect. Because bootstrap
+    adoption had re-keyed the sole `gptiDesktopThread` row into tid 20, ReactOS correctly saw the
+    exiting thread as the only PROCESSINFO thread, ran `DestroyProcessClasses`, and cleared
+    `W32PF_CLASSESREGISTERED`; winlogon's later `IntCreateDesktop` could no longer find `WC_DESKTOP`.
+
+    ReactOS `DesktopThreadMain` is a dedicated, non-terminating CSRSS GUI thread. Bootstrap adoption
+    now re-keys only the process context: its original provider-owned desktop ETHREAD/THREADINFO
+    retains the distinct bootstrap TID and becomes the permanent desktop thread linked to the CSRSS
+    PROCESSINFO, while CSRSS's real main tid receives a separate native/thread-info context. Thus
+    genuine tid-20 rundown remains mandatory but cannot destroy the system-class owner. Repeat the
+    serialized desktop proof and require tid 20 teardown success, retained system classes, real
+    `Winlogon`/`Screen-saver` desktop handles, and then the finalizer/churn criteria above.
+
+    Runtime review (2026-09-02, two serialized boots complete): the first dedicated-thread run
+    proved the separate CSRSS main THREADINFO was created correctly, but
+    `create_winsta_and_desktop` immediately reassigned `gptiDesktopThread` to that current main
+    thread. The bootstrap desktop owner is now retained there as well; the real main and desktop
+    threads share the same PROCESSINFO, so desktop registration remains process-correct without
+    making the permanent owner mortal. The second run completed genuine tid-20 W32 teardown and
+    retained the default desktop and system classes. Winlogon then reached its first real GUI
+    attach, where `InitThreadCallback -> IntSetThreadDesktop` failed the 32-byte
+    `DesktopHeapAlloc(CLIENTTHREADINFO)` after successfully mapping the inherited Default desktop.
+    Provider-pool census shows ample capacity and no corruption, so this is not OOM. The corrected
+    extra CSRSS thread merely exposed a desktop-heap handle/mapping invariant that had depended on
+    the old aliased lifetime. Trace the rejected `RtlAllocateHeap` handle and section-backed heap
+    metadata, repair that generic boundary, then repeat the one-hour-capped desktop acceptance.
+
+    Desktop-heap lifetime correction (2026-09-02, accepted): bounded RTL diagnostics showed
+    winlogon's correct kernel heap handle `0x100076c45f0` with both heap magic and reserve size
+    cleared. The prior CSRSS main-thread exit
+    drained a host-created `W32HEAP_USER_MAPPING` whose Count=1 had no corresponding session-section
+    map reference, so `MmUnmapViewOfSection` released the only server backing while
+    `DESKTOP.pheapDesktop` remained live. Winlogon's subsequent map reused and zeroed that 3 MiB
+    outer allocation before `DesktopHeapAlloc`, explaining both the exact failure and its apparent
+    allocation-order sensitivity.
+
+    The permanent DesktopThreadMain binding now targets `gptiDesktopThread`, while unbound
+    `TIF_SYSTEMTHREAD`/`TIF_CSRSSTHREAD` contexts neither inherit nor reassert Default and the CSRSS
+    process role is excluded from hosted startup-desktop seeding, matching ReactOS. A host-created
+    W32HEAP mapping now acquires exactly one coherent section-view lease before publishing Count=1,
+    rolls it back on failure, and allocates its node through the process's real global USER heap so
+    `UserHeapFree` has matching ownership. No-desktop `pcti` points at embedded `THREADINFO.cti`
+    instead of foreign pool storage. Hosted heap validation additionally requires an exact live
+    outer allocation; desktop-info and CLIENTTHREADINFO pointers require exact live inner blocks and
+    exact heap bounds. Formatting, diff checks, the 208-warning freestanding executive check, and
+    all six focused session-section tests pass.
+
+    Serialized desktop proof `.tmp/run-desktop-20260902-015904.log` closes the correction in 276
+    seconds, well inside the one-hour ceiling, and QEMU exits normally at the sentinel. CSRSS main
+    tid 20 completes genuine mechanism teardown while the distinct bootstrap DesktopThreadMain and
+    Default desktop remain alive. Winlogon subsequently attaches to Default, creates and switches to
+    the real `Winlogon` desktop handle `0x0c`, completes the credential path, and launches genuine
+    userinit and Explorer processes. There are no `InitThreadCallback`/`pcti` allocation failures.
+    Explorer creates 34 windows, captures five registered shell messages, executes 674 real api0
+    callbacks with zero failures, and completes 5/20 BeginPaint/EndPaint calls, 187 direct GDI
+    returns, and 135 batch flushes containing 184 records. The final 1,024x768 framebuffer has
+    non-background pixels across the complete surface with at least 32 colors.
+
+    The final provider census records 9,768 allocations, 8,214 frees, 6,663 reuse hits, 2,132 KiB
+    live against a 2,255 KiB high-water mark, and zero invalid frees, OOMs, or corruptions. Five
+    exact process generations and five associated thread sets have already passed the post-Object-
+    Manager provider finalizer; remaining context rows belong to live system/session processes at
+    the gate. All 298/298 executive checks pass. This accepts the section-view lease accounting,
+    permanent desktop-thread identity, CSRSS no-desktop state, exact heap validation, and the
+    provider-backed object-finalization integration under real desktop/process churn.
+
     Queue events then require a growable, process-generation-fenced registry with separate
     handle, pointer, native-wait, GUI-wait, and signal leases. The current four-entry evicting event
     ring, no-op dereference path, raw wait/signal pointers, and synthetic queue-event repair must be
