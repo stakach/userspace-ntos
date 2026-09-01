@@ -376,10 +376,78 @@ pub(crate) unsafe fn register_image_committed_mappings(
     true
 }
 
+const SEC_IMAGE_OWNED_MAPPING_CAPS: usize = 64;
+const SEC_IMAGE_OWNED_PLAIN_CAPS: usize = 16;
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedProcessVspaceCaps {
+    pub(crate) generation: u64,
+    pub(crate) pml4: u64,
+    pub(crate) image_pdpt: u64,
+    pub(crate) image_pd: u64,
+    pub(crate) kuser_pdpt: u64,
+    pub(crate) kuser_pd: u64,
+    pub(crate) fault_endpoint: u64,
+    pub(crate) mapped: [u64; SEC_IMAGE_OWNED_MAPPING_CAPS],
+    pub(crate) mapped_len: usize,
+    pub(crate) mapped_unmapped: u64,
+    pub(crate) plain: [u64; SEC_IMAGE_OWNED_PLAIN_CAPS],
+    pub(crate) plain_len: usize,
+}
+
+impl HostedProcessVspaceCaps {
+    fn new(
+        generation: u64,
+        pml4: u64,
+        image_pdpt: u64,
+        image_pd: u64,
+        fault_endpoint: u64,
+    ) -> Self {
+        assert!(generation != 0);
+        assert!(pml4 != 0 && image_pdpt != 0 && image_pd != 0 && fault_endpoint != 0);
+        Self {
+            generation,
+            pml4,
+            image_pdpt,
+            image_pd,
+            kuser_pdpt: 0,
+            kuser_pd: 0,
+            fault_endpoint,
+            mapped: [0; SEC_IMAGE_OWNED_MAPPING_CAPS],
+            mapped_len: 0,
+            mapped_unmapped: 0,
+            plain: [0; SEC_IMAGE_OWNED_PLAIN_CAPS],
+            plain_len: 0,
+        }
+    }
+
+    fn push_mapped(&mut self, capability: u64) {
+        assert!(capability != 0);
+        let slot = self
+            .mapped
+            .get_mut(self.mapped_len)
+            .expect("SEC_IMAGE mapped-cap ownership capacity is sufficient");
+        *slot = capability;
+        self.mapped_len += 1;
+    }
+
+    fn push_plain(&mut self, capability: u64) {
+        assert!(capability != 0);
+        let slot = self
+            .plain
+            .get_mut(self.plain_len)
+            .expect("SEC_IMAGE plain-cap ownership capacity is sufficient");
+        *slot = capability;
+        self.plain_len += 1;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SecImageSpawn {
     pub(crate) pml4: u64,
     pub(crate) main_tcb: u64,
+    pub(crate) main_mechanism: HostedThreadMechanismCaps,
+    pub(crate) vspace_caps: HostedProcessVspaceCaps,
 }
 
 /// Build a PE32+/x86_64 image. `sections` = (name8, va, chars, data); `dirs` = (index, rva,
@@ -753,6 +821,7 @@ unsafe fn reserve_sec_image_page_tables(pi: u64, pml4: u64, image_va: u64, exten
 
 pub(crate) unsafe fn spawn_sec_image(
     pi: u64,
+    generation: u64,
     pe: &nt_pe_loader::PeFile,
     fault_ep_c: u64,
     ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
@@ -816,6 +885,8 @@ pub(crate) unsafe fn spawn_sec_image(
     spawn_paging_retype(pdpt, OBJ_X86_PDPT, b"image-pdpt");
     let pd = alloc_slot();
     spawn_paging_retype(pd, OBJ_X86_PAGE_DIRECTORY, b"image-pd");
+    let mut vspace_caps =
+        HostedProcessVspaceCaps::new(generation, pml4, pdpt, pd, fault_ep_c);
     // The image VA's page tables — but NOT the image pages. Touching the image faults in.
     checked_spawn_paging_map(pdpt, LBL_X86_PDPT_MAP, IMAGE_BASE, pml4, b"pdpt");
     checked_spawn_paging_map(pd, LBL_X86_PAGE_DIRECTORY_MAP, IMAGE_BASE, pml4, b"pd");
@@ -875,6 +946,10 @@ pub(crate) unsafe fn spawn_sec_image(
         let f = alloc_frame();
         let stack_cap = checked_spawn_copy_cap(f, b"stack-target");
         let _ = checked_spawn_page_map(stack_cap, STACK_BASE + i * 0x1000, RW_NX, pml4, b"stack");
+        if !setup_env {
+            vspace_caps.push_plain(f);
+            vspace_caps.push_mapped(stack_cap);
+        }
         // Mirror the stack into the executive so it can read/write a syscall's stack-based
         // pointer args (copyin/copyout).
         let (stack_alias, stack_alias_cap) = if setup_env {
@@ -917,6 +992,7 @@ pub(crate) unsafe fn spawn_sec_image(
     }
     let ipcbuf = alloc_frame();
     let _ = checked_spawn_page_map(ipcbuf, IPCBUF_VADDR, RW_NX, pml4, b"ipcbuf");
+    vspace_caps.push_mapped(ipcbuf);
     if setup_env {
         checked_register_spawn_private_mapping(
             pi,
@@ -1010,6 +1086,8 @@ pub(crate) unsafe fn spawn_sec_image(
         core::ptr::write_volatile((acs + 0x20) as *mut u32, 1); // StackId
         let acs_client = checked_spawn_copy_cap(acs_frame, b"acs-target");
         let _ = checked_spawn_page_map(acs_client, acs_va, RW_NX, pml4, b"acs-target");
+        vspace_caps.push_mapped(acs_frame);
+        vspace_caps.push_mapped(acs_client);
         checked_register_spawn_private_mapping(
             pi,
             acs_va,
@@ -1057,6 +1135,8 @@ pub(crate) unsafe fn spawn_sec_image(
             pml4,
             b"deskinfo-target",
         );
+        vspace_caps.push_mapped(deskinfo);
+        vspace_caps.push_mapped(deskinfo_client);
         checked_register_spawn_private_mapping(
             pi,
             SMSS_DESKINFO_VA,
@@ -1242,6 +1322,7 @@ pub(crate) unsafe fn spawn_sec_image(
             for i in 0..frames {
                 let cap = checked_spawn_copy_cap(start + i, b"nls-target");
                 let _ = checked_spawn_page_map(cap, va + i * 0x1000, RW_NX, pml4, b"nls-target");
+                vspace_caps.push_mapped(cap);
             }
             checked_register_spawn_mapped_mapping(
                 pi,
@@ -1398,6 +1479,8 @@ pub(crate) unsafe fn spawn_sec_image(
         spawn_paging_retype(kpdpt, OBJ_X86_PDPT, b"kuser-pdpt");
         let kpd = alloc_slot();
         spawn_paging_retype(kpd, OBJ_X86_PAGE_DIRECTORY, b"kuser-pd");
+        vspace_caps.kuser_pdpt = kpdpt;
+        vspace_caps.kuser_pd = kpd;
         checked_spawn_paging_map(kpdpt, LBL_X86_PDPT_MAP, KUSER_VA, pml4, b"kuser-pdpt");
         checked_spawn_paging_map(kpd, LBL_X86_PAGE_DIRECTORY_MAP, KUSER_VA, pml4, b"kuser-pd");
         map_initial_process_page_table(pi, pml4, KUSER_VA, b"kuser-pt");
@@ -1419,15 +1502,6 @@ pub(crate) unsafe fn spawn_sec_image(
         );
         zero_scratch_page(kscr);
         unsafe { initialize_kuser_snapshot(kscr) };
-        if !kuser_page_alias_put(pi, kscr) {
-            print_str(b"[spawn-vad] kuser alias record failed pi=");
-            print_u64(pi);
-            print_str(b" alias=0x");
-            print_hex((kscr >> 32) as u32);
-            print_hex(kscr as u32);
-            print_str(b"\n");
-            panic!("hosted kuser alias table unavailable");
-        }
         let kuser_client = checked_spawn_copy_cap(kuser_f, b"kuser-target");
         let _ = checked_spawn_page_map(
             kuser_client,
@@ -1436,6 +1510,15 @@ pub(crate) unsafe fn spawn_sec_image(
             pml4,
             b"kuser-target",
         );
+        if !kuser_page_alias_put(pi, kscr, kuser_f, kuser_client) {
+            print_str(b"[spawn-vad] kuser owner record failed pi=");
+            print_u64(pi);
+            print_str(b" alias=0x");
+            print_hex((kscr >> 32) as u32);
+            print_hex(kscr as u32);
+            print_str(b"\n");
+            panic!("hosted kuser page ownership unavailable");
+        }
         // Trampoline: enter ntdll's REAL loader init, LdrpInitialize (ntdll+0x8e70, the target of
         // LdrInitializeThunk's `mov rcx,r9; jmp`). It does the whole process bring-up — reads
         // TEB/PEB/KUSER, NtQueryVirtualMemory, creates the process heap (RtlCreateHeap itself),
@@ -1508,6 +1591,8 @@ pub(crate) unsafe fn spawn_sec_image(
             pml4,
             b"tramp-target",
         );
+        vspace_caps.push_mapped(tramp);
+        vspace_caps.push_mapped(tramp_client);
         checked_register_spawn_private_mapping(
             pi,
             SMSS_TRAMP_VA,
@@ -1569,14 +1654,17 @@ pub(crate) unsafe fn spawn_sec_image(
         tcb,
         b"secimage-set-hosted-syscalls",
     );
-    if let Err(e_sc) = attach_sched_context(tcb) {
-        print_str(b"[thread-life] secimage SC attach failed tcb=0x");
-        print_hex(tcb as u32);
-        print_str(b" error=");
-        print_u64(e_sc);
-        print_str(b"\n");
-        park();
-    }
+    let sched_context = match attach_sched_context(tcb) {
+        Ok(sched_context) => sched_context,
+        Err(e_sc) => {
+            print_str(b"[thread-life] secimage SC attach failed tcb=0x");
+            print_hex(tcb as u32);
+            print_str(b" error=");
+            print_u64(e_sc);
+            print_str(b"\n");
+            park();
+        }
+    };
     if start_immediately {
         checked_spawn_tcb_op(tcb_resume_r(tcb), tcb, b"secimage-resume");
     }
@@ -1584,6 +1672,8 @@ pub(crate) unsafe fn spawn_sec_image(
     SecImageSpawn {
         pml4,
         main_tcb: tcb,
+        main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),
+        vspace_caps,
     }
 }
 

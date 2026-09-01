@@ -87,7 +87,10 @@ mod tests {
         assert_eq!(mappings[0].length, 0x2000);
         assert_eq!(physical_address(&mappings[..count], 0x2345), Some(0xa345));
         assert_eq!(physical_address(&mappings[..count], 0x3000), None);
-        assert_eq!(virtual_address(&mappings[..count], 0x9345, 0x20), Some(0x1345));
+        assert_eq!(
+            virtual_address(&mappings[..count], 0x9345, 0x20),
+            Some(0x1345)
+        );
         assert_eq!(virtual_address(&mappings[..count], 0xaff0, 0x20), None);
         assert_eq!(virtual_address(&mappings[..count], 0x9000, 0), None);
     }

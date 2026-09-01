@@ -35,6 +35,7 @@ impl HostedBootstrapManifestEntry {
         nt_exe_image::HostedProcessImageRef {
             pi,
             top_badge: self.top_badge,
+            generation: 1,
             leaf: self.leaf,
             process_name: core::str::from_utf8(self.leaf)
                 .expect("hosted bootstrap image manifest leaf is ASCII"),

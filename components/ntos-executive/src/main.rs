@@ -1598,7 +1598,23 @@ static mut VM_PAGE_LOCKS: nt_address_space::VmPageLockTable =
 static VM_LOCK_RECLAIM_REFUSALS: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static KUSER_PAGE_ALIAS_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
-static mut KUSER_PAGE_ALIASES: alloc::vec::Vec<AtomicU64> = alloc::vec::Vec::new();
+struct KuserPageOwner {
+    alias: AtomicU64,
+    source_cap: AtomicU64,
+    target_cap: AtomicU64,
+}
+
+impl KuserPageOwner {
+    const fn empty() -> Self {
+        Self {
+            alias: AtomicU64::new(0),
+            source_cap: AtomicU64::new(0),
+            target_cap: AtomicU64::new(0),
+        }
+    }
+}
+
+static mut KUSER_PAGE_ALIASES: alloc::vec::Vec<KuserPageOwner> = alloc::vec::Vec::new();
 /// Executive-visible aliases for persistent kernel personalities which map KUSER_SHARED_DATA.
 /// This registry is component-agnostic; a newly loaded personality registers its writable alias
 /// instead of adding another clock-publication special case.
@@ -1715,7 +1731,7 @@ pub(crate) unsafe fn reset_kuser_page_aliases(slots: usize) -> bool {
         return false;
     }
     while aliases.len() < slots {
-        aliases.push(AtomicU64::new(0));
+        aliases.push(KuserPageOwner::empty());
     }
     true
 }
@@ -1749,9 +1765,27 @@ unsafe fn for_each_kuser_page_alias(mut publish: impl FnMut(u64)) {
     }
 }
 
-unsafe fn kuser_page_alias_put(pi: u64, alias: u64) -> bool {
+unsafe fn kuser_page_alias_put(
+    pi: u64,
+    alias: u64,
+    source_cap: u64,
+    target_cap: u64,
+) -> bool {
+    if alias == 0 || source_cap == 0 || target_cap == 0 {
+        KUSER_PAGE_ALIAS_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     if let Some(slot) = (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES)).get(pi as usize) {
-        slot.store(alias, Ordering::Release);
+        if slot.alias.load(Ordering::Acquire) != 0
+            || slot.source_cap.load(Ordering::Acquire) != 0
+            || slot.target_cap.load(Ordering::Acquire) != 0
+        {
+            KUSER_PAGE_ALIAS_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        slot.source_cap.store(source_cap, Ordering::Release);
+        slot.target_cap.store(target_cap, Ordering::Release);
+        slot.alias.store(alias, Ordering::Release);
         true
     } else {
         KUSER_PAGE_ALIAS_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -1759,16 +1793,32 @@ unsafe fn kuser_page_alias_put(pi: u64, alias: u64) -> bool {
     }
 }
 
-unsafe fn kuser_page_alias_clear(pi: usize) {
-    if let Some(slot) = (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES)).get(pi) {
-        slot.store(0, Ordering::Release);
+unsafe fn kuser_page_alias_release(pi: usize) -> bool {
+    let Some(slot) = (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES)).get(pi) else {
+        return false;
+    };
+    let target = slot.target_cap.load(Ordering::Acquire);
+    if target != 0 {
+        if page_unmap_r(target) != 0 || cnode_delete_recycle_r(target) != 0 {
+            return false;
+        }
+        slot.target_cap.store(0, Ordering::Release);
     }
+    let source = slot.source_cap.load(Ordering::Acquire);
+    if source != 0 {
+        if page_unmap_r(source) != 0 || cnode_delete_recycle_r(source) != 0 {
+            return false;
+        }
+        slot.source_cap.store(0, Ordering::Release);
+    }
+    slot.alias.store(0, Ordering::Release);
+    true
 }
 
 unsafe fn kuser_page_alias_get(pi: usize) -> u64 {
     (&*core::ptr::addr_of!(KUSER_PAGE_ALIASES))
         .get(pi)
-        .map(|slot| slot.load(Ordering::Acquire))
+        .map(|slot| slot.alias.load(Ordering::Acquire))
         .unwrap_or(0)
 }
 
@@ -9907,6 +9957,21 @@ struct ClientCopyinFrameRecord {
     alias: u64,
 }
 
+impl ClientCopyinFrameRecord {
+    const fn empty() -> Self {
+        Self {
+            pi: 0,
+            page: 0,
+            frame: 0,
+            alias: 0,
+        }
+    }
+
+    const fn is_live(self) -> bool {
+        self.frame != 0
+    }
+}
+
 static mut CLIENT_COPYIN_FRAMES: Option<Vec<ClientCopyinFrameRecord>> = None;
 const CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES: usize = 3;
 
@@ -9928,7 +9993,7 @@ unsafe fn client_copyin_frame_find(pi: u64, page: u64) -> Option<ClientCopyinFra
     client_copyin_frames()?
         .iter()
         .copied()
-        .find(|record| record.pi == pi && record.page == page)
+        .find(|record| record.is_live() && record.pi == pi && record.page == page)
 }
 
 unsafe fn client_copyin_frame_alias_for_index(index: usize, scratch_base: u64) -> Option<u64> {
@@ -9949,7 +10014,10 @@ unsafe fn client_copyin_frame_prepare_insert(pi: u64, page: u64, scratch_base: u
         return None;
     }
     let frames = client_copyin_frames_mut();
-    let count = frames.len();
+    let count = frames
+        .iter()
+        .position(|record| !record.is_live())
+        .unwrap_or(frames.len());
     let Some(alias) = client_copyin_frame_alias_for_index(count, scratch_base) else {
         print_str(b"[client-copyin] ERROR: scratch alias capacity exhausted pi=");
         print_u64(pi);
@@ -9961,7 +10029,7 @@ unsafe fn client_copyin_frame_prepare_insert(pi: u64, page: u64, scratch_base: u
         print_str(b"\n");
         return None;
     };
-    if frames.try_reserve(1).is_err() {
+    if count == frames.len() && frames.try_reserve(1).is_err() {
         print_str(b"[client-copyin] ERROR: frame record allocation failed pi=");
         print_u64(pi);
         print_str(b" page=0x");
@@ -9978,6 +10046,15 @@ unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64, alias: u64) -> bo
         return false;
     }
     let frames = client_copyin_frames_mut();
+    if let Some(slot) = frames.iter_mut().find(|record| !record.is_live()) {
+        *slot = ClientCopyinFrameRecord {
+            pi,
+            page,
+            frame: fr,
+            alias,
+        };
+        return true;
+    }
     if frames.try_reserve(1).is_err() {
         print_str(b"[client-copyin] ERROR: frame record allocation failed pi=");
         print_u64(pi);
@@ -9994,6 +10071,41 @@ unsafe fn client_copyin_frame_put(pi: u64, page: u64, fr: u64, alias: u64) -> bo
         alias,
     });
     true
+}
+
+unsafe fn client_copyin_frame_drop_process(pi: u64) -> (u64, u64) {
+    let Some(frames) = (&mut *core::ptr::addr_of_mut!(CLIENT_COPYIN_FRAMES)).as_mut() else {
+        return (0, 0);
+    };
+    let mut released = 0u64;
+    let mut failed = 0u64;
+    for record in frames
+        .iter_mut()
+        .filter(|record| record.is_live() && record.pi == pi)
+    {
+        if record.alias != 0 {
+            if page_unmap_r(record.frame) != 0 {
+                failed = failed.saturating_add(1);
+                continue;
+            }
+            record.alias = 0;
+        }
+        if cnode_delete_recycle_r(record.frame) != 0 {
+            failed = failed.saturating_add(1);
+            continue;
+        }
+        *record = ClientCopyinFrameRecord::empty();
+        released = released.saturating_add(1);
+    }
+    (released, failed)
+}
+
+fn client_copyin_frame_process_is_empty(pi: u64) -> bool {
+    client_copyin_frames().is_none_or(|frames| {
+        !frames
+            .iter()
+            .any(|record| record.is_live() && record.pi == pi)
+    })
 }
 
 unsafe fn client_copyin_frame_get(pi: u64, page: u64) -> u64 {
@@ -18735,9 +18847,12 @@ unsafe fn drop_current_syscall_reply() -> bool {
     true
 }
 
-unsafe fn release_hosted_thread_mechanism_caps(tid: u64, mechanism: HostedThreadMechanismCaps) {
+unsafe fn release_hosted_thread_mechanism_caps(
+    tid: u64,
+    mechanism: HostedThreadMechanismCaps,
+) -> bool {
     if !mechanism.is_live() {
-        return;
+        return true;
     }
     let sc_delete = if mechanism.sched_context != 0 {
         cnode_delete_recycle_r(mechanism.sched_context)
@@ -18756,6 +18871,7 @@ unsafe fn release_hosted_thread_mechanism_caps(tid: u64, mechanism: HostedThread
     };
     if sc_delete == 0 && cnode_delete == 0 && raw_delete == 0 {
         HOSTED_THREAD_CNODE_RELEASES.fetch_add(1, Ordering::Relaxed);
+        true
     } else {
         if HOSTED_THREAD_CNODE_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
             print_str(b"[thread-term] mechanism CNode release failed tid=");
@@ -18774,7 +18890,69 @@ unsafe fn release_hosted_thread_mechanism_caps(tid: u64, mechanism: HostedThread
             print_u64(raw_delete);
             print_str(b"\n");
         }
+        false
     }
+}
+
+unsafe fn release_sec_image_vspace_caps(
+    owner: &mut img_spawn::HostedProcessVspaceCaps,
+) -> bool {
+    while owner.mapped_len != 0 {
+        let index = owner.mapped_len - 1;
+        let cap = owner.mapped[index];
+        if cap == 0 {
+            owner.mapped_len -= 1;
+            continue;
+        }
+        let bit = 1u64 << index;
+        if owner.mapped_unmapped & bit == 0 {
+            if page_unmap_r(cap) != 0 {
+                return false;
+            }
+            owner.mapped_unmapped |= bit;
+        }
+        if cnode_delete_recycle_r(cap) != 0 {
+            return false;
+        }
+        owner.mapped[index] = 0;
+        owner.mapped_unmapped &= !bit;
+        owner.mapped_len -= 1;
+    }
+    while owner.plain_len != 0 {
+        let index = owner.plain_len - 1;
+        let cap = owner.plain[index];
+        if cap != 0 && cnode_delete_recycle_r(cap) != 0 {
+            return false;
+        }
+        owner.plain[index] = 0;
+        owner.plain_len -= 1;
+    }
+    for cap in [
+        &mut owner.kuser_pd,
+        &mut owner.kuser_pdpt,
+        &mut owner.image_pd,
+        &mut owner.image_pdpt,
+    ] {
+        if *cap != 0 {
+            if cnode_delete_recycle_r(*cap) != 0 {
+                return false;
+            }
+            *cap = 0;
+        }
+    }
+    if owner.pml4 != 0 {
+        if cnode_delete_recycle_r(owner.pml4) != 0 {
+            return false;
+        }
+        owner.pml4 = 0;
+    }
+    if owner.fault_endpoint != 0 {
+        if cnode_delete_recycle_r(owner.fault_endpoint) != 0 {
+            return false;
+        }
+        owner.fault_endpoint = 0;
+    }
+    true
 }
 
 unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
@@ -18788,6 +18966,41 @@ pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThrea
     }
     release_hosted_thread_resources(spawn.resources());
     release_hosted_thread_mechanism_caps(0, spawn.mechanism());
+}
+
+unsafe fn release_unpublished_sec_image_spawn(
+    pi: usize,
+    spawn: img_spawn::SecImageSpawn,
+) -> bool {
+    if spawn.main_tcb <= 1
+        || tcb_suspend_r(spawn.main_tcb) != 0
+        || cnode_delete_recycle_r(spawn.main_tcb) != 0
+    {
+        return false;
+    }
+    if !release_hosted_thread_mechanism_caps(0, spawn.main_mechanism) {
+        return false;
+    }
+    let _ = csrss_frame_drop_process_all(pi as u64);
+    let (_, copyin_failures) = client_copyin_frame_drop_process(pi as u64);
+    process_committed_mapping_reset(pi);
+    process_vm_region_map_reset(pi);
+    if !kuser_page_alias_release(pi)
+        || copyin_failures != 0
+        || !client_frame_registry_process_is_empty(pi as u64)
+        || !client_copyin_frame_process_is_empty(pi as u64)
+    {
+        return false;
+    }
+    let _ = reclaim_unpublished_process_page_tables(pi);
+    if (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
+        .first_for_process(pi as u64)
+        .is_some()
+    {
+        return false;
+    }
+    let mut owner = spawn.vspace_caps;
+    release_sec_image_vspace_caps(&mut owner)
 }
 
 pub(crate) unsafe fn release_unpublished_hosted_thread_runtime(runtime: HostedThreadRuntime) {
@@ -18943,8 +19156,11 @@ struct ProcessVmReclaimStats {
     win32k_client_cap_failures: u64,
     dll_cache_evictions: u64,
     registered_frames: u64,
+    client_copyin_frames: u64,
+    client_copyin_frame_failures: u64,
     private_pts: u64,
     private_pt_failures: u64,
+    vspace_released: bool,
 }
 
 unsafe fn reclaim_final_process_vm(
@@ -19001,10 +19217,6 @@ unsafe fn reclaim_final_process_vm(
                 stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
             }
         }
-        if pi < MAX_PI {
-            let procs = &mut *ctx.procs;
-            procs[pi] = ProcExec::empty();
-        }
     }
 
     stats.shared_image_maps = shared_image_mapping_unmap_process(pi as u64);
@@ -19013,14 +19225,36 @@ unsafe fn reclaim_final_process_vm(
     stats.win32k_client_cap_failures = win32k_reclaim.failures;
     stats.dll_cache_evictions = dll_cache_evict_unreferenced_all();
     stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
+    let (copyin_frames, copyin_failures) = client_copyin_frame_drop_process(pi as u64);
+    stats.client_copyin_frames = copyin_frames;
+    stats.client_copyin_frame_failures = copyin_failures;
     process_committed_mapping_reset(pi);
     process_vm_region_map_reset(pi);
-    let (private_pts, private_pt_failures) = process_user_page_tables_release(pi, handler);
+    let kuser_released = kuser_page_alias_release(pi);
+    let (private_pts, mut private_pt_failures) = process_user_page_tables_release(pi, handler);
+    if !kuser_released {
+        private_pt_failures = private_pt_failures.saturating_add(1);
+    }
     stats.private_pts = private_pts;
     stats.private_pt_failures = private_pt_failures;
-    kuser_page_alias_clear(pi);
-    if let Some(slot) = handler.process_vspaces.get_mut(pi) {
-        *slot = 0;
+    let leaf_ownership_clear = stats.win32k_client_cap_failures == 0
+        && win32k_glue::win32k_client_cap_bank_is_empty(pi)
+        && client_frame_registry_process_is_empty(pi as u64)
+        && stats.client_copyin_frame_failures == 0
+        && client_copyin_frame_process_is_empty(pi as u64)
+        && kuser_page_alias_get(pi) == 0
+        && stats.private_pt_failures == 0
+        && (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
+            .first_for_process(pi as u64)
+            .is_none();
+    if leaf_ownership_clear {
+        stats.vspace_released = handler.release_hosted_process_vspace_caps(pi);
+    }
+    if stats.vspace_released {
+        if let Some(ctx) = handler.loop_ctx {
+            let procs = &mut *ctx.procs;
+            procs[pi] = ProcExec::empty();
+        }
     }
     stats
 }
@@ -23950,6 +24184,8 @@ struct ExecNtHandler {
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     /// seL4 VSpace caps for hosted and temporary process slots, owned by the handler.
     process_vspaces: alloc::vec::Vec<u64>,
+    /// Generation-exact capabilities that constitute each hosted SEC_IMAGE address space.
+    process_vspace_caps: alloc::vec::Vec<Option<img_spawn::HostedProcessVspaceCaps>>,
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
     /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
     temporary_process_slots: alloc::vec::Vec<nt_process::ProcessId>,
@@ -24802,9 +25038,10 @@ impl ExecProcessMechanisms {
         pid: u32,
         main_tid: u32,
         top_badge: u64,
+        generation: u64,
     ) -> Result<nt_user_host::ProcessMechanism, nt_user_host::MechanismError> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).claim_or_get(pi, pid, main_tid, top_badge) }
+        unsafe { (&mut *self.table).claim_or_get(pi, pid, main_tid, top_badge, generation) }
     }
 
     fn pid_for_pi(&self, pi: usize) -> Option<u32> {
@@ -24817,9 +25054,22 @@ impl ExecProcessMechanisms {
         unsafe { (&*self.table).pi_for_pid(pid) }
     }
 
+    fn get(&self, pi: usize) -> Option<nt_user_host::ProcessMechanism> {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).get(pi) }
+    }
+
     fn release_pi(&mut self, pi: usize) -> Option<nt_user_host::ProcessMechanism> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).release_pi(pi) }
+    }
+
+    fn release_exact(
+        &mut self,
+        expected: nt_user_host::ProcessMechanism,
+    ) -> Result<nt_user_host::ProcessMechanism, nt_user_host::MechanismError> {
+        // SAFETY: this wrapper is the sole owner while its handler is live.
+        unsafe { (&mut *self.table).release_exact(expected) }
     }
 }
 
@@ -25378,6 +25628,29 @@ impl HostedThreadRuntimeTable {
         self.store(pi, tid, tcb, badge, role)
     }
 
+    fn register_main(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        mechanism: HostedThreadMechanismCaps,
+    ) -> Option<HostedThreadRuntime> {
+        if !mechanism.is_live() {
+            return None;
+        }
+        let runtime = self.store(pi, tid, tcb, badge, HostedThreadRole::Main)?;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_live() && entry.tid == tid)?;
+        entry.mechanism = mechanism;
+        Some(HostedThreadRuntime {
+            mechanism,
+            ..runtime
+        })
+    }
+
     fn register_spawn(
         &mut self,
         pi: usize,
@@ -25550,6 +25823,12 @@ impl HostedThreadRuntimeTable {
             .filter(|&tcb| tcb > 1)
     }
 
+    fn has_process(&self, pi: usize) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.is_live() && entry.pi == pi)
+    }
+
     fn get_by_role(&self, pi: usize, role: HostedThreadRole) -> Option<HostedThreadRuntime> {
         self.entries
             .iter()
@@ -25625,6 +25904,17 @@ impl HostedThreadRuntimes {
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
         unsafe { (&mut *self.table).register(pi, tid, tcb, badge, role) }
+    }
+
+    fn register_main(
+        &mut self,
+        pi: usize,
+        tid: u64,
+        tcb: u64,
+        badge: u64,
+        mechanism: HostedThreadMechanismCaps,
+    ) -> Option<HostedThreadRuntime> {
+        unsafe { (&mut *self.table).register_main(pi, tid, tcb, badge, mechanism) }
     }
 
     fn register_spawn(
@@ -25708,6 +25998,11 @@ impl HostedThreadRuntimes {
     fn tcb_for_main_pi(&self, pi: usize) -> Option<u64> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).tcb_for_main_pi(pi) }
+    }
+
+    fn has_process(&self, pi: usize) -> bool {
+        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
+        unsafe { (&*self.table).has_process(pi) }
     }
 
     fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {
@@ -29600,6 +29895,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             pi: SEC_IMAGE_SELFTEST_PI,
             top_badge: nt_exe_image::dynamic_top_badge_for_pi(SEC_IMAGE_SELFTEST_PI)
                 .expect("SEC_IMAGE selftest must use a dynamic hosted-process identity"),
+            generation: 1,
             leaf: b"secimgtest.exe",
             process_name: "secimgtest.exe",
             role: nt_exe_image::HostedProcessRole::NonInteractiveService,
@@ -29627,8 +29923,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
             let (v, f, _, _, _, _, _, _, _, _) = service_sec_image(
                 si_fault,
-                spawn.pml4,
-                spawn.main_tcb,
+                spawn,
                 sec_image_test_image,
                 &pe,
                 BOOT_SEC_IMAGE_SCRATCH_BASE,
@@ -29636,7 +29931,10 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 DriverStartBootstrap::with_capacity(PENDING_DRIVER_LOAD_INITIAL_CAPACITY),
                 0,
             );
-            let _ = tcb_suspend_r(spawn.main_tcb);
+            assert!(release_unpublished_sec_image_spawn(
+                SEC_IMAGE_SELFTEST_PI,
+                spawn,
+            ));
             si_verdict = v;
             si_faults = f;
         } else {
@@ -33162,7 +33460,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let ntdll_bytes =
                     core::slice::from_raw_parts(NTDLLBUF_VADDR as *const u8, ntdll_size as usize);
                 let si_fault = make_object(OBJ_ENDPOINT);
-                let si_fault_c = copy_cap(si_fault);
                 // OUR Rust ntdll IS `\reactos\system32\ntdll.dll` (make_image stages ours under that
                 // name; the real ReactOS ntdll is NOT on the image). So the ntdll bytes the storage
                 // host read into NTDLLBUF are OURS — no separate load, no flag, no fallback. We DERIVE
@@ -33209,10 +33506,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     reset_hosted_process_runtimes();
                     register_hosted_process_runtime_for_image(smss_image)
                         .expect("SMSS runtime layout must register before live SEC_IMAGE spawn");
+                    let smss_fault_c = mint_badged(si_fault, smss_image.top_badge);
                     let spawn = spawn_hosted_sec_image_for_image(
                         smss_image,
                         &pe,
-                        si_fault_c,
+                        smss_fault_c,
                         Some((NTDLL_BASE, smss_ntdll_pe)),
                         true,
                         false,
@@ -33251,8 +33549,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         start_device_call_report,
                     ) = service_sec_image(
                         si_fault,
-                        spawn.pml4,
-                        spawn.main_tcb,
+                        spawn,
                         smss_image,
                         &pe,
                         SCRATCH_BASE,

@@ -1254,15 +1254,9 @@ fn imports_selected_control_set_critical_device_database() {
         ),
         1
     );
-    let binding = cm
-        .resolve_critical_device_id("*PNP0C08")
-        .unwrap()
-        .unwrap();
+    let binding = cm.resolve_critical_device_id("*PNP0C08").unwrap().unwrap();
     assert_eq!(binding.matched_id, "*PNP0C08");
-    assert_eq!(
-        binding.class_guid,
-        "{4D36E97D-E325-11CE-BFC1-08002BE10318}"
-    );
+    assert_eq!(binding.class_guid, "{4D36E97D-E325-11CE-BFC1-08002BE10318}");
     assert_eq!(binding.service_name.as_deref(), Some("acpi"));
     assert_eq!(
         cm.resolve_critical_device_id(r"ROOT\INACTIVE").unwrap(),

@@ -13,6 +13,7 @@ pub enum MechanismError {
     DuplicateBadge,
     InvalidIdentity,
     InvalidBadge,
+    StaleIdentity,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct ProcessMechanism {
     pub pid: u32,
     pub main_tid: u32,
     pub top_badge: u64,
+    pub generation: u64,
 }
 
 impl ProcessMechanism {
@@ -30,6 +32,7 @@ impl ProcessMechanism {
             pid: 0,
             main_tid: 0,
             top_badge: 0,
+            generation: 0,
         }
     }
 
@@ -266,11 +269,12 @@ impl<const N: usize> ProcessMechanismTable<N> {
         pid: u32,
         main_tid: u32,
         top_badge: u64,
+        generation: u64,
     ) -> Result<(), MechanismError> {
         if pi >= N {
             return Err(MechanismError::SlotOutOfRange);
         }
-        if pid == 0 || main_tid == 0 {
+        if pid == 0 || main_tid == 0 || generation == 0 {
             return Err(MechanismError::InvalidIdentity);
         }
         if top_badge >= u64::BITS as u64 {
@@ -285,8 +289,9 @@ impl<const N: usize> ProcessMechanismTable<N> {
         pid: u32,
         main_tid: u32,
         top_badge: u64,
+        generation: u64,
     ) -> Result<ProcessMechanism, MechanismError> {
-        self.validate_identity(pi, pid, main_tid, top_badge)?;
+        self.validate_identity(pi, pid, main_tid, top_badge, generation)?;
         if self.slots[pi].is_live() {
             return Err(MechanismError::SlotOccupied);
         }
@@ -305,6 +310,7 @@ impl<const N: usize> ProcessMechanismTable<N> {
             pid,
             main_tid,
             top_badge,
+            generation,
         };
         self.slots[pi] = mechanism;
         Ok(mechanism)
@@ -316,13 +322,15 @@ impl<const N: usize> ProcessMechanismTable<N> {
         pid: u32,
         main_tid: u32,
         top_badge: u64,
+        generation: u64,
     ) -> Result<ProcessMechanism, MechanismError> {
-        self.validate_identity(pi, pid, main_tid, top_badge)?;
+        self.validate_identity(pi, pid, main_tid, top_badge, generation)?;
         let requested = ProcessMechanism {
             pi,
             pid,
             main_tid,
             top_badge,
+            generation,
         };
         if let Some(existing) = self.get(pi) {
             return if existing == requested {
@@ -331,7 +339,7 @@ impl<const N: usize> ProcessMechanismTable<N> {
                 Err(MechanismError::SlotOccupied)
             };
         }
-        self.claim(pi, pid, main_tid, top_badge)
+        self.claim(pi, pid, main_tid, top_badge, generation)
     }
 
     pub fn release_pi(&mut self, pi: usize) -> Option<ProcessMechanism> {
@@ -342,6 +350,20 @@ impl<const N: usize> ProcessMechanismTable<N> {
         let previous = *slot;
         *slot = ProcessMechanism::empty();
         Some(previous)
+    }
+
+    pub fn release_exact(
+        &mut self,
+        expected: ProcessMechanism,
+    ) -> Result<ProcessMechanism, MechanismError> {
+        let current = self
+            .get(expected.pi)
+            .ok_or(MechanismError::InvalidIdentity)?;
+        if current != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        self.release_pi(expected.pi)
+            .ok_or(MechanismError::InvalidIdentity)
     }
 
     pub fn get(&self, pi: usize) -> Option<ProcessMechanism> {
@@ -402,14 +424,15 @@ mod tests {
     #[test]
     fn claim_indexes_by_pid_tid_and_badge() {
         let mut table = ProcessMechanismTable::<4>::new();
-        let slot = table.claim(1, 12, 20, 2).unwrap();
+        let slot = table.claim(1, 12, 20, 2, 1).unwrap();
         assert_eq!(
             slot,
             ProcessMechanism {
                 pi: 1,
                 pid: 12,
                 main_tid: 20,
-                top_badge: 2
+                top_badge: 2,
+                generation: 1,
             }
         );
         assert_eq!(table.pid_for_pi(1), Some(12));
@@ -424,43 +447,60 @@ mod tests {
     #[test]
     fn claim_rejects_collisions() {
         let mut table = ProcessMechanismTable::<4>::new();
-        table.claim(1, 12, 20, 2).unwrap();
-        assert_eq!(table.claim(1, 13, 21, 4), Err(MechanismError::SlotOccupied));
-        assert_eq!(table.claim(2, 12, 21, 4), Err(MechanismError::DuplicatePid));
-        assert_eq!(table.claim(2, 13, 20, 4), Err(MechanismError::DuplicateTid));
+        table.claim(1, 12, 20, 2, 1).unwrap();
         assert_eq!(
-            table.claim(2, 13, 21, 2),
+            table.claim(1, 13, 21, 4, 2),
+            Err(MechanismError::SlotOccupied)
+        );
+        assert_eq!(
+            table.claim(2, 12, 21, 4, 2),
+            Err(MechanismError::DuplicatePid)
+        );
+        assert_eq!(
+            table.claim(2, 13, 20, 4, 2),
+            Err(MechanismError::DuplicateTid)
+        );
+        assert_eq!(
+            table.claim(2, 13, 21, 2, 2),
             Err(MechanismError::DuplicateBadge)
         );
         assert_eq!(
-            table.claim(4, 13, 21, 4),
+            table.claim(4, 13, 21, 4, 2),
             Err(MechanismError::SlotOutOfRange)
         );
         assert_eq!(
-            table.claim(2, 0, 21, 4),
+            table.claim(2, 0, 21, 4, 2),
             Err(MechanismError::InvalidIdentity)
         );
         assert_eq!(
-            table.claim(2, 13, 21, 64),
+            table.claim(2, 13, 21, 64, 2),
             Err(MechanismError::InvalidBadge)
+        );
+        assert_eq!(
+            table.claim(2, 13, 21, 4, 0),
+            Err(MechanismError::InvalidIdentity)
         );
     }
 
     #[test]
     fn claim_or_get_is_idempotent_only_for_exact_identity() {
         let mut table = ProcessMechanismTable::<4>::new();
-        let first = table.claim_or_get(1, 12, 20, 2).unwrap();
-        assert_eq!(table.claim_or_get(1, 12, 20, 2), Ok(first));
+        let first = table.claim_or_get(1, 12, 20, 2, 1).unwrap();
+        assert_eq!(table.claim_or_get(1, 12, 20, 2, 1), Ok(first));
         assert_eq!(
-            table.claim_or_get(1, 12, 21, 2),
+            table.claim_or_get(1, 12, 21, 2, 1),
             Err(MechanismError::SlotOccupied)
         );
         assert_eq!(
-            table.claim_or_get(1, 13, 20, 2),
+            table.claim_or_get(1, 13, 20, 2, 1),
             Err(MechanismError::SlotOccupied)
         );
         assert_eq!(
-            table.claim_or_get(1, 12, 20, 3),
+            table.claim_or_get(1, 12, 20, 3, 1),
+            Err(MechanismError::SlotOccupied)
+        );
+        assert_eq!(
+            table.claim_or_get(1, 12, 20, 2, 2),
             Err(MechanismError::SlotOccupied)
         );
     }
@@ -468,14 +508,18 @@ mod tests {
     #[test]
     fn release_frees_all_indexes() {
         let mut table = ProcessMechanismTable::<4>::new();
-        table.claim(1, 12, 20, 2).unwrap();
+        let old = table.claim(1, 12, 20, 2, 1).unwrap();
         assert_eq!(table.live_len(), 1);
         assert_eq!(table.release_pi(1).unwrap().pid, 12);
         assert_eq!(table.live_len(), 0);
         assert_eq!(table.pi_for_pid(12), None);
         assert_eq!(table.pi_for_tid(20), None);
         assert_eq!(table.pi_for_badge(2), None);
-        assert_eq!(table.claim(1, 14, 22, 2).unwrap().pid, 14);
+        let replacement = table.claim(1, 14, 22, 2, 2).unwrap();
+        assert_eq!(replacement.pid, 14);
+        assert_eq!(table.release_exact(old), Err(MechanismError::StaleIdentity));
+        assert_eq!(table.get(1), Some(replacement));
+        assert_eq!(table.release_exact(replacement), Ok(replacement));
     }
 
     #[test]

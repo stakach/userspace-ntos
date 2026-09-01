@@ -3591,10 +3591,10 @@ unsafe fn spawn_requested_hosted_exe(
         child_pid as u64,
         child_tid as u64,
     );
-    nt_handler.register_main_thread_tcb(pi, child_spawn.main_tcb);
+    nt_handler.register_main_thread_spawn(pi, child_spawn);
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
-    nt_handler.publish_hosted_process_vspace(pi, child_spawn.pml4)?;
+    nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)?;
     procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
@@ -5577,8 +5577,7 @@ unsafe fn capture_builtin_class_key(
 /// non-VMFault (#GP), or a fault cap. Returns (verdict, faults, first, stop, ntdll_faults).
 pub(crate) unsafe fn service_sec_image(
     fault_ep: u64,
-    pml4: u64,
-    main_tcb: u64,
+    primary_spawn: img_spawn::SecImageSpawn,
     primary_image: nt_exe_image::HostedProcessImageRef<'static>,
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,
@@ -5597,6 +5596,8 @@ pub(crate) unsafe fn service_sec_image(
     LiveDeviceActionReport,
     StartDeviceCallReport,
 ) {
+    let pml4 = primary_spawn.pml4;
+    let main_tcb = primary_spawn.main_tcb;
     let live_service = ntdll.is_some();
     loader_trace_clear();
     reset_deferred_user_callback_returns();
@@ -5818,7 +5819,7 @@ pub(crate) unsafe fn service_sec_image(
     if live_service {
         print_str(b"[sec-init] handler-ready\n");
     }
-    nt_handler.register_main_thread_tcb(primary_pi, main_tcb);
+    nt_handler.register_main_thread_spawn(primary_pi, primary_spawn);
     let delay_queue = reset_service_delay_queue_work().expect("delay wait queue allocation failed");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
     // Boot drivers can publish timer deadlines before the service loop owns its
@@ -5869,7 +5870,7 @@ pub(crate) unsafe fn service_sec_image(
     procs[primary_pi].pml4 = pml4;
     if nt_handler.pm_pid_for_pi(primary_pi).is_some() {
         nt_handler
-            .publish_hosted_process_vspace(primary_pi, pml4)
+            .publish_hosted_process_vspace(primary_pi, primary_spawn.vspace_caps)
             .expect("primary VSpace publication requires a registered bootstrap process");
     }
     procs[primary_pi].scratch_base = scratch_base;
@@ -9730,6 +9731,15 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             ProcessVmReclaimStats::default()
                         };
+                        if vm_reclaim.vspace_released {
+                            pfilled[process_index as usize] = [0; 512];
+                            if pi == process_index as usize {
+                                faults = 0;
+                                first = 0;
+                                ntfaults = 0;
+                                *filled_pages = [0; 512];
+                            }
+                        }
                         if final_process_teardown {
                             let _ = win32k_glue::unwind_dead_client_user_callbacks(
                                 process_index as u32,
@@ -9778,6 +9788,12 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(vm_reclaim.private_pts);
                         print_str(b"/");
                         print_u64(vm_reclaim.private_pt_failures);
+                        print_str(b" copyin-frames=");
+                        print_u64(vm_reclaim.client_copyin_frames);
+                        print_str(b"/");
+                        print_u64(vm_reclaim.client_copyin_frame_failures);
+                        print_str(b" vspace-released=");
+                        print_u64(vm_reclaim.vspace_released as u64);
                         print_str(b"\n");
                         if drop_reply {
                             procs[pi].faults = faults;

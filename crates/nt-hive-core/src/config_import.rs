@@ -73,18 +73,14 @@ pub fn import_control_set_critical_device_database_into_config_manager(
     let Some(src_database) = hive.open_key(&src_path) else {
         return 0;
     };
-    let dst_database = cm
-        .registry_mut()
-        .create_key(CRITICAL_DEVICE_DATABASE_PATH);
+    let dst_database = cm.registry_mut().create_key(CRITICAL_DEVICE_DATABASE_PATH);
     let device_ids = hive.enum_subkeys(src_database);
     let count = device_ids.len();
     for device_id in device_ids {
         let Some(src_device) = hive.open_subkey(src_database, &device_id) else {
             continue;
         };
-        let dst_device = cm
-            .registry_mut()
-            .create_subkey(dst_database, &device_id);
+        let dst_device = cm.registry_mut().create_subkey(dst_database, &device_id);
         import_hive_key(hive, src_device, cm.registry_mut(), dst_device);
     }
     count

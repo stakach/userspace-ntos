@@ -3700,6 +3700,11 @@ pub(crate) fn win32k_client_cap_bank_stats() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+pub(crate) fn win32k_client_cap_bank_is_empty(pi: usize) -> bool {
+    unsafe { win32k_client_cap_bank_live_row(pi) }
+        .is_some_and(|row| row.load(Ordering::Acquire) == 0)
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Win32kClientCapBankReclaimStats {
     pub caps: u64,

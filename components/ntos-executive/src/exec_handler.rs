@@ -2538,6 +2538,56 @@ unsafe fn admit_dynamic_hosted_exe(
     Some((image, true))
 }
 
+unsafe fn dynamic_hosted_identity_attachments_match(
+    ctx: ExecLoopCtx,
+    target: nt_exe_image::SpawnTarget,
+    published_targets: usize,
+) -> bool {
+    let catalog = &*ctx.exe_image_catalog;
+    catalog
+        .get_by_pi(target.pi)
+        .is_some_and(|image| nt_exe_image::SpawnTarget::from_image(image) == target)
+        && hosted_process_runtime_matches_target(target)
+        && (&*ctx.hosted_loaded_images).matches_target(target)
+        && (&*ctx.exe_images).published_target_count(target) == published_targets
+}
+
+unsafe fn retire_dynamic_hosted_identity_attachments(
+    ctx: ExecLoopCtx,
+    target: nt_exe_image::SpawnTarget,
+    published_targets: usize,
+) -> bool {
+    if target.pi < nt_exe_image::DYNAMIC_PROCESS_FIRST_PI
+        || !dynamic_hosted_identity_attachments_match(ctx, target, published_targets)
+    {
+        return false;
+    }
+    if published_targets != 0
+        && (&mut *ctx.exe_images).retire_published_target(target) != published_targets
+    {
+        panic!("preflighted hosted spawn target retirement changed while serialized");
+    }
+    (&mut *ctx.hosted_loaded_images)
+        .retire_exact(target)
+        .expect("preflighted loaded-image attachment must retire exactly");
+    retire_hosted_process_runtime(target)
+        .expect("preflighted hosted-process runtime must retire exactly");
+    (&mut *ctx.exe_image_catalog)
+        .retire_dynamic_target(target)
+        .expect("preflighted hosted-image catalog identity must retire exactly");
+    true
+}
+
+unsafe fn retire_unspawned_dynamic_hosted_identity(
+    ctx: ExecLoopCtx,
+    target: nt_exe_image::SpawnTarget,
+) -> bool {
+    if !hosted_process_runtime_target_is_unspawned(target) {
+        return false;
+    }
+    retire_dynamic_hosted_identity_attachments(ctx, target, 0)
+}
+
 /// `NtCreateToken`'s bounded reader over the CALLING process' address space — the executive's
 /// cross-address-space copy-in behind the pure `nt_security::ClientMemory` capture contract.
 /// `xas_read` resolves the stack/heap/image mirrors, the persistent frame aliases, and finally the
@@ -3272,6 +3322,18 @@ fn zeroed_process_slot_u64_vec() -> alloc::vec::Vec<u64> {
     slots
 }
 
+fn empty_process_vspace_caps_vec(
+) -> alloc::vec::Vec<Option<img_spawn::HostedProcessVspaceCaps>> {
+    let mut slots = alloc::vec::Vec::new();
+    if slots.try_reserve_exact(MAX_PI).is_err() {
+        panic!("process VSpace capability vector allocation failed");
+    }
+    while slots.len() < MAX_PI {
+        slots.push(None);
+    }
+    slots
+}
+
 fn zeroed_temporary_process_slot_vec() -> alloc::vec::Vec<nt_process::ProcessId> {
     let mut slots = alloc::vec::Vec::new();
     if slots.try_reserve_exact(MAX_PI).is_err() {
@@ -3963,6 +4025,7 @@ impl ExecNtHandler {
         write_field!(process_mechanisms, ExecProcessMechanisms::reset());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
+        write_field!(process_vspace_caps, empty_process_vspace_caps_vec());
         write_field!(temporary_process_slots, zeroed_temporary_process_slot_vec());
         write_field!(thread_mechanisms, ExecThreadMechanisms::reset());
         write_field!(pool_used, zeroed_process_slot_u64_vec());
@@ -3985,9 +4048,14 @@ impl ExecNtHandler {
             let main_tid = bootstrap_main_tids[pi];
             if pid != 0 && main_tid != 0 {
                 if let Some(image) = handler.hosted_process_image(pi) {
-                    let top_badge = image.top_badge;
                     let _ = handler.publish_registered_hosted_process_metadata(image);
-                    let _ = handler.register_hosted_process_identity(pi, pid, main_tid, top_badge);
+                    let _ = handler.register_hosted_process_identity(
+                        pi,
+                        pid,
+                        main_tid,
+                        image.top_badge,
+                        image.generation,
+                    );
                 }
                 for slot in 0..PM_RUNTIME_THREAD_SLOTS {
                     let tid = bootstrap_pool_tids[pi][slot];
@@ -9125,16 +9193,28 @@ impl ExecNtHandler {
     pub(crate) fn publish_hosted_process_vspace(
         &mut self,
         pi: usize,
-        pml4: u64,
+        caps: img_spawn::HostedProcessVspaceCaps,
     ) -> Result<(), u32> {
-        let Some(pid) = (pi < MAX_PI && pml4 != 0)
+        let Some(pid) = (pi < MAX_PI && caps.pml4 != 0 && caps.generation != 0)
             .then(|| self.pm_pid_for_pi(pi))
             .flatten()
         else {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         };
+        let mechanism = self
+            .process_mechanisms
+            .get(pi)
+            .filter(|mechanism| mechanism.generation == caps.generation)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        if mechanism.pid != pid
+            || self.process_vspace_caps[pi].is_some()
+            || self.process_vspaces[pi] != 0
+        {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
         unsafe { self.ensure_process_commit_owner(pid, pi)? };
-        self.process_vspaces[pi] = pml4;
+        self.process_vspaces[pi] = caps.pml4;
+        self.process_vspace_caps[pi] = Some(caps);
         if pi < 64 {
             PM_VSPACE_PUBLISHED_OK.fetch_or(1u64 << pi, Ordering::Relaxed);
         }
@@ -9145,6 +9225,35 @@ impl ExecNtHandler {
         self.pm_pid_for_pi(pi)?;
         let pml4 = *self.process_vspaces.get(pi)?;
         (pml4 != 0).then_some(pml4)
+    }
+
+    pub(crate) unsafe fn release_hosted_process_vspace_caps(&mut self, pi: usize) -> bool {
+        let Some(mechanism) = self.process_mechanisms.get(pi) else {
+            return false;
+        };
+        if self.thread_runtime.has_process(pi) {
+            return false;
+        }
+        let Some(owner) = self
+            .process_vspace_caps
+            .get_mut(pi)
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        if owner.generation != mechanism.generation
+            || owner.pml4 == 0
+            || self.process_vspaces.get(pi).copied() != Some(owner.pml4)
+        {
+            return false;
+        }
+
+        if !release_sec_image_vspace_caps(owner) {
+            return false;
+        }
+        self.process_vspace_caps[pi] = None;
+        self.process_vspaces[pi] = 0;
+        true
     }
 
     fn pool_slot_bit(slot: usize) -> Option<u64> {
@@ -9361,16 +9470,25 @@ impl ExecNtHandler {
         self.thread_runtime.reserve(pi, tid, badge, role).is_some()
     }
 
-    pub(crate) fn register_main_thread_tcb(&mut self, pi: usize, tcb: u64) {
+    pub(crate) fn register_main_thread_spawn(
+        &mut self,
+        pi: usize,
+        spawn: img_spawn::SecImageSpawn,
+    ) {
         if let Some(tid) = self.pm_main_tid_for_pi(pi) {
             let badge = self.hosted_process_top_badge(pi).unwrap_or(0);
-            if self.register_hosted_thread_tcb(
-                pi,
-                u64::from(tid),
-                tcb,
-                badge,
-                HostedThreadRole::Main,
-            ) {
+            if self
+                .thread_runtime
+                .register_main(
+                    pi,
+                    u64::from(tid),
+                    spawn.main_tcb,
+                    badge,
+                    spawn.main_mechanism,
+                )
+                .is_some()
+            {
+                publish_hosted_thread_runtime_gate(pi, HostedThreadRole::Main);
                 let _ = self.thread_runtime.set_user_stack(
                     u64::from(tid),
                     HOSTED_MAIN_STACK_ALLOCATION_BASE,
@@ -10480,12 +10598,13 @@ impl ExecNtHandler {
         pid: nt_process::ProcessId,
         main_tid: nt_process::ThreadId,
         top_badge: u64,
+        generation: u64,
     ) -> Result<(), u32> {
         let main_claimed = self.register_hosted_main_thread_identity(pi, main_tid)?;
 
         match self
             .process_mechanisms
-            .claim_or_get(pi, pid, main_tid, top_badge)
+            .claim_or_get(pi, pid, main_tid, top_badge, generation)
         {
             Ok(_) => Ok(()),
             Err(_) => {
@@ -10795,7 +10914,13 @@ impl ExecNtHandler {
             }
         };
         if let Err(status) =
-            self.register_hosted_process_identity(child_pi, pid, main_tid, image.top_badge)
+            self.register_hosted_process_identity(
+                child_pi,
+                pid,
+                main_tid,
+                image.top_badge,
+                image.generation,
+            )
         {
             self.rollback_hosted_process_creation(child_pi, pid);
             return Err(status);
@@ -21665,10 +21790,57 @@ impl ExecNtHandler {
             return false;
         };
         if self.process_vspaces.get(pi).copied().unwrap_or(1) != 0
+            || self
+                .process_vspace_caps
+                .get(pi)
+                .is_none_or(Option::is_some)
             || !self.pm.process_object_delete_ready(pid)
         {
             return false;
         }
+
+        let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
+            return false;
+        };
+        let dynamic_retirement = if pi >= nt_exe_image::DYNAMIC_PROCESS_FIRST_PI {
+            let Some(image) = self.hosted_process_image(pi) else {
+                return false;
+            };
+            let target = nt_exe_image::SpawnTarget::from_image(image);
+            if target.generation != process_mechanism.generation {
+                return false;
+            }
+            let thread_has_win32_context = self
+                .pm
+                .process(pid)
+                .is_some_and(|process| {
+                    process
+                        .threads
+                        .iter()
+                        .copied()
+                        .any(|tid| self.pm.thread_win32(tid).is_some())
+                });
+            if self.pm.process_win32(pid).is_some() || thread_has_win32_context {
+                return false;
+            }
+            let Some(loop_ctx) = self.loop_ctx else {
+                return false;
+            };
+            let published_targets =
+                unsafe { (&*loop_ctx.exe_images).published_target_count(target) };
+            if !unsafe {
+                dynamic_hosted_identity_attachments_match(
+                    loop_ctx,
+                    target,
+                    published_targets,
+                )
+            } {
+                return false;
+            }
+            Some((loop_ctx, target, published_targets))
+        } else {
+            None
+        };
 
         if let Some(w32process) = self.pm.process_win32(pid) {
             if self
@@ -21740,8 +21912,20 @@ impl ExecNtHandler {
         for slot in 0..PM_RUNTIME_THREAD_SLOTS {
             let _ = self.thread_mechanisms.release_pool(pi, slot);
         }
-        let released = self.process_mechanisms.release_pi(pi);
-        debug_assert!(released.is_some_and(|mechanism| mechanism.pid == pid));
+        let released = self
+            .process_mechanisms
+            .release_exact(process_mechanism)
+            .expect("preflighted hosted process mechanism must retire exactly");
+        debug_assert_eq!(released.pid, pid);
+        if let Some((loop_ctx, target, published_targets)) = dynamic_retirement {
+            assert!(unsafe {
+                retire_dynamic_hosted_identity_attachments(
+                    loop_ctx,
+                    target,
+                    published_targets,
+                )
+            });
+        }
         self.pool_used[pi] = 0;
         self.drain_job_destructions();
         self.refresh_process_manager_gates();
@@ -32883,7 +33067,25 @@ impl ExecNtHandler {
                 }
                 if let Some(loop_ctx) = self.loop_ctx {
                     unsafe {
-                        let _ = (&mut *loop_ctx.exe_images).close(self.pi, args[0]);
+                        let image_target =
+                            (&*loop_ctx.exe_images).target_for_handle(self.pi, args[0]);
+                        let image_close =
+                            (&mut *loop_ctx.exe_images).close(self.pi, args[0]);
+                        if matches!(image_close, nt_exe_image::CloseOutcome::Released(_)) {
+                            if let Some((target, state)) = image_target {
+                                if state != nt_exe_image::ImageState::Published {
+                                    let retired =
+                                        retire_unspawned_dynamic_hosted_identity(loop_ctx, target);
+                                    if retired {
+                                        print_str(b"[hosted-exe] aborted unspawned identity pi=");
+                                        print_u64(target.pi as u64);
+                                        print_str(b" generation=");
+                                        print_u64(target.generation);
+                                        print_str(b"\n");
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if closed {

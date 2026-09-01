@@ -11,6 +11,7 @@ use nt_hosted_runtime::{DynamicRuntimeArena, ProcessRuntimeLayout};
 #[derive(Clone, Copy)]
 pub(crate) struct HostedProcessRuntime {
     pub(crate) pi: usize,
+    pub(crate) generation: u64,
     pub(crate) priority: u64,
     pub(crate) env_scratch_va: u64,
     pub(crate) stack_mirror_va: u64,
@@ -26,6 +27,8 @@ pub(crate) enum HostedProcessRuntimeRegistrationError {
     InvalidPi,
     DuplicatePi,
     MissingLayout,
+    NotFound,
+    StaleIdentity,
 }
 
 struct HostedProcessRuntimeTable {
@@ -69,6 +72,30 @@ impl HostedProcessRuntimeTable {
     fn get_by_pi(&self, pi: usize) -> Option<HostedProcessRuntime> {
         self.entries.get(pi).and_then(|entry| *entry)
     }
+
+    fn matches_target(&self, target: nt_exe_image::SpawnTarget) -> bool {
+        self.get_by_pi(target.pi)
+            .is_some_and(|runtime| runtime.generation == target.generation)
+    }
+
+    fn retire_exact(
+        &mut self,
+        target: nt_exe_image::SpawnTarget,
+    ) -> Result<HostedProcessRuntime, HostedProcessRuntimeRegistrationError> {
+        let entry = self
+            .entries
+            .get_mut(target.pi)
+            .ok_or(HostedProcessRuntimeRegistrationError::InvalidPi)?;
+        let runtime = entry.ok_or(HostedProcessRuntimeRegistrationError::NotFound)?;
+        if runtime.generation != target.generation {
+            return Err(HostedProcessRuntimeRegistrationError::StaleIdentity);
+        }
+        if let Some(spawned) = runtime.spawned {
+            spawned.store(0, Ordering::Release);
+        }
+        *entry = None;
+        Ok(runtime)
+    }
 }
 
 static HOSTED_PROCESS_RUNTIME_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -91,6 +118,29 @@ pub(crate) fn register_hosted_process_runtime(
 
 pub(crate) fn hosted_process_runtime_for_pi(pi: usize) -> Option<HostedProcessRuntime> {
     unsafe { (&*core::ptr::addr_of!(HOSTED_PROCESS_RUNTIMES)).get_by_pi(pi) }
+}
+
+pub(crate) fn hosted_process_runtime_matches_target(
+    target: nt_exe_image::SpawnTarget,
+) -> bool {
+    unsafe { (&*core::ptr::addr_of!(HOSTED_PROCESS_RUNTIMES)).matches_target(target) }
+}
+
+pub(crate) fn hosted_process_runtime_target_is_unspawned(
+    target: nt_exe_image::SpawnTarget,
+) -> bool {
+    hosted_process_runtime_for_pi(target.pi).is_some_and(|runtime| {
+        runtime.generation == target.generation
+            && runtime
+                .spawned
+                .is_some_and(|spawned| spawned.load(Ordering::Acquire) == 0)
+    })
+}
+
+pub(crate) fn retire_hosted_process_runtime(
+    target: nt_exe_image::SpawnTarget,
+) -> Result<HostedProcessRuntime, HostedProcessRuntimeRegistrationError> {
+    unsafe { (&mut *core::ptr::addr_of_mut!(HOSTED_PROCESS_RUNTIMES)).retire_exact(target) }
 }
 
 #[derive(Clone, Copy)]
@@ -300,6 +350,7 @@ fn runtime_for_image(
     };
     Ok(HostedProcessRuntime {
         pi: image.pi,
+        generation: image.generation,
         priority: HOSTED_PROCESS_DEFAULT_PRIORITY,
         env_scratch_va: layout.env_scratch_va,
         stack_mirror_va: layout.stack_mirror_va,
@@ -356,6 +407,7 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
     let runtime = expect_hosted_process_runtime(image.pi);
     spawn_sec_image(
         image.pi as u64,
+        image.generation,
         pe,
         fault_ep_c,
         ntdll,

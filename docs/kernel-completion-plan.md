@@ -21760,6 +21760,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     teardown into the same lifecycle work. The following frontier remains the dedicated
     real-provider GetClassInfo integration client.
 
+    Dynamic hosted-process reclamation checkpoint (2026-09-01, implementation green; runtime
+    acceptance pending): dynamic executable identities now carry a monotonically increasing
+    generation through the hosted-image catalog, image table, loaded-image attachment, runtime
+    placement, and seL4 process mechanism. Retirement and release are exact-generation operations;
+    a stale target cannot retire or attach to a replacement that reuses the same `pi`, badge, role,
+    or executable leaf. The durable loaded PE cache is keyed by canonical leaf while per-process
+    attachments are transient and generation tagged. Closing an executable that never published a
+    spawn now retires the complete unspawned identity transaction instead of consuming a permanent
+    catalog slot. Host tests cover full-window exhaustion, exact retirement, same-PI reuse with a
+    new generation, stale-token rejection, and stale same-leaf publication rejection.
+
+    The SEC_IMAGE spawn boundary now returns ownership of the main thread's SC/raw CNode/guarded
+    CNode and a bounded VSpace ledger containing the PML4, upper paging objects, badged fault cap,
+    IPC mapping, activation-context and desktop pages, NLS mappings, trampoline, and the diagnostic
+    path's otherwise-unregistered initial stack caps. Initial process frames, KUSER source/target
+    caps, client copy-in aliases, leaf page tables, and win32k client caps are reclaimed before the
+    upper paging hierarchy. Every partial delete is fail-closed and retryable; the process VSpace
+    and `ProcExec` identity remain published until all owned capabilities are actually gone. The
+    historical service-loop writeback can no longer restore stale fault/page-fill state after final
+    teardown. The early SEC_IMAGE diagnostic now destroys its full unpublished address space rather
+    than leaving pi 20's mechanism behind. Final Object Manager deletion preflights every dynamic
+    attachment, releases the process mechanism exactly, and only then retires runtime/image/catalog
+    ownership. `nt-exe-image` passes 32/32 tests, `nt-user-host` passes 13 unit and 3 real-ntdll
+    tests, and the freestanding executive check is green.
+
+    Review adjustment: a dynamic process with a live win32k `W32PROCESS` or `W32THREAD` is
+    deliberately not reusable yet. Implement the provider-owned process/thread delete callouts
+    registered by `PsEstablishWin32Callouts`, clear the Process Manager context slots only after
+    provider success, and retry final deletion from the common zombie-reference release path. Then
+    run one serialized desktop acceptance under the 3,600-second boot ceiling and require repeated
+    `rundll32.exe` device-install launches to reuse reclaimed identities without `err=6`, stale
+    frames, callback ownership, or capability-delete failures. Do not raise `MAX_PI`. After that
+    runtime proof, proceed to the dedicated real-provider GetClassInfo integration client.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

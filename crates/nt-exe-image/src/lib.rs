@@ -123,6 +123,7 @@ impl HostedProcessRole {
 pub struct SpawnTarget {
     pub pi: usize,
     pub top_badge: u64,
+    pub generation: u64,
     pub role: HostedProcessRole,
 }
 
@@ -131,6 +132,7 @@ impl SpawnTarget {
         Self {
             pi: image.pi,
             top_badge: image.top_badge,
+            generation: image.generation,
             role: image.role,
         }
     }
@@ -140,6 +142,7 @@ impl SpawnTarget {
 pub struct HostedProcessImageRef<'a> {
     pub pi: usize,
     pub top_badge: u64,
+    pub generation: u64,
     pub leaf: &'a [u8],
     pub process_name: &'a str,
     pub role: HostedProcessRole,
@@ -158,6 +161,15 @@ pub enum HostedImageRegistrationError {
     DuplicateTopBadge,
     DuplicateLeaf,
     Full,
+    InvalidGeneration,
+    GenerationExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedImageRetirementError {
+    StaticIdentity,
+    NotFound,
+    StaleIdentity,
 }
 
 fn validate_hosted_image_ref(
@@ -170,6 +182,7 @@ fn validate_hosted_image_ref(
         return Err(HostedImageRegistrationError::InvalidPath);
     };
     if image.top_badge >= 64
+        || image.generation == 0
         || image.leaf.is_empty()
         || image.leaf.len() > MAX_EXE_LEAF
         || image.nt_image_path.is_empty()
@@ -351,6 +364,7 @@ impl<const N: usize> FixedBytes<N> {
 pub struct OwnedHostedProcessImage {
     pub pi: usize,
     pub top_badge: u64,
+    pub generation: u64,
     leaf: FixedBytes<MAX_EXE_LEAF>,
     process_name: FixedBytes<MAX_EXE_LEAF>,
     pub role: HostedProcessRole,
@@ -365,6 +379,7 @@ impl OwnedHostedProcessImage {
         Self {
             pi: 0,
             top_badge: 0,
+            generation: 0,
             leaf: FixedBytes::empty(),
             process_name: FixedBytes::empty(),
             role: HostedProcessRole::NativeSession,
@@ -378,6 +393,7 @@ impl OwnedHostedProcessImage {
     pub fn new(
         pi: usize,
         top_badge: u64,
+        generation: u64,
         leaf: &[u8],
         process_name: &[u8],
         role: HostedProcessRole,
@@ -392,6 +408,7 @@ impl OwnedHostedProcessImage {
         image.copy_from_ref(HostedProcessImageRef {
             pi,
             top_badge,
+            generation,
             leaf,
             process_name,
             role,
@@ -410,6 +427,7 @@ impl OwnedHostedProcessImage {
         validate_hosted_image_ref(image)?;
         self.pi = image.pi;
         self.top_badge = image.top_badge;
+        self.generation = image.generation;
         self.leaf.set_from_slice(image.leaf)?;
         self.process_name
             .set_from_slice(image.process_name.as_bytes())?;
@@ -425,6 +443,7 @@ impl OwnedHostedProcessImage {
         HostedProcessImageRef {
             pi: self.pi,
             top_badge: self.top_badge,
+            generation: self.generation,
             leaf: self.leaf.as_slice(),
             process_name: self.process_name_str(),
             role: self.role,
@@ -462,6 +481,7 @@ impl OwnedHostedProcessImage {
 pub struct OwnedHostedImageCatalog<const N: usize> {
     entries: [OwnedHostedProcessImage; N],
     used: [bool; N],
+    next_dynamic_generation: u64,
 }
 
 impl<const N: usize> Default for OwnedHostedImageCatalog<N> {
@@ -475,11 +495,13 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
         Self {
             entries: [OwnedHostedProcessImage::empty(); N],
             used: [false; N],
+            next_dynamic_generation: 1,
         }
     }
 
     pub fn clear(&mut self) {
         self.used.fill(false);
+        self.next_dynamic_generation = 1;
     }
 
     pub fn register(
@@ -552,9 +574,14 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             .ok_or(HostedImageRegistrationError::Full)?;
         let top_badge =
             dynamic_top_badge_for_pi(pi).ok_or(HostedImageRegistrationError::InvalidPath)?;
+        if self.next_dynamic_generation == u64::MAX {
+            return Err(HostedImageRegistrationError::GenerationExhausted);
+        }
+        let generation = self.next_dynamic_generation;
         let image = OwnedHostedProcessImage::new(
             pi,
             top_badge,
+            generation,
             leaf,
             leaf,
             role,
@@ -564,7 +591,33 @@ impl<const N: usize> OwnedHostedImageCatalog<N> {
             leaf,
         )?;
         self.register_dynamic_instance(image)?;
+        self.next_dynamic_generation += 1;
         Ok(pi)
+    }
+
+    /// Retire an exact dynamic process-image identity after all process-instance owners have been
+    /// removed. Generation matching prevents a delayed cleanup from clearing a replacement that
+    /// reused the same PI and top-level fault badge.
+    pub fn retire_dynamic_target(
+        &mut self,
+        target: SpawnTarget,
+    ) -> Result<OwnedHostedProcessImage, HostedImageRetirementError> {
+        if !(DYNAMIC_PROCESS_FIRST_PI..DYNAMIC_PROCESS_PI_LIMIT).contains(&target.pi) {
+            return Err(HostedImageRetirementError::StaticIdentity);
+        }
+        let index = self
+            .entries
+            .iter()
+            .zip(self.used.iter())
+            .position(|(image, used)| *used && image.pi == target.pi)
+            .ok_or(HostedImageRetirementError::NotFound)?;
+        if SpawnTarget::from_image(self.entries[index].as_ref()) != target {
+            return Err(HostedImageRetirementError::StaleIdentity);
+        }
+        let retired = self.entries[index];
+        self.entries[index] = OwnedHostedProcessImage::empty();
+        self.used[index] = false;
+        Ok(retired)
     }
 
     fn register_dynamic_instance(
@@ -816,6 +869,26 @@ impl<const N: usize> ImageTable<N> {
             .count()
     }
 
+    pub fn published_target_count(&self, target: SpawnTarget) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.state == ImageState::Published && slot.target == Some(target))
+            .count()
+    }
+
+    /// Remove completed spawn bookkeeping for an exact process-image incarnation. The generation
+    /// check in `SpawnTarget` makes delayed cleanup harmless after PI and badge reuse.
+    pub fn retire_published_target(&mut self, target: SpawnTarget) -> usize {
+        let mut retired = 0;
+        for slot in &mut self.slots {
+            if slot.state == ImageState::Published && slot.target == Some(target) {
+                *slot = EMPTY_SLOT;
+                retired += 1;
+            }
+        }
+        retired
+    }
+
     pub fn open(
         &mut self,
         owner_pi: usize,
@@ -892,6 +965,24 @@ impl<const N: usize> ImageTable<N> {
                 && slot.owner_pi == owner_pi
                 && slot.section_handle == section_handle
         })
+    }
+
+    pub fn target_for_handle(
+        &self,
+        owner_pi: usize,
+        handle: u64,
+    ) -> Option<(SpawnTarget, ImageState)> {
+        if handle == 0 {
+            return None;
+        }
+        self.slots
+            .iter()
+            .find(|slot| {
+                slot.state != ImageState::Empty
+                    && slot.owner_pi == owner_pi
+                    && (slot.file_handle == handle || slot.section_handle == handle)
+            })
+            .and_then(|slot| slot.target.map(|target| (target, slot.state)))
     }
 
     pub fn create_section(
@@ -1192,6 +1283,7 @@ mod tests {
         HostedProcessImageRef {
             pi,
             top_badge,
+            generation: 1,
             leaf,
             process_name: "registered.exe",
             role,
@@ -1214,6 +1306,7 @@ mod tests {
         OwnedHostedProcessImage::new(
             pi,
             top_badge,
+            1,
             leaf,
             b"registered.exe",
             role,
@@ -1240,6 +1333,7 @@ mod tests {
                     OwnedHostedProcessImage::new(
                         pi,
                         top_badge,
+                        1,
                         leaf,
                         leaf,
                         role,
@@ -1556,6 +1650,7 @@ mod tests {
             OwnedHostedProcessImage::new(
                 5,
                 USERINIT_TOP_BADGE,
+                1,
                 b"userinit.exe",
                 &[0xff],
                 HostedProcessRole::InteractiveShellBootstrap,
@@ -1570,6 +1665,7 @@ mod tests {
             OwnedHostedProcessImage::new(
                 5,
                 USERINIT_TOP_BADGE,
+                1,
                 b"userinit.exe",
                 b"userinit.exe",
                 HostedProcessRole::InteractiveShellBootstrap,
@@ -1667,6 +1763,90 @@ mod tests {
         assert_eq!(
             catalog.get_by_pi(second).unwrap().top_badge,
             DYNAMIC_TOP_BADGE_BASE + 1
+        );
+    }
+
+    #[test]
+    fn owned_catalog_reuses_retired_pi_with_a_new_generation() {
+        let mut catalog = OwnedHostedImageCatalog::<2>::new();
+        let first_pi = catalog
+            .admit_dynamic_executable(
+                b"rundll32.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\rundll32.exe",
+                b"rundll32.exe setup.dll,Install",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        let first = catalog.get_by_pi(first_pi).unwrap();
+        let first_target = SpawnTarget::from_image(first);
+        let first_top_badge = first.top_badge;
+        let first_generation = first.generation;
+        catalog
+            .admit_dynamic_executable(
+                b"rundll32.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\rundll32.exe",
+                b"rundll32.exe setup.dll,Install",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.admit_dynamic_executable(
+                b"cmd.exe",
+                HostedProcessRole::InteractiveShell,
+                b"\\SystemRoot\\System32\\cmd.exe",
+                b"cmd.exe",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            ),
+            Err(HostedImageRegistrationError::Full)
+        );
+
+        let retired = catalog.retire_dynamic_target(first_target).unwrap();
+        assert_eq!(retired.leaf(), b"rundll32.exe");
+        let reused_pi = catalog
+            .admit_dynamic_executable(
+                b"rundll32.exe",
+                HostedProcessRole::NonInteractiveService,
+                b"\\SystemRoot\\System32\\rundll32.exe",
+                b"rundll32.exe setup.dll,Install",
+                HostedImageRoot::System32,
+                DYNAMIC_PROCESS_FIRST_PI + 2,
+            )
+            .unwrap();
+        let replacement = catalog.get_by_pi(reused_pi).unwrap();
+        assert_eq!(reused_pi, first_pi);
+        assert_eq!(replacement.top_badge, first_top_badge);
+        assert_ne!(replacement.generation, first_generation);
+
+        let before = catalog.clone();
+        assert_eq!(
+            catalog.retire_dynamic_target(first_target),
+            Err(HostedImageRetirementError::StaleIdentity)
+        );
+        assert_eq!(catalog, before);
+    }
+
+    #[test]
+    fn owned_catalog_retirement_rejects_static_and_missing_identities() {
+        let mut catalog = boot_owned_catalog();
+        let static_target = SpawnTarget::from_image(catalog.get_by_pi(0).unwrap());
+        assert_eq!(
+            catalog.retire_dynamic_target(static_target),
+            Err(HostedImageRetirementError::StaticIdentity)
+        );
+        assert_eq!(catalog.count(), 7);
+        assert_eq!(
+            catalog.retire_dynamic_target(SpawnTarget {
+                pi: DYNAMIC_PROCESS_FIRST_PI,
+                top_badge: DYNAMIC_TOP_BADGE_BASE,
+                generation: 1,
+                role: HostedProcessRole::NonInteractiveService,
+            }),
+            Err(HostedImageRetirementError::NotFound)
         );
     }
 
@@ -1808,6 +1988,7 @@ mod tests {
             Some(SpawnTarget {
                 pi: 5,
                 top_badge: USERINIT_TOP_BADGE,
+                generation: 1,
                 role: HostedProcessRole::InteractiveShellBootstrap,
             })
         );
@@ -1860,6 +2041,7 @@ mod tests {
             Some(SpawnTarget {
                 pi: 6,
                 top_badge: EXPLORER_TOP_BADGE,
+                generation: 1,
                 role: HostedProcessRole::InteractiveShell,
             })
         );
@@ -2091,6 +2273,41 @@ mod tests {
         assert_eq!(table.close(2, 0x44), CloseOutcome::Released(slot));
         assert_eq!(table.active_len(), 0);
         assert_eq!(table.open(2, b"explorer.exe", 0x40, META), Ok(slot));
+    }
+
+    #[test]
+    fn published_spawn_retirement_rejects_stale_same_leaf_generation() {
+        let old = SpawnTarget {
+            pi: DYNAMIC_PROCESS_FIRST_PI,
+            top_badge: DYNAMIC_TOP_BADGE_BASE,
+            generation: 2,
+            role: HostedProcessRole::NonInteractiveService,
+        };
+        let replacement = SpawnTarget {
+            generation: 3,
+            ..old
+        };
+        let mut table = ImageTable::<2>::new();
+        for (file, section, process_out, process, target) in [
+            (0x40, 0x44, 0x1000, 0x48, old),
+            (0x50, 0x54, 0x2000, 0x58, replacement),
+        ] {
+            table
+                .open_with_target(3, b"rundll32.exe", file, META, Some(target))
+                .unwrap();
+            table.create_section(3, file, section).unwrap();
+            let request = table
+                .reserve_spawn_with_target(3, section, 0x1f_ffff, process_out, Some(target))
+                .unwrap();
+            table.publish(request, process).unwrap();
+        }
+
+        assert_eq!(table.published_target_count(old), 1);
+        assert_eq!(table.published_target_count(replacement), 1);
+        assert_eq!(table.retire_published_target(old), 1);
+        assert_eq!(table.retire_published_target(old), 0);
+        assert_eq!(table.published_target_count(replacement), 1);
+        assert_eq!(table.active_len(), 1);
     }
 
     #[test]
