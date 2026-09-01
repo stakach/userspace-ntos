@@ -6,19 +6,14 @@
 
 #![no_std]
 
-mod hosted_irq;
 mod hosted_irq_arena;
 
-pub use hosted_irq::{
-    HostedIrqCommand, HostedIrqCompletion, HostedIrqFrame, HostedIrqFrameError,
-    HostedIrqLaneIdentity, HostedIrqWork, HOSTED_IRQ_FRAME_MAGIC, HOSTED_IRQ_FRAME_VERSION,
-};
 pub use hosted_irq_arena::{
     HostedIrqArena, HostedIrqArenaConfig, HostedIrqArenaControl, HostedIrqArenaError,
     HostedIrqArenaLayout, HostedIrqArenaResult, HostedIrqArenaToken, HostedIrqDispatchCommand,
     HostedIrqDispatchKind, HostedIrqDispatchPage, HostedIrqFaultKind, HostedIrqFaultRecord,
-    HostedIrqGrantIdentity, HostedIrqLaneDirection, HostedIrqServiceCommand, HostedIrqServiceKind,
-    HostedIrqServicePage, HostedIrqTransaction, HostedIrqTransactionClass,
+    HostedIrqGrantIdentity, HostedIrqLaneDirection, HostedIrqLaneIdentity, HostedIrqServiceCommand,
+    HostedIrqServiceKind, HostedIrqServicePage, HostedIrqTransaction, HostedIrqTransactionClass,
     HOSTED_IRQ_ARENA_ARGUMENT_CAP, HOSTED_IRQ_ARENA_BYTES, HOSTED_IRQ_ARENA_DEPTH,
     HOSTED_IRQ_ARENA_MAGIC, HOSTED_IRQ_ARENA_PAGE_COUNT, HOSTED_IRQ_ARENA_RESULT_CAP,
     HOSTED_IRQ_ARENA_VERSION,

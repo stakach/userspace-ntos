@@ -22399,9 +22399,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retired by the executive's out-of-band TCB-suspend barrier rather than graceful shutdown. The
     crate passes 97/97 tests including all 16 depths, stale reuse, malformed wire cleanup, poison
     unwind, retryable acknowledgement, exact layout/in-place initialization, DPC separation, and
-    exhaustion. The executive freestanding check remains green. V1 stays live only for bootstrap
-    until the next step maps the KPCR plus all 33 pages, expands the private message token, and moves
-    READY to the v2 control page; delete v1 only with the final live IRQ cutover.
+    exhaustion. The executive freestanding check remains green. At this contract-only checkpoint,
+    V1 remained the bootstrap transport pending the private mappings completed below.
+
+    B3 private arena bootstrap checkpoint (2026-09-02, host and freestanding green; live dispatch
+    open): every hosted interrupt lane now maps a private KPCR at worker offset `0x42000` and the
+    complete v2 arena at `0x43000..0x64000`. Each arena frame keeps one component mapping and one
+    executive alias under the same teardown record; partial construction retains those records, and
+    retirement suspends the TCB and releases its scheduling context, TCB, and CSpace before removing
+    arena/KPCR/trampoline/IPC/stack mappings. GS now selects the lane-private KPCR rather than the
+    driver-wide placeholder.
+
+    The worker marks the v2 control page READY and parks with the exact four-word
+    generation/transaction/sequence/depth-direction tuple. The executive accepts only that canonical
+    tuple and activates the arena after receiving it. Token encoding/decoding lives in the testable
+    runtime contract and rejects reserved bits, invalid direction, and out-of-range depth. The
+    obsolete single-page `HostedIrqFrame`, its exports, direct ISR entry, mailbox ownership, and
+    duplicate in-flight fields are deleted. The v2-only runtime passes 93/93 tests and the executive
+    freestanding check is green. Until live grant, interrupt-lock, lane-local IRQL, and nested service
+    handling are wired, receiving a command is a fatal protocol wall rather than a fabricated result.
+    No QEMU run was made for this fail-closed bootstrap checkpoint.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.

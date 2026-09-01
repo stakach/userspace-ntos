@@ -14,7 +14,37 @@
 
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
-use crate::{HostedIrqLaneIdentity, PAGE_SIZE};
+use crate::PAGE_SIZE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostedIrqLaneIdentity {
+    pub domain_id: u64,
+    pub domain_cookie: u64,
+    pub lane_generation: u64,
+}
+
+impl HostedIrqLaneIdentity {
+    pub const fn new(domain_id: u64, domain_cookie: u64, lane_generation: u64) -> Option<Self> {
+        if domain_id == 0 || domain_cookie == 0 || lane_generation == 0 {
+            None
+        } else {
+            Some(Self {
+                domain_id,
+                domain_cookie,
+                lane_generation,
+            })
+        }
+    }
+
+    pub const fn ready_transport_words(self) -> [u64; 4] {
+        [
+            self.lane_generation,
+            0,
+            0,
+            (HostedIrqLaneDirection::Dispatch as u32 as u64) << 8,
+        ]
+    }
+}
 
 pub const HOSTED_IRQ_ARENA_MAGIC: u64 = 0x4849_5251_4152_454e;
 pub const HOSTED_IRQ_ARENA_VERSION: u16 = 2;
@@ -260,6 +290,34 @@ impl HostedIrqArenaToken {
             && self.transaction != TRANSACTION_PUBLISHING
             && self.sequence != 0
             && (self.depth as usize) < HOSTED_IRQ_ARENA_DEPTH
+    }
+
+    pub const fn transport_words(self) -> [u64; 4] {
+        [
+            self.lane_generation,
+            self.transaction,
+            self.sequence,
+            self.depth as u64 | (self.direction as u32 as u64) << 8,
+        ]
+    }
+
+    pub fn from_transport_words(words: [u64; 4]) -> Option<Self> {
+        if words[3] & !0xffff != 0 {
+            return None;
+        }
+        let direction = match (words[3] >> 8) as u32 {
+            1 => HostedIrqLaneDirection::Dispatch,
+            2 => HostedIrqLaneDirection::Service,
+            _ => return None,
+        };
+        let token = Self {
+            lane_generation: words[0],
+            transaction: words[1],
+            sequence: words[2],
+            depth: words[3] as u8,
+            direction,
+        };
+        token.valid().then_some(token)
     }
 }
 
@@ -2080,6 +2138,36 @@ mod tests {
         assert_eq!(HostedIrqArenaLayout::service_page_index(16), None);
         assert_eq!(HostedIrqArenaLayout::page_offset(32), Some(32 * PAGE_SIZE));
         assert_eq!(HostedIrqArenaLayout::page_offset(33), None);
+    }
+
+    #[test]
+    fn transport_words_roundtrip_exact_token_and_reject_reserved_bits() {
+        assert_eq!(identity().ready_transport_words(), [11, 0, 0, 0x100]);
+        let token = HostedIrqArenaToken {
+            lane_generation: 11,
+            transaction: 13,
+            sequence: 17,
+            depth: 15,
+            direction: HostedIrqLaneDirection::Service,
+        };
+        let words = token.transport_words();
+        assert_eq!(words, [11, 13, 17, 0x20f]);
+        assert_eq!(
+            HostedIrqArenaToken::from_transport_words(words),
+            Some(token)
+        );
+        assert_eq!(
+            HostedIrqArenaToken::from_transport_words([11, 13, 17, 0x1_020f]),
+            None
+        );
+        assert_eq!(
+            HostedIrqArenaToken::from_transport_words([11, 13, 17, 0x30f]),
+            None
+        );
+        assert_eq!(
+            HostedIrqArenaToken::from_transport_words([11, 13, 17, 0x210]),
+            None
+        );
     }
 
     #[test]

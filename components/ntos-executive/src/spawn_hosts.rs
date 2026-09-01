@@ -1825,8 +1825,12 @@ pub(crate) struct PumpResult {
 /// command replies to that exact parked call before receiving its completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostedIrqExchangeAction {
-    ReceiveReady,
-    ReplyCommand { sequence: u64 },
+    ReceiveReady {
+        identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    },
+    ReplyCommand {
+        token: nt_hosted_runtime::HostedIrqArenaToken,
+    },
 }
 
 /// Raw IRQ-lane transport result. Unlike [`PumpResult`], this never reads a component request bank
@@ -1835,7 +1839,10 @@ pub(crate) enum HostedIrqExchangeAction {
 pub(crate) struct HostedIrqExchangeResult {
     pub reply_cap: u64,
     pub completed: bool,
+    pub lane_generation: u64,
+    pub transaction: u64,
     pub sequence: u64,
+    pub depth_direction: u64,
     pub wall_ip: u64,
     pub wall_addr: u64,
     pub wall_label: u64,
@@ -1917,9 +1924,9 @@ unsafe fn hosted_irq_reply_recv(
     ch: &PumpChannel,
     reply_cap: u64,
     reply_len: u64,
-    reply_mr0: u64,
+    reply: [u64; 4],
 ) -> PumpMessage {
-    let mut reply = true;
+    let mut send_reply = true;
     loop {
         let badge: u64;
         let mi: u64;
@@ -1927,18 +1934,21 @@ unsafe fn hosted_irq_reply_recv(
         let m1: u64;
         let m2: u64;
         let m3: u64;
-        if reply {
+        if send_reply {
             let send_mi = reply_len;
-            let send_m0 = reply_mr0;
+            let send_m0 = reply[0];
+            let send_m1 = reply[1];
+            let send_m2 = reply[2];
+            let send_m3 = reply[3];
             core::arch::asm!(
                 "syscall",
                 in("rdx") crate::SYS_NB_SEND_RECV as u64,
                 inout("rdi") ch.fault_ep => badge,
                 inout("rsi") send_mi => mi,
                 inout("r10") send_m0 => m0,
-                inout("r8") 0u64 => m1,
-                inout("r9") 0u64 => m2,
-                inout("r15") 0u64 => m3,
+                inout("r8") send_m1 => m1,
+                inout("r9") send_m2 => m2,
+                inout("r15") send_m3 => m3,
                 in("r12") reply_cap,
                 in("r13") reply_cap,
                 lateout("rax") _, lateout("rcx") _, lateout("r11") _,
@@ -1947,7 +1957,7 @@ unsafe fn hosted_irq_reply_recv(
             if badge == crate::COMPOSITE_SEND_ERROR_BADGE {
                 return PumpMessage::transport_wall();
             }
-            reply = false;
+            send_reply = false;
         } else {
             return hosted_irq_recv(ch, reply_cap);
         }
@@ -1985,14 +1995,14 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     expected_badge: u64,
     completion_label: u64,
 ) -> HostedIrqExchangeResult {
-    let expected_sequence = match action {
-        HostedIrqExchangeAction::ReceiveReady => 0,
-        HostedIrqExchangeAction::ReplyCommand { sequence } => sequence,
+    let expected = match action {
+        HostedIrqExchangeAction::ReceiveReady { identity } => identity.ready_transport_words(),
+        HostedIrqExchangeAction::ReplyCommand { token } => token.transport_words(),
     };
     let mut msg = match action {
-        HostedIrqExchangeAction::ReceiveReady => hosted_irq_recv(ch, ch.reply_cap),
-        HostedIrqExchangeAction::ReplyCommand { sequence } => {
-            hosted_irq_reply_recv(ch, ch.reply_cap, REQUEST_TAG_LEN, sequence)
+        HostedIrqExchangeAction::ReceiveReady { .. } => hosted_irq_recv(ch, ch.reply_cap),
+        HostedIrqExchangeAction::ReplyCommand { .. } => {
+            hosted_irq_reply_recv(ch, ch.reply_cap, 4, expected)
         }
     };
     let mut outcome = PumpLoopOutcome::new();
@@ -2004,7 +2014,10 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             break;
         }
         if label == completion_label {
-            if msg.mi & 0xfff == 1 && length == 1 && msg.m0 == expected_sequence {
+            if msg.mi & 0xfff == 4
+                && length == 4
+                && [msg.m0, msg.m1, msg.m2, msg.m3] == expected
+            {
                 outcome.completed = true;
             } else {
                 outcome.wall(msg);
@@ -2026,12 +2039,12 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
                 break;
             }
             outcome.demand += 1;
-            msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, 0);
+            msg = hosted_irq_reply_recv(ch, ch.reply_cap, 0, [0; 4]);
             continue;
         }
         if label == 3 && ch.caps.io_port_faults {
             if let Some(next_ip) = pump_service_io_port_fault(ch, msg.m0, msg.m3) {
-                msg = hosted_irq_reply_recv(ch, ch.reply_cap, 1, next_ip);
+                msg = hosted_irq_reply_recv(ch, ch.reply_cap, 1, [next_ip, 0, 0, 0]);
                 continue;
             }
         }
@@ -2042,7 +2055,10 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     HostedIrqExchangeResult {
         reply_cap: ch.reply_cap,
         completed: outcome.completed,
-        sequence: if outcome.completed { msg.m0 } else { 0 },
+        lane_generation: if outcome.completed { msg.m0 } else { 0 },
+        transaction: if outcome.completed { msg.m1 } else { 0 },
+        sequence: if outcome.completed { msg.m2 } else { 0 },
+        depth_direction: if outcome.completed { msg.m3 } else { 0 },
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,
