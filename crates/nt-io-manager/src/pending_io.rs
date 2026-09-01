@@ -157,6 +157,14 @@ pub struct PendingFileIoReservation {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingFileIoParkError {
+    StaleReservation,
+    OccupiedReservation,
+    InvalidRecord,
+    DuplicateIrp,
+}
+
 /// Reset-safe, growable table of generic pending File I/O delivery owners.
 #[derive(Clone, Debug)]
 pub struct PendingFileIoTable {
@@ -229,7 +237,7 @@ impl PendingFileIoTable {
         true
     }
 
-    fn pending_is_valid(&self, pending: PendingFileIo) -> bool {
+    fn pending_shape_is_valid(pending: PendingFileIo) -> bool {
         let create_valid = match pending.operation {
             PendingFileIoOperation::Transfer => {
                 !crate::is_create_major(pending.major)
@@ -284,7 +292,6 @@ impl PendingFileIoTable {
                     && pending.output_va == 0
                     && pending.output_len == 0
                     && pending.iosb_va != 0
-                    && !pending.signal_file
                     && !pending.publish_iocp
             }
             PendingFileIoOperation::LocalDirectoryNotify(operation) => {
@@ -293,7 +300,6 @@ impl PendingFileIoTable {
                     && operation.status == nt_status::NtStatus::PENDING.raw() as u32
                     && operation.information == 0
                     && pending.iosb_va != 0
-                    && !pending.signal_file
                     && !pending.publish_iocp
             }
         };
@@ -316,10 +322,12 @@ impl PendingFileIoTable {
             && (pending.output_len == 0 || pending.output_va != 0)
             && (pending.apc_routine == 0 || !pending.publish_iocp)
             && pending.reply_required == (pending.reply_cap != 0)
-            && !self
-                .slots
-                .iter()
-                .any(|slot| slot.is_some_and(|record| record.irp_id == pending.irp_id))
+    }
+
+    fn contains_irp(&self, irp_id: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.is_some_and(|record| record.irp_id == irp_id))
     }
 
     /// Claim one exact owner slot before dispatching an IRP.
@@ -358,21 +366,31 @@ impl PendingFileIoTable {
         &mut self,
         reservation: PendingFileIoReservation,
         pending: PendingFileIo,
-    ) -> Option<usize> {
-        if self.reservations.get(reservation.slot).copied() != Some(reservation.generation)
-            || self.slots.get(reservation.slot)?.is_some()
-            || !self.pending_is_valid(pending)
+    ) -> Result<usize, PendingFileIoParkError> {
+        if self.reservations.get(reservation.slot).copied() != Some(reservation.generation) {
+            return Err(PendingFileIoParkError::StaleReservation);
+        }
+        if self
+            .slots
+            .get(reservation.slot)
+            .is_none_or(|slot| slot.is_some())
         {
-            return None;
+            return Err(PendingFileIoParkError::OccupiedReservation);
+        }
+        if !Self::pending_shape_is_valid(pending) {
+            return Err(PendingFileIoParkError::InvalidRecord);
+        }
+        if self.contains_irp(pending.irp_id) {
+            return Err(PendingFileIoParkError::DuplicateIrp);
         }
         self.slots[reservation.slot] = Some(pending);
         self.reservations[reservation.slot] = 0;
-        Some(reservation.slot)
+        Ok(reservation.slot)
     }
 
     /// Insert one exact pending owner. A canonical IRP may have only one delivery owner.
     pub fn park(&mut self, pending: PendingFileIo) -> Option<usize> {
-        if !self.pending_is_valid(pending) {
+        if !Self::pending_shape_is_valid(pending) || self.contains_irp(pending.irp_id) {
             return None;
         }
         for (index, (slot, reservation)) in self
@@ -1003,6 +1021,33 @@ mod tests {
         let cancelled = table.reserve().unwrap();
         assert!(table.cancel_reservation(cancelled));
         assert!(!table.cancel_reservation(cancelled));
+    }
+
+    #[test]
+    fn reserved_commit_reports_exact_ownership_rejection() {
+        let mut table = PendingFileIoTable::with_initial_reserve(1);
+        let stale = table.reserve().unwrap();
+        assert!(table.cancel_reservation(stale));
+        assert_eq!(
+            table.park_reserved(stale, pending(10, 100, 7)),
+            Err(PendingFileIoParkError::StaleReservation)
+        );
+
+        let live = table.reserve().unwrap();
+        let mut invalid = pending(10, 100, 7);
+        invalid.irp_id = 0;
+        assert_eq!(
+            table.park_reserved(live, invalid),
+            Err(PendingFileIoParkError::InvalidRecord)
+        );
+        assert!(table.cancel_reservation(live));
+
+        table.park(pending(10, 100, 7)).unwrap();
+        let duplicate = table.reserve().unwrap();
+        assert_eq!(
+            table.park_reserved(duplicate, pending(20, 100, 8)),
+            Err(PendingFileIoParkError::DuplicateIrp)
+        );
     }
 
     #[test]
@@ -1721,7 +1766,7 @@ mod tests {
         request.output_va = 0;
         request.output_len = 0;
         request.apc_routine = 0;
-        request.signal_file = false;
+        request.signal_file = true;
         request.publish_iocp = false;
         request.event_obj_idx = u64::MAX;
         let slot = table.park(request).unwrap();
@@ -1740,6 +1785,22 @@ mod tests {
             table.get(slot).unwrap().operation,
             PendingFileIoOperation::LocalByteLock(PendingLocalByteLock { status: 0, .. })
         ));
+        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        table
+            .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_IOSB_PUBLISHED)
+            .unwrap();
+        assert_eq!(
+            table.claim_reply_cap_exact(slot, request.irp_id),
+            Some(Some(request.reply_cap))
+        );
+        table
+            .mark_reply_published_exact(slot, request.irp_id)
+            .unwrap();
+        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        table
+            .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_FILE_PUBLISHED)
+            .unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, request.irp_id));
     }
 
     #[test]
@@ -1757,7 +1818,7 @@ mod tests {
         request.output_len = 64;
         request.apc_routine = 0;
         request.publish_iocp = false;
-        request.signal_file = false;
+        request.signal_file = true;
         request.event_obj_idx = u64::MAX;
         let slot = table.park(request).unwrap();
 
@@ -1778,5 +1839,21 @@ mod tests {
                 ..
             })
         ));
+        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        table
+            .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_IOSB_PUBLISHED)
+            .unwrap();
+        assert_eq!(
+            table.claim_reply_cap_exact(slot, request.irp_id),
+            Some(Some(request.reply_cap))
+        );
+        table
+            .mark_reply_published_exact(slot, request.irp_id)
+            .unwrap();
+        assert!(!table.completion_surfaces_published_exact(slot, request.irp_id));
+        table
+            .mark_delivery_exact(slot, request.irp_id, IO_DELIVERY_FILE_PUBLISHED)
+            .unwrap();
+        assert!(table.completion_surfaces_published_exact(slot, request.irp_id));
     }
 }

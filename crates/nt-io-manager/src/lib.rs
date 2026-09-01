@@ -119,13 +119,13 @@ pub use lock_control::{
 pub use mock_driver::{IoctlBehavior, MockDriverBackend};
 pub use object_port::{MockObjectPort, ObjectManagerPort};
 pub use pending_io::{
-    PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoReservation,
-    PendingFileIoTable, PendingLocalByteLock, PendingLocalDirectoryNotify,
-    PendingSetFileNameOperation, IO_DELIVERY_APC_PUBLISHED, IO_DELIVERY_BACKEND_ACKED,
-    IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED, IO_DELIVERY_EVENT_PUBLISHED,
-    IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED, IO_DELIVERY_HANDLE_PUBLISHED,
-    IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED, IO_DELIVERY_REPLY_CLAIMED,
-    IO_DELIVERY_REPLY_PUBLISHED,
+    PendingFileCreate, PendingFileIo, PendingFileIoOperation, PendingFileIoParkError,
+    PendingFileIoReservation, PendingFileIoTable, PendingLocalByteLock,
+    PendingLocalDirectoryNotify, PendingSetFileNameOperation, IO_DELIVERY_APC_PUBLISHED,
+    IO_DELIVERY_BACKEND_ACKED, IO_DELIVERY_BUFFER_PUBLISHED, IO_DELIVERY_CREATE_COMMITTED,
+    IO_DELIVERY_EVENT_PUBLISHED, IO_DELIVERY_FILE_LOCK_RELEASED, IO_DELIVERY_FILE_PUBLISHED,
+    IO_DELIVERY_HANDLE_PUBLISHED, IO_DELIVERY_IOCP_PUBLISHED, IO_DELIVERY_IOSB_PUBLISHED,
+    IO_DELIVERY_REPLY_CLAIMED, IO_DELIVERY_REPLY_PUBLISHED,
 };
 pub use pending_set_file_name::{
     PendingSetFileName, PendingSetFileNameId, PendingSetFileNamePhase,

@@ -21552,6 +21552,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     still begins at the unchanged `HEAP_BASE + 128`. No diagnostic is suppressed and no image page
     becomes writable.
 
+    B3 isolated-CM runtime acceptance checkpoint (2026-09-01, accepted; later File-owner frontier
+    open): serialized live-device-action boot
+    `.tmp/run-live-device-action-20260901-135617.log` passes the repaired CM boundary. Umpnpmgr
+    claims, delivers, and retires 33 real generation-6 device actions with monotonically distinct
+    incarnation-2 tokens (`8589934593..8589934625`). The former TCB 3 write-protection fault is
+    absent, durable SYSTEM checkpoints continue, and the run reaches Explorer with real nested USER
+    callbacks. This accepts the CM isolation repair independently of the later final gate.
+
+    The run subsequently exposed a separate asynchronous File ownership assertion at
+    `service_sec_image.rs:22988`. Serial then remained unchanged for more than one minute while QEMU
+    consumed one full core in the panic loop, so QEMU was terminated after roughly three minutes of
+    runtime rather than left until the 900-second outer timeout. `PendingFileIoTable::park_reserved`
+    now reports typed stale-reservation, occupied-reservation, malformed-record, and duplicate-IRP
+    failures, and the executive preserves a fatal exact-owner diagnostic rather than falling back to
+    an unreserved insertion.
+
+    File-owner classification checkpoint (2026-09-01, host accepted; runtime rerun pending): the
+    faulting caller resolves to `kernel32!ReadDirectoryChangesW`. The local directory-notify
+    producer correctly requests File-object signaling for an asynchronous operation with no
+    explicit event, while the generic pending-owner shape validator incorrectly rejected
+    `signal_file=true`. Local byte-range lock waits had the same producer/validator mismatch. Both
+    operations now admit that NT completion surface and retain the exact pending record until
+    `IO_DELIVERY_FILE_PUBLISHED`; the existing terminal redrive already signals the local File
+    object. This repairs the contract rather than suppressing the signal or increasing capacity.
+
+    The first diagnostic rerun did not reach that File operation because a later hosted process
+    wave exhausted rust-micro's static radix-12 CNode backing while creating `kbswitch.exe`:
+    `[retype: cnode pool exhausted]`, followed by a failed child-CNode mint. This is a live
+    microkernel object-backing limit, not root CSpace slot pressure and not permission to raise
+    `MAX_CNODES`: the latter embeds another 128 KiB per entry in the BOOTBOOT-visible kernel image
+    and has already reproduced the 16 MiB EFI load failure. Replace the fixed big-CNode-page pool
+    with metadata-bounded, dynamically backed CNodes derived from real Untyped memory, preserving
+    exact revoke/delete accounting and fail-closed capability identity. Then rerun the File-owner
+    proof and the full desktop gate. Boot attempts retain a hard one-hour maximum; focused
+    integration runs default to 900 seconds, and fixed panic loops are terminated immediately.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

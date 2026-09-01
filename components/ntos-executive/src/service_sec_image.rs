@@ -22981,11 +22981,61 @@ unsafe fn pending_file_io_transfer(
     sp: u64,
     flags: u64,
 ) {
+    fn commit_error_code(error: nt_io_manager::PendingFileIoParkError) -> u64 {
+        match error {
+            nt_io_manager::PendingFileIoParkError::StaleReservation => 1,
+            nt_io_manager::PendingFileIoParkError::OccupiedReservation => 2,
+            nt_io_manager::PendingFileIoParkError::InvalidRecord => 3,
+            nt_io_manager::PendingFileIoParkError::DuplicateIrp => 4,
+        }
+    }
+
+    fn commit_or_panic(
+        table: &mut nt_io_manager::PendingFileIoTable,
+        reservation: nt_io_manager::PendingFileIoReservation,
+        pending: nt_io_manager::PendingFileIo,
+        synchronous: bool,
+    ) {
+        if let Err(error) = table.park_reserved(reservation, pending) {
+            print_str(b"[pending-file-owner] commit rejected error/file/irp/major/pi/tid/badge/sync/reply=");
+            print_u64(commit_error_code(error));
+            print_str(b"/");
+            print_u64(pending.file_id);
+            print_str(b"/");
+            print_u64(pending.irp_id);
+            print_str(b"/");
+            print_u64(pending.major as u64);
+            print_str(b"/");
+            print_u64(pending.pi as u64);
+            print_str(b"/");
+            print_u64(pending.tid);
+            print_str(b"/");
+            print_u64(pending.badge);
+            print_str(b"/");
+            print_u64(synchronous as u64);
+            print_str(b"/");
+            print_u64(pending.reply_required as u64);
+            print_str(b" output/iosb/apc/iocp/event=0x");
+            print_hex((pending.output_va >> 32) as u32);
+            print_hex(pending.output_va as u32);
+            print_str(b"/0x");
+            print_hex((pending.iosb_va >> 32) as u32);
+            print_hex(pending.iosb_va as u32);
+            print_str(b"/0x");
+            print_hex((pending.apc_routine >> 32) as u32);
+            print_hex(pending.apc_routine as u32);
+            print_str(b"/");
+            print_u64(pending.publish_iocp as u64);
+            print_str(b"/");
+            print_u64(pending.event_obj_idx);
+            print_str(b"\n");
+            panic!("pre-dispatch pending File reservation rejected its exact IRP");
+        }
+    }
+
     if !wait_for_completion {
         let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-        table
-            .park_reserved(reservation, pending)
-            .expect("pre-dispatch pending File reservation rejected its exact IRP");
+        commit_or_panic(table, reservation, pending, false);
         return;
     }
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -23006,9 +23056,7 @@ unsafe fn pending_file_io_transfer(
         pending.reply_mrs[17] = flags;
     }
     let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
-    table
-        .park_reserved(reservation, pending)
-        .expect("pre-dispatch pending File reservation rejected its synchronous IRP");
+    commit_or_panic(table, reservation, pending, true);
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh, Ordering::Relaxed);
 }
