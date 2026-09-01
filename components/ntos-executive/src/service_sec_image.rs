@@ -3622,6 +3622,7 @@ unsafe fn spawn_requested_hosted_exe(
         return Err(0xC000_000D);
     }
     spec.spawned.store(1, Ordering::Relaxed);
+    PM_PROCESS_SPAWNED_OK.fetch_or(1u64 << pi, Ordering::Relaxed);
 
     print_str(b"[ntos-exec] NtCreateProcessEx: spawned ");
     print_str(spec.image.leaf);
@@ -4426,8 +4427,6 @@ struct CapturedGetClassInfo {
     class_desc: u64,
     wnd_out: u64,
     menu_out: u64,
-    scrollbar: bool,
-    ansi: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -4489,28 +4488,11 @@ fn is_int_resource_value(value: u64) -> bool {
     value != 0 && value <= 0xffff
 }
 
-unsafe fn staged_unicode_string_is_scrollbar(desc: u64) -> bool {
-    let length = core::ptr::read_unaligned(desc as *const u16) as usize;
-    if length != nt_kernel_exec::user_class::SCROLLBAR_CLASS_NAME.len() * 2 {
-        return false;
-    }
-    let buffer = core::ptr::read_unaligned((desc + 8) as *const u64);
-    if buffer == 0 {
-        return false;
-    }
-    let mut units = [0u16; nt_kernel_exec::user_class::SCROLLBAR_CLASS_NAME.len()];
-    for (index, unit) in units.iter_mut().enumerate() {
-        *unit = core::ptr::read_unaligned((buffer + index as u64 * 2) as *const u16);
-    }
-    nt_kernel_exec::user_class::is_scrollbar_class_name(&units)
-}
-
 unsafe fn capture_get_class_info_graph(
     pi: u64,
     class_name: u64,
     wnd_class: u64,
     menu_name_ptr: u64,
-    ansi: bool,
     filled_pages: &[u64],
     nfilled: usize,
     scratch_base: u64,
@@ -4540,54 +4522,41 @@ unsafe fn capture_get_class_info_graph(
     }
 
     let mut wnd = [0u8; WNDCLASSEXW_SIZE];
-    // NtUserGetClassInfo probes lpWndClassEx for write before copying it into a temporary
-    // WNDCLASSEXW, but ReactOS does not depend on the caller's initial contents. Treat this as an
-    // output graph at the isolation boundary; otherwise an unfaulted-but-valid caller output page
-    // prevents us from rebasing the class-name graph and win32k sees a foreign client pointer.
-    let _ = img_spawn::client_copyin_mapped(
+    // ReactOS preserves caller-owned fields such as cbSize and lpszClassName while populating the
+    // remaining WNDCLASSEXW result. The isolation boundary must therefore capture the complete seed
+    // and fail closed if any byte is inaccessible.
+    if !img_spawn::client_copyin_mapped(
         pi,
         wnd_class,
         &mut wnd,
         filled_pages,
         nfilled,
         scratch_base,
-    );
+    ) {
+        return None;
+    }
     let wnd_out = out_base;
     let menu_out = out_base + WNDCLASSEXW_SIZE as u64;
     core::ptr::copy_nonoverlapping(wnd.as_ptr(), wnd_out as *mut u8, wnd.len());
     core::ptr::write_unaligned(menu_out as *mut u64, 0);
-    let scrollbar = staged_unicode_string_is_scrollbar(class_base);
     Some(CapturedGetClassInfo {
         wnd_client: wnd_class,
         menu_client: menu_name_ptr,
         class_desc: class_base,
         wnd_out,
         menu_out,
-        scrollbar,
-        ansi,
     })
 }
 
 unsafe fn copy_back_get_class_info(
-    nt_handler: &mut ExecNtHandler,
     pi: usize,
     capture: CapturedGetClassInfo,
-    atom: u64,
     filled_pages: &[u64],
     nfilled: usize,
     scratch_base: u64,
 ) -> bool {
     use nt_kernel_exec::user_class::WNDCLASSEXW_SIZE;
 
-    let wnd_bytes = core::slice::from_raw_parts(capture.wnd_out as *const u8, WNDCLASSEXW_SIZE);
-    let wnd_ok = img_spawn::client_write_mapped(
-        pi as u64,
-        capture.wnd_client,
-        wnd_bytes,
-        filled_pages,
-        nfilled,
-        scratch_base,
-    );
     let menu_value = core::ptr::read_unaligned(capture.menu_out as *const u64);
     let menu_ok = capture.menu_client == 0
         || img_spawn::client_write_mapped(
@@ -4598,37 +4567,16 @@ unsafe fn copy_back_get_class_info(
             nfilled,
             scratch_base,
         );
-    let copyout_ok = wnd_ok && menu_ok;
-    if nt_handler.hosted_process_role(pi)
-        == Some(nt_exe_image::HostedProcessRole::InteractiveShellBootstrap)
-        && capture.scrollbar
-    {
-        let style = core::ptr::read_unaligned((capture.wnd_out + 0x04) as *const u32);
-        let proc = core::ptr::read_unaligned((capture.wnd_out + 0x08) as *const u64);
-        let cb_wnd_extra = core::ptr::read_unaligned((capture.wnd_out + 0x14) as *const u32);
-        let hcursor = core::ptr::read_unaligned((capture.wnd_out + 0x28) as *const u64);
-        nt_handler.record_userinit_scrollbar_classinfo(
-            atom as u16,
-            style,
-            cb_wnd_extra,
-            proc != 0,
-            copyout_ok,
-        );
-        print_str(b"[win32k-class] userinit ScrollBar capture=1 atom=0x");
-        print_hex(atom as u32);
-        print_str(b" copyout=");
-        print_u64(copyout_ok as u64);
-        print_str(b" style=0x");
-        print_hex(style);
-        print_str(b" cbWndExtra=0x");
-        print_hex(cb_wnd_extra);
-        print_str(b" proc=");
-        print_u64((proc != 0) as u64);
-        print_str(b" hcursor=0x");
-        print_hex_u64(hcursor);
-        print_str(b"\n");
-    }
-    copyout_ok
+    let wnd_bytes = core::slice::from_raw_parts(capture.wnd_out as *const u8, WNDCLASSEXW_SIZE);
+    menu_ok
+        && img_spawn::client_write_mapped(
+            pi as u64,
+            capture.wnd_client,
+            wnd_bytes,
+            filled_pages,
+            nfilled,
+            scratch_base,
+        )
 }
 
 unsafe fn capture_get_class_name_out(
@@ -10782,6 +10730,7 @@ pub(crate) unsafe fn service_sec_image(
                 let mut defer_window_pos_stack_arg_count = 0usize;
                 let mut defer_window_pos_probe_failed = false;
                 let mut get_atom_name_probe_failed = false;
+                let mut get_class_info_probe_failed = false;
                 let mut def_set_text_probe_failed = false;
                 let mut find_cursor_icon_probe_failed = false;
                 let mut set_cursor_icon_data_probe_failed = false;
@@ -13289,7 +13238,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else {
                     None
                 };
-                let get_class_info_ansi = if m0 == 0x10bd {
+                let get_class_info_stack_ok = if m0 == 0x10bd {
                     client_read_u64_mapped(
                         pi as u64,
                         sp + 0x28,
@@ -13297,30 +13246,31 @@ pub(crate) unsafe fn service_sec_image(
                         faults as usize,
                         scratch_base,
                     )
-                    .is_some_and(|value| value != 0)
+                    .is_some()
                 } else {
-                    false
+                    true
                 };
                 let get_class_info_capture = if m0 == 0x10bd {
-                    let capture = capture_get_class_info_graph(
-                        pi as u64,
-                        a1,
-                        a2,
-                        a3,
-                        get_class_info_ansi,
-                        filled_pages,
-                        faults as usize,
-                        scratch_base,
-                    );
+                    let capture = get_class_info_stack_ok
+                        .then(|| {
+                            capture_get_class_info_graph(
+                                pi as u64,
+                                a1,
+                                a2,
+                                a3,
+                                filled_pages,
+                                faults as usize,
+                                scratch_base,
+                            )
+                        })
+                        .flatten();
                     if let Some(capture) = capture {
                         d_a1 = capture.class_desc;
                         d_a2 = capture.wnd_out;
                         d_a3 = if a3 == 0 { 0 } else { capture.menu_out };
-                        if userinit_gui_client && capture.scrollbar {
-                            nt_handler.record_userinit_scrollbar_query();
-                        }
                         Some(capture)
                     } else {
+                        get_class_info_probe_failed = true;
                         None
                     }
                 } else {
@@ -13867,6 +13817,22 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex(a0 as u32);
                         print_str(b" desc=0x");
                         print_hex_u64(a1);
+                        print_str(b" -> 0\n");
+                    }
+                    (0, true)
+                } else if get_class_info_probe_failed {
+                    let failures = WIN32K_MSG_COPY_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    if failures < 8 {
+                        print_str(b"[win32k-svc] NtUserGetClassInfo capture failed pi=");
+                        print_u64(pi as u64);
+                        print_str(b" class=0x");
+                        print_hex_u64(a1);
+                        print_str(b" wndclass=0x");
+                        print_hex_u64(a2);
+                        print_str(b" menu=0x");
+                        print_hex_u64(a3);
+                        print_str(b" sp=0x");
+                        print_hex_u64(sp);
                         print_str(b" -> 0\n");
                     }
                     (0, true)
@@ -14724,19 +14690,14 @@ pub(crate) unsafe fn service_sec_image(
                     if let Some(capture) = get_class_info_capture {
                         if st != 0 {
                             if !copy_back_get_class_info(
-                                &mut *nt_handler,
                                 pi,
                                 capture,
-                                st as u32 as u64,
                                 filled_pages,
                                 faults as usize,
                                 scratch_base,
                             ) {
                                 st = 0;
                             }
-                        } else if userinit_gui_client && capture.scrollbar {
-                            nt_handler.record_userinit_scrollbar_error();
-                            print_str(b"[win32k-class] userinit ScrollBar capture=1 atom=0x00000000 copyout=0 style=0x00000000 cbWndExtra=0x00000000 proc=0\n");
                         }
                     }
                     if let Some(capture) = get_class_name_capture {
@@ -16666,8 +16627,6 @@ pub(crate) unsafe fn service_sec_image(
             const A_STATE: u64 = STACK_BASE + 0xA0;
             // Handler-owned temporary slots let the specs exercise pid -> pi routing without
             // publishing throwaway processes as hosted launch topology.
-            const DBGK_TEST_PI: usize = MAX_PI - 1;
-            const DBGK_TEST_PI2: usize = MAX_PI - 2;
 
             let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -16783,9 +16742,8 @@ pub(crate) unsafe fn service_sec_image(
                     let target = nt_handler.pm.create_process("dbgk-syscall.exe", None, None);
                     nt_handler.pm.set_image_base(target, 0x0000_0001_5000_0000);
                     let main = nt_handler.pm.create_thread(target, 0x2100, 0, false).ok();
-                    let target_registered = nt_handler
-                        .register_temporary_process_slot(DBGK_TEST_PI, target, 0)
-                        .is_ok();
+                    let target_claim = nt_handler.claim_temporary_process_slot(target, 0).ok();
+                    let target_registered = target_claim.is_some();
                     let h_target = nt_handler
                         .pm
                         .insert_handle(
@@ -16999,9 +16957,8 @@ pub(crate) unsafe fn service_sec_image(
                         .create_process("dbgk-syscall-b.exe", None, None);
                     nt_handler.pm.set_image_base(target2, 0x0000_0001_6000_0000);
                     let _ = nt_handler.pm.create_thread(target2, 0x2200, 0, false);
-                    let target2_registered = nt_handler
-                        .register_temporary_process_slot(DBGK_TEST_PI2, target2, 0)
-                        .is_ok();
+                    let target2_claim = nt_handler.claim_temporary_process_slot(target2, 0).ok();
+                    let target2_registered = target2_claim.is_some();
                     let h_target2 = nt_handler
                         .pm
                         .insert_handle(
@@ -17059,8 +17016,12 @@ pub(crate) unsafe fn service_sec_image(
                         sc_ok |= 0x0400;
                     }
 
-                    nt_handler.clear_temporary_process_slot(DBGK_TEST_PI);
-                    nt_handler.clear_temporary_process_slot(DBGK_TEST_PI2);
+                    if let Some(claim) = target_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
+                    if let Some(claim) = target2_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
                     for handle in [
                         h_target,
                         h_target2,
@@ -17114,10 +17075,8 @@ pub(crate) unsafe fn service_sec_image(
             const A_CLIENT_ID: u64 = STACK_BASE + 0x188;
             const A_TIMEOUT: u64 = STACK_BASE + 0x198;
             const A_STATE: u64 = STACK_BASE + 0x1A0;
-            // Temporary slots for the throwaway debuggees (cleared again below). Slots 0..=4 are
-            // the live hosted set and remain untouched.
-            const EXC_TEST_PI: usize = MAX_PI - 1;
-            const EXC_TEST_PI2: usize = MAX_PI - 2;
+            // Temporary slots for the throwaway debuggees are claimed from identities with no live
+            // process/thread mechanism, VSpace, worker reservation, or registered client frames.
 
             let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -17188,16 +17147,20 @@ pub(crate) unsafe fn service_sec_image(
                     // A second thread so terminating one (the lifecycle poster below) does not
                     // signal the process and tear its handles down.
                     let worker = nt_handler.pm.create_thread(target, 0x3200, 0, false).ok();
-                    let target_registered = nt_handler
-                        .register_temporary_process_slot(EXC_TEST_PI, target, 0)
-                        .is_ok();
+                    let target_claim = nt_handler.claim_temporary_process_slot(target, 0).ok();
+                    let exc_test_pi = target_claim
+                        .map(TemporaryProcessSlotClaim::pi)
+                        .unwrap_or(MAX_PI);
+                    let target_registered = target_claim.is_some();
                     // A NEVER-attached process in the OTHER free slot: the live-boot shape, the
                     // control for the no-debugger gate.
                     let plain = nt_handler.pm.create_process("dbgk-plain.exe", None, None);
                     let _ = nt_handler.pm.create_thread(plain, 0x3300, 0, false);
-                    let plain_registered = nt_handler
-                        .register_temporary_process_slot(EXC_TEST_PI2, plain, 0)
-                        .is_ok();
+                    let plain_claim = nt_handler.claim_temporary_process_slot(plain, 0).ok();
+                    let exc_test_pi2 = plain_claim
+                        .map(TemporaryProcessSlotClaim::pi)
+                        .unwrap_or(MAX_PI);
+                    let plain_registered = plain_claim.is_some();
                     let h_target = nt_handler
                         .pm
                         .insert_handle(
@@ -17280,7 +17243,7 @@ pub(crate) unsafe fn service_sec_image(
                     const EXC_ADDR: u64 = 0x18;
                     let forwarded_before = DBGK_EXCEPTIONS_FORWARDED.load(Ordering::Relaxed);
                     let forwarded = nt_handler.dbgk_forward_exception(
-                        EXC_TEST_PI,
+                        exc_test_pi,
                         main.unwrap_or(0) as u64,
                         dbgk::ExceptionRecord::access_violation(EXC_IP, 1, EXC_ADDR),
                         true,
@@ -17360,7 +17323,7 @@ pub(crate) unsafe fn service_sec_image(
                     // the one `KiDispatchException` reports.
                     const BP_IP: u64 = 0x0000_0001_7000_1005;
                     if nt_handler.dbgk_forward_exception(
-                        EXC_TEST_PI,
+                        exc_test_pi,
                         main.unwrap_or(0) as u64,
                         dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, BP_IP),
                         true,
@@ -17395,7 +17358,7 @@ pub(crate) unsafe fn service_sec_image(
                         .unwrap_or(0);
                     if plain_registered
                         && !nt_handler.dbgk_forward_exception(
-                            EXC_TEST_PI2,
+                            exc_test_pi2,
                             0,
                             dbgk::ExceptionRecord::access_violation(0x1000, 0, 0x40),
                             true,
@@ -17430,7 +17393,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.wait_park_event = -1;
                     const FAULT_IP: u64 = 0x0000_0001_7000_9999;
                     let woke = nt_handler.dbgk_forward_exception(
-                        EXC_TEST_PI,
+                        exc_test_pi,
                         main.unwrap_or(0) as u64,
                         dbgk::ExceptionRecord::access_violation(FAULT_IP, 0, 0x88),
                         false,
@@ -17498,8 +17461,12 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.wait_park_event = -1;
                     nt_handler.wait_timeout = PendingWaitTimeout::none();
 
-                    nt_handler.clear_temporary_process_slot(EXC_TEST_PI);
-                    nt_handler.clear_temporary_process_slot(EXC_TEST_PI2);
+                    if let Some(claim) = target_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
+                    if let Some(claim) = plain_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
                     for handle in [h_target, h_worker] {
                         if handle != 0 {
                             let _ = nt_handler
@@ -17548,9 +17515,8 @@ pub(crate) unsafe fn service_sec_image(
             const A_CLIENT_ID: u64 = STACK_BASE + 0x288;
             const A_TIMEOUT: u64 = STACK_BASE + 0x298;
             const A_STATE: u64 = STACK_BASE + 0x2A0;
-            // Temporary slots are cleared again below; slots 0..=4 are the live hosted set.
-            const MOD_TEST_PI: usize = MAX_PI - 1;
-            const MOD_TEST_PI2: usize = MAX_PI - 2;
+            // Temporary identities are claimed dynamically so admitted hosted images cannot collide
+            // with this integration-only debug plane.
             // The debuggee's own image base + the IMAGE views this test maps into it.
             const TARGET_IMAGE_BASE: u64 = 0x0000_0001_8000_0000;
             const DLL_BASE: u64 = 0x0000_0000_7100_0000;
@@ -17630,9 +17596,11 @@ pub(crate) unsafe fn service_sec_image(
                     let target = nt_handler.pm.create_process("dbgk-module.exe", None, None);
                     nt_handler.pm.set_image_base(target, TARGET_IMAGE_BASE);
                     let main = nt_handler.pm.create_thread(target, 0x4100, 0, false).ok();
-                    let target_registered = nt_handler
-                        .register_temporary_process_slot(MOD_TEST_PI, target, 0)
-                        .is_ok();
+                    let target_claim = nt_handler.claim_temporary_process_slot(target, 0).ok();
+                    let mod_test_pi = target_claim
+                        .map(TemporaryProcessSlotClaim::pi)
+                        .unwrap_or(MAX_PI);
+                    let target_registered = target_claim.is_some();
                     // The NEVER-attached control — the live-boot shape, and later the subject of the
                     // attach-time fake-module proof.
                     let plain = nt_handler
@@ -17640,9 +17608,11 @@ pub(crate) unsafe fn service_sec_image(
                         .create_process("dbgk-modplain.exe", None, None);
                     nt_handler.pm.set_image_base(plain, PLAIN_IMAGE_BASE);
                     let plain_main = nt_handler.pm.create_thread(plain, 0x4200, 0, false).ok();
-                    let plain_registered = nt_handler
-                        .register_temporary_process_slot(MOD_TEST_PI2, plain, 0)
-                        .is_ok();
+                    let plain_claim = nt_handler.claim_temporary_process_slot(plain, 0).ok();
+                    let mod_test_pi2 = plain_claim
+                        .map(TemporaryProcessSlotClaim::pi)
+                        .unwrap_or(MAX_PI);
+                    let plain_registered = plain_claim.is_some();
                     let h_target = nt_handler
                         .pm
                         .insert_handle(
@@ -17708,7 +17678,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid = main.unwrap_or(0) as u64;
                     let loads_before = DBGK_MODULE_LOADS.load(Ordering::Relaxed);
                     let loaded = nt_handler.dbgk_module_load(
-                        MOD_TEST_PI,
+                        mod_test_pi,
                         DLL_BASE,
                         debuggee_file,
                         DBG_INFO,
@@ -17775,7 +17745,7 @@ pub(crate) unsafe fn service_sec_image(
                     // --- THE UNLOAD: the exact entry the live NtUnmapViewOfSection arm calls -----
                     nt_handler.current_tid = main.unwrap_or(0) as u64;
                     let unloads_before = DBGK_MODULE_UNLOADS.load(Ordering::Relaxed);
-                    let unloaded = nt_handler.dbgk_module_unload(MOD_TEST_PI, DLL_BASE);
+                    let unloaded = nt_handler.dbgk_module_unload(mod_test_pi, DLL_BASE);
                     nt_handler.current_tid = debugger_tid as u64;
                     // 0x0008 — DbgKmUnloadDllApi posted, retrieved as DbgUnloadDllStateChange with
                     // the right base, and the view is no longer tracked.
@@ -17804,8 +17774,8 @@ pub(crate) unsafe fn service_sec_image(
                     // re-unmapping the view already unmapped above.
                     let quiet_unloads = DBGK_MODULE_UNLOADS.load(Ordering::Relaxed);
                     nt_handler.current_tid = main.unwrap_or(0) as u64;
-                    let image_only = !nt_handler.dbgk_module_unload(MOD_TEST_PI, NOT_AN_IMAGE_BASE)
-                        && !nt_handler.dbgk_module_unload(MOD_TEST_PI, DLL_BASE);
+                    let image_only = !nt_handler.dbgk_module_unload(mod_test_pi, NOT_AN_IMAGE_BASE)
+                        && !nt_handler.dbgk_module_unload(mod_test_pi, DLL_BASE);
                     nt_handler.current_tid = debugger_tid as u64;
                     if image_only
                         && DBGK_MODULE_UNLOADS.load(Ordering::Relaxed) == quiet_unloads
@@ -17833,13 +17803,13 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid = plain_main.unwrap_or(0) as u64;
                     let gated = plain_registered
                         && !nt_handler.dbgk_module_load(
-                            MOD_TEST_PI2,
+                            mod_test_pi2,
                             PLAIN_PROBE_BASE,
                             0,
                             DBG_INFO,
                             NAME_POINTER,
                         )
-                        && !nt_handler.dbgk_module_unload(MOD_TEST_PI2, PLAIN_PROBE_BASE);
+                        && !nt_handler.dbgk_module_unload(mod_test_pi2, PLAIN_PROBE_BASE);
                     nt_handler.current_tid = debugger_tid as u64;
                     if gated
                         && !nt_handler.pm.is_process_being_debugged(plain)
@@ -17864,7 +17834,7 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.current_tid = plain_main.unwrap_or(0) as u64;
                     let premapped_loads = DBGK_MODULE_LOADS.load(Ordering::Relaxed);
                     for base in [PLAIN_DLL_A, PLAIN_DLL_B, PLAIN_IMAGE_BASE] {
-                        nt_handler.dbgk_module_load(MOD_TEST_PI2, base, 0, DBG_INFO, NAME_POINTER);
+                        nt_handler.dbgk_module_load(mod_test_pi2, base, 0, DBG_INFO, NAME_POINTER);
                     }
                     nt_handler.current_tid = debugger_tid as u64;
                     let premapped = DBGK_MODULE_LOADS.load(Ordering::Relaxed) == premapped_loads
@@ -17941,8 +17911,12 @@ pub(crate) unsafe fn service_sec_image(
                         md_ok |= 0x0080;
                     }
 
-                    nt_handler.clear_temporary_process_slot(MOD_TEST_PI);
-                    nt_handler.clear_temporary_process_slot(MOD_TEST_PI2);
+                    if let Some(claim) = target_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
+                    if let Some(claim) = plain_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
                     for handle in [h_target, h_plain] {
                         if handle != 0 {
                             let _ = nt_handler
@@ -18006,7 +17980,6 @@ pub(crate) unsafe fn service_sec_image(
             const CONTEXT_AMD64_CONTROL: u32 = 0x0010_0000 | 0x0000_0001;
             const CONTEXT_AMD64_DEBUG_REGISTERS: u32 = 0x0010_0000 | 0x0000_0010;
             const EFLAGS_TF: u32 = 0x0000_0100;
-            const BLK_TEST_PI: usize = MAX_PI - 1;
             const BLK_TEST_RUNTIME_BADGE: u64 = 0xDB6B_0001;
             // Executive scratch VAs inside the SAME proven-resident 2 MiB page table the ALPC
             // cross-VSpace self-test uses (see its comment): base + 3000*0x1000, PT index 5.
@@ -18122,9 +18095,11 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.pm.set_image_base(target, 0x0000_0001_9000_0000);
                     let main = nt_handler.pm.create_thread(target, 0x5100, 0, false).ok();
                     let _keepalive = nt_handler.pm.create_thread(target, 0x5200, 0, false).ok();
-                    let target_registered = nt_handler
-                        .register_temporary_process_slot(BLK_TEST_PI, target, 0)
-                        .is_ok();
+                    let target_claim = nt_handler.claim_temporary_process_slot(target, 0).ok();
+                    let blk_test_pi = target_claim
+                        .map(TemporaryProcessSlotClaim::pi)
+                        .unwrap_or(MAX_PI);
+                    let target_registered = target_claim.is_some();
                     let main_tid = main.unwrap_or(0);
                     let h_target = nt_handler
                         .pm
@@ -18152,7 +18127,7 @@ pub(crate) unsafe fn service_sec_image(
                     );
                     let client_runtime_registered = main_tid != 0
                         && nt_handler.register_hosted_thread_tcb(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             client_tcb,
                             BLK_TEST_RUNTIME_BADGE,
@@ -18269,13 +18244,13 @@ pub(crate) unsafe fn service_sec_image(
                         // client has NOT progressed (marker still 1) while the debugger holds it.
                         let blocked_before = DBGK_REPORTERS_BLOCKED.load(Ordering::Relaxed);
                         let forwarded = nt_handler.dbgk_forward_exception(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             dbgk::ExceptionRecord::access_violation(f1_m0, 1, f1_m1),
                             true,
                         );
                         let parked = nt_handler.dbgk_block_reporter(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             0,
                             dbgk::DBGK_BLOCK_VM_FAULT,
@@ -18420,14 +18395,14 @@ pub(crate) unsafe fn service_sec_image(
                                 && marker_t() == 2;
                             let forwarded_hw = hw_fault
                                 && nt_handler.dbgk_forward_exception(
-                                    BLK_TEST_PI,
+                                    blk_test_pi,
                                     main_tid as u64,
                                     dbgk::ExceptionRecord::new(dbgk::STATUS_SINGLE_STEP, f2hw_m0),
                                     true,
                                 );
                             let blocked_hw = forwarded_hw
                                 && nt_handler.dbgk_block_reporter(
-                                    BLK_TEST_PI,
+                                    blk_test_pi,
                                     main_tid as u64,
                                     0,
                                     dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
@@ -18549,13 +18524,13 @@ pub(crate) unsafe fn service_sec_image(
                         // prove no progress, then let the debugger edit the real target context
                         // before continuing it.
                         let forwarded2 = nt_handler.dbgk_forward_exception(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, f2_m0),
                             true,
                         );
                         let blocked2 = nt_handler.dbgk_block_reporter(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             0,
                             dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
@@ -18656,14 +18631,14 @@ pub(crate) unsafe fn service_sec_image(
                             && marker_t() == 2;
                         let forwarded_step = step_fault
                             && nt_handler.dbgk_forward_exception(
-                                BLK_TEST_PI,
+                                blk_test_pi,
                                 main_tid as u64,
                                 dbgk::ExceptionRecord::new(dbgk::STATUS_SINGLE_STEP, f2s_m0),
                                 true,
                             );
                         let blocked_step = forwarded_step
                             && nt_handler.dbgk_block_reporter(
-                                BLK_TEST_PI,
+                                blk_test_pi,
                                 main_tid as u64,
                                 0,
                                 dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
@@ -18787,7 +18762,7 @@ pub(crate) unsafe fn service_sec_image(
                         // on.
                         nt_handler.current_tid = main_tid as u64;
                         let module_posted = nt_handler.dbgk_module_load(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             0x0000_0001_9100_0000,
                             0,
                             (0, 0),
@@ -18796,7 +18771,7 @@ pub(crate) unsafe fn service_sec_image(
                         nt_handler.current_tid = debugger_tid as u64;
                         nt_handler.dbgk_block_request = false;
                         let blocked3 = nt_handler.dbgk_block_reporter(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             0,
                             dbgk::DBGK_BLOCK_SYSCALL,
@@ -18853,13 +18828,13 @@ pub(crate) unsafe fn service_sec_image(
                         // instruction after the `ud2` never executed. (Before this batch the status
                         // was recorded, not enforced.)
                         let forwarded4 = nt_handler.dbgk_forward_exception(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             dbgk::ExceptionRecord::new(0xC000_001D, f4_m0),
                             true,
                         );
                         let blocked4 = nt_handler.dbgk_block_reporter(
-                            BLK_TEST_PI,
+                            blk_test_pi,
                             main_tid as u64,
                             0,
                             dbgk::DBGK_BLOCK_USER_EXCEPTION,
@@ -19024,7 +18999,7 @@ pub(crate) unsafe fn service_sec_image(
                     // A queue-side post through the very entry the fault path uses SETS the
                     // object's EventsPresent dispatcher event and wakes the parked client.
                     let _ = nt_handler.dbgk_forward_exception(
-                        BLK_TEST_PI,
+                        blk_test_pi,
                         main_tid as u64,
                         dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, 0x9999),
                         true,
@@ -19045,7 +19020,7 @@ pub(crate) unsafe fn service_sec_image(
                     // event): every blocked target is RELEASED, so nothing can stay parked forever.
                     let released_before = DBGK_REPORTERS_RELEASED.load(Ordering::Relaxed);
                     let stranded = nt_handler.dbgk_block_reporter(
-                        BLK_TEST_PI,
+                        blk_test_pi,
                         main_tid as u64,
                         0,
                         dbgk::DBGK_BLOCK_VM_FAULT,
@@ -19092,7 +19067,9 @@ pub(crate) unsafe fn service_sec_image(
                     let _ = cnode_delete_recycle_r(dbg_tcb);
                     let _ = cnode_delete_recycle_r(client_pml4);
                     let _ = cnode_delete_recycle_r(dbg_pml4);
-                    nt_handler.clear_temporary_process_slot(BLK_TEST_PI);
+                    if let Some(claim) = target_claim {
+                        let _ = nt_handler.release_temporary_process_slot(claim);
+                    }
                 }
             }
 
@@ -19150,7 +19127,6 @@ pub(crate) unsafe fn service_sec_image(
             const PROCESS_CREATE_THREAD: u32 = 0x0002;
             const THREAD_ALL_ACCESS: u64 = 0x001F_03FF;
             const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-            const BRK_TEST_PI: usize = MAX_PI - 3;
             // Argument scratch in smss's CLIENT memory (its stack mirror), clear of the block
             // self-test's window and of the live stack (which grows DOWN from the top).
             const A_HANDLE: u64 = STACK_BASE + 0x300;
@@ -19252,6 +19228,14 @@ pub(crate) unsafe fn service_sec_image(
             map_image_skeleton(target_pml4, 1);
             map_hosted_client_env_pt(target_pml4);
             map_tp_worker_target_lane_pts(target_pml4);
+            let target = nt_handler.pm.create_process("dbgk-breakin.exe", None, None);
+            nt_handler.pm.set_image_base(target, 0x0000_0001_A000_0000);
+            let brk_test_claim = nt_handler
+                .claim_temporary_process_slot(target, target_pml4)
+                .ok();
+            let test_pi = brk_test_claim
+                .map(TemporaryProcessSlotClaim::pi)
+                .unwrap_or(MAX_PI);
             // The target's PEB page: mapped in ITS VSpace first, then windowed into the executive
             // (a frame capability carries its own mapping — map the original before any copy), and
             // registered with that window as its permanent alias, exactly as `spawn_sec_image`
@@ -19262,9 +19246,9 @@ pub(crate) unsafe fn service_sec_image(
             let peb_alias = push_slot!(copy_cap(peb_frame));
             let peb_win_ok =
                 peb_mapped && page_map_r(peb_alias, peb_win, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
-            if peb_win_ok {
-                csrss_frame_put_at(BRK_TEST_PI as u64, SMSS_PEB_VA, peb_frame, peb_win);
-            }
+            let peb_registered = peb_win_ok
+                && brk_test_claim.is_some()
+                && csrss_frame_put_at(test_pi as u64, SMSS_PEB_VA, peb_frame, peb_win);
             // The marker page (target-only) + the executive's window on the same frame.
             let mark_frame = make!(OBJ_X86_4K_PAGE, PAGING_BITS);
             let mark_mapped = page_map_r(
@@ -19316,8 +19300,6 @@ pub(crate) unsafe fn service_sec_image(
             let reply_b = make!(OBJ_REPLY, 0);
 
             // ── The throwaway TARGET process object ────────────────────────────────────────
-            let target = nt_handler.pm.create_process("dbgk-breakin.exe", None, None);
-            nt_handler.pm.set_image_base(target, 0x0000_0001_A000_0000);
             let target_main = nt_handler
                 .pm
                 .create_thread(target, selftests::DBGK_BREAKIN_CODE_VA, 0, false)
@@ -19325,15 +19307,16 @@ pub(crate) unsafe fn service_sec_image(
             // The target's pre-created spare ETHREAD pool — the same reset-safe pool every hosted
             // process gets at boot, and what a runtime thread create draws from.
             let pool_tid = nt_handler.pm.create_dormant_thread(target).unwrap_or(0);
-            let target_registered = nt_handler
-                .register_temporary_process_slot(BRK_TEST_PI, target, target_pml4)
-                .is_ok();
-            let pool_registered = nt_handler
-                .register_temporary_pool_thread_slot(BRK_TEST_PI, 0, pool_tid)
-                .is_ok();
+            let target_registered = brk_test_claim.is_some();
+            let pool_registered = target_registered
+                && nt_handler
+                    .register_temporary_pool_thread_slot(test_pi, 0, pool_tid)
+                    .is_ok();
             // This process HAS its initial thread, so a foreign-handle create is a genuine
             // ADDITIONAL thread — the real cross-VSpace path (exactly the live rule).
-            PM_INITIAL_THREAD_DONE.fetch_or(1u64 << BRK_TEST_PI, Ordering::Relaxed);
+            if target_registered {
+                PM_INITIAL_THREAD_DONE.fetch_or(1u64 << test_pi, Ordering::Relaxed);
+            }
 
             let h_target = nt_handler
                 .pm
@@ -19358,7 +19341,7 @@ pub(crate) unsafe fn service_sec_image(
             let args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
                 && img_spawn::smss_copyout(A_CONTEXT, &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE])
                 && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
-            let setup_ok = peb_win_ok
+            let setup_ok = peb_registered
                 && mark_win_ok
                 && code_mapped
                 && target_main != 0
@@ -19537,10 +19520,10 @@ pub(crate) unsafe fn service_sec_image(
                         spawned_tcb = spawned.tcb();
                         if spawned_tcb != 0 {
                             let registered = nt_handler.register_hosted_thread_spawn(
-                                BRK_TEST_PI,
+                                test_pi,
                                 request.cid_thread,
                                 spawned,
-                                tp_worker_badge(BRK_TEST_PI, request.slot),
+                                tp_worker_badge(test_pi, request.slot),
                                 HostedThreadRole::TpWorker { slot: request.slot },
                             );
                             if registered {
@@ -19579,7 +19562,7 @@ pub(crate) unsafe fn service_sec_image(
                         && breakin_tid != 0
                         && breakin_tid != target_main as u64
                         && request.is_some_and(|r| {
-                            r.target_pi == BRK_TEST_PI
+                            r.target_pi == test_pi
                                 && r.pml4 == target_pml4
                                 && r.start.rip == selftests::DBGK_BREAKIN_CODE_VA
                                 && r.start.rcx == selftests::DBGK_BREAKIN_PARAM
@@ -19653,14 +19636,14 @@ pub(crate) unsafe fn service_sec_image(
                             let is_breakpoint = (f1_mi >> 12) == 4 && marker(0x10) == 1;
                             let forwarded = is_breakpoint
                                 && nt_handler.dbgk_forward_exception(
-                                    BRK_TEST_PI,
+                                    test_pi,
                                     breakin_tid,
                                     dbgk::ExceptionRecord::new(dbgk::STATUS_BREAKPOINT, f1_m0),
                                     true,
                                 );
                             let parked = forwarded
                                 && nt_handler.dbgk_block_reporter(
-                                    BRK_TEST_PI,
+                                    test_pi,
                                     breakin_tid,
                                     0,
                                     dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
@@ -19767,7 +19750,7 @@ pub(crate) unsafe fn service_sec_image(
                     // replies, endpoints, or throwaway frames.
                     let brk_tcb = nt_handler
                         .hosted_thread_tcb_for_role(
-                            BRK_TEST_PI,
+                            test_pi,
                             HostedThreadRole::TpWorker {
                                 slot: breakin_runtime_slot,
                             },
@@ -19810,9 +19793,12 @@ pub(crate) unsafe fn service_sec_image(
                     release_hosted_thread_mechanism_cnodes(runtime);
                 }
             }
-            nt_handler.clear_temporary_pool_thread_slot(BRK_TEST_PI, 0);
-            nt_handler.clear_temporary_process_slot(BRK_TEST_PI);
-            PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << BRK_TEST_PI), Ordering::Relaxed);
+            if let Some(claim) = brk_test_claim {
+                let _ = csrss_frame_take(test_pi as u64, SMSS_PEB_VA);
+                nt_handler.clear_temporary_pool_thread_slot(test_pi, 0);
+                let _ = nt_handler.release_temporary_process_slot(claim);
+                PM_INITIAL_THREAD_DONE.fetch_and(!(1u64 << test_pi), Ordering::Relaxed);
+            }
             nt_handler.remote_thread_request = None;
 
             ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);

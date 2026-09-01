@@ -41,13 +41,6 @@ struct Win32kSessionRuntimeState {
     class_atom_names_observed: u64,
     class_atom_name_serves: u64,
     class_atom_name_failures: u64,
-    userinit_scrollbar_queries: u64,
-    userinit_scrollbar_copyouts: u64,
-    userinit_scrollbar_errors: u64,
-    userinit_scrollbar_atom: u64,
-    userinit_scrollbar_style: u64,
-    userinit_scrollbar_extra: u64,
-    userinit_scrollbar_proc: u64,
 }
 
 impl Win32kSessionRuntimeState {
@@ -71,13 +64,6 @@ impl Win32kSessionRuntimeState {
             class_atom_names_observed: 0,
             class_atom_name_serves: 0,
             class_atom_name_failures: 0,
-            userinit_scrollbar_queries: 0,
-            userinit_scrollbar_copyouts: 0,
-            userinit_scrollbar_errors: 0,
-            userinit_scrollbar_atom: 0,
-            userinit_scrollbar_style: 0,
-            userinit_scrollbar_extra: 0,
-            userinit_scrollbar_proc: 0,
         }
     }
 
@@ -101,13 +87,6 @@ impl Win32kSessionRuntimeState {
         self.class_atom_names_observed = 0;
         self.class_atom_name_serves = 0;
         self.class_atom_name_failures = 0;
-        self.userinit_scrollbar_queries = 0;
-        self.userinit_scrollbar_copyouts = 0;
-        self.userinit_scrollbar_errors = 0;
-        self.userinit_scrollbar_atom = 0;
-        self.userinit_scrollbar_style = 0;
-        self.userinit_scrollbar_extra = 0;
-        self.userinit_scrollbar_proc = 0;
     }
 
     fn observe_stock_object(&mut self, object_id: u32, handle: u32) -> bool {
@@ -281,33 +260,6 @@ impl Win32kSessionRuntimeState {
             self.class_atom_name_failures = self.class_atom_name_failures.saturating_add(1);
         }
     }
-
-    fn record_userinit_scrollbar_query(&mut self) {
-        self.userinit_scrollbar_queries = self.userinit_scrollbar_queries.saturating_add(1);
-    }
-
-    fn record_userinit_scrollbar_classinfo(
-        &mut self,
-        atom: u16,
-        style: u32,
-        cb_wnd_extra: u32,
-        has_proc: bool,
-        copyout_ok: bool,
-    ) {
-        self.userinit_scrollbar_atom = atom as u64;
-        self.userinit_scrollbar_style = style as u64;
-        self.userinit_scrollbar_extra = cb_wnd_extra as u64;
-        self.userinit_scrollbar_proc = has_proc as u64;
-        if copyout_ok {
-            self.userinit_scrollbar_copyouts = self.userinit_scrollbar_copyouts.saturating_add(1);
-        } else {
-            self.userinit_scrollbar_errors = self.userinit_scrollbar_errors.saturating_add(1);
-        }
-    }
-
-    fn record_userinit_scrollbar_error(&mut self) {
-        self.userinit_scrollbar_errors = self.userinit_scrollbar_errors.saturating_add(1);
-    }
 }
 
 static mut WIN32K_SESSION_RUNTIME_WORK: Option<Win32kSessionRuntimeState> = None;
@@ -340,17 +292,10 @@ pub(crate) struct Win32kSessionCursorClassCounters {
     pub(crate) userinit_dialog_class_atom: u64,
 }
 
-pub(crate) struct Win32kSessionAtomScrollbarCounters {
+pub(crate) struct Win32kSessionAtomNameCounters {
     pub(crate) class_atom_names_observed: u64,
     pub(crate) class_atom_name_serves: u64,
     pub(crate) class_atom_name_failures: u64,
-    pub(crate) userinit_scrollbar_queries: u64,
-    pub(crate) userinit_scrollbar_copyouts: u64,
-    pub(crate) userinit_scrollbar_errors: u64,
-    pub(crate) userinit_scrollbar_atom: u64,
-    pub(crate) userinit_scrollbar_style: u64,
-    pub(crate) userinit_scrollbar_extra: u64,
-    pub(crate) userinit_scrollbar_proc: u64,
 }
 
 impl Win32kSessionRuntime {
@@ -439,36 +384,6 @@ impl Win32kSessionRuntime {
         // SAFETY: this wrapper is the sole mutable owner while its handler is live.
         unsafe { (&mut *self.state).record_class_atom_name_serve(success) };
     }
-
-    pub(crate) fn record_userinit_scrollbar_query(&mut self) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe { (&mut *self.state).record_userinit_scrollbar_query() };
-    }
-
-    pub(crate) fn record_userinit_scrollbar_classinfo(
-        &mut self,
-        atom: u16,
-        style: u32,
-        cb_wnd_extra: u32,
-        has_proc: bool,
-        copyout_ok: bool,
-    ) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe {
-            (&mut *self.state).record_userinit_scrollbar_classinfo(
-                atom,
-                style,
-                cb_wnd_extra,
-                has_proc,
-                copyout_ok,
-            )
-        };
-    }
-
-    pub(crate) fn record_userinit_scrollbar_error(&mut self) {
-        // SAFETY: this wrapper is the sole mutable owner while its handler is live.
-        unsafe { (&mut *self.state).record_userinit_scrollbar_error() };
-    }
 }
 
 pub(crate) fn win32k_session_stock_counters() -> u64 {
@@ -510,34 +425,20 @@ pub(crate) fn win32k_session_cursor_class_counters() -> Win32kSessionCursorClass
     }
 }
 
-pub(crate) fn win32k_session_atom_scrollbar_counters() -> Win32kSessionAtomScrollbarCounters {
+pub(crate) fn win32k_session_atom_name_counters() -> Win32kSessionAtomNameCounters {
     // SAFETY: post-loop gates run after `service_sec_image` quiesces; there is no concurrent writer.
     unsafe {
         let Some(state) = win32k_session_runtime_ref() else {
-            return Win32kSessionAtomScrollbarCounters {
+            return Win32kSessionAtomNameCounters {
                 class_atom_names_observed: 0,
                 class_atom_name_serves: 0,
                 class_atom_name_failures: 0,
-                userinit_scrollbar_queries: 0,
-                userinit_scrollbar_copyouts: 0,
-                userinit_scrollbar_errors: 0,
-                userinit_scrollbar_atom: 0,
-                userinit_scrollbar_style: 0,
-                userinit_scrollbar_extra: 0,
-                userinit_scrollbar_proc: 0,
             };
         };
-        Win32kSessionAtomScrollbarCounters {
+        Win32kSessionAtomNameCounters {
             class_atom_names_observed: state.class_atom_names_observed,
             class_atom_name_serves: state.class_atom_name_serves,
             class_atom_name_failures: state.class_atom_name_failures,
-            userinit_scrollbar_queries: state.userinit_scrollbar_queries,
-            userinit_scrollbar_copyouts: state.userinit_scrollbar_copyouts,
-            userinit_scrollbar_errors: state.userinit_scrollbar_errors,
-            userinit_scrollbar_atom: state.userinit_scrollbar_atom,
-            userinit_scrollbar_style: state.userinit_scrollbar_style,
-            userinit_scrollbar_extra: state.userinit_scrollbar_extra,
-            userinit_scrollbar_proc: state.userinit_scrollbar_proc,
         }
     }
 }

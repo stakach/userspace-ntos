@@ -180,6 +180,10 @@ impl ClientFrameRegistry {
             .map(|record| record.page)
     }
 
+    pub fn is_process_empty(&self, pi: u64) -> bool {
+        self.first_page_for_process(pi).is_none()
+    }
+
     pub fn next_page_after(&self, pi: u64, page: u64) -> Option<u64> {
         self.records
             .iter()
@@ -286,5 +290,18 @@ mod tests {
         assert_eq!(registry.get(3, 0x2000).unwrap().frame, 0x44);
         assert_eq!(registry.next_page_after(2, 0x1000), Some(0x3000));
         assert_eq!(registry.first_page_for_process(3), Some(0x2000));
+    }
+
+    #[test]
+    fn process_empty_tracks_insert_and_take() {
+        let mut registry = ClientFrameRegistry::new();
+        assert!(registry.is_process_empty(7));
+        insert(&mut registry, 7, 0x1000, 11);
+        insert(&mut registry, 8, 0x1000, 12);
+        assert!(!registry.is_process_empty(7));
+        assert!(!registry.is_process_empty(8));
+        assert!(registry.take(7, 0x1000).is_some());
+        assert!(registry.is_process_empty(7));
+        assert!(!registry.is_process_empty(8));
     }
 }

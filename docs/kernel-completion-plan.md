@@ -21665,6 +21665,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     deletion with live waiters and complete seL4 Retype error-detail precedence; neither is licensed
     as a fallback or a reason to weaken the desktop gate.
 
+    Full-desktop rerun and lifecycle review (2026-09-01, host accepted; clean runtime rerun
+    pending): `.tmp/run-headless-20260901-154716.log` reached genuine userinit/Explorer launch,
+    redirected user callbacks, client-installed Explorer WndProc, real shell COM activation, and a
+    fully non-background 1,024x768 framebuffer. The one-hour wrapper remained an absolute ceiling;
+    the desktop proof completed in minutes and QEMU exited at the sentinel. No 20-hour boot or QEMU
+    process was retained.
+
+    The run exposed four debug gates and `exec_vm_pool_headroom` failing together with one client
+    frame conflict. This was identity/lifecycle corruption rather than resource pressure: Untyped,
+    root CSpace, VAD, commit, and executive heap headroom were all healthy. The post-loop Dbgk lanes
+    had hard-coded `MAX_PI-N` identities, and the hosted-thread stack publisher discarded frame
+    registration failures. Temporary Dbgk processes now receive exact `{pi,pid}` claims selected
+    only from identities with no live process/thread mechanism, VSpace, worker reservation,
+    runtime, or registered client frame; the historical hosted-image catalog is not treated as a
+    live PI allocator. All five Dbgk lanes release the exact claim, and the remote-breakin lane
+    checks and retires its PEB frame record before capability recycling.
+
+    Hosted-thread creation now preflights every stack and TEB registry key, checks every stack/TEB,
+    ACS, IPC, and trampoline mapping and publication, and unwinds the complete resource set on the
+    first failure. A rejected client-frame insertion logs the exact process/page plus existing and
+    incoming frame/ownership identities. The registry has a host-tested process-quiescence query;
+    `nt-memory-manager` passes 32/32 tests, `nt-kernel-exec` passes 184/184, and the optimized
+    executive build is green.
+
+    The short-lived userinit gate now uses a monotonic lifecycle bit set only after real process
+    allocation, VSpace publication, and image-table spawn commit. It no longer requires the live
+    Process Manager identity after userinit exits normally. The same desktop rerun proved the new
+    historical signal green.
+
+    Review adjustment: remove `exec_userinit_scrollbar_classinfo` as a boot requirement. ReactOS
+    userinit does not request that class; the observed call is an optional comctl32 v6 theming query
+    after Explorer notification, so zero calls are compatible with a genuine desktop. No query is
+    injected and zero is not reported as synthetic success. The userinit/ScrollBar-only telemetry
+    is deleted, while generic class and atom state remains. `NtUserGetClassInfo` capture now requires
+    the complete caller WNDCLASSEX seed and fifth stack argument, fails closed instead of forwarding
+    foreign pointers, and copies the menu result before WNDCLASSEX to match provider order. Add a
+    dedicated real-provider integration client for named/MAKEINTATOM and ANSI/Unicode class-info
+    behavior as a deterministic compatibility proof; do not put that optional workload back into
+    the desktop gate. The immediate next action is one serialized `./run.sh --desktop` acceptance
+    under the 3,600-second hard limit, followed by exact selftest Process Manager object teardown if
+    the runtime confirms the frame-conflict and Dbgk gates are green.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial

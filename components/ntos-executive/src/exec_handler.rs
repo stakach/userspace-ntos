@@ -2995,6 +2995,7 @@ fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
     PM_PROC_COUNT.store(0, Ordering::Relaxed);
     PM_OBJECT_COUNT.store(0, Ordering::Relaxed);
     PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
+    PM_PROCESS_SPAWNED_OK.store(0, Ordering::Relaxed);
     PM_IDENTITY_OK.store(0, Ordering::Relaxed);
     PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
     reset_hosted_gate_metadata();
@@ -9119,31 +9120,6 @@ impl ExecNtHandler {
         self.win32k_session.record_class_atom_name_serve(success);
     }
 
-    pub(crate) fn record_userinit_scrollbar_query(&mut self) {
-        self.win32k_session.record_userinit_scrollbar_query();
-    }
-
-    pub(crate) fn record_userinit_scrollbar_classinfo(
-        &mut self,
-        atom: u16,
-        style: u32,
-        cb_wnd_extra: u32,
-        has_proc: bool,
-        copyout_ok: bool,
-    ) {
-        self.win32k_session.record_userinit_scrollbar_classinfo(
-            atom,
-            style,
-            cb_wnd_extra,
-            has_proc,
-            copyout_ok,
-        );
-    }
-
-    pub(crate) fn record_userinit_scrollbar_error(&mut self) {
-        self.win32k_session.record_userinit_scrollbar_error();
-    }
-
     pub(crate) fn publish_hosted_process_vspace(
         &mut self,
         pi: usize,
@@ -9214,7 +9190,7 @@ impl ExecNtHandler {
             .position(|stored| *stored == pid)
     }
 
-    pub(crate) fn register_temporary_process_slot(
+    fn register_temporary_process_slot(
         &mut self,
         pi: usize,
         pid: nt_process::ProcessId,
@@ -9241,7 +9217,38 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    pub(crate) fn clear_temporary_process_slot(&mut self, pi: usize) {
+    pub(crate) fn claim_temporary_process_slot(
+        &mut self,
+        pid: nt_process::ProcessId,
+        pml4: u64,
+    ) -> Result<TemporaryProcessSlotClaim, u32> {
+        if pid == 0 || self.pm.process(pid).is_none() {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let runtime_table = unsafe { &*self.thread_runtime.table };
+        let pi = (0..MAX_PI)
+            .rev()
+            .find(|&pi| {
+                self.process_mechanisms.pid_for_pi(pi).is_none()
+                    && self.temporary_process_slots[pi] == 0
+                    && self.process_vspaces[pi] == 0
+                    && client_frame_registry_process_is_empty(pi as u64)
+                    && self.thread_mechanisms.main_tid_for_pi(pi).is_none()
+                    && (0..PM_RUNTIME_THREAD_SLOTS)
+                        .all(|slot| self.thread_mechanisms.pool_tid_for_slot(pi, slot).is_none())
+                    && self.pool_used[pi] == 0
+                    && self.tp_worker_window_used[pi] == 0
+                    && !runtime_table
+                        .entries
+                        .iter()
+                        .any(|runtime| runtime.is_live() && runtime.pi == pi)
+            })
+            .ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        self.register_temporary_process_slot(pi, pid, pml4)?;
+        Ok(TemporaryProcessSlotClaim { pi, pid })
+    }
+
+    fn clear_temporary_process_slot(&mut self, pi: usize) {
         if pi >= MAX_PI || self.process_mechanisms.pid_for_pi(pi).is_some() {
             return;
         }
@@ -9249,6 +9256,17 @@ impl ExecNtHandler {
         self.process_vspaces[pi] = 0;
         unsafe { process_committed_mapping_reset(pi) };
         self.clear_hosted_tp_worker_windows(pi);
+    }
+
+    pub(crate) fn release_temporary_process_slot(
+        &mut self,
+        claim: TemporaryProcessSlotClaim,
+    ) -> bool {
+        if claim.pi >= MAX_PI || self.temporary_process_slots[claim.pi] != claim.pid {
+            return false;
+        }
+        self.clear_temporary_process_slot(claim.pi);
+        self.temporary_process_slots[claim.pi] == 0
     }
 
     pub(crate) fn register_temporary_pool_thread_slot(

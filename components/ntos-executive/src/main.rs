@@ -4768,9 +4768,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let creates = USERINIT_CREATE_PROCESS_REQUESTS.load(Ordering::Relaxed);
     let process_linked_now =
         userinit_bit != 0 && (PM_EXEC_LINK_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let identity_published =
+    let identity_published_now =
         userinit_bit != 0 && (PM_IDENTITY_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
-    let spawned = USERINIT_SPAWNED.load(Ordering::Relaxed);
+    let spawned_signal = USERINIT_SPAWNED.load(Ordering::Relaxed);
+    let spawned_ever =
+        userinit_bit != 0 && (PM_PROCESS_SPAWNED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let vspace_published =
         userinit_bit != 0 && (PM_VSPACE_PUBLISHED_OK.load(Ordering::Relaxed) & userinit_bit) != 0;
     let main_thread_published = userinit_pi
@@ -4782,7 +4784,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     let wallpaper_spi_captures = USERINIT_WALLPAPER_SPI_CAPTURES.load(Ordering::Relaxed);
     let gdi_mapped = USERINIT_GDI_MAPPED.load(Ordering::Relaxed);
     let cursor_class = win32k_session_cursor_class_counters();
-    let atom_scrollbar = win32k_session_atom_scrollbar_counters();
+    let atom_names = win32k_session_atom_name_counters();
     let stock_observed = win32k_session_stock_counters();
     let (font_seeds, font_successes, font_failures) = win32k_subsystem::client_system_font_proofs();
     print_str(b"[userinit-image] opens=");
@@ -4797,10 +4799,12 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_u64(userinit_pi.unwrap_or(MAX_PI) as u64);
     print_str(b" eprocess-linked-now=");
     print_u64(process_linked_now as u64);
-    print_str(b" identity-published=");
-    print_u64(identity_published as u64);
-    print_str(b" spawned=");
-    print_u64(spawned);
+    print_str(b" identity-published-now=");
+    print_u64(identity_published_now as u64);
+    print_str(b" spawned-signal/ever=");
+    print_u64(spawned_signal);
+    print_str(b"/");
+    print_u64(spawned_ever as u64);
     print_str(b" vspace-published=");
     print_u64(vspace_published as u64);
     print_str(b" main-thread-runtime-ok=");
@@ -4836,25 +4840,11 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
     print_str(b" dialog-atom=0x");
     print_hex(cursor_class.userinit_dialog_class_atom as u32);
     print_str(b" class-atom-names=");
-    print_u64(atom_scrollbar.class_atom_names_observed);
+    print_u64(atom_names.class_atom_names_observed);
     print_str(b" atom-name-session-serves/failures=");
-    print_u64(atom_scrollbar.class_atom_name_serves);
+    print_u64(atom_names.class_atom_name_serves);
     print_str(b"/");
-    print_u64(atom_scrollbar.class_atom_name_failures);
-    print_str(b" scrollbar-classinfo=");
-    print_u64(atom_scrollbar.userinit_scrollbar_queries);
-    print_str(b"/");
-    print_u64(atom_scrollbar.userinit_scrollbar_copyouts);
-    print_str(b"/");
-    print_u64(atom_scrollbar.userinit_scrollbar_errors);
-    print_str(b" atom=0x");
-    print_hex(atom_scrollbar.userinit_scrollbar_atom as u32);
-    print_str(b" style=0x");
-    print_hex(atom_scrollbar.userinit_scrollbar_style as u32);
-    print_str(b" extra=0x");
-    print_hex(atom_scrollbar.userinit_scrollbar_extra as u32);
-    print_str(b" proc=");
-    print_u64(atom_scrollbar.userinit_scrollbar_proc);
+    print_u64(atom_names.class_atom_name_failures);
     print_str(b" system-font seeds/successes/failures=0x");
     print_hex(font_seeds as u32);
     print_str(b"/0x");
@@ -4868,8 +4858,7 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && sectioned >= 1
             && queried >= 1
             && creates >= 1
-            && identity_published
-            && spawned == 1
+            && spawned_ever
             && vspace_published
             && main_thread_published
             && token_assigned >= 1,
@@ -4915,15 +4904,6 @@ fn userinit_image_pipeline_spec(passed: &mut u64) {
             && cursor_class.userinit_dialog_class_atom == 0x8002,
         passed,
     );
-    check(
-        b"exec_userinit_scrollbar_classinfo",
-        atom_scrollbar.userinit_scrollbar_queries >= 1
-            && atom_scrollbar.userinit_scrollbar_copyouts >= 1
-            && atom_scrollbar.userinit_scrollbar_errors == 0
-            && atom_scrollbar.userinit_scrollbar_atom != 0
-            && atom_scrollbar.userinit_scrollbar_proc != 0,
-        passed,
-    );
     explorer_image_pipeline_spec(passed);
 }
 
@@ -4951,7 +4931,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     let register_window_message_captures =
         EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed);
     let win32k_pool_exhaustions = WIN32K_POOL_EXHAUSTIONS.load(Ordering::Relaxed);
-    let atom_scrollbar = win32k_session_atom_scrollbar_counters();
+    let atom_names = win32k_session_atom_name_counters();
     let shell_com_provisioned = EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.load(Ordering::Relaxed);
     let shell_com_opened = EXPLORER_SHELL_COM_CLASS_OPEN_MASK.load(Ordering::Relaxed);
     let shell_com_inproc_default = EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK.load(Ordering::Relaxed);
@@ -4996,11 +4976,11 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_str(b" win32k-pool-exhaustions=");
     print_u64(win32k_pool_exhaustions);
     print_str(b" class-atom-names=");
-    print_u64(atom_scrollbar.class_atom_names_observed);
+    print_u64(atom_names.class_atom_names_observed);
     print_str(b" atom-name-session-serves/failures=");
-    print_u64(atom_scrollbar.class_atom_name_serves);
+    print_u64(atom_names.class_atom_name_serves);
     print_str(b"/");
-    print_u64(atom_scrollbar.class_atom_name_failures);
+    print_u64(atom_names.class_atom_name_failures);
     print_str(b" api0-redirects=");
     print_u64(api0_redirects);
     print_str(b" callback-failures=");
@@ -8625,9 +8605,12 @@ unsafe fn client_frame_registry_reserve_initial() -> bool {
 fn client_frame_registry_stats() -> ClientFrameRegistryStats {
     unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).stats() }
 }
+fn client_frame_registry_process_is_empty(pi: u64) -> bool {
+    unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
+}
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
-unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) {
-    let _ = csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, 0);
+unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) -> bool {
+    csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, 0)
 }
 pub(crate) unsafe fn csrss_frame_put_with_source(
     pi: u64,
@@ -8674,7 +8657,8 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
-    match (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY)).insert_at_age(
+    let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
+    match registry.insert_at_age(
         pi,
         page,
         fr,
@@ -8686,7 +8670,23 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     ) {
         Ok(ClientFrameInsert::Inserted { .. }) => true,
         Ok(ClientFrameInsert::Updated) => true,
-        Err(_) => false,
+        Err(_) => {
+            let existing = registry.get(pi, page);
+            print_str(b"[client-frame] rejected registration pi=");
+            print_u64(pi);
+            print_str(b" page=0x");
+            print_hex_u64(page);
+            print_str(b" existing/incoming=0x");
+            print_hex_u64(existing.map(|record| record.frame).unwrap_or(0));
+            print_str(b"/0x");
+            print_hex_u64(fr);
+            print_str(b" owns=");
+            print_u64(existing.map(|record| record.owns_frame).unwrap_or(false) as u64);
+            print_str(b"/");
+            print_u64(owns_frame as u64);
+            print_str(b"\n");
+            false
+        }
     }
 }
 unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> {
@@ -23623,6 +23623,18 @@ struct CmSystemKeyTarget {
     physical_path: alloc::string::String,
 }
 
+#[derive(Clone, Copy)]
+struct TemporaryProcessSlotClaim {
+    pi: usize,
+    pid: nt_process::ProcessId,
+}
+
+impl TemporaryProcessSlotClaim {
+    fn pi(self) -> usize {
+        self.pi
+    }
+}
+
 struct ExecNtHandler {
     /// The REAL ReactOS **SECURITY** hive (root = `\Registry\Machine\SECURITY`) — the LSA policy
     /// database's backing store, read BY PATH off `\reactos\system32\config\security`. The staged
@@ -26664,10 +26676,46 @@ unsafe fn ensure_hosted_thread_exec_alias_paging(t: &HostedThread, scr: u64) -> 
     ok
 }
 
+fn hosted_thread_client_frame_keys_available(t: &HostedThread) -> bool {
+    if t.client_pi == 0 {
+        return true;
+    }
+    let mut page = t.stack_base;
+    for _ in 0..t.stack_frames {
+        if unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(t.client_pi, page) }
+            .is_some()
+        {
+            print_str(b"[thread-life] stale stack frame blocks spawn pi=");
+            print_u64(t.client_pi);
+            print_str(b" page=0x");
+            print_hex_u64(page);
+            print_str(b"\n");
+            return false;
+        }
+        page += 0x1000;
+    }
+    for page in [t.teb_va, t.teb_va + 0x1000] {
+        if unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(t.client_pi, page) }
+            .is_some()
+        {
+            print_str(b"[thread-life] stale TEB frame blocks spawn pi=");
+            print_u64(t.client_pi);
+            print_str(b" page=0x");
+            print_hex_u64(page);
+            print_str(b"\n");
+            return false;
+        }
+    }
+    true
+}
+
 unsafe fn spawn_hosted_thread(
     handler: &mut ExecNtHandler,
     t: &HostedThread,
 ) -> HostedThreadSpawnResult {
+    if !hosted_thread_client_frame_keys_available(t) {
+        return HostedThreadSpawnResult::failed();
+    }
     let prepared = match handler.prepare_hosted_thread_commitment(
         t.client_pi as usize,
         t.stack_base,
@@ -26705,11 +26753,12 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
         let f = alloc_frame();
         let page = t.stack_base + i * 0x1000;
         let target_cap = copy_cap(f);
-        page_map(target_cap, page, RW_NX, t.pml4);
+        let target_map = page_map(target_cap, page, RW_NX, t.pml4);
         let mut mirror_cap = 0;
+        let mut mirror_map = 0;
         if t.stack_mirror_va != 0 {
             mirror_cap = copy_cap(f);
-            page_map(
+            mirror_map = page_map(
                 mirror_cap,
                 t.stack_mirror_va + i * 0x1000,
                 RW_NX,
@@ -26720,8 +26769,21 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
         resources.stack_owner[index] = f;
         resources.stack_target[index] = target_cap;
         resources.stack_mirror[index] = mirror_cap;
-        if t.client_pi != 0 {
-            csrss_frame_put(t.client_pi, page, f);
+        let registered = t.client_pi == 0 || csrss_frame_put(t.client_pi, page, f);
+        if target_map != 0 || mirror_map != 0 || !registered {
+            print_str(b"[thread-life] stack publication failed pi=");
+            print_u64(t.client_pi);
+            print_str(b" page=0x");
+            print_hex_u64(page);
+            print_str(b" map=");
+            print_u64(target_map);
+            print_str(b"/");
+            print_u64(mirror_map);
+            print_str(b" registered=");
+            print_u64(registered as u64);
+            print_str(b"\n");
+            release_hosted_thread_resources(resources);
+            return HostedThreadSpawnResult::failed();
         }
     }
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
@@ -26750,6 +26812,22 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
     resources.teb_owner = teb;
     resources.teb_target = teb_client;
     resources.teb_scratch = teb_scratch;
+    if teb_target_map != 0 || teb_scratch_map != 0 || teb_live_map != 0 {
+        if teb_live_alias != 0 && teb_live_map == 0 {
+            recycle_mapped_cap(teb_live_mirror);
+        } else {
+            recycle_plain_cap(teb_live_mirror);
+        }
+        print_str(b"[thread-life] TEB map failure target/scratch/live=");
+        print_u64(teb_target_map);
+        print_str(b"/");
+        print_u64(teb_scratch_map);
+        print_str(b"/");
+        print_u64(teb_live_map);
+        print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
+    }
     if t.client_pi != 0 {
         let source_cap =
             csrss_frame_create_source_copy(teb_client, t.client_pi, t.teb_va, b"thread-teb");
@@ -26785,6 +26863,8 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
             print_hex((t.teb_va >> 32) as u32);
             print_hex(t.teb_va as u32);
             print_str(b"\n");
+            release_hosted_thread_resources(resources);
+            return HostedThreadSpawnResult::failed();
         }
     } else {
         recycle_plain_cap(teb_live_mirror);
@@ -26843,6 +26923,22 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
     resources.teb2_owner = teb2;
     resources.teb2_target = teb2_client;
     resources.teb2_scratch = teb2_scratch;
+    if teb2_target_map != 0 || teb2_scratch_map != 0 || teb2_live_map != 0 {
+        if teb2_live_alias != 0 && teb2_live_map == 0 {
+            recycle_mapped_cap(teb2_live_mirror);
+        } else {
+            recycle_plain_cap(teb2_live_mirror);
+        }
+        print_str(b"[thread-life] TEB tail map failure target/scratch/live=");
+        print_u64(teb2_target_map);
+        print_str(b"/");
+        print_u64(teb2_scratch_map);
+        print_str(b"/");
+        print_u64(teb2_live_map);
+        print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
+    }
     if t.client_pi != 0 {
         let source_cap = csrss_frame_create_source_copy(
             teb2_client,
@@ -26892,6 +26988,8 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
             print_hex((page >> 32) as u32);
             print_hex(page as u32);
             print_str(b"\n");
+            release_hosted_thread_resources(resources);
+            return HostedThreadSpawnResult::failed();
         }
         // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
         let tail_page = t.teb_va + 0x1000;
@@ -26929,31 +27027,12 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
         print_str(b"/");
         print_u64(acs_target_map);
         print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
     }
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
     core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
     seed_teb_tail_canary(scr + 0x1000);
-    if teb_target_map != 0
-        || teb_scratch_map != 0
-        || teb_live_map != 0
-        || teb2_target_map != 0
-        || teb2_scratch_map != 0
-        || teb2_live_map != 0
-    {
-        print_str(b"[thread-life] TEB map failure target/scratch/live=");
-        print_u64(teb_target_map);
-        print_str(b"/");
-        print_u64(teb_scratch_map);
-        print_str(b"/");
-        print_u64(teb_live_map);
-        print_str(b" second=");
-        print_u64(teb2_target_map);
-        print_str(b"/");
-        print_u64(teb2_scratch_map);
-        print_str(b"/");
-        print_u64(teb2_live_map);
-        print_str(b"\n");
-    }
     // Every hosted thread gets a distinct IPC frame. Native ntdll derives `ipcbuf_va` from the
     // active TEB; trap threads use the same binding directly through the kernel fault transport.
     let ipcbuf = alloc_frame();
@@ -26963,17 +27042,40 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
         page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4)
     };
     resources.ipc_target = ipcbuf;
+    if e_ipc_target_map != 0 {
+        print_str(b"[thread-life] IPC buffer map failure status=");
+        print_u64(e_ipc_target_map);
+        print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
+    }
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let (tramp, e_tramp_frame) = if t.diag {
         alloc_frame_r()
     } else {
         (alloc_frame(), 0)
     };
+    if e_tramp_frame != 0 {
+        recycle_deleted_root_slot(tramp);
+        print_str(b"[thread-life] trampoline allocation failure status=");
+        print_u64(e_tramp_frame);
+        print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
+    }
     let e_tramp_exec_map = if t.diag {
         page_map_r(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE)
     } else {
         page_map(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE)
     };
+    resources.tramp_owner = tramp;
+    if e_tramp_exec_map != 0 {
+        print_str(b"[thread-life] trampoline executive map failure status=");
+        print_u64(e_tramp_exec_map);
+        print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
+    }
     if let Some(loader) = t.loader_context {
         const CONTEXT_OFFSET: u64 = 0x1900;
         let context_scratch = scr + CONTEXT_OFFSET;
@@ -27020,8 +27122,14 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
     } else {
         page_map(tramp_tgt_cap, t.tramp_va, /* RX */ 2, t.pml4)
     };
-    resources.tramp_owner = tramp;
     resources.tramp_target = tramp_tgt_cap;
+    if e_tramp_tgt_map != 0 {
+        print_str(b"[thread-life] trampoline target map failure status=");
+        print_u64(e_tramp_tgt_map);
+        print_str(b"\n");
+        release_hosted_thread_resources(resources);
+        return HostedThreadSpawnResult::failed();
+    }
     if t.diag {
         // Read the FIRST 8 bytes back through what we WROTE (executive alias) AND through a FRESH,
         // independent alias of the SAME `tramp` frame mapped at a throwaway VA — if these disagree, the
@@ -27348,6 +27456,10 @@ static PM_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Hosted EPROCESS allocations performed by real `NtCreateProcess[Ex]` calls after the SMSS
 /// bootstrap trio.
 static PM_DYNAMIC_PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+/// Bit i is set once dynamically hosted process pi=i has completed real process allocation, VSpace
+/// publication, and image-table spawn publication. Unlike the live ProcessManager masks, this
+/// lifecycle proof is retained after a short-lived bootstrap process exits normally.
+static PM_PROCESS_SPAWNED_OK: AtomicU64 = AtomicU64::new(0);
 /// Bit i set iff EPROCESS pi=i exists AND its image_file_name matches the expected hosted binary AND
 /// its pid is distinct — proves the real objects (not just pid scalars) back each hosted process.
 static PM_IDENTITY_OK: AtomicU64 = AtomicU64::new(0);
