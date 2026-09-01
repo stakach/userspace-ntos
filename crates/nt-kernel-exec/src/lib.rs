@@ -18,6 +18,7 @@ mod dispatcher_wait;
 mod dpc;
 mod driver_thread;
 mod event;
+mod event_object;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod interrupt;
@@ -57,6 +58,11 @@ pub use driver_thread::{
     HOSTED_DRIVER_THREAD_HANDLE_BASE,
 };
 pub use event::{map_event_access, EventKind, EventStore, WaitManyResult, WaitResult};
+pub use event_object::{
+    EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
+    EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, RetiredEventObject,
+    SignalQueueResult,
+};
 pub use interrupt::{InterruptTable, ReadyIsr, SYNTHETIC_DIRQL};
 pub use irql::{IrqlState, APC_LEVEL, DISPATCH_LEVEL, PASSIVE_LEVEL};
 pub use lookaside::{

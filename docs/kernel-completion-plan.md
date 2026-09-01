@@ -22126,6 +22126,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     removed as that typed lifetime model is wired. Only after repeated-generation live bytes settle
     toward baseline should work start on the separate real-provider GetClassInfo client.
 
+    Queue-event lifetime foundation (2026-09-02, host-tested; integration pending):
+    `nt-kernel-exec::EventObjectRegistry` now provides growable generation-protected Event identities
+    and unique native/GUI wait leases. Immutable creator `(pid, process-generation)` provenance and
+    canonical executive event identity are separate from the optional provider `KEVENT` projection.
+    Handle, provider-pointer, native-wait, GUI-wait, and embedded signal leases defer deletion
+    independently. Queued signals hold object lifetime, coalesce repeated sets without allocating,
+    preserve enqueue order, and remain leased through delivery acknowledgement. Final retirement
+    returns both the executive identity and provider body so their respective owners can reclaim
+    them only after every reference drains.
+
+    Eight focused tests cover growth to 64 objects and 32 GUI waits, stale object and lease rejection
+    after slot reuse, wrong-kind and duplicate release, independent five-class deletion blockers,
+    provider-body uniqueness, signal coalescing/FIFO/delivery ownership, and exact process-generation
+    provenance. `cargo test -p nt-kernel-exec` passes 196/196. Next wire the executive's existing
+    `EventStore`/Process Manager event handles to this registry through a dedicated pointer-free
+    win32k broker. Provider `ZwCreateEvent`, `ObReferenceObjectByHandle`, `ObCloseHandle`,
+    `ObDereferenceObject`, native waits, GUI waits, and signal redrive must all cross that boundary
+    before deleting the old four-slot ring, raw-pointer FIFO, no-op references, and queue-event repair.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
