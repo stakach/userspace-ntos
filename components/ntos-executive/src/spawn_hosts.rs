@@ -1357,10 +1357,11 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
 
-unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool) {
+unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool, bool) {
     let timer = crate::badge_has_delay_timer(badge);
     let irq_lines = crate::driver_launch::latch_hosted_irq_badge(badge);
-    let event = timer || irq_lines != 0;
+    let irq = irq_lines != 0;
+    let event = timer || irq;
     if crate::EXEC_DEADMAN_WATCHDOG {
         if timer {
             crate::watchdog_on_tick();
@@ -1374,7 +1375,7 @@ unsafe fn pump_handle_executive_event_badge(badge: u64) -> (bool, bool) {
             crate::delay_timer_nested_ack();
         }
     }
-    (event, timer)
+    (event, timer, irq)
 }
 
 /// After a bound HPET notification interrupts a component endpoint receive, probe that endpoint
@@ -1404,10 +1405,13 @@ unsafe fn pump_try_recv_after_timer(ch: &PumpChannel, reply_cap: u64) -> Option<
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    let (executive_event, _timer) = pump_handle_executive_event_badge(badge);
+    let (executive_event, _timer, irq) = pump_handle_executive_event_badge(badge);
     if executive_event {
         if pump_deadman_tripped() {
             return Some(PumpMessage::deadman_wall());
+        }
+        if ch.caps.kind == ReqKind::Irp && irq {
+            return Some(PumpMessage::scheduler_yield());
         }
         return None;
     }
@@ -1629,12 +1633,12 @@ unsafe fn pump_recv(ch: &PumpChannel, reply_cap: u64) -> PumpMessage {
             lateout("rax") _, lateout("rcx") _, lateout("r11") _,
             options(nostack),
         );
-        let (executive_event, timer) = pump_handle_executive_event_badge(badge);
+        let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
         if executive_event {
             if pump_deadman_tripped() {
                 return PumpMessage::deadman_wall();
             }
-            if ch.caps.kind == ReqKind::Irp {
+            if ch.caps.kind == ReqKind::Irp && irq {
                 return PumpMessage::scheduler_yield();
             }
             if timer {
@@ -1711,12 +1715,12 @@ unsafe fn pump_reply_recv4(
         lateout("rax") _, lateout("rcx") _, lateout("r11") _,
         options(nostack),
     );
-    let (executive_event, timer) = pump_handle_executive_event_badge(badge);
+    let (executive_event, timer, irq) = pump_handle_executive_event_badge(badge);
     if executive_event {
         if pump_deadman_tripped() {
             return PumpMessage::deadman_wall();
         }
-        if ch.caps.kind == ReqKind::Irp {
+        if ch.caps.kind == ReqKind::Irp && irq {
             return PumpMessage::scheduler_yield();
         }
         if timer {

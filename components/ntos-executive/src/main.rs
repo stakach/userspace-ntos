@@ -32117,36 +32117,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 print_hex(ssdt_argument_table as u32);
                 print_str(b"\n");
             }
-            // Phase 2c: report the per-process attach (win32k's process-create callout) + the SSN
-            // 0x10FA (NtUserProcessConnect) dispatch through the SSDT.
-            let nt_handler = core::ptr::read_volatile(
-                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_NTUSER_HANDLER)
-                    as *const u64,
-            );
-            let nt_status = core::ptr::read_volatile(
-                (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_NTUSER_STATUS)
-                    as *const i32,
-            );
+            // Report the provider process-callout bootstrap and the resolved NtUser service-table
+            // entry. The genuine CSRSS call exercises NtUserProcessConnect later with a real owner.
             if (verdict & win32k_subsystem::V_CALLOUT_ENTERED) != 0 {
                 print_str(b"[win32k-svc] win32k process-create callout ");
                 if (verdict & win32k_subsystem::V_CALLOUT_RETURNED) != 0 {
                     print_str(b"RETURNED");
                 } else {
                     print_str(b"ran then faulted (see backtrace)");
-                }
-                print_str(b"\n");
-            }
-            if (verdict & win32k_subsystem::V_NTUSER_ENTERED) != 0 {
-                print_str(b"[win32k-svc] NtUserProcessConnect(0x10FA) via SSDT -> handler RVA=0x");
-                print_hex(nt_handler.wrapping_sub(code_va) as u32);
-                if (verdict & win32k_subsystem::V_NTUSER_RETURNED) != 0 {
-                    print_str(b" RETURNED status=0x");
-                    print_hex(nt_status as u32);
-                    if (verdict & win32k_subsystem::V_NTUSER_SUCCESS) != 0 {
-                        print_str(b" (STATUS_SUCCESS)");
-                    }
-                } else {
-                    print_str(b" (ran in component context, then faulted - see backtrace)");
                 }
                 print_str(b"\n");
             }
@@ -32263,40 +32241,11 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             }
             check(b"win32k_driver_entry_success", success, &mut passed);
 
-            // --- Milestone B: prove the PERSISTENT DISPATCH LOOP end-to-end. The component is now
-            // parked at the dispatch sentinel (not parked/dead). Marshal a USERCONNECT buffer into
-            // the shared arg frame and dispatch NtUserProcessConnect (SSN 0x10FA) THROUGH the loop
-            // (win32k_dispatch resume-replies the sentinel, services handler faults, waits the next
-            // sentinel = done). A clean round-trip (ok=true) proves csrss's win32k syscalls can be
-            // routed to the live component. The arg frame stands in for csrss's user pointer.
+            // The component is now parked at its persistent dispatch sentinel. Do not manufacture
+            // an ownerless NtUserProcessConnect here: the first real CSRSS call supplies the native
+            // process generation and handle table. Keep only the provider-fault transport proof,
+            // which intentionally requires no GUI-client context.
             if finished {
-                core::ptr::write_bytes(win32k_subsystem::WIN32K_ARG_VADDR as *mut u8, 0, 0x240);
-                let (st, ok) = win32k_dispatch(
-                    win32k_subsystem::SSN_NT_USER_INITIALIZE,
-                    0x0000_0000_5A5A_0100, // a process handle (ObReferenceObjectByHandle → EPROCESS)
-                    win32k_subsystem::WIN32K_ARG_VADDR, // USERCONNECT buffer in the shared arg frame
-                    0x240,
-                    0,
-                );
-                // The component-written `SH_REQ_SEQ` counter is gone with the hand-rolled transport;
-                // the KERNEL-attested count of completions that arrived as the return value of
-                // win32k's own `Call` is the stronger evidence that replaces it.
-                let seq = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
-                print_str(b"[win32k-svc] DISPATCH-LOOP round-trip: SSN 0x10FA -> status=0x");
-                print_hex(st as u32);
-                print_str(if ok {
-                    b" (serviced, call-bound completions="
-                } else {
-                    b" (WALL, call-bound completions="
-                });
-                print_u64(seq);
-                print_str(b")\n");
-                check(
-                    b"win32k_dispatch_loop_roundtrip",
-                    ok && seq >= 1,
-                    &mut passed,
-                );
-
                 // --- Fix (B): prove a win32k dispatch whose handler FAULTS is resolved through the
                 // per-caller reply cap (REPLY_W32 / decode_reply), NOT the single per-TCB reply_to.
                 // SSN_TEST_FAULT's handler reads an un-demand-paged page → the executive demand-maps

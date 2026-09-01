@@ -22494,6 +22494,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     to the private arena in one cutover. A serialized desktop run remains required after that cutover;
     deterministic stalls must terminate immediately and readiness remains capped at 3,600 seconds.
 
+    B3 desktop-bootstrap ownership and timer fairness checkpoint (2026-09-02, freestanding and
+    desktop acceptance green): the event-pump regression was two independent ownership violations.
+    A pure HPET notification was being converted into an IRP-pump scheduler yield, so SMSS could
+    abandon a valid registry continuation. The pump now distinguishes timer wakeups from hosted IRQ
+    notifications and yields the IRP lane only for a real interrupt; the nonblocking post-timer probe
+    applies the same rule when an IRQ arrives concurrently.
+
+    The earlier win32k bootstrap also ran `InitThreadCallback` and a manufactured
+    `NtUserProcessConnect` before any hosted process generation or handle table existed. Its
+    `ZwCreateEvent` therefore had no legitimate native owner. That machinery, its verdict fields,
+    diagnostics, and the obsolete dispatch-loop gate are deleted. DriverEntry now establishes only
+    win32k's provider-owned bootstrap PROCESSINFO. On the first genuine CSRSS attach, the permanent
+    desktop-thread row is rekeyed to CSRSS's exact `(pi, pid, generation)`, its real THREADINFO and
+    queue Event are created under that identity, and `gptiDesktopThread` is bound before selecting
+    the real CSRSS main thread. The provider fault/reply-cap selftest remains context-free and no
+    longer creates a GUI client as a side effect.
+
+    Serialized `./run.sh --desktop` evidence in
+    `.tmp/run-desktop-20260902-080304.log` reached quiescence in 275 seconds and passed 297/297
+    checks. It records the real CSRSS desktop-thread callout and `csrss-desktop` binding, one
+    userinit and Explorer launch, 661 Explorer api0 redirects with zero callback failures, 125 GDI
+    batch flushes, and a fully non-background 1024x768 framebuffer with at least 32 colors. QEMU
+    matched the sentinel and exited normally. This restores the desktop acceptance baseline without
+    an ownerless event, fabricated client identity, or synthetic success path.
+
+    Review adjustment: before the private-arena transport cutover, make physical IRQ Ack a checked
+    request/reply operation. The current executive sends Ack without waiting for the microkernel
+    result and then confirms it in software; the replacement must confirm the line only after a
+    successful kernel reply, and otherwise keep it masked/quarantined while unwinding all exact
+    delivery leases. Then proceed with lane-private IRQL/actual-lock ownership, provider and
+    dependent lanes, nested callback/import exchange, and the generation-backed DPC registry before
+    atomically deleting the old request-bank transport.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after

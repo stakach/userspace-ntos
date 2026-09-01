@@ -262,7 +262,6 @@ pub const SH_SSDT_INDEX: u64 = 0x24; // out: recorded SSDT index (u32)
 pub const SH_SSDT_ARGUMENT_TABLE: u64 = 0x28; // out: recorded win32k SSPT/KiArgumentTable base (u64)
 pub const SH_POOL_USED: u64 = 0x30; // out: pool high-water (u64)
 pub const SH_NTUSER_HANDLER: u64 = 0x40; // out: resolved SSDT[0xFA] handler VA (u64)
-pub const SH_NTUSER_STATUS: u64 = 0x48; // out: NtUserInitialize NTSTATUS (i32)
                                         // Phase 2c dispatch-loop request/reply (executive → win32k, via the shared page). After
                                         // DriverEntry+attach the host enters a persistent loop: it trips the sentinel (ready/done), the
                                         // executive fills these fields + resume-replies, the host resolves the SSN through the registered
@@ -449,9 +448,6 @@ unsafe fn registered_win32k_provider_argc(ssn: u64) -> Option<u64> {
 pub const V_ENTERED: u32 = 1; // host called into DriverEntry
 pub const V_SUCCESS: u32 = 4; // DriverEntry returned STATUS_SUCCESS
 pub const V_SSDT: u32 = 8; // KeAddSystemServiceTable recorded the win32k table
-pub const V_NTUSER_ENTERED: u32 = 0x10; // dispatched SSDT[0xFA] NtUserInitialize into the handler
-pub const V_NTUSER_RETURNED: u32 = 0x20; // NtUserInitialize returned (did not fault)
-pub const V_NTUSER_SUCCESS: u32 = 0x40; // NtUserInitialize returned STATUS_SUCCESS
 pub const V_CALLOUT_ENTERED: u32 = 0x80; // invoked win32k's process-create callout
 pub const V_CALLOUT_RETURNED: u32 = 0x100; // process-create callout returned (did not fault)
 pub const V_NTUSER_RESOLVED: u32 = 0x200; // SSDT resolve(0x10FA) yielded a real win32k handler
@@ -7940,6 +7936,27 @@ unsafe fn adopt_bootstrap_csrss_process(
     set_thread_ctx_pi(desktop_thread_index, pi as u64);
     set_thread_ctx_generation(desktop_thread_index, generation);
 
+    // InitThreadCallback creates the desktop thread's queue Event through ZwCreateEvent. Run it
+    // only after the bootstrap row belongs to a live CSRSS generation, while the enclosing pump
+    // carries this exact `(pi, generation)` to the executive object manager. The caller's real
+    // main-thread context is selected immediately afterwards.
+    let desktop_ethread = thread_ctx_ethread(desktop_thread_index);
+    let desktop_teb = seed_win32k_callout_teb(desktop_thread_index)?;
+    prepare_ethread_for_win32k_callout(desktop_thread_index, desktop_teb);
+    WIN32K_CURRENT_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+    WIN32K_CURRENT_PROCESS_ID.store(pid, Ordering::Relaxed);
+    WIN32K_CURRENT_THREAD_ID.store(WIN32K_BOOTSTRAP_TID, Ordering::Relaxed);
+    write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, eprocess);
+    write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, desktop_ethread);
+    write_volatile(SLOT_W32PROCESS as *mut u64, ppi);
+    write_volatile(SLOT_W32THREAD as *mut u64, 0);
+    publish_selected_context(process_index, desktop_thread_index);
+    if !ensure_win32k_threadinfo(desktop_thread_index, desktop_teb)
+        || !bind_desktop_thread_to_current_context(false, b"csrss-desktop")
+    {
+        return None;
+    }
+
     let thread_index = ensure_thread_context(pi, pid, tid, generation, teb, supplied_ethread)?;
     let ethread = thread_ctx_ethread(thread_index);
     let effective_teb = seed_win32k_callout_teb(thread_index)?;
@@ -11851,8 +11868,10 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
     // the `post_driver_entry` hook, and the persistent send_done→recv_req→dispatch→writeback loop are
     // all delegated to [`crate::spawn_hosts::component_main`]. win32k's irreducible specifics stay
     // win32k-side: the SSN router + per-dispatch pre/post work is [`win32k_dispatch`] (the `dispatch`
-    // closure); `establish_client_and_dispatch` + `setup_dispatch_context` are [`win32k_post_driver_entry`]
-    // (both MUST run between DriverEntry and the FIRST send_done — preserved by the harness ordering).
+    // closure); bootstrap process establishment + `setup_dispatch_context` are
+    // [`win32k_post_driver_entry`] (both MUST run between DriverEntry and the FIRST send_done —
+    // preserved by the harness ordering). The user-thread callout is deferred until a real CSRSS
+    // generation exists because its queue Event is a process-owned native handle.
     let entry_rva = read_volatile((WIN32K_SHARED_VADDR + SH_ENTRY_RVA) as *const u64) as u32;
     print_str(b"[win32k-host] START DriverEntry rva=0x");
     print_hex(entry_rva);
@@ -11902,9 +11921,9 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
 
 /// win32k `post_driver_entry` (runs between DriverEntry and the FIRST `send_done`, exactly as the old
 /// inline entry): emit the DriverEntry-returned diagnostic, record the pool high-water, then
-/// establish the client's per-process win32 context (Phase 2c) and enter the per-dispatch process/
-/// thread context ([`setup_dispatch_context`]) — the same establish→setup ordering the old
-/// `win32k_subsystem_entry` → `dispatch_loop` did before its first sentinel.
+/// establish win32k's bootstrap process context and enter the per-dispatch process context
+/// ([`setup_dispatch_context`]). The first real CSRSS dispatch rekeys the bootstrap process and
+/// creates the permanent desktop thread with CSRSS's exact process generation active.
 unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
     let v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
     let pool_used = provider_pool_census().arena_high_water;
@@ -11915,13 +11934,10 @@ unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
     print_hex(v);
     print_str(b"\n");
 
-    // Phase 2c: establish the calling client's per-process win32 context THE AUTHENTIC WAY — invoke
-    // win32k's OWN process-create callout (recorded by PsEstablishWin32Callouts during DriverEntry)
-    // so win32k allocates + owns the client's W32PROCESS and calls PsSetProcessWin32Process — then
-    // dispatch NtUserProcessConnect (SSN 0x10FA) through the SSDT in this component's context. Any
-    // fault is caught + backtraced by the executive's fault loop before the first sentinel.
+    // Establish only the provider bootstrap PROCESSINFO here. InitThreadCallback calls
+    // ZwCreateEvent, and no hosted process lifetime owns a handle table at DriverEntry time.
     if status == 0 {
-        establish_client_and_dispatch();
+        establish_bootstrap_process_context();
     }
     // Enter the per-dispatch process/thread context (the old `dispatch_loop` ran this ONCE before the
     // loop; the harness's loop calls win32k_dispatch per request, so seed the context here — before the
@@ -12226,6 +12242,13 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
     if request_kind != WIN32K_REQUEST_SSDT {
         return (0xC000_000Du32 as i32, 0xC000_000Du32 as u64);
     }
+    if ssn == SSN_TEST_FAULT {
+        // Transport selftest: touch an un-demand-paged provider page without manufacturing a GUI
+        // client. The executive resolves the fault through the dedicated win32k reply object.
+        let probe = read_volatile(TEST_FAULT_VA as *const u64);
+        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
+        return (TEST_FAULT_STATUS as u32 as i32, TEST_FAULT_STATUS as u32 as u64);
+    }
     // Ps invokes the registered JobCallout as an executive-to-provider operation. It owns no
     // calling GUI thread and must not inherit or manufacture a client win32 context merely to
     // update win32k-owned job policy.
@@ -12378,14 +12401,7 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
             publish_thread_desktop_binding(t, hdesk, desk_body, pdeskinfo);
         }
     }
-    let result = if ssn == SSN_TEST_FAULT {
-        // Fix (B) self-test: touch an un-demand-paged page → FAULT mid-dispatch. The executive
-        // resolves it via the REPLY_W32 reply cap and resumes us here; we read back the zeroed
-        // page (observability into SH_REQ_A0) and report the sentinel status.
-        let probe = read_volatile(TEST_FAULT_VA as *const u64);
-        write_volatile((WIN32K_SHARED_VADDR + SH_REQ_A0) as *mut u64, probe);
-        TEST_FAULT_STATUS as u32 as u64
-    } else if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
+    let result = if ssn == SSN_GDI_BATCH_FLUSH_CALLOUT {
         dispatch_gdi_batch_flush_callout(client_pi, client_teb)
     } else if ssn == SSN_WIN32_JOB_USER_HANDLE {
         dispatch_win32_job_user_handle(a0, a1, a2 != 0, a3 as u32)
@@ -13657,20 +13673,8 @@ unsafe fn setup_dispatch_context() {
     write_volatile((WIN32K_KPCR_VA + 0x188) as *mut u64, ethread);
     initialize_eprocess_body(eprocess, FAKE_PROCESS_HANDLE, 0);
 
-    // win32k's IntCbAllocateMemory (callback.c:44) does
-    // `InsertTailList(&W32Thread->W32CallbackListHead, &Mem->ListEntry)` in the desktop-init callback
-    // tail (co_IntSetWndIcons). Real win32k initializes this in InitThreadCallback (main.c:497
-    // `InitializeListHead(&ptiCurrent->W32CallbackListHead)`). Offset confirmed by disasm of
-    // IntCbAllocateMemory (RVA 0x4aa86: `add rcx, 0x2e8; call InsertTailList`). Keep the real
-    // callout-owned THREADINFO's list heads complete before the bootstrap connect path runs.
-    let w32thread = current_w32thread();
-    if w32thread == 0 {
-        print_str(b"[win32k-host] ERROR: no callout-owned W32THREAD for dispatch setup\n");
-        return;
-    }
-    init_threadinfo_placeholder(w32thread);
-
-    let _ = bind_desktop_thread_to_current_context(false, b"bootstrap");
+    // No W32THREAD is valid yet. InitThreadCallback creates a process-owned Event handle, so the
+    // permanent desktop thread is initialized only when the first real CSRSS generation attaches.
 }
 
 /// Stand up `gptiDesktopThread` from the currently selected dynamic GUI context.
@@ -14283,11 +14287,11 @@ static mut BOUND_DESK_PDESKINFO: u64 = 0;
 // body + context seed moved to [`win32k_dispatch`] / [`setup_dispatch_context`] (above). BOUND_DESK_*
 // (latched by `create_winsta_and_desktop` / `dispatch_ssn`, re-asserted per dispatch in `win32k_dispatch`).
 
-/// Give the EPROCESS placeholder the fields win32k's process callout asserts, invoke win32k's
-/// process-create callout (WIN32_CALLOUTS[0]) to build the W32PROCESS authentically, then dispatch
-/// NtUserProcessConnect(ProcessHandle, USERCONNECT buffer, 0x240) via the SSDT.
-unsafe fn establish_client_and_dispatch() {
-    let Some((process_index, thread_index)) = ensure_bootstrap_win32k_context() else {
+/// Give the EPROCESS placeholder the fields win32k's process callout asserts and invoke win32k's
+/// process-create callout (WIN32_CALLOUTS[0]) to build the W32PROCESS authentically. A user thread
+/// and its handle table do not exist until the genuine CSRSS attach.
+unsafe fn establish_bootstrap_process_context() {
+    let Some((process_index, _thread_index)) = ensure_bootstrap_win32k_context() else {
         print_str(b"[win32k-host] ERROR: bootstrap GUI context allocation failed\n");
         return;
     };
@@ -14348,30 +14352,6 @@ unsafe fn establish_client_and_dispatch() {
         print_str(b"[win32k-host] ERROR: bootstrap process callout did not publish W32PROCESS\n");
         return;
     }
-    if !ensure_win32k_threadinfo(thread_index, 0) {
-        print_str(b"[win32k-host] ERROR: bootstrap thread callout did not publish W32THREAD\n");
-        return;
-    }
-
-    // Dispatch NtUserProcessConnect (SSN 0x10FA) with real args: a process handle, a 0x240-byte
-    // USERCONNECT buffer, and its size 0x240.
-    let user_connect = pool_alloc(0x240);
-    let mut v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_ENTERED;
-    write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
-    let f: extern "win64" fn(u64, u64, u64) -> i32 = core::mem::transmute(handler as *const ());
-    let nstatus = f(FAKE_PROCESS_HANDLE, user_connect, 0x240);
-    v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32) | V_NTUSER_RETURNED;
-    if nstatus == 0 {
-        v |= V_NTUSER_SUCCESS;
-    }
-    write_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *mut u32, v);
-    write_volatile(
-        (WIN32K_SHARED_VADDR + SH_NTUSER_STATUS) as *mut i32,
-        nstatus,
-    );
-    print_str(b"[win32k-host] NtUserProcessConnect(0x10FA) returned status=0x");
-    print_hex(nstatus as u32);
-    print_str(b"\n");
 }
 
 // --- win32k-adjacent driver hosting -----------------------------------------------------------
