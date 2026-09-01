@@ -21332,6 +21332,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retired only after the corresponding terminal devnode proof. Remove the eager demand-PnP launch
     and permissive `PlugPlayControlStartDevice` no-action success as that path replaces them.
 
+    B3 exact pending-START terminal-ledger runtime checkpoint (2026-09-01, accepted): serialized
+    integration run `.tmp/run-pending-start-integration-20260901-110618.log` reached the sentinel at
+    guest time 115 seconds with 297/297 gates. Its two independent fixture devnodes each emitted one
+    successful immutable row with the complete `0x7f` stage mask, exact IRP/devnode/dispatch/
+    PDO/FDO/driver/device identities, retired canonical IRPs, and committed observation. The summary
+    is exactly `2/2/0/0` rows/success/failed/incomplete and `0/0/0/0` active/retained/violations/
+    duplicates. The separate native load-only request remains an exact successful `1/1/1` terminal
+    and replied SCM result. Explorer painted all 786432 pixels with at least 32 colours.
+
+    Serialized production run `.tmp/run-headless-production-pnp-proof-20260901.log` reached the
+    sentinel at guest time 116 seconds with 297/297 gates and the same full Explorer framebuffer.
+    Three production config-selected devices reached START success. The pending ledger is coherently
+    empty at `0/0/0/0` with no active owner, retained IRP, violation, or duplicate; the native-load
+    ledger is coherently empty at `0/0/0`; and no PendingStartTest, NativeLoadTest, or fixture devnode
+    identity appears in the log. Both accepted boots used the 900-second operational bound under the
+    hard one-hour ceiling and left no QEMU process running.
+
+    One earlier integration attempt reached the full framebuffer, emitted both exact proof rows, and
+    exited at the sentinel, but finished 296/297 because the historical userinit-specific ScrollBar
+    class-info observation did not happen on that schedule. The immediate repeat observed it and
+    passed; no gate or runtime behavior was weakened. Track that path-dependent readiness check for
+    later gate cleanup or replacement by focused class-info behavior coverage. Review adjustment:
+    close the boot-profile pending ledger. The next B3 slice is the live Config Manager action/reply
+    state machine and deletion of the eager demand-PnP and no-action-success machinery identified
+    above.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
