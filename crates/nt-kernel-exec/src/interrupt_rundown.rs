@@ -626,6 +626,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_ack_and_clear_remain_retryable_until_exact_mask_and_abort() {
+        let mut line = InterruptLineRundown::new(line_identity(1));
+        let delivery = line.begin_delivery().unwrap();
+        assert_eq!(
+            line.complete_scan(delivery),
+            Ok(InterruptLineScanCompletion::Acknowledge(delivery))
+        );
+
+        // A failed kernel Ack must not be reflected into software. Quarantine closes admission,
+        // while a failed Clear leaves the exact delivery reconstructible for a later retry.
+        let mask = line.quarantine().unwrap();
+        assert_eq!(line.rundown_state(), InterruptRundownState::Draining);
+        assert_eq!(
+            line.phase(),
+            InterruptLineDeliveryPhase::AwaitingAcknowledgement(1)
+        );
+        assert!(!line.hardware_masked());
+
+        let retry_mask = line.quarantine().unwrap();
+        assert_eq!(retry_mask, mask);
+        assert_eq!(
+            line.confirm_mask(InterruptLineMask {
+                identity: line_identity(2),
+            }),
+            Err(InterruptLineError::StaleMask)
+        );
+        line.confirm_mask(retry_mask).unwrap();
+        assert_eq!(
+            line.abort_delivery(InterruptLineDelivery {
+                identity: line_identity(2),
+                sequence: delivery.sequence,
+            }),
+            Err(InterruptLineError::StaleDelivery)
+        );
+        line.abort_delivery(delivery).unwrap();
+        assert_eq!(line.rundown_state(), InterruptRundownState::Ready);
+    }
+
+    #[test]
     fn line_sequence_exhaustion_quarantines_without_delivery() {
         let mut line = InterruptLineRundown::new(line_identity(1));
         line.set_next_sequence_for_test(u64::MAX);

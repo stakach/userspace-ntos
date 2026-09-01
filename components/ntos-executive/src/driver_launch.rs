@@ -45615,14 +45615,18 @@ unsafe fn release_hosted_irq_line_caps(
     let Ok(mask) = line.rundown.begin_retirement() else {
         return 1;
     };
+    if !line.rundown.hardware_masked() {
+        if crate::mask_ioapic_irq_handler_checked(line.handler_cap).is_err()
+            || line.rundown.confirm_mask(mask).is_err()
+        {
+            return 1;
+        }
+    }
     if line.handler_cap != 0 {
-        if crate::clear_ioapic_irq_handler(line.handler_cap).is_err() {
+        if crate::delete_ioapic_irq_handler_cap_checked(line.handler_cap).is_err() {
             return 1;
         }
         line.handler_cap = 0;
-    }
-    if !line.rundown.hardware_masked() && line.rundown.confirm_mask(mask).is_err() {
-        return 1;
     }
     if connection_deliveries_drained {
         let sequence = match line.rundown.phase() {
@@ -46214,19 +46218,21 @@ unsafe fn mask_hosted_irq_line_terminal(
             .begin_retirement()
     }
     .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
-    if handler_cap != 0 {
-        crate::clear_ioapic_irq_handler(handler_cap)?;
-        hosted_irq_lines_mut()[line_index].handler_cap = 0;
-    }
     if !hosted_irq_lines_mut()[line_index]
         .rundown
         .hardware_masked()
     {
+        let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
+        crate::mask_ioapic_irq_handler_checked(handler_cap)?;
         hosted_irq_lines_mut()[line_index]
             .rundown
             .confirm_mask(mask)
             .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    }
+    let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
+    if handler_cap != 0 {
+        crate::delete_ioapic_irq_handler_cap_checked(handler_cap)?;
+        hosted_irq_lines_mut()[line_index].handler_cap = 0;
     }
     Ok(())
 }
@@ -46516,15 +46522,27 @@ unsafe fn service_hosted_irq_event(
                     nt_status::NtStatus::INVALID_DEVICE_REQUEST,
                 ));
             }
-            crate::acknowledge_ioapic_irq_handler(handler_cap);
+            if let Err(status) = crate::acknowledge_ioapic_irq_handler_checked(handler_cap) {
+                return Err(quarantine_hosted_irq_delivery(
+                    line.gsi,
+                    line.rundown.identity(),
+                    delivery,
+                    &leased,
+                    status,
+                ));
+            }
             if hosted_irq_lines_mut()[line_index]
                 .rundown
                 .confirm_acknowledgement(ack)
                 .is_err()
             {
-                let _ = mask_hosted_irq_line_terminal(line.rundown.identity(), true);
-                let _ = complete_hosted_irq_connection_leases(&leased);
-                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                return Err(quarantine_hosted_irq_delivery(
+                    line.gsi,
+                    line.rundown.identity(),
+                    delivery,
+                    &leased,
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                ));
             }
             HOSTED_IRQ_EVENTS_ACKNOWLEDGED.fetch_add(1, Ordering::Relaxed);
             if complete_hosted_irq_connection_leases(&leased).is_err() {

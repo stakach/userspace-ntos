@@ -17649,7 +17649,9 @@ unsafe fn delay_timer_init() -> bool {
         return false;
     };
     if irq_handler_set_notification_checked(handler, badged).is_err() {
-        let _ = clear_ioapic_irq_handler(handler);
+        if mask_ioapic_irq_handler_checked(handler).is_ok() {
+            let _ = delete_ioapic_irq_handler_cap_checked(handler);
+        }
         let _ = delete_executive_event_badge(badged);
         return false;
     }
@@ -19966,18 +19968,36 @@ pub(crate) unsafe fn irq_handler_set_notification_checked(
     }
 }
 
-pub(crate) unsafe fn acknowledge_ioapic_irq_handler(handler: u64) {
-    if handler != 0 {
-        let _ = syscall5(SYS_SEND, handler, LBL_IRQ_ACK << 12, 0, 0, 0);
+pub(crate) unsafe fn acknowledge_ioapic_irq_handler_checked(
+    handler: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if handler == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    if syscall5_call(handler, LBL_IRQ_ACK << 12, 0, 0, 0) == 0 {
+        Ok(())
+    } else {
+        Err(nt_status::NtStatus::UNSUCCESSFUL)
     }
 }
 
-pub(crate) unsafe fn clear_ioapic_irq_handler(handler: u64) -> Result<(), nt_status::NtStatus> {
+pub(crate) unsafe fn mask_ioapic_irq_handler_checked(
+    handler: u64,
+) -> Result<(), nt_status::NtStatus> {
     if handler == 0 {
-        return Ok(());
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     if syscall5_call(handler, LBL_IRQ_CLEAR_HANDLER << 12, 0, 0, 0) != 0 {
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn delete_ioapic_irq_handler_cap_checked(
+    handler: u64,
+) -> Result<(), nt_status::NtStatus> {
+    if handler == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
     }
     if cnode_delete_recycle_r(handler) != 0 {
         return Err(nt_status::NtStatus::UNSUCCESSFUL);

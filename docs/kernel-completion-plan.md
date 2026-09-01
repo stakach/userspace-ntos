@@ -22527,6 +22527,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     dependent lanes, nested callback/import exchange, and the generation-backed DPC registry before
     atomically deleting the old request-bank transport.
 
+    B3 checked hosted-IRQ acknowledgement checkpoint (2026-09-02, host, freestanding, and desktop
+    acceptance green): the hosted device line now sends `IRQHandler::Ack` as a checked `SYS_CALL`
+    and waits for the microkernel invocation label before confirming the exact line delivery in
+    software. A missing, stale, wrong-type, or inactive handler capability can no longer be silently
+    converted into a rearmed line. Any nonzero reply quarantines every connection on the line,
+    permanently masks the hardware route, completes the full retained connection-lease pass, and
+    aborts the exact delivery only after mask confirmation. A post-Ack software invariant failure
+    uses that same cleanup path instead of discarding mask, lease, and delivery errors.
+
+    Hardware Clear and handler-cap deletion are now separate monotonic stages. Successful Clear is
+    recorded immediately as `hardware_masked`; a later CSpace deletion failure retains the cap and
+    retries deletion without issuing Clear again against an inactive handler. Both ordinary
+    retirement and quarantine share this ordering. The host lifecycle proof covers failed Ack,
+    failed Clear, repeated quarantine, stale mask/delivery rejection, exact mask confirmation, and
+    final delivery abort; `nt-kernel-exec` passes 217/217 and the executive freestanding check is
+    green.
+
+    Serialized `.tmp/run-desktop-20260902-081041.log` exercised the checked Ack path under live NIC
+    traffic, serviced both observed hosted IRQ deliveries, reached quiescence in 283 seconds, and
+    passed 297/297 desktop checks with the complete Explorer framebuffer before QEMU exited on the
+    sentinel. The subsequent monotonic Clear/delete edits affect only injected teardown failures and
+    are covered by the host lifecycle test plus the final executive build. Four separately owned
+    HPET/watchdog/proof Ack sites still use raw sends; audit those timer owners independently and do
+    not describe this checkpoint as a conversion of every executive physical Ack.
+
+    Review adjustment: the hosted-line Ack prerequisite is closed. Before private-arena cutover,
+    audit the four timer/proof Ack owners for checked retry and permanent-mask semantics, then proceed
+    with lane-private IRQL/actual-lock ownership, provider and dependent lanes, nested
+    callback/import exchange, and the generation-backed DPC registry. The old request-bank ISR path
+    remains the sole temporary transport and must still be removed atomically at cutover.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after
