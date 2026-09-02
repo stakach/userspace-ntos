@@ -450,6 +450,240 @@ impl HostedIrqRootSession {
         Ok(())
     }
 
+    unsafe fn drive_provider_dispatch(
+        &mut self,
+        source_lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        target: HostedIrqPreparedTarget,
+        work_id: u64,
+        routine: u64,
+        grant: nt_hosted_runtime::HostedIrqGrantIdentity,
+        arguments: [u64; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP],
+    ) -> Result<u64, nt_status::NtStatus> {
+        let source_lane = self.lane(source_lane_index)?;
+        let target_lane = self.lane(target.lane_index)?;
+        let entry_irql = source_lane
+            .arena()
+            .control
+            .current_irql(source_lane.identity)
+            .map_err(arena_status)?;
+        let transaction = self.lanes[target.lane_index].transaction;
+        let command = nt_hosted_runtime::HostedIrqDispatchCommand {
+            kind: nt_hosted_runtime::HostedIrqDispatchKind::ProviderCallback,
+            work_id,
+            routine,
+            object: 0,
+            context: 0,
+            entry_irql,
+            synchronize_irql: entry_irql,
+            grant,
+            argument_count: nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP as u8,
+            arguments,
+        };
+        self.call_frames
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        let dispatch = target_lane.arena().dispatch[target.depth as usize]
+            .root_publish(
+                &target_lane.arena().control,
+                target_lane.identity,
+                transaction,
+                target.depth,
+                command,
+            )
+            .map_err(arena_status)?;
+        let frame = match self.push_call_frame(
+            source_lane_index,
+            service,
+            target.lane_index,
+            dispatch,
+        ) {
+            Ok(frame) => frame,
+            Err(status) => {
+                self.record_fault(
+                    target.lane_index,
+                    dispatch,
+                    nt_hosted_runtime::HostedIrqFaultKind::Protocol,
+                    0x4341_4c4c,
+                    0,
+                    routine,
+                    service.transport_words(),
+                );
+                return Err(status);
+            }
+        };
+        let result = self.drive_dispatch(target.lane_index, dispatch);
+        let pop = self.pop_call_frame(frame);
+        let result = result?;
+        pop?;
+        if result.faulted {
+            return Err(if result.status == STATUS_SUCCESS {
+                nt_status::NtStatus::UNSUCCESSFUL
+            } else {
+                nt_status::NtStatus(result.status)
+            });
+        }
+        if result.status != STATUS_SUCCESS || result.value_count != 1 {
+            return Err(if result.status == STATUS_SUCCESS {
+                nt_status::NtStatus::INVALID_DEVICE_REQUEST
+            } else {
+                nt_status::NtStatus(result.status)
+            });
+        }
+        Ok(result.values[0])
+    }
+
+    unsafe fn provider_import_service(
+        &mut self,
+        lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let source_lane = match self.lane(lane_index) {
+            Ok(lane) => lane,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        let (dependency, target_lane, _authority_lease) =
+            match provider_import_authority(source_lane, command) {
+                Ok(authority) => authority,
+                Err(status) => return fatal_service_result(status.raw()),
+            };
+        let target = match self.prepare_target_lane(target_lane) {
+            Ok(target) => target,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        let marshal_window_source = match self.target_marshal_window(target) {
+            Ok(window) => window,
+            Err(status) => {
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(status.raw());
+            }
+        };
+        let mut dispatch_error = None;
+        let value = service_hosted_provider_export_with_dispatch(
+            &source_lane.channel,
+            command.service_id,
+            command.authority_cookie,
+            0,
+            command.arguments,
+            marshal_window_source,
+            |singleton, _provider_inst, _exec_code_va, arguments, _caller_rsp| {
+                if singleton.instance != dependency.provider_instance
+                    || singleton.owner_domain != dependency.provider_domain
+                    || command.service_id >= singleton.image_len as u64
+                {
+                    dispatch_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    return Err(STATUS_INVALID_DEVICE_REQUEST);
+                }
+                let Some(routine) = singleton.run_va.checked_add(command.service_id) else {
+                    dispatch_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                    return Err(STATUS_INVALID_DEVICE_REQUEST);
+                };
+                match self.drive_provider_dispatch(
+                    lane_index,
+                    service,
+                    target,
+                    command.service_id,
+                    routine,
+                    dependency.provider_grant,
+                    *arguments,
+                ) {
+                    Ok(value) => Ok(value),
+                    Err(status) => {
+                        dispatch_error = Some(status);
+                        Err(status.raw())
+                    }
+                }
+            },
+        );
+        let finish = self.finish_target_lane(target);
+        if let Some(status) = dispatch_error {
+            return fatal_service_result(status.raw());
+        }
+        if let Err(status) = finish {
+            return fatal_service_result(status.raw());
+        }
+        service_result(STATUS_SUCCESS, Some(value))
+    }
+
+    unsafe fn provider_callback_service(
+        &mut self,
+        lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let source_lane = match self.lane(lane_index) {
+            Ok(lane) => lane,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        let (authority_record, dependency, target_lane, _authority_lease) =
+            match provider_callback_authority(source_lane, command) {
+                Ok(authority) => authority,
+                Err(status) => return fatal_service_result(status.raw()),
+            };
+        let target = match self.prepare_target_lane(target_lane) {
+            Ok(target) => target,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        let marshal_window_source = match self.target_marshal_window(target) {
+            Ok(window) => window,
+            Err(status) => {
+                let _ = self.finish_target_lane(target);
+                return fatal_service_result(status.raw());
+            }
+        };
+        let mut dispatch_error = None;
+        let mut dispatch = |record: HostedProviderCallbackRecord,
+                            _dependent_inst: DriverInstance,
+                            _exec_code_va: u64,
+                            args: [u64; 4],
+                            stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS]| {
+            if record.callback_cookie != authority_record.callback_cookie
+                || record.provider_instance != dependency.provider_instance
+                || record.dependent_instance != dependency.dependent_instance
+                || record.target != authority_record.target
+            {
+                dispatch_error = Some(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+                return Err(HostedComponentDispatchError::Status(
+                    STATUS_INVALID_DEVICE_REQUEST,
+                ));
+            }
+            let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+            arguments[..4].copy_from_slice(&args);
+            arguments[4..].copy_from_slice(&stack_args);
+            match self.drive_provider_dispatch(
+                lane_index,
+                service,
+                target,
+                record.callback_cookie,
+                record.target,
+                dependency.dependent_grant,
+                arguments,
+            ) {
+                Ok(value) => Ok(value),
+                Err(status) => {
+                    dispatch_error = Some(status);
+                    Err(HostedComponentDispatchError::Status(status.raw()))
+                }
+            }
+        };
+        let value = service_hosted_provider_callback_with_dispatch(
+            &source_lane.channel,
+            command.service_id,
+            command.arguments,
+            marshal_window_source,
+            &mut dispatch,
+        );
+        let finish = self.finish_target_lane(target);
+        if let Some(status) = dispatch_error {
+            return fatal_service_result(status.raw());
+        }
+        if let Err(status) = finish {
+            return fatal_service_result(status.raw());
+        }
+        service_result(STATUS_SUCCESS, Some(value))
+    }
+
     unsafe fn record_fault(
         &self,
         lane_index: usize,
@@ -694,11 +928,9 @@ impl HostedIrqRootSession {
     unsafe fn execute_service(
         &mut self,
         lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
         command: nt_hosted_runtime::HostedIrqServiceCommand,
     ) -> nt_hosted_runtime::HostedIrqArenaResult {
-        let Ok(lane) = self.lane(lane_index) else {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        };
         match command.kind {
             nt_hosted_runtime::HostedIrqServiceKind::AcquireActualLock
             | nt_hosted_runtime::HostedIrqServiceKind::ReleaseActualLock => {
@@ -708,16 +940,10 @@ impl HostedIrqRootSession {
                 self.queue_dpc_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderImport => {
-                match provider_import_authority(lane, command) {
-                    Ok(_authority) => service_result(STATUS_NOT_SUPPORTED, None),
-                    Err(status) => fatal_service_result(status.raw()),
-                }
+                self.provider_import_service(lane_index, service, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
-                match provider_callback_authority(lane, command) {
-                    Ok(_authority) => service_result(STATUS_NOT_SUPPORTED, None),
-                    Err(status) => fatal_service_result(status.raw()),
-                }
+                self.provider_callback_service(lane_index, service, command)
             }
         }
     }
@@ -760,7 +986,7 @@ impl HostedIrqRootSession {
             .try_reserve(1)
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
         self.lanes[lane_index].parked_services.push(service);
-        let result = self.execute_service(lane_index, command);
+        let result = self.execute_service(lane_index, service, command);
         let parked = self.lanes[lane_index].parked_services.pop();
         if parked != Some(service) {
             self.record_fault(
@@ -948,6 +1174,7 @@ pub(super) unsafe fn dispatch_interrupt(
         );
     }
     let leaked_service_lock = !session.service_locks.is_empty();
+    let leaked_recursive_state = !session.call_frames.is_empty() || session.lanes.len() != 1;
     let service_release = session.release_service_locks();
     if leaked_service_lock {
         session.record_fault(
@@ -958,6 +1185,17 @@ pub(super) unsafe fn dispatch_interrupt(
             0,
             0,
             [0; 4],
+        );
+    }
+    if leaked_recursive_state {
+        session.record_fault(
+            0,
+            dispatch,
+            nt_hosted_runtime::HostedIrqFaultKind::ServiceFault,
+            0x4341_4c4c,
+            0,
+            0,
+            [session.call_frames.len() as u64, session.lanes.len() as u64, 0, 0],
         );
     }
     let finish = arena
@@ -971,7 +1209,7 @@ pub(super) unsafe fn dispatch_interrupt(
     service_release?;
     finish?;
     outer_release?;
-    if leaked_service_lock || dispatch_faulted {
+    if leaked_service_lock || leaked_recursive_state || dispatch_faulted {
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     Ok(HostedIrqRootDispatchOutcome::Completed(result))

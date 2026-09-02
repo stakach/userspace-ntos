@@ -29290,6 +29290,10 @@ impl HostedProviderMarshalWindowSource {
         }
     }
 
+    fn is_legacy_shared_bank(self) -> bool {
+        self.exact.is_none()
+    }
+
     fn resolve(self, exec_shared_va: u64) -> Option<HostedProviderMarshalWindow> {
         self.exact
             .or_else(|| HostedProviderMarshalWindow::legacy(exec_shared_va))
@@ -30658,6 +30662,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
 ) -> u64 {
     HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let mirror_legacy_irql = marshal_window_source.is_legacy_shared_bank();
     let [arg0, arg1, arg2, arg3, stack0, stack1, stack2, stack3, stack4, stack5, stack6, stack7] =
         args;
     let provider_stack = [stack0, stack1, stack2, stack3, stack4, stack5, stack6, stack7];
@@ -30728,14 +30733,18 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     trace_hosted_provider_callback(b"enter", record, callback_args, &provider_stack, Ok(0));
 
     let dependent_shared = dependent_inst.exec_shared_va;
-    let saved_dependent_irql =
-        read_volatile((dependent_shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
-    let callback_irql =
-        read_volatile((provider_channel.shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
-    write_volatile(
-        (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
-        callback_irql,
-    );
+    let saved_dependent_irql = if mirror_legacy_irql {
+        let saved = read_volatile((dependent_shared + SH_HOSTED_CURRENT_IRQL) as *const u8);
+        let callback_irql =
+            read_volatile((provider_channel.shared_va + SH_HOSTED_CURRENT_IRQL) as *const u8);
+        write_volatile(
+            (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+            callback_irql,
+        );
+        Some(saved)
+    } else {
+        None
+    };
 
     let result = {
         let preflight = if record.callback_kind == HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT
@@ -31068,10 +31077,12 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
             }
         }
     };
-    write_volatile(
-        (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
-        saved_dependent_irql,
-    );
+    if let Some(saved_dependent_irql) = saved_dependent_irql {
+        write_volatile(
+            (dependent_shared + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+            saved_dependent_irql,
+        );
+    }
     if result.is_ok() {
         record_provider_protocol_receive_completion(record);
     }

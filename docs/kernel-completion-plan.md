@@ -23251,6 +23251,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     established 213-warning baseline; live provider Service arms remain fail-closed until the next
     checkpoint publishes and drives these prepared Dispatches.
 
+    B3 recursive provider-Service checkpoint (2026-09-03, freestanding green; live selection and
+    legacy deletion open): the typed root broker no longer returns `STATUS_NOT_SUPPORTED` for a
+    valid provider import or reverse callback. It retains the exact dependency authority, marshals
+    directly into the prepared target depth, publishes a twelve-argument Dispatch with the
+    target-side generation grant and inherited IRQL, recursively drives that lane, and requires the
+    exact global call frame to pop before completing the parked source Service. Provider function
+    return values remain ordinary call results; transport, grant, ancestry, worker, and teardown
+    failures are fatal arena results. Reverse callbacks no longer rewrite the legacy shared IRQL
+    byte because the target lane executor owns the authoritative mirror. New target transactions
+    finish only after all nested callbacks unwind, and the outer session quarantines any leaked call
+    frame or lane. `cargo fmt --all` and the freestanding executive check are green at the
+    established 213-warning baseline. The module is still not selected by the physical interrupt
+    path, so the next checkpoint must perform one atomic cutover and remove the superseded shared
+    ISR/DPC/provider nesting machinery rather than retain it as a fallback.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
