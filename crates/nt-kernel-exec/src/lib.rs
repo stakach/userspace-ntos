@@ -22,6 +22,7 @@ mod event_object;
 pub mod executive_sync;
 pub mod gdi_bitmap;
 mod interrupt;
+mod interrupt_lock;
 mod interrupt_rundown;
 mod irql;
 pub mod kevent;
@@ -67,6 +68,10 @@ pub use event_object::{
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,
     InterruptScanBuildError, InterruptScanProgress, InterruptTable, ReadyIsr, SYNTHETIC_DIRQL,
+};
+pub use interrupt_lock::{
+    InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,
+    InterruptActualLockSnapshot, InterruptActualLockTable,
 };
 pub use interrupt_rundown::{
     InterruptConnectionDisposition, InterruptConnectionIdentity, InterruptConnectionLease,

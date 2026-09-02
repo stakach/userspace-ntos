@@ -22962,6 +22962,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and QEMU exited normally. Return now to the open private interrupt-arena ISR/DPC cutover and
     delete `FSD_DISPATCH_INTERRUPT` atomically.
 
+    B3 generation-owned `ActualLock` checkpoint (2026-09-02, complete): `nt-kernel-exec` now owns an
+    allocation-backed, generation-fenced interrupt lock table keyed by the exact hosted domain/cookie
+    and native `KINTERRUPT::ActualLock` token.
+    Multiple connections may share that exact identity, while registration, acquisition, release,
+    replay validation, and retirement require the exact connection/grant generation. A held owner
+    blocks its own disconnect; stale identities and leases fail closed; final retirement tombstones
+    the record; and later reuse receives a fresh generation while reusing bounded registry storage.
+
+    The executive now retains this identity beside every connected interrupt. Install registers it
+    before publishing the connection and unwinds it on every later failure, idempotent connect replay
+    requires the exact live owner, and disconnect preflights it only after ISR rundown has drained,
+    then releases it after lane and physical-route cleanup. The focused kernel-exec suite passes
+    225/225 and the executive freestanding check is green at the existing 215-warning baseline. This
+    establishes ownership only: no live code may claim cross-TCB exclusion until the root service
+    exchange acquires this table for both arena ISR execution and `KeSynchronizeExecution`.
+
+    Serialized Simpleboot acceptance `.tmp/run-desktop-20260902-125122.log` completes at guest
+    `t_ms=116828`. Real NDIS traffic and hardware interrupt/DPC gates pass; Explorer reports
+    begin/end paint `5/20`, 165 direct GDI returns, 125/172 batch flushes/records, and all 786432
+    framebuffer pixels non-background with at least 32 colours. The final result is `295/295`, the
+    sentinel matched, and QEMU exited normally.
+
+    Next, complete the nested Service-direction arena exchange and expose exact acquire/release
+    operations through that root broker. Wire `KeSynchronizeExecution` and ISR dispatch to the same
+    retained identity at each connection's `SynchronizeIrql`; a private-lane spin loop is forbidden
+    because it can deadlock a sibling TCB on a uniprocessor host. Then add the generation-owned DPC
+    registry and perform the single atomic live-arena cutover/removal described below.
+
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
     Fatal worker faults quarantine the line rather than fabricating an unclaimed result. Only after

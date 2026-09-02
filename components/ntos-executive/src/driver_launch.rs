@@ -92,6 +92,7 @@ use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
     HostedDriverThreadError, HostedDriverThreadTable,
+    InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockTable,
     InterruptConnection as KernelInterruptConnection, InterruptConnectionDisposition,
     InterruptConnectionIdentity, InterruptConnectionLease, InterruptConnectionRundown,
     InterruptLineDelivery, InterruptLineDeliveryPhase, InterruptLineDisposition,
@@ -42470,6 +42471,7 @@ struct HostedIrqConnection {
     interrupt_object: u64,
     pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
     lane_generation: u64,
+    actual_lock: InterruptActualLockIdentity,
     rundown: InterruptConnectionRundown,
 }
 
@@ -42489,14 +42491,22 @@ struct HostedPhysicalIrqLease {
 }
 
 impl HostedIrqConnectionAuthority {
-    fn bind(self, binding: HostedDeviceBinding, lane_generation: u64) -> HostedIrqConnection {
-        let rundown_identity = InterruptConnectionIdentity::new(
+    fn connection_identity(self, binding: HostedDeviceBinding) -> InterruptConnectionIdentity {
+        InterruptConnectionIdentity::new(
             binding.projection_domain.domain_id.raw(),
             binding.projection_domain.cookie,
             self.grant.grant_id,
             self.grant.grant_generation,
         )
-        .expect("validated interrupt grant must have a complete rundown identity");
+        .expect("validated interrupt grant must have a complete connection identity")
+    }
+
+    fn bind(
+        self,
+        binding: HostedDeviceBinding,
+        lane_generation: u64,
+        actual_lock: InterruptActualLockIdentity,
+    ) -> HostedIrqConnection {
         HostedIrqConnection {
             binding,
             grant: self.grant,
@@ -42504,7 +42514,8 @@ impl HostedIrqConnectionAuthority {
             interrupt_object: self.interrupt_object,
             pnp_context_lease: self.pnp_context_lease,
             lane_generation,
-            rundown: InterruptConnectionRundown::new(rundown_identity),
+            actual_lock,
+            rundown: InterruptConnectionRundown::new(self.connection_identity(binding)),
         }
     }
 }
@@ -42800,6 +42811,7 @@ static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
+static mut HOSTED_IRQ_ACTUAL_LOCKS: Option<InterruptActualLockTable> = None;
 static mut HOSTED_PHYSICAL_IRQ_LEASES: Option<Vec<HostedPhysicalIrqLease>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static mut HOSTED_IRQ_LANES: Option<Vec<HostedIrqLaneRuntime>> = None;
@@ -45396,6 +45408,77 @@ unsafe fn hosted_irq_connections_mut() -> &'static mut Vec<HostedIrqConnection> 
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_irq_actual_locks_mut() -> &'static mut InterruptActualLockTable {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_IRQ_ACTUAL_LOCKS);
+    if slot.is_none() {
+        *slot = Some(InterruptActualLockTable::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn hosted_irq_actual_lock_status(error: InterruptActualLockError) -> nt_status::NtStatus {
+    match error {
+        InterruptActualLockError::Busy => nt_status::NtStatus::DEVICE_BUSY,
+        InterruptActualLockError::OutOfMemory => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        InterruptActualLockError::InvalidIdentity
+        | InterruptActualLockError::AlreadyRegistered
+        | InterruptActualLockError::NotRegistered
+        | InterruptActualLockError::StaleLease
+        | InterruptActualLockError::SequenceExhausted
+        | InterruptActualLockError::GenerationExhausted => {
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST
+        }
+    }
+}
+
+unsafe fn register_hosted_irq_actual_lock(
+    authority: HostedIrqConnectionAuthority,
+    binding: HostedDeviceBinding,
+) -> Result<InterruptActualLockIdentity, nt_status::NtStatus> {
+    hosted_irq_actual_locks_mut()
+        .register(
+            authority.connection_identity(binding),
+            authority.route.tokens.actual_lock_token,
+        )
+        .map_err(hosted_irq_actual_lock_status)
+}
+
+unsafe fn validate_hosted_irq_actual_lock(
+    connection: HostedIrqConnection,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_irq_actual_locks_mut()
+        .validate_owner(connection.actual_lock, connection.rundown.identity())
+        .map_err(hosted_irq_actual_lock_status)
+}
+
+unsafe fn prepare_hosted_irq_actual_lock_retirement(
+    connection: HostedIrqConnection,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_irq_actual_locks_mut()
+        .prepare_unregister(connection.actual_lock, connection.rundown.identity())
+        .map_err(hosted_irq_actual_lock_status)
+}
+
+unsafe fn unregister_hosted_irq_actual_lock(
+    connection: HostedIrqConnection,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_irq_actual_locks_mut()
+        .unregister(connection.actual_lock, connection.rundown.identity())
+        .map(|_| ())
+        .map_err(hosted_irq_actual_lock_status)
+}
+
+unsafe fn rollback_hosted_irq_actual_lock(
+    authority: HostedIrqConnectionAuthority,
+    binding: HostedDeviceBinding,
+    identity: InterruptActualLockIdentity,
+) -> Result<(), nt_status::NtStatus> {
+    hosted_irq_actual_locks_mut()
+        .unregister(identity, authority.connection_identity(binding))
+        .map(|_| ())
+        .map_err(hosted_irq_actual_lock_status)
+}
+
 unsafe fn hosted_physical_irq_leases_mut() -> &'static mut Vec<HostedPhysicalIrqLease> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PHYSICAL_IRQ_LEASES);
     if slot.is_none() {
@@ -46355,6 +46438,7 @@ unsafe fn install_hosted_irq_connection(
             || !hosted_irq_projection_matches(existing)
             || !hosted_irq_connection_line_live(existing)
             || !hosted_physical_irq_lease_live(existing.route.tokens.interrupt_id, existing.route)
+            || validate_hosted_irq_actual_lock(existing).is_err()
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -46416,7 +46500,24 @@ unsafe fn install_hosted_irq_connection(
                 Err(cleanup_status) => Err(cleanup_status),
             };
         }
-        hosted_irq_connections_mut().push(authority.bind(binding, lane_generation));
+        let actual_lock = match register_hosted_irq_actual_lock(authority, binding) {
+            Ok(identity) => identity,
+            Err(status) => {
+                let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
+                let lane_status =
+                    retire_hosted_irq_lane_if_unreferenced(
+                        binding.projection_instance,
+                        binding.projection_domain,
+                    )
+                    .err();
+                return Err(lease_status.or(lane_status).unwrap_or(status));
+            }
+        };
+        hosted_irq_connections_mut().push(authority.bind(
+            binding,
+            lane_generation,
+            actual_lock,
+        ));
         return Ok(());
     }
 
@@ -46441,12 +46542,26 @@ unsafe fn install_hosted_irq_connection(
             Err(cleanup_status) => Err(cleanup_status),
         };
     }
-    let connection = authority.bind(binding, lane_generation);
+    let actual_lock = match register_hosted_irq_actual_lock(authority, binding) {
+        Ok(identity) => identity,
+        Err(status) => {
+            let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
+            let lane_status = retire_hosted_irq_lane_if_unreferenced(
+                binding.projection_instance,
+                binding.projection_domain,
+            )
+            .err();
+            return Err(lease_status.or(lane_status).unwrap_or(status));
+        }
+    };
+    let connection = authority.bind(binding, lane_generation, actual_lock);
 
     let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << event_bit);
     let notification_cap = match crate::mint_executive_event_badge(badge) {
         Ok(cap) => cap,
         Err(status) => {
+            let lock_status =
+                rollback_hosted_irq_actual_lock(authority, binding, actual_lock).err();
             let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
             if retire_hosted_irq_lane_if_unreferenced(
                 binding.projection_instance,
@@ -46454,9 +46569,13 @@ unsafe fn install_hosted_irq_connection(
             )
             .is_err()
             {
-                return Err(lease_status.unwrap_or(nt_status::NtStatus::DEVICE_BUSY));
+                return Err(
+                    lock_status
+                        .or(lease_status)
+                        .unwrap_or(nt_status::NtStatus::DEVICE_BUSY),
+                );
             }
-            return Err(lease_status.unwrap_or(status));
+            return Err(lock_status.or(lease_status).unwrap_or(status));
         }
     };
     let handler_cap = match crate::issue_ioapic_irq_handler_checked(
@@ -46468,6 +46587,8 @@ unsafe fn install_hosted_irq_connection(
     ) {
         Ok(cap) => cap,
         Err(status) => {
+            let lock_status =
+                rollback_hosted_irq_actual_lock(authority, binding, actual_lock).err();
             let notification_retained =
                 crate::delete_executive_event_badge(notification_cap).is_err();
             if notification_retained {
@@ -46493,8 +46614,14 @@ unsafe fn install_hosted_irq_connection(
             .is_err();
             let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
             return Err(
-                if notification_retained || lane_retained || lease_status.is_some() {
-                    lease_status.unwrap_or(nt_status::NtStatus::DEVICE_BUSY)
+                if notification_retained
+                    || lane_retained
+                    || lock_status.is_some()
+                    || lease_status.is_some()
+                {
+                    lock_status
+                        .or(lease_status)
+                        .unwrap_or(nt_status::NtStatus::DEVICE_BUSY)
                 } else {
                     status
                 },
@@ -46587,6 +46714,7 @@ unsafe fn retire_hosted_irq_connection(
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
+    prepare_hosted_irq_actual_lock_retirement(connection)?;
     match hosted_resource_manager_mut().disconnect_interrupt(
         hosted_resource_owner(binding),
         interrupt_id,
@@ -46610,6 +46738,7 @@ unsafe fn retire_hosted_irq_connection(
     }
     retire_hosted_irq_lane_if_unreferenced(binding.projection_instance, binding.projection_domain)?;
     release_hosted_physical_irq_lease(interrupt_id)?;
+    unregister_hosted_irq_actual_lock(connection)?;
     hosted_irq_connections_mut().remove(connection_index);
     Ok(())
 }
