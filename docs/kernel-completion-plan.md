@@ -23016,6 +23016,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     bound. This closes the raw nested-token transport and worker LIFO execution checkpoint; root
     Service authority and the live ISR/DPC cutover remain open as described next.
 
+    B3 exact projected interrupt-identity checkpoint (2026-09-02, complete): the component-local
+    hosted `KINTERRUPT` projection now retains the nonzero grant generation returned by the root
+    interrupt broker beside its opaque interrupt id. The connect reply carries both values; a new
+    projection must present zero identity, an idempotent replay must present the exact live id and
+    generation, and every later projection/dispatch validation compares both fields with the
+    executive's generation-fenced connection ledger. A stale component projection therefore cannot
+    attach to a reissued interrupt id or a later grant.
+
+    The freestanding executive check is green at the established 215-warning baseline. Serialized
+    Simpleboot acceptance `.tmp/run-desktop-20260902-132040.log` completes at guest `t_ms=113904`,
+    passes real NDIS receive and hardware interrupt delivery, and reaches genuine Explorer chrome.
+    Explorer reports begin/end paint `5/20`, 165 direct GDI returns, 125/172 batch
+    flushes/records, and all 786432 framebuffer pixels non-background with at least 32 colours. The
+    final result is `295/295`, the sentinel matches, and QEMU exits normally. The full projected
+    connection identity is now closed; continue with the typed root Service broker and recursive
+    dispatch driver.
+
     Reference review adjustment: the live NDIS call graph requires both provider-import services
     and reverse provider-callback requests inside the same Interrupt or Dpc transaction. Add a
     distinct typed reverse-callback Service kind and retain the outer transaction class throughout

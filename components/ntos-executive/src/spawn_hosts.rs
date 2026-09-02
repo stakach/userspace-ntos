@@ -2316,17 +2316,18 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_INTERRUPT_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let (status, interrupt_id) = crate::driver_launch::service_hosted_driver_interrupt(
-                ch, msg.m0, msg.m1, *reply_cap,
-            );
+            let (status, interrupt_id, grant_generation) =
+                crate::driver_launch::service_hosted_driver_interrupt(
+                    ch, msg.m0, msg.m1, *reply_cap,
+                );
             pump_reply_recv4_into!(
                 ch,
                 *reply_cap,
                 msg,
-                2,
+                3,
                 status as u32 as u64,
                 interrupt_id,
-                0,
+                grant_generation,
                 0
             );
             continue;

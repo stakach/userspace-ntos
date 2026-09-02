@@ -735,7 +735,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
 const HOSTED_KINTERRUPT_MAGIC: u64 = 0x4B49_4E54_5250_5431;
-const HOSTED_KINTERRUPT_SIZE: u64 = 0x48;
+const HOSTED_KINTERRUPT_SIZE: u64 = 0x50;
 const HOSTED_KINTERRUPT_VECTOR: u64 = 0x00;
 const HOSTED_KINTERRUPT_IRQL: u64 = 0x04;
 const HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL: u64 = 0x05;
@@ -749,6 +749,7 @@ const HOSTED_KINTERRUPT_ID: u64 = 0x28;
 const HOSTED_KINTERRUPT_MAGIC_OFF: u64 = 0x30;
 const HOSTED_KINTERRUPT_PRIVATE_LOCK: u64 = 0x38;
 const HOSTED_KINTERRUPT_FLOATING_SAVE: u64 = 0x40;
+const HOSTED_KINTERRUPT_GRANT_GENERATION: u64 = 0x48;
 
 #[inline]
 const fn hosted_interrupt_policy(irql: u8, mode: u8, share: u8) -> u64 {
@@ -9213,7 +9214,7 @@ extern "win64" fn s_io_connect_interrupt(
             (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *mut u64,
             service_context,
         );
-        let (_label, broker_status, interrupt_id, _, _) = call_on4(
+        let (_label, broker_status, interrupt_id, grant_generation, _) = call_on4(
             (FSD_SERVICE_INTERRUPT_LABEL << 12) | 2,
             HOSTED_INTERRUPT_OP_CONNECT,
             projection,
@@ -9221,7 +9222,7 @@ extern "win64" fn s_io_connect_interrupt(
             0,
         );
         let broker_status = broker_status as u32 as i32;
-        if broker_status != STATUS_SUCCESS || interrupt_id == 0 {
+        if broker_status != STATUS_SUCCESS || interrupt_id == 0 || grant_generation == 0 {
             if !interrupt_obj_out.is_null() {
                 write_unaligned(interrupt_obj_out, 0);
             }
@@ -9262,6 +9263,10 @@ extern "win64" fn s_io_connect_interrupt(
         write_unaligned(
             (projection + HOSTED_KINTERRUPT_ID) as *mut u64,
             interrupt_id,
+        );
+        write_unaligned(
+            (projection + HOSTED_KINTERRUPT_GRANT_GENERATION) as *mut u64,
+            grant_generation,
         );
         trace_hosted_io_connect_interrupt(
             interrupt_obj_out as u64,
@@ -46889,6 +46894,10 @@ unsafe fn hosted_irq_projection_matches(connection: HostedIrqConnection) -> bool
             == connection.route.tokens.share
         && read_unaligned((projection + HOSTED_KINTERRUPT_AFFINITY) as *const u64)
             == connection.route.tokens.affinity
+        && read_unaligned((projection + HOSTED_KINTERRUPT_ID) as *const u64)
+            == connection.route.tokens.interrupt_id
+        && read_unaligned((projection + HOSTED_KINTERRUPT_GRANT_GENERATION) as *const u64)
+            == connection.grant.grant_generation
         && (read_unaligned((projection + HOSTED_KINTERRUPT_FLOATING_SAVE) as *const u8) != 0)
             == connection.route.tokens.floating_save
 }
@@ -51528,12 +51537,12 @@ pub(crate) fn service_hosted_driver_interrupt(
     operation: u64,
     interrupt_object: u64,
     active_reply_cap: u64,
-) -> (i32, u64) {
+) -> (i32, u64, u64) {
     let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
         unsafe {
             trace_hosted_interrupt_broker_rejection(b"channel", None, None);
         }
-        return (STATUS_ACCESS_DENIED, 0);
+        return (STATUS_ACCESS_DENIED, 0, 0);
     };
     let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
         Ok(binding) => binding,
@@ -51545,7 +51554,7 @@ pub(crate) fn service_hosted_driver_interrupt(
                     Some(instance_index),
                 );
             }
-            return (STATUS_INVALID_DEVICE_REQUEST, 0);
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
         }
     };
     if instance_domain_identity(inst) != Some(binding.projection_domain)
@@ -51554,25 +51563,35 @@ pub(crate) fn service_hosted_driver_interrupt(
         unsafe {
             trace_hosted_interrupt_broker_rejection(b"domain", Some(binding), Some(instance_index));
         }
-        return (STATUS_ACCESS_DENIED, 0);
+        return (STATUS_ACCESS_DENIED, 0, 0);
     }
     let sh = ch.shared_va;
     let active = unsafe { read_volatile((sh + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64) };
     if interrupt_object == 0 || active != interrupt_object {
-        return (STATUS_INVALID_PARAMETER, 0);
+        return (STATUS_INVALID_PARAMETER, 0, 0);
     }
     match operation {
         HOSTED_INTERRUPT_OP_CONNECT => unsafe {
             match publish_hosted_interrupt_connection_from_shared(binding, sh) {
                 Ok(()) => {
                     let interrupt_id = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
-                    if interrupt_id == 0 {
-                        (STATUS_INVALID_DEVICE_REQUEST, 0)
+                    let grant_generation = hosted_irq_connections()
+                        .and_then(|connections| {
+                            connections.iter().find(|connection| {
+                                connection.binding == binding
+                                    && hosted_irq_connection_active(**connection)
+                                    && connection.route.tokens.interrupt_id == interrupt_id
+                            })
+                        })
+                        .map(|connection| connection.grant.grant_generation)
+                        .unwrap_or(0);
+                    if interrupt_id == 0 || grant_generation == 0 {
+                        (STATUS_INVALID_DEVICE_REQUEST, 0, 0)
                     } else {
-                        (STATUS_SUCCESS, interrupt_id)
+                        (STATUS_SUCCESS, interrupt_id, grant_generation)
                     }
                 }
-                Err(status) => (status.raw(), 0),
+                Err(status) => (status.raw(), 0, 0),
             }
         },
         HOSTED_INTERRUPT_OP_DISCONNECT => unsafe {
@@ -51584,16 +51603,16 @@ pub(crate) fn service_hosted_driver_interrupt(
                 })
             });
             if interrupt_id == 0 || !connection_present {
-                return (STATUS_INVALID_DEVICE_REQUEST, 0);
+                return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
             }
             if let Err(status) = retire_hosted_irq_connection(binding, interrupt_id) {
-                return (status.raw(), 0);
+                return (status.raw(), 0, 0);
             }
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             refresh_hosted_device_resource_state(binding, sh);
-            (STATUS_SUCCESS, 0)
+            (STATUS_SUCCESS, 0, 0)
         },
-        _ => (STATUS_INVALID_PARAMETER, 0),
+        _ => (STATUS_INVALID_PARAMETER, 0, 0),
     }
 }
 
@@ -54734,6 +54753,10 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let projected_interrupt_id =
+        read_unaligned((projection + HOSTED_KINTERRUPT_ID) as *const u64);
+    let projected_grant_generation =
+        read_unaligned((projection + HOSTED_KINTERRUPT_GRANT_GENERATION) as *const u64);
     let request = nt_resource_manager::InterruptConnectionRequest {
         service_routine_token: read_unaligned(
             (projection + HOSTED_KINTERRUPT_ROUTINE) as *const u64,
@@ -54774,14 +54797,22 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
             if retiring.binding != binding {
                 return Err(nt_status::NtStatus::ACCESS_DENIED);
             }
+            if projected_interrupt_id != 0 || projected_grant_generation != 0 {
+                return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+            }
             retire_hosted_irq_connection(binding, existing)?;
             write_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *mut u64, 0);
             refresh_hosted_device_resource_state(binding, sh);
         }
     }
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
+    if (existing == 0 && (projected_interrupt_id != 0 || projected_grant_generation != 0))
+        || (existing != 0 && projected_interrupt_id != existing)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
     if existing != 0 {
-        let tokens = hosted_irq_connections()
+        let (tokens, grant_generation) = hosted_irq_connections()
             .and_then(|connections| {
                 connections
                     .iter()
@@ -54790,10 +54821,13 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
                             && hosted_irq_connection_active(**connection)
                             && connection.route.tokens.interrupt_id == existing
                     })
-                    .map(|connection| connection.route.tokens)
+                    .map(|connection| {
+                        (connection.route.tokens, connection.grant.grant_generation)
+                    })
             })
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        if tokens.vector != interrupt_vector
+        if projected_grant_generation != grant_generation
+            || tokens.vector != interrupt_vector
             || tokens.service_routine_token != service_routine
             || tokens.service_context_token != service_context
             || tokens.actual_lock_token != request.actual_lock_token
