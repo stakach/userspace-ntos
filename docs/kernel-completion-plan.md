@@ -23239,6 +23239,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     services still return `STATUS_NOT_SUPPORTED` until target-lane publication and lease retention
     are wired through this stack.
 
+    B3 target-lane planning checkpoint (2026-09-03, freestanding green; provider publication
+    open): the root session can now prepare any exact dependency lane without assuming a fixed NIC
+    or two permanent domains. A new target begins its own transaction with the outer transaction
+    class at depth zero. An already-active target is accepted only when the global call stack names
+    its exact still-parked ancestor Service, and resumes at that Service depth+1; otherwise planning
+    fails with `STATUS_POSSIBLE_DEADLOCK`. The planner obtains the root pointer from
+    `root_idle_marshal_ptr`, verifies it against the arena layout, and constructs the component alias
+    from the same depth offset. Owned target transactions can finish only at the lane-stack tail with
+    no parked Service or call frame. The freestanding executive check remains green at the
+    established 213-warning baseline; live provider Service arms remain fail-closed until the next
+    checkpoint publishes and drives these prepared Dispatches.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

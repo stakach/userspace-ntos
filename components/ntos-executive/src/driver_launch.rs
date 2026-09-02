@@ -29284,6 +29284,12 @@ struct HostedProviderMarshalWindowSource {
 impl HostedProviderMarshalWindowSource {
     const LEGACY_SHARED_BANK: Self = Self { exact: None };
 
+    fn exact(window: HostedProviderMarshalWindow) -> Self {
+        Self {
+            exact: Some(window),
+        }
+    }
+
     fn resolve(self, exec_shared_va: u64) -> Option<HostedProviderMarshalWindow> {
         self.exact
             .or_else(|| HostedProviderMarshalWindow::legacy(exec_shared_va))

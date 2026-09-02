@@ -35,6 +35,13 @@ struct HostedIrqActiveLane {
     parked_services: Vec<nt_hosted_runtime::HostedIrqArenaToken>,
 }
 
+#[derive(Clone, Copy)]
+struct HostedIrqPreparedTarget {
+    lane_index: usize,
+    depth: u8,
+    owns_transaction: bool,
+}
+
 struct HostedIrqRootSession {
     lanes: Vec<HostedIrqActiveLane>,
     call_frames: Vec<nt_hosted_runtime::HostedIrqCallFrame>,
@@ -320,6 +327,126 @@ impl HostedIrqRootSession {
         nt_hosted_runtime::validate_hosted_irq_call_pop(&self.call_frames, frame)
             .map_err(|_| nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK))?;
         self.call_frames.pop();
+        Ok(())
+    }
+
+    fn active_lane_index(
+        &self,
+        identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    ) -> Option<usize> {
+        self.lanes
+            .iter()
+            .position(|candidate| candidate.lane.identity == identity)
+    }
+
+    unsafe fn prepare_target_lane(
+        &mut self,
+        target: HostedIrqLaneView,
+    ) -> Result<HostedIrqPreparedTarget, nt_status::NtStatus> {
+        if let Some(lane_index) = self.active_lane_index(target.identity) {
+            let parent = self
+                .call_frames
+                .iter()
+                .rev()
+                .find(|candidate| candidate.source == target.identity)
+                .ok_or(nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK))?;
+            if self.lanes[lane_index].parked_services.last() != Some(&parent.service) {
+                return Err(nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK));
+            }
+            let depth = parent
+                .service
+                .depth
+                .checked_add(1)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if depth as usize >= nt_hosted_runtime::HOSTED_IRQ_ARENA_DEPTH {
+                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+            }
+            return Ok(HostedIrqPreparedTarget {
+                lane_index,
+                depth,
+                owns_transaction: false,
+            });
+        }
+
+        self.lanes
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        let class = self
+            .lanes
+            .first()
+            .map(|lane| lane.transaction.class)
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let transaction = target
+            .arena()
+            .control
+            .root_begin_transaction(target.identity, class)
+            .map_err(arena_status)?;
+        let lane_index = self.lanes.len();
+        self.lanes.push(HostedIrqActiveLane {
+            lane: target,
+            transaction,
+            owns_transaction: true,
+            parked_services: Vec::new(),
+        });
+        Ok(HostedIrqPreparedTarget {
+            lane_index,
+            depth: 0,
+            owns_transaction: true,
+        })
+    }
+
+    unsafe fn target_marshal_window(
+        &self,
+        target: HostedIrqPreparedTarget,
+    ) -> Result<HostedProviderMarshalWindowSource, nt_status::NtStatus> {
+        let lane = self.lane(target.lane_index)?;
+        let transaction = self.lanes[target.lane_index].transaction;
+        let offset = nt_hosted_runtime::HostedIrqArenaLayout::dispatch_marshal_offset(
+            target.depth as usize,
+        )
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let exec_base = lane.arena().dispatch[target.depth as usize]
+            .root_idle_marshal_ptr(&lane.arena().control, lane.identity, transaction)
+            .map_err(arena_status)? as u64;
+        if lane.arena_va.checked_add(offset) != Some(exec_base) {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let component_base = FSD_WORKER_VADDR
+            .checked_add(FSD_IRQ_LANE_ARENA_OFFSET)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let window = HostedProviderMarshalWindow::new(
+            component_base,
+            exec_base,
+            nt_hosted_runtime::HOSTED_IRQ_ARENA_MARSHAL_BYTES as u64,
+        )
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        Ok(HostedProviderMarshalWindowSource::exact(window))
+    }
+
+    unsafe fn finish_target_lane(
+        &mut self,
+        target: HostedIrqPreparedTarget,
+    ) -> Result<(), nt_status::NtStatus> {
+        if !target.owns_transaction {
+            return Ok(());
+        }
+        if target.lane_index + 1 != self.lanes.len()
+            || !self.lanes[target.lane_index].parked_services.is_empty()
+            || self.call_frames.iter().any(|frame| {
+                frame.source == self.lanes[target.lane_index].lane.identity
+                    || frame.target == self.lanes[target.lane_index].lane.identity
+            })
+        {
+            return Err(nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK));
+        }
+        let lane = &self.lanes[target.lane_index];
+        lane.lane
+            .arena()
+            .control
+            .root_finish_transaction(lane.lane.identity, lane.transaction)
+            .map_err(arena_status)?;
+        self.lanes.pop();
         Ok(())
     }
 
