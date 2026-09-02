@@ -23182,6 +23182,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-hosted-runtime` passes 103/103 tests and the freestanding executive remains green at the
     established 213-warning baseline.
 
+    B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
+    authoritative lane-local IRQL, while the generic lane executor now mirrors each active
+    ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
+    nested unwind. Lane-context `KeRaiseIrql` and `KeLowerIrql` update both the arena and that mirror.
+    This is required because the current ReactOS CR8 read transform loads the shared byte directly;
+    callback marshal code no longer needs to invent per-call IRQL state once the arena path is
+    selected. The freestanding executive check is green at the established 213-warning baseline.
+
     Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
     single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
     dependency lease and drive a provider-domain arena while that Service stays open. A provider
