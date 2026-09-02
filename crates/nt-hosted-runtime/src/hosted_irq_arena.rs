@@ -133,18 +133,26 @@ impl HostedIrqDispatchKind {
 #[repr(u32)]
 pub enum HostedIrqServiceKind {
     ProviderImport = 1,
-    QueueDpc = 2,
-    SynchronizeExecution = 3,
+    ProviderCallbackRequest = 2,
+    QueueDpc = 3,
+    AcquireActualLock = 4,
+    ReleaseActualLock = 5,
 }
 
 impl HostedIrqServiceKind {
     fn from_raw(raw: u32) -> Option<Self> {
         match raw {
             1 => Some(Self::ProviderImport),
-            2 => Some(Self::QueueDpc),
-            3 => Some(Self::SynchronizeExecution),
+            2 => Some(Self::ProviderCallbackRequest),
+            3 => Some(Self::QueueDpc),
+            4 => Some(Self::AcquireActualLock),
+            5 => Some(Self::ReleaseActualLock),
             _ => None,
         }
+    }
+
+    pub const fn may_request_nested_dispatch(self) -> bool {
+        matches!(self, Self::ProviderCallbackRequest)
     }
 }
 
@@ -426,11 +434,21 @@ pub struct HostedIrqServiceCommand {
 
 impl HostedIrqServiceCommand {
     fn valid(self) -> bool {
-        self.service_id != 0
+        let common = self.service_id != 0
             && self.target_domain_id != 0
             && self.target_domain_cookie != 0
             && self.grant.valid()
-            && self.argument_count as usize <= HOSTED_IRQ_ARENA_ARGUMENT_CAP
+            && self.argument_count as usize <= HOSTED_IRQ_ARENA_ARGUMENT_CAP;
+        common
+            && match self.kind {
+                HostedIrqServiceKind::AcquireActualLock => self.argument_count == 0,
+                HostedIrqServiceKind::ReleaseActualLock => {
+                    self.argument_count == 1 && self.arguments[0] != 0
+                }
+                HostedIrqServiceKind::ProviderImport
+                | HostedIrqServiceKind::ProviderCallbackRequest
+                | HostedIrqServiceKind::QueueDpc => true,
+            }
     }
 }
 
@@ -2203,6 +2221,47 @@ mod tests {
             dispatch(HostedIrqDispatchKind::ProviderCallback).execution_irql(),
             2
         );
+    }
+
+    #[test]
+    fn service_kind_preserves_distinct_broker_operations() {
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(1),
+            Some(HostedIrqServiceKind::ProviderImport)
+        );
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(2),
+            Some(HostedIrqServiceKind::ProviderCallbackRequest)
+        );
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(3),
+            Some(HostedIrqServiceKind::QueueDpc)
+        );
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(4),
+            Some(HostedIrqServiceKind::AcquireActualLock)
+        );
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(5),
+            Some(HostedIrqServiceKind::ReleaseActualLock)
+        );
+        assert_eq!(HostedIrqServiceKind::from_raw(6), None);
+        assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
+        assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
+
+        let mut acquire = service();
+        acquire.kind = HostedIrqServiceKind::AcquireActualLock;
+        acquire.argument_count = 0;
+        assert!(acquire.valid());
+        acquire.argument_count = 1;
+        assert!(!acquire.valid());
+
+        let mut release = service();
+        release.kind = HostedIrqServiceKind::ReleaseActualLock;
+        release.argument_count = 1;
+        assert!(release.valid());
+        release.arguments[0] = 0;
+        assert!(!release.valid());
     }
 
     fn service() -> HostedIrqServiceCommand {

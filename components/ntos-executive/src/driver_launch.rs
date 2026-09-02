@@ -20,6 +20,10 @@
 //! The existing bespoke spawners are follow-on migrations onto this path (their descriptor-builders
 //! already exist post effort-1); the named-pipe provider remains the deepest FSD data-plane proof.
 
+#[path = "hosted_irq_broker.rs"]
+#[allow(dead_code)] // Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
+mod hosted_irq_broker;
+
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use core::sync::atomic::{compiler_fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -92,7 +96,8 @@ use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
     HostedDriverThreadError, HostedDriverThreadTable,
-    InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockTable,
+    InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,
+    InterruptActualLockTable,
     InterruptConnection as KernelInterruptConnection, InterruptConnectionDisposition,
     InterruptConnectionIdentity, InterruptConnectionLease, InterruptConnectionRundown,
     InterruptLineDelivery, InterruptLineDeliveryPhase, InterruptLineDisposition,
@@ -11324,7 +11329,7 @@ extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
 
 #[inline]
 unsafe fn hosted_current_irql() -> u8 {
-    if let Some((arena, identity, _, _)) = hosted_irq_lane_context() {
+    if let Some((arena, identity, _, _, _)) = hosted_irq_lane_context() {
         return arena
             .control
             .current_irql(identity)
@@ -11337,7 +11342,7 @@ unsafe fn hosted_current_irql() -> u8 {
 unsafe fn hosted_raise_irql(irql: u8) -> u8 {
     let old = hosted_current_irql();
     if irql > old {
-        if let Some((arena, identity, transaction, _)) = hosted_irq_lane_context() {
+        if let Some((arena, identity, transaction, _, _)) = hosted_irq_lane_context() {
             arena
                 .control
                 .worker_raise_irql(identity, transaction, old, irql)
@@ -11354,7 +11359,7 @@ unsafe fn hosted_raise_irql(irql: u8) -> u8 {
 
 #[inline]
 unsafe fn hosted_lower_irql(irql: u8) {
-    if let Some((arena, identity, transaction, _)) = hosted_irq_lane_context() {
+    if let Some((arena, identity, transaction, _, _)) = hosted_irq_lane_context() {
         let current = arena
             .control
             .current_irql(identity)
@@ -11380,6 +11385,8 @@ const HOSTED_IRQ_LANE_KPCR_GENERATION_OFFSET: u64 = 0x20;
 const HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET: u64 = 0x28;
 const HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET: u64 = 0x30;
 const HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET: u64 = 0x38;
+const HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET: u64 = 0x40;
+const HOSTED_IRQ_LANE_KPCR_GRANT_GENERATION_OFFSET: u64 = 0x48;
 
 #[inline]
 unsafe fn hosted_irq_lane_gs_read(offset: u64) -> u64 {
@@ -11398,6 +11405,7 @@ unsafe fn hosted_irq_lane_context() -> Option<(
     nt_hosted_runtime::HostedIrqLaneIdentity,
     nt_hosted_runtime::HostedIrqTransaction,
     u8,
+    nt_hosted_runtime::HostedIrqGrantIdentity,
 )> {
     if hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) != HOSTED_IRQ_LANE_KPCR_MAGIC {
         return None;
@@ -11427,11 +11435,18 @@ unsafe fn hosted_irq_lane_context() -> Option<(
     if arena_va == 0 {
         hosted_irq_lane_protocol_fault(0);
     }
+    let grant = nt_hosted_runtime::HostedIrqGrantIdentity::new(
+        identity.domain_id,
+        identity.domain_cookie,
+        hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET),
+        hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_GRANT_GENERATION_OFFSET),
+    )
+    .unwrap_or_else(|| hosted_irq_lane_protocol_fault(0));
     let arena = &*(arena_va as *const nt_hosted_runtime::HostedIrqArena);
     if !arena.control.identity_matches(identity) {
         hosted_irq_lane_protocol_fault(0);
     }
-    Some((arena, identity, transaction, depth as u8))
+    Some((arena, identity, transaction, depth as u8, grant))
 }
 
 unsafe fn hosted_irq_lane_publish_context(
@@ -11439,6 +11454,7 @@ unsafe fn hosted_irq_lane_publish_context(
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     transaction: nt_hosted_runtime::HostedIrqTransaction,
     depth: u8,
+    grant: nt_hosted_runtime::HostedIrqGrantIdentity,
 ) {
     let kpcr = FSD_WORKER_VADDR + FSD_WORKER_SCRATCH_OFFSET;
     write_volatile(
@@ -11469,6 +11485,14 @@ unsafe fn hosted_irq_lane_publish_context(
         (kpcr + HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET) as *mut u64,
         depth as u64,
     );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET) as *mut u64,
+        grant.grant_id,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_GENERATION_OFFSET) as *mut u64,
+        grant.grant_generation,
+    );
     compiler_fence(Ordering::Release);
     write_volatile(
         (kpcr + HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) as *mut u64,
@@ -11493,6 +11517,14 @@ unsafe fn hosted_irq_lane_clear_context() {
     );
     write_volatile(
         (kpcr + HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET) as *mut u64,
+        0,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_ID_OFFSET) as *mut u64,
+        0,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_GRANT_GENERATION_OFFSET) as *mut u64,
         0,
     );
 }
@@ -11608,7 +11640,13 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         .control
         .active_transaction(identity, token.transaction)
         .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
-    hosted_irq_lane_publish_context(arena_va, identity, transaction_state, token.depth);
+    hosted_irq_lane_publish_context(
+        arena_va,
+        identity,
+        transaction_state,
+        token.depth,
+        command.grant,
+    );
     let execution_irql = command.execution_irql();
     if execution_irql < entry_irql
         || (execution_irql != entry_irql
@@ -11637,12 +11675,14 @@ unsafe fn hosted_irq_lane_execute_dispatch(
         hosted_irq_lane_record_protocol_fault(arena, identity, token, 4);
         hosted_irq_lane_protocol_fault(sequence);
     }
-    if let Some((_, parent_identity, parent_transaction, parent_depth)) = parent_context {
+    if let Some((_, parent_identity, parent_transaction, parent_depth, parent_grant)) = parent_context
+    {
         hosted_irq_lane_publish_context(
             arena_va,
             parent_identity,
             parent_transaction,
             parent_depth,
+            parent_grant,
         );
     } else {
         hosted_irq_lane_clear_context();
@@ -11660,7 +11700,7 @@ unsafe fn hosted_irq_lane_execute_dispatch(
 unsafe fn hosted_irq_lane_service(
     command: nt_hosted_runtime::HostedIrqServiceCommand,
 ) -> nt_hosted_runtime::HostedIrqArenaResult {
-    let Some((arena, identity, transaction, depth)) = hosted_irq_lane_context() else {
+    let Some((arena, identity, transaction, depth, _)) = hosted_irq_lane_context() else {
         hosted_irq_lane_protocol_fault(0);
     };
     let service_token = arena.service[depth as usize]
@@ -12978,8 +13018,65 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
         let synchronize_irql =
             read_unaligned((interrupt + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8);
         let actual_lock = read_unaligned((interrupt + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64);
-        if actual_lock == 0 || synchronize_irql < DISPATCH_LEVEL {
+        let interrupt_id = read_unaligned((interrupt + HOSTED_KINTERRUPT_ID) as *const u64);
+        let grant_generation =
+            read_unaligned((interrupt + HOSTED_KINTERRUPT_GRANT_GENERATION) as *const u64);
+        if actual_lock == 0
+            || interrupt_id == 0
+            || grant_generation == 0
+            || synchronize_irql < DISPATCH_LEVEL
+        {
             return 0;
+        }
+        if let Some((_, identity, _, _, _)) = hosted_irq_lane_context() {
+            let Some(grant) = nt_hosted_runtime::HostedIrqGrantIdentity::new(
+                identity.domain_id,
+                identity.domain_cookie,
+                interrupt_id,
+                grant_generation,
+            ) else {
+                hosted_irq_lane_protocol_fault(0);
+            };
+            let old_irql = hosted_raise_irql(synchronize_irql);
+            let acquired = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::AcquireActualLock,
+                service_id: actual_lock,
+                target_domain_id: identity.domain_id,
+                target_domain_cookie: identity.domain_cookie,
+                grant,
+                argument_count: 0,
+                arguments: [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP],
+            });
+            if acquired.faulted
+                || acquired.status != STATUS_SUCCESS
+                || acquired.value_count != 1
+                || acquired.values[0] == 0
+            {
+                hosted_lower_irql(old_irql);
+                hosted_irq_lane_protocol_fault(interrupt_id);
+            }
+            let f: extern "win64" fn(u64) -> u8 = core::mem::transmute(routine as *const ());
+            let result = f(context);
+            let mut release_arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+            release_arguments[0] = acquired.values[0];
+            let released = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::ReleaseActualLock,
+                service_id: actual_lock,
+                target_domain_id: identity.domain_id,
+                target_domain_cookie: identity.domain_cookie,
+                grant,
+                argument_count: 1,
+                arguments: release_arguments,
+            });
+            if released.faulted
+                || released.status != STATUS_SUCCESS
+                || released.value_count != 0
+            {
+                hosted_lower_irql(old_irql);
+                hosted_irq_lane_protocol_fault(interrupt_id);
+            }
+            hosted_lower_irql(old_irql);
+            return result;
         }
         let old_irql = hosted_raise_irql(synchronize_irql);
         // The hosted ABI exposes one logical processor. Its KSPIN_LOCK operations are therefore

@@ -23033,6 +23033,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     connection identity is now closed; continue with the typed root Service broker and recursive
     dispatch driver.
 
+    B3 typed root interrupt-Service checkpoint (2026-09-02, implementation green; atomic cutover
+    still open): `nt-hosted-runtime` now gives each required nested operation a distinct wire kind:
+    provider import, reverse provider-callback request, queue DPC, acquire `ActualLock`, and release
+    `ActualLock`. Acquire and release have exact argument shapes, reverse callback is the only kind
+    allowed to request nested dispatch, malformed commands fail before page state changes, and the
+    focused runtime suite passes 101/101.
+
+    The executive's root driver now lives in focused `hosted_irq_broker.rs`. It acquires the outer
+    connection's generation-owned `ActualLock` before opening an Interrupt transaction, drives the
+    private lane until the exact outer Dispatch completion, begins and completes same-depth Service
+    pages recursively, retains nested lock leases by exact sequence, and releases all root-held
+    authority on unwind. Contention before dispatch is reported as deferred work; acquiring a lock
+    already held by the current recursive ISR descendant is a fatal possible-deadlock result.
+    Transport/protocol/service faults poison the arena and quarantine the lane instead of fabricating
+    an unclaimed ISR result.
+
+    Lane KPCR context now retains the active dispatch grant id and generation across nested calls.
+    Lane-local `KeSynchronizeExecution` raises to the projected `SynchronizeIrql`, sends typed
+    acquire/release Service commands for the exact projected interrupt grant, invokes the real
+    synchronization routine only while root owns the lease, and fails closed on any mismatched
+    completion. The ordinary component path is unchanged until cutover. Provider import, reverse
+    callback, and DPC Service kinds currently return explicit `STATUS_NOT_SUPPORTED`; the root
+    driver is therefore staged but not selected by live IRQ delivery, and there is no alternate or
+    fallback arena behavior. The freestanding executive check is green with 213 warnings.
+
+    Serialized Simpleboot acceptance `.tmp/run-desktop-20260902-134142.log` completes at guest
+    `t_ms=113708`, passes real NDIS receive and hardware interrupt delivery, and reaches genuine
+    Explorer chrome. Explorer reports begin/end paint `5/20`, 165 direct GDI returns, 125/172 batch
+    flushes/records, and all 786432 framebuffer pixels non-background with at least 32 colours. The
+    final result is `295/295`, the sentinel matches, and QEMU exits normally.
+
+    Next add the generation-owned KDPC registry and route lane `KeInsertQueueDpc` through its typed
+    Service command. Then adapt the existing provider marshal/callback authorities to arena-owned
+    arguments and nested dispatch without the shared request banks. When all three Service families
+    are green, select the root driver for live ISR/DPC/provider execution and delete
+    `FSD_DISPATCH_INTERRUPT`, the shared DPC ring, provider shared-bank nesting, and ordinary-bank
+    busy deferral in one commit series before serialized desktop acceptance.
+
     Reference review adjustment: the live NDIS call graph requires both provider-import services
     and reverse provider-callback requests inside the same Interrupt or Dpc transaction. Add a
     distinct typed reverse-callback Service kind and retain the outer transaction class throughout
