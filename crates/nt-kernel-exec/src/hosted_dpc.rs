@@ -10,16 +10,18 @@ use alloc::vec::Vec;
 pub struct HostedDpcOwner {
     pub domain_id: u64,
     pub domain_cookie: u64,
+    pub lane_generation: u64,
 }
 
 impl HostedDpcOwner {
-    pub const fn new(domain_id: u64, domain_cookie: u64) -> Option<Self> {
-        if domain_id == 0 || domain_cookie == 0 {
+    pub const fn new(domain_id: u64, domain_cookie: u64, lane_generation: u64) -> Option<Self> {
+        if domain_id == 0 || domain_cookie == 0 || lane_generation == 0 {
             None
         } else {
             Some(Self {
                 domain_id,
                 domain_cookie,
+                lane_generation,
             })
         }
     }
@@ -120,8 +122,11 @@ impl HostedDpcTable {
     }
 
     fn identity_valid(identity: HostedDpcIdentity) -> bool {
-        HostedDpcOwner::new(identity.owner.domain_id, identity.owner.domain_cookie)
-            == Some(identity.owner)
+        HostedDpcOwner::new(
+            identity.owner.domain_id,
+            identity.owner.domain_cookie,
+            identity.owner.lane_generation,
+        ) == Some(identity.owner)
             && HostedDpcIdentity::new(identity.owner, identity.dpc_token, identity.generation)
                 == Some(identity)
     }
@@ -151,7 +156,8 @@ impl HostedDpcTable {
         routine: u64,
         deferred_context: u64,
     ) -> Result<HostedDpcIdentity, HostedDpcError> {
-        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie) != Some(owner)
+        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie, owner.lane_generation)
+            != Some(owner)
             || dpc_token == 0
             || routine == 0
         {
@@ -248,7 +254,9 @@ impl HostedDpcTable {
         &mut self,
         owner: HostedDpcOwner,
     ) -> Result<Option<HostedDpcActivation>, HostedDpcError> {
-        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie) != Some(owner) {
+        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie, owner.lane_generation)
+            != Some(owner)
+        {
             return Err(HostedDpcError::InvalidIdentity);
         }
         let Some(index) = self
@@ -306,6 +314,44 @@ impl HostedDpcTable {
         Ok(())
     }
 
+    pub fn has_owner(&self, owner: HostedDpcOwner) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.live && record.identity.owner == owner)
+    }
+
+    pub fn queued_count(&self, owner: HostedDpcOwner) -> usize {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.live && record.identity.owner == owner && record.queued.is_some()
+            })
+            .count()
+    }
+
+    pub fn retire_owner(&mut self, owner: HostedDpcOwner) -> Result<usize, HostedDpcError> {
+        if HostedDpcOwner::new(owner.domain_id, owner.domain_cookie, owner.lane_generation)
+            != Some(owner)
+        {
+            return Err(HostedDpcError::InvalidIdentity);
+        }
+        if self.records.iter().any(|record| {
+            record.live
+                && record.identity.owner == owner
+                && (record.queued.is_some() || record.in_flight.is_some())
+        }) {
+            return Err(HostedDpcError::Busy);
+        }
+        let mut retired = 0usize;
+        for record in &mut self.records {
+            if record.live && record.identity.owner == owner {
+                record.live = false;
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
     pub fn snapshot(
         &self,
         identity: HostedDpcIdentity,
@@ -326,7 +372,7 @@ mod tests {
     use super::*;
 
     fn owner(id: u64) -> HostedDpcOwner {
-        HostedDpcOwner::new(id, id + 1).unwrap()
+        HostedDpcOwner::new(id, id + 1, id + 2).unwrap()
     }
 
     #[test]
@@ -415,5 +461,27 @@ mod tests {
             Err(HostedDpcError::StaleActivation)
         );
         table.complete(activation).unwrap();
+    }
+
+    #[test]
+    fn owner_retirement_requires_an_idle_exact_lane_generation() {
+        let mut table = HostedDpcTable::new();
+        let first_owner = owner(7);
+        let next_owner = HostedDpcOwner::new(
+            first_owner.domain_id,
+            first_owner.domain_cookie,
+            first_owner.lane_generation + 1,
+        )
+        .unwrap();
+        let identity = table.register(first_owner, 0x1000, 0x2000, 0).unwrap();
+        assert!(table.has_owner(first_owner));
+        assert!(!table.has_owner(next_owner));
+        table.queue(identity, 0, 0).unwrap();
+        assert_eq!(table.queued_count(first_owner), 1);
+        assert_eq!(table.retire_owner(first_owner), Err(HostedDpcError::Busy));
+        assert!(table.remove(identity).unwrap());
+        assert_eq!(table.queued_count(first_owner), 0);
+        assert_eq!(table.retire_owner(first_owner), Ok(1));
+        assert!(!table.has_owner(first_owner));
     }
 }

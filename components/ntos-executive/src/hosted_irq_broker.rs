@@ -14,6 +14,7 @@ pub(super) enum HostedIrqRootDispatchOutcome {
 
 #[derive(Clone, Copy)]
 struct HostedIrqLaneView {
+    projection_instance: usize,
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     channel: crate::spawn_hosts::PumpChannel,
     badge: u64,
@@ -43,7 +44,7 @@ struct HostedIrqPreparedTarget {
 struct HostedIrqRootSession {
     lanes: Vec<HostedIrqActiveLane>,
     call_frames: Vec<nt_hosted_runtime::HostedIrqCallFrame>,
-    outer_lock: InterruptActualLockLease,
+    outer_lock: Option<InterruptActualLockLease>,
     service_locks: Vec<InterruptActualLockLease>,
 }
 
@@ -113,6 +114,7 @@ unsafe fn lane_view_for_domain(
     let channel = hosted_irq_lane_channel(lane, inst)
         .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     Ok(HostedIrqLaneView {
+        projection_instance: lane.projection_instance,
         identity: lane.identity,
         channel,
         badge: lane.badge,
@@ -152,6 +154,30 @@ unsafe fn lane_has_connection_grant(
                     == lane.identity.domain_id
                 && connection.binding.projection_domain.cookie == lane.identity.domain_cookie
                 && connection.lane_generation == lane.identity.lane_generation
+        })
+    })
+}
+
+unsafe fn lane_has_service_grant(
+    lane: HostedIrqLaneView,
+    grant: nt_hosted_runtime::HostedIrqGrantIdentity,
+) -> bool {
+    if lane_has_connection_grant(lane, grant) {
+        return true;
+    }
+    hosted_provider_domain_dependencies().is_some_and(|dependencies| {
+        dependencies.iter().copied().any(|dependency| {
+            hosted_provider_domain_dependency_is_live(dependency)
+                && ((dependency.dependent_instance == lane.projection_instance
+                    && dependency.dependent_domain.domain_id.raw() == lane.identity.domain_id
+                    && dependency.dependent_domain.cookie == lane.identity.domain_cookie
+                    && dependency.dependent_lane_generation == lane.identity.lane_generation
+                    && dependency.dependent_grant == grant)
+                    || (dependency.provider_instance == lane.projection_instance
+                        && dependency.provider_domain.domain_id.raw() == lane.identity.domain_id
+                        && dependency.provider_domain.cookie == lane.identity.domain_cookie
+                        && dependency.provider_lane_generation == lane.identity.lane_generation
+                        && dependency.provider_grant == grant))
         })
     })
 }
@@ -776,7 +802,9 @@ impl HostedIrqRootSession {
         }
         match command.kind {
             nt_hosted_runtime::HostedIrqServiceKind::AcquireActualLock => {
-                if self.outer_lock.identity == connection.actual_lock
+                if self
+                    .outer_lock
+                    .is_some_and(|lease| lease.identity == connection.actual_lock)
                     || self
                         .service_locks
                         .iter()
@@ -841,15 +869,19 @@ impl HostedIrqRootSession {
         {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         }
-        let connection = match connection_for_service(lane, command) {
-            Ok(connection) => connection,
-            Err(status) => return fatal_service_result(status.raw()),
-        };
-        let instance_index = connection.binding.projection_instance;
+        if !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let instance_index = lane.projection_instance;
         let Some(inst) = instance(instance_index) else {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         };
-        if instance_domain_identity(inst) != Some(connection.binding.projection_domain) {
+        let Some(domain) = instance_domain_identity(inst) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if domain.domain_id.raw() != lane.identity.domain_id
+            || domain.cookie != lane.identity.domain_cookie
+        {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         }
         let Some(exec_dpc) = component_to_exec_va_for_instance(
@@ -888,8 +920,9 @@ impl HostedIrqRootSession {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         }
         let Some(owner) = HostedDpcOwner::new(
-            connection.binding.projection_domain.domain_id.raw(),
-            connection.binding.projection_domain.cookie,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            lane.identity.lane_generation,
         ) else {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         };
@@ -1152,7 +1185,7 @@ pub(super) unsafe fn dispatch_interrupt(
     let mut session = HostedIrqRootSession {
         lanes,
         call_frames: Vec::new(),
-        outer_lock,
+        outer_lock: Some(outer_lock),
         service_locks: Vec::new(),
     };
     let result = session.drive_dispatch(0, dispatch);
@@ -1200,9 +1233,11 @@ pub(super) unsafe fn dispatch_interrupt(
         .control
         .root_finish_transaction(lane.identity, transaction)
         .map_err(arena_status);
-    let outer_release = hosted_irq_actual_locks_mut()
-        .release(session.outer_lock)
-        .map_err(hosted_irq_actual_lock_status);
+    let outer_release = session.outer_lock.take().map_or(Ok(()), |lease| {
+        hosted_irq_actual_locks_mut()
+            .release(lease)
+            .map_err(hosted_irq_actual_lock_status)
+    });
     let result = result?;
     service_release?;
     finish?;
