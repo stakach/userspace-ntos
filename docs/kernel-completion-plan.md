@@ -22458,6 +22458,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     handling are wired, receiving a command is a fatal protocol wall rather than a fabricated result.
     No QEMU run was made for this fail-closed bootstrap checkpoint.
 
+    B3 private arena worker checkpoint (2026-09-02, host, freestanding, and desktop acceptance
+    green; root command/service orchestration open): the lane no longer faults merely because the
+    executive replies with its first live command. It decodes the exact v2 token, admits the matching
+    depth-indexed dispatch page, derives the transaction class from the typed ISR/DPC/provider-
+    callback command, publishes the active transaction in its private KPCR, raises and lowers the
+    arena-owned IRQL, invokes the native Win64 routine shape, publishes the typed result, and parks on
+    the same private completion transport for the next command. Protocol, identity, page, IRQL, and
+    completion mismatch records the sticky arena fault and fails closed. Ordinary component execution
+    continues to use its existing IRQL projection; lane code selects the arena control through the
+    private GS/KPCR context and never touches `SH_REQ_*`.
+
+    The command-to-transaction mapping now lives in `nt-hosted-runtime` so worker and root cannot
+    assign different classes. Its focused suite passes 98/98 and the freestanding executive check is
+    green at the existing 215-warning baseline. Serialized desktop proof
+    `.tmp/run-desktop-20260902-123837.log` preserves real NDIS receive and hardware ISR/DPC delivery,
+    Explorer begin/end paint `5/20`, 165 direct GDI returns, 125/172 batch flushes/records, and all
+    786432 framebuffer pixels with at least 32 colours. The result is `295/295`, the sentinel matched,
+    and QEMU exited normally. This checkpoint does not route a live ISR through the arena yet; the old
+    request-bank transport remains the sole temporary path until the following prerequisites can be
+    cut over and removed together.
+
+    Reference adjustment: a private sibling TCB invalidates the earlier barrier-only interpretation
+    of `KINTERRUPT::ActualLock`. NT5 and ReactOS raise to each connection's `SynchronizeIrql`, acquire
+    that exact lock across ISR execution, and make `KeSynchronizeExecution` use the same lock and IRQL.
+    Add a generation-owned actual-lock lease shared by ordinary synchronization calls and the IRQ
+    lane. Then surface nested Service-direction arena tokens, add exact provider/dependent callback
+    grants and lanes, and add the generation-owned DPC registry. DPC insertion may only queue work;
+    root dispatches its fresh depth-zero DPC transaction after the complete line scan and checked
+    physical acknowledgement. Disconnect must not discard an independently queued DPC. Only after
+    those requirements are green may root enable live arena ISR dispatch and atomically delete
+    `FSD_DISPATCH_INTERRUPT`, active-request-bank deferral, and shared ISR/DPC evidence.
+
     B3 generation-fenced interrupt-grant checkpoint (2026-09-02, host and freestanding green; live
     dispatch open): `nt-resource-manager` now assigns every interrupt connection a checked, nonzero
     grant generation in addition to its monotonic interrupt id. Connect atomically returns the full

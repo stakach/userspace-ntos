@@ -11318,26 +11318,162 @@ extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
 
 #[inline]
 unsafe fn hosted_current_irql() -> u8 {
+    if let Some((arena, identity, _)) = hosted_irq_lane_context() {
+        return arena
+            .control
+            .current_irql(identity)
+            .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
+    }
     read_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *const u8)
-}
-
-#[inline]
-unsafe fn hosted_set_current_irql(irql: u8) {
-    write_volatile((FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8, irql);
 }
 
 #[inline]
 unsafe fn hosted_raise_irql(irql: u8) -> u8 {
     let old = hosted_current_irql();
     if irql > old {
-        hosted_set_current_irql(irql);
+        if let Some((arena, identity, transaction)) = hosted_irq_lane_context() {
+            arena
+                .control
+                .worker_raise_irql(identity, transaction, old, irql)
+                .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
+        } else {
+            write_volatile(
+                (FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+                irql,
+            );
+        }
     }
     old
 }
 
 #[inline]
 unsafe fn hosted_lower_irql(irql: u8) {
-    hosted_set_current_irql(irql);
+    if let Some((arena, identity, transaction)) = hosted_irq_lane_context() {
+        let current = arena
+            .control
+            .current_irql(identity)
+            .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
+        arena
+            .control
+            .worker_lower_irql(identity, transaction, current, irql)
+            .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
+    } else {
+        write_volatile(
+            (FSD_SHARED_VADDR + SH_HOSTED_CURRENT_IRQL) as *mut u8,
+            irql,
+        );
+    }
+}
+
+const HOSTED_IRQ_LANE_KPCR_MAGIC: u64 = 0x4849_5251_4b50_4352;
+const HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET: u64 = 0x00;
+const HOSTED_IRQ_LANE_KPCR_ARENA_OFFSET: u64 = 0x08;
+const HOSTED_IRQ_LANE_KPCR_DOMAIN_ID_OFFSET: u64 = 0x10;
+const HOSTED_IRQ_LANE_KPCR_DOMAIN_COOKIE_OFFSET: u64 = 0x18;
+const HOSTED_IRQ_LANE_KPCR_GENERATION_OFFSET: u64 = 0x20;
+const HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET: u64 = 0x28;
+const HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET: u64 = 0x30;
+
+#[inline]
+unsafe fn hosted_irq_lane_gs_read(offset: u64) -> u64 {
+    let value: u64;
+    core::arch::asm!(
+        "mov {value}, qword ptr gs:[{offset}]",
+        value = out(reg) value,
+        offset = in(reg) offset,
+        options(nostack, preserves_flags, readonly),
+    );
+    value
+}
+
+unsafe fn hosted_irq_lane_context() -> Option<(
+    &'static nt_hosted_runtime::HostedIrqArena,
+    nt_hosted_runtime::HostedIrqLaneIdentity,
+    nt_hosted_runtime::HostedIrqTransaction,
+)> {
+    if hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) != HOSTED_IRQ_LANE_KPCR_MAGIC {
+        return None;
+    }
+    let arena_va = hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_ARENA_OFFSET);
+    let identity = nt_hosted_runtime::HostedIrqLaneIdentity::new(
+        hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_DOMAIN_ID_OFFSET),
+        hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_DOMAIN_COOKIE_OFFSET),
+        hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_GENERATION_OFFSET),
+    )
+    .unwrap_or_else(|| hosted_irq_lane_protocol_fault(0));
+    let class = match hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET) {
+        1 => nt_hosted_runtime::HostedIrqTransactionClass::Interrupt,
+        2 => nt_hosted_runtime::HostedIrqTransactionClass::Callback,
+        3 => nt_hosted_runtime::HostedIrqTransactionClass::Dpc,
+        _ => hosted_irq_lane_protocol_fault(0),
+    };
+    let transaction = nt_hosted_runtime::HostedIrqTransaction {
+        lane_generation: identity.lane_generation,
+        transaction: hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET),
+        class,
+    };
+    if arena_va == 0 {
+        hosted_irq_lane_protocol_fault(0);
+    }
+    let arena = &*(arena_va as *const nt_hosted_runtime::HostedIrqArena);
+    if !arena.control.identity_matches(identity) {
+        hosted_irq_lane_protocol_fault(0);
+    }
+    Some((arena, identity, transaction))
+}
+
+unsafe fn hosted_irq_lane_publish_context(
+    arena_va: u64,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    transaction: nt_hosted_runtime::HostedIrqTransaction,
+) {
+    let kpcr = FSD_WORKER_VADDR + FSD_WORKER_SCRATCH_OFFSET;
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_ARENA_OFFSET) as *mut u64,
+        arena_va,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_DOMAIN_ID_OFFSET) as *mut u64,
+        identity.domain_id,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_DOMAIN_COOKIE_OFFSET) as *mut u64,
+        identity.domain_cookie,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_GENERATION_OFFSET) as *mut u64,
+        identity.lane_generation,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET) as *mut u64,
+        transaction.transaction,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET) as *mut u64,
+        transaction.class as u32 as u64,
+    );
+    compiler_fence(Ordering::Release);
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) as *mut u64,
+        HOSTED_IRQ_LANE_KPCR_MAGIC,
+    );
+}
+
+unsafe fn hosted_irq_lane_clear_context() {
+    let kpcr = FSD_WORKER_VADDR + FSD_WORKER_SCRATCH_OFFSET;
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) as *mut u64,
+        0,
+    );
+    compiler_fence(Ordering::Release);
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET) as *mut u64,
+        0,
+    );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET) as *mut u64,
+        0,
+    );
 }
 
 fn hosted_irq_lane_protocol_fault(sequence: u64) -> ! {
@@ -11348,10 +11484,115 @@ fn hosted_irq_lane_protocol_fault(sequence: u64) -> ! {
     }
 }
 
+fn hosted_irq_lane_transaction(
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    token: nt_hosted_runtime::HostedIrqArenaToken,
+    command: nt_hosted_runtime::HostedIrqDispatchCommand,
+) -> nt_hosted_runtime::HostedIrqTransaction {
+    nt_hosted_runtime::HostedIrqTransaction {
+        lane_generation: identity.lane_generation,
+        transaction: token.transaction,
+        class: command.transaction_class(),
+    }
+}
+
+unsafe fn hosted_irq_lane_invoke(
+    command: nt_hosted_runtime::HostedIrqDispatchCommand,
+) -> nt_hosted_runtime::HostedIrqArenaResult {
+    match command.kind {
+        nt_hosted_runtime::HostedIrqDispatchKind::InterruptService => {
+            let routine: extern "win64" fn(u64, u64) -> u8 =
+                core::mem::transmute(command.routine as *const ());
+            let claimed = routine(command.object, command.context) != 0;
+            nt_hosted_runtime::HostedIrqArenaResult {
+                status: STATUS_SUCCESS,
+                faulted: false,
+                value_count: 1,
+                values: [claimed as u64, 0, 0, 0],
+            }
+        }
+        nt_hosted_runtime::HostedIrqDispatchKind::DeferredProcedure => {
+            let routine: extern "win64" fn(u64, u64, u64, u64) =
+                core::mem::transmute(command.routine as *const ());
+            routine(
+                command.object,
+                command.context,
+                command.arguments[0],
+                command.arguments[1],
+            );
+            nt_hosted_runtime::HostedIrqArenaResult {
+                status: STATUS_SUCCESS,
+                faulted: false,
+                value_count: 0,
+                values: [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_RESULT_CAP],
+            }
+        }
+        nt_hosted_runtime::HostedIrqDispatchKind::ProviderCallback => {
+            let routine: extern "win64" fn(
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+            ) -> u64 = core::mem::transmute(command.routine as *const ());
+            let result = routine(
+                command.arguments[0],
+                command.arguments[1],
+                command.arguments[2],
+                command.arguments[3],
+                command.arguments[4],
+                command.arguments[5],
+                command.arguments[6],
+                command.arguments[7],
+                command.arguments[8],
+                command.arguments[9],
+                command.arguments[10],
+                command.arguments[11],
+            );
+            nt_hosted_runtime::HostedIrqArenaResult {
+                status: STATUS_SUCCESS,
+                faulted: false,
+                value_count: 1,
+                values: [result, 0, 0, 0],
+            }
+        }
+    }
+}
+
+unsafe fn hosted_irq_lane_record_protocol_fault(
+    arena: &nt_hosted_runtime::HostedIrqArena,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    token: nt_hosted_runtime::HostedIrqArenaToken,
+    code: u64,
+) {
+    let _ = arena.control.record_first_fault(
+        identity,
+        nt_hosted_runtime::HostedIrqFaultRecord {
+            kind: nt_hosted_runtime::HostedIrqFaultKind::Protocol,
+            transaction: token.transaction,
+            sequence: token.sequence,
+            depth: token.depth,
+            direction: token.direction,
+            code,
+            instruction_pointer: 0,
+            address: 0,
+            parameters: [0; 4],
+        },
+    );
+}
+
 /// Entry point for the private interrupt execution lane in each hosted driver domain. Bootstrap
-/// publishes READY through the v2 arena and parks in one completion `Call`. Live commands remain
-/// fenced until the executive validates their grants and installs the nested dispatch/service loop;
-/// receiving one before that cutover is a protocol fault, never a synthetic completion.
+/// publishes READY through the v2 arena and parks in one completion `Call`. Every subsequent reply
+/// carries the exact arena token for one root-published command; the worker validates, enters the
+/// transaction's lane-local IRQL context, invokes the typed routine, publishes the result, and parks
+/// again without touching the ordinary component request bank.
 extern "win64" fn hosted_irq_lane_component_entry(arena_va: u64) -> ! {
     if arena_va != FSD_WORKER_VADDR + FSD_IRQ_LANE_ARENA_OFFSET {
         hosted_irq_lane_protocol_fault(0);
@@ -11364,7 +11605,7 @@ extern "win64" fn hosted_irq_lane_component_entry(arena_va: u64) -> ! {
         hosted_irq_lane_protocol_fault(0);
     }
     let ready = identity.ready_transport_words();
-    let (label, lane_generation, transaction, sequence, depth_direction) = unsafe {
+    let (mut label, mut lane_generation, mut transaction, mut sequence, mut depth_direction) = unsafe {
         call_on4(
             (FSD_IRQ_LANE_COMPLETION_LABEL << 12) | 4,
             ready[0],
@@ -11373,15 +11614,84 @@ extern "win64" fn hosted_irq_lane_component_entry(arena_va: u64) -> ! {
             ready[3],
         )
     };
-    if label != 0
-        || lane_generation != identity.lane_generation
-        || transaction == 0
-        || sequence == 0
-        || depth_direction & !0xffff != 0
-    {
-        hosted_irq_lane_protocol_fault(sequence);
+    loop {
+        let Some(token) = nt_hosted_runtime::HostedIrqArenaToken::from_transport_words([
+            lane_generation,
+            transaction,
+            sequence,
+            depth_direction,
+        ]) else {
+            hosted_irq_lane_protocol_fault(sequence);
+        };
+        if label != 0
+            || token.lane_generation != identity.lane_generation
+            || token.direction != nt_hosted_runtime::HostedIrqLaneDirection::Dispatch
+        {
+            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 1) };
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        let command = match arena.dispatch[token.depth as usize].worker_begin(
+            &arena.control,
+            identity,
+            token,
+        ) {
+            Ok(command) => command,
+            Err(_) => {
+                unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 2) };
+                hosted_irq_lane_protocol_fault(sequence);
+            }
+        };
+        let transaction_state = hosted_irq_lane_transaction(identity, token, command);
+        unsafe { hosted_irq_lane_publish_context(arena_va, identity, transaction_state) };
+        let execution_irql = command.execution_irql();
+        if arena
+            .control
+            .worker_raise_irql(identity, transaction_state, PASSIVE_LEVEL, execution_irql)
+            .is_err()
+        {
+            unsafe { hosted_irq_lane_clear_context() };
+            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 3) };
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        let result = unsafe { hosted_irq_lane_invoke(command) };
+        let current_irql = arena
+            .control
+            .current_irql(identity)
+            .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
+        if current_irql != execution_irql
+            || arena
+                .control
+                .worker_lower_irql(
+                    identity,
+                    transaction_state,
+                    execution_irql,
+                    PASSIVE_LEVEL,
+                )
+                .is_err()
+        {
+            unsafe { hosted_irq_lane_clear_context() };
+            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 4) };
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        unsafe { hosted_irq_lane_clear_context() };
+        if arena.dispatch[token.depth as usize]
+            .worker_complete(&arena.control, identity, token, result)
+            .is_err()
+        {
+            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 5) };
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        let words = token.transport_words();
+        (label, lane_generation, transaction, sequence, depth_direction) = unsafe {
+            call_on4(
+                (FSD_IRQ_LANE_COMPLETION_LABEL << 12) | 4,
+                words[0],
+                words[1],
+                words[2],
+                words[3],
+            )
+        };
     }
-    hosted_irq_lane_protocol_fault(sequence)
 }
 
 fn hosted_fast_mutex_failure(mutex: u64, status: i32) -> ! {

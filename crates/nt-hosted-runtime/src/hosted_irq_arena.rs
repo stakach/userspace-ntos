@@ -336,6 +336,23 @@ pub struct HostedIrqDispatchCommand {
 }
 
 impl HostedIrqDispatchCommand {
+    pub const fn transaction_class(self) -> HostedIrqTransactionClass {
+        match self.kind {
+            HostedIrqDispatchKind::InterruptService => HostedIrqTransactionClass::Interrupt,
+            HostedIrqDispatchKind::DeferredProcedure => HostedIrqTransactionClass::Dpc,
+            HostedIrqDispatchKind::ProviderCallback => HostedIrqTransactionClass::Callback,
+        }
+    }
+
+    pub const fn execution_irql(self) -> u8 {
+        match self.kind {
+            HostedIrqDispatchKind::InterruptService => self.synchronize_irql,
+            HostedIrqDispatchKind::DeferredProcedure | HostedIrqDispatchKind::ProviderCallback => {
+                self.entry_irql
+            }
+        }
+    }
+
     fn valid(self) -> bool {
         if self.work_id == 0
             || self.routine == 0
@@ -2095,6 +2112,34 @@ mod tests {
             argument_count: 3,
             arguments: [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         }
+    }
+
+    #[test]
+    fn dispatch_kind_selects_one_exact_transaction_class() {
+        assert_eq!(
+            dispatch(HostedIrqDispatchKind::InterruptService).transaction_class(),
+            HostedIrqTransactionClass::Interrupt
+        );
+        assert_eq!(
+            dispatch(HostedIrqDispatchKind::DeferredProcedure).transaction_class(),
+            HostedIrqTransactionClass::Dpc
+        );
+        assert_eq!(
+            dispatch(HostedIrqDispatchKind::ProviderCallback).transaction_class(),
+            HostedIrqTransactionClass::Callback
+        );
+        assert_eq!(
+            dispatch(HostedIrqDispatchKind::InterruptService).execution_irql(),
+            7
+        );
+        assert_eq!(
+            dispatch(HostedIrqDispatchKind::DeferredProcedure).execution_irql(),
+            2
+        );
+        assert_eq!(
+            dispatch(HostedIrqDispatchKind::ProviderCallback).execution_irql(),
+            2
+        );
     }
 
     fn service() -> HostedIrqServiceCommand {
