@@ -16503,6 +16503,8 @@ struct HostedProviderDomainDependency {
     provider_publication_cookie: u64,
     dependent_lane_generation: u64,
     provider_lane_generation: u64,
+    dependent_grant: HostedIrqGrantIdentity,
+    provider_grant: HostedIrqGrantIdentity,
 }
 
 impl HostedProviderDomainDependency {
@@ -16524,6 +16526,18 @@ impl HostedProviderDomainDependency {
             provider_publication_cookie: 0,
             dependent_lane_generation: 0,
             provider_lane_generation: 0,
+            dependent_grant: HostedIrqGrantIdentity {
+                owner_domain_id: 0,
+                owner_domain_cookie: 0,
+                grant_id: 0,
+                grant_generation: 0,
+            },
+            provider_grant: HostedIrqGrantIdentity {
+                owner_domain_id: 0,
+                owner_domain_cookie: 0,
+                grant_id: 0,
+                grant_generation: 0,
+            },
         }
     }
 }
@@ -18266,6 +18280,19 @@ fn hosted_provider_domain_dependency_is_live(dependency: HostedProviderDomainDep
     !dependency.retiring && hosted_provider_domain_dependency_is_current(dependency)
 }
 
+fn hosted_provider_dependency_grant(
+    domain: HostedDomainIdentity,
+    provider_publication_cookie: u64,
+    lane_generation: u64,
+) -> Option<HostedIrqGrantIdentity> {
+    let identity = nt_hosted_runtime::HostedIrqLaneIdentity::new(
+        domain.domain_id.raw(),
+        domain.cookie,
+        lane_generation,
+    )?;
+    HostedIrqGrantIdentity::for_lane(identity, provider_publication_cookie)
+}
+
 fn hosted_provider_domain_dependency_is_current(
     dependency: HostedProviderDomainDependency,
 ) -> bool {
@@ -18283,6 +18310,16 @@ fn hosted_provider_domain_dependency_is_current(
         || unsafe {
             hosted_irq_lane_generation(dependency.provider_instance, dependency.provider_domain)
         } != Some(dependency.provider_lane_generation)
+        || hosted_provider_dependency_grant(
+            dependency.dependent_domain,
+            dependency.provider_publication_cookie,
+            dependency.dependent_lane_generation,
+        ) != Some(dependency.dependent_grant)
+        || hosted_provider_dependency_grant(
+            dependency.provider_domain,
+            dependency.provider_publication_cookie,
+            dependency.provider_lane_generation,
+        ) != Some(dependency.provider_grant)
         || io_manager_mut().hosted_provider_identity(dependency.dependent_domain)
             != Some(dependency.provider_domain)
     {
@@ -18389,6 +18426,22 @@ unsafe fn ensure_hosted_provider_domain_dependency(
             return Err(status.raw());
         }
     };
+    let (Some(provider_grant), Some(dependent_grant)) = (
+        hosted_provider_dependency_grant(
+            provider_domain,
+            provider_publication_cookie,
+            provider_lane_generation,
+        ),
+        hosted_provider_dependency_grant(
+            dependent_domain,
+            provider_publication_cookie,
+            dependent_lane_generation,
+        ),
+    ) else {
+        let _ = retire_hosted_irq_lane_if_unreferenced(dependent_instance, dependent_domain);
+        let _ = retire_hosted_irq_lane_if_unreferenced(provider_instance, provider_domain);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
     let created = io_manager_mut()
         .set_hosted_domain_provider(dependent_domain, provider_domain)
         .map_err(|status| {
@@ -18412,6 +18465,8 @@ unsafe fn ensure_hosted_provider_domain_dependency(
         provider_publication_cookie,
         dependent_lane_generation,
         provider_lane_generation,
+        dependent_grant,
+        provider_grant,
     };
     let dependencies = hosted_provider_domain_dependencies_mut();
     if let Some(index) = vacant_index {

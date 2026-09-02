@@ -265,6 +265,15 @@ impl HostedIrqGrantIdentity {
         }
     }
 
+    pub const fn for_lane(identity: HostedIrqLaneIdentity, grant_id: u64) -> Option<Self> {
+        Self::new(
+            identity.domain_id,
+            identity.domain_cookie,
+            grant_id,
+            identity.lane_generation,
+        )
+    }
+
     fn valid(self) -> bool {
         Self::new(
             self.owner_domain_id,
@@ -2173,6 +2182,21 @@ mod tests {
 
     fn grant() -> HostedIrqGrantIdentity {
         HostedIrqGrantIdentity::new(7, 9, 19, 23).unwrap()
+    }
+
+    #[test]
+    fn lane_owned_grants_change_with_lane_generation() {
+        let first_lane = HostedIrqLaneIdentity::new(7, 9, 11).unwrap();
+        let next_lane = HostedIrqLaneIdentity::new(7, 9, 12).unwrap();
+        let first = HostedIrqGrantIdentity::for_lane(first_lane, 19).unwrap();
+        let next = HostedIrqGrantIdentity::for_lane(next_lane, 19).unwrap();
+
+        assert_eq!(first.owner_domain_id, first_lane.domain_id);
+        assert_eq!(first.owner_domain_cookie, first_lane.domain_cookie);
+        assert_eq!(first.grant_id, 19);
+        assert_eq!(first.grant_generation, first_lane.lane_generation);
+        assert_ne!(first, next);
+        assert_eq!(HostedIrqGrantIdentity::for_lane(first_lane, 0), None);
     }
 
     fn config() -> HostedIrqArenaConfig {

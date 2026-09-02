@@ -70,12 +70,24 @@ fn fatal_service_result(status: i32) -> nt_hosted_runtime::HostedIrqArenaResult 
 unsafe fn lane_view(
     connection: HostedIrqConnection,
 ) -> Result<HostedIrqLaneView, nt_status::NtStatus> {
+    lane_view_for_domain(
+        connection.binding.projection_instance,
+        connection.binding.projection_domain,
+        connection.lane_generation,
+    )
+}
+
+unsafe fn lane_view_for_domain(
+    projection_instance: usize,
+    domain: HostedDomainIdentity,
+    lane_generation: u64,
+) -> Result<HostedIrqLaneView, nt_status::NtStatus> {
     let lane = hosted_irq_lanes()
         .and_then(|lanes| {
             lanes.iter().find(|lane| {
-                lane.projection_instance == connection.binding.projection_instance
-                    && lane.domain == connection.binding.projection_domain
-                    && lane.identity.lane_generation == connection.lane_generation
+                lane.projection_instance == projection_instance
+                    && lane.domain == domain
+                    && lane.identity.lane_generation == lane_generation
                     && lane.state == HostedIrqLaneState::Ready
             })
         })
@@ -114,6 +126,137 @@ unsafe fn connection_for_service(
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     validate_hosted_irq_actual_lock(connection)?;
     Ok(connection)
+}
+
+unsafe fn lane_has_connection_grant(
+    lane: HostedIrqLaneView,
+    grant: nt_hosted_runtime::HostedIrqGrantIdentity,
+) -> bool {
+    hosted_irq_connections().is_some_and(|connections| {
+        connections.iter().copied().any(|connection| {
+            hosted_irq_connection_active(connection)
+                && connection.grant == grant
+                && connection.binding.projection_domain.domain_id.raw()
+                    == lane.identity.domain_id
+                && connection.binding.projection_domain.cookie == lane.identity.domain_cookie
+                && connection.lane_generation == lane.identity.lane_generation
+        })
+    })
+}
+
+unsafe fn provider_import_authority(
+    source_lane: HostedIrqLaneView,
+    command: nt_hosted_runtime::HostedIrqServiceCommand,
+) -> Result<
+    (
+        HostedProviderDomainDependency,
+        HostedIrqLaneView,
+        HostedProviderDependencyDispatchLease,
+    ),
+    nt_status::NtStatus,
+> {
+    let dependency = hosted_provider_domain_dependencies()
+        .and_then(|dependencies| {
+            dependencies.iter().copied().find(|dependency| {
+                hosted_provider_domain_dependency_is_live(*dependency)
+                    && dependency.dependent_domain.domain_id.raw()
+                        == source_lane.identity.domain_id
+                    && dependency.dependent_domain.cookie == source_lane.identity.domain_cookie
+                    && dependency.dependent_lane_generation
+                        == source_lane.identity.lane_generation
+                    && dependency.provider_domain.domain_id.raw() == command.target_domain_id
+                    && dependency.provider_domain.cookie == command.target_domain_cookie
+                    && dependency.provider_publication_cookie == command.authority_cookie
+            })
+        })
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    if command.grant != dependency.dependent_grant
+        && !lane_has_connection_grant(source_lane, command.grant)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let (_, singleton) = find_hosted_provider_singleton_by_cookie(command.authority_cookie)
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    if singleton.instance != dependency.provider_instance
+        || singleton.owner_domain != dependency.provider_domain
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let policy = loaded_pe_export_rva_marshal_policy(
+        singleton.provider.as_str(),
+        singleton.exec_va,
+        singleton.image_len,
+        command.service_id,
+    )
+    .or_else(|| hosted_provider_internal_rva_marshal_policy(singleton, command.service_id))
+    .ok_or(nt_status::NtStatus::NOT_SUPPORTED)?;
+    let _ = policy;
+    match plan_hosted_provider_import_binding(
+        Some(hosted_provider_domain_descriptor(singleton)),
+        command.service_id,
+    ) {
+        Ok(HostedProviderImportBinding::ProviderDomainCall(_)) => {}
+        Ok(HostedProviderImportBinding::PrivateDependencyRequired) => {
+            return Err(nt_status::NtStatus::DEVICE_NOT_READY)
+        }
+        Err(_) => return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+    }
+    let target_lane = lane_view_for_domain(
+        dependency.provider_instance,
+        dependency.provider_domain,
+        dependency.provider_lane_generation,
+    )?;
+    let lease = acquire_hosted_provider_dependency_dispatch_lease(
+        dependency.provider_instance,
+        dependency.dependent_instance,
+        dependency.provider_publication_cookie,
+    )
+    .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    Ok((dependency, target_lane, lease))
+}
+
+unsafe fn provider_callback_authority(
+    source_lane: HostedIrqLaneView,
+    command: nt_hosted_runtime::HostedIrqServiceCommand,
+) -> Result<
+    (
+        HostedProviderCallbackRecord,
+        HostedProviderDomainDependency,
+        HostedIrqLaneView,
+        HostedProviderDependencyDispatchLease,
+    ),
+    nt_status::NtStatus,
+> {
+    let record = hosted_provider_callback_record(command.service_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let dependency = hosted_provider_domain_dependency_for_pair(
+        record.provider_instance,
+        record.dependent_instance,
+    )
+    .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    if record.provider_domain.domain_id.raw() != source_lane.identity.domain_id
+        || record.provider_domain.cookie != source_lane.identity.domain_cookie
+        || dependency.provider_lane_generation != source_lane.identity.lane_generation
+        || command.grant != dependency.provider_grant
+        || command.target_domain_id != record.dependent_domain.domain_id.raw()
+        || command.target_domain_cookie != record.dependent_domain.cookie
+        || command.authority_cookie != record.provider_publication_cookie
+        || dependency.provider_publication_cookie != record.provider_publication_cookie
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let target_lane = lane_view_for_domain(
+        dependency.dependent_instance,
+        dependency.dependent_domain,
+        dependency.dependent_lane_generation,
+    )?;
+    let lease = acquire_hosted_provider_dependency_dispatch_lease(
+        dependency.provider_instance,
+        dependency.dependent_instance,
+        dependency.provider_publication_cookie,
+    )
+    .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    Ok((record, dependency, target_lane, lease))
 }
 
 impl HostedIrqRootSession {
@@ -356,9 +499,17 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
                 self.queue_dpc_service(command)
             }
-            nt_hosted_runtime::HostedIrqServiceKind::ProviderImport
-            | nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
-                service_result(STATUS_NOT_SUPPORTED, None)
+            nt_hosted_runtime::HostedIrqServiceKind::ProviderImport => {
+                match provider_import_authority(self.lane, command) {
+                    Ok(_authority) => service_result(STATUS_NOT_SUPPORTED, None),
+                    Err(status) => fatal_service_result(status.raw()),
+                }
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
+                match provider_callback_authority(self.lane, command) {
+                    Ok(_authority) => service_result(STATUS_NOT_SUPPORTED, None),
+                    Err(status) => fatal_service_result(status.raw()),
+                }
             }
         }
     }

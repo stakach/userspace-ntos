@@ -23135,6 +23135,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `cargo fmt --all` and the freestanding executive check are green at the established 213-warning
     baseline.
 
+    B3 cross-domain grant checkpoint (2026-09-02, host and freestanding green; dispatch execution
+    open): each provider dependency now retains two distinct grants derived from the exact lane
+    identity, provider publication id, and that side's lane generation. The dependent grant belongs
+    only to the dependent domain and the provider grant belongs only to the provider domain; lane
+    replacement changes the grant generation and makes the old authority stale. `nt-hosted-runtime`
+    exposes this construction as `HostedIrqGrantIdentity::for_lane` and its focused suite now passes
+    102/102, including stale-generation coverage.
+
+    Root's staged provider resolver now joins a provider import to the source dependent lane, live
+    dependency, exact target provider, publication cookie, supported export marshal policy, and
+    either the live hardware-connection grant or the dependent-side dependency grant. A reverse
+    callback must instead present the provider-side dependency grant, exact published callback
+    record, target dependent identity, and both current lane generations. Both paths retain a
+    dependency dispatch lease before returning target-lane authority. Valid requests still complete
+    `STATUS_NOT_SUPPORTED` because cross-lane execution is not selected until the recursive driver
+    is present; authority failures are fatal arena faults, and no ordinary-bank fallback is used.
+    The freestanding executive check remains green at the established 213-warning baseline.
+
     Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
     single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
     dependency lease and drive a provider-domain arena while that Service stays open. A provider
