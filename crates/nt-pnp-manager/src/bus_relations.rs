@@ -15,6 +15,28 @@ pub enum DeviceRelationsCopyError {
     InsufficientResources,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRelationsResultDisposition {
+    NoRelations,
+    CopyAllocation(u64),
+}
+
+/// Classify the native `IRP_MN_QUERY_DEVICE_RELATIONS` result before touching driver memory.
+///
+/// A leaf stack normally leaves `Information` null and may return `STATUS_NOT_SUPPORTED`; that is
+/// an optional probe with no child publication. A successful nonnull result owns a real native
+/// `DEVICE_RELATIONS` allocation, including the meaningful `Count == 0` case.
+pub const fn classify_device_relations_result(
+    driver_success: bool,
+    information: u64,
+) -> DeviceRelationsResultDisposition {
+    if driver_success && information != 0 {
+        DeviceRelationsResultDisposition::CopyAllocation(information)
+    } else {
+        DeviceRelationsResultDisposition::NoRelations
+    }
+}
+
 /// Validate and copy one driver-owned native x64 `DEVICE_RELATIONS` allocation.
 ///
 /// The input may include allocator capacity after the native object, so only the count-derived
@@ -994,6 +1016,29 @@ mod tests {
             generation: 1,
             pdo_object_id: pdo,
         }
+    }
+
+    #[test]
+    fn native_device_relations_result_distinguishes_probe_absence_from_allocated_empty_set() {
+        assert_eq!(
+            classify_device_relations_result(false, 0),
+            DeviceRelationsResultDisposition::NoRelations
+        );
+        assert_eq!(
+            classify_device_relations_result(false, 0x1000),
+            DeviceRelationsResultDisposition::NoRelations
+        );
+        assert_eq!(
+            classify_device_relations_result(true, 0),
+            DeviceRelationsResultDisposition::NoRelations
+        );
+        assert_eq!(
+            classify_device_relations_result(true, 0x1000),
+            DeviceRelationsResultDisposition::CopyAllocation(0x1000)
+        );
+        assert!(copy_device_relations_x64(&native_relations(&[], 32))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

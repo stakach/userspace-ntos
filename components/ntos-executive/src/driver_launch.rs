@@ -36388,6 +36388,11 @@ unsafe fn set_hosted_relation_query_disposition(disposition: HostedDeviceRelatio
         .as_mut()
         .expect("hosted relation query disappeared while publishing its result");
     match disposition {
+        HostedDeviceRelationQueryDisposition::NoRelations => {
+            query.phase = HostedDeviceRelationQueryPhase::NoRelations;
+            query.barrier_status = None;
+            query.barrier_origin = HostedRelationBarrierOrigin::None;
+        }
         HostedDeviceRelationQueryDisposition::Copied => {
             query.phase = HostedDeviceRelationQueryPhase::RelationsCopied;
             query.barrier_status = None;
@@ -38384,6 +38389,46 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     Ok(())
 }
 
+unsafe fn complete_hosted_relation_probe_without_publication(
+) -> Result<(), HostedRelationPublishError> {
+    let query = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .ok_or(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ))?;
+    if query.phase != HostedDeviceRelationQueryPhase::NoRelations
+        || !query.child_pdo_objects.is_empty()
+        || !query.reported_children.is_empty()
+        || !query.child_properties.is_empty()
+        || !query.acpi_pci_scope_sources.is_empty()
+        || !query.acpi_pci_link_candidates.is_empty()
+        || query.acpi_pci_catalog_update.is_some()
+    {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let claim = query.claim;
+    let relation_owner = hosted_relation_owner_for_device(claim.pdo_device_id)
+        .map_err(HostedRelationPublishError::Barrier)?;
+    let invalidation_completion = hosted_device_relation_invalidations_mut()
+        .complete(claim)
+        .map_err(|_| {
+            HostedRelationPublishError::Barrier(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+        })?;
+    let route_reconciliation_ready =
+        crate::hosted_pci_topology::note_hosted_pci_relation_completion(
+            relation_owner,
+            invalidation_completion,
+        )
+        .map_err(HostedRelationPublishError::Barrier)?;
+    *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
+    if route_reconciliation_ready {
+        let _ = start_hosted_acpi_pci_route_query();
+    }
+    Ok(())
+}
+
 unsafe fn drain_hosted_device_relation_query() -> usize {
     let mut progress = 0usize;
     loop {
@@ -38450,15 +38495,21 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                     .as_mut()
                     .unwrap();
                 query.driver_status = Some(completion.status);
-                query.phase = if completion.status.is_success() {
-                    HostedDeviceRelationQueryPhase::AwaitingCopy {
-                        information: completion.information,
+                query.phase = match nt_pnp_manager::classify_device_relations_result(
+                    completion.status.is_success(),
+                    completion.information,
+                ) {
+                    nt_pnp_manager::DeviceRelationsResultDisposition::NoRelations => {
+                        HostedDeviceRelationQueryPhase::AwaitingAck {
+                            disposition: HostedDeviceRelationQueryDisposition::NoRelations,
+                        }
+                    }
+                    nt_pnp_manager::DeviceRelationsResultDisposition::CopyAllocation(
+                        information,
+                    ) => HostedDeviceRelationQueryPhase::AwaitingCopy {
+                        information,
                         pending_completion: true,
-                    }
-                } else {
-                    HostedDeviceRelationQueryPhase::AwaitingAck {
-                        disposition: HostedDeviceRelationQueryDisposition::Copied,
-                    }
+                    },
                 };
                 progress = progress.saturating_add(1);
             }
@@ -38518,6 +38569,18 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
                             .unwrap()
                             .barrier_status = Some(status);
                         return progress;
+                    }
+                }
+            }
+            HostedDeviceRelationQueryPhase::NoRelations => {
+                match complete_hosted_relation_probe_without_publication() {
+                    Ok(()) => return progress.saturating_add(1),
+                    Err(HostedRelationPublishError::Retry) => return progress,
+                    Err(HostedRelationPublishError::Barrier(status)) => {
+                        set_hosted_relation_query_disposition(
+                            HostedDeviceRelationQueryDisposition::Barrier(status),
+                        );
+                        return progress.saturating_add(1);
                     }
                 }
             }
@@ -39901,13 +39964,21 @@ unsafe fn start_hosted_device_relation_query() -> usize {
                 .as_mut()
                 .unwrap();
             query.driver_status = Some(status);
-            if status.is_success() {
-                query.phase = HostedDeviceRelationQueryPhase::AwaitingCopy {
-                    information,
-                    pending_completion: false,
-                };
-            } else {
-                set_hosted_relation_query_disposition(HostedDeviceRelationQueryDisposition::Copied);
+            match nt_pnp_manager::classify_device_relations_result(
+                status.is_success(),
+                information,
+            ) {
+                nt_pnp_manager::DeviceRelationsResultDisposition::NoRelations => {
+                    set_hosted_relation_query_disposition(
+                        HostedDeviceRelationQueryDisposition::NoRelations,
+                    );
+                }
+                nt_pnp_manager::DeviceRelationsResultDisposition::CopyAllocation(information) => {
+                    query.phase = HostedDeviceRelationQueryPhase::AwaitingCopy {
+                        information,
+                        pending_completion: false,
+                    };
+                }
             }
         }
         ExternalPnpDispatchResult::ReturnedPayload { .. } => {
@@ -42453,6 +42524,7 @@ const HOSTED_ACPI_EVAL_INTEGER_LEN: usize = nt_acpi::ACPI_EVAL_OUTPUT_PROBE_LEN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedDeviceRelationQueryDisposition {
+    NoRelations,
     Copied,
     Barrier(nt_status::NtStatus),
 }
@@ -42506,6 +42578,7 @@ enum HostedDeviceRelationQueryPhase {
     AwaitingAck {
         disposition: HostedDeviceRelationQueryDisposition,
     },
+    NoRelations,
     RelationsCopied,
     DispatchId {
         child_index: usize,
@@ -43597,7 +43670,6 @@ pub(crate) enum HostedPnpRelationProgress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedPnpRelationRefresh {
     invalidation: nt_pnp_manager::DeviceRelationInvalidation,
-    base_relation_generation: u64,
 }
 
 fn hosted_relation_invalidation_status(
@@ -43680,14 +43752,9 @@ pub(crate) unsafe fn enqueue_hosted_initial_bus_relations(
     device_id: u64,
 ) -> Result<HostedPnpRelationRefresh, nt_status::NtStatus> {
     let relation_owner = hosted_relation_owner_for_device(device_id)?;
-    let base_relation_generation = hosted_bus_relations_mut()
-        .current_relation_identity(relation_owner.device_id)
-        .map(nt_pnp_manager::BusRelationIdentity::generation)
-        .unwrap_or(0);
     enqueue_hosted_device_relations(relation_owner, nt_pnp_abi::BUS_RELATIONS).map(|enqueued| {
         HostedPnpRelationRefresh {
             invalidation: enqueued.invalidation,
-            base_relation_generation,
         }
     })
 }
@@ -43723,14 +43790,10 @@ pub(crate) unsafe fn hosted_pnp_relation_progress(
     {
         return HostedPnpRelationProgress::Pending;
     }
-    let advanced = hosted_bus_relations_mut()
-        .current_relation_identity(refresh.invalidation.pdo_device_id)
-        .is_some_and(|identity| identity.generation() > refresh.base_relation_generation);
-    if advanced {
-        HostedPnpRelationProgress::Current
-    } else {
-        HostedPnpRelationProgress::Blocked(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
-    }
+    // The exact invalidation can leave the queue only through terminal completion. A real
+    // DEVICE_RELATIONS allocation publishes its generation before that completion; a null optional
+    // probe deliberately completes without creating a bus-relation identity.
+    HostedPnpRelationProgress::Current
 }
 
 pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
@@ -43743,6 +43806,9 @@ pub(crate) unsafe fn print_hosted_pnp_enumeration_evidence() {
         | HostedDeviceRelationQueryPhase::AwaitingCopy { .. }
         | HostedDeviceRelationQueryPhase::AwaitingAck { .. }
         | HostedDeviceRelationQueryPhase::RelationsCopied => (b"relations".as_slice(), usize::MAX),
+        HostedDeviceRelationQueryPhase::NoRelations => {
+            (b"no-relations".as_slice(), usize::MAX)
+        }
         HostedDeviceRelationQueryPhase::DispatchId { child_index, .. }
         | HostedDeviceRelationQueryPhase::AwaitingIdCompletion { child_index, .. }
         | HostedDeviceRelationQueryPhase::AwaitingIdCopy { child_index, .. }

@@ -22905,12 +22905,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     direct GDI returns, 125/172 batch flushes/records, and all 786432 pixels non-background with at
     least 32 colours. The final result is `295/295`, the sentinel matched, and QEMU exited normally.
 
-    Review adjustment: the per-parent relation and per-child route-admission correction is closed.
-    The next B3 ownership target is initial enumeration scheduling: derive which started stacks own
-    BusRelations from dynamic PnP/bus capability and accepted relation state instead of asking every
-    successfully started devnode. Preserve first-provider discovery without service-name, image-name,
-    class-code, or fixed-device checks, then prove multiple independent bus parents and IRQ-bearing
-    children without cross-bus stalls.
+    Reference correction: the per-parent relation and per-child route-admission correction is
+    closed, and the initial BusRelations query remains unconditional after every successful START.
+    NT5 `PipProcessStartPhase3` and ReactOS `PiStartDeviceFinal` both mark every started devnode for
+    re-enumeration; a leaf stack is discovered by its null/unsupported response, not by a prior bus
+    capability flag. Do not replace this behavioral contract with service, image, class, group, or
+    device-name classification.
+
+    B3 optional relation-result checkpoint (2026-09-02, complete): a null/unsupported leaf response
+    no longer advances an accepted empty bus-relation generation. The host-tested result classifier
+    separates that optional outcome from a successful nonnull `DEVICE_RELATIONS` allocation. The
+    former acknowledges and completes the exact invalidation without publication; the latter still
+    copies, validates, and publishes the allocation when native `Count` is zero. Malformed nonnull
+    results, transport/identity loss, and acknowledgement failure remain barriers. Unknown
+    first-provider probes remain in the transient PCI discovery fence so an IRQ child cannot race
+    ACPI's first real relation response.
+
+    Focused acceptance is `65/65` `nt-pnp-manager` tests, clean workspace formatting, and a clean
+    freestanding executive check with the existing 215-warning baseline. Serialized desktop proof
+    `.tmp/run-desktop-20260902-122731.log` starts E1000 after real ACPI/PCI relation and route
+    reconciliation, passes real NDIS receive plus hardware IRQ/DPC delivery, records Explorer
+    begin/end paint `5/20`, 165 direct GDI returns and 125/172 batch flushes/records, and paints all
+    786432 framebuffer pixels with at least 32 colours. The result is `295/295`, the sentinel matched,
+    and QEMU exited normally. Return now to the open private interrupt-arena ISR/DPC cutover and
+    delete `FSD_DISPATCH_INTERRUPT` atomically.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.
