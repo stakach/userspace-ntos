@@ -23101,6 +23101,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     cutover. Focused `nt-hosted-runtime` validation passes 101/101 and the freestanding executive
     check is green at the established 213-warning baseline.
 
+    B3 provider-dependency lane-lifetime checkpoint (2026-09-02, implementation and desktop
+    acceptance green; recursive dispatch still open): every callable provider dependency now owns
+    an exact ready lane for both the dependent and provider domains, recording each lane generation
+    beside the existing domain identities and provider publication cookie. Dependency publication
+    creates both lanes transactionally before publishing the I/O-manager provider edge and rolls
+    back unreferenced lanes on any failure. A dependency is current only while both exact lane
+    generations, both domains, the provider publication, and the I/O-manager edge remain live.
+    Lane retirement therefore recognizes either a generation-owned interrupt connection or a live
+    provider dependency as authority; provider teardown detaches the dependency graph before lane
+    reclamation, so a provider-only domain cannot disappear while a cross-domain call is parked.
+
+    Focused validation passes 101/101 `nt-hosted-runtime` tests, 230/230 `nt-kernel-exec` tests,
+    and the freestanding executive check at the established 213-warning baseline. The first
+    serialized run `.tmp/run-desktop-20260902-142019.log` stopped after a root `memcpy` read from an
+    address outside the executive heap during concurrent hosted-network progress. The exact retry
+    `.tmp/run-desktop-20260902-142946.log` did not reproduce that stale-pointer fault: it completed
+    the Simpleboot handoff, real userinit and Explorer launch, 661 redirected api0 callbacks, shell
+    COM activation, five/20 Explorer paint begin/end observations, 165 direct GDI returns, 125/172
+    batch flushes/records, and all 786432 framebuffer pixels non-background with at least 32
+    colours. The final result is `295/295`, the sentinel matches, and QEMU exits normally. Keep the
+    earlier fault as a residual concurrency diagnostic; it is not evidence for reverting the exact
+    lane ownership or adding a fallback.
+
     Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
     single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
     dependency lease and drive a provider-domain arena while that Service stays open. A provider

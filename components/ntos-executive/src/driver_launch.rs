@@ -16501,6 +16501,8 @@ struct HostedProviderDomainDependency {
     dependent_domain: HostedDomainIdentity,
     provider_domain: HostedDomainIdentity,
     provider_publication_cookie: u64,
+    dependent_lane_generation: u64,
+    provider_lane_generation: u64,
 }
 
 impl HostedProviderDomainDependency {
@@ -16520,6 +16522,8 @@ impl HostedProviderDomainDependency {
                 cookie: 0,
             },
             provider_publication_cookie: 0,
+            dependent_lane_generation: 0,
+            provider_lane_generation: 0,
         }
     }
 }
@@ -18270,6 +18274,15 @@ fn hosted_provider_domain_dependency_is_current(
             != Some(dependency.dependent_domain)
         || instance(dependency.provider_instance).and_then(instance_domain_identity)
             != Some(dependency.provider_domain)
+        || unsafe {
+            hosted_irq_lane_generation(
+                dependency.dependent_instance,
+                dependency.dependent_domain,
+            )
+        } != Some(dependency.dependent_lane_generation)
+        || unsafe {
+            hosted_irq_lane_generation(dependency.provider_instance, dependency.provider_domain)
+        } != Some(dependency.provider_lane_generation)
         || io_manager_mut().hosted_provider_identity(dependency.dependent_domain)
             != Some(dependency.provider_domain)
     {
@@ -18356,17 +18369,36 @@ unsafe fn ensure_hosted_provider_domain_dependency(
             };
         }
     }
-    let dependencies = hosted_provider_domain_dependencies_mut();
-    let vacant_index = dependencies.iter().position(|slot| !slot.present);
-    if vacant_index.is_none() {
-        dependencies
-            .try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    }
+    let vacant_index = {
+        let dependencies = hosted_provider_domain_dependencies_mut();
+        let vacant_index = dependencies.iter().position(|slot| !slot.present);
+        if vacant_index.is_none() {
+            dependencies
+                .try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        }
+        vacant_index
+    };
+    let provider_lane_generation = ensure_hosted_irq_lane(provider_instance, provider_domain)
+        .map_err(nt_status::NtStatus::raw)?;
+    let dependent_lane_generation = match ensure_hosted_irq_lane(dependent_instance, dependent_domain)
+    {
+        Ok(generation) => generation,
+        Err(status) => {
+            let _ = retire_hosted_irq_lane_if_unreferenced(provider_instance, provider_domain);
+            return Err(status.raw());
+        }
+    };
     let created = io_manager_mut()
         .set_hosted_domain_provider(dependent_domain, provider_domain)
-        .map_err(nt_status::NtStatus::raw)?;
+        .map_err(|status| {
+            let _ = retire_hosted_irq_lane_if_unreferenced(dependent_instance, dependent_domain);
+            let _ = retire_hosted_irq_lane_if_unreferenced(provider_instance, provider_domain);
+            status.raw()
+        })?;
     if !created {
+        let _ = retire_hosted_irq_lane_if_unreferenced(dependent_instance, dependent_domain);
+        let _ = retire_hosted_irq_lane_if_unreferenced(provider_instance, provider_domain);
         return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
     }
     let dependency = HostedProviderDomainDependency {
@@ -18378,7 +18410,10 @@ unsafe fn ensure_hosted_provider_domain_dependency(
         dependent_domain,
         provider_domain,
         provider_publication_cookie,
+        dependent_lane_generation,
+        provider_lane_generation,
     };
+    let dependencies = hosted_provider_domain_dependencies_mut();
     if let Some(index) = vacant_index {
         dependencies[index] = dependency;
     } else {
@@ -46447,15 +46482,43 @@ unsafe fn hosted_irq_lane_channel(
     })
 }
 
-unsafe fn hosted_irq_lane_has_connections(lane: &HostedIrqLaneRuntime) -> bool {
-    hosted_irq_connections().is_some_and(|connections| {
+unsafe fn hosted_irq_lane_is_referenced(lane: &HostedIrqLaneRuntime) -> bool {
+    let connection = hosted_irq_connections().is_some_and(|connections| {
         connections.iter().any(|connection| {
             connection.rundown.disposition() == InterruptConnectionDisposition::Active
                 && connection.binding.projection_instance == lane.projection_instance
                 && connection.binding.projection_domain == lane.domain
                 && connection.lane_generation == lane.identity.lane_generation
         })
-    })
+    });
+    connection
+        || hosted_provider_domain_dependencies().is_some_and(|dependencies| {
+            dependencies.iter().copied().any(|dependency| {
+                hosted_provider_domain_dependency_is_live(dependency)
+                    && (dependency.dependent_instance == lane.projection_instance
+                        && dependency.dependent_domain == lane.domain
+                        && dependency.dependent_lane_generation
+                            == lane.identity.lane_generation
+                        || dependency.provider_instance == lane.projection_instance
+                            && dependency.provider_domain == lane.domain
+                            && dependency.provider_lane_generation
+                                == lane.identity.lane_generation)
+            })
+        })
+}
+
+unsafe fn hosted_irq_lane_generation(
+    projection_instance: usize,
+    domain: HostedDomainIdentity,
+) -> Option<u64> {
+    hosted_irq_lanes()?
+        .iter()
+        .find(|lane| {
+            lane.projection_instance == projection_instance
+                && lane.domain == domain
+                && lane.state == HostedIrqLaneState::Ready
+        })
+        .map(|lane| lane.identity.lane_generation)
 }
 
 unsafe fn retire_hosted_irq_lane_if_unreferenced(
@@ -46469,7 +46532,7 @@ unsafe fn retire_hosted_irq_lane_if_unreferenced(
     }) else {
         return Ok(());
     };
-    if hosted_irq_lane_has_connections(&hosted_irq_lanes_mut()[index]) {
+    if hosted_irq_lane_is_referenced(&hosted_irq_lanes_mut()[index]) {
         return Ok(());
     }
     let state = hosted_irq_lanes_mut()[index].state;
@@ -46516,7 +46579,7 @@ unsafe fn ensure_hosted_irq_lane(
             if matches!(
                 existing.state,
                 HostedIrqLaneState::Quarantined | HostedIrqLaneState::ShuttingDown
-            ) && !hosted_irq_lane_has_connections(existing)
+            ) && !hosted_irq_lane_is_referenced(existing)
             {
                 retire_hosted_irq_lane_if_unreferenced(projection_instance, domain)?;
             } else {
@@ -50042,7 +50105,7 @@ fn clear_hosted_irq_lanes_for_instance(instance: usize) -> u64 {
                     .find(|lane| {
                         lane.projection_instance == projection_instance && lane.domain == domain
                     })
-                    .is_some_and(|lane| hosted_irq_lane_has_connections(lane))
+                    .is_some_and(|lane| hosted_irq_lane_is_referenced(lane))
             });
             if referenced {
                 return failures.saturating_add(1);
@@ -51307,8 +51370,8 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             print_str(b"\n");
         }
     }
-    // Physical sources and their execution lanes are the first runtime objects retired. If either
-    // fence fails, leave waits, workers, and resource mappings intact for the next exact retry.
+    // Physical sources are retired before their execution lanes. Provider dependencies also own
+    // those lanes, so lane retirement waits until the provider lifetime graph below is detached.
     let device_binding_failures = clear_hosted_device_bindings_for_instance(i);
     if device_binding_failures != 0 {
         print_str(b"[driver-launch] hosted device binding release failed inst=");
@@ -51324,15 +51387,6 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         print_u64(i as u64);
         print_str(b" failures=");
         print_u64(orphan_line_failures);
-        print_str(b"\n");
-        return Err(nt_status::NtStatus::DEVICE_BUSY);
-    }
-    let irq_lane_failures = clear_hosted_irq_lanes_for_instance(i);
-    if irq_lane_failures != 0 {
-        print_str(b"[driver-launch] hosted interrupt lane release failed inst=");
-        print_u64(i as u64);
-        print_str(b" failures=");
-        print_u64(irq_lane_failures);
         print_str(b"\n");
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -51392,6 +51446,17 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
                 print_u64(singleton_failures);
                 print_str(b"\n");
             }
+        }
+    }
+    if !teardown_blocked {
+        let irq_lane_failures = clear_hosted_irq_lanes_for_instance(i);
+        if irq_lane_failures != 0 {
+            teardown_blocked = true;
+            print_str(b"[driver-launch] hosted interrupt lane release failed inst=");
+            print_u64(i as u64);
+            print_str(b" failures=");
+            print_u64(irq_lane_failures);
+            print_str(b"\n");
         }
     }
     if unsafe { !driver_instance_thunk_slots_are_free(i) } {
