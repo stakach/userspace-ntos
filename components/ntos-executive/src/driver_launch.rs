@@ -41982,7 +41982,7 @@ struct HostedDeviceResourceState {
     interrupt_shared: bool,
     interrupt_latched: bool,
     interrupt_active_low: bool,
-    interrupt_route_authoritative: bool,
+    interrupt_claim: Option<nt_interrupt_authority::PhysicalInterruptClaim>,
     interface_type: u32,
     bus_number: u32,
     address: u32,
@@ -42018,6 +42018,13 @@ struct HostedIrqConnectionAuthority {
     route: nt_resource_manager::ConnectedInterrupt,
     interrupt_object: u64,
     pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
+    physical_claim: nt_interrupt_authority::PhysicalInterruptClaim,
+}
+
+struct HostedPhysicalIrqLease {
+    interrupt_id: u64,
+    claim: nt_interrupt_authority::PhysicalInterruptClaim,
+    lease: nt_interrupt_authority::PhysicalInterruptConnectionLease,
 }
 
 impl HostedIrqConnectionAuthority {
@@ -42232,7 +42239,17 @@ fn validate_hosted_interrupt_connection(
     if state.interrupt_shared != (route.share == nt_hal_abi::SHARE_SHARED) {
         return Err(HostedInterruptConnectionRejection::Sharing);
     }
-    if !state.interrupt_route_authoritative {
+    let Some(claim) = state.interrupt_claim else {
+        return Err(HostedInterruptConnectionRejection::RouteAuthority);
+    };
+    let physical = unsafe { crate::validate_physical_interrupt_claim(claim) }
+        .map_err(|_| HostedInterruptConnectionRejection::RouteAuthority)?;
+    if physical.gsi != route.line
+        || physical.vector != route.translated_vector
+        || physical.level_sensitive != !state.interrupt_latched
+        || physical.active_low != state.interrupt_active_low
+        || physical.shared != state.interrupt_shared
+    {
         return Err(HostedInterruptConnectionRejection::RouteAuthority);
     }
     Ok(())
@@ -42253,6 +42270,9 @@ fn retain_hosted_irq_connection_authority(
     if !unsafe { crate::hosted_pnp_context_lease_is_live(pnp_context_lease) } {
         return Err(HostedInterruptConnectionRejection::PnpContextLease);
     }
+    let physical_claim = state
+        .interrupt_claim
+        .ok_or(HostedInterruptConnectionRejection::RouteAuthority)?;
     let grant = HostedIrqGrantIdentity::new(
         binding.projection_domain.domain_id.raw(),
         binding.projection_domain.cookie,
@@ -42265,6 +42285,7 @@ fn retain_hosted_irq_connection_authority(
         route,
         interrupt_object: state.evidence.interrupt_object,
         pnp_context_lease,
+        physical_claim,
     })
 }
 
@@ -42329,6 +42350,7 @@ static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
+static mut HOSTED_PHYSICAL_IRQ_LEASES: Option<Vec<HostedPhysicalIrqLease>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static mut HOSTED_IRQ_LANES: Option<Vec<HostedIrqLaneRuntime>> = None;
 static HOSTED_IRQ_LANE_GENERATION_NEXT: AtomicU64 = AtomicU64::new(0);
@@ -44880,6 +44902,86 @@ unsafe fn hosted_irq_connections_mut() -> &'static mut Vec<HostedIrqConnection> 
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_physical_irq_leases_mut() -> &'static mut Vec<HostedPhysicalIrqLease> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_PHYSICAL_IRQ_LEASES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_physical_irq_leases() -> Option<&'static Vec<HostedPhysicalIrqLease>> {
+    (*core::ptr::addr_of!(HOSTED_PHYSICAL_IRQ_LEASES)).as_ref()
+}
+
+unsafe fn hosted_physical_irq_lease_live(
+    interrupt_id: u64,
+    route: nt_resource_manager::ConnectedInterrupt,
+) -> bool {
+    hosted_physical_irq_leases()
+        .and_then(|leases| {
+            leases
+                .iter()
+                .find(|retained| retained.interrupt_id == interrupt_id)
+        })
+        .is_some_and(|retained| {
+            crate::validate_physical_interrupt_connection(&retained.lease).is_ok_and(|physical| {
+                physical.gsi == route.line
+                    && physical.vector == route.translated_vector
+                    && physical.level_sensitive
+                        == (route.mode == nt_hal_abi::INT_MODE_LEVEL_SENSITIVE)
+                    && physical.shared == (route.share == nt_hal_abi::SHARE_SHARED)
+            })
+        })
+}
+
+unsafe fn retain_hosted_physical_irq_lease(
+    authority: &HostedIrqConnectionAuthority,
+) -> Result<(), nt_status::NtStatus> {
+    if hosted_physical_irq_leases().is_some_and(|leases| {
+        leases
+            .iter()
+            .any(|retained| retained.interrupt_id == authority.route.tokens.interrupt_id)
+    }) {
+        return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+    }
+    hosted_physical_irq_leases_mut()
+        .try_reserve(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let lease = crate::acquire_physical_interrupt_connection(authority.physical_claim)?;
+    hosted_physical_irq_leases_mut().push(HostedPhysicalIrqLease {
+        interrupt_id: authority.route.tokens.interrupt_id,
+        claim: authority.physical_claim,
+        lease,
+    });
+    Ok(())
+}
+
+unsafe fn release_hosted_physical_irq_lease(interrupt_id: u64) -> Result<(), nt_status::NtStatus> {
+    let index = hosted_physical_irq_leases()
+        .and_then(|leases| {
+            leases
+                .iter()
+                .position(|retained| retained.interrupt_id == interrupt_id)
+        })
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let retained = hosted_physical_irq_leases_mut().remove(index);
+    match crate::release_physical_interrupt_connection(retained.lease) {
+        Ok(()) => Ok(()),
+        Err((status, lease)) => {
+            hosted_physical_irq_leases_mut().insert(
+                index,
+                HostedPhysicalIrqLease {
+                    interrupt_id: retained.interrupt_id,
+                    claim: retained.claim,
+                    lease,
+                },
+            );
+            Err(status)
+        }
+    }
+}
+
 unsafe fn hosted_irq_lines_mut() -> &'static mut Vec<HostedIrqLine> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_IRQ_LINES);
     if slot.is_none() {
@@ -44890,26 +44992,6 @@ unsafe fn hosted_irq_lines_mut() -> &'static mut Vec<HostedIrqLine> {
 
 unsafe fn hosted_irq_lines() -> Option<&'static Vec<HostedIrqLine>> {
     (*core::ptr::addr_of!(HOSTED_IRQ_LINES)).as_ref()
-}
-
-/// Snapshot every translated vector that still has a live kernel or hosted-line owner. PCI route
-/// publication uses this as an exclusion set, so an unrelated GSI cannot be assigned the SCI,
-/// timer, or a draining driver's vector while that physical-line lifetime is still retained.
-pub(crate) unsafe fn snapshot_hosted_reserved_interrupt_vectors(
-) -> Result<Vec<u32>, nt_status::NtStatus> {
-    let lines = hosted_irq_lines().map(Vec::as_slice).unwrap_or(&[]);
-    let mut vectors = Vec::new();
-    vectors
-        .try_reserve_exact(lines.len().saturating_add(1))
-        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    vectors.push(crate::DELAY_TIMER_IRQ as u32);
-    vectors.extend(lines.iter().filter_map(|line| {
-        (line.rundown.disposition() != InterruptLineDisposition::Released)
-            .then_some(line.vector)
-    }));
-    vectors.sort_unstable();
-    vectors.dedup();
-    Ok(vectors)
 }
 
 unsafe fn hosted_irq_connections() -> Option<&'static Vec<HostedIrqConnection>> {
@@ -45783,6 +45865,10 @@ unsafe fn install_hosted_irq_connection(
             || !crate::hosted_pnp_context_lease_is_live(existing.pnp_context_lease)
             || !hosted_irq_projection_matches(existing)
             || !hosted_irq_connection_line_live(existing)
+            || !hosted_physical_irq_lease_live(
+                existing.route.tokens.interrupt_id,
+                existing.route,
+            )
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -45848,6 +45934,15 @@ unsafe fn install_hosted_irq_connection(
             binding.projection_instance,
             binding.projection_domain,
         )?;
+        if let Err(status) = retain_hosted_physical_irq_lease(&authority) {
+            return match retire_hosted_irq_lane_if_unreferenced(
+                binding.projection_instance,
+                binding.projection_domain,
+            ) {
+                Ok(()) => Err(status),
+                Err(cleanup_status) => Err(cleanup_status),
+            };
+        }
         hosted_irq_connections_mut().push(authority.bind(binding, lane_generation));
         return Ok(());
     }
@@ -45875,21 +45970,31 @@ unsafe fn install_hosted_irq_connection(
         binding.projection_instance,
         binding.projection_domain,
     )?;
+    if let Err(status) = retain_hosted_physical_irq_lease(&authority) {
+        return match retire_hosted_irq_lane_if_unreferenced(
+            binding.projection_instance,
+            binding.projection_domain,
+        ) {
+            Ok(()) => Err(status),
+            Err(cleanup_status) => Err(cleanup_status),
+        };
+    }
     let connection = authority.bind(binding, lane_generation);
 
     let badge = crate::HOSTED_IRQ_EVENT_BADGE | (1u64 << event_bit);
     let notification_cap = match crate::mint_executive_event_badge(badge) {
         Ok(cap) => cap,
         Err(status) => {
+            let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
             if retire_hosted_irq_lane_if_unreferenced(
                 binding.projection_instance,
                 binding.projection_domain,
             )
             .is_err()
             {
-                return Err(nt_status::NtStatus::DEVICE_BUSY);
+                return Err(lease_status.unwrap_or(nt_status::NtStatus::DEVICE_BUSY));
             }
-            return Err(status);
+            return Err(lease_status.unwrap_or(status));
         }
     };
     let handler_cap = match crate::issue_ioapic_irq_handler_checked(
@@ -45932,8 +46037,9 @@ unsafe fn install_hosted_irq_connection(
                 binding.projection_domain,
             )
             .is_err();
-            return Err(if notification_retained || lane_retained {
-                nt_status::NtStatus::DEVICE_BUSY
+            let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
+            return Err(if notification_retained || lane_retained || lease_status.is_some() {
+                lease_status.unwrap_or(nt_status::NtStatus::DEVICE_BUSY)
             } else {
                 status
             });
@@ -46059,6 +46165,7 @@ unsafe fn retire_hosted_irq_connection(
         binding.projection_instance,
         binding.projection_domain,
     )?;
+    release_hosted_physical_irq_lease(interrupt_id)?;
     hosted_irq_connections_mut().remove(connection_index);
     Ok(())
 }
@@ -46152,6 +46259,10 @@ unsafe fn dispatch_hosted_irq_connection(
         || !crate::hosted_pnp_context_lease_is_live(connection.pnp_context_lease)
         || !hosted_irq_projection_matches(connection)
         || !hosted_irq_connection_line_live(connection)
+        || !hosted_physical_irq_lease_live(
+            connection.route.tokens.interrupt_id,
+            connection.route,
+        )
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -48078,9 +48189,7 @@ unsafe fn read_hosted_device_resource_state_from_shared(
         interrupt_active_low: previous_state
             .map(|state| state.interrupt_active_low)
             .unwrap_or(false),
-        interrupt_route_authoritative: previous_state
-            .map(|state| state.interrupt_route_authoritative)
-            .unwrap_or(false),
+        interrupt_claim: previous_state.and_then(|state| state.interrupt_claim),
         interface_type: read_volatile((sh + SH_RESOURCE_INTERFACE_TYPE) as *const u32),
         bus_number: read_volatile((sh + SH_RESOURCE_BUS_NUMBER) as *const u32),
         address: read_volatile((sh + SH_RESOURCE_ADDRESS) as *const u32),
@@ -53065,7 +53174,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     interrupt_shared: bool,
     interrupt_latched: bool,
     interrupt_active_low: bool,
-    interrupt_route_authoritative: bool,
+    interrupt_claim: Option<nt_interrupt_authority::PhysicalInterruptClaim>,
     interrupt_affinity: u64,
     dma_va: u64,
     dma_broker_va: u64,
@@ -53079,8 +53188,21 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         || memory.is_empty() && ports.is_empty() && interrupt_vector == 0
         || (interrupt_vector == 0 && interrupt_line != 0)
         || interrupt_affinity > u32::MAX as u64
+        || (interrupt_vector != 0) != interrupt_claim.is_some()
     {
         return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+
+    if let Some(claim) = interrupt_claim {
+        let physical = crate::validate_physical_interrupt_claim(claim)?;
+        if physical.gsi != interrupt_line
+            || physical.vector != interrupt_vector
+            || physical.level_sensitive == interrupt_latched
+            || physical.active_low != interrupt_active_low
+            || physical.shared != interrupt_shared
+        {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
     }
 
     let mut video_memory = None;
@@ -53739,7 +53861,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
         state.interrupt_shared = interrupt_shared;
         state.interrupt_latched = interrupt_latched;
         state.interrupt_active_low = interrupt_active_low;
-        state.interrupt_route_authoritative = interrupt_route_authoritative;
+        state.interrupt_claim = interrupt_claim;
         if let Some(memory) = resources
             .iter()
             .find(|resource| resource.kind == SH_RESOURCE_ADDRESS_KIND_MEMORY)

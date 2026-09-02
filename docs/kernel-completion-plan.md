@@ -22677,6 +22677,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     acquire a catalog lease before `connect_interrupt_exact`, release it only after rundown and cap
     teardown, then delete the vector snapshot and duplicate executive collision fields/checks.
 
+    B3 physical interrupt-line publication/lease cutover checkpoint (2026-09-02, host and
+    freestanding validation green; desktop runtime pending): the executive now exposes the neutral
+    catalog through the focused `hosted_interrupt_authority` module. The production PIT publishes an
+    exclusive GSI 0/vector 2 claim only after its real handler and notification bind succeed. The
+    ACPI platform context stages an exact SCI claim and commits it only after the context registry
+    accepts the new generation. PCI `_PRT` commit stages one catalog mutation against the exact route
+    target generation, commits the PnP route owner, then performs the allocation-free catalog commit
+    on the serialized executive lane. Relation invalidation fences the exact PCI owner generation
+    before invalidating the PnP route, so old leases retain their line/vector while new admission is
+    denied.
+
+    Platform and PCI resource descriptors now carry `PhysicalInterruptClaim`; the historical
+    `interrupt_route_authoritative` boolean is deleted. Resource assignment and `IoConnectInterrupt`
+    both resolve and compare the exact claim's GSI, vector, trigger, polarity, and sharing policy.
+    Successful connect acquires a move-only catalog lease before issuing a new hardware line; normal
+    delivery and duplicate connect validate that lease, while disconnect releases it only after
+    connection rundown, physical mask/cap teardown, resource-manager disconnect, and lane teardown.
+    A failed lease release returns the token to the executive sidecar instead of losing ownership.
+
+    The temporary live-vector snapshot and the superseded `nt-pnp` PCI-only vector allocator are
+    deleted with their tests and exports. `nt-interrupt-authority` passes 11/11,
+    `nt-pnp` passes 67/67, formatting and diff checks are clean, and the executive freestanding check
+    is green at the established 214-warning baseline. Review adjustment: run the serialized desktop
+    lane under the external 3,600-second ceiling. Require distinct PIT/SCI/PCI vector ownership,
+    catalog-backed ACPI and E1000 connection leases, genuine NIC ISR/DPC/receive, timer disarm,
+    Explorer framebuffer proof, and the full sentinel before removing the now-redundant semantic
+    fields and collision decisions from the hardware-cap sidecar.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child

@@ -1,21 +1,19 @@
 use alloc::vec::Vec;
 
 use nt_pnp::{
-    allocate_pci_interrupt_vectors, AcpiPciCrsMethodSource, AcpiPciLinkCandidateFact,
-    AcpiPciProviderEndpoint, AcpiPciScopeCatalog, AcpiPciScopeError, AcpiPciScopeSource, PciDevice,
-    PciInterruptRouteClaim, PciInterruptRouteOwner, PciInterruptVector, PciInterruptVectorError,
-    PciInventory, PciInventoryError, PciLocation, PreparedAcpiPciInterruptLinkDiscovery,
-    PreparedAcpiPciRoutingDiscovery, PreparedAcpiPciRoutingTables,
-    PreparedAcpiPciScopeCatalogUpdate, PreparedPciInterruptRoutePublication,
+    AcpiPciCrsMethodSource, AcpiPciLinkCandidateFact, AcpiPciProviderEndpoint, AcpiPciScopeCatalog,
+    AcpiPciScopeError, AcpiPciScopeSource, PciDevice, PciInterruptRouteClaim,
+    PciInterruptRouteOwner, PciInventory, PciInventoryError, PciLocation,
+    PreparedAcpiPciInterruptLinkDiscovery, PreparedAcpiPciRoutingDiscovery,
+    PreparedAcpiPciRoutingTables, PreparedAcpiPciScopeCatalogUpdate,
+    PreparedPciInterruptRoutePublication,
 };
-
-const HOSTED_INTERRUPT_VECTOR_LIMIT: u32 = 64;
 
 struct HostedPciTopologyAuthority {
     inventory: PciInventory,
     scopes: AcpiPciScopeCatalog,
     routes: PciInterruptRouteOwner,
-    interrupt_vectors: Vec<PciInterruptVector>,
+    interrupt_claims: Vec<nt_interrupt_authority::PhysicalInterruptAssignment>,
     dirty_relations: Vec<HostedPciDirtyRelation>,
     reconcile_ready: bool,
     interrupt_overrides: Option<Vec<nt_acpi::LegacyIrqOverride>>,
@@ -46,6 +44,7 @@ pub(crate) enum HostedPciTopologyReconciliation {
 #[derive(Clone, Copy)]
 pub(crate) struct HostedPciInterruptRouteClaim {
     claim: PciInterruptRouteClaim,
+    physical: nt_interrupt_authority::PhysicalInterruptClaim,
     vector: u32,
 }
 
@@ -56,6 +55,7 @@ pub(crate) struct HostedPciInterruptRouteAssignment {
     pub(crate) level_sensitive: bool,
     pub(crate) active_low: bool,
     pub(crate) shared: bool,
+    pub(crate) physical: nt_interrupt_authority::PhysicalInterruptClaim,
 }
 
 impl HostedPciInterruptRouteClaim {
@@ -132,7 +132,7 @@ pub(crate) unsafe fn install_hosted_pci_topology(
         inventory,
         scopes: AcpiPciScopeCatalog::default(),
         routes: PciInterruptRouteOwner::default(),
-        interrupt_vectors: Vec::new(),
+        interrupt_claims: Vec::new(),
         dirty_relations: Vec::new(),
         reconcile_ready: false,
         interrupt_overrides: None,
@@ -167,15 +167,6 @@ fn route_status(_error: nt_pnp::PciInterruptRouteError) -> nt_status::NtStatus {
     nt_status::NtStatus::INVALID_DEVICE_REQUEST
 }
 
-fn vector_status(error: PciInterruptVectorError) -> nt_status::NtStatus {
-    match error {
-        PciInterruptVectorError::Allocation => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-        PciInterruptVectorError::InvalidVectorLimit
-        | PciInterruptVectorError::InvalidReservedVector(_)
-        | PciInterruptVectorError::Exhausted => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-    }
-}
-
 /// Retain the exact route generation selected for one current PCI function.
 pub(crate) unsafe fn acquire_hosted_pci_interrupt_route(
     device: &PciDevice,
@@ -205,13 +196,17 @@ pub(crate) unsafe fn acquire_hosted_pci_interrupt_route(
     let Some(claim) = claim else {
         return Ok(None);
     };
-    let vector = authority
-        .interrupt_vectors
+    let physical = authority
+        .interrupt_claims
         .iter()
-        .find(|assignment| assignment.gsi == claim.route().gsi)
-        .map(|assignment| assignment.vector)
+        .find(|assignment| assignment.route.gsi == claim.route().gsi)
+        .copied()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    Ok(Some(HostedPciInterruptRouteClaim { claim, vector }))
+    Ok(Some(HostedPciInterruptRouteClaim {
+        claim,
+        physical: physical.claim,
+        vector: physical.route.vector,
+    }))
 }
 
 /// Revalidate a retained route immediately before resource publication and capability minting.
@@ -232,19 +227,21 @@ pub(crate) unsafe fn validate_hosted_pci_interrupt_route(
             retained.claim,
         )
         .map_err(route_status)?;
-    if !authority
-        .interrupt_vectors
-        .iter()
-        .any(|assignment| assignment.gsi == route.gsi && assignment.vector == retained.vector)
+    let physical = crate::validate_physical_interrupt_claim(retained.physical)?;
+    if physical.gsi != route.gsi
+        || physical.level_sensitive != route.level_sensitive
+        || physical.active_low != route.active_low
+        || physical.shared != route.shared
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     Ok(HostedPciInterruptRouteAssignment {
         gsi: route.gsi,
-        vector: retained.vector,
+        vector: physical.vector,
         level_sensitive: route.level_sensitive,
         active_low: route.active_low,
         shared: route.shared,
+        physical: retained.physical,
     })
 }
 
@@ -301,11 +298,12 @@ pub(crate) unsafe fn note_hosted_pci_relation_queued(
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let relevant = authority.scopes.relation_has_sources(relation_owner);
     if relevant {
+        crate::fence_pci_interrupt_claims(authority.routes.generation())?;
         authority
             .routes
             .invalidate()
             .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        authority.interrupt_vectors.clear();
+        authority.interrupt_claims.clear();
         authority.reconcile_ready = false;
         authority.route_blocked = None;
     }
@@ -494,19 +492,10 @@ pub(crate) unsafe fn commit_hosted_pci_interrupt_routes(
     if !authority.dirty_relations.is_empty() || authority.route_blocked.is_some() {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    let reserved_vectors = crate::driver_launch::snapshot_hosted_reserved_interrupt_vectors()?;
-    let interrupt_vectors = allocate_pci_interrupt_vectors(
+    let physical = crate::prepare_pci_interrupt_claims(
+        publication.target_generation(),
         publication.routes(),
-        HOSTED_INTERRUPT_VECTOR_LIMIT,
-        &reserved_vectors,
-    )
-    .map_err(vector_status)?;
-    if interrupt_vectors
-        .iter()
-        .any(|assignment| crate::resolve_platform_ioapic_gsi(assignment.gsi).is_none())
-    {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
+    )?;
     let generation = authority
         .routes
         .commit(
@@ -515,7 +504,8 @@ pub(crate) unsafe fn commit_hosted_pci_interrupt_routes(
             authority.scopes.generation(),
         )
         .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    authority.interrupt_vectors = interrupt_vectors;
+    authority.interrupt_claims = crate::commit_physical_interrupt_claims(physical)
+        .expect("serialized PCI route commit must preserve the prepared physical-line mutation");
     authority.reconcile_ready = false;
     Ok(generation)
 }

@@ -63,9 +63,11 @@ mod pnp;
 pub(crate) use pnp::*;
 mod hard_error;
 mod hosted_pci_topology;
+mod hosted_interrupt_authority;
 mod hosted_pnp_context;
 mod power_manager;
 pub(crate) use hosted_pci_topology::*;
+pub(crate) use hosted_interrupt_authority::*;
 pub(crate) use hosted_pnp_context::*;
 mod hosted_pnp_start;
 pub(crate) use hosted_pnp_start::*;
@@ -14754,7 +14756,7 @@ unsafe fn grant_hosted_pci_devnode_resources(
         interrupt_route
             .map(|route| route.active_low)
             .unwrap_or(false),
-        interrupt_route.is_some(),
+        interrupt_route.map(|route| route.physical),
         interrupt.map(|interrupt| interrupt.affinity).unwrap_or(0),
         window.dma_va,
         window.dma_seed_va,
@@ -14924,7 +14926,7 @@ unsafe fn grant_hosted_platform_devnode_resources(
         window.interrupt_shared,
         window.interrupt_latched,
         window.interrupt_active_low,
-        true,
+        Some(window.interrupt_claim),
         interrupt.affinity,
         0,
         0,
@@ -17550,6 +17552,9 @@ unsafe fn delay_timer_init() -> bool {
     if irq_state != DELAY_TIMER_IRQ_UNINITIALIZED {
         return false;
     }
+    let Ok(timer_claim) = prepare_delay_timer_interrupt_claim() else {
+        return false;
+    };
     let period = HPET_PERIOD_FS.load(Ordering::Relaxed);
     if period == 0 {
         print_str(b"[delay] monotonic clock unavailable; refusing timed-wait fallback\n");
@@ -17579,6 +17584,14 @@ unsafe fn delay_timer_init() -> bool {
         return false;
     };
     if irq_handler_set_notification_checked(handler, badged).is_err() {
+        if mask_ioapic_irq_handler_checked(handler).is_ok() {
+            let _ = delete_ioapic_irq_handler_cap_checked(handler);
+        }
+        let _ = cnode_delete_recycle_r(ioport);
+        let _ = delete_executive_event_badge(badged);
+        return false;
+    }
+    if commit_physical_interrupt_claims(timer_claim).is_err() {
         if mask_ioapic_irq_handler_checked(handler).is_ok() {
             let _ = delete_ioapic_irq_handler_cap_checked(handler);
         }
@@ -22063,6 +22076,25 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
             platform_reset: resource.platform_reset,
         });
     }
+    let sci_claim_publication = match prepare_acpi_sci_interrupt_claim(
+        discovery.fixed.sci_interrupt as u32,
+        discovery.fixed.sci_interrupt as u32,
+        true,
+        true,
+        true,
+    ) {
+        Ok(publication) => publication,
+        Err(_) => {
+            report.missing_platform_grants += 1;
+            let _ = retire_hosted_pnp_context_owner(context_owner);
+            return report;
+        }
+    };
+    let Some(sci_assignment) = sci_claim_publication.assignments().first().copied() else {
+        report.missing_platform_grants += 1;
+        let _ = retire_hosted_pnp_context_owner(context_owner);
+        return report;
+    };
     if let Some(window) = HostedPnpPlatformResourceDescriptor::new(
         ACPI_ROOT_INSTANCE_PATH,
         ACPI_ROOT_HARDWARE_ID,
@@ -22073,6 +22105,7 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
         false,
         true,
         true,
+        sci_assignment.claim,
     ) {
         platform_windows.push(window);
     } else {
@@ -22243,11 +22276,15 @@ unsafe fn publish_hosted_pnp_context_for_launch_plans(
     }
     report.published_windows = windows.len() as u64;
     report.published_platform_windows = platform_windows.len() as u64;
-    if publish_hosted_pnp_resource_context(devices, windows, platform_windows, context_owner)
-        .is_err()
-    {
-        report.missing_grants += 1;
-        report.missing_platform_grants += 1;
+    match publish_hosted_pnp_resource_context(devices, windows, platform_windows, context_owner) {
+        Ok(_) => {
+            commit_physical_interrupt_claims(sci_claim_publication)
+                .expect("serialized PnP context publication must preserve the prepared SCI claim");
+        }
+        Err(_) => {
+            report.missing_grants += 1;
+            report.missing_platform_grants += 1;
+        }
     }
     report
 }

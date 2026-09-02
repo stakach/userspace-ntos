@@ -568,19 +568,26 @@ impl PhysicalInterruptLineCatalog {
     pub fn release_connection(
         &mut self,
         lease: PhysicalInterruptConnectionLease,
-    ) -> Result<(), PhysicalInterruptAuthorityError> {
-        let next_mutation_generation = self.next_mutation_generation()?;
-        let record = self
-            .leases
-            .iter_mut()
-            .find(|record| {
-                record.active
-                    && record.line == lease.line
-                    && record.claim_id == lease.claim_id
-                    && record.lease_id == lease.lease_id
-            })
-            .ok_or(PhysicalInterruptAuthorityError::StaleLease)?;
-        record.active = false;
+    ) -> Result<
+        (),
+        (
+            PhysicalInterruptAuthorityError,
+            PhysicalInterruptConnectionLease,
+        ),
+    > {
+        let next_mutation_generation = match self.next_mutation_generation() {
+            Ok(generation) => generation,
+            Err(error) => return Err((error, lease)),
+        };
+        let Some(index) = self.leases.iter().position(|record| {
+            record.active
+                && record.line == lease.line
+                && record.claim_id == lease.claim_id
+                && record.lease_id == lease.lease_id
+        }) else {
+            return Err((PhysicalInterruptAuthorityError::StaleLease, lease));
+        };
+        self.leases[index].active = false;
         self.mutation_generation = next_mutation_generation;
         self.retire_drained_fenced_claims();
         self.collect_drained_lines();
@@ -814,6 +821,36 @@ mod tests {
         assert_eq!(catalog.active_lease_count(), 2);
         catalog.release_connection(first).unwrap();
         assert_eq!(catalog.resolve_connection(&second), Ok(pci[0].route));
+    }
+
+    #[test]
+    fn shared_owner_republication_fences_old_claim_and_preserves_its_lease() {
+        let mut catalog = PhysicalInterruptLineCatalog::new();
+        let first = publish(
+            &mut catalog,
+            PCI,
+            0,
+            1,
+            &[request(23, PhysicalInterruptVectorRequest::Allocate)],
+        );
+        let old_lease = catalog.acquire_connection(first[0].claim).unwrap();
+        let second = publish(
+            &mut catalog,
+            PCI,
+            1,
+            2,
+            &[request(23, PhysicalInterruptVectorRequest::Allocate)],
+        );
+        assert_eq!(first[0].claim.line, second[0].claim.line);
+        assert_eq!(first[0].route.vector, second[0].route.vector);
+        assert_eq!(catalog.resolve_connection(&old_lease), Ok(first[0].route));
+        assert_eq!(
+            catalog.acquire_connection(first[0].claim),
+            Err(PhysicalInterruptAuthorityError::Fenced)
+        );
+        let new_lease = catalog.acquire_connection(second[0].claim).unwrap();
+        catalog.release_connection(old_lease).unwrap();
+        assert_eq!(catalog.resolve_connection(&new_lease), Ok(second[0].route));
     }
 
     #[test]

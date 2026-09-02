@@ -29,7 +29,6 @@ extern crate alloc;
 mod acpi_pci_routing_discovery;
 mod acpi_pci_scope_catalog;
 mod pci_interrupt_routes;
-mod pci_interrupt_vectors;
 mod pci_inventory;
 
 pub use acpi_pci_routing_discovery::{
@@ -48,9 +47,6 @@ pub use acpi_pci_scope_catalog::{
 pub use pci_interrupt_routes::{
     PciInterruptRoute, PciInterruptRouteClaim, PciInterruptRouteError, PciInterruptRouteOwner,
     PciRouteFunction, PreparedPciInterruptRoutePublication, PreparedPciInterruptRouteRevocation,
-};
-pub use pci_interrupt_vectors::{
-    allocate_pci_interrupt_vectors, PciInterruptVector, PciInterruptVectorError,
 };
 pub use pci_inventory::{
     CommittedPciInventoryUpdate, PciInventory, PciInventoryError, PciLocation, PciResourceChange,

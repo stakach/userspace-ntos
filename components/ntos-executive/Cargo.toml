@@ -62,6 +62,7 @@ nt-video-miniport = { path = "../../crates/nt-video-miniport" }
 nt-cm-resources = { path = "../../crates/nt-cm-resources" }
 # Canonical HAL/PnP resource ownership for hosted MMIO and interrupt grants.
 nt-hal-abi = { path = "../../crates/nt-hal-abi" }
+nt-interrupt-authority = { path = "../../crates/nt-interrupt-authority" }
 nt-resource-manager = { path = "../../crates/nt-resource-manager" }
 # Canonical DMA adapter/common-buffer ownership for hosted device drivers.
 nt-dma-manager = { path = "../../crates/nt-dma-manager" }
