@@ -29229,6 +29229,7 @@ unsafe fn drain_hosted_work_queues_at_passive_level() -> Result<u64, i32> {
 }
 
 unsafe fn provider_callback_marshal_window(
+    window: HostedProviderMarshalWindow,
     payload_bytes: u64,
     trailing_cells: u64,
 ) -> Result<(u64, u64), i32> {
@@ -29240,14 +29241,45 @@ unsafe fn provider_callback_marshal_window(
                 .ok_or(STATUS_INVALID_PARAMETER)?,
         )
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if used > window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     Ok((cell_base, used))
 }
 
+#[derive(Clone, Copy)]
+struct HostedProviderMarshalWindow {
+    component_base: u64,
+    exec_base: u64,
+    capacity: u64,
+}
+
+impl HostedProviderMarshalWindow {
+    fn legacy(shared: u64) -> Option<Self> {
+        Self::new(
+            FSD_SHARED_VADDR.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)?,
+            shared.checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)?,
+            SH_PROVIDER_EXPORT_MARSHAL_BYTES,
+        )
+    }
+
+    fn new(component_base: u64, exec_base: u64, capacity: u64) -> Option<Self> {
+        if component_base == 0 || exec_base == 0 || capacity == 0 {
+            return None;
+        }
+        component_base.checked_add(capacity)?;
+        exec_base.checked_add(capacity)?;
+        Some(Self {
+            component_base,
+            exec_base,
+            capacity,
+        })
+    }
+}
+
 unsafe fn service_ndis_initialize_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29265,7 +29297,7 @@ unsafe fn service_ndis_initialize_callback(
     let medium_bytes = arg3
         .checked_mul(NDIS_MEDIUM_ENTRY_BYTES_X64)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    provider_callback_marshal_window(0x10 + medium_bytes, 0)?;
+    provider_callback_marshal_window(marshal_window, 0x10 + medium_bytes, 0)?;
 
     let provider_open_status_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
@@ -29277,11 +29309,10 @@ unsafe fn service_ndis_initialize_callback(
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, medium_bytes)
             .ok_or(STATUS_INVALID_PARAMETER)?;
 
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_open_status_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_open_status_component = marshal_window.component_base;
     let dependent_selected_component = dependent_open_status_component + 8;
     let dependent_medium_component = dependent_open_status_component + 0x10;
-    let dependent_open_status_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_open_status_exec = marshal_window.exec_base;
     let dependent_selected_exec = dependent_open_status_exec + 8;
     let dependent_medium_exec = dependent_open_status_exec + 0x10;
     provider_marshal_zero(dependent_open_status_exec, 0x10 + medium_bytes);
@@ -29330,6 +29361,7 @@ unsafe fn service_ndis_initialize_callback(
 
 unsafe fn service_ndis_query_set_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29348,10 +29380,10 @@ unsafe fn service_ndis_query_set_callback(
     if bytes0_provider == 0 || bytes1_provider == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if arg3 > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if arg3 > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let (cell_base, used) = provider_callback_marshal_window(arg3, 2)?;
+    let (cell_base, used) = provider_callback_marshal_window(marshal_window, arg3, 2)?;
     let provider_bytes0_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, bytes0_provider, 4)
             .ok_or(STATUS_INVALID_PARAMETER)?;
@@ -29365,16 +29397,15 @@ unsafe fn service_ndis_query_set_callback(
             .ok_or(STATUS_INVALID_PARAMETER)?
     };
 
-    let dependent_shared = dependent_inst.exec_shared_va;
     let dependent_info_component = if arg3 == 0 {
         0
     } else {
-        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE
+        marshal_window.component_base
     };
-    let dependent_info_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_bytes0_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
+    let dependent_info_exec = marshal_window.exec_base;
+    let dependent_bytes0_component = marshal_window.component_base + cell_base;
     let dependent_bytes1_component = dependent_bytes0_component + 8;
-    let dependent_bytes0_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE + cell_base;
+    let dependent_bytes0_exec = marshal_window.exec_base + cell_base;
     let dependent_bytes1_exec = dependent_bytes0_exec + 8;
     provider_marshal_zero(dependent_info_exec, used);
     if input_buffer && arg3 != 0 {
@@ -29402,6 +29433,7 @@ unsafe fn service_ndis_query_set_callback(
 
 unsafe fn service_ndis_reset_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29410,13 +29442,12 @@ unsafe fn service_ndis_reset_callback(
     arg0: u64,
     arg1: u64,
 ) -> Result<u64, i32> {
-    provider_callback_marshal_window(1, 0)?;
+    provider_callback_marshal_window(marshal_window, 1, 0)?;
     let provider_reset_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 1)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_reset_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_reset_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_reset_component = marshal_window.component_base;
+    let dependent_reset_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_reset_exec, 8);
     let result = dispatch_dependent_provider_callback(
         dispatch,
@@ -29432,6 +29463,7 @@ unsafe fn service_ndis_reset_callback(
 
 unsafe fn service_ndis_isr_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29441,17 +29473,16 @@ unsafe fn service_ndis_isr_callback(
     arg1: u64,
     arg2: u64,
 ) -> Result<u64, i32> {
-    provider_callback_marshal_window(0x10, 0)?;
+    provider_callback_marshal_window(marshal_window, 0x10, 0)?;
     let provider_recognized_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 1)
             .ok_or(STATUS_INVALID_PARAMETER)?;
     let provider_queue_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 1)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_recognized_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_recognized_component = marshal_window.component_base;
     let dependent_queue_component = dependent_recognized_component + 8;
-    let dependent_recognized_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_recognized_exec = marshal_window.exec_base;
     let dependent_queue_exec = dependent_recognized_exec + 8;
     provider_marshal_zero(dependent_recognized_exec, 0x10);
     let result = dispatch_dependent_provider_callback(
@@ -29474,6 +29505,7 @@ unsafe fn service_ndis_isr_callback(
 
 unsafe fn service_ndis_reconfigure_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29483,13 +29515,12 @@ unsafe fn service_ndis_reconfigure_callback(
     arg1: u64,
     arg2: u64,
 ) -> Result<u64, i32> {
-    provider_callback_marshal_window(4, 0)?;
+    provider_callback_marshal_window(marshal_window, 4, 0)?;
     let provider_open_status_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_open_status_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_open_status_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_open_status_component = marshal_window.component_base;
+    let dependent_open_status_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_open_status_exec, 8);
     let result = dispatch_dependent_provider_callback(
         dispatch,
@@ -29521,6 +29552,7 @@ unsafe fn provider_callback_packet_shadow(
 
 unsafe fn service_ndis_send_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29582,6 +29614,7 @@ unsafe fn service_ndis_send_callback(
 
 unsafe fn service_ndis_send_packets_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29603,13 +29636,12 @@ unsafe fn service_ndis_send_packets_callback(
         );
     }
     let bytes = count.checked_mul(8).ok_or(STATUS_INVALID_PARAMETER)?;
-    provider_callback_marshal_window(bytes, 0)?;
+    provider_callback_marshal_window(marshal_window, bytes, 0)?;
     let provider_array_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, bytes)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_array_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_array_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_array_component = marshal_window.component_base;
+    let dependent_array_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_array_exec, bytes);
 
     let mut index = 0u64;
@@ -29682,6 +29714,7 @@ unsafe fn service_ndis_send_packets_callback(
 
 unsafe fn service_ndis_return_packet_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29719,6 +29752,7 @@ unsafe fn service_ndis_return_packet_callback(
 
 unsafe fn service_ndis_transfer_data_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29733,7 +29767,7 @@ unsafe fn service_ndis_transfer_data_callback(
     if arg1 == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    provider_callback_marshal_window(8, 0)?;
+    provider_callback_marshal_window(marshal_window, 8, 0)?;
     let provider_bytes_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 4)
             .ok_or(STATUS_INVALID_PARAMETER)?;
@@ -29752,9 +29786,8 @@ unsafe fn service_ndis_transfer_data_callback(
         shadow,
     )?;
 
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_bytes_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_bytes_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_bytes_component = marshal_window.component_base;
+    let dependent_bytes_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_bytes_exec, 8);
 
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
@@ -29796,6 +29829,7 @@ unsafe fn service_ndis_transfer_data_callback(
 }
 
 unsafe fn provider_callback_unicode_string_length(
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     provider_desc_component: u64,
@@ -29811,7 +29845,7 @@ unsafe fn provider_callback_unicode_string_length(
     let length = read_unaligned(provider_desc_exec as *const u16) as u64;
     let maximum = read_unaligned((provider_desc_exec + 2) as *const u16) as u64;
     let buffer = read_unaligned((provider_desc_exec + 8) as *const u64);
-    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+    if length > maximum || length > marshal_window.capacity / 2 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     if length != 0
@@ -29833,6 +29867,7 @@ unsafe fn provider_callback_unicode_string_buffer_bytes(length: u64) -> Result<u
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn provider_callback_copy_unicode_string(
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     provider_desc_component: u64,
@@ -29851,7 +29886,7 @@ unsafe fn provider_callback_copy_unicode_string(
     let length = read_unaligned(provider_desc_exec as *const u16) as u64;
     let maximum = read_unaligned((provider_desc_exec + 2) as *const u16) as u64;
     let buffer = read_unaligned((provider_desc_exec + 8) as *const u64);
-    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+    if length > maximum || length > marshal_window.capacity / 2 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let dependent_buffer = if length == 0 {
@@ -29876,6 +29911,7 @@ unsafe fn provider_callback_copy_unicode_string(
 
 unsafe fn service_ndis_protocol_bind_adapter_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29888,9 +29924,9 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
     provider_stack: [u64; PROVIDER_CALLBACK_STACK_QWORDS],
 ) -> Result<u64, i32> {
     let device_len =
-        provider_callback_unicode_string_length(provider_instance, provider_inst, arg2)?;
+        provider_callback_unicode_string_length(marshal_window, provider_instance, provider_inst, arg2)?;
     let registry_len =
-        provider_callback_unicode_string_length(provider_instance, provider_inst, arg3)?;
+        provider_callback_unicode_string_length(marshal_window, provider_instance, provider_inst, arg3)?;
     let device_buffer_bytes = provider_callback_unicode_string_buffer_bytes(device_len)?;
     let registry_buffer_bytes = provider_callback_unicode_string_buffer_bytes(registry_len)?;
     let status_off = 0u64;
@@ -29901,19 +29937,19 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
     let registry_buffer_off = registry_desc_off + 16;
     let used = provider_marshal_align8(registry_buffer_off + registry_buffer_bytes)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if used > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
 
     let provider_status_exec =
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 4)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_base_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_base_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_base_component = marshal_window.component_base;
+    let dependent_base_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_base_exec, used);
 
     provider_callback_copy_unicode_string(
+        marshal_window,
         provider_instance,
         provider_inst,
         arg2,
@@ -29922,6 +29958,7 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
         dependent_base_exec + device_buffer_off,
     )?;
     provider_callback_copy_unicode_string(
+        marshal_window,
         provider_instance,
         provider_inst,
         arg3,
@@ -29951,6 +29988,7 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
 
 unsafe fn service_ndis_protocol_pnp_event_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29972,7 +30010,7 @@ unsafe fn service_ndis_protocol_pnp_event_callback(
         provider_marshal_align8(NDIS_NET_PNP_EVENT_LEN_X64).ok_or(STATUS_INVALID_PARAMETER)?;
     let used = provider_marshal_align8(buffer_off + provider_buffer_len)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if used > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     if provider_buffer_len != 0
@@ -29987,9 +30025,8 @@ unsafe fn service_ndis_protocol_pnp_event_callback(
         return Err(STATUS_INVALID_PARAMETER);
     }
 
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_base_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_base_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_base_component = marshal_window.component_base;
+    let dependent_base_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_base_exec, used);
     copy_bytes(
         dependent_base_exec,
@@ -30029,6 +30066,7 @@ unsafe fn service_ndis_protocol_pnp_event_callback(
 
 unsafe fn service_ndis_protocol_send_complete_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30064,6 +30102,7 @@ unsafe fn service_ndis_protocol_send_complete_callback(
 
 unsafe fn service_ndis_protocol_transfer_data_complete_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30100,6 +30139,7 @@ unsafe fn service_ndis_protocol_transfer_data_complete_callback(
 
 unsafe fn service_ndis_protocol_receive_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30122,7 +30162,7 @@ unsafe fn service_ndis_protocol_receive_callback(
             .ok_or(STATUS_INVALID_PARAMETER)?,
     )
     .ok_or(STATUS_INVALID_PARAMETER)?;
-    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if used > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     let provider_header_exec = if header_bytes == 0 {
@@ -30143,9 +30183,8 @@ unsafe fn service_ndis_protocol_receive_callback(
         .ok_or(STATUS_INVALID_PARAMETER)?
     };
 
-    let dependent_shared = dependent_inst.exec_shared_va;
-    let dependent_base_component = FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE;
-    let dependent_base_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+    let dependent_base_component = marshal_window.component_base;
+    let dependent_base_exec = marshal_window.exec_base;
     provider_marshal_zero(dependent_base_exec, used);
     let dependent_header_component = if header_bytes == 0 {
         0
@@ -30180,6 +30219,7 @@ unsafe fn service_ndis_protocol_receive_callback(
 
 unsafe fn service_ndis_protocol_receive_complete_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
     exec_code_va: u64,
@@ -30197,6 +30237,7 @@ unsafe fn service_ndis_protocol_receive_complete_callback(
 
 unsafe fn service_ndis_protocol_status_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30208,7 +30249,7 @@ unsafe fn service_ndis_protocol_status_callback(
     arg3: u64,
 ) -> Result<u64, i32> {
     let used = provider_marshal_align8(arg3).ok_or(STATUS_INVALID_PARAMETER)?;
-    if used > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if used > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     let provider_status_exec = if arg3 == 0 {
@@ -30217,14 +30258,13 @@ unsafe fn service_ndis_protocol_status_callback(
         component_to_exec_va_for_instance(provider_instance, provider_inst, arg2, arg3)
             .ok_or(STATUS_INVALID_PARAMETER)?
     };
-    let dependent_shared = dependent_inst.exec_shared_va;
     let dependent_status_component = if arg3 == 0 {
         0
     } else {
-        let dependent_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
+        let dependent_exec = marshal_window.exec_base;
         provider_marshal_zero(dependent_exec, used);
         copy_bytes(dependent_exec, provider_status_exec, arg3);
-        FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE
+        marshal_window.component_base
     };
     dispatch_dependent_provider_callback(
         dispatch,
@@ -30238,6 +30278,7 @@ unsafe fn service_ndis_protocol_status_callback(
 
 unsafe fn service_ndis_protocol_status_complete_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
     exec_code_va: u64,
@@ -30255,6 +30296,7 @@ unsafe fn service_ndis_protocol_status_complete_callback(
 
 unsafe fn service_ndis_protocol_receive_packet_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30306,6 +30348,7 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
 
 unsafe fn service_ndis_miniport_timer_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
@@ -30345,6 +30388,7 @@ unsafe fn service_ndis_miniport_timer_callback(
 
 unsafe fn service_ndis_work_item_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+    _marshal_window: HostedProviderMarshalWindow,
     provider_instance: usize,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
@@ -30564,6 +30608,16 @@ unsafe fn service_hosted_provider_callback_explicit(
     callback_cookie: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> u64 {
+    let Some(record) = hosted_provider_callback_record(callback_cookie) else {
+        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
+    };
+    let Some(dependent_inst) = instance(record.dependent_instance) else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(marshal_window) = HostedProviderMarshalWindow::legacy(dependent_inst.exec_shared_va)
+    else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
     let mut dispatch = |record: HostedProviderCallbackRecord,
                         dependent_inst: DriverInstance,
                         exec_code_va: u64,
@@ -30582,6 +30636,7 @@ unsafe fn service_hosted_provider_callback_explicit(
         provider_channel,
         callback_cookie,
         args,
+        marshal_window,
         &mut dispatch,
     )
 }
@@ -30590,6 +30645,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    marshal_window: HostedProviderMarshalWindow,
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
 ) -> u64 {
     HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -30691,6 +30747,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => {
                         service_ndis_initialize_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30706,6 +30763,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => {
                         service_ndis_query_set_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30723,6 +30781,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => {
                         service_ndis_query_set_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30739,6 +30798,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     }
                     NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
                         dispatch,
+                            marshal_window,
                         provider_instance,
                         provider_inst,
                         record,
@@ -30749,6 +30809,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     ),
                     NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
                         dispatch,
+                            marshal_window,
                         provider_instance,
                         provider_inst,
                         record,
@@ -30761,6 +30822,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => {
                         service_ndis_reconfigure_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30787,6 +30849,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     }
                     NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64 => service_ndis_send_callback(
                         dispatch,
+                            marshal_window,
                         provider_instance,
                         provider_inst,
                         record,
@@ -30799,6 +30862,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_RETURN_PACKET_CALLBACK_OFFSET_X64 => {
                         service_ndis_return_packet_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30811,6 +30875,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_SEND_PACKETS_CALLBACK_OFFSET_X64 => {
                         service_ndis_send_packets_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30824,6 +30889,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => {
                         service_ndis_transfer_data_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30842,6 +30908,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_bind_adapter_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30857,6 +30924,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_pnp_event_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30869,6 +30937,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_send_complete_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30882,6 +30951,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_transfer_data_complete_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30896,6 +30966,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30911,6 +30982,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_complete_callback(
                             dispatch,
+                            marshal_window,
                             record,
                             dependent_inst,
                             exec_code_va,
@@ -30920,6 +30992,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_status_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30934,6 +31007,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_status_complete_callback(
                             dispatch,
+                            marshal_window,
                             record,
                             dependent_inst,
                             exec_code_va,
@@ -30943,6 +31017,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_packet_callback(
                             dispatch,
+                            marshal_window,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30957,6 +31032,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                 HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => {
                     service_ndis_miniport_timer_callback(
                         dispatch,
+                            marshal_window,
                         provider_instance,
                         record,
                         dependent_inst,
@@ -30969,6 +31045,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                 }
                 HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => service_ndis_work_item_callback(
                     dispatch,
+                            marshal_window,
                     provider_instance,
                     record,
                     dependent_inst,

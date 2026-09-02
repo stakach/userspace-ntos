@@ -23188,6 +23188,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ordinary pump. `cargo fmt --all` and the freestanding executive check are green at the
     established 213-warning baseline.
 
+    B3 provider-callback marshal-window checkpoint (2026-09-03, freestanding green; arena wiring
+    open): every callback shape that projects pointer arguments now consumes one explicit
+    component/executive alias pair and capacity instead of naming the global provider scratch bank.
+    The ordinary adapter derives its executive alias from the target dependent component, preserving
+    the existing address-space ownership; the recursive broker can instead provide the exact
+    depth-owned dependent-lane window. Bounds checks and all component pointers are derived from that
+    same window, so a nested callback cannot silently spill into another depth. This is an address
+    ownership refactor only: the legacy adapter remains selected until root has a global call-frame
+    stack and there is no fallback from a selected arena path. `cargo fmt --all` and the freestanding
+    executive check are green at the established 213-warning baseline.
+
     B3 depth-owned marshal and multi-lane session checkpoint (2026-09-02, host and freestanding
     green; marshal integration open): arena ABI v4 replaces unused dispatch-page padding with a
     0x800-byte marshal window owned by that exact lane depth. Root can obtain the window only while
