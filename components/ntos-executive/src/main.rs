@@ -3556,7 +3556,7 @@ pub(crate) static WL_CPUEXC_DIAG_N: AtomicU64 = AtomicU64::new(0);
 /// Per-client win32k dispatch counters (indexed by pi), used only for census/gate evidence.
 /// Explorer and other real GUI clients can legitimately cross the old fixed bootstrap budgets while
 /// still loading code, filling pages, taking user callbacks, and painting. Liveness is therefore
-/// owned by the wall-clock progress-stall watchdog (`PROGRESS_EPOCH`), not by this counter.
+/// owned by the wall-clock boot-milestone watchdog, not by this counter.
 static mut W32_TOTAL_DISPATCH_ROWS: Vec<AtomicU64> = Vec::new();
 static W32_DISPATCH_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static W32_DISPATCH_ROW_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -7061,21 +7061,73 @@ fn lsa_selfrpc_bounded_spec(passed: &mut u64) {
         passed,
     );
 }
-/// (B) GLOBAL PROGRESS-STALL WATCHDOG epoch. Bumped whenever the boot makes UNAMBIGUOUS forward
-/// progress toward the gate — a NEW DLL demand-loaded, a NEW process spawned, an event created /
-/// signalled, a demand fault serviced into a runnable mapping/COW page, or the desktop paint. The
-/// service loop snapshots this at each iteration; if it runs a large window of iterations with NO
-/// epoch bump (only re-parks / a slow win32k live-lock churn remains), forward progress is
-/// impossible → QUIESCE (break → run the gate + qemu_exit). This is the robust termination backstop:
-/// cooperatively-parked
-/// processes (lsass listener wait / winlogon WaitForLsass) + a stuck client that keeps issuing
-/// syscalls (so it is neither crash- nor wait-parked) would otherwise block the loop's recv forever.
-/// Bumping it on real progress keeps a genuinely-advancing boot alive; a stall means the gate should
-/// run with whatever was reached (all remaining walls visible in the [parked] list).
-pub(crate) static PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Boot-readiness milestone epoch used by the progress-stall watchdog. Only durable movement toward
+/// the validation frontier belongs here: a new image/page mapping or the first observation of an
+/// Explorer paint milestone. Registry traffic, handle churn, waiter wakes, and IPC completions are
+/// normal runtime activity and must not extend the readiness deadline.
+static BOOT_PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
+static BOOT_PROGRESS_MILESTONES: AtomicU64 = AtomicU64::new(0);
+static BOOT_PROGRESS_SEALED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+pub(crate) enum BootProgress {
+    ImageActivated,
+    PageMappingPublished,
+    UserShellImageAttempted,
+    ExplorerMessageRegistrationObserved,
+    ExplorerDirectDrawObserved,
+    ExplorerBeginPaintObserved,
+    ExplorerEndPaintObserved,
+    ExplorerGdiBatchObserved,
+}
+
+impl BootProgress {
+    const fn one_shot_bit(self) -> u64 {
+        match self {
+            Self::ImageActivated | Self::PageMappingPublished => 0,
+            Self::UserShellImageAttempted => 1 << 0,
+            Self::ExplorerMessageRegistrationObserved => 1 << 1,
+            Self::ExplorerDirectDrawObserved => 1 << 2,
+            Self::ExplorerBeginPaintObserved => 1 << 3,
+            Self::ExplorerEndPaintObserved => 1 << 4,
+            Self::ExplorerGdiBatchObserved => 1 << 5,
+        }
+    }
+}
+
+pub(crate) fn explorer_chrome_runtime_milestones_reached() -> bool {
+    let begin = EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed);
+    begin != 0
+        && EXPLORER_END_PAINTS.load(Ordering::Relaxed) >= begin
+        && EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed) != 0
+        && EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed) != 0
+        && EXPLORER_GDI_BATCH_RECORDS.load(Ordering::Relaxed) != 0
+}
+
 #[inline]
-pub(crate) fn bump_progress() {
-    PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn note_boot_progress(progress: BootProgress) {
+    if BOOT_PROGRESS_SEALED.load(Ordering::Acquire) {
+        return;
+    }
+    let one_shot_bit = progress.one_shot_bit();
+    if one_shot_bit != 0
+        && BOOT_PROGRESS_MILESTONES.fetch_or(one_shot_bit, Ordering::AcqRel) & one_shot_bit != 0
+    {
+        return;
+    }
+    BOOT_PROGRESS_EPOCH.fetch_add(1, Ordering::Relaxed);
+    if explorer_chrome_runtime_milestones_reached()
+        && BOOT_PROGRESS_SEALED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        print_str(b"[quiesce] Explorer runtime paint milestones complete; boot-progress epoch sealed\n");
+    }
+}
+
+#[inline]
+pub(crate) fn boot_progress_epoch() -> u64 {
+    BOOT_PROGRESS_EPOCH.load(Ordering::Relaxed)
 }
 /// services' RPC listener thread fault count (multiplex proof).
 static SVC_LISTENER_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -11125,9 +11177,11 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
         GDI_BATCH_MAX_OFFSET.store(offset as u64, Ordering::Relaxed);
     }
     if client.process_role == Some(nt_exe_image::HostedProcessRole::InteractiveShell) {
-        EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        let first_flush = EXPLORER_GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed) == 0;
         EXPLORER_GDI_BATCH_RECORDS.fetch_add(count as u64, Ordering::Relaxed);
-        bump_progress();
+        if first_flush {
+            note_boot_progress(BootProgress::ExplorerGdiBatchObserved);
+        }
     }
     GDI_BATCH_FLUSHES.fetch_add(1, Ordering::Relaxed);
     GDI_BATCH_RECORDS_FLUSHED.fetch_add(count as u64, Ordering::Relaxed);

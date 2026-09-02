@@ -19,6 +19,7 @@ class RunWithTimeoutTests(unittest.TestCase):
         ready_file: Path | None = None,
         completion_file: Path | None = None,
         completion_grace_seconds: float = 5.0,
+        post_ready_seconds: float | None = None,
         merge_output: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         args = [
@@ -33,6 +34,8 @@ class RunWithTimeoutTests(unittest.TestCase):
             args.extend(
                 ["--ready-file", str(ready_file), "--ready-text", "DESKTOP_READY"]
             )
+            if post_ready_seconds is not None:
+                args.extend(["--post-ready-seconds", str(post_ready_seconds)])
         if completion_file is not None:
             args.extend(
                 [
@@ -92,6 +95,27 @@ class RunWithTimeoutTests(unittest.TestCase):
             result = self.run_helper(1, [sys.executable, "-c", program], ready_file)
         self.assertEqual(result.returncode, 0)
         self.assertIn("deadline disarmed", result.stderr)
+
+    def test_post_ready_deadline_bounds_missing_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ready_file = Path(temporary_directory) / "serial.log"
+            ready_file.touch()
+            program = (
+                "import pathlib,time; "
+                "time.sleep(.2); "
+                f"pathlib.Path({str(ready_file)!r}).write_text('DESKTOP_READY'); "
+                "time.sleep(30)"
+            )
+            started = time.monotonic()
+            result = self.run_helper(
+                3,
+                [sys.executable, "-c", program],
+                ready_file,
+                post_ready_seconds=0.3,
+            )
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("completion deadline armed", result.stderr)
+        self.assertLess(time.monotonic() - started, 3)
 
     def test_readiness_status_cannot_split_merged_child_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

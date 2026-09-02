@@ -22809,6 +22809,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     serialized desktop acceptance; any repeatable fault is a microkernel/boot regression to repair,
     not a reason to weaken the executive gate.
 
+    Simpleboot storage and desktop checkpoint (2026-09-02, loader/runtime proof green; final verdict
+    pending): the parent now pins rust-micro `4abaca8`, which contains the upstream Simpleboot
+    migration plus the complete platform handoff. The first rebuilt run exposed Simpleboot's
+    zero-filled FAT long-name tail; the shared checked FAT decoder now accepts the legal post-NUL
+    zero padding and its exact `initrd.tar` fixture. The next serialized run mounted the protective
+    MBR/GPT/ESP, validated both GPT CRCs and FAT bounds, loaded all 31 installed-tree images with
+    zero flat-root fallbacks, launched genuine Explorer, and executed real api0/WM_PAINT/GDI work.
+    It then stayed alive on ordinary TCP/IP, registry, event, and IPC traffic rather than reaching
+    the final gate.
+
+    Boot-liveness correction checkpoint (2026-09-02, host and freestanding validation green;
+    serialized runtime pending): the generic `bump_progress` escape hatch is deleted. A closed
+    `BootProgress` API now admits only new image activation, successfully published page mappings,
+    the first user-shell image attempt, and one-shot Explorer message/paint/GDI milestones. Registry
+    reads and mutations, handle closes, GUI waiter wakes, LPC/RPC completion, APC redrive, setup
+    tracing, and arbitrary pre-dialog win32k traffic no longer reset the readiness clock. The page
+    fill edges were moved after mapping and ownership publication, and Explorer seals the epoch once
+    BeginPaint/EndPaint, direct GDI, and a non-empty GDI batch have all occurred.
+
+    Progress-stall grace is now generation/state-sensitive and bounded: an unchanged callback, IPC,
+    or Explorer-frontier snapshot receives no second grace, and at most two changed snapshots can be
+    deferred per durable progress epoch. Explorer deferral tests only Explorer's own live owner, not
+    an unrelated runnable service. `ProgressDeferralBudget` lives in host-tested
+    `nt-hosted-runtime`; all 97 tests pass (including four policy tests), the freestanding executive
+    check remains green at the established 215-warning baseline, and all nine runner tests pass.
+    Desktop test mode retains the 3,600-second readiness ceiling and now also requires the final gate
+    and sentinel within 60 seconds of the shell-chrome PASS marker, instead of permitting an
+    accidental indefinite validation run. Next run one serialized desktop acceptance and require the
+    full gate, framebuffer proof, sentinel, and runner success before closing this checkpoint.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child

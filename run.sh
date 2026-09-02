@@ -59,6 +59,7 @@ run_desktop_boot_lane() {
     --cwd "$RM" \
     --ready-file "$RUN_LOG" \
     --ready-text 'PASS exec_explorer_shell_chrome_painted' \
+    --post-ready-seconds 60 \
     --completion-file "$RUN_LOG" \
     --completion-text '[microtest sentinel matched -- exiting QEMU]' \
     -- "$@"
@@ -239,7 +240,7 @@ if [ "$GRAPHICS" = 1 ]; then
   RUN_LOG="${RUN_LOG:-$ROOT/.tmp/run-desktop-$(date +%Y%m%d-%H%M%S).log}"
   : > "$RUN_LOG"
   say "      Serial log streams here and to: $RUN_LOG"
-  say "      Boot readiness timeout: ${BOOT_TIMEOUT_SECONDS}s (disarmed after Explorer paint)."
+  say "      Boot readiness timeout: ${BOOT_TIMEOUT_SECONDS}s (60s final-verdict grace after paint)."
   say "      QEMU exits after the guest's complete validation verdict."
   set +e
   if [ "${#PASSTHRU[@]}" -gt 0 ]; then

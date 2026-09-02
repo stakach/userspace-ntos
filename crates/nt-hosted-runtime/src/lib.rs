@@ -7,6 +7,7 @@
 #![no_std]
 
 mod hosted_irq_arena;
+mod progress_deferral;
 
 pub use hosted_irq_arena::{
     HostedIrqArena, HostedIrqArenaConfig, HostedIrqArenaControl, HostedIrqArenaError,
@@ -18,6 +19,7 @@ pub use hosted_irq_arena::{
     HOSTED_IRQ_ARENA_MAGIC, HOSTED_IRQ_ARENA_PAGE_COUNT, HOSTED_IRQ_ARENA_RESULT_CAP,
     HOSTED_IRQ_ARENA_VERSION,
 };
+pub use progress_deferral::ProgressDeferralBudget;
 
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const PAGE_TABLE_SPAN: u64 = 0x20_0000;

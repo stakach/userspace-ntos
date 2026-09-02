@@ -1455,11 +1455,8 @@ unsafe fn drain_deferred_user_callback_returns(
             print_str(b"\n");
         } else if outer_dispatch_completed {
             pfilled[current_pi] = *current_filled_pages;
-            let (_, woken, safe) =
+            let (_, _, safe) =
                 drain_selected_gui_event_signals(nt_handler, pfilled, procs);
-            if woken != 0 {
-                bump_progress();
-            }
             if !safe {
                 print_str(b"[gui-msg-wait] deferred callback drain aborted unsafe redrive\n");
             }
@@ -1492,6 +1489,33 @@ fn win32k_callback_transport_idle() -> bool {
         && continuation_depth == 0
         && spawn_hosts::dispatch_depth() == 0
         && spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed) == 0
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StallDeferralSnapshot {
+    UserCallbacks {
+        active_depth: u64,
+        continuation_depth: u64,
+        dispatch_depth: u64,
+        suspended: u64,
+    },
+    HostedIpc {
+        pi: usize,
+        badge: u64,
+        tid: u64,
+        head: u64,
+        tail: u64,
+    },
+    ExplorerChrome {
+        pi: usize,
+        generation: u64,
+        owner: u64,
+        register_messages: u64,
+        begin_paints: u64,
+        end_paints: u64,
+        direct_draws: u64,
+        batch_flushes: u64,
+    },
 }
 
 fn defer_quiesce_for_active_user_callbacks(site: &[u8]) -> bool {
@@ -1578,6 +1602,71 @@ unsafe fn defer_quiesce_for_pending_hosted_ipc(nt_handler: &ExecNtHandler, site:
         print_str(b"\n");
     }
     true
+}
+
+unsafe fn progress_stall_deferral_snapshot(
+    nt_handler: &ExecNtHandler,
+    crash_parked: u64,
+    wait_parked: u64,
+) -> Option<StallDeferralSnapshot> {
+    if !win32k_callback_transport_idle() {
+        let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+        return Some(StallDeferralSnapshot::UserCallbacks {
+            active_depth: active_depth as u64,
+            continuation_depth: continuation_depth as u64,
+            dispatch_depth: spawn_hosts::dispatch_depth(),
+            suspended: spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed),
+        });
+    }
+    if let Some((pi, thread, head, tail)) = pending_hosted_fault_endpoint_sender(nt_handler) {
+        return Some(StallDeferralSnapshot::HostedIpc {
+            pi,
+            badge: thread.badge,
+            tid: thread.tid,
+            head,
+            tail,
+        });
+    }
+    if interactive_shell_chrome_frontier_pending(nt_handler, crash_parked, wait_parked) {
+        let pi = live_hosted_pi_for_role(
+            nt_handler,
+            nt_exe_image::HostedProcessRole::InteractiveShell,
+        )?;
+        return Some(StallDeferralSnapshot::ExplorerChrome {
+            pi,
+            generation: nt_handler.hosted_process_generation(pi).unwrap_or(0),
+            owner: nt_handler.hosted_process_top_badge(pi).unwrap_or(u64::MAX),
+            register_messages: EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed),
+            begin_paints: EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed),
+            end_paints: EXPLORER_END_PAINTS.load(Ordering::Relaxed),
+            direct_draws: EXPLORER_DIRECT_GDI_DRAW_RETURNS.load(Ordering::Relaxed),
+            batch_flushes: EXPLORER_GDI_BATCH_FLUSHES.load(Ordering::Relaxed),
+        });
+    }
+    None
+}
+
+unsafe fn trace_progress_stall_deferral(
+    snapshot: StallDeferralSnapshot,
+    nt_handler: &ExecNtHandler,
+    crash_parked: u64,
+    wait_parked: u64,
+) {
+    match snapshot {
+        StallDeferralSnapshot::UserCallbacks { .. } => {
+            let _ = defer_quiesce_for_active_user_callbacks(b"progress-stall");
+        }
+        StallDeferralSnapshot::HostedIpc { .. } => {
+            let _ = defer_quiesce_for_pending_hosted_ipc(nt_handler, b"progress-stall");
+        }
+        StallDeferralSnapshot::ExplorerChrome { .. } => {
+            let _ = defer_quiesce_for_interactive_shell_chrome(
+                nt_handler,
+                crash_parked,
+                wait_parked,
+            );
+        }
+    }
 }
 
 fn align_up_u64(value: u64, align: u64) -> Option<u64> {
@@ -2448,7 +2537,6 @@ pub(crate) unsafe fn service_image_page_residency(
             }
         }
         *faults += 1;
-        bump_progress();
         (
             frame,
             if shareable { 0 } else { scratch },
@@ -2503,6 +2591,7 @@ pub(crate) unsafe fn service_image_page_residency(
             filled_pages[filled_index] = page;
         }
     }
+    note_boot_progress(BootProgress::PageMappingPublished);
     Ok(())
 }
 
@@ -3438,9 +3527,7 @@ unsafe fn interactive_shell_chrome_frontier_pending(
     if EXPLORER_SPAWNED.load(Ordering::Relaxed) != 1 {
         return false;
     }
-    if EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES.load(Ordering::Relaxed) >= 1
-        && EXPLORER_BEGIN_PAINTS.load(Ordering::Relaxed) >= 1
-    {
+    if explorer_chrome_runtime_milestones_reached() {
         return false;
     }
     let Some(pi) = live_hosted_pi_for_role(
@@ -3459,7 +3546,7 @@ unsafe fn interactive_shell_chrome_frontier_pending(
     if crash_parked & owner_bit != 0 {
         return false;
     }
-    (live_top_badges(nt_handler) & !(crash_parked | wait_parked)) != 0
+    owner_bit & !(crash_parked | wait_parked) != 0
 }
 
 unsafe fn defer_quiesce_for_interactive_shell_chrome(
@@ -6538,18 +6625,20 @@ pub(crate) unsafe fn service_sec_image(
             }
         }};
     }
-    // (B) GLOBAL PROGRESS-STALL WATCHDOG state — WALL-CLOCK based (iteration counts are useless here:
+    // Boot-milestone watchdog state is wall-clock based (iteration counts are useless here:
     // each win32k dispatch is a whole-component TCG round-trip taking SECONDS, so the loop does only
     // ~1-2 iterations/sec and an iter-count stall never trips within the boot budget). `last_progress_t`
-    // is the monotonic time (100ns units) at the last epoch bump (a NEW demand-load / fresh page fill /
-    // event / paint = real forward progress). If NO progress happens for STALL_BUDGET_100NS of
+    // is the monotonic time (100ns units) at the last epoch bump (a new image/page publication or
+    // one-shot shell milestone). If no progress happens for STALL_BUDGET_100NS of
     // WALL-CLOCK time, forward progress is impossible (every live process cooperatively parked with no
     // signaler, or a slow win32k live-lock that WALLs without loading/filling anything new) → QUIESCE
     // (break → run the gate + qemu_exit). Generous enough that a genuinely-advancing (even if slow)
     // boot phase — which keeps filling pages / loading DLLs — never trips; only a true stall does.
     const STALL_BUDGET_100NS: u64 = 45 * 10_000_000; // 45 s of NO forward progress
-    let mut last_progress_epoch = PROGRESS_EPOCH.load(Ordering::Relaxed);
+    let mut last_progress_epoch = boot_progress_epoch();
     let mut last_progress_t = monotonic_time_100ns();
+    let mut stall_deferrals =
+        nt_hosted_runtime::ProgressDeferralBudget::new(last_progress_epoch, 2);
     // FORWARD-PROGRESS CENSUS (see `print_progress_census`): attribute the wall-clock between two
     // consecutive loop tops to the badge that was serviced in between, and count the iterations.
     let mut census_prev_t = last_progress_t;
@@ -6624,8 +6713,8 @@ pub(crate) unsafe fn service_sec_image(
         if overdue_timed_wakes != 0 {
             let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
             // Timer drains are scheduler bookkeeping, not forward progress by themselves. The
-            // resumed waiter will bump PROGRESS_EPOCH if it performs real load/fill/event/paint
-            // work; counting the wake itself can keep the boot alive forever on timeout churn.
+            // resumed waiter records a boot milestone if it publishes a new image/page or crosses a
+            // shell frontier; counting the wake itself can keep boot alive forever on timeout churn.
             if crate::WATCHDOG_TRIPPED.load(Ordering::Relaxed) != 0 {
                 if watchdog_defer_if_hosted_work_can_run(b"overdue-timer") {
                     wait_parked = wait_parked_owner_mask(&nt_handler);
@@ -6640,7 +6729,7 @@ pub(crate) unsafe fn service_sec_image(
         // progress); quiesce if no progress for STALL_BUDGET_100NS.
         {
             let quiesce_started = crate::disk_census_ticks();
-            let ep = PROGRESS_EPOCH.load(Ordering::Relaxed);
+            let ep = boot_progress_epoch();
             let now = monotonic_time_100ns();
             {
                 let slot = census_slot(badge);
@@ -6675,23 +6764,21 @@ pub(crate) unsafe fn service_sec_image(
             if ep != last_progress_epoch {
                 last_progress_epoch = ep;
                 last_progress_t = now;
+                let _ = stall_deferrals.observe_progress(ep);
             } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
-                if defer_quiesce_for_active_user_callbacks(b"progress-stall") {
-                    last_progress_t = now;
-                } else if defer_quiesce_for_pending_hosted_ipc(&nt_handler, b"progress-stall") {
-                    last_progress_t = now;
-                } else if pre_user_shell_frontier_pending(
+                let deferral = progress_stall_deferral_snapshot(
                     &nt_handler,
                     crash_parked,
                     wait_parked,
-                    b"progress-stall",
-                ) {
-                    last_progress_t = now;
-                } else if defer_quiesce_for_interactive_shell_chrome(
-                    &nt_handler,
-                    crash_parked,
-                    wait_parked,
-                ) {
+                );
+                if deferral.is_some() && stall_deferrals.grant(ep, deferral.unwrap()) {
+                    let snapshot = deferral.unwrap();
+                    trace_progress_stall_deferral(
+                        snapshot,
+                        &nt_handler,
+                        crash_parked,
+                        wait_parked,
+                    );
                     last_progress_t = now;
                 } else {
                     dump_lsa_readiness_quiesce(
@@ -6718,7 +6805,7 @@ pub(crate) unsafe fn service_sec_image(
                         procs,
                         pfilled,
                     );
-                    print_str(b"[quiesce] no forward progress for ~45s wall-clock (no new load/fill/event/paint) -> run gate\n");
+                    print_str(b"[quiesce] no boot milestone for ~45s wall-clock -> run gate\n");
                     stop = m1;
                     break;
                 }
@@ -8251,7 +8338,7 @@ pub(crate) unsafe fn service_sec_image(
                 faults as usize,
             ) {
                 Ok(true) => {
-                    bump_progress();
+                    note_boot_progress(BootProgress::PageMappingPublished);
                     faults += 1;
                     procs[pi].faults = faults;
                     procs[pi].first = first;
@@ -8291,7 +8378,7 @@ pub(crate) unsafe fn service_sec_image(
                 vm_fault_access_from_x86_error(m3),
             ) {
                 Ok(true) => {
-                    bump_progress();
+                    note_boot_progress(BootProgress::PageMappingPublished);
                     procs[pi].faults = faults;
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
@@ -8967,7 +9054,6 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     faults += 1; // a fill consumed a scratch slot; shared HITs do not
-                    bump_progress(); // (B) a fresh page filled = real memory progress (resets stall)
                     (
                         f,
                         image_map_rights,
@@ -9077,7 +9163,7 @@ pub(crate) unsafe fn service_sec_image(
                 }
             }
             if fault_page_serviced {
-                bump_progress();
+                note_boot_progress(BootProgress::PageMappingPublished);
             }
             procs[pi].faults = faults;
             procs[pi].first = first;
@@ -9532,14 +9618,11 @@ pub(crate) unsafe fn service_sec_image(
                             }
                             if outer_dispatch_completed {
                                 pfilled[pi] = *filled_pages;
-                                let (_, woken, safe) = drain_selected_gui_event_signals(
+                                let (_, _, safe) = drain_selected_gui_event_signals(
                                     &mut nt_handler,
                                     pfilled,
                                     procs,
                                 );
-                                if woken != 0 {
-                                    bump_progress();
-                                }
                                 if !safe {
                                     print_str(b"[gui-msg-wait] callback drain aborted unsafe redrive\n");
                                 }
@@ -11196,9 +11279,14 @@ pub(crate) unsafe fn service_sec_image(
                     if captured != d_a0 {
                         d_a0 = captured;
                         if explorer_gui_client {
-                            EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
-                                .fetch_add(1, Ordering::Relaxed);
-                            bump_progress();
+                            if EXPLORER_REGISTER_WINDOW_MESSAGE_CAPTURES
+                                .fetch_add(1, Ordering::Relaxed)
+                                == 0
+                            {
+                                note_boot_progress(
+                                    BootProgress::ExplorerMessageRegistrationObserved,
+                                );
+                            }
                         }
                     }
                 } else if m0 == 0x101b && sp != 0 {
@@ -14359,8 +14447,9 @@ pub(crate) unsafe fn service_sec_image(
                         client,
                     );
                     if explorer_direct_gdi_draw && r.1 {
-                        EXPLORER_DIRECT_GDI_DRAW_RETURNS.fetch_add(1, Ordering::Relaxed);
-                        bump_progress();
+                        if EXPLORER_DIRECT_GDI_DRAW_RETURNS.fetch_add(1, Ordering::Relaxed) == 0 {
+                            note_boot_progress(BootProgress::ExplorerDirectDrawObserved);
+                        }
                     }
                     // ★ win32k just ran KeStackAttachProcess'd to this client and may have written
                     // SERVER data through its TEB pages — OBSERVE (do not yet repair) the TEB-tail
@@ -14738,11 +14827,13 @@ pub(crate) unsafe fn service_sec_image(
                     if explorer_gui_client && r.1 && r.0 != 0 {
                         match m0 {
                             NTUSER_BEGIN_PAINT_SSN => {
-                                EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed);
-                                bump_progress();
+                                if EXPLORER_BEGIN_PAINTS.fetch_add(1, Ordering::Relaxed) == 0 {
+                                    note_boot_progress(BootProgress::ExplorerBeginPaintObserved);
+                                }
                             }
                             NTUSER_END_PAINT_SSN => {
                                 EXPLORER_END_PAINTS.fetch_add(1, Ordering::Relaxed);
+                                note_boot_progress(BootProgress::ExplorerEndPaintObserved);
                             }
                             _ => {}
                         }
@@ -15123,12 +15214,6 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                 }
                 if winlogon_gui_client && ok && !redirected_user_callback {
-                    if WINLOGON_SAS2_RETRIEVED.load(Ordering::Relaxed) != 0
-                        && WINLOGON_DIALOG_WINDOWS.load(Ordering::Relaxed) == 0
-                        && st != 0
-                    {
-                        bump_progress();
-                    }
                     if m0 == 0x10a8 && st != 0 {
                         if let Some(key) = cursor_identity_key.as_ref() {
                             nt_handler.observe_global_cursor_identity(key, a0 as u32);
@@ -15170,11 +15255,8 @@ pub(crate) unsafe fn service_sec_image(
                     && !callback_suspended
                     && !redirected_user_callback
                 {
-                    let (_, gui_message_waits_woken, drain_safe) =
+                    let (_, _, drain_safe) =
                         drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
-                    if gui_message_waits_woken != 0 {
-                        bump_progress();
-                    }
                     if !drain_safe {
                         ok = false;
                         st = 0xC000_0001;
@@ -15578,11 +15660,8 @@ pub(crate) unsafe fn service_sec_image(
             pfilled[pi] = *filled_pages;
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             if gui_message_wait_park_request {
-                let (_, already_woken, prepark_safe) =
+                let (_, _, prepark_safe) =
                     drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
-                if already_woken != 0 {
-                    bump_progress();
-                }
                 if prepark_safe
                     && reply_main != 0
                     && gui_message_wait_park(
@@ -15599,13 +15678,10 @@ pub(crate) unsafe fn service_sec_image(
                         parked_syscall_reply,
                     )
                 {
-                    let (event_signals, gui_message_waits_woken, _drain_safe) =
+                    let (event_signals, _, _drain_safe) =
                         drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
                     if event_signals != 0 {
                         GUI_MESSAGE_WAIT_READY_REDRIVES.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if gui_message_waits_woken != 0 {
-                        bump_progress();
                     }
                     if gui_message_wait_was_replied(pi as u32, badge) {
                         let _ = finalize_service_loop_state(&mut nt_handler);
@@ -21615,7 +21691,6 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         thread_wait_state_clear_badge_ready(nt_handler, completed.continuation.badge);
         if replied {
             LPC_RECEIVE_WAIT_WOKEN.fetch_add(1, Ordering::Relaxed);
-            bump_progress();
             woken += 1;
         } else {
             LPC_RECEIVE_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -21773,7 +21848,6 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 }
                 LSA_LOGON_IN_FLIGHT.store(0, Ordering::Relaxed);
             }
-            bump_progress();
             woken += 1;
         } else {
             LPC_REQUEST_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -21927,7 +22001,6 @@ unsafe fn lpc_connect_wait_complete(
                 WINLOGON_LSA_CONNECTED.store(1, Ordering::Relaxed);
             }
         }
-        bump_progress();
     } else {
         LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
@@ -22675,7 +22748,6 @@ unsafe fn reconcile_user_apc_object_wait(nt_handler: &mut ExecNtHandler, tid: u6
     let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
     release_reply_pool_cap(removed.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
-    bump_progress();
     true
 }
 
@@ -22719,7 +22791,6 @@ unsafe fn reconcile_user_apc_file_acquisition_wait(
     let _ = client_reply_on(removed.reply_cap, 0, 0, 0, 0, 0);
     release_reply_pool_cap(removed.reply_cap);
     thread_wait_state_clear_badge_ready(nt_handler, removed.badge);
-    bump_progress();
     true
 }
 

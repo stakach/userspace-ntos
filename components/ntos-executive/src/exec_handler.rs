@@ -364,7 +364,6 @@ fn trace_setup_provision_phase(phase: &[u8], detail: u64) {
     if trace >= TRACE_LIMIT {
         return;
     }
-    bump_progress();
     print_str(b"[setup-provision] phase=");
     print_str(phase);
     print_str(b" detail=");
@@ -4383,7 +4382,6 @@ impl ExecNtHandler {
         }
         let generation =
             self.persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)?;
-        self.note_mutable_hives_changed();
         print_str(b"[timezone-setup] ReactOS timezone index=");
         print_u64(selected_index as u64);
         print_str(b" selected from ");
@@ -4541,7 +4539,6 @@ impl ExecNtHandler {
                 return;
             }
         };
-        self.note_mutable_hives_changed();
         print_str(b"[network-setup] HKLM\\SYSTEM committed through CM generation ");
         print_u64(generation);
         print_str(b": ndis=");
@@ -4580,7 +4577,6 @@ impl ExecNtHandler {
         };
         EXPLORER_SHELL_COM_REG_CLASSES_PROVISIONED.store(mask, Ordering::Relaxed);
         if changed {
-            self.note_mutable_hives_changed();
             trace_setup_provision_phase(b"shell-com-changed", mask);
         }
         if failed {
@@ -4640,7 +4636,6 @@ impl ExecNtHandler {
                 return;
             }
         };
-        self.note_mutable_hives_changed();
         print_str(b"[print-setup] HKLM\\SYSTEM committed through CM generation ");
         print_u64(generation);
         print_str(b": root=");
@@ -4692,7 +4687,6 @@ impl ExecNtHandler {
             }
             return;
         }
-        self.note_mutable_hives_changed();
         print_str(b"[profile-setup] HKU\\.DEFAULT shell folders provisioned: Shell Folders=");
         print_u64(stats.shell_folder_values as u64);
         print_str(b" User Shell Folders=");
@@ -4910,7 +4904,6 @@ impl ExecNtHandler {
                 .persist_and_publish_system_mutations(&mutations, SystemHiveMutationOrigin::Setup)
             {
                 Ok(generation) => {
-                    self.note_mutable_hives_changed();
                     Some(generation)
                 }
                 Err(status) => {
@@ -5027,11 +5020,7 @@ impl ExecNtHandler {
         if self.mutable_key_handles.len() >= MUTABLE_KEY_MAX as usize {
             return Err(0xC000_009A);
         }
-        let grows_buffer = self.mutable_key_handles.len() == self.mutable_key_handles.capacity();
         self.mutable_key_handles.push(Some(key));
-        if grows_buffer {
-            self.note_mutable_hives_changed();
-        }
         Ok(MUTABLE_KEY_TAG | (self.mutable_key_handles.len() - 1) as u32)
     }
 
@@ -5401,7 +5390,6 @@ impl ExecNtHandler {
             self.mutable_hive_journal_pending_boot_mask |= bit;
             self.mutable_hive_journal_dirty_boot_mask |= bit;
         }
-        bump_progress();
     }
 
     fn journal_mutable_hive_op(
@@ -7232,7 +7220,6 @@ impl ExecNtHandler {
             }
             NT_LOAD_KEY_CORE_HIVE_MOUNTED.fetch_add(1, Ordering::Relaxed);
         }
-        self.note_mutable_hives_changed();
         self.hive_mounts.push(HiveMount {
             sel: hive_sel,
             canon,
@@ -7486,9 +7473,7 @@ impl ExecNtHandler {
         if let Some(slot) = mount.slot {
             USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
         }
-        if self.mutable_hives.unmount(&mount.mount).is_some() {
-            self.note_mutable_hives_changed();
-        }
+        let _ = self.mutable_hives.unmount(&mount.mount);
         let mut mutable_handles_invalidated = 0usize;
         for entry in self.mutable_key_handles.iter_mut() {
             if entry.as_ref().is_some_and(|key| key.hive == mount.sel) {
@@ -7699,7 +7684,6 @@ impl ExecNtHandler {
                 }],
                 SystemHiveMutationOrigin::Runtime,
             )?;
-            self.note_mutable_hives_changed();
             return Ok(());
         }
         if let Some(index) = self.registry_overlay_index(target) {
@@ -7713,7 +7697,6 @@ impl ExecNtHandler {
                 return Err(STATUS_INVALID_HANDLE);
             }
             self.journal_set_mutable_key_security_descriptor(key, descriptor)?;
-            self.note_mutable_hives_changed();
             return Ok(());
         }
         if self.base_hive(target).is_some() {
@@ -7880,7 +7863,6 @@ impl ExecNtHandler {
         {
             return false;
         }
-        self.note_mutable_hives_changed();
         true
     }
 
@@ -8030,7 +8012,6 @@ impl ExecNtHandler {
                 }],
                 SystemHiveMutationOrigin::Runtime,
             )?;
-            self.note_mutable_hives_changed();
             return Ok(());
         }
         if self.mutable_registry_key_by_path(&path).is_none() {
@@ -8866,10 +8847,6 @@ impl ExecNtHandler {
             }
         }
         Ok(stats)
-    }
-
-    fn note_mutable_hives_changed(&mut self) {
-        bump_progress();
     }
 
     fn registry_subkey_entry_for_name(
@@ -31218,7 +31195,6 @@ impl ExecNtHandler {
                 ) {
                     return status;
                 }
-                bump_progress();
                 0
             }
             Err(status) if status.raw() as u32 == STATUS_PENDING => {
@@ -33350,7 +33326,7 @@ impl ExecNtHandler {
         if let Some(leaf) = userinit_shell_probe {
             let attempt = USERINIT_SHELL_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
             if attempt == 0 {
-                bump_progress();
+                note_boot_progress(BootProgress::UserShellImageAttempted);
             }
             if leaf == b"explorer.exe" {
                 USERINIT_EXPLORER_IMAGE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -33754,7 +33730,6 @@ impl ExecNtHandler {
             // owning table so a duplicated desktop handle has an independent lifetime.
             NativeService::NtClose => {
                 let mut closed = false;
-                let mut closed_user_object = false;
                 let pid = self.pm_pid_for_pi(self.pi);
                 if let (Some(pid), Ok(handle)) = (pid, nt_process::Handle::try_from(args[0])) {
                     if self
@@ -33848,11 +33823,7 @@ impl ExecNtHandler {
                 }
                 if !closed && unsafe { crate::win32k_subsystem::close_user_object_handle(args[0]) }
                 {
-                    closed_user_object = true;
                     PM_HANDLES_CLOSED.fetch_add(1, Ordering::Relaxed);
-                }
-                if closed || closed_user_object {
-                    bump_progress();
                 }
                 0 // STATUS_SUCCESS
             }
@@ -34605,7 +34576,6 @@ impl ExecNtHandler {
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
-                    bump_progress();
                     return 0;
                 }
                 if canon == r"\registry" {
@@ -34655,7 +34625,6 @@ impl ExecNtHandler {
                             .to_le_bytes(),
                         );
                     }
-                    bump_progress();
                     return 0;
                 }
                 let overlay_existing = crate::probe_seg!(
@@ -34690,7 +34659,6 @@ impl ExecNtHandler {
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
-                    bump_progress();
                     return 0;
                 }
                 if is_system_registry_path(&canon) {
@@ -34716,7 +34684,6 @@ impl ExecNtHandler {
                                     &REG_OPENED_EXISTING_KEY.to_le_bytes(),
                                 );
                             }
-                            bump_progress();
                             return 0;
                         }
                         Err(status) if status as u32 == STATUS_OBJECT_NAME_NOT_FOUND => {}
@@ -34797,7 +34764,6 @@ impl ExecNtHandler {
                         ) {
                             return status;
                         }
-                        self.note_mutable_hives_changed();
                         let status = crate::probe_seg!(
                             9,
                             self.mint_cm_system_registry_key(canon, desired_access, args[0])
@@ -34809,7 +34775,6 @@ impl ExecNtHandler {
                         if disp_ptr != 0 {
                             self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
                         }
-                        bump_progress();
                         return 0;
                     }
                 }
@@ -34843,7 +34808,6 @@ impl ExecNtHandler {
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
-                    bump_progress();
                     return 0;
                 }
                 if let Some(base_key) = base_existing {
@@ -34866,7 +34830,6 @@ impl ExecNtHandler {
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_OPENED_EXISTING_KEY.to_le_bytes());
                     }
-                    bump_progress();
                     return 0;
                 }
                 let mutable_parent = crate::probe_seg!(
@@ -34961,7 +34924,6 @@ impl ExecNtHandler {
                             return status;
                         }
                     }
-                    crate::probe_seg!(8, self.note_mutable_hives_changed());
                     // Provenance counters for the LSA/SAM gate specs: keys created by lsasrv's
                     // own first-boot setup, plus registry writes needed by profile/computer-name
                     // boot paths.
@@ -35004,7 +34966,6 @@ impl ExecNtHandler {
                     if disp_ptr != 0 {
                         self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
                     }
-                    bump_progress();
                     return 0;
                 }
                 if self.overlay.len() >= OVERLAY_KEY_MAX as usize {
@@ -35121,7 +35082,6 @@ impl ExecNtHandler {
                 if disp_ptr != 0 {
                     self.xas_write_buf(disp_ptr, &REG_CREATED_NEW_KEY.to_le_bytes());
                 }
-                bump_progress();
                 0 // STATUS_SUCCESS
             },
             // NtSetValueKey captured args: KeyHandle=args[0], *ValueName=args[1],
@@ -35260,7 +35220,6 @@ impl ExecNtHandler {
                     }
                 };
                 if existing_matches {
-                    bump_progress();
                     return 0;
                 }
                 // The account-domain SID lsasrv mints in `LsapCreateRandomDomainSid` and persists as
@@ -35344,7 +35303,6 @@ impl ExecNtHandler {
                     ) {
                         return status;
                     }
-                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 if cm_runtime_target {
@@ -35368,7 +35326,6 @@ impl ExecNtHandler {
                     {
                         return status as u32;
                     }
-                    bump_progress();
                     return 0;
                 }
                 if let Some(mutable_key) = mutable_target {
@@ -35406,7 +35363,6 @@ impl ExecNtHandler {
                             false
                         };
                         if logged_copy {
-                            self.note_mutable_hives_changed();
                             return 0;
                         }
                     }
@@ -35429,7 +35385,6 @@ impl ExecNtHandler {
                     ) {
                         return status;
                     }
-                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 let Some(staged) = data_view else {
@@ -35459,7 +35414,6 @@ impl ExecNtHandler {
                 {
                     return 0xC000_0008;
                 }
-                bump_progress();
                 0 // STATUS_SUCCESS
             },
             // `NtFlushKey(IN HANDLE KeyHandle)` — `references/reactos/ntoskrnl/config/ntapi.c:1085`.
@@ -35571,7 +35525,6 @@ impl ExecNtHandler {
                     ) {
                         return status;
                     }
-                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 let stats = match self.registry_key_stats(key) {
@@ -35589,7 +35542,6 @@ impl ExecNtHandler {
                     if self.overlay.detach_subtree(&path) == 0 {
                         return 0xC000_0034;
                     }
-                    bump_progress();
                     return 0;
                 }
                 let key_path = self.registry_target_path(key);
@@ -35603,7 +35555,6 @@ impl ExecNtHandler {
                             if let Some(path) = key_path.as_deref() {
                                 let _ = self.overlay.detach_subtree(path);
                             }
-                            self.note_mutable_hives_changed();
                             return 0;
                         }
                         Err(status) => return status,
@@ -35670,14 +35621,12 @@ impl ExecNtHandler {
                     ) {
                         return status;
                     }
-                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 if let Some(index) = overlay_index {
                     if !self.overlay.delete_value(index, name) {
                         return 0xC000_0008;
                     }
-                    bump_progress();
                     return 0;
                 }
                 if let Some(mutable_key) = mutable_key {
@@ -35688,7 +35637,6 @@ impl ExecNtHandler {
                     if let Err(status) = mutation_status {
                         return status;
                     }
-                    self.note_mutable_hives_changed();
                     return 0;
                 }
                 if overlay_key_idx(key).is_some() {
@@ -35775,9 +35723,6 @@ impl ExecNtHandler {
                     self.registry_value_copy_provenance
                         .clear_for_thread(self.pi as u64, self.current_tid);
                 }
-                if status == 0 {
-                    bump_progress();
-                }
                 status
             },
             // NtEnumerateKey(KeyHandle[0], Index[1], KeyInformationClass[2], KeyInformation[3],
@@ -35834,9 +35779,6 @@ impl ExecNtHandler {
                         args[5],
                         self.pi >= 2,
                     );
-                    if status == 0 {
-                        bump_progress();
-                    }
                     trace_winlogon_post_lsa_registry(
                         self,
                         b"enum-key",
@@ -35886,9 +35828,6 @@ impl ExecNtHandler {
                     args[5],
                     self.pi >= 2,
                 );
-                if status == 0 {
-                    bump_progress();
-                }
                 trace_winlogon_post_lsa_registry(
                     self,
                     b"enum-key",

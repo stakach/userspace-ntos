@@ -67,6 +67,7 @@ def main() -> int:
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--ready-file")
     parser.add_argument("--ready-text")
+    parser.add_argument("--post-ready-seconds", type=float)
     parser.add_argument("--completion-file")
     parser.add_argument("--completion-text")
     parser.add_argument("--completion-grace-seconds", type=float, default=5.0)
@@ -77,6 +78,10 @@ def main() -> int:
         parser.error("a positive timeout and command are required")
     if bool(args.ready_file) != bool(args.ready_text):
         parser.error("--ready-file and --ready-text must be specified together")
+    if args.post_ready_seconds is not None and args.post_ready_seconds <= 0:
+        parser.error("--post-ready-seconds must be positive")
+    if args.post_ready_seconds is not None and not args.ready_file:
+        parser.error("--post-ready-seconds requires --ready-file and --ready-text")
     if bool(args.completion_file) != bool(args.completion_text):
         parser.error("--completion-file and --completion-text must be specified together")
     if args.completion_grace_seconds < 0:
@@ -150,18 +155,24 @@ def main() -> int:
                     ready_path, ready_marker, ready_offset, ready_tail
                 )
                 if ready:
-                    status_messages.append(
-                        "boot readiness marker observed; deadline disarmed"
-                    )
+                    if args.post_ready_seconds is None:
+                        status_messages.append(
+                            "boot readiness marker observed; deadline disarmed"
+                        )
+                        deadline = None
+                    else:
+                        status_messages.append(
+                            "boot readiness marker observed; completion deadline armed"
+                        )
+                        deadline = time.monotonic() + args.post_ready_seconds
                     ready_path = None
                     ready_marker = None
-                    deadline = None
 
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     status_messages.append(
-                        f"boot validation exceeded {args.seconds}s; terminating process group",
+                        "boot validation deadline exceeded; terminating process group",
                     )
                     terminate_and_wait(process, signal.SIGTERM)
                     flush_status_messages()

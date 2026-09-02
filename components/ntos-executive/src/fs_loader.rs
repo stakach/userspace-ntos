@@ -1272,7 +1272,7 @@ pub(crate) unsafe fn demand_load_dll_result(
     store
         .set(slot, Some(pe))
         .map_err(|_| DemandLoadError::StoreAllocationFailed { slot })?;
-    crate::bump_progress(); // (B) a NEW DLL loaded = unambiguous forward progress (resets stall)
+    crate::note_boot_progress(crate::BootProgress::ImageActivated);
                             // samsrv.dll — lsass' SAM server. lsasrv/lsass resolve it at runtime; nothing in the executive
                             // names it, so a genuine by-path demand-load is the ONLY way it can appear. Recorded for the
                             // `exec_samsrv_hosted` gate spec (with its real on-disk byte size).
