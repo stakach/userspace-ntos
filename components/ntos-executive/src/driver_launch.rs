@@ -19965,20 +19965,6 @@ unsafe fn clear_hosted_provider_pointer_allocations_for_instance(
     failures
 }
 
-fn provider_shared_component_to_exec(
-    provider_shared: u64,
-    component_va: u64,
-    bytes: u64,
-) -> Option<u64> {
-    translate_component_range(
-        component_va,
-        bytes,
-        FSD_SHARED_VADDR,
-        FSD_SHARED_FRAMES * 0x1000,
-        provider_shared,
-    )
-}
-
 unsafe fn ndis_packet_shadow_len(packet_exec: u64) -> Option<u64> {
     let oob_offset =
         read_unaligned((packet_exec + NDIS_PACKET_PRIVATE_OOB_OFFSET_X64) as *const u16) as u64;
@@ -22077,7 +22063,7 @@ unsafe fn provider_marshal_ndis_packet_array(
     provider_inst: DriverInstance,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     count: u64,
     copyback: bool,
@@ -22092,7 +22078,7 @@ unsafe fn provider_marshal_ndis_packet_array(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, bytes)
+        provider_marshal_alloc(state, marshal_window, bytes)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -22128,7 +22114,7 @@ unsafe fn provider_marshal_output_ndis_packet(
     state: &mut ProviderMarshalState,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     let Some(dependent_exec_va) =
@@ -22137,7 +22123,7 @@ unsafe fn provider_marshal_output_ndis_packet(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -22152,7 +22138,7 @@ unsafe fn provider_marshal_output_ndis_buffer(
     dependent_inst: DriverInstance,
     provider_instance: usize,
     provider_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     out_arg_value: u64,
     dependent_data_component_va: u64,
     bytes: u64,
@@ -22205,7 +22191,7 @@ unsafe fn provider_marshal_output_ndis_buffer(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_out_component_va, provider_out_exec)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         if provider_data_owned_by_bridge {
             hosted_instance_pool_free(provider_inst, provider_data_component_va);
@@ -22225,7 +22211,7 @@ unsafe fn provider_marshal_output_ndis_first_buffer(
     state: &mut ProviderMarshalState,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     let Some(dependent_exec_va) =
@@ -22234,7 +22220,7 @@ unsafe fn provider_marshal_output_ndis_first_buffer(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -22247,7 +22233,7 @@ unsafe fn provider_marshal_output_ndis_first_buffer_va(
     state: &mut ProviderMarshalState,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     let Some(dependent_exec_va) =
@@ -22256,7 +22242,7 @@ unsafe fn provider_marshal_output_ndis_first_buffer_va(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -22269,7 +22255,7 @@ unsafe fn provider_marshal_output_ndis_configuration_parameter(
     state: &mut ProviderMarshalState,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     let Some(dependent_exec_va) =
@@ -22278,7 +22264,7 @@ unsafe fn provider_marshal_output_ndis_configuration_parameter(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -22291,7 +22277,7 @@ unsafe fn provider_marshal_output_network_address(
     state: &mut ProviderMarshalState,
     dependent_instance: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     length_arg_value: u64,
 ) -> Result<(u64, u64), i32> {
@@ -22306,12 +22292,12 @@ unsafe fn provider_marshal_output_network_address(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_ptr_component_va, provider_ptr_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     let Some((provider_len_component_va, provider_len_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 4)
+        provider_marshal_alloc(state, marshal_window, 4)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -25433,7 +25419,7 @@ unsafe fn provider_marshal_zero(exec_va: u64, bytes: u64) {
 
 unsafe fn provider_marshal_alloc(
     state: &mut ProviderMarshalState,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     bytes: u64,
 ) -> Option<(u64, u64)> {
     if bytes == 0 {
@@ -25441,16 +25427,12 @@ unsafe fn provider_marshal_alloc(
     }
     let start = provider_marshal_align8(state.cursor)?;
     let end = start.checked_add(bytes)?;
-    if end > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if end > marshal_window.capacity {
         return None;
     }
     state.cursor = end;
-    let component_va = FSD_SHARED_VADDR
-        .checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)?
-        .checked_add(start)?;
-    let exec_va = provider_shared
-        .checked_add(SH_PROVIDER_EXPORT_MARSHAL_BASE)?
-        .checked_add(start)?;
+    let component_va = marshal_window.component_base.checked_add(start)?;
+    let exec_va = marshal_window.exec_base.checked_add(start)?;
     provider_marshal_zero(exec_va, bytes);
     Some((component_va, exec_va))
 }
@@ -25537,7 +25519,7 @@ unsafe fn provider_marshal_output_cell(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     bytes: u64,
 ) -> Result<u64, i32> {
@@ -25547,7 +25529,7 @@ unsafe fn provider_marshal_output_cell(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, bytes)
+        provider_marshal_alloc(state, marshal_window, bytes)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -25560,7 +25542,7 @@ unsafe fn provider_marshal_ndis_device_property_output(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     kind: u8,
 ) -> Result<u64, i32> {
@@ -25576,7 +25558,7 @@ unsafe fn provider_marshal_ndis_device_property_output(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -25595,7 +25577,7 @@ unsafe fn provider_marshal_inout_cell(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     bytes: u64,
 ) -> Result<u64, i32> {
@@ -25605,7 +25587,7 @@ unsafe fn provider_marshal_inout_cell(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, bytes)
+        provider_marshal_alloc(state, marshal_window, bytes)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -25619,7 +25601,7 @@ unsafe fn provider_marshal_output_buffer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     bytes: u64,
 ) -> Result<u64, i32> {
@@ -25630,7 +25612,7 @@ unsafe fn provider_marshal_output_buffer(
         state,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         arg_value,
         bytes,
     )
@@ -25640,7 +25622,7 @@ unsafe fn provider_marshal_input_buffer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     bytes: u64,
 ) -> Result<u64, i32> {
@@ -25654,7 +25636,7 @@ unsafe fn provider_marshal_input_buffer(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, bytes)
+        provider_marshal_alloc(state, marshal_window, bytes)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -25749,7 +25731,7 @@ unsafe fn provider_marshal_ansi_string(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     if arg_value == 0 {
@@ -25764,11 +25746,11 @@ unsafe fn provider_marshal_ansi_string(
     let maximum =
         read_unaligned((desc_exec + ANSI_STRING_MAXIMUM_LENGTH_OFFSET) as *const u16) as u64;
     let buffer = read_unaligned((desc_exec + ANSI_STRING_BUFFER_OFFSET) as *const u64);
-    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+    if length > maximum || length > marshal_window.capacity / 2 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let Some((provider_desc_va, provider_desc_exec)) =
-        provider_marshal_alloc(state, provider_shared, 16)
+        provider_marshal_alloc(state, marshal_window, 16)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -25782,7 +25764,7 @@ unsafe fn provider_marshal_ansi_string(
         };
         let buffer_bytes = length.checked_add(1).ok_or(STATUS_INVALID_PARAMETER)?;
         let Some((provider_buffer_va, provider_buffer_exec)) =
-            provider_marshal_alloc(state, provider_shared, buffer_bytes)
+            provider_marshal_alloc(state, marshal_window, buffer_bytes)
         else {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
@@ -25808,7 +25790,7 @@ unsafe fn provider_marshal_resource_list(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     length_pointer: u64,
 ) -> Result<u64, i32> {
@@ -25833,7 +25815,7 @@ unsafe fn provider_marshal_resource_list(
         state,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         arg_value,
         bytes,
     )
@@ -25976,7 +25958,7 @@ unsafe fn provider_marshal_fixed_output_pointer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     success_value: u64,
 ) -> Result<u64, i32> {
@@ -25989,7 +25971,7 @@ unsafe fn provider_marshal_fixed_output_pointer(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26010,7 +25992,7 @@ unsafe fn provider_marshal_io_port_range(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     initial_port: u64,
     length: u64,
@@ -26032,7 +26014,7 @@ unsafe fn provider_marshal_io_port_range(
         state,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         arg_value,
         initial_port,
     )
@@ -26042,7 +26024,7 @@ unsafe fn provider_marshal_mmio_mapping(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     physical_address: u64,
     length: u64,
@@ -26066,7 +26048,7 @@ unsafe fn provider_marshal_mmio_mapping(
         state,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         arg_value,
         resource.va + (physical_address - resource.translated_start),
     )
@@ -26205,7 +26187,7 @@ unsafe fn provider_marshal_output_dma_common_buffer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     length: u64,
 ) -> Result<u64, i32> {
@@ -26229,7 +26211,7 @@ unsafe fn provider_marshal_output_dma_common_buffer(
         state,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         arg_value,
         8,
     )?;
@@ -26267,7 +26249,7 @@ unsafe fn provider_marshal_output_pointer_from_length(
     provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     length: u64,
 ) -> Result<u64, i32> {
@@ -26294,7 +26276,7 @@ unsafe fn provider_marshal_output_pointer_from_length(
         length,
     );
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, 8)
+        provider_marshal_alloc(state, marshal_window, 8)
     else {
         if !release_hosted_provider_pointer_allocation_by_dependent(
             dependent_index,
@@ -26384,7 +26366,7 @@ unsafe fn provider_marshal_ndis_request(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     if arg_value == 0 {
@@ -26413,7 +26395,7 @@ unsafe fn provider_marshal_ndis_request(
     ) as u64;
 
     let Some((provider_request_component, provider_request_exec)) =
-        provider_marshal_alloc(state, provider_shared, NDIS_REQUEST_LEN_X64)
+        provider_marshal_alloc(state, marshal_window, NDIS_REQUEST_LEN_X64)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26446,7 +26428,7 @@ unsafe fn provider_marshal_ndis_request(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_info_component, provider_info_exec)) =
-        provider_marshal_alloc(state, provider_shared, info_len)
+        provider_marshal_alloc(state, marshal_window, info_len)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26469,7 +26451,7 @@ unsafe fn provider_marshal_ndis_buffer(
     provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     if arg_value == 0 {
@@ -26480,7 +26462,7 @@ unsafe fn provider_marshal_ndis_buffer(
         component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, mdl_bytes)
     {
         let Some((provider_component_va, provider_exec_va)) =
-            provider_marshal_alloc(state, provider_shared, mdl_bytes)
+            provider_marshal_alloc(state, marshal_window, mdl_bytes)
         else {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
@@ -26524,7 +26506,7 @@ unsafe fn provider_marshal_unicode_string(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
     let Some(desc_exec) =
@@ -26535,11 +26517,11 @@ unsafe fn provider_marshal_unicode_string(
     let length = read_unaligned(desc_exec as *const u16) as u64;
     let maximum = read_unaligned((desc_exec + 2) as *const u16) as u64;
     let buffer = read_unaligned((desc_exec + 8) as *const u64);
-    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+    if length > maximum || length > marshal_window.capacity / 2 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let Some((provider_desc_va, provider_desc_exec)) =
-        provider_marshal_alloc(state, provider_shared, 16)
+        provider_marshal_alloc(state, marshal_window, 16)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26553,7 +26535,7 @@ unsafe fn provider_marshal_unicode_string(
         };
         let buffer_bytes = length.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
         let Some((provider_buffer_va, provider_buffer_exec)) =
-            provider_marshal_alloc(state, provider_shared, buffer_bytes)
+            provider_marshal_alloc(state, marshal_window, buffer_bytes)
         else {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
@@ -26573,7 +26555,7 @@ unsafe fn provider_marshal_unicode_string_from_source(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     desc_arg_value: u64,
     source_arg_value: u64,
 ) -> Result<(u64, u64), i32> {
@@ -26622,12 +26604,12 @@ unsafe fn provider_marshal_unicode_string_from_source(
         return Err(STATUS_INVALID_PARAMETER);
     };
     let Some((provider_desc_va, provider_desc_exec)) =
-        provider_marshal_alloc(state, provider_shared, 16)
+        provider_marshal_alloc(state, marshal_window, 16)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
     let Some((provider_source_va, provider_source_exec)) =
-        provider_marshal_alloc(state, provider_shared, source_total)
+        provider_marshal_alloc(state, marshal_window, source_total)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26643,14 +26625,14 @@ unsafe fn provider_marshal_embedded_unicode_string_buffer(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     provider_desc_exec: u64,
     dependent_desc_exec: u64,
 ) -> Result<(), i32> {
     let length = read_unaligned(dependent_desc_exec as *const u16) as u64;
     let maximum = read_unaligned((dependent_desc_exec + 2) as *const u16) as u64;
     let buffer = read_unaligned((dependent_desc_exec + 8) as *const u64);
-    if length > maximum || length > SH_PROVIDER_EXPORT_MARSHAL_BYTES / 2 {
+    if length > maximum || length > marshal_window.capacity / 2 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let provider_buffer_va = if length == 0 {
@@ -26663,7 +26645,7 @@ unsafe fn provider_marshal_embedded_unicode_string_buffer(
         };
         let buffer_bytes = length.checked_add(2).ok_or(STATUS_INVALID_PARAMETER)?;
         let Some((provider_buffer_va, provider_buffer_exec)) =
-            provider_marshal_alloc(state, provider_shared, buffer_bytes)
+            provider_marshal_alloc(state, marshal_window, buffer_bytes)
         else {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         };
@@ -26684,7 +26666,7 @@ unsafe fn provider_marshal_miniport_characteristics(
     provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     supplied_len: u64,
 ) -> Result<u64, i32> {
@@ -26704,7 +26686,7 @@ unsafe fn provider_marshal_miniport_characteristics(
             return Err(STATUS_INVALID_PARAMETER)
         }
     };
-    if layout.required_len > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if layout.required_len > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     let Some(dependent_exec_va) = component_to_exec_va_for_instance(
@@ -26728,7 +26710,7 @@ unsafe fn provider_marshal_miniport_characteristics(
         callback_index += 1;
     }
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, layout.required_len)
+        provider_marshal_alloc(state, marshal_window, layout.required_len)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26774,7 +26756,7 @@ unsafe fn provider_marshal_protocol_characteristics(
     provider_instance: usize,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
     supplied_len: u64,
 ) -> Result<u64, i32> {
@@ -26794,7 +26776,7 @@ unsafe fn provider_marshal_protocol_characteristics(
             return Err(STATUS_INVALID_PARAMETER)
         }
     };
-    if layout.required_len > SH_PROVIDER_EXPORT_MARSHAL_BYTES {
+    if layout.required_len > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     let Some(dependent_exec_va) = component_to_exec_va_for_instance(
@@ -26818,7 +26800,7 @@ unsafe fn provider_marshal_protocol_characteristics(
         callback_index += 1;
     }
     let Some((provider_component_va, provider_exec_va)) =
-        provider_marshal_alloc(state, provider_shared, layout.required_len)
+        provider_marshal_alloc(state, marshal_window, layout.required_len)
     else {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -26828,7 +26810,7 @@ unsafe fn provider_marshal_protocol_characteristics(
         state,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         provider_exec_va + NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
         dependent_exec_va + NDIS_PROTOCOL_CHARACTERISTICS_NAME_OFFSET_X64,
     )?;
@@ -26874,7 +26856,7 @@ unsafe fn prepare_provider_export_marshal(
     provider_publication_cookie: u64,
     dependent_index: usize,
     dependent_inst: DriverInstance,
-    provider_shared: u64,
+    marshal_window: HostedProviderMarshalWindow,
     args: &mut [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> Result<ProviderMarshalState, i32> {
     if policy.argument_count as usize > args.len() {
@@ -26933,13 +26915,13 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     4,
                 )?;
-                state.ndis_status_provider_exec_va =
-                    provider_shared_component_to_exec(provider_shared, provider_arg, 4)
-                        .unwrap_or(0);
+                state.ndis_status_provider_exec_va = marshal_window
+                    .component_to_exec(provider_arg, 4)
+                    .unwrap_or(0);
                 provider_arg
             }
             HostedProviderArgumentMarshal::CallerOutHandle
@@ -26955,7 +26937,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     bytes,
                 )?;
@@ -26965,8 +26947,9 @@ unsafe fn prepare_provider_export_marshal(
                         HostedProviderArgumentMarshal::CallerOutHandle
                     )
                 {
-                    state.ndis_initialize_wrapper_handle_exec_va =
-                        provider_shared + (provider_arg - FSD_SHARED_VADDR);
+                    state.ndis_initialize_wrapper_handle_exec_va = marshal_window
+                        .component_to_exec(provider_arg, bytes)
+                        .unwrap_or(0);
                 }
                 if policy.side_effect == HostedProviderExportSideEffect::NdisProtocolRegistration
                     && matches!(
@@ -26974,8 +26957,9 @@ unsafe fn prepare_provider_export_marshal(
                         HostedProviderArgumentMarshal::CallerOutHandle
                     )
                 {
-                    state.callback_parent_handle_exec_va =
-                        provider_shared + (provider_arg - FSD_SHARED_VADDR);
+                    state.callback_parent_handle_exec_va = marshal_window
+                        .component_to_exec(provider_arg, bytes)
+                        .unwrap_or(0);
                 }
                 provider_arg
             }
@@ -26983,7 +26967,7 @@ unsafe fn prepare_provider_export_marshal(
                 &mut state,
                 dependent_index,
                 dependent_inst,
-                provider_shared,
+                marshal_window,
                 arg,
                 4,
             )?,
@@ -26992,7 +26976,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                 )?
             }
@@ -27006,7 +26990,7 @@ unsafe fn prepare_provider_export_marshal(
                         &mut state,
                         dependent_index,
                         dependent_inst,
-                        provider_shared,
+                        marshal_window,
                         arg,
                         args[source_index],
                     )?;
@@ -27017,7 +27001,7 @@ unsafe fn prepare_provider_export_marshal(
                 &mut state,
                 dependent_index,
                 dependent_inst,
-                provider_shared,
+                marshal_window,
                 arg,
             )?,
             HostedProviderArgumentMarshal::CallerInBuffer { length_arg } => {
@@ -27026,7 +27010,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
@@ -27052,7 +27036,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     bytes,
                 )?
@@ -27062,7 +27046,7 @@ unsafe fn prepare_provider_export_marshal(
                 provider_instance,
                 dependent_index,
                 dependent_inst,
-                provider_shared,
+                marshal_window,
                 arg,
             )?,
             HostedProviderArgumentMarshal::CallerInPacket => {
@@ -27114,7 +27098,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                 )?
             }
@@ -27137,7 +27121,7 @@ unsafe fn prepare_provider_export_marshal(
                     dependent_inst,
                     provider_instance,
                     provider_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     args[virtual_address_index],
                     length,
@@ -27150,7 +27134,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                 )?
             }
@@ -27159,7 +27143,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                 )?
             }
@@ -27168,7 +27152,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                 )?
             }
@@ -27182,7 +27166,7 @@ unsafe fn prepare_provider_export_marshal(
                         &mut state,
                         dependent_index,
                         dependent_inst,
-                        provider_shared,
+                        marshal_window,
                         arg,
                         args[length_index],
                     )?;
@@ -27193,7 +27177,7 @@ unsafe fn prepare_provider_export_marshal(
                 &mut state,
                 dependent_index,
                 dependent_inst,
-                provider_shared,
+                marshal_window,
                 arg,
             )?,
             HostedProviderArgumentMarshal::CallerOutBuffer { length_arg } => {
@@ -27202,7 +27186,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
@@ -27214,7 +27198,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_instance,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
@@ -27226,7 +27210,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_instance,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
@@ -27240,7 +27224,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     args[length_index],
                 )?
@@ -27250,7 +27234,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     kind,
                 )?
@@ -27320,7 +27304,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     args[initial_port_index],
                     provider_marshal_u32_arg(policy, args, length_index)?,
@@ -27341,7 +27325,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     args[physical_address_index],
                     provider_marshal_u32_arg(policy, args, length_index)?,
@@ -27353,7 +27337,7 @@ unsafe fn prepare_provider_export_marshal(
                     &mut state,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
@@ -27384,7 +27368,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_instance,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, length_index)?,
                 )?
@@ -27400,7 +27384,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_inst,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, count_index)?,
                     false,
@@ -27420,7 +27404,7 @@ unsafe fn prepare_provider_export_marshal(
                     provider_inst,
                     dependent_index,
                     dependent_inst,
-                    provider_shared,
+                    marshal_window,
                     arg,
                     provider_marshal_u32_arg(policy, args, count_index)?,
                     true,
@@ -28427,6 +28411,7 @@ unsafe fn service_hosted_provider_export_explicit(
         provider_publication_cookie,
         caller_rsp,
         args,
+        HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
         |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp| {
             dispatch_hosted_provider_export_legacy(
                 singleton,
@@ -28543,6 +28528,7 @@ unsafe fn service_hosted_provider_export_with_dispatch<F>(
     provider_publication_cookie: u64,
     caller_rsp: u64,
     mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    marshal_window_source: HostedProviderMarshalWindowSource,
     dispatch: F,
 ) -> u64
 where
@@ -28614,6 +28600,9 @@ where
     {
         return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
     }
+    let Some(marshal_window) = marshal_window_source.resolve(provider_inst.exec_shared_va) else {
+        return hosted_provider_export_failure(STATUS_DEVICE_NOT_READY);
+    };
     if let Err(status) = ensure_hosted_provider_domain_dependency(
         singleton.instance,
         singleton.provider_publication_cookie,
@@ -28666,7 +28655,7 @@ where
         singleton.provider_publication_cookie,
         dependent_index,
         dependent_inst,
-        provider_shared,
+        marshal_window,
         &mut args,
     ) {
         Ok(state) => state,
@@ -29274,6 +29263,30 @@ impl HostedProviderMarshalWindow {
             exec_base,
             capacity,
         })
+    }
+
+    fn component_to_exec(self, component_va: u64, bytes: u64) -> Option<u64> {
+        translate_component_range(
+            component_va,
+            bytes,
+            self.component_base,
+            self.capacity,
+            self.exec_base,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostedProviderMarshalWindowSource {
+    exact: Option<HostedProviderMarshalWindow>,
+}
+
+impl HostedProviderMarshalWindowSource {
+    const LEGACY_SHARED_BANK: Self = Self { exact: None };
+
+    fn resolve(self, exec_shared_va: u64) -> Option<HostedProviderMarshalWindow> {
+        self.exact
+            .or_else(|| HostedProviderMarshalWindow::legacy(exec_shared_va))
     }
 }
 
@@ -30608,16 +30621,6 @@ unsafe fn service_hosted_provider_callback_explicit(
     callback_cookie: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> u64 {
-    let Some(record) = hosted_provider_callback_record(callback_cookie) else {
-        return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
-    };
-    let Some(dependent_inst) = instance(record.dependent_instance) else {
-        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
-    };
-    let Some(marshal_window) = HostedProviderMarshalWindow::legacy(dependent_inst.exec_shared_va)
-    else {
-        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
-    };
     let mut dispatch = |record: HostedProviderCallbackRecord,
                         dependent_inst: DriverInstance,
                         exec_code_va: u64,
@@ -30636,7 +30639,7 @@ unsafe fn service_hosted_provider_callback_explicit(
         provider_channel,
         callback_cookie,
         args,
-        marshal_window,
+        HostedProviderMarshalWindowSource::LEGACY_SHARED_BANK,
         &mut dispatch,
     )
 }
@@ -30645,7 +30648,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     provider_channel: &crate::spawn_hosts::PumpChannel,
     callback_cookie: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
-    marshal_window: HostedProviderMarshalWindow,
+    marshal_window_source: HostedProviderMarshalWindowSource,
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
 ) -> u64 {
     HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -30668,6 +30671,9 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
     let Some(dependent_inst) = instance(record.dependent_instance) else {
+        return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
+    };
+    let Some(marshal_window) = marshal_window_source.resolve(dependent_inst.exec_shared_va) else {
         return hosted_provider_callback_failure(STATUS_DEVICE_NOT_READY);
     };
     let provider_channel_domain = hosted_domain_identity_for_pml4(provider_channel.pml4);

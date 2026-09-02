@@ -23178,6 +23178,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the old pump. `cargo fmt --all` and the freestanding executive check are green at the existing
     213-warning baseline.
 
+    B3 provider-export marshal-window checkpoint (2026-09-03, freestanding green; arena wiring
+    open): every provider-import marshal helper now receives one explicit provider-side window.
+    Allocation, zeroing, component-pointer publication, executive copyout addresses, string and
+    characteristics bounds, and nested packet-array storage all derive from its aliases and
+    capacity. The shared export core resolves the legacy bank only after validating the exact
+    provider instance; an exact window source remains exact and cannot retry or degrade into the
+    legacy bank. The obsolete whole-shared-region pointer translator has been removed. Together
+    with the callback checkpoint, both directions can now consume a lane-depth marshal window.
+    `cargo fmt --all` and the freestanding executive check are green at the established 213-warning
+    baseline.
+
     B3 provider-callback dispatch boundary checkpoint (2026-09-03, freestanding green; depth
     window and broker integration open): all twenty supported NDIS callback marshal shapes now
     receive one stack-owned callback dispatcher. Resource restoration, callback-specific pointer
