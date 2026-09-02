@@ -445,9 +445,11 @@ impl HostedIrqServiceCommand {
                 HostedIrqServiceKind::ReleaseActualLock => {
                     self.argument_count == 1 && self.arguments[0] != 0
                 }
+                HostedIrqServiceKind::QueueDpc => {
+                    self.argument_count == 4 && self.arguments[0] != 0
+                }
                 HostedIrqServiceKind::ProviderImport
-                | HostedIrqServiceKind::ProviderCallbackRequest
-                | HostedIrqServiceKind::QueueDpc => true,
+                | HostedIrqServiceKind::ProviderCallbackRequest => true,
             }
     }
 }
@@ -2262,6 +2264,16 @@ mod tests {
         assert!(release.valid());
         release.arguments[0] = 0;
         assert!(!release.valid());
+
+        let mut queue_dpc = service();
+        queue_dpc.kind = HostedIrqServiceKind::QueueDpc;
+        queue_dpc.argument_count = 4;
+        assert!(queue_dpc.valid());
+        queue_dpc.arguments[0] = 0;
+        assert!(!queue_dpc.valid());
+        queue_dpc.arguments[0] = 43;
+        queue_dpc.argument_count = 3;
+        assert!(!queue_dpc.valid());
     }
 
     fn service() -> HostedIrqServiceCommand {

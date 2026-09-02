@@ -21,6 +21,7 @@ mod event;
 mod event_object;
 pub mod executive_sync;
 pub mod gdi_bitmap;
+mod hosted_dpc;
 mod interrupt;
 mod interrupt_lock;
 mod interrupt_rundown;
@@ -64,6 +65,10 @@ pub use event_object::{
     EventLeaseId, EventLeaseKind, EventObjectError, EventObjectId, EventObjectOwner,
     EventObjectRegistry, EventObjectSnapshot, PendingEventSignal, ProviderEventProjectionCatalog,
     ProviderEventProjectionError, RetiredEventObject, SignalQueueResult,
+};
+pub use hosted_dpc::{
+    HostedDpcActivation, HostedDpcError, HostedDpcIdentity, HostedDpcOwner, HostedDpcQueueResult,
+    HostedDpcSnapshot, HostedDpcTable,
 };
 pub use interrupt::{
     InterruptConnectError, InterruptConnection, InterruptMode, InterruptScan,

@@ -251,6 +251,99 @@ impl HostedIrqRootSession {
         }
     }
 
+    unsafe fn queue_dpc_service(
+        &mut self,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        if command.target_domain_id != self.lane.identity.domain_id
+            || command.target_domain_cookie != self.lane.identity.domain_cookie
+            || command.argument_count != 4
+            || command.arguments[0] == 0
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let connection = match connection_for_service(self.lane, command) {
+            Ok(connection) => connection,
+            Err(status) => return fatal_service_result(status.raw()),
+        };
+        let instance_index = connection.binding.projection_instance;
+        let Some(inst) = instance(instance_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if instance_domain_identity(inst) != Some(connection.binding.projection_domain) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Some(exec_dpc) = component_to_exec_va_for_instance(
+            instance_index,
+            inst,
+            command.service_id,
+            KDPC_SIZE,
+        ) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let routine = command.arguments[0];
+        let deferred_context = command.arguments[1];
+        let image_frames = if inst.image_frames == 0 {
+            FSD_IMAGE_FRAMES
+        } else {
+            inst.image_frames
+        };
+        let routine_is_executable = image_frames
+            .checked_mul(0x1000)
+            .and_then(|image_bytes| {
+                let window = ExecVaWindow::try_for_instance(instance_index)?;
+                translate_component_range(
+                    routine,
+                    1,
+                    FSD_CODE_VA,
+                    image_bytes,
+                    window.code_va,
+                )
+            })
+            .is_some();
+        if !routine_is_executable
+            || read_unaligned((exec_dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64) != routine
+            || read_unaligned((exec_dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64)
+                != deferred_context
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let Some(owner) = HostedDpcOwner::new(
+            connection.binding.projection_domain.domain_id.raw(),
+            connection.binding.projection_domain.cookie,
+        ) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        let queue = match hosted_dpcs_mut().register_and_queue(
+            owner,
+            command.service_id,
+            routine,
+            deferred_context,
+            command.arguments[2],
+            command.arguments[3],
+        ) {
+            Ok(queue) => queue,
+            Err(error) => return fatal_service_result(hosted_dpc_status(error).raw()),
+        };
+        let (inserted, identity) = match queue {
+            HostedDpcQueueResult::Queued(identity) => (true, identity),
+            HostedDpcQueueResult::AlreadyQueued(identity) => (false, identity),
+        };
+        let projected_queued = read_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
+        if projected_queued != !inserted {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        if inserted {
+            write_unaligned((exec_dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64, command.arguments[2]);
+            write_unaligned((exec_dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64, command.arguments[3]);
+            write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
+        }
+        let mut result = service_result(STATUS_SUCCESS, Some(inserted as u64));
+        result.value_count = 2;
+        result.values[1] = identity.generation;
+        result
+    }
+
     unsafe fn execute_service(
         &mut self,
         command: nt_hosted_runtime::HostedIrqServiceCommand,
@@ -260,9 +353,11 @@ impl HostedIrqRootSession {
             | nt_hosted_runtime::HostedIrqServiceKind::ReleaseActualLock => {
                 self.actual_lock_service(command)
             }
+            nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
+                self.queue_dpc_service(command)
+            }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderImport
-            | nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest
-            | nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
+            | nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest => {
                 service_result(STATUS_NOT_SUPPORTED, None)
             }
         }

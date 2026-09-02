@@ -23064,8 +23064,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     flushes/records, and all 786432 framebuffer pixels non-background with at least 32 colours. The
     final result is `295/295`, the sentinel matches, and QEMU exits normally.
 
-    Next add the generation-owned KDPC registry and route lane `KeInsertQueueDpc` through its typed
-    Service command. Then adapt the existing provider marshal/callback authorities to arena-owned
+    B3 generation-owned KDPC Service checkpoint (2026-09-02, implementation green; atomic cutover
+    still open): `nt-kernel-exec` now owns a growable, generation-fenced hosted KDPC table keyed by
+    the exact domain/cookie and component KDPC token. Idempotent registration preserves identity,
+    idle reinitialization changes generation, stale identities cannot queue or complete a reused
+    slot, duplicate insertion returns the native false result, FIFO order is owner-scoped, and root
+    clears inserted state before callback admission so a running DPC can queue itself again. Exact
+    activations retain routine, deferred context, both system arguments, sequence, and generation;
+    retirement refuses queued or in-flight objects.
+
+    Private-lane `KeInsertQueueDpc` no longer touches the shared KDPC ring. It sends the typed
+    QueueDpc Service command with the active connection grant and exact four-argument shape. Root
+    joins that grant to the live projection domain, validates the mapped KDPC, its executable image
+    routine and deferred context, owns the inserted bit, and returns the table generation. A
+    malformed projection or stale connection poisons the active arena instead of entering the old
+    queue. The ordinary component path remains unchanged because the root arena is not live yet;
+    there is no fallback from a lane Service failure. Focused validation passes 101/101
+    `nt-hosted-runtime` tests, 230/230 `nt-kernel-exec` tests, and the freestanding executive check
+    at the established 213-warning baseline.
+
+    Next adapt the existing provider marshal/callback authorities to arena-owned
     arguments and nested dispatch without the shared request banks. When all three Service families
     are green, select the root driver for live ISR/DPC/provider execution and delete
     `FSD_DISPATCH_INTERRUPT`, the shared DPC ring, provider shared-bank nesting, and ordinary-bank
@@ -23117,9 +23135,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
 ## NTFS System-Volume Workstream
 
-The target boot disk is one GPT image with two independently owned volumes. A small FAT32 EFI
-System Partition contains only Simpleboot, `simpleboot.cfg`, the stripped rust-micro kernel ELF,
-and the USTAR bootstrap initrd. A Microsoft Basic Data partition
+The target boot disk is one GPT image with two independently owned volumes plus the conventional
+unformatted Microsoft Reserved partition. A small FAT32 EFI System Partition contains only
+Simpleboot, `simpleboot.cfg`, the stripped rust-micro kernel ELF, and the USTAR bootstrap initrd. A
+Microsoft Basic Data partition
 (`EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`) contains the NT system volume: `\ReactOS`, our
 `\ReactOS\System32\ntdll.dll`, installed drivers and services, profiles, registry hives, and later
 runtime state. Do not use exFAT for the ESP: UEFI defines the system partition around its FAT
@@ -23145,11 +23164,12 @@ NTFS.
   enumeration, resident/non-resident unnamed data reads, sparse extents, alternate streams, stable
   file-reference identity, and precise parser-to-NTSTATUS mapping. Keep block policy and NT object
   policy outside the parser crate.
-- [ ] Replace the image builder's monolithic ESP staging with two staging products. Build a small
-  FAT32 ESP containing only loader artifacts, build a deterministic NTFS partition image containing
-  the installed ReactOS tree and project ntdll, and pass that image to Simpleboot as a Microsoft
-  Basic Data partition. Give both partitions stable build-manifest GUIDs while allowing deployed
-  media identities to vary. Remove `SYSTEM.DAT`, `IMPORTS.BIN`, `\ReactOS`, `\Profiles`, driver
+- [ ] Replace the image builder's monolithic ESP staging with two staged volumes and a 16 MiB
+  Microsoft Reserved partition. Build a small FAT32 ESP containing only loader artifacts, build a
+  deterministic NTFS partition image containing the installed ReactOS tree and project ntdll, and
+  pass the reserved image plus NTFS image to Simpleboot as MSR and Microsoft Basic Data GPT entries.
+  Give every partition stable build-manifest GUIDs while allowing deployed media identities to
+  vary. Remove `SYSTEM.DAT`, `IMPORTS.BIN`, `\ReactOS`, `\Profiles`, driver
   fixtures, and ntdll from ESP staging, and remove the unpartitioned persistence append in the same
   cutover. The host image tool must verify both GPT copies, partition-array CRCs, alignment, unique
   GUIDs, filesystem bounds, and an exact installed-tree manifest before QEMU runs.

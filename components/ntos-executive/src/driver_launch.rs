@@ -95,7 +95,8 @@ use nt_io_manager::{
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
-    HostedDriverThreadError, HostedDriverThreadTable,
+    HostedDpcError, HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable, HostedDriverThreadError,
+    HostedDriverThreadTable,
     InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,
     InterruptActualLockTable,
     InterruptConnection as KernelInterruptConnection, InterruptConnectionDisposition,
@@ -12924,11 +12925,41 @@ extern "win64" fn s_ke_initialize_dpc(dpc: u64, routine: u64, deferred_context: 
 /// KDPC projection so duplicate inserts are rejected deterministically.
 extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
     unsafe {
-        if dpc == 0
-            || read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64) == 0
+        if dpc == 0 {
+            return 0;
+        }
+        let routine = read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
+        if routine == 0
             || read_unaligned((dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0
         {
             return 0;
+        }
+        if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+            let deferred_context =
+                read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
+            let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+            arguments[0] = routine;
+            arguments[1] = deferred_context;
+            arguments[2] = arg1;
+            arguments[3] = arg2;
+            let queued = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::QueueDpc,
+                service_id: dpc,
+                target_domain_id: identity.domain_id,
+                target_domain_cookie: identity.domain_cookie,
+                grant,
+                argument_count: 4,
+                arguments,
+            });
+            if queued.faulted
+                || queued.status != STATUS_SUCCESS
+                || queued.value_count != 2
+                || queued.values[0] > 1
+                || queued.values[1] == 0
+            {
+                hosted_irq_lane_protocol_fault(dpc);
+            }
+            return queued.values[0] as u8;
         }
         let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
         if capacity == 0 {
@@ -43017,6 +43048,7 @@ static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
 static mut HOSTED_DEVICE_RESOURCE_STATES: Option<Vec<HostedDeviceResourceState>> = None;
 static mut HOSTED_IRQ_CONNECTIONS: Option<Vec<HostedIrqConnection>> = None;
 static mut HOSTED_IRQ_ACTUAL_LOCKS: Option<InterruptActualLockTable> = None;
+static mut HOSTED_DPCS: Option<HostedDpcTable> = None;
 static mut HOSTED_PHYSICAL_IRQ_LEASES: Option<Vec<HostedPhysicalIrqLease>> = None;
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static mut HOSTED_IRQ_LANES: Option<Vec<HostedIrqLaneRuntime>> = None;
@@ -45619,6 +45651,26 @@ unsafe fn hosted_irq_actual_locks_mut() -> &'static mut InterruptActualLockTable
         *slot = Some(InterruptActualLockTable::new());
     }
     slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_dpcs_mut() -> &'static mut HostedDpcTable {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DPCS);
+    if slot.is_none() {
+        *slot = Some(HostedDpcTable::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+fn hosted_dpc_status(error: HostedDpcError) -> nt_status::NtStatus {
+    match error {
+        HostedDpcError::Busy => nt_status::NtStatus::DEVICE_BUSY,
+        HostedDpcError::OutOfMemory => nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+        HostedDpcError::InvalidIdentity
+        | HostedDpcError::NotRegistered
+        | HostedDpcError::StaleActivation
+        | HostedDpcError::GenerationExhausted
+        | HostedDpcError::SequenceExhausted => nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+    }
 }
 
 fn hosted_irq_actual_lock_status(error: InterruptActualLockError) -> nt_status::NtStatus {
