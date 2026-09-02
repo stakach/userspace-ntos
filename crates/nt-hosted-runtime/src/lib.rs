@@ -10,11 +10,12 @@ mod hosted_irq_arena;
 mod progress_deferral;
 
 pub use hosted_irq_arena::{
-    HostedIrqArena, HostedIrqArenaConfig, HostedIrqArenaControl, HostedIrqArenaError,
-    HostedIrqArenaLayout, HostedIrqArenaResult, HostedIrqArenaToken, HostedIrqDispatchCommand,
-    HostedIrqDispatchKind, HostedIrqDispatchPage, HostedIrqFaultKind, HostedIrqFaultRecord,
-    HostedIrqGrantIdentity, HostedIrqLaneDirection, HostedIrqLaneIdentity, HostedIrqServiceCommand,
-    HostedIrqServiceKind, HostedIrqServicePage, HostedIrqTransaction, HostedIrqTransactionClass,
+    decode_hosted_irq_transport_message, HostedIrqArena, HostedIrqArenaConfig,
+    HostedIrqArenaControl, HostedIrqArenaError, HostedIrqArenaLayout, HostedIrqArenaResult,
+    HostedIrqArenaToken, HostedIrqDispatchCommand, HostedIrqDispatchKind, HostedIrqDispatchPage,
+    HostedIrqFaultKind, HostedIrqFaultRecord, HostedIrqGrantIdentity, HostedIrqLaneDirection,
+    HostedIrqLaneIdentity, HostedIrqServiceCommand, HostedIrqServiceKind, HostedIrqServicePage,
+    HostedIrqTransaction, HostedIrqTransactionClass, HostedIrqTransportMessage,
     HOSTED_IRQ_ARENA_ARGUMENT_CAP, HOSTED_IRQ_ARENA_BYTES, HOSTED_IRQ_ARENA_DEPTH,
     HOSTED_IRQ_ARENA_MAGIC, HOSTED_IRQ_ARENA_PAGE_COUNT, HOSTED_IRQ_ARENA_RESULT_CAP,
     HOSTED_IRQ_ARENA_VERSION,

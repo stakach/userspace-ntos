@@ -321,6 +321,47 @@ impl HostedIrqArenaToken {
     }
 }
 
+/// One valid message received from a hosted interrupt lane's private endpoint.
+///
+/// READY is deliberately distinct from an arena token: it has no transaction or sequence and is
+/// accepted only while bootstrapping a lane. Once a root replies to a parked arena call, the next
+/// call may carry a different sequence, depth, and direction as the worker enters a synchronous
+/// service or nested dispatch. The lane generation and transaction remain the transport fence;
+/// the arena control/page state machines validate the stronger nesting rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedIrqTransportMessage {
+    Ready,
+    Token(HostedIrqArenaToken),
+}
+
+pub fn decode_hosted_irq_transport_message(
+    identity: HostedIrqLaneIdentity,
+    replying_to: Option<HostedIrqArenaToken>,
+    words: [u64; 4],
+) -> Option<HostedIrqTransportMessage> {
+    if HostedIrqLaneIdentity::new(
+        identity.domain_id,
+        identity.domain_cookie,
+        identity.lane_generation,
+    ) != Some(identity)
+    {
+        return None;
+    }
+    let Some(parent) = replying_to else {
+        return (words == identity.ready_transport_words())
+            .then_some(HostedIrqTransportMessage::Ready);
+    };
+    if !parent.valid() || parent.lane_generation != identity.lane_generation {
+        return None;
+    }
+    let token = HostedIrqArenaToken::from_transport_words(words)?;
+    if token.lane_generation != identity.lane_generation || token.transaction != parent.transaction
+    {
+        return None;
+    }
+    Some(HostedIrqTransportMessage::Token(token))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedIrqDispatchCommand {
     pub kind: HostedIrqDispatchKind,
@@ -748,6 +789,28 @@ impl HostedIrqArenaControl {
         self.active_transaction_class.store(0, Ordering::Release);
         self.active_transaction.store(0, Ordering::Release);
         Ok(())
+    }
+
+    /// Recover the exact active transaction class for a token received by the lane worker.
+    /// Nested dispatch kinds do not define a new transaction: provider callbacks inherit the
+    /// Interrupt, Dpc, or Callback transaction opened by the root.
+    pub fn active_transaction(
+        &self,
+        identity: HostedIrqLaneIdentity,
+        transaction: u64,
+    ) -> Result<HostedIrqTransaction, HostedIrqArenaError> {
+        self.check_identity(identity)?;
+        let class = HostedIrqTransactionClass::from_raw(
+            self.active_transaction_class.load(Ordering::Acquire),
+        )
+        .ok_or(HostedIrqArenaError::StaleTransaction)?;
+        let active = HostedIrqTransaction {
+            lane_generation: identity.lane_generation,
+            transaction,
+            class,
+        };
+        self.check_transaction_present(identity, active)?;
+        Ok(active)
     }
 
     pub fn current_irql(&self, identity: HostedIrqLaneIdentity) -> Result<u8, HostedIrqArenaError> {
@@ -2216,6 +2279,116 @@ mod tests {
     }
 
     #[test]
+    fn transport_decoder_accepts_ready_and_nested_same_transaction_tokens() {
+        let identity = identity();
+        assert_eq!(
+            decode_hosted_irq_transport_message(identity, None, identity.ready_transport_words()),
+            Some(HostedIrqTransportMessage::Ready)
+        );
+        let dispatch = HostedIrqArenaToken {
+            lane_generation: identity.lane_generation,
+            transaction: 13,
+            sequence: 17,
+            depth: 0,
+            direction: HostedIrqLaneDirection::Dispatch,
+        };
+        let service = HostedIrqArenaToken {
+            sequence: 18,
+            direction: HostedIrqLaneDirection::Service,
+            ..dispatch
+        };
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                identity,
+                Some(dispatch),
+                service.transport_words()
+            ),
+            Some(HostedIrqTransportMessage::Token(service))
+        );
+        let nested_dispatch = HostedIrqArenaToken {
+            sequence: 19,
+            depth: 1,
+            direction: HostedIrqLaneDirection::Dispatch,
+            ..service
+        };
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                identity,
+                Some(service),
+                nested_dispatch.transport_words()
+            ),
+            Some(HostedIrqTransportMessage::Token(nested_dispatch))
+        );
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                identity,
+                Some(nested_dispatch),
+                dispatch.transport_words()
+            ),
+            Some(HostedIrqTransportMessage::Token(dispatch))
+        );
+    }
+
+    #[test]
+    fn transport_decoder_rejects_wrong_phase_lane_transaction_and_shape() {
+        let identity = identity();
+        let dispatch = HostedIrqArenaToken {
+            lane_generation: identity.lane_generation,
+            transaction: 13,
+            sequence: 17,
+            depth: 0,
+            direction: HostedIrqLaneDirection::Dispatch,
+        };
+        assert_eq!(
+            decode_hosted_irq_transport_message(identity, None, dispatch.transport_words()),
+            None
+        );
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                identity,
+                Some(dispatch),
+                HostedIrqArenaToken {
+                    lane_generation: identity.lane_generation + 1,
+                    ..dispatch
+                }
+                .transport_words()
+            ),
+            None
+        );
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                identity,
+                Some(dispatch),
+                HostedIrqArenaToken {
+                    transaction: dispatch.transaction + 1,
+                    ..dispatch
+                }
+                .transport_words()
+            ),
+            None
+        );
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                identity,
+                Some(dispatch),
+                [identity.lane_generation, dispatch.transaction, 0, 0x100]
+            ),
+            None
+        );
+        assert_eq!(
+            decode_hosted_irq_transport_message(
+                HostedIrqLaneIdentity {
+                    lane_generation: 0,
+                    ..identity
+                },
+                None,
+                identity.ready_transport_words()
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn every_protocol_object_is_cache_aligned_and_page_safe() {
         assert_eq!(align_of::<HostedIrqArenaControl>(), PAGE_SIZE as usize);
         assert_eq!(align_of::<HostedIrqDispatchPage>(), PAGE_SIZE as usize);
@@ -2258,6 +2431,10 @@ mod tests {
         let transaction = control
             .root_begin_transaction(identity(), HostedIrqTransactionClass::Interrupt)
             .unwrap();
+        assert_eq!(
+            control.active_transaction(identity(), transaction.transaction),
+            Ok(transaction)
+        );
         let command = dispatch(HostedIrqDispatchKind::InterruptService);
         let token = page
             .root_publish(&control, identity(), transaction, 0, command)

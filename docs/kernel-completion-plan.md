@@ -22984,11 +22984,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     framebuffer pixels non-background with at least 32 colours. The final result is `295/295`, the
     sentinel matched, and QEMU exited normally.
 
-    Next, complete the nested Service-direction arena exchange and expose exact acquire/release
-    operations through that root broker. Wire `KeSynchronizeExecution` and ISR dispatch to the same
-    retained identity at each connection's `SynchronizeIrql`; a private-lane spin loop is forbidden
-    because it can deadlock a sibling TCB on a uniprocessor host. Then add the generation-owned DPC
-    registry and perform the single atomic live-arena cutover/removal described below.
+    Current boot architecture note (2026-09-02): the superproject pins rust-micro `4abaca8`
+    (`boot: complete Simpleboot platform handoff`). Simpleboot loads the microkernel and separately
+    described initrd/service payload; BOOTBOOT is no longer the active loader contract. Older
+    BOOTBOOT measurements below remain dated diagnostic history only and must not drive new image
+    aggregation or size work.
+
+    B3 nested private-lane transport checkpoint (2026-09-02, implementation green): the raw lane
+    exchange no longer assumes that the next `Call` must echo the token to which root just replied.
+    `nt-hosted-runtime` now decodes an exact bootstrap READY separately from subsequent arena tokens,
+    and fences every subsequent token by valid shape, lane generation, and parent transaction while
+    leaving sequence/direction/depth validation to the arena page state machines. The executive
+    exposes typed `Ready`/`Token`/`Wall` results and a neutral `ReplyToken` action instead of loose
+    transport words and the misleading `ReplyCommand` name.
+
+    The private worker now retains current dispatch depth in its lane KPCR, recovers the active
+    transaction class from the arena rather than deriving a new class from a nested dispatch kind,
+    executes dispatches through one reusable inherited-IRQL path, and restores its exact parent
+    transaction/depth context on unwind. Its Service-direction wait loop publishes on the matching
+    depth page, accepts only the exact service completion or one strict depth+1 Dispatch token, and
+    can execute repeated nested dispatches before the parent service returns. This is transport and
+    worker machinery only; it is intentionally not a synthetic proof or an alternate shared-bank
+    path. Focused `nt-hosted-runtime` validation passes 100/100 and the freestanding executive check
+    remains green at the established 215-warning baseline.
+
+    Serialized Simpleboot acceptance `.tmp/run-desktop-20260902-130710.log` reaches genuine Explorer
+    execution and completes at guest `t_ms=117481`. Explorer reports begin/end paint `5/20`, 165
+    direct GDI returns, 125/172 batch flushes/records, and all 786432 framebuffer pixels
+    non-background with at least 32 colours. Real NDIS/TCPIP traffic remains live, the final result
+    is `295/295`, the sentinel matches, and QEMU exits normally under the 3600-second readiness
+    bound. This closes the raw nested-token transport and worker LIFO execution checkpoint; root
+    Service authority and the live ISR/DPC cutover remain open as described next.
+
+    Reference review adjustment: the live NDIS call graph requires both provider-import services
+    and reverse provider-callback requests inside the same Interrupt or Dpc transaction. Add a
+    distinct typed reverse-callback Service kind and retain the outer transaction class throughout
+    recursion. The root broker must then drive Service tokens recursively until the exact outer
+    Dispatch completion arrives. Split actual-lock acquire/release into explicit broker operations;
+    retain leases root-side and park/defer contention instead of returning false or spinning a
+    private TCB. A recursive acquire by the current ISR descendant is a fatal driver deadlock.
+
+    Next, implement that typed root Service broker and exact recursive dispatch driver. Extend the
+    hosted KINTERRUPT projection with the full connection grant generation, route ISR dispatch and
+    `KeSynchronizeExecution` through the same retained `ActualLock` identity at
+    `SynchronizeIrql`, and make lane bugcheck/fault publication poison and quarantine the active
+    line. Then add the generation-owned KDPC registry, marshal `KeInsertQueueDpc` through the broker,
+    and perform the single atomic live-arena cutover/removal described below. The old shared-bank
+    provider, ISR, and DPC paths must be deleted in that cutover, not retained as fallbacks.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.

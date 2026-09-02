@@ -11319,7 +11319,7 @@ extern "win64" fn s_ke_initialize_spin_lock(lock: u64) {
 
 #[inline]
 unsafe fn hosted_current_irql() -> u8 {
-    if let Some((arena, identity, _)) = hosted_irq_lane_context() {
+    if let Some((arena, identity, _, _)) = hosted_irq_lane_context() {
         return arena
             .control
             .current_irql(identity)
@@ -11332,7 +11332,7 @@ unsafe fn hosted_current_irql() -> u8 {
 unsafe fn hosted_raise_irql(irql: u8) -> u8 {
     let old = hosted_current_irql();
     if irql > old {
-        if let Some((arena, identity, transaction)) = hosted_irq_lane_context() {
+        if let Some((arena, identity, transaction, _)) = hosted_irq_lane_context() {
             arena
                 .control
                 .worker_raise_irql(identity, transaction, old, irql)
@@ -11349,7 +11349,7 @@ unsafe fn hosted_raise_irql(irql: u8) -> u8 {
 
 #[inline]
 unsafe fn hosted_lower_irql(irql: u8) {
-    if let Some((arena, identity, transaction)) = hosted_irq_lane_context() {
+    if let Some((arena, identity, transaction, _)) = hosted_irq_lane_context() {
         let current = arena
             .control
             .current_irql(identity)
@@ -11374,6 +11374,7 @@ const HOSTED_IRQ_LANE_KPCR_DOMAIN_COOKIE_OFFSET: u64 = 0x18;
 const HOSTED_IRQ_LANE_KPCR_GENERATION_OFFSET: u64 = 0x20;
 const HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET: u64 = 0x28;
 const HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET: u64 = 0x30;
+const HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET: u64 = 0x38;
 
 #[inline]
 unsafe fn hosted_irq_lane_gs_read(offset: u64) -> u64 {
@@ -11391,6 +11392,7 @@ unsafe fn hosted_irq_lane_context() -> Option<(
     &'static nt_hosted_runtime::HostedIrqArena,
     nt_hosted_runtime::HostedIrqLaneIdentity,
     nt_hosted_runtime::HostedIrqTransaction,
+    u8,
 )> {
     if hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) != HOSTED_IRQ_LANE_KPCR_MAGIC {
         return None;
@@ -11413,6 +11415,10 @@ unsafe fn hosted_irq_lane_context() -> Option<(
         transaction: hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_TRANSACTION_OFFSET),
         class,
     };
+    let depth = hosted_irq_lane_gs_read(HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET);
+    if depth >= nt_hosted_runtime::HOSTED_IRQ_ARENA_DEPTH as u64 {
+        hosted_irq_lane_protocol_fault(0);
+    }
     if arena_va == 0 {
         hosted_irq_lane_protocol_fault(0);
     }
@@ -11420,13 +11426,14 @@ unsafe fn hosted_irq_lane_context() -> Option<(
     if !arena.control.identity_matches(identity) {
         hosted_irq_lane_protocol_fault(0);
     }
-    Some((arena, identity, transaction))
+    Some((arena, identity, transaction, depth as u8))
 }
 
 unsafe fn hosted_irq_lane_publish_context(
     arena_va: u64,
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     transaction: nt_hosted_runtime::HostedIrqTransaction,
+    depth: u8,
 ) {
     let kpcr = FSD_WORKER_VADDR + FSD_WORKER_SCRATCH_OFFSET;
     write_volatile(
@@ -11453,6 +11460,10 @@ unsafe fn hosted_irq_lane_publish_context(
         (kpcr + HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET) as *mut u64,
         transaction.class as u32 as u64,
     );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET) as *mut u64,
+        depth as u64,
+    );
     compiler_fence(Ordering::Release);
     write_volatile(
         (kpcr + HOSTED_IRQ_LANE_KPCR_MAGIC_OFFSET) as *mut u64,
@@ -11475,6 +11486,10 @@ unsafe fn hosted_irq_lane_clear_context() {
         (kpcr + HOSTED_IRQ_LANE_KPCR_CLASS_OFFSET) as *mut u64,
         0,
     );
+    write_volatile(
+        (kpcr + HOSTED_IRQ_LANE_KPCR_DEPTH_OFFSET) as *mut u64,
+        0,
+    );
 }
 
 fn hosted_irq_lane_protocol_fault(sequence: u64) -> ! {
@@ -11482,18 +11497,6 @@ fn hosted_irq_lane_protocol_fault(sequence: u64) -> ! {
         unsafe {
             let _ = call_on4((FSD_IRQ_LANE_FAULT_LABEL << 12) | 1, sequence, 0, 0, 0);
         }
-    }
-}
-
-fn hosted_irq_lane_transaction(
-    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
-    token: nt_hosted_runtime::HostedIrqArenaToken,
-    command: nt_hosted_runtime::HostedIrqDispatchCommand,
-) -> nt_hosted_runtime::HostedIrqTransaction {
-    nt_hosted_runtime::HostedIrqTransaction {
-        lane_generation: identity.lane_generation,
-        transaction: token.transaction,
-        class: command.transaction_class(),
     }
 }
 
@@ -11567,6 +11570,156 @@ unsafe fn hosted_irq_lane_invoke(
     }
 }
 
+unsafe fn hosted_irq_lane_execute_dispatch(
+    arena_va: u64,
+    arena: &nt_hosted_runtime::HostedIrqArena,
+    identity: nt_hosted_runtime::HostedIrqLaneIdentity,
+    token: nt_hosted_runtime::HostedIrqArenaToken,
+) {
+    let sequence = token.sequence;
+    if token.lane_generation != identity.lane_generation
+        || token.direction != nt_hosted_runtime::HostedIrqLaneDirection::Dispatch
+    {
+        hosted_irq_lane_record_protocol_fault(arena, identity, token, 1);
+        hosted_irq_lane_protocol_fault(sequence);
+    }
+    let parent_context = hosted_irq_lane_context();
+    let entry_irql = arena
+        .control
+        .current_irql(identity)
+        .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
+    let command = match arena.dispatch[token.depth as usize].worker_begin(
+        &arena.control,
+        identity,
+        token,
+    ) {
+        Ok(command) => command,
+        Err(_) => {
+            hosted_irq_lane_record_protocol_fault(arena, identity, token, 2);
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+    };
+    let transaction_state = arena
+        .control
+        .active_transaction(identity, token.transaction)
+        .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
+    hosted_irq_lane_publish_context(arena_va, identity, transaction_state, token.depth);
+    let execution_irql = command.execution_irql();
+    if execution_irql < entry_irql
+        || (execution_irql != entry_irql
+            && arena
+                .control
+                .worker_raise_irql(identity, transaction_state, entry_irql, execution_irql)
+                .is_err())
+    {
+        hosted_irq_lane_clear_context();
+        hosted_irq_lane_record_protocol_fault(arena, identity, token, 3);
+        hosted_irq_lane_protocol_fault(sequence);
+    }
+    let result = hosted_irq_lane_invoke(command);
+    let current_irql = arena
+        .control
+        .current_irql(identity)
+        .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
+    if current_irql != execution_irql
+        || (execution_irql != entry_irql
+            && arena
+                .control
+                .worker_lower_irql(identity, transaction_state, execution_irql, entry_irql)
+                .is_err())
+    {
+        hosted_irq_lane_clear_context();
+        hosted_irq_lane_record_protocol_fault(arena, identity, token, 4);
+        hosted_irq_lane_protocol_fault(sequence);
+    }
+    if let Some((_, parent_identity, parent_transaction, parent_depth)) = parent_context {
+        hosted_irq_lane_publish_context(
+            arena_va,
+            parent_identity,
+            parent_transaction,
+            parent_depth,
+        );
+    } else {
+        hosted_irq_lane_clear_context();
+    }
+    if arena.dispatch[token.depth as usize]
+        .worker_complete(&arena.control, identity, token, result)
+        .is_err()
+    {
+        hosted_irq_lane_record_protocol_fault(arena, identity, token, 5);
+        hosted_irq_lane_protocol_fault(sequence);
+    }
+}
+
+#[allow(dead_code)]
+unsafe fn hosted_irq_lane_service(
+    command: nt_hosted_runtime::HostedIrqServiceCommand,
+) -> nt_hosted_runtime::HostedIrqArenaResult {
+    let Some((arena, identity, transaction, depth)) = hosted_irq_lane_context() else {
+        hosted_irq_lane_protocol_fault(0);
+    };
+    let service_token = arena.service[depth as usize]
+        .worker_publish(&arena.control, identity, transaction, depth, command)
+        .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(0));
+    let mut reply = {
+        let words = service_token.transport_words();
+        call_on4(
+            (FSD_IRQ_LANE_COMPLETION_LABEL << 12) | 4,
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+        )
+    };
+    loop {
+        let (label, lane_generation, transaction_id, sequence, depth_direction) = reply;
+        let Some(token) = nt_hosted_runtime::HostedIrqArenaToken::from_transport_words([
+            lane_generation,
+            transaction_id,
+            sequence,
+            depth_direction,
+        ]) else {
+            hosted_irq_lane_protocol_fault(sequence);
+        };
+        if label != 0
+            || token.lane_generation != identity.lane_generation
+            || token.transaction != transaction.transaction
+        {
+            hosted_irq_lane_record_protocol_fault(arena, identity, token, 6);
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        if token == service_token {
+            let result = arena.service[depth as usize]
+                .worker_completion(identity, token)
+                .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
+            arena.service[depth as usize]
+                .worker_acknowledge(&arena.control, identity, token)
+                .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
+            return result;
+        }
+        if token.direction != nt_hosted_runtime::HostedIrqLaneDirection::Dispatch
+            || token.depth != depth.saturating_add(1)
+        {
+            hosted_irq_lane_record_protocol_fault(arena, identity, token, 7);
+            hosted_irq_lane_protocol_fault(sequence);
+        }
+        hosted_irq_lane_execute_dispatch(
+            FSD_WORKER_VADDR + FSD_IRQ_LANE_ARENA_OFFSET,
+            arena,
+            identity,
+            token,
+        );
+        let words = token.transport_words();
+        reply = call_on4(
+            (FSD_IRQ_LANE_COMPLETION_LABEL << 12) | 4,
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+        );
+    }
+}
+
 unsafe fn hosted_irq_lane_record_protocol_fault(
     arena: &nt_hosted_runtime::HostedIrqArena,
     identity: nt_hosted_runtime::HostedIrqLaneIdentity,
@@ -11631,57 +11784,7 @@ extern "win64" fn hosted_irq_lane_component_entry(arena_va: u64) -> ! {
             unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 1) };
             hosted_irq_lane_protocol_fault(sequence);
         }
-        let command = match arena.dispatch[token.depth as usize].worker_begin(
-            &arena.control,
-            identity,
-            token,
-        ) {
-            Ok(command) => command,
-            Err(_) => {
-                unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 2) };
-                hosted_irq_lane_protocol_fault(sequence);
-            }
-        };
-        let transaction_state = hosted_irq_lane_transaction(identity, token, command);
-        unsafe { hosted_irq_lane_publish_context(arena_va, identity, transaction_state) };
-        let execution_irql = command.execution_irql();
-        if arena
-            .control
-            .worker_raise_irql(identity, transaction_state, PASSIVE_LEVEL, execution_irql)
-            .is_err()
-        {
-            unsafe { hosted_irq_lane_clear_context() };
-            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 3) };
-            hosted_irq_lane_protocol_fault(sequence);
-        }
-        let result = unsafe { hosted_irq_lane_invoke(command) };
-        let current_irql = arena
-            .control
-            .current_irql(identity)
-            .unwrap_or_else(|_| hosted_irq_lane_protocol_fault(sequence));
-        if current_irql != execution_irql
-            || arena
-                .control
-                .worker_lower_irql(
-                    identity,
-                    transaction_state,
-                    execution_irql,
-                    PASSIVE_LEVEL,
-                )
-                .is_err()
-        {
-            unsafe { hosted_irq_lane_clear_context() };
-            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 4) };
-            hosted_irq_lane_protocol_fault(sequence);
-        }
-        unsafe { hosted_irq_lane_clear_context() };
-        if arena.dispatch[token.depth as usize]
-            .worker_complete(&arena.control, identity, token, result)
-            .is_err()
-        {
-            unsafe { hosted_irq_lane_record_protocol_fault(arena, identity, token, 5) };
-            hosted_irq_lane_protocol_fault(sequence);
-        }
+        unsafe { hosted_irq_lane_execute_dispatch(arena_va, arena, identity, token) };
         let words = token.transport_words();
         (label, lane_generation, transaction, sequence, depth_direction) = unsafe {
             call_on4(
@@ -46210,16 +46313,7 @@ unsafe fn ensure_hosted_irq_lane(
         badge,
         FSD_IRQ_LANE_COMPLETION_LABEL,
     );
-    let ready = hosted_irq_lanes_mut()[lane_index]
-        .identity
-        .ready_transport_words();
-    if !exchange.completed
-        || [
-            exchange.lane_generation,
-            exchange.transaction,
-            exchange.sequence,
-            exchange.depth_direction,
-        ] != ready
+    if exchange.message != crate::spawn_hosts::HostedIrqExchangeMessage::Ready
         || exchange.reply_cap != channel.reply_cap
     {
         hosted_irq_lanes_mut()[lane_index].state = HostedIrqLaneState::Quarantined;

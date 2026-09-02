@@ -1795,9 +1795,17 @@ pub(crate) enum HostedIrqExchangeAction {
     ReceiveReady {
         identity: nt_hosted_runtime::HostedIrqLaneIdentity,
     },
-    ReplyCommand {
+    ReplyToken {
+        identity: nt_hosted_runtime::HostedIrqLaneIdentity,
         token: nt_hosted_runtime::HostedIrqArenaToken,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedIrqExchangeMessage {
+    Ready,
+    Token(nt_hosted_runtime::HostedIrqArenaToken),
+    Wall,
 }
 
 /// Raw IRQ-lane transport result. Unlike [`PumpResult`], this never reads a component request bank
@@ -1805,11 +1813,7 @@ pub(crate) enum HostedIrqExchangeAction {
 #[derive(Clone, Copy)]
 pub(crate) struct HostedIrqExchangeResult {
     pub reply_cap: u64,
-    pub completed: bool,
-    pub lane_generation: u64,
-    pub transaction: u64,
-    pub sequence: u64,
-    pub depth_direction: u64,
+    pub message: HostedIrqExchangeMessage,
     pub wall_ip: u64,
     pub wall_addr: u64,
     pub wall_label: u64,
@@ -1962,17 +1966,18 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     expected_badge: u64,
     completion_label: u64,
 ) -> HostedIrqExchangeResult {
-    let expected = match action {
-        HostedIrqExchangeAction::ReceiveReady { identity } => identity.ready_transport_words(),
-        HostedIrqExchangeAction::ReplyCommand { token } => token.transport_words(),
+    let (identity, replying_to) = match action {
+        HostedIrqExchangeAction::ReceiveReady { identity } => (identity, None),
+        HostedIrqExchangeAction::ReplyToken { identity, token } => (identity, Some(token)),
     };
     let mut msg = match action {
         HostedIrqExchangeAction::ReceiveReady { .. } => hosted_irq_recv(ch, ch.reply_cap),
-        HostedIrqExchangeAction::ReplyCommand { .. } => {
-            hosted_irq_reply_recv(ch, ch.reply_cap, 4, expected)
+        HostedIrqExchangeAction::ReplyToken { token, .. } => {
+            hosted_irq_reply_recv(ch, ch.reply_cap, 4, token.transport_words())
         }
     };
     let mut outcome = PumpLoopOutcome::new();
+    let mut message = HostedIrqExchangeMessage::Wall;
     loop {
         let label = msg.label();
         let length = msg.mi & 0x7f;
@@ -1981,13 +1986,25 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
             break;
         }
         if label == completion_label {
-            if msg.mi & 0xfff == 4
-                && length == 4
-                && [msg.m0, msg.m1, msg.m2, msg.m3] == expected
-            {
-                outcome.completed = true;
-            } else {
+            if msg.mi & 0xfff == 4 && length == 4 {
+                message = match nt_hosted_runtime::decode_hosted_irq_transport_message(
+                    identity,
+                    replying_to,
+                    [msg.m0, msg.m1, msg.m2, msg.m3],
+                ) {
+                    Some(nt_hosted_runtime::HostedIrqTransportMessage::Ready) => {
+                        HostedIrqExchangeMessage::Ready
+                    }
+                    Some(nt_hosted_runtime::HostedIrqTransportMessage::Token(token)) => {
+                        HostedIrqExchangeMessage::Token(token)
+                    }
+                    None => HostedIrqExchangeMessage::Wall,
+                };
+            }
+            if message == HostedIrqExchangeMessage::Wall {
                 outcome.wall(msg);
+            } else {
+                outcome.completed = true;
             }
             break;
         }
@@ -2021,11 +2038,7 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
     pump_suspend_walled_component(ch, outcome);
     HostedIrqExchangeResult {
         reply_cap: ch.reply_cap,
-        completed: outcome.completed,
-        lane_generation: if outcome.completed { msg.m0 } else { 0 },
-        transaction: if outcome.completed { msg.m1 } else { 0 },
-        sequence: if outcome.completed { msg.m2 } else { 0 },
-        depth_direction: if outcome.completed { msg.m3 } else { 0 },
+        message,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,
         wall_label: outcome.wall_label,
