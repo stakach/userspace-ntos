@@ -19,6 +19,7 @@ class RunWithTimeoutTests(unittest.TestCase):
         ready_file: Path | None = None,
         completion_file: Path | None = None,
         completion_grace_seconds: float = 5.0,
+        merge_output: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         args = [
             sys.executable,
@@ -44,6 +45,14 @@ class RunWithTimeoutTests(unittest.TestCase):
                 ]
             )
         args.extend(["--", *command])
+        if merge_output:
+            return subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=8,
+            )
         return subprocess.run(args, capture_output=True, text=True, timeout=8)
 
     def test_timeout_returns_124(self) -> None:
@@ -83,6 +92,33 @@ class RunWithTimeoutTests(unittest.TestCase):
             result = self.run_helper(1, [sys.executable, "-c", program], ready_file)
         self.assertEqual(result.returncode, 0)
         self.assertIn("deadline disarmed", result.stderr)
+
+    def test_readiness_status_cannot_split_merged_child_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ready_file = Path(temporary_directory) / "serial.log"
+            ready_file.touch()
+            program = (
+                "import pathlib,time; "
+                "print('GUEST_BEGIN', flush=True); "
+                f"pathlib.Path({str(ready_file)!r}).write_text('DESKTOP_READY'); "
+                "time.sleep(.3); print('GUEST_END', flush=True)"
+            )
+            result = self.run_helper(
+                1,
+                [sys.executable, "-c", program],
+                ready_file,
+                merge_output=True,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "GUEST_BEGIN",
+                "GUEST_END",
+                "boot readiness marker observed; deadline disarmed",
+            ],
+        )
 
     def test_stale_readiness_marker_does_not_disarm_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -96,6 +96,12 @@ def main() -> int:
     except FileNotFoundError:
         completion_offset = 0
     completion_tail = b""
+    status_messages: list[str] = []
+
+    def flush_status_messages() -> None:
+        for message in status_messages:
+            print(message, file=sys.stderr, flush=True)
+        status_messages.clear()
 
     def forward_signal(signum: int, _frame: object) -> None:
         raise ForwardedSignal(signum)
@@ -113,6 +119,7 @@ def main() -> int:
         while True:
             result = process.poll()
             if result is not None:
+                flush_status_messages()
                 return result
 
             if completion_path is not None and completion_marker is not None:
@@ -123,20 +130,19 @@ def main() -> int:
                     completion_tail,
                 )
                 if completed:
-                    print(
-                        "completion marker observed; awaiting process exit",
-                        file=sys.stderr,
-                        flush=True,
+                    status_messages.append(
+                        "completion marker observed; awaiting process exit"
                     )
                     try:
-                        return process.wait(timeout=args.completion_grace_seconds)
+                        result = process.wait(timeout=args.completion_grace_seconds)
+                        flush_status_messages()
+                        return result
                     except subprocess.TimeoutExpired:
-                        print(
+                        status_messages.append(
                             "completion exit grace expired; terminating process group",
-                            file=sys.stderr,
-                            flush=True,
                         )
                         terminate_and_wait(process, signal.SIGTERM)
+                        flush_status_messages()
                         return 0
 
             if ready_path is not None and ready_marker is not None:
@@ -144,10 +150,8 @@ def main() -> int:
                     ready_path, ready_marker, ready_offset, ready_tail
                 )
                 if ready:
-                    print(
-                        "boot readiness marker observed; deadline disarmed",
-                        file=sys.stderr,
-                        flush=True,
+                    status_messages.append(
+                        "boot readiness marker observed; deadline disarmed"
                     )
                     ready_path = None
                     ready_marker = None
@@ -156,18 +160,18 @@ def main() -> int:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    print(
+                    status_messages.append(
                         f"boot validation exceeded {args.seconds}s; terminating process group",
-                        file=sys.stderr,
-                        flush=True,
                     )
                     terminate_and_wait(process, signal.SIGTERM)
+                    flush_status_messages()
                     return 124
                 time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
             else:
                 time.sleep(POLL_INTERVAL_SECONDS)
     except ForwardedSignal as forwarded:
         terminate_and_wait(process, signal.Signals(forwarded.signum))
+        flush_status_messages()
         return 128 + forwarded.signum
     finally:
         for signum, handler in previous_handlers.items():

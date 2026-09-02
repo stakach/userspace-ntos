@@ -22747,6 +22747,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the global `hosted_pnp_enumeration_progress` barrier so unrelated or pinless children do not wait
     on PCI route reconciliation.
 
+    B3 sidecar cleanup runtime checkpoint (2026-09-02, kernel proof green; harness retry pending):
+    `.tmp/run-desktop-irq-sidecar-cleanup-20260902.log` connected ACPI and E1000 through the canonical
+    physical identities, serviced both real NIC deliveries, passed ISR/DPC/NDIS receive, passed the
+    direct PIT one-shot proof (`4385` deliveries, `6597` programs, `2` idle disarms, `2` unproductive,
+    zero ACK failures), rendered the full Explorer framebuffer, and reported `295/295`. The runner
+    nevertheless returned failure because its readiness diagnostic was emitted concurrently on
+    stderr while `run.sh` merged stderr with serial stdout; it split the exact summary marker between
+    `[boot readiness marker observed; deadline disarmed` and the remaining summary bytes.
+
+    Review adjustment: this is a harness integrity defect, not a reason to weaken the verdict parser.
+    `run_with_timeout.py` now buffers readiness/completion/timeout status until the child exits, so
+    operational diagnostics cannot interleave with guest proof bytes. A merged-stream regression test
+    asserts the readiness status follows the complete child output; all 8 wrapper tests pass. Re-run
+    the full desktop lane and require an uncorrupted `295/295` summary plus a successful runner exit
+    before marking the sidecar cleanup complete.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child
