@@ -42019,11 +42019,11 @@ struct HostedIrqConnectionAuthority {
     interrupt_object: u64,
     pnp_context_lease: nt_pnp_context::ContextLeaseIdentity,
     physical_claim: nt_interrupt_authority::PhysicalInterruptClaim,
+    physical_route: nt_interrupt_authority::PhysicalInterruptRoute,
 }
 
 struct HostedPhysicalIrqLease {
     interrupt_id: u64,
-    claim: nt_interrupt_authority::PhysicalInterruptClaim,
     lease: nt_interrupt_authority::PhysicalInterruptConnectionLease,
 }
 
@@ -42144,16 +42144,8 @@ impl HostedIrqLaneRuntime {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HostedIrqLine {
-    owner_projection_instance: usize,
-    owner_domain: HostedDomainIdentity,
-    gsi: u32,
-    controller_ordinal: u16,
-    local_pin: u16,
+    physical_line: nt_interrupt_authority::PhysicalInterruptLineId,
     event_bit: u8,
-    vector: u32,
-    level_sensitive: bool,
-    active_low: bool,
-    shared: bool,
     handler_cap: u64,
     notification_cap: u64,
     rundown: InterruptLineRundown,
@@ -42205,7 +42197,7 @@ fn validate_hosted_interrupt_connection(
     binding: HostedDeviceBinding,
     state: HostedDeviceResourceState,
     route: nt_resource_manager::ConnectedInterrupt,
-) -> Result<(), HostedInterruptConnectionRejection> {
+) -> Result<nt_interrupt_authority::PhysicalInterruptRoute, HostedInterruptConnectionRejection> {
     if state.driver_id != binding.driver_id {
         return Err(HostedInterruptConnectionRejection::Driver);
     }
@@ -42252,7 +42244,7 @@ fn validate_hosted_interrupt_connection(
     {
         return Err(HostedInterruptConnectionRejection::RouteAuthority);
     }
-    Ok(())
+    Ok(physical)
 }
 
 fn retain_hosted_irq_connection_authority(
@@ -42260,7 +42252,7 @@ fn retain_hosted_irq_connection_authority(
     state: HostedDeviceResourceState,
     route: nt_resource_manager::ConnectedInterrupt,
 ) -> Result<HostedIrqConnectionAuthority, HostedInterruptConnectionRejection> {
-    validate_hosted_interrupt_connection(binding, state, route)?;
+    let physical_route = validate_hosted_interrupt_connection(binding, state, route)?;
     if state.evidence.interrupt_object == 0 {
         return Err(HostedInterruptConnectionRejection::InterruptObject);
     }
@@ -42286,6 +42278,7 @@ fn retain_hosted_irq_connection_authority(
         interrupt_object: state.evidence.interrupt_object,
         pnp_context_lease,
         physical_claim,
+        physical_route,
     })
 }
 
@@ -42354,7 +42347,6 @@ static mut HOSTED_PHYSICAL_IRQ_LEASES: Option<Vec<HostedPhysicalIrqLease>> = Non
 static mut HOSTED_IRQ_LINES: Option<Vec<HostedIrqLine>> = None;
 static mut HOSTED_IRQ_LANES: Option<Vec<HostedIrqLaneRuntime>> = None;
 static HOSTED_IRQ_LANE_GENERATION_NEXT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_IRQ_LINE_GENERATION_NEXT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_PENDING_EVENTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_RETIRED_EVENT_BITS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_NOTIFICATION_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -44914,6 +44906,25 @@ unsafe fn hosted_physical_irq_leases() -> Option<&'static Vec<HostedPhysicalIrqL
     (*core::ptr::addr_of!(HOSTED_PHYSICAL_IRQ_LEASES)).as_ref()
 }
 
+unsafe fn hosted_physical_irq_line(
+    interrupt_id: u64,
+) -> Option<nt_interrupt_authority::PhysicalInterruptLineId> {
+    hosted_physical_irq_leases()
+        .and_then(|leases| {
+            leases
+                .iter()
+                .find(|retained| retained.interrupt_id == interrupt_id)
+        })
+        .map(|retained| retained.lease.line())
+}
+
+unsafe fn hosted_irq_connection_owns_line(
+    connection: HostedIrqConnection,
+    line: nt_interrupt_authority::PhysicalInterruptLineId,
+) -> bool {
+    hosted_physical_irq_line(connection.route.tokens.interrupt_id) == Some(line)
+}
+
 unsafe fn hosted_physical_irq_lease_live(
     interrupt_id: u64,
     route: nt_resource_manager::ConnectedInterrupt,
@@ -44951,7 +44962,6 @@ unsafe fn retain_hosted_physical_irq_lease(
     let lease = crate::acquire_physical_interrupt_connection(authority.physical_claim)?;
     hosted_physical_irq_leases_mut().push(HostedPhysicalIrqLease {
         interrupt_id: authority.route.tokens.interrupt_id,
-        claim: authority.physical_claim,
         lease,
     });
     Ok(())
@@ -44973,7 +44983,6 @@ unsafe fn release_hosted_physical_irq_lease(interrupt_id: u64) -> Result<(), nt_
                 index,
                 HostedPhysicalIrqLease {
                     interrupt_id: retained.interrupt_id,
-                    claim: retained.claim,
                     lease,
                 },
             );
@@ -45697,18 +45706,11 @@ unsafe fn allocate_hosted_irq_event_bit() -> Option<u8> {
     (0..crate::HOSTED_IRQ_EVENT_SLOT_COUNT).find(|bit| used & (1u64 << bit) == 0)
 }
 
-fn allocate_hosted_irq_line_identity(
-    controller_ordinal: u16,
-    local_pin: u16,
+fn hosted_irq_line_identity(
+    line: nt_interrupt_authority::PhysicalInterruptLineId,
+    route: nt_interrupt_authority::PhysicalInterruptRoute,
 ) -> Result<InterruptLineIdentity, nt_status::NtStatus> {
-    let generation = HOSTED_IRQ_LINE_GENERATION_NEXT
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(1).filter(|generation| *generation != 0)
-        })
-        .ok()
-        .and_then(|previous| previous.checked_add(1))
-        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    InterruptLineIdentity::new(controller_ordinal, local_pin, generation)
+    InterruptLineIdentity::new(route.controller_ordinal, route.local_pin, line.generation)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
 }
 
@@ -45786,21 +45788,16 @@ unsafe fn remove_released_hosted_irq_line(index: usize, quarantine_event: bool) 
     hosted_irq_lines_mut().remove(index);
 }
 
-unsafe fn clear_hosted_irq_orphan_lines_for_instance(
-    instance: usize,
-    domain: HostedDomainIdentity,
-) -> u64 {
+unsafe fn clear_hosted_irq_orphan_lines() -> u64 {
     let mut failures = 0u64;
     loop {
         let Some(index) = hosted_irq_lines().and_then(|lines| {
             lines.iter().position(|line| {
-                line.owner_projection_instance == instance
-                    && line.owner_domain == domain
-                    && line.rundown.disposition() != InterruptLineDisposition::Active
+                line.rundown.disposition() != InterruptLineDisposition::Active
                     && hosted_irq_connections().is_none_or(|connections| {
-                        connections
-                            .iter()
-                            .all(|connection| connection.route.line != line.gsi)
+                        connections.iter().all(|connection| {
+                            !hosted_irq_connection_owns_line(*connection, line.physical_line)
+                        })
                     })
             })
         }) else {
@@ -45817,10 +45814,12 @@ unsafe fn clear_hosted_irq_orphan_lines_for_instance(
 }
 
 unsafe fn hosted_irq_connection_line_live(connection: HostedIrqConnection) -> bool {
+    let Some(physical_line) = hosted_physical_irq_line(connection.route.tokens.interrupt_id) else {
+        return false;
+    };
     hosted_irq_lines().is_some_and(|lines| {
         lines.iter().any(|line| {
-            line.gsi == connection.route.line
-                && line.vector == connection.route.translated_vector
+            line.physical_line == physical_line
                 && line.handler_cap != 0
                 && line.notification_cap != 0
                 && hosted_irq_line_active(*line)
@@ -45832,11 +45831,7 @@ unsafe fn install_hosted_irq_connection(
     binding: HostedDeviceBinding,
     tokens: nt_resource_manager::InterruptTokens,
 ) -> Result<(), nt_status::NtStatus> {
-    if clear_hosted_irq_orphan_lines_for_instance(
-        binding.projection_instance,
-        binding.projection_domain,
-    ) != 0
-    {
+    if clear_hosted_irq_orphan_lines() != 0 {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     if let Some(existing) = hosted_irq_connections().and_then(|connections| {
@@ -45908,24 +45903,14 @@ unsafe fn install_hosted_irq_connection(
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         },
     )?;
-    let hardware_route = crate::resolve_platform_ioapic_gsi(route.line)
-        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     if let Some(existing) = hosted_irq_lines().and_then(|lines| {
         lines
             .iter()
             .copied()
-            .find(|existing| existing.gsi == route.line)
+            .find(|existing| existing.physical_line == authority.physical_claim.line)
     }) {
-        if existing.controller_ordinal != hardware_route.controller_ordinal
-            || existing.local_pin != hardware_route.local_pin
-            || existing.vector != route.translated_vector
-            || existing.level_sensitive != !state.interrupt_latched
-            || existing.active_low != state.interrupt_active_low
-            || !hosted_irq_line_active(existing)
-            || !existing.shared
-            || route.share != nt_hal_abi::SHARE_SHARED
-        {
-            return Err(nt_status::NtStatus::ACCESS_DENIED);
+        if !hosted_irq_line_active(existing) {
+            return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
         hosted_irq_connections_mut()
             .try_reserve(1)
@@ -45947,13 +45932,6 @@ unsafe fn install_hosted_irq_connection(
         return Ok(());
     }
 
-    if hosted_irq_lines().is_some_and(|lines| {
-        lines
-            .iter()
-            .any(|existing| existing.vector == route.translated_vector)
-    }) {
-        return Err(nt_status::NtStatus::ACCESS_DENIED);
-    }
     hosted_irq_lines_mut()
         .try_reserve(1)
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
@@ -45962,9 +45940,9 @@ unsafe fn install_hosted_irq_connection(
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let event_bit =
         allocate_hosted_irq_event_bit().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let line_identity = allocate_hosted_irq_line_identity(
-        hardware_route.controller_ordinal,
-        hardware_route.local_pin,
+    let line_identity = hosted_irq_line_identity(
+        authority.physical_claim.line,
+        authority.physical_route,
     )?;
     let lane_generation = ensure_hosted_irq_lane(
         binding.projection_instance,
@@ -45998,11 +45976,11 @@ unsafe fn install_hosted_irq_connection(
         }
     };
     let handler_cap = match crate::issue_ioapic_irq_handler_checked(
-        hardware_route.controller_ordinal as u64,
-        hardware_route.local_pin as u64,
-        route.translated_vector as u64,
-        !state.interrupt_latched,
-        state.interrupt_active_low,
+        authority.physical_route.controller_ordinal as u64,
+        authority.physical_route.local_pin as u64,
+        authority.physical_route.vector as u64,
+        authority.physical_route.level_sensitive,
+        authority.physical_route.active_low,
     ) {
         Ok(cap) => cap,
         Err(status) => {
@@ -46017,16 +45995,8 @@ unsafe fn install_hosted_irq_connection(
                     .confirm_mask(mask)
                     .expect("a route that was never issued is already masked");
                 hosted_irq_lines_mut().push(HostedIrqLine {
-                    owner_projection_instance: binding.projection_instance,
-                    owner_domain: binding.projection_domain,
-                    gsi: route.line,
-                    controller_ordinal: hardware_route.controller_ordinal,
-                    local_pin: hardware_route.local_pin,
+                    physical_line: authority.physical_claim.line,
                     event_bit,
-                    vector: route.translated_vector,
-                    level_sensitive: !state.interrupt_latched,
-                    active_low: state.interrupt_active_low,
-                    shared: route.share == nt_hal_abi::SHARE_SHARED,
                     handler_cap: 0,
                     notification_cap,
                     rundown,
@@ -46046,16 +46016,8 @@ unsafe fn install_hosted_irq_connection(
         }
     };
     hosted_irq_lines_mut().push(HostedIrqLine {
-        owner_projection_instance: binding.projection_instance,
-        owner_domain: binding.projection_domain,
-        gsi: route.line,
-        controller_ordinal: hardware_route.controller_ordinal,
-        local_pin: hardware_route.local_pin,
+        physical_line: authority.physical_claim.line,
         event_bit,
-        vector: route.translated_vector,
-        level_sensitive: !state.interrupt_latched,
-        active_low: state.interrupt_active_low,
-        shared: route.share == nt_hal_abi::SHARE_SHARED,
         handler_cap,
         notification_cap,
         rundown: InterruptLineRundown::new(line_identity),
@@ -46096,10 +46058,12 @@ unsafe fn retire_hosted_irq_connection(
         Err(HalError::StaleId | HalError::Revoked | HalError::NotAssigned) => {}
         Err(error) => return Err(hosted_hal_status(error)),
     }
+    let physical_line = hosted_physical_irq_line(interrupt_id)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let last_on_line = hosted_irq_connections().is_none_or(|connections| {
         connections.iter().enumerate().all(|(index, candidate)| {
             index == connection_index
-                || candidate.route.line != connection.route.line
+                || !hosted_irq_connection_owns_line(*candidate, physical_line)
                 || !hosted_irq_connection_active(*candidate)
         })
     });
@@ -46107,7 +46071,7 @@ unsafe fn retire_hosted_irq_connection(
         hosted_irq_lines().and_then(|lines| {
             lines
                 .iter()
-                .position(|line| line.gsi == connection.route.line)
+                .position(|line| line.physical_line == physical_line)
         })
     } else {
         None
@@ -46121,7 +46085,7 @@ unsafe fn retire_hosted_irq_connection(
     if let Some(index) = line_index {
         let deliveries_drained = hosted_irq_connections().is_none_or(|connections| {
             connections.iter().all(|candidate| {
-                candidate.route.line != connection.route.line
+                !hosted_irq_connection_owns_line(*candidate, physical_line)
                     || !candidate.rundown.has_delivery_lease()
             })
         });
@@ -46399,7 +46363,7 @@ unsafe fn abort_hosted_irq_line_delivery(
 }
 
 unsafe fn quarantine_hosted_irq_delivery(
-    line_gsi: u32,
+    physical_line: nt_interrupt_authority::PhysicalInterruptLineId,
     line_identity: InterruptLineIdentity,
     delivery: InterruptLineDelivery,
     leased: &[HostedIrqLeasedConnection],
@@ -46407,7 +46371,7 @@ unsafe fn quarantine_hosted_irq_delivery(
 ) -> nt_status::NtStatus {
     for connection in hosted_irq_connections_mut()
         .iter_mut()
-        .filter(|connection| connection.route.line == line_gsi)
+        .filter(|connection| hosted_irq_connection_owns_line(**connection, physical_line))
     {
         connection.rundown.quarantine();
     }
@@ -46470,7 +46434,7 @@ unsafe fn service_hosted_irq_event(
             .try_reserve_exact(live_len)
             .map_err(|_| {
                 quarantine_hosted_irq_delivery(
-                    line.gsi,
+                    line.physical_line,
                     line.rundown.identity(),
                     delivery,
                     &[],
@@ -46479,7 +46443,9 @@ unsafe fn service_hosted_irq_event(
             })?;
         for index in 0..live_len {
             let connection = hosted_irq_connections_mut()[index];
-            if connection.route.line != line.gsi || !hosted_irq_connection_active(connection) {
+            if !hosted_irq_connection_owns_line(connection, line.physical_line)
+                || !hosted_irq_connection_active(connection)
+            {
                 continue;
             }
             let lease = match hosted_irq_connections_mut()[index]
@@ -46489,7 +46455,7 @@ unsafe fn service_hosted_irq_event(
                 Ok(lease) => lease,
                 Err(_) => {
                     let status = quarantine_hosted_irq_delivery(
-                        line.gsi,
+                        line.physical_line,
                         line.rundown.identity(),
                         delivery,
                         &leased,
@@ -46506,7 +46472,7 @@ unsafe fn service_hosted_irq_event(
     }
     if leased.is_empty() {
         return Err(quarantine_hosted_irq_delivery(
-            line.gsi,
+            line.physical_line,
             line.rundown.identity(),
             delivery,
             &leased,
@@ -46519,7 +46485,7 @@ unsafe fn service_hosted_irq_event(
     {
         if complete_hosted_irq_connection_leases(&leased).is_err() {
             return Err(quarantine_hosted_irq_delivery(
-                line.gsi,
+                line.physical_line,
                 line.rundown.identity(),
                 delivery,
                 &leased,
@@ -46542,7 +46508,7 @@ unsafe fn service_hosted_irq_event(
     let mut scan_entries = Vec::new();
     if scan_entries.try_reserve_exact(leased.len()).is_err() {
         return Err(quarantine_hosted_irq_delivery(
-            line.gsi,
+            line.physical_line,
             line.rundown.identity(),
             delivery,
             &leased,
@@ -46572,7 +46538,7 @@ unsafe fn service_hosted_irq_event(
         Ok(scan) => scan,
         Err(_) => {
             return Err(quarantine_hosted_irq_delivery(
-                line.gsi,
+                line.physical_line,
                 line.rundown.identity(),
                 delivery,
                 &leased,
@@ -46591,7 +46557,7 @@ unsafe fn service_hosted_irq_event(
             .map(|retained| retained.connection)
         else {
             return Err(quarantine_hosted_irq_delivery(
-                line.gsi,
+                line.physical_line,
                 line.rundown.identity(),
                 delivery,
                 &leased,
@@ -46602,7 +46568,7 @@ unsafe fn service_hosted_irq_event(
             Ok(claimed) => claimed,
             Err(status) => {
                 return Err(quarantine_hosted_irq_delivery(
-                    line.gsi,
+                    line.physical_line,
                     line.rundown.identity(),
                     delivery,
                     &leased,
@@ -46645,7 +46611,7 @@ unsafe fn service_hosted_irq_event(
         Ok(completion) => completion,
         Err(_) => {
             return Err(quarantine_hosted_irq_delivery(
-                line.gsi,
+                line.physical_line,
                 line.rundown.identity(),
                 delivery,
                 &leased,
@@ -46658,7 +46624,7 @@ unsafe fn service_hosted_irq_event(
             let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
             if handler_cap == 0 {
                 return Err(quarantine_hosted_irq_delivery(
-                    line.gsi,
+                    line.physical_line,
                     line.rundown.identity(),
                     delivery,
                     &leased,
@@ -46667,7 +46633,7 @@ unsafe fn service_hosted_irq_event(
             }
             if let Err(status) = crate::acknowledge_ioapic_irq_handler_checked(handler_cap) {
                 return Err(quarantine_hosted_irq_delivery(
-                    line.gsi,
+                    line.physical_line,
                     line.rundown.identity(),
                     delivery,
                     &leased,
@@ -46680,7 +46646,7 @@ unsafe fn service_hosted_irq_event(
                 .is_err()
             {
                 return Err(quarantine_hosted_irq_delivery(
-                    line.gsi,
+                    line.physical_line,
                     line.rundown.identity(),
                     delivery,
                     &leased,
@@ -46691,7 +46657,9 @@ unsafe fn service_hosted_irq_event(
             if complete_hosted_irq_connection_leases(&leased).is_err() {
                 for connection in hosted_irq_connections_mut()
                     .iter_mut()
-                    .filter(|connection| connection.route.line == line.gsi)
+                    .filter(|connection| {
+                        hosted_irq_connection_owns_line(**connection, line.physical_line)
+                    })
                 {
                     connection.rundown.quarantine();
                 }
@@ -46715,7 +46683,7 @@ unsafe fn service_hosted_irq_event(
                 .unwrap_or(nt_status::NtStatus::DEVICE_BUSY))
         }
         InterruptLineScanCompletion::Acknowledge(_) => Err(quarantine_hosted_irq_delivery(
-            line.gsi,
+            line.physical_line,
             line.rundown.identity(),
             delivery,
             &leased,
@@ -50413,9 +50381,7 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
         print_str(b"\n");
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
-    let orphan_line_failures = retiring_domain
-        .map(|domain| unsafe { clear_hosted_irq_orphan_lines_for_instance(i, domain) })
-        .unwrap_or(0);
+    let orphan_line_failures = unsafe { clear_hosted_irq_orphan_lines() };
     if orphan_line_failures != 0 {
         print_str(b"[driver-launch] hosted interrupt line release failed inst=");
         print_u64(i as u64);

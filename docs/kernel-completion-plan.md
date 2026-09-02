@@ -22729,6 +22729,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     accepts the physical authority cutover. Next delete duplicate `HostedIrqLine` route semantics
     and collision decisions while retaining only cap/event/delivery mechanism state.
 
+    B3 interrupt sidecar authority cleanup checkpoint (2026-09-02, host and freestanding validation
+    green; desktop runtime pending): `HostedIrqLine` now retains only the canonical
+    `PhysicalInterruptLineId` foreign key, notification event bit, handler/notification capabilities,
+    and `InterruptLineRundown`. Its copied projection owner, GSI, controller/pin, vector, trigger,
+    polarity, and sharing fields are deleted. Line identity generation is the physical catalog's
+    generation, so the executive-only `HOSTED_IRQ_LINE_GENERATION_NEXT` allocator is deleted. The
+    late same-GSI policy comparison and cross-line vector collision scan are also deleted; catalog
+    claim validation and move-only connection acquisition are now the only semantic admission path.
+    Shared-line delivery, quarantine, disconnect, and orphan cleanup join through the exact physical
+    line identity retained by each move-only lease. The lease sidecar no longer copies its claim.
+
+    `nt-interrupt-authority` remains green at 11/11, formatting and diff checks are clean, and the
+    executive freestanding check remains green at the established 214-warning baseline. Review
+    adjustment: run the serialized desktop acceptance under the 3,600-second cap before closing this
+    cleanup. Then implement generation-owned parent relation identity per enumerated child and remove
+    the global `hosted_pnp_enumeration_progress` barrier so unrelated or pinless children do not wait
+    on PCI route reconciliation.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child
