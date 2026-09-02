@@ -5,12 +5,6 @@
 #![allow(clippy::all)]
 use crate::*;
 
-struct DirFindLfnScratch {
-    short: [u8; 11],
-    want: [u8; 256],
-    lfn: [u8; 260],
-}
-
 #[repr(C)]
 struct FatSectorCacheScratch {
     sector: u32,
@@ -18,10 +12,8 @@ struct FatSectorCacheScratch {
     data: [u8; 512],
 }
 
-const LFN_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 pub(crate) const FAT32_SCRATCH_OFFSET: u64 = 0xA00;
-const FAT32_FAT_CACHE_OFFSET: u64 =
-    (FAT32_SCRATCH_OFFSET + core::mem::size_of::<DirFindLfnScratch>() as u64 + 7) & !7;
+const FAT32_FAT_CACHE_OFFSET: u64 = FAT32_SCRATCH_OFFSET;
 const _: () = assert!(
     FAT32_FAT_CACHE_OFFSET + core::mem::size_of::<FatSectorCacheScratch>() as u64 <= 0x1000
 );
@@ -473,19 +465,19 @@ unsafe fn system32_cache_candidate_count(fs: &Fat32, system32_cluster: u32) -> u
 }
 
 unsafe fn system32_cache_build(fs: &Fat32) -> bool {
-    let Some((reactos_cluster, _, reactos_attr)) = dir_find_lfn(fs, fs.root_cl, b"reactos") else {
+    let Some(reactos) = fat_find_open_metadata(fs, fs.root_cl, b"reactos") else {
         return false;
     };
-    if reactos_attr & 0x10 == 0 {
+    if !reactos.metadata.is_directory {
         return false;
     }
-    let Some((system32_cluster, _, system32_attr)) = dir_find_lfn(fs, reactos_cluster, b"system32")
-    else {
+    let Some(system32) = fat_find_open_metadata(fs, reactos.first_cluster, b"system32") else {
         return false;
     };
-    if system32_attr & 0x10 == 0 {
+    if !system32.metadata.is_directory {
         return false;
     }
+    let system32_cluster = system32.first_cluster;
 
     let needed = system32_cache_candidate_count(fs, system32_cluster);
     let Some(cache) = system32_cache_entries_mut(needed) else {
@@ -805,210 +797,6 @@ pub(crate) unsafe fn fat_read_file_range(
     written
 }
 
-/// Like `dir_find` but matches EITHER the 8.3 short entry OR the reassembled long (LFN) name of
-/// `comp` — case-insensitive ASCII — so names WITHOUT a clean 8.3 alias (e.g. `advapi32_vista.dll`,
-/// `windowscodecs.dll`) resolve by their real name. Returns `(first_cluster, size, attr)`. VFAT
-/// stores 0-N LFN entries (attr 0x0F) physically BEFORE the 8.3 entry, each carrying 13 UTF-16
-/// chars keyed by a 1-based sequence ordinal; this reassembles them (ASCII only — sufficient for
-/// the ReactOS tree) and compares to `comp`. When an entry has an LFN, only the long name is
-/// matched (the 8.3 is a mangled alias); otherwise the 8.3 short name is matched (old behavior).
-pub(crate) unsafe fn dir_find_lfn(
-    fs: &Fat32,
-    dir_cluster: u32,
-    comp: &[u8],
-) -> Option<(u32, u32, u8)> {
-    let DirFindLfnScratch { short, want, lfn } = &mut *(fs.scratch_vaddr as *mut DirFindLfnScratch);
-    name_to_83_into(comp, short);
-    // Lowercase the target (ASCII) once.
-    let want_len = if comp.len() < 256 { comp.len() } else { 256 };
-    let mut i = 0;
-    while i < want_len {
-        let c = comp[i];
-        want[i] = if c.is_ascii_uppercase() { c + 32 } else { c };
-        i += 1;
-    }
-    // Does `comp` fit a clean 8.3 (base<=8, ext<=3, at most one dot)? If NOT, the 8.3 fallback
-    // is UNSAFE: `name_to_83` truncates (e.g. "kernel32_vista.dll" -> "KERNEL32DLL") and would
-    // COLLIDE with a different file's short entry ("kernel32.dll"). So the short-name match is
-    // gated on `fits_83`; a long name matches ONLY via its reassembled LFN.
-    let (mut base_len, mut ext_len, mut dots) = (0usize, 0usize, 0usize);
-    for &c in comp {
-        if c == b'.' {
-            dots += 1;
-        } else if dots >= 1 {
-            ext_len += 1;
-        } else {
-            base_len += 1;
-        }
-    }
-    let fits_83 = dots <= 1 && base_len >= 1 && base_len <= 8 && ext_len <= 3;
-    lfn.fill(0); // reassembled long name (lowercased ASCII)
-    let mut term: Option<usize> = None; // index of the 0x0000 terminator, if seen
-    let mut hi_ord = 0usize;
-    let mut have_lfn = false;
-    let mut cl = dir_cluster;
-    let max_clusters = if fs.spc == 0 {
-        0
-    } else {
-        (fs.total_sectors / fs.spc).min(4096)
-    };
-    let mut clusters_seen = 0u32;
-    while cl >= 2 && cl < 0x0FFF_FFF8 {
-        if clusters_seen >= max_clusters {
-            print_str(b"[fat-dir] directory chain overrun cluster=");
-            print_u64(dir_cluster as u64);
-            print_str(b" component=");
-            print_str(comp);
-            print_str(b"\n");
-            return None;
-        }
-        clusters_seen += 1;
-        for s in 0..fs.spc {
-            let p = fat_read_sector_checked(fs, fat_cluster_sector(fs, cl) + s)?;
-            for e in 0..(fs.bps as usize / 32) {
-                let ent = p.add(e * 32);
-                let first = *ent;
-                if first == 0x00 {
-                    return None; // end of directory
-                }
-                if first == 0xE5 {
-                    have_lfn = false;
-                    term = None;
-                    hi_ord = 0; // deleted — drop any pending LFN
-                    continue;
-                }
-                let attr = *ent.add(0x0B);
-                if attr == 0x0F {
-                    // LFN fragment: place its 13 chars at [(ord-1)*13 ..].
-                    let ord = (first & 0x1F) as usize;
-                    if ord >= 1 && ord <= 20 {
-                        have_lfn = true;
-                        if ord > hi_ord {
-                            hi_ord = ord;
-                        }
-                        let base = (ord - 1) * 13;
-                        let mut k = 0;
-                        while k < 13 {
-                            let o = LFN_OFFSETS[k];
-                            let lo = *ent.add(o);
-                            let hi = *ent.add(o + 1);
-                            let idx = base + k;
-                            if idx < 260 {
-                                if lo == 0 && hi == 0 {
-                                    if term.is_none() {
-                                        term = Some(idx);
-                                    }
-                                } else if !(lo == 0xFF && hi == 0xFF) {
-                                    lfn[idx] = if hi == 0 {
-                                        if lo.is_ascii_uppercase() {
-                                            lo + 32
-                                        } else {
-                                            lo
-                                        }
-                                    } else {
-                                        0xFF // non-ASCII — won't match an ASCII target
-                                    };
-                                }
-                            }
-                            k += 1;
-                        }
-                    }
-                    continue;
-                }
-                if (attr & 0x08) != 0 {
-                    have_lfn = false;
-                    term = None;
-                    hi_ord = 0; // volume label
-                    continue;
-                }
-                // 8.3 entry: decide match against the long name (if any) or the short name.
-                let matched = if have_lfn {
-                    let len = term.unwrap_or(hi_ord * 13);
-                    len == want_len && {
-                        let mut m = true;
-                        let mut j = 0;
-                        while j < len {
-                            if lfn[j] != want[j] {
-                                m = false;
-                                break;
-                            }
-                            j += 1;
-                        }
-                        m
-                    }
-                } else {
-                    fits_83 && {
-                        let mut m = true;
-                        let mut j = 0;
-                        while j < 11 {
-                            if *ent.add(j) != short[j] {
-                                m = false;
-                                break;
-                            }
-                            j += 1;
-                        }
-                        m
-                    }
-                };
-                if matched {
-                    let hi = core::ptr::read_unaligned(ent.add(0x14) as *const u16) as u32;
-                    let lo = core::ptr::read_unaligned(ent.add(0x1A) as *const u16) as u32;
-                    let size = core::ptr::read_unaligned(ent.add(0x1C) as *const u32);
-                    return Some(((hi << 16) | lo, size, attr));
-                }
-                have_lfn = false;
-                term = None;
-                hi_ord = 0;
-            }
-        }
-        let next = fat_next(fs, cl);
-        if next == cl {
-            print_str(b"[fat-dir] self-referential directory chain cluster=");
-            print_u64(dir_cluster as u64);
-            print_str(b" component=");
-            print_str(comp);
-            print_str(b"\n");
-            return None;
-        }
-        cl = next;
-    }
-    None
-}
-
-/// Convert one path component (e.g. `b"ntdll.dll"`) to a space-padded 8.3 FAT short name.
-/// ASCII-uppercases; splits on the LAST '.' (a leading dot is treated as part of the base);
-/// truncates base to 8 and extension to 3. Good enough for the ReactOS install tree, whose
-/// names (`reactos`, `system32`, `ntdll.dll`, …) all have clean 8.3 aliases — verified: mcopy
-/// stores the uppercased 8.3 short entry (`REACTOS`, `SYSTEM32`, `NTDLL   DLL`) alongside an
-/// LFN, and `dir_find` matches the short entry (skipping LFN fragments). No `~1` mangling.
-fn name_to_83_into(comp: &[u8], out: &mut [u8; 11]) {
-    out.fill(b' ');
-    let upper = |c: u8| if c.is_ascii_lowercase() { c - 32 } else { c };
-    // Locate the extension separator = the last '.' that isn't the first char.
-    let mut dot: Option<usize> = None;
-    let mut i = 0usize;
-    while i < comp.len() {
-        if comp[i] == b'.' && i != 0 {
-            dot = Some(i);
-        }
-        i += 1;
-    }
-    let (base_end, ext_start) = match dot {
-        Some(d) => (d, d + 1),
-        None => (comp.len(), comp.len()),
-    };
-    let mut j = 0usize;
-    while j < 8 && j < base_end {
-        out[j] = upper(comp[j]);
-        j += 1;
-    }
-    let mut k = 0usize;
-    while k < 3 && ext_start + k < comp.len() {
-        out[8 + k] = upper(comp[ext_start + k]);
-        k += 1;
-    }
-}
-
 fn fat_name_matches_ascii(name: &[u16], wanted: &[u8]) -> bool {
     name.len() == wanted.len()
         && name
@@ -1038,6 +826,16 @@ unsafe fn fat_find_open_metadata(
         }
     });
     found
+}
+
+/// Find one native FAT directory entry by its long name or physical short alias.
+/// All validation and UTF-16 assembly is owned by `nt_fs::FatDirectoryDecoder`.
+pub(crate) unsafe fn dir_find_lfn(
+    fs: &Fat32,
+    directory_cluster: u32,
+    component: &[u8],
+) -> Option<(u32, u32, u8)> {
+    fat_find_open_metadata(fs, directory_cluster, component).map(FatOpenMetadata::entry_tuple)
 }
 
 unsafe fn fat_open_path_metadata_inner(
@@ -1194,7 +992,7 @@ pub(crate) unsafe fn open_sys32_uncached(fs: &Fat32, leaf: &[u8]) -> Option<(u32
 /// Does `\reactos\system32\<leaf>` exist on the executive's live FS? The REAL-FS existence
 /// authority for NtQueryAttributesFile/NtOpenFile (replaces the hand-maintained SYSTEM32_FILES
 /// seed): a System32 file exists iff it's present on the actual \reactos volume. `leaf` is a bare
-/// leaf name (already lowercased/folded is fine — dir_find_lfn is ASCII case-insensitive). Returns
+/// leaf name (already lowercased/folded is fine; native FAT matching is ASCII case-insensitive). Returns
 /// false if the FS isn't mounted yet (pre-boot) — the seed path never ran that early anyway.
 pub(crate) unsafe fn sys32_exists(leaf: &[u8]) -> bool {
     if leaf.is_empty() {

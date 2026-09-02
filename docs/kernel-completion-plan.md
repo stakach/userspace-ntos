@@ -9240,6 +9240,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     tests 6/6, `bootstrap-clock` tests 6/6, and the freestanding executive check. Pin and push the
     repaired submodule revision, then require a fresh serialized `./run.sh --desktop` gate under the
     3,600-second cap before accepting the migration.
+
+    First GPT desktop attempt `.tmp/run-desktop-simpleboot-gpt-20260902.log` proves the replacement
+    loader, RTC, framebuffer, protective MBR, GPT CRC, ESP discovery, and FAT32 mount, then fails
+    closed at installed-tree lookup. The on-disk diagnosis found Simpleboot writes zero-filled UTF-16
+    slots after an LFN terminator, while the shared decoder required `0xffff` filler. `nt-fs` now
+    accepts either defined filler value after the mandatory NUL, with an exact `initrd.tar` fixture;
+    the executive's duplicate ad hoc LFN assembly was deleted and all name lookup now uses the
+    validated shared decoder. The FAT-directory slice passes 8/8 tests and the freestanding
+    executive check is green. Repeat the serialized desktop lane; do not add generated short-name
+    aliases or restore flat-root executable paths.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and

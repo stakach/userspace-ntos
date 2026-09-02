@@ -230,7 +230,7 @@ impl FatDirectoryDecoder {
                     length = index;
                     if self.long_name.name[index + 1..units]
                         .iter()
-                        .any(|unit| *unit != 0xffff)
+                        .any(|unit| *unit != 0 && *unit != 0xffff)
                     {
                         return None;
                     }
@@ -421,6 +421,23 @@ mod tests {
         );
         assert_eq!(record.first_cluster, 0x0001_0002);
         assert_eq!(record.entry.allocation_size, 4096);
+    }
+
+    #[test]
+    fn accepts_simpleboot_zero_filled_lfn_tail() {
+        let raw = *b"~0000003LFN";
+        let checksum = fat_short_name_checksum(&raw);
+        let name: std::vec::Vec<u16> = "initrd.tar".encode_utf16().collect();
+        let mut slot = lfn_slot(0x41, checksum, &name);
+        for offset in LFN_OFFSETS.iter().skip(name.len() + 1) {
+            slot[*offset..*offset + 2].copy_from_slice(&0u16.to_le_bytes());
+        }
+        let mut decoder = FatDirectoryDecoder::new();
+        decoder.consume(&slot, 0, 512);
+        let FatDirectorySlot::Entry(record) = decoder.consume(&short_slot(raw), 32, 512) else {
+            panic!()
+        };
+        assert_eq!(record.entry.name(), name);
     }
 
     #[test]
