@@ -3098,12 +3098,12 @@ pub(crate) static PUMP_TIMER_NESTED_ACKS: AtomicU64 = AtomicU64::new(0);
 // and executive-side SURT client waits.
 //
 // ★ IT RESPECTS `exec_delay_timer_disarms`. The trigger-type bit is never used as an arm control
-// (only `delay_timer_rearm`'s existing `Tn_INT_ENB` path arms/disarms), the period is 20 s so the
-// whole post-logon window costs single-digit deliveries against that spec's 4096 ceiling, and a
-// watchdog tick is counted as WORK rather than as a spurious wake (`WATCHDOG_TICK_IS_OURS`), so the
-// `spurious <= 64` clause keeps meaning what it meant. The storm that cost 2.7 M deliveries came
-// from a comparator left permanently BEHIND the main counter; every path here writes a comparator
-// strictly ahead of `now`.
+// (only `delay_timer_rearm`'s existing one-shot path arms it), the period is 20 s so the whole
+// post-logon window costs single-digit deliveries, and a watchdog tick is counted as WORK rather
+// than as a spurious wake (`WATCHDOG_TICK_IS_OURS`). The storm that cost 2.7 M deliveries came from
+// a comparator left permanently BEHIND the main counter; every path here writes a comparator
+// strictly ahead of `now`, and the gate relates deliveries to successful programs instead of
+// imposing a boot-duration ceiling.
 /// Ship switch: `false` removes the deadline from the rearm chain and the check from every recv.
 pub(crate) const EXEC_DEADMAN_WATCHDOG: bool = true;
 /// 20 s of wall clock. A TRIP needs two consecutive expiries with no message in between, so the
@@ -3366,6 +3366,7 @@ pub(crate) unsafe fn watchdog_nested_rearm() {
         && io_out8(ioport, PIT_CHANNEL0_PORT, shot.reload as u8) == 0
         && io_out8(ioport, PIT_CHANNEL0_PORT, (shot.reload >> 8) as u8) == 0;
     if programmed && delay_timer_ack_irq().is_ok() {
+        TIMER_SHOTS_PROGRAMMED.fetch_add(1, Ordering::Relaxed);
         WATCHDOG_NESTED_REARMS.fetch_add(1, Ordering::Relaxed);
     } else if !programmed {
         delay_timer_irq_fault(handler, u64::MAX - 1);
@@ -6981,10 +6982,16 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
     let ioport = DELAY_TIMER_IOPORT.load(Ordering::Relaxed);
     let irq_state = DELAY_TIMER_IRQ_STATE.load(Ordering::Acquire);
     let ack_failures = DELAY_TIMER_IRQ_ACK_FAILURES.load(Ordering::Relaxed);
+    let programmed = TIMER_SHOTS_PROGRAMMED.load(Ordering::Relaxed);
+    let idle_disarms = TIMER_IDLE_DISARMS.load(Ordering::Relaxed);
     print_str(b"[delay-timer] armed-ever=");
     print_u64(if handler != 0 { 1 } else { 0 });
     print_str(b" deliveries=");
     print_u64(seen);
+    print_str(b" programmed=");
+    print_u64(programmed);
+    print_str(b" idle-disarms=");
+    print_u64(idle_disarms);
     print_str(b" woke-nothing=");
     print_u64(spurious);
     print_str(b" chunk-wakes=");
@@ -7008,7 +7015,9 @@ fn delay_timer_disarm_spec(passed: &mut u64) {
             && irq_state == DELAY_TIMER_IRQ_ACTIVE
             && ack_failures == 0
             && seen >= 1
-            && seen <= 4096
+            // One programmed one-shot can produce at most one delivery. Permit one residual
+            // notification from the line transition performed during initial ownership setup.
+            && seen <= programmed.saturating_add(1)
             && spurious <= 64
             && TIMER_TICKS_EARLY_STALE.load(Ordering::Relaxed) <= seen
     };
@@ -7486,6 +7495,12 @@ pub(crate) fn census_slot(badge: u64) -> usize {
 pub(crate) static TIMER_TICKS_SEEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_TICKS_SPURIOUS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_TICKS_EARLY_STALE: AtomicU64 = AtomicU64::new(0);
+/// Successful channel-0 one-shot programs. Unlike a fixed delivery ceiling, this directly proves
+/// that a long boot cannot manufacture an unbounded interrupt stream from one stale comparator.
+pub(crate) static TIMER_SHOTS_PROGRAMMED: AtomicU64 = AtomicU64::new(0);
+/// Rearm scans which found no live deadline. Channel 0 stops after each one-shot, so these scans
+/// deliberately leave it stopped instead of programming a sentinel or periodic fallback.
+pub(crate) static TIMER_IDLE_DISARMS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TIMER_DUE_WORK_DRAINS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static IO_COMPLETION_TIMEOUT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DELAY_TIMER_REARM_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -17718,6 +17733,8 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtH
             || io_out8(ioport, PIT_CHANNEL0_PORT, (shot.reload >> 8) as u8) != 0
         {
             delay_timer_irq_fault(timer_handler, u64::MAX - 1);
+        } else {
+            TIMER_SHOTS_PROGRAMMED.fetch_add(1, Ordering::Relaxed);
         }
     } else {
         // Channel 0 is in hardware one-shot mode and therefore already stopped after its delivery.
@@ -17726,6 +17743,7 @@ unsafe fn delay_timer_rearm(queue: &nt_delay_execution::Queue, handler: &ExecNtH
         LAST_REARM_ARMED.store(0, Ordering::Relaxed);
         LAST_REARM_WAKE_DEADLINE.store(u64::MAX, Ordering::Relaxed);
         LAST_REARM_CHUNKED.store(false, Ordering::Relaxed);
+        TIMER_IDLE_DISARMS.fetch_add(1, Ordering::Relaxed);
     }
 }
 

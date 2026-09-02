@@ -22705,6 +22705,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Explorer framebuffer proof, and the full sentinel before removing the now-redundant semantic
     fields and collision decisions from the hardware-cap sidecar.
 
+    B3 physical interrupt-line runtime checkpoint (2026-09-02, mechanism green; revised timer proof
+    pending): serialized run `.tmp/run-desktop-physical-irq-20260902-101051.log` reached genuine
+    Explorer chrome and the sentinel. ACPI connected SCI GSI/vector 9, E1000 received firmware GSI
+    23 with distinct translated vector 5, `IoConnectInterrupt` accepted both exact grants, the
+    hardware line serviced real deliveries, and the NDIS receive, hardware ISR, and DPC gates all
+    passed. The framebuffer was fully non-background with at least 32 colors. The result was
+    `294/295`; the only failure was the historical `exec_delay_timer_disarms` fixed ceiling of 4,096
+    deliveries. This longer run had 4,507 deliveries, 3 unproductive wakes, and zero ACK failures,
+    so the fixed count measured elapsed boot time and PIT maximum one-shot duration rather than a
+    timer storm.
+
+    Review adjustment: retain the bounded unproductive-wake and zero-ACK-failure checks, but replace
+    the elapsed-time ceiling with direct one-shot evidence. The executive now counts each successful
+    PIT channel-0 program, records scans that intentionally leave an idle one-shot stopped, and
+    requires deliveries not to exceed successful programs plus one bounded setup residual. The
+    freestanding executive check remains green at 214 warnings. Re-run the serialized desktop lane
+    under the 3,600-second cap and require this direct proof plus all 295 gates before accepting the
+    physical authority cutover and deleting duplicate `HostedIrqLine` route semantics.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child
