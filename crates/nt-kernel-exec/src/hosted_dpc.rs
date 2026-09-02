@@ -305,6 +305,21 @@ impl HostedDpcTable {
         Ok(())
     }
 
+    pub fn abort(&mut self, activation: HostedDpcActivation) -> Result<(), HostedDpcError> {
+        let index = self.record_index(activation.identity)?;
+        let record = &mut self.records[index];
+        if record.in_flight != Some(activation.sequence) || record.queued.is_some() {
+            return Err(HostedDpcError::StaleActivation);
+        }
+        record.in_flight = None;
+        record.queued = Some(HostedDpcQueued {
+            sequence: activation.sequence,
+            argument1: activation.system_argument1,
+            argument2: activation.system_argument2,
+        });
+        Ok(())
+    }
+
     pub fn retire(&mut self, identity: HostedDpcIdentity) -> Result<(), HostedDpcError> {
         let index = self.record_index(identity)?;
         if self.records[index].queued.is_some() || self.records[index].in_flight.is_some() {
@@ -327,6 +342,20 @@ impl HostedDpcTable {
                 record.live && record.identity.owner == owner && record.queued.is_some()
             })
             .count()
+    }
+
+    pub fn has_queued(&self) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.live && record.queued.is_some())
+    }
+
+    pub fn owner_pending(&self, owner: HostedDpcOwner) -> bool {
+        self.records.iter().any(|record| {
+            record.live
+                && record.identity.owner == owner
+                && (record.queued.is_some() || record.in_flight.is_some())
+        })
     }
 
     pub fn retire_owner(&mut self, owner: HostedDpcOwner) -> Result<usize, HostedDpcError> {
@@ -410,6 +439,19 @@ mod tests {
             table.queue(identity, 3, 4),
             Ok(HostedDpcQueueResult::AlreadyQueued(identity))
         );
+    }
+
+    #[test]
+    fn abort_restores_the_exact_activation_for_retry() {
+        let mut table = HostedDpcTable::new();
+        let owner = owner(73);
+        let identity = table.register(owner, 0x1000, 0x2000, 0x3000).unwrap();
+        table.queue(identity, 0x44, 0x55).unwrap();
+        let activation = table.begin_next(owner).unwrap().unwrap();
+
+        table.abort(activation).unwrap();
+
+        assert_eq!(table.begin_next(owner), Ok(Some(activation)));
     }
 
     #[test]

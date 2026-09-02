@@ -45,6 +45,10 @@ struct HostedIrqRootSession {
     lanes: Vec<HostedIrqActiveLane>,
     call_frames: Vec<nt_hosted_runtime::HostedIrqCallFrame>,
     outer_lock: Option<InterruptActualLockLease>,
+    dpc_grant: Option<(
+        nt_hosted_runtime::HostedIrqLaneIdentity,
+        nt_hosted_runtime::HostedIrqGrantIdentity,
+    )>,
     service_locks: Vec<InterruptActualLockLease>,
 }
 
@@ -869,87 +873,28 @@ impl HostedIrqRootSession {
         {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         }
-        if !lane_has_service_grant(lane, command.grant) {
+        let root_dpc_grant = self
+            .dpc_grant
+            .is_some_and(|(identity, grant)| identity == lane.identity && grant == command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
             return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
         }
         let instance_index = lane.projection_instance;
-        let Some(inst) = instance(instance_index) else {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        };
-        let Some(domain) = instance_domain_identity(inst) else {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        };
-        if domain.domain_id.raw() != lane.identity.domain_id
-            || domain.cookie != lane.identity.domain_cookie
-        {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        }
-        let Some(exec_dpc) = component_to_exec_va_for_instance(
+        let queue = match queue_hosted_driver_dpc(
             instance_index,
-            inst,
             command.service_id,
-            KDPC_SIZE,
-        ) else {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        };
-        let routine = command.arguments[0];
-        let deferred_context = command.arguments[1];
-        let image_frames = if inst.image_frames == 0 {
-            FSD_IMAGE_FRAMES
-        } else {
-            inst.image_frames
-        };
-        let routine_is_executable = image_frames
-            .checked_mul(0x1000)
-            .and_then(|image_bytes| {
-                let window = ExecVaWindow::try_for_instance(instance_index)?;
-                translate_component_range(
-                    routine,
-                    1,
-                    FSD_CODE_VA,
-                    image_bytes,
-                    window.code_va,
-                )
-            })
-            .is_some();
-        if !routine_is_executable
-            || read_unaligned((exec_dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64) != routine
-            || read_unaligned((exec_dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64)
-                != deferred_context
-        {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        }
-        let Some(owner) = HostedDpcOwner::new(
-            lane.identity.domain_id,
-            lane.identity.domain_cookie,
-            lane.identity.lane_generation,
-        ) else {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        };
-        let queue = match hosted_dpcs_mut().register_and_queue(
-            owner,
-            command.service_id,
-            routine,
-            deferred_context,
+            Some(command.arguments[0]),
+            Some(command.arguments[1]),
             command.arguments[2],
             command.arguments[3],
         ) {
             Ok(queue) => queue,
-            Err(error) => return fatal_service_result(hosted_dpc_status(error).raw()),
+            Err(status) => return fatal_service_result(status.raw()),
         };
         let (inserted, identity) = match queue {
             HostedDpcQueueResult::Queued(identity) => (true, identity),
             HostedDpcQueueResult::AlreadyQueued(identity) => (false, identity),
         };
-        let projected_queued = read_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
-        if projected_queued != !inserted {
-            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
-        }
-        if inserted {
-            write_unaligned((exec_dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64, command.arguments[2]);
-            write_unaligned((exec_dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64, command.arguments[3]);
-            write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
-        }
         let mut result = service_result(STATUS_SUCCESS, Some(inserted as u64));
         result.value_count = 2;
         result.values[1] = identity.generation;
@@ -1186,6 +1131,7 @@ pub(super) unsafe fn dispatch_interrupt(
         lanes,
         call_frames: Vec::new(),
         outer_lock: Some(outer_lock),
+        dpc_grant: None,
         service_locks: Vec::new(),
     };
     let result = session.drive_dispatch(0, dispatch);
@@ -1246,4 +1192,216 @@ pub(super) unsafe fn dispatch_interrupt(
         return Err(nt_status::NtStatus::UNSUCCESSFUL);
     }
     Ok(HostedIrqRootDispatchOutcome::Completed(result))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedDpcRootDispatchOutcome {
+    Completed,
+    DeferredBusy,
+}
+
+unsafe fn lane_view_for_dpc_owner(
+    owner: HostedDpcOwner,
+) -> Result<HostedIrqLaneView, nt_status::NtStatus> {
+    let (projection_instance, domain) = hosted_irq_lanes()
+        .and_then(|lanes| {
+            lanes.iter().find(|lane| {
+                lane.identity.domain_id == owner.domain_id
+                    && lane.identity.domain_cookie == owner.domain_cookie
+                    && lane.identity.lane_generation == owner.lane_generation
+                    && lane.state == HostedIrqLaneState::Ready
+            })
+        })
+        .map(|lane| (lane.projection_instance, lane.domain))
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    lane_view_for_domain(projection_instance, domain, owner.lane_generation)
+}
+
+unsafe fn abort_dpc_before_dispatch(
+    lane: HostedIrqLaneView,
+    transaction: nt_hosted_runtime::HostedIrqTransaction,
+    activation: HostedDpcActivation,
+    exec_dpc: u64,
+) -> Result<(), nt_status::NtStatus> {
+    write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
+    abort_dpc_transaction(lane, transaction, activation)
+}
+
+unsafe fn abort_dpc_transaction(
+    lane: HostedIrqLaneView,
+    transaction: nt_hosted_runtime::HostedIrqTransaction,
+    activation: HostedDpcActivation,
+) -> Result<(), nt_status::NtStatus> {
+    let abort = hosted_dpcs_mut()
+        .abort(activation)
+        .map_err(hosted_dpc_status);
+    let finish = lane
+        .arena()
+        .control
+        .root_finish_transaction(lane.identity, transaction)
+        .map_err(arena_status);
+    abort.and(finish)
+}
+
+unsafe fn dispatch_next_dpc(
+    owner: HostedDpcOwner,
+) -> Result<HostedDpcRootDispatchOutcome, nt_status::NtStatus> {
+    let lane = lane_view_for_dpc_owner(owner)?;
+    let mut lanes = Vec::new();
+    lanes
+        .try_reserve_exact(1)
+        .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+    let arena = lane.arena();
+    let transaction = match arena.control.root_begin_transaction(
+        lane.identity,
+        nt_hosted_runtime::HostedIrqTransactionClass::Dpc,
+    ) {
+        Ok(transaction) => transaction,
+        Err(nt_hosted_runtime::HostedIrqArenaError::Busy) => {
+            return Ok(HostedDpcRootDispatchOutcome::DeferredBusy)
+        }
+        Err(error) => return Err(arena_status(error)),
+    };
+    let activation = match hosted_dpcs_mut().begin_next(owner) {
+        Ok(Some(activation)) => activation,
+        Ok(None) => {
+            arena
+                .control
+                .root_finish_transaction(lane.identity, transaction)
+                .map_err(arena_status)?;
+            return Ok(HostedDpcRootDispatchOutcome::Completed);
+        }
+        Err(error) => {
+            arena
+                .control
+                .root_finish_transaction(lane.identity, transaction)
+                .map_err(arena_status)?;
+            return Err(hosted_dpc_status(error));
+        }
+    };
+    let inst = match instance(lane.projection_instance) {
+        Some(inst) => inst,
+        None => {
+            abort_dpc_transaction(lane, transaction, activation)?;
+            return Err(nt_status::NtStatus::DEVICE_NOT_CONNECTED);
+        }
+    };
+    let exec_dpc = match hosted_driver_component_object_exec_va(
+        lane.projection_instance,
+        inst,
+        activation.identity.dpc_token,
+        KDPC_SIZE,
+    ) {
+        Some(exec_dpc) => exec_dpc,
+        None => {
+            abort_dpc_transaction(lane, transaction, activation)?;
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    };
+    if read_unaligned((exec_dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64)
+        != activation.routine
+        || read_unaligned((exec_dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64)
+            != activation.deferred_context
+        || read_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *const u8) == 0
+    {
+        abort_dpc_before_dispatch(lane, transaction, activation, exec_dpc)?;
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let Some(grant) = nt_hosted_runtime::HostedIrqGrantIdentity::for_lane(
+        lane.identity,
+        activation.identity.generation,
+    ) else {
+        abort_dpc_before_dispatch(lane, transaction, activation, exec_dpc)?;
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    };
+    let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+    arguments[0] = activation.system_argument1;
+    arguments[1] = activation.system_argument2;
+    let command = nt_hosted_runtime::HostedIrqDispatchCommand {
+        kind: nt_hosted_runtime::HostedIrqDispatchKind::DeferredProcedure,
+        work_id: activation.sequence,
+        routine: activation.routine,
+        object: activation.identity.dpc_token,
+        context: activation.deferred_context,
+        entry_irql: DISPATCH_LEVEL,
+        synchronize_irql: DISPATCH_LEVEL,
+        grant,
+        argument_count: 2,
+        arguments,
+    };
+    let dispatch = match arena.dispatch[0].root_publish(
+        &arena.control,
+        lane.identity,
+        transaction,
+        0,
+        command,
+    ) {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            abort_dpc_before_dispatch(lane, transaction, activation, exec_dpc)?;
+            return Err(arena_status(error));
+        }
+    };
+    write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 0);
+
+    lanes.push(HostedIrqActiveLane {
+        lane,
+        transaction,
+        owns_transaction: false,
+        parked_services: Vec::new(),
+    });
+    let mut session = HostedIrqRootSession {
+        lanes,
+        call_frames: Vec::new(),
+        outer_lock: None,
+        dpc_grant: Some((lane.identity, grant)),
+        service_locks: Vec::new(),
+    };
+    let result = session.drive_dispatch(0, dispatch);
+    let leaked_service_lock = !session.service_locks.is_empty();
+    let leaked_recursive_state = !session.call_frames.is_empty() || session.lanes.len() != 1;
+    let service_release = session.release_service_locks();
+    let finish = arena
+        .control
+        .root_finish_transaction(lane.identity, transaction)
+        .map_err(arena_status);
+    let complete = hosted_dpcs_mut()
+        .complete(activation)
+        .map_err(hosted_dpc_status);
+    let result = result?;
+    service_release?;
+    finish?;
+    complete?;
+    if leaked_service_lock
+        || leaked_recursive_state
+        || result.faulted
+        || result.status != STATUS_SUCCESS
+        || result.value_count != 0
+    {
+        return Err(if result.status == STATUS_SUCCESS {
+            nt_status::NtStatus::UNSUCCESSFUL
+        } else {
+            nt_status::NtStatus(result.status)
+        });
+    }
+    let deliveries = read_volatile((inst.exec_shared_va + SH_DPC_DELIVERIES) as *const u64);
+    write_volatile(
+        (inst.exec_shared_va + SH_DPC_DELIVERIES) as *mut u64,
+        deliveries.saturating_add(1),
+    );
+    Ok(HostedDpcRootDispatchOutcome::Completed)
+}
+
+pub(super) unsafe fn drain_dpcs(owner: HostedDpcOwner) -> Result<u64, nt_status::NtStatus> {
+    let budget = hosted_dpcs_mut().queued_count(owner);
+    let mut delivered = 0u64;
+    for _ in 0..budget {
+        match dispatch_next_dpc(owner)? {
+            HostedDpcRootDispatchOutcome::Completed => {
+                delivered = delivered.saturating_add(1);
+            }
+            HostedDpcRootDispatchOutcome::DeferredBusy => break,
+        }
+    }
+    Ok(delivered)
 }

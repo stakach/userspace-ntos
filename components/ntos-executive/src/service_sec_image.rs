@@ -23385,7 +23385,7 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
 }
 
 unsafe fn pump_hosted_io_and_redrive_driver_starts(nt_handler: &mut ExecNtHandler) -> u64 {
-    let activated = driver_launch::drain_hosted_driver_dpc_activations();
+    let activated = driver_launch::drain_hosted_driver_dpcs();
     let pumped = driver_launch::pump_hosted_io_completions() as u64;
     if crate::config_manager_take_device_action_wake() {
         nt_handler.pnp_signal_pending_action();

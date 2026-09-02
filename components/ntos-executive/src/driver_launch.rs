@@ -95,8 +95,8 @@ use nt_io_manager::{
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
-    HostedDpcError, HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable, HostedDriverThreadError,
-    HostedDriverThreadTable,
+    HostedDpcActivation, HostedDpcError, HostedDpcOwner, HostedDpcQueueResult, HostedDpcTable,
+    HostedDriverThreadError, HostedDriverThreadTable,
     InterruptActualLockError, InterruptActualLockIdentity, InterruptActualLockLease,
     InterruptActualLockTable,
     InterruptConnection as KernelInterruptConnection, InterruptConnectionDisposition,
@@ -404,11 +404,8 @@ pub const SH_RESOURCE_INTERRUPT_ID: u64 = 0x450; // out: canonical nt-resource-m
 pub const SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR: u64 = 0x458; // out: last delivered vector
 pub const SH_RESOURCE_INTERRUPT_ISR_CLAIMED: u64 = 0x460; // out: last ISR BOOLEAN result
 pub const SH_RESOURCE_INTERRUPT_DELIVERIES: u64 = 0x468; // out: ISR delivery count
-pub const SH_DPC_QUEUE_HEAD: u64 = 0x470; // out: bounded KDPC queue consumer index
-pub const SH_DPC_QUEUE_TAIL: u64 = 0x478; // out: bounded KDPC queue producer index
-pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: failed inserts due to full queue
+pub const SH_DPC_QUEUE_DROPS: u64 = 0x480; // out: rejected root-owned KDPC insertions
 pub const SH_DPC_DELIVERIES: u64 = 0x488; // out: deferred routines called
-pub const SH_DPC_QUEUE_CAPACITY: u64 = 0x490; // out: active KDPC queue entries in the shared arena
 pub const SH_SUPPORT_ENTRY_COUNT: u64 = 0x498; // in: dependency support records to initialize
 pub const SH_SUPPORT_ENTRY_CAPACITY: u64 = 0x4A0; // in: dependency support record capacity
 pub const SH_SUPPORT_ENTRY_RVA: u64 = 0x4B0; // in: first support DriverEntry RVA, legacy mirror
@@ -536,23 +533,17 @@ pub const SH_WORK_QUEUE_ENTRY_ARG0: u64 = 0x18;
 pub const SH_WORK_QUEUE_ENTRY_ARG1: u64 = 0x20;
 pub const SH_WORK_QUEUE_CAPACITY: u64 = 256;
 pub const SH_WORK_QUEUE_ARENA_BYTES: u64 = 0x20 + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE;
-pub const SH_DPC_QUEUE_BASE: u64 = SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES; // out: queued KDPC pointers
-pub const SH_DPC_QUEUE_ENTRY_SIZE: u64 = 8;
-pub const SH_DPC_QUEUE_ARENA_BYTES: u64 = ((SH_HANDOFF_ARENA_LIMIT - SH_DPC_QUEUE_BASE) / 8) & !0x7;
-pub const SH_DPC_QUEUE_DERIVED_CAPACITY: u64 = SH_DPC_QUEUE_ARENA_BYTES / SH_DPC_QUEUE_ENTRY_SIZE;
-pub const SH_DMA_ALLOC_RECORDS: u64 = SH_DPC_QUEUE_BASE + SH_DPC_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
+pub const SH_DMA_ALLOC_RECORDS: u64 = SH_WORK_QUEUE_BASE + SH_WORK_QUEUE_ARENA_BYTES; // out: [logical,len,va] allocation records
 pub const SH_DMA_ALLOC_RECORD_LIMIT: u64 = SH_HANDOFF_ARENA_LIMIT;
 const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_HOSTED_CURRENT_IRQL);
 const _: () = assert!(SH_VIDEO_HW_START_IO_CALLS + 8 <= SH_HANDOFF_ARENA_BASE);
 const _: () = assert!(SH_SUPPORT_RECORDS + SH_SUPPORT_RECORD_BYTES <= SH_HANDOFF_ARENA_LIMIT);
-const _: () = assert!(SH_DPC_QUEUE_BASE > SH_SUPPORT_RECORDS);
 const _: () = assert!(SH_WORK_QUEUE_BASE >= SH_PROVIDER_EXPORT_MARSHAL_BASE);
 const _: () = assert!(
-    SH_WORK_QUEUE_ENTRIES + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE <= SH_DPC_QUEUE_BASE
+    SH_WORK_QUEUE_ENTRIES + SH_WORK_QUEUE_CAPACITY * SH_WORK_QUEUE_ENTRY_SIZE
+        <= SH_DMA_ALLOC_RECORDS
 );
 const _: () = assert!(SH_DMA_ALLOC_RECORD_LIMIT > SH_DMA_ALLOC_RECORDS);
-const _: () = assert!(SH_DPC_QUEUE_DERIVED_CAPACITY > 0);
-const _: () = assert!(SH_DMA_ALLOC_RECORDS > SH_DPC_QUEUE_BASE);
 const _: () = assert!(SH_VIDEO_MEMORY_MAPPED_VA + 8 <= SH_RESOURCE_IO_PORT_OUT32_FAULTS);
 const _: () = assert!(SH_TSC_FREQUENCY_HZ + 8 <= SH_VIDEO_MEMORY_PHYS);
 const _: () = assert!(SH_VIDEO_DISPI_SELECTED_INDEX + 8 <= SH_HANDOFF_ARENA_BASE);
@@ -695,6 +686,8 @@ pub const FSD_SERVICE_INTERRUPT_LABEL: u64 = 0x785;
 pub const FSD_IRQ_LANE_COMPLETION_LABEL: u64 = 0x786;
 pub const FSD_IRQ_LANE_FAULT_LABEL: u64 = 0x787;
 pub const FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL: u64 = 0x788;
+pub const FSD_SERVICE_QUEUE_DPC_LABEL: u64 = 0x789;
+pub const FSD_SERVICE_FLUSH_DPCS_LABEL: u64 = 0x78A;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -706,7 +699,6 @@ pub const FSD_DISPATCH_PROVIDER_CALLBACK: u64 = u64::MAX - 0x77A;
 pub const FSD_DISPATCH_CANCEL_IRP: u64 = u64::MAX - 0x77B;
 pub const FSD_DISPATCH_COPY_COMPLETION: u64 = u64::MAX - 0x77C;
 pub const FSD_DISPATCH_ACK_COMPLETION: u64 = u64::MAX - 0x77D;
-pub const FSD_DISPATCH_TIMER_DPC: u64 = u64::MAX - 0x77E;
 pub const FSD_DISPATCH_CREATE_PDO_PROJECTION: u64 = u64::MAX - 0x77F;
 pub const FSD_DISPATCH_ROLLBACK_ADD_DEVICE: u64 = u64::MAX - 0x780;
 
@@ -734,6 +726,8 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_PCI_CONFIG_LABEL
             | FSD_SERVICE_INTERRUPT_LABEL
             | FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
+            | FSD_SERVICE_QUEUE_DPC_LABEL
+            | FSD_SERVICE_FLUSH_DPCS_LABEL
     )
 }
 
@@ -9330,7 +9324,7 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
                 (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
                 0,
             );
-            clear_dpc_queue_projection(FSD_SHARED_VADDR);
+            clear_dpc_diagnostics(FSD_SHARED_VADDR);
             pool_free(pkinterrupt);
         }
     }
@@ -12403,6 +12397,20 @@ fn hosted_driver_wait_object_exec_va(
         })
 }
 
+fn hosted_driver_component_object_exec_va(
+    instance: usize,
+    inst: DriverInstance,
+    component_object: u64,
+    bytes: u64,
+) -> Option<u64> {
+    component_to_exec_va_for_instance(instance, inst, component_object, bytes).or_else(|| {
+        hosted_driver_runtime_for_worker_component_range(instance, component_object, bytes)
+            .and_then(|runtime| {
+                hosted_worker_component_to_exec_va(runtime, component_object, bytes)
+            })
+    })
+}
+
 pub(crate) enum HostedDriverWaitServiceResult {
     Reply(i32),
     Parked { fresh_reply_cap: u64 },
@@ -12603,74 +12611,54 @@ pub(crate) unsafe fn hosted_driver_timer_wake_due(now_100ns: u64) -> u64 {
                 delivered.saturating_add(wake_hosted_driver_waiters_for_instance(instance_index));
 
             if let Some(dpc) = expiry.dpc_ptr {
-                let activations = hosted_driver_dpc_activations_mut();
-                if !activations
-                    .iter()
-                    .any(|queued| queued.instance == instance_index && queued.dpc_ptr == dpc)
-                {
-                    activations.push(HostedDriverDpcActivation {
-                        instance: instance_index,
-                        timer_ptr: expiry.timer_ptr,
-                        dpc_ptr: dpc,
-                    });
+                if queue_hosted_driver_dpc(instance_index, dpc, None, None, 0, 0).is_err() {
+                    let drops = read_volatile((inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *const u64);
+                    write_volatile(
+                        (inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *mut u64,
+                        drops.saturating_add(1),
+                    );
                 }
             }
         }
     }
-    delivered = delivered.saturating_add(drain_hosted_driver_dpc_activations());
+    delivered = delivered.saturating_add(drain_hosted_driver_dpcs());
     delivered
 }
 
 pub(crate) fn hosted_driver_dpc_activation_pending() -> bool {
-    unsafe {
-        (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
-            .as_ref()
-            .is_some_and(|activations| !activations.is_empty())
-    }
+    unsafe { (*core::ptr::addr_of!(HOSTED_DPCS)).as_ref().is_some_and(HostedDpcTable::has_queued) }
 }
 
-/// Dispatch timer-DPC activations whose target request bank is idle. A busy driver no longer blocks
-/// unrelated NICs or timer owners; its activation is rotated to the back and remains queued. The
-/// snapshot budget prevents a periodic timer that re-arms during its own DPC from monopolising the
-/// executive, so newly queued work runs at the next scheduler boundary.
-pub(crate) unsafe fn drain_hosted_driver_dpc_activations() -> u64 {
-    let budget = (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
-        .as_ref()
-        .map(Vec::len)
-        .unwrap_or(0);
+/// Drain one queue snapshot per exact hosted lane. A DPC that requeues itself is left for the next
+/// scheduler boundary, matching the bounded dispatch behavior of the native DPC software interrupt.
+pub(crate) unsafe fn drain_hosted_driver_dpcs() -> u64 {
+    let budget = hosted_irq_lanes().map(Vec::len).unwrap_or(0);
     let mut delivered = 0u64;
-    for _ in 0..budget {
-        let activation = {
-            let activations = hosted_driver_dpc_activations_mut();
-            if activations.is_empty() {
-                break;
-            }
-            activations.remove(0)
+    for index in 0..budget {
+        let Some(identity) = hosted_irq_lanes()
+            .and_then(|lanes| lanes.get(index))
+            .map(|lane| lane.identity)
+        else {
+            break;
         };
-        if instance(activation.instance)
-            .is_some_and(|inst| hosted_component_bank_active(inst.exec_shared_va))
-        {
-            hosted_driver_dpc_activations_mut().push(activation);
+        let Some(owner) = HostedDpcOwner::new(
+            identity.domain_id,
+            identity.domain_cookie,
+            identity.lane_generation,
+        ) else {
             continue;
-        }
-        let mut no_output = [];
-        if dispatch_irp_for_instance(
-            activation.instance,
-            FSD_DISPATCH_TIMER_DPC,
-            0,
-            0,
-            0,
-            0,
-            activation.dpc_ptr,
-            activation.timer_ptr,
-            0,
-            None,
-            &[],
-            &mut no_output,
-        )
-        .is_some_and(|(status, _, _)| status >= 0)
-        {
-            delivered = delivered.saturating_add(1);
+        };
+        match hosted_irq_broker::drain_dpcs(owner) {
+            Ok(count) => delivered = delivered.saturating_add(count),
+            Err(status) => {
+                print_str(b"[hosted-dpc] dispatch failed domain=");
+                print_u64(identity.domain_id);
+                print_str(b" lane-generation=");
+                print_u64(identity.lane_generation);
+                print_str(b" status=0x");
+                print_hex(status.raw() as u32);
+                print_str(b"\n");
+            }
         }
     }
     delivered
@@ -12865,57 +12853,9 @@ const KDPC_SYSTEM_ARGUMENT2_OFFSET: u64 = 0x30;
 const KDPC_QUEUED_OFFSET: u64 = 0x38;
 const KDPC_SIZE: u64 = 0x40;
 
-unsafe fn dpc_queue_capacity(sh: u64) -> u64 {
-    let capacity = read_volatile((sh + SH_DPC_QUEUE_CAPACITY) as *const u64);
-    if capacity == 0 || capacity > SH_DPC_QUEUE_DERIVED_CAPACITY {
-        0
-    } else {
-        capacity
-    }
-}
-
-#[inline]
-fn dpc_queue_slot(sh: u64, index: u64, capacity: u64) -> u64 {
-    sh + SH_DPC_QUEUE_BASE + (index % capacity) * SH_DPC_QUEUE_ENTRY_SIZE
-}
-
-unsafe fn clear_dpc_queue_projection(sh: u64) {
-    write_volatile((sh + SH_DPC_QUEUE_HEAD) as *mut u64, 0);
-    write_volatile((sh + SH_DPC_QUEUE_TAIL) as *mut u64, 0);
+unsafe fn clear_dpc_diagnostics(sh: u64) {
     write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, 0);
     write_volatile((sh + SH_DPC_DELIVERIES) as *mut u64, 0);
-    write_volatile(
-        (sh + SH_DPC_QUEUE_CAPACITY) as *mut u64,
-        SH_DPC_QUEUE_DERIVED_CAPACITY,
-    );
-    let mut slot = 0u64;
-    while slot < SH_DPC_QUEUE_DERIVED_CAPACITY {
-        write_volatile(
-            (sh + SH_DPC_QUEUE_BASE + slot * SH_DPC_QUEUE_ENTRY_SIZE) as *mut u64,
-            0,
-        );
-        slot += 1;
-    }
-}
-
-unsafe fn ensure_dpc_queue_projection(sh: u64) {
-    if dpc_queue_capacity(sh) != 0 {
-        return;
-    }
-    write_volatile((sh + SH_DPC_QUEUE_HEAD) as *mut u64, 0);
-    write_volatile((sh + SH_DPC_QUEUE_TAIL) as *mut u64, 0);
-    write_volatile(
-        (sh + SH_DPC_QUEUE_CAPACITY) as *mut u64,
-        SH_DPC_QUEUE_DERIVED_CAPACITY,
-    );
-    let mut slot = 0u64;
-    while slot < SH_DPC_QUEUE_DERIVED_CAPACITY {
-        write_volatile(
-            (sh + SH_DPC_QUEUE_BASE + slot * SH_DPC_QUEUE_ENTRY_SIZE) as *mut u64,
-            0,
-        );
-        slot += 1;
-    }
 }
 
 /// `void KeInitializeDpc(PRKDPC, PKDEFERRED_ROUTINE, PVOID)`.
@@ -12924,11 +12864,6 @@ extern "win64" fn s_ke_initialize_dpc(dpc: u64, routine: u64, deferred_context: 
         if dpc == 0 {
             return;
         }
-        // Every hosted component owns a software-DPC queue, including
-        // resource-free and legacy drivers that never receive a hardware
-        // resource projection. KeInitializeDpc is the authoritative point at
-        // which that queue first becomes required.
-        ensure_dpc_queue_projection(FSD_SHARED_VADDR);
         core::ptr::write_bytes(dpc as *mut u8, 0, KDPC_SIZE as usize);
         write_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *mut u64, routine);
         write_unaligned(
@@ -12979,36 +12914,21 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
             }
             return queued.values[0] as u8;
         }
-        let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
-        if capacity == 0 {
-            let drops = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *const u64);
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *mut u64,
-                drops.saturating_add(1),
-            );
-            return 0;
-        }
-        let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
-        let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
-        if tail.saturating_sub(head) >= capacity {
-            let drops = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *const u64);
-            write_volatile(
-                (FSD_SHARED_VADDR + SH_DPC_QUEUE_DROPS) as *mut u64,
-                drops.saturating_add(1),
-            );
-            return 0;
-        }
-        write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64, arg1);
-        write_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64, arg2);
-        write_unaligned((dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
-        let slot = dpc_queue_slot(FSD_SHARED_VADDR, tail, capacity);
-        write_volatile(slot as *mut u64, dpc);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *mut u64,
-            tail.saturating_add(1),
+        let deferred_context =
+            read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
+        let (_label, status, inserted, generation, _) = call_on5(
+            (FSD_SERVICE_QUEUE_DPC_LABEL << 12) | 5,
+            dpc,
+            routine,
+            deferred_context,
+            arg1,
+            arg2,
         );
+        if status as u32 as i32 != STATUS_SUCCESS || inserted > 1 || generation == 0 {
+            return 0;
+        }
+        return inserted as u8;
     }
-    1
 }
 
 /// `ULONG KeQueryTimeIncrement()`.
@@ -13142,73 +13062,16 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
     }
 }
 
-unsafe fn fsd_drain_queued_dpcs() -> u64 {
-    let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
-    if capacity == 0 {
-        return 0;
-    }
-    let mut inspected = 0u64;
-    let mut delivered = 0u64;
-    while inspected < capacity {
-        let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
-        let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
-        if head == tail {
-            break;
-        }
-        let slot = dpc_queue_slot(FSD_SHARED_VADDR, head, capacity);
-        let dpc = read_volatile(slot as *const u64);
-        write_volatile(slot as *mut u64, 0);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *mut u64,
-            head.saturating_add(1),
-        );
-        inspected += 1;
-        if dpc == 0 {
-            continue;
-        }
-        let routine = read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
-        write_unaligned((dpc + KDPC_QUEUED_OFFSET) as *mut u8, 0);
-        if routine == 0 {
-            continue;
-        }
-        let context = read_unaligned((dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
-        let arg1 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *const u64);
-        let arg2 = read_unaligned((dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *const u64);
-        let f: extern "win64" fn(u64, u64, u64, u64) = core::mem::transmute(routine as *const ());
-        let old_irql = hosted_raise_irql(DISPATCH_LEVEL);
-        f(dpc, context, arg1, arg2);
-        hosted_lower_irql(old_irql);
-        delivered += 1;
-    }
-    if delivered != 0 {
-        let total = read_volatile((FSD_SHARED_VADDR + SH_DPC_DELIVERIES) as *const u64);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_DPC_DELIVERIES) as *mut u64,
-            total.saturating_add(delivered),
-        );
-    }
-    delivered
-}
-
 /// `VOID KeFlushQueuedDpcs(VOID)` — drain the hosted driver's KDPC queue before returning.
 extern "win64" fn s_ke_flush_queued_dpcs() {
     unsafe {
-        let capacity = dpc_queue_capacity(FSD_SHARED_VADDR);
-        if capacity == 0 {
-            return;
+        if hosted_irq_lane_context().is_some() {
+            hosted_irq_lane_protocol_fault(FSD_SERVICE_FLUSH_DPCS_LABEL);
         }
-        let mut rounds = 0u64;
-        let max_rounds = capacity.saturating_mul(4).max(1);
-        while rounds < max_rounds {
-            let head = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_HEAD) as *const u64);
-            let tail = read_volatile((FSD_SHARED_VADDR + SH_DPC_QUEUE_TAIL) as *const u64);
-            if head == tail {
-                break;
-            }
-            if fsd_drain_queued_dpcs() == 0 {
-                break;
-            }
-            rounds = rounds.saturating_add(1);
+        let (_, status, _, _, _) =
+            call_on4(FSD_SERVICE_FLUSH_DPCS_LABEL << 12, 0, 0, 0, 0);
+        if status as u32 as i32 != STATUS_SUCCESS {
+            hosted_irq_lane_protocol_fault(FSD_SERVICE_FLUSH_DPCS_LABEL);
         }
     }
 }
@@ -28330,12 +28193,6 @@ impl Drop for HostedComponentPumpDepthGuard {
     }
 }
 
-unsafe fn hosted_component_bank_active(shared_va: u64) -> bool {
-    (*core::ptr::addr_of!(ACTIVE_HOSTED_COMPONENT_BANKS))
-        .as_ref()
-        .is_some_and(|banks| banks.contains(&shared_va))
-}
-
 unsafe fn hosted_component_pump(
     ch: &crate::spawn_hosts::PumpChannel,
 ) -> crate::spawn_hosts::PumpResult {
@@ -28348,7 +28205,7 @@ unsafe fn hosted_component_pump(
         }
         let yield_number = HOSTED_COMPONENT_SCHEDULER_YIELDS.fetch_add(1, Ordering::Relaxed) + 1;
         let irq_lines = drain_pending_hosted_irqs_for_scheduler_yield();
-        let dpcs = drain_hosted_driver_dpc_activations();
+        let dpcs = drain_hosted_driver_dpcs();
         if yield_number <= 16 {
             print_str(b"[hosted-scheduler] resume component bank=0x");
             print_hex64(active.shared_va);
@@ -32881,9 +32738,7 @@ unsafe fn fsd_post_driver_entry(status: i32, drv: u64) {
 /// runs the driver's handler via [`run_irp`] in this component's context. Returns `(status, info)`.
 /// This is the EXACT body the retired inline `dispatch_loop` ran per request.
 unsafe fn fsd_dispatch(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
-    let result = fsd_dispatch_inner(req);
-    let _ = fsd_drain_queued_dpcs();
-    result
+    fsd_dispatch_inner(req)
 }
 
 unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
@@ -32923,25 +32778,6 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         } else {
             (0xC000_000Du32 as i32, 0) // STATUS_INVALID_PARAMETER
         };
-    }
-    if major == FSD_DISPATCH_TIMER_DPC {
-        let timer = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let dpc = read_volatile((FSD_SHARED_VADDR + SH_REQ_FSCTL) as *const u64);
-        if timer == 0 {
-            return (STATUS_INVALID_PARAMETER, 0);
-        }
-        write_unaligned((timer + 4) as *mut i32, 1);
-        if dpc != 0 {
-            let routine = read_unaligned((dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
-            if routine == 0 {
-                return (STATUS_INVALID_PARAMETER, 0);
-            }
-            let queued = read_unaligned((dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
-            if !queued && s_ke_insert_queue_dpc(dpc, 0, 0) == 0 {
-                return (STATUS_INSUFFICIENT_RESOURCES, 0);
-            }
-        }
-        return (STATUS_SUCCESS, 0);
     }
     if major == FSD_DISPATCH_CREATE_PDO_PROJECTION {
         let projection = match crate::hosted_driver_projection::create_hosted_device_projection(
@@ -46799,7 +46635,17 @@ unsafe fn hosted_irq_lane_is_referenced(lane: &HostedIrqLaneRuntime) -> bool {
                 && connection.lane_generation == lane.identity.lane_generation
         })
     });
+    let dpc_owner = HostedDpcOwner::new(
+        lane.identity.domain_id,
+        lane.identity.domain_cookie,
+        lane.identity.lane_generation,
+    );
     connection
+        || dpc_owner.is_some_and(|owner| {
+            (*core::ptr::addr_of!(HOSTED_DPCS))
+                .as_ref()
+                .is_some_and(|dpcs| dpcs.has_owner(owner))
+        })
         || hosted_provider_domain_dependencies().is_some_and(|dependencies| {
             dependencies.iter().copied().any(|dependency| {
                 hosted_provider_domain_dependency_is_live(dependency)
@@ -47565,7 +47411,7 @@ unsafe fn dispatch_hosted_irq_connection(
         .filter(|(_, inst)| inst.ready)
         .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
     let sh = inst.exec_shared_va;
-    restore_hosted_device_resource_state(binding, sh, true)?;
+    restore_hosted_device_resource_state(binding, sh, false)?;
     let lane_live = hosted_irq_lanes().is_some_and(|lanes| {
         lanes.iter().any(|lane| {
             lane.projection_instance == binding.projection_instance
@@ -47990,6 +47836,34 @@ unsafe fn service_hosted_irq_event(
                 let _ = mask_hosted_irq_line_terminal(line.rundown.identity(), true);
                 return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
             }
+            for (index, retained) in leased.iter().enumerate() {
+                let owner = HostedDpcOwner::new(
+                    retained
+                        .connection
+                        .binding
+                        .projection_domain
+                        .domain_id
+                        .raw(),
+                    retained.connection.binding.projection_domain.cookie,
+                    retained.connection.lane_generation,
+                )
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                let already_drained = leased[..index].iter().any(|previous| {
+                    HostedDpcOwner::new(
+                        previous
+                            .connection
+                            .binding
+                            .projection_domain
+                            .domain_id
+                            .raw(),
+                        previous.connection.binding.projection_domain.cookie,
+                        previous.connection.lane_generation,
+                    ) == Some(owner)
+                });
+                if !already_drained {
+                    hosted_irq_broker::drain_dpcs(owner)?;
+                }
+            }
             Ok(HostedIrqServiceOutcome::Serviced(claimed))
         }
         InterruptLineScanCompletion::Mask(masked) => {
@@ -48232,7 +48106,7 @@ unsafe fn clear_hosted_resource_projection(
     write_volatile((sh + SH_RESOURCE_IO_PORT_OUT32_FAULTS) as *mut u64, 0);
     clear_shared_io_port_evidence_at(sh);
     write_volatile((sh + SH_VIDEO_DISPI_SELECTED_INDEX) as *mut u64, 0);
-    clear_dpc_queue_projection(sh);
+    clear_dpc_diagnostics(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, 0);
     write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, 0);
@@ -49734,7 +49608,7 @@ unsafe fn copy_hosted_io_port_caps_to_instance(
 unsafe fn write_hosted_resource_state_projection(
     sh: u64,
     state: HostedDeviceResourceState,
-    reset_dpc_queue: bool,
+    reset_dpc_diagnostics: bool,
 ) {
     let evidence = state.evidence;
     let _ = publish_shared_address_resources(sh, hosted_state_address_resources(&state));
@@ -49830,8 +49704,8 @@ unsafe fn write_hosted_resource_state_projection(
         (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
         evidence.interrupt_deliveries,
     );
-    if reset_dpc_queue {
-        clear_dpc_queue_projection(sh);
+    if reset_dpc_diagnostics {
+        clear_dpc_diagnostics(sh);
     }
     write_volatile((sh + SH_DPC_QUEUE_DROPS) as *mut u64, evidence.dpc_drops);
     write_volatile(
@@ -49961,7 +49835,7 @@ unsafe fn publish_hosted_device_identity_state(
 unsafe fn restore_hosted_device_resource_state(
     binding: HostedDeviceBinding,
     sh: u64,
-    reset_dpc_queue: bool,
+    reset_dpc_diagnostics: bool,
 ) -> Result<HostedDeviceResourceState, nt_status::NtStatus> {
     let state = hosted_device_resource_state_by_device_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
@@ -49971,7 +49845,7 @@ unsafe fn restore_hosted_device_resource_state(
     let (_, inst) = instance_by_driver_id(binding.driver_id)
         .ok_or(nt_status::NtStatus::OBJECT_NAME_NOT_FOUND)?;
     copy_hosted_io_port_caps_to_instance(inst, state)?;
-    write_hosted_resource_state_projection(sh, state, reset_dpc_queue);
+    write_hosted_resource_state_projection(sh, state, reset_dpc_diagnostics);
     Ok(state)
 }
 
@@ -49988,7 +49862,6 @@ unsafe fn project_provider_device_dispatch_state(
     }
     copy_hosted_io_port_caps_to_instance(provider_inst, state)?;
     write_hosted_resource_state_projection(provider_sh, state, false);
-    ensure_dpc_queue_projection(provider_sh);
     copy_provider_dma_allocation_records(provider_sh, dependent_sh);
     Ok(())
 }
@@ -50442,6 +50315,37 @@ fn clear_hosted_irq_lanes_for_instance(instance: usize) -> u64 {
     }
 }
 
+fn clear_hosted_dpcs_for_instance(instance: usize) -> u64 {
+    unsafe {
+        let Some(lanes) = hosted_irq_lanes() else {
+            return 0;
+        };
+        let mut owners = Vec::new();
+        if owners.try_reserve_exact(lanes.len()).is_err() {
+            return 1;
+        }
+        for lane in lanes
+            .iter()
+            .filter(|lane| lane.projection_instance == instance)
+        {
+            let Some(owner) = HostedDpcOwner::new(
+                lane.identity.domain_id,
+                lane.identity.domain_cookie,
+                lane.identity.lane_generation,
+            ) else {
+                return 1;
+            };
+            owners.push(owner);
+        }
+        for owner in owners {
+            if hosted_dpcs_mut().retire_owner(owner).is_err() {
+                return 1;
+            }
+        }
+        0
+    }
+}
+
 pub(crate) fn device_object_id(device_id: u64) -> u64 {
     io_manager_mut()
         .device(nt_io_manager::DeviceId(device_id))
@@ -50721,19 +50625,6 @@ static mut HOSTED_DRIVER_WAITERS: Option<Vec<HostedDriverRawWaiter>> = None;
 static mut HOSTED_DRIVER_REPLY_POOLS: Option<Vec<HostedDriverReplyPool>> = None;
 static mut HOSTED_DRIVER_TIMERS: Option<Vec<nt_kernel_exec::TimerQueue>> = None;
 
-#[derive(Clone, Copy)]
-struct HostedDriverDpcActivation {
-    instance: usize,
-    timer_ptr: u64,
-    dpc_ptr: u64,
-}
-
-/// Timer interrupts may arrive while the executive is nested inside a driver
-/// component pump. Activations wait here until no component owns its shared
-/// request bank; duplicate KDPC identities are suppressed exactly as
-/// KeInsertQueueDpc suppresses an already-queued KDPC.
-static mut HOSTED_DRIVER_DPC_ACTIVATIONS: Option<Vec<HostedDriverDpcActivation>> = None;
-
 struct ExecutiveClock;
 
 impl nt_kernel_exec::Clock for ExecutiveClock {
@@ -50854,14 +50745,6 @@ unsafe fn hosted_driver_timer_queue_mut(
         queues.push(nt_kernel_exec::TimerQueue::new());
     }
     &mut queues[instance]
-}
-
-unsafe fn hosted_driver_dpc_activations_mut() -> &'static mut Vec<HostedDriverDpcActivation> {
-    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DRIVER_DPC_ACTIVATIONS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
 }
 
 unsafe fn hosted_driver_reply_pools_mut() -> &'static mut Vec<HostedDriverReplyPool> {
@@ -51072,11 +50955,6 @@ fn clear_hosted_driver_timers_for_instance(instance: usize) {
                 queue.clear();
             }
         }
-        if let Some(activations) =
-            (*core::ptr::addr_of_mut!(HOSTED_DRIVER_DPC_ACTIVATIONS)).as_mut()
-        {
-            activations.retain(|activation| activation.instance != instance);
-        }
         let _ = crate::service_sec_image::rearm_registered_delay_timer();
     }
 }
@@ -51092,13 +50970,23 @@ unsafe fn hosted_driver_runtime_quiesced(instance: usize) -> bool {
         .as_ref()
         .and_then(|queues| queues.get(instance))
         .is_none_or(|queue| queue.active_count() == 0);
-    let dpcs_quiesced = (*core::ptr::addr_of!(HOSTED_DRIVER_DPC_ACTIVATIONS))
-        .as_ref()
-        .is_none_or(|activations| {
-            activations
-                .iter()
-                .all(|activation| activation.instance != instance)
-        });
+    let dpcs_quiesced = hosted_irq_lanes().is_none_or(|lanes| {
+        lanes
+            .iter()
+            .filter(|lane| lane.projection_instance == instance)
+            .all(|lane| {
+                HostedDpcOwner::new(
+                    lane.identity.domain_id,
+                    lane.identity.domain_cookie,
+                    lane.identity.lane_generation,
+                )
+                .is_none_or(|owner| {
+                    (*core::ptr::addr_of!(HOSTED_DPCS))
+                        .as_ref()
+                        .is_none_or(|dpcs| !dpcs.owner_pending(owner))
+                })
+            })
+    });
     threads_quiesced && waits_quiesced && timers_quiesced && dpcs_quiesced
 }
 
@@ -51770,6 +51658,15 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
                 print_u64(singleton_failures);
                 print_str(b"\n");
             }
+        }
+    }
+    if !teardown_blocked {
+        let dpc_failures = clear_hosted_dpcs_for_instance(i);
+        if dpc_failures != 0 {
+            teardown_blocked = true;
+            print_str(b"[driver-launch] hosted DPC retirement blocked inst=");
+            print_u64(i as u64);
+            print_str(b"\n");
         }
     }
     if !teardown_blocked {
@@ -53194,6 +53091,159 @@ pub(crate) fn service_hosted_driver_ke_set_timer(
         );
         let _ = crate::service_sec_image::rearm_registered_delay_timer();
         was_active as u8
+    }
+}
+
+unsafe fn queue_hosted_driver_dpc(
+    instance_index: usize,
+    dpc: u64,
+    expected_routine: Option<u64>,
+    expected_context: Option<u64>,
+    argument1: u64,
+    argument2: u64,
+) -> Result<HostedDpcQueueResult, nt_status::NtStatus> {
+    let inst = instance(instance_index).ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+    let domain = instance_domain_identity(inst).ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let lane_generation = ensure_hosted_irq_lane(instance_index, domain)?;
+    let exec_dpc = hosted_driver_component_object_exec_va(instance_index, inst, dpc, KDPC_SIZE)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let routine = read_unaligned((exec_dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64);
+    let deferred_context =
+        read_unaligned((exec_dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64);
+    if routine == 0
+        || expected_routine.is_some_and(|expected| expected != routine)
+        || expected_context.is_some_and(|expected| expected != deferred_context)
+    {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let image_frames = if inst.image_frames == 0 {
+        FSD_IMAGE_FRAMES
+    } else {
+        inst.image_frames
+    };
+    let routine_is_executable = image_frames
+        .checked_mul(0x1000)
+        .and_then(|image_bytes| {
+            let window = ExecVaWindow::try_for_instance(instance_index)?;
+            translate_component_range(routine, 1, FSD_CODE_VA, image_bytes, window.code_va)
+        })
+        .is_some();
+    if !routine_is_executable {
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    let owner = HostedDpcOwner::new(domain.domain_id.raw(), domain.cookie, lane_generation)
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let queued = hosted_dpcs_mut()
+        .register_and_queue(
+            owner,
+            dpc,
+            routine,
+            deferred_context,
+            argument1,
+            argument2,
+        )
+        .map_err(hosted_dpc_status)?;
+    let inserted = matches!(queued, HostedDpcQueueResult::Queued(_));
+    let identity = match queued {
+        HostedDpcQueueResult::Queued(identity) | HostedDpcQueueResult::AlreadyQueued(identity) => {
+            identity
+        }
+    };
+    let projected_queued = read_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *const u8) != 0;
+    if projected_queued != !inserted {
+        let _ = hosted_dpcs_mut().remove(identity);
+        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
+    if inserted {
+        write_unaligned(
+            (exec_dpc + KDPC_SYSTEM_ARGUMENT1_OFFSET) as *mut u64,
+            argument1,
+        );
+        write_unaligned(
+            (exec_dpc + KDPC_SYSTEM_ARGUMENT2_OFFSET) as *mut u64,
+            argument2,
+        );
+        write_unaligned((exec_dpc + KDPC_QUEUED_OFFSET) as *mut u8, 1);
+    }
+    Ok(queued)
+}
+
+pub(crate) fn service_hosted_driver_queue_dpc(
+    ch: &crate::spawn_hosts::PumpChannel,
+    dpc: u64,
+    routine: u64,
+    deferred_context: u64,
+    argument1: u64,
+    argument2: u64,
+    active_reply_cap: u64,
+) -> (i32, u64, u64) {
+    let Some((instance_index, _)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    };
+    let queued = unsafe {
+        queue_hosted_driver_dpc(
+            instance_index,
+            dpc,
+            Some(routine),
+            Some(deferred_context),
+            argument1,
+            argument2,
+        )
+    };
+    match queued {
+        Ok(HostedDpcQueueResult::Queued(identity)) => {
+            (STATUS_SUCCESS, 1, identity.generation)
+        }
+        Ok(HostedDpcQueueResult::AlreadyQueued(identity)) => {
+            (STATUS_SUCCESS, 0, identity.generation)
+        }
+        Err(status) => {
+            if let Some(inst) = instance(instance_index) {
+                unsafe {
+                    let drops =
+                        read_volatile((inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *const u64);
+                    write_volatile(
+                        (inst.exec_shared_va + SH_DPC_QUEUE_DROPS) as *mut u64,
+                        drops.saturating_add(1),
+                    );
+                }
+            }
+            (status.raw(), 0, 0)
+        }
+    }
+}
+
+pub(crate) fn service_hosted_driver_flush_dpcs(
+    ch: &crate::spawn_hosts::PumpChannel,
+    active_reply_cap: u64,
+) -> i32 {
+    let Some((instance_index, _)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let owner = unsafe {
+        hosted_irq_lanes().and_then(|lanes| {
+            lanes
+                .iter()
+                .find(|lane| {
+                    lane.projection_instance == instance_index
+                        && lane.state == HostedIrqLaneState::Ready
+                })
+                .and_then(|lane| {
+                    HostedDpcOwner::new(
+                        lane.identity.domain_id,
+                        lane.identity.domain_cookie,
+                        lane.identity.lane_generation,
+                    )
+                })
+        })
+    };
+    let Some(owner) = owner else {
+        return STATUS_SUCCESS;
+    };
+    unsafe {
+        hosted_irq_broker::drain_dpcs(owner)
+            .map(|_| STATUS_SUCCESS)
+            .unwrap_or_else(nt_status::NtStatus::raw)
     }
 }
 
@@ -55138,7 +55188,7 @@ pub(crate) unsafe fn grant_hosted_device_resources(
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64, 0);
     write_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64, 0);
-    clear_dpc_queue_projection(sh);
+    clear_dpc_diagnostics(sh);
     write_volatile((sh + SH_DMA_COMMON_VA) as *mut u64, dma_va);
     write_volatile((sh + SH_DMA_COMMON_LEN) as *mut u64, mapped_dma_len);
     write_volatile((sh + SH_DMA_COMMON_LOGICAL) as *mut u64, dma_logical);
@@ -57002,8 +57052,7 @@ unsafe fn dispatch_irp_for_instance_exact(
     let mut driver_object = d.driver_object;
     let mut provider_binding = None;
     let mut provider_route = None;
-    if major != FSD_DISPATCH_TIMER_DPC {
-        if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
+    if let Some(route) = hosted_provider_dispatch_route_for_instance(inst) {
             if !route.add_device_ready() {
                 return Some(HostedIrpTransportResult::NotDispatched {
                     status: nt_status::NtStatus(STATUS_INVALID_DEVICE_REQUEST),
@@ -57051,9 +57100,8 @@ unsafe fn dispatch_irp_for_instance_exact(
             d = provider_inst;
             sh = provider_inst.exec_shared_va;
             driver_object = route.provider_driver_object;
-            provider_binding = Some(binding);
-            provider_route = Some(route);
-        }
+        provider_binding = Some(binding);
+        provider_route = Some(route);
     }
     let ep = d.fault_ep;
     let pml4 = d.pml4;

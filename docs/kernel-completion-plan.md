@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
 
 ## Objective
 
@@ -22998,11 +22998,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     framebuffer pixels non-background with at least 32 colours. The final result is `295/295`, the
     sentinel matched, and QEMU exited normally.
 
-    Current boot architecture note (2026-09-02): the superproject pins rust-micro `4abaca8`
-    (`boot: complete Simpleboot platform handoff`). Simpleboot loads the microkernel and separately
-    described initrd/service payload; BOOTBOOT is no longer the active loader contract. Older
-    BOOTBOOT measurements below remain dated diagnostic history only and must not drive new image
-    aggregation or size work.
+    Current boot architecture note (2026-09-03): the superproject pins rust-micro `c8093b7`, which
+    includes merged rust-micro PR #2 and its ARM64 boot/runtime work on top of the Simpleboot
+    platform handoff. Simpleboot loads the microkernel and separately described initrd/service
+    payload; BOOTBOOT is no longer the active loader contract. Older BOOTBOOT measurements below
+    remain dated diagnostic history only and must not drive new image aggregation or size work.
 
     B3 nested private-lane transport checkpoint (2026-09-02, implementation green): the raw lane
     exchange no longer assumes that the next `Call` must echo the token to which root just replied.
@@ -23278,6 +23278,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive check remain green at the established 213-warning baseline. The root-owned KDPC
     registry still needs a canonical drain path before the shared DPC ring can be deleted, so live
     desktop acceptance follows this checkpoint and DPC cutover remains the next B3 implementation.
+
+    Serialized post-cutover desktop evidence `.tmp/run-desktop-20260903-080303.log` completes the
+    Simpleboot handoff and reaches genuine Explorer shell chrome in about 118 guest seconds.
+    Explorer reports begin/end paint `5/20`, 165 direct GDI returns, 172 flushed batch records, and
+    all 786432 framebuffer pixels non-background with at least 32 colours. The run finishes
+    `290/295`: the remaining failures are one pending PCI `StartDevice`, its consequently unexercised
+    live interrupt/DPC/NDIS gates, and the separate LSA worker-route gate. This accepts desktop
+    rendering after the ISR cutover but does not claim live hardware acceptance for that run.
+
+    B3 root-owned DPC cutover checkpoint (2026-09-03, host and freestanding green; serialized
+    hardware acceptance open): hosted KDPC ownership is now fenced by domain id, domain cookie, and
+    exact lane generation. Ordinary `KeInsertQueueDpc`, timer expiry, and ISR/provider-lane inserts
+    all register through one root table; the old shared KDPC ring, component-side drain loop, and
+    synthetic timer-DPC dispatch major have been deleted. Root executes each activation as a
+    Dpc-class arena transaction at `DISPATCH_LEVEL`, clears the projected inserted bit before the
+    callback so self-requeue works, retains recursive provider services, and restores an activation
+    only when publication fails before execution. Physical interrupt DPCs run only after the line
+    acknowledgement and exact connection-lease release. `KeFlushQueuedDpcs` is now an authenticated
+    root service, and teardown retires idle DPC identities before destroying the exact lane.
+
+    Focused `nt-kernel-exec` validation passes 232/232 tests, including exact pre-dispatch abort and
+    lane-generation retirement coverage; the freestanding executive check remains green at the
+    213-warning baseline after removing the superseded queue machinery. Next run one serialized
+    desktop acceptance under the 3,600-second limit. If the PCI devnode still remains pending,
+    repair its canonical PnP continuation before evaluating the live interrupt/DPC gates; do not
+    add an interrupt stimulus or success fallback.
 
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
