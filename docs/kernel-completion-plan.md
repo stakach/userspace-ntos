@@ -23164,6 +23164,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the old pump. `cargo fmt --all` and the freestanding executive check are green at the existing
     213-warning baseline.
 
+    B3 depth-owned marshal and multi-lane session checkpoint (2026-09-02, host and freestanding
+    green; marshal integration open): arena ABI v4 replaces unused dispatch-page padding with a
+    0x800-byte marshal window owned by that exact lane depth. Root can obtain the window only while
+    the dispatch slot is idle; publishing makes it busy until the matching completion is
+    acknowledged. The layout exposes the component-relative offset without adding pages or worker
+    mappings. A focused test fills two adjacent depth windows with distinct patterns, proves that a
+    published slot cannot be reacquired, and proves both payloads survive completion independently.
+
+    Root session bookkeeping now indexes every active lane rather than assuming all services target
+    the outer interrupt domain, and each lane retains its exact transaction plus a LIFO stack of
+    begun Service tokens. Transport exchange, fault quarantine, service dispatch, and completion
+    all use the selected lane identity and channel. Actual-lock release now requires the exact top
+    lease, so a driver cannot punch a hole in lock ancestry. This is deliberately still a
+    foundation: provider execution remains unselected until provider export and callback marshal
+    helpers consume the depth-owned window and a root call-frame stack proves cross-lane LIFO.
+    `nt-hosted-runtime` passes 103/103 tests and the freestanding executive remains green at the
+    established 213-warning baseline.
+
     Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
     single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
     dependency lease and drive a provider-domain arena while that Service stays open. A provider

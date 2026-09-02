@@ -12,6 +12,7 @@
 //! barrier. Grant identities carried here are authenticated lookup keys only. The executive must
 //! resolve every key against its live generation-fenced lease registry before invoking a routine.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::PAGE_SIZE;
@@ -47,10 +48,11 @@ impl HostedIrqLaneIdentity {
 }
 
 pub const HOSTED_IRQ_ARENA_MAGIC: u64 = 0x4849_5251_4152_454e;
-pub const HOSTED_IRQ_ARENA_VERSION: u16 = 3;
+pub const HOSTED_IRQ_ARENA_VERSION: u16 = 4;
 pub const HOSTED_IRQ_ARENA_DEPTH: usize = 16;
 pub const HOSTED_IRQ_ARENA_ARGUMENT_CAP: usize = 12;
 pub const HOSTED_IRQ_ARENA_RESULT_CAP: usize = 4;
+pub const HOSTED_IRQ_ARENA_MARSHAL_BYTES: usize = 0x800;
 pub const HOSTED_IRQ_ARENA_PAGE_COUNT: usize = 1 + HOSTED_IRQ_ARENA_DEPTH * 2;
 pub const HOSTED_IRQ_ARENA_BYTES: u64 = HOSTED_IRQ_ARENA_PAGE_COUNT as u64 * PAGE_SIZE;
 
@@ -230,6 +232,16 @@ impl HostedIrqArenaLayout {
         } else {
             None
         }
+    }
+
+    pub const fn dispatch_marshal_offset(depth: usize) -> Option<u64> {
+        let Some(page_index) = Self::dispatch_page_index(depth) else {
+            return None;
+        };
+        let Some(page_offset) = Self::page_offset(page_index) else {
+            return None;
+        };
+        page_offset.checked_add(core::mem::offset_of!(HostedIrqSlotPage, marshal) as u64)
     }
 }
 
@@ -1381,8 +1393,14 @@ struct HostedIrqSlotPage {
     result_status: AtomicI32,
     result_faulted: AtomicU32,
     result_values: [AtomicU64; HOSTED_IRQ_ARENA_RESULT_CAP],
-    padding: [u8; 3816],
+    marshal: UnsafeCell<[u8; HOSTED_IRQ_ARENA_MARSHAL_BYTES]>,
+    padding: [u8; 1768],
 }
+
+// The page state machine is the synchronization boundary for the shared marshal bytes. Root is the
+// sole writer before publishing a dispatch; the worker may access the bytes only while that exact
+// dispatch token is running, and root cannot reuse the page until completion is acknowledged.
+unsafe impl Sync for HostedIrqSlotPage {}
 
 #[derive(Clone, Copy)]
 struct HostedIrqWireCommand {
@@ -1428,7 +1446,8 @@ impl HostedIrqSlotPage {
             result_status: AtomicI32::new(0),
             result_faulted: AtomicU32::new(0),
             result_values: [const { AtomicU64::new(0) }; HOSTED_IRQ_ARENA_RESULT_CAP],
-            padding: [0; 3816],
+            marshal: UnsafeCell::new([0; HOSTED_IRQ_ARENA_MARSHAL_BYTES]),
+            padding: [0; 1768],
         }
     }
 
@@ -1889,6 +1908,26 @@ impl HostedIrqDispatchPage {
             identity,
             HostedIrqLaneDirection::Dispatch,
         ))
+    }
+
+    /// Return the root alias of this depth's marshal window before the dispatch is published.
+    ///
+    /// The root broker is the single publisher for a lane. It must finish writing this window
+    /// before `root_publish`, and it must not retain or reuse the pointer until the resulting token
+    /// has been completed and acknowledged.
+    pub unsafe fn root_idle_marshal_ptr(
+        &self,
+        control: &HostedIrqArenaControl,
+        identity: HostedIrqLaneIdentity,
+        transaction: HostedIrqTransaction,
+    ) -> Result<*mut u8, HostedIrqArenaError> {
+        self.0
+            .check(control, identity, HostedIrqLaneDirection::Dispatch)?;
+        control.check_transaction(identity, transaction)?;
+        if self.0.state.load(Ordering::Acquire) != SLOT_IDLE {
+            return Err(HostedIrqArenaError::Busy);
+        }
+        Ok((*self.0.marshal.get()).as_mut_ptr())
     }
 
     pub fn root_publish(
@@ -2518,6 +2557,68 @@ mod tests {
         assert_eq!(size_of::<HostedIrqArena>(), HOSTED_IRQ_ARENA_BYTES as usize);
         assert_eq!(core::mem::offset_of!(HostedIrqArena, dispatch), 0x1000);
         assert_eq!(core::mem::offset_of!(HostedIrqArena, service), 0x11_000);
+        let marshal0 = HostedIrqArenaLayout::dispatch_marshal_offset(0).unwrap();
+        let marshal1 = HostedIrqArenaLayout::dispatch_marshal_offset(1).unwrap();
+        assert_eq!(marshal1 - marshal0, PAGE_SIZE);
+        assert_eq!(marshal0 % PAGE_SIZE, 280);
+        assert_eq!(
+            HostedIrqArenaLayout::dispatch_marshal_offset(HOSTED_IRQ_ARENA_DEPTH),
+            None
+        );
+    }
+
+    #[test]
+    fn dispatch_marshal_windows_are_depth_owned_until_acknowledge() {
+        let control = active_control();
+        let page0 = HostedIrqDispatchPage::new(identity());
+        let page1 = HostedIrqDispatchPage::new(identity());
+        let transaction = control
+            .root_begin_transaction(identity(), HostedIrqTransactionClass::Callback)
+            .unwrap();
+        let window0 = unsafe {
+            page0
+                .root_idle_marshal_ptr(&control, identity(), transaction)
+                .unwrap()
+        };
+        let window1 = unsafe {
+            page1
+                .root_idle_marshal_ptr(&control, identity(), transaction)
+                .unwrap()
+        };
+        unsafe {
+            window0.write_bytes(0x5a, HOSTED_IRQ_ARENA_MARSHAL_BYTES);
+            window1.write_bytes(0xa5, HOSTED_IRQ_ARENA_MARSHAL_BYTES);
+        }
+        let token = page0
+            .root_publish(
+                &control,
+                identity(),
+                transaction,
+                0,
+                dispatch(HostedIrqDispatchKind::ProviderCallback),
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { page0.root_idle_marshal_ptr(&control, identity(), transaction) },
+            Err(HostedIrqArenaError::Busy)
+        );
+        assert_eq!(unsafe { window0.read() }, 0x5a);
+        assert_eq!(unsafe { window1.read() }, 0xa5);
+        page0.worker_begin(&control, identity(), token).unwrap();
+        page0
+            .worker_complete(&control, identity(), token, success(0))
+            .unwrap();
+        page0.root_acknowledge(&control, identity(), token).unwrap();
+        assert!(unsafe {
+            page0
+                .root_idle_marshal_ptr(&control, identity(), transaction)
+                .is_ok()
+        });
+        assert_eq!(unsafe { window0.read() }, 0x5a);
+        assert_eq!(unsafe { window1.read() }, 0xa5);
+        control
+            .root_finish_transaction(identity(), transaction)
+            .unwrap();
     }
 
     #[test]
