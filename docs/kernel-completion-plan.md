@@ -23115,6 +23115,81 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     post-reclaim/provider finalization as explicit monotonic phases so a `false` retry result never
     describes an already-partially-deleted process.
 
+## NTFS System-Volume Workstream
+
+The target boot disk is one GPT image with two independently owned volumes. A small FAT32 EFI
+System Partition contains only Simpleboot, `simpleboot.cfg`, the stripped rust-micro kernel ELF,
+and the USTAR bootstrap initrd. A Microsoft Basic Data partition
+(`EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`) contains the NT system volume: `\ReactOS`, our
+`\ReactOS\System32\ntdll.dll`, installed drivers and services, profiles, registry hives, and later
+runtime state. Do not use exFAT for the ESP: UEFI defines the system partition around its FAT
+filesystem contract, and the active Simpleboot creator already formats FAT32. Do not place the
+installed NT tree back on the ESP as a compatibility fallback.
+
+The selected [`ntfs` crate](https://docs.rs/ntfs/latest/ntfs/) is a useful `no_std` NTFS 3.x parser
+over an exact-partition `Read + Seek` source. Version 0.4.0 has no write, cache, compression,
+encryption, journal, quota, reparse-point, or security-descriptor support. It can therefore own the
+first checked read/mount path, but it cannot by itself close the writable Windows system-volume
+contract. Treat the write path as explicit filesystem work and fail unsupported operations with the
+real status until each feature exists; never disguise the existing memory snapshot or ESP writes as
+NTFS.
+
+- [x] Audit the Simpleboot and NTFS boundaries. The pinned Simpleboot creator accepts extra raw
+  partition images through `-p <type-guid> <unique-guid> <image>` and writes matching primary and
+  backup GPT entries. This gives the image builder a direct, reproducible FAT32-ESP plus NTFS-volume
+  route. The current `PERSIST_IMAGE_MIB` zero append is not a partition and must be deleted at
+  cutover. The `ntfs` crate is read-only and must not be presented as a complete NTFS driver.
+- [ ] Add a host-tested `nt-ntfs` crate pinned to the reviewed `ntfs` 0.4.x source. Implement a
+  bounded partition reader over the existing block-provider contract, exact boot-sector/volume-size
+  validation, `$MFT` and `$UpCase` initialization, case-insensitive path traversal, directory
+  enumeration, resident/non-resident unnamed data reads, sparse extents, alternate streams, stable
+  file-reference identity, and precise parser-to-NTSTATUS mapping. Keep block policy and NT object
+  policy outside the parser crate.
+- [ ] Replace the image builder's monolithic ESP staging with two staging products. Build a small
+  FAT32 ESP containing only loader artifacts, build a deterministic NTFS partition image containing
+  the installed ReactOS tree and project ntdll, and pass that image to Simpleboot as a Microsoft
+  Basic Data partition. Give both partitions stable build-manifest GUIDs while allowing deployed
+  media identities to vary. Remove `SYSTEM.DAT`, `IMPORTS.BIN`, `\ReactOS`, `\Profiles`, driver
+  fixtures, and ntdll from ESP staging, and remove the unpartitioned persistence append in the same
+  cutover. The host image tool must verify both GPT copies, partition-array CRCs, alignment, unique
+  GUIDs, filesystem bounds, and an exact installed-tree manifest before QEMU runs.
+- [ ] Enumerate disks and GPT partitions dynamically through the block-device/PnP stack. Publish
+  each valid partition as its own volume device, identify candidates by GPT type plus validated
+  filesystem identity rather than disk number or partition index, and select the boot system volume
+  from an initrd manifest containing its partition GUID and expected NTFS serial. Mount it as an NT
+  volume object, publish `\Device\HarddiskVolume<N>`, and let Mount Manager/device-map policy assign
+  `C:`. Multiple disks and multiple matching data partitions must remain deterministic and isolated.
+- [ ] Stage the minimal NTFS filesystem service in the bootstrap initrd and launch it through an
+  explicit versioned capability manifest. Rootserver retains only block/GPT/capability primitives;
+  filesystem parsing, cache policy, file-object dispatch, and NT compatibility live in the isolated
+  NTFS service/FSD. Once its read path is mounted, load executive personalities, hosted drivers,
+  win32k assets, services, and ntdll from the NTFS system volume instead of incidental ESP names.
+- [ ] Implement the writable NTFS core behind the same `nt-ntfs` contracts before making the volume
+  writable: allocation bitmap and cluster allocation, fixup-protected MFT record mutation, resident
+  and non-resident attribute growth, run-list updates, directory index insertion/removal, file and
+  directory create/delete/rename, timestamps and standard information, security-descriptor storage,
+  reparse data, flush ordering, and mount-time recovery. Add a redo/undo log transaction boundary
+  before exposing writable metadata. A read-only mounted volume is acceptable as an explicit
+  intermediate gate; a RAM overlay, sidecar snapshot, or direct ESP mutation is not an NTFS
+  fallback and must not survive the writable cutover.
+- [ ] Wire Cache Manager, Memory Manager sections, paging I/O, byte-range locks, change notify,
+  oplocks, volume information, file IDs, alternate data streams, and durable hive/profile writes to
+  the NTFS FSD through ordinary IRP/file-object contracts. Add compression, encryption, quotas, and
+  USN-journal behavior only behind their real information classes and on-disk structures; unsupported
+  requests must continue to fail accurately until implemented.
+- [ ] Cut over the production desktop image atomically. Delete FAT installed-tree lookup, ESP-backed
+  checkpoint writes, the memory-snapshot persistence route, and any partition-index or fixed-volume
+  identity machinery that the NTFS path replaces. Acceptance requires cold boot and repeat boot from
+  the NTFS partition, real profile and registry durability, genuine Explorer rendering, clean
+  unmount/recovery tests, malformed-volume tests, multiple-disk enumeration, `295/295` or the then
+  current complete gate, sentinel/QEMU exit, and the external 3,600-second boot deadline.
+
+Review adjustment (2026-09-02): finish the active B3 interrupt arena cutover before beginning the
+storage implementation so the serialized desktop baseline stays attributable. The first NTFS slice
+after B3 is the host-testable bounded reader and deterministic two-partition image builder. Read-only
+NTFS boot is a meaningful intermediate checkpoint, but plan completion requires the real writable
+FSD and deletion of the old ESP/snapshot machinery.
+
 ## Post-Kernel Compatibility Workstream: Wine ntdll Coverage
 
 Wine is retained locally at `references/wine` alongside the ReactOS and NT5 sources. The initial
