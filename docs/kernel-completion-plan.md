@@ -22839,6 +22839,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     accidental indefinite validation run. Next run one serialized desktop acceptance and require the
     full gate, framebuffer proof, sentinel, and runner success before closing this checkpoint.
 
+    Simpleboot/liveness runtime acceptance checkpoint (2026-09-02, accepted): the serialized run
+    `.tmp/run-desktop-simpleboot-bounded-progress-20260902.log` completed through the UEFI/Simpleboot
+    path, mounted the protective MBR/GPT/ESP and checked FAT image, loaded the installed ReactOS
+    service tree, and reached genuine userinit and Explorer execution. Explorer completed 1,036 real
+    user callbacks, five BeginPaint calls, twenty EndPaint calls, 165 direct GDI returns, and 125
+    non-empty-capable batch flushes carrying 172 records. The final framebuffer contained
+    786,432/786,432 non-background pixels with at least 32 colors. After the Explorer runtime
+    milestones sealed the progress epoch, ordinary TCP/IP and completion-port traffic no longer
+    postponed quiescence: the gate ran at 118,544 ms, passed all 295/295 checks, matched the sentinel,
+    and exited QEMU successfully. This closes the interrupt-sidecar cleanup, Simpleboot storage, and
+    boot-liveness acceptance checkpoints under the pinned rust-micro `4abaca8` baseline.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child
