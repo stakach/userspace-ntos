@@ -2793,8 +2793,9 @@ than add ACPI service-name handling.
   `bochsmp.sys`/`framebuf.dll` route for `\Device\Video<N>` publication, DeviceMap metadata, direct
   win32k `EngDeviceIoControl` routing, resource-shaped Bochs VRAM reporting, and
   caller-address-space framebuffer mapping through the hosted `VideoPortMapMemory` path. The old
-  boot-framebuffer-backed Video0 route has been removed; the BOOTBOOT framebuffer remains only as
-  the physical scanout memory granted to the selected miniport and mapped into hosted win32k.
+  boot-framebuffer-backed Video0 route has been removed; the Simpleboot framebuffer handoff remains
+  only as the physical scanout memory granted to the selected miniport and mapped into hosted
+  win32k.
   Loaded GDI/display driver image records also grow in component-visible win32k pool storage, so
   win32k's hosted trampolines never depend on executive-only heap pointers. The current automated
   shell-pixel gate proves this route through Explorer shell chrome. The hosted-driver import
@@ -22859,8 +22860,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and pinless children behind route reconciliation. Do not copy NT5's legacy PCI InterruptLine
     fallback when `_PRT` is absent; this kernel keeps the child unassigned and fails closed.
 
-    B3 generation-owned parent relation checkpoint (2026-09-02, host and freestanding validation
-    green; desktop runtime pending): `nt-pnp-manager` now gives every bus its own monotonic
+    B3 generation-owned parent relation checkpoint (2026-09-02, complete): `nt-pnp-manager` now
+    gives every bus its own monotonic
     `BusRelationIdentity` while retaining the table-wide generation only as prepare/commit
     serialization. Every bus-reported PDO retains the exact parent devnode ID/generation and
     relation generation that published it. Child publication requires that parent generation to be
@@ -22887,17 +22888,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     prepare-to-commit parent stop fencing, unrelated-bus independence, and current-relation resource
     admission. The freestanding executive check is green at the established 215-warning baseline,
     formatting and diff checks are clean, and no old global enumeration-progress symbol remains.
-    Next run the serialized Simpleboot desktop lane and require parent-bound relation publication,
-    genuine PCI route/interrupt service, Explorer framebuffer proof, all gates, and the sentinel.
 
-    Review adjustment: after the rebuilt provider artifact is pinned, run the serialized desktop
-    acceptance with PIT IRQ evidence, provider-initialization `_PIC(1)` success before the first real
-    `_PRT`, Q35 E1000 GSI 23 publication, genuine NIC delivery, Explorer framebuffer proof, and the
-    full gate sentinel. After acceptance, add one generation-owned physical-line authority shared by
-    SCI and hosted PCI publication; invalidation must fence new admissions while retaining physical
-    claims until old connection leases drain. Then complete the private interrupt arena cutover and
-    model wait reply capabilities as move-only lifecycle leases before deleting the request-bank ISR
-    transport.
+    The first serialized run exposed one real ordering edge rather than a reason to restore the
+    global gate: an IRQ-bearing PCI child could observe an empty route owner after ACPI START queued
+    its first BusRelations transaction but before that transaction discovered the initial routing
+    provider. PCI interrupt admission now reports `Pending` while initial provider discovery is
+    owned, while an accepted scope catalog is awaiting a matching inventory/scope route generation,
+    or while a relevant relation has explicitly fenced existing routes. Pinless PCI and platform
+    devnodes remain independent. A completed discovery with no route and a failed reconciliation
+    remain terminal; there is no InterruptLine fallback or synthetic assignment.
+
+    Serialized Simpleboot acceptance `.tmp/run-desktop-route-lifecycle-20260902.log` completed in
+    about two minutes. ACPI START and its initial relation transaction precede E1000 resource
+    admission; E1000 then receives the current firmware route, completes AddDevice/START, and passes
+    real NDIS receive, hardware interrupt, and DPC gates. Explorer reports `begin/end=5/20`, 165
+    direct GDI returns, 125/172 batch flushes/records, and all 786432 pixels non-background with at
+    least 32 colours. The final result is `295/295`, the sentinel matched, and QEMU exited normally.
+
+    Review adjustment: the per-parent relation and per-child route-admission correction is closed.
+    The next B3 ownership target is initial enumeration scheduling: derive which started stacks own
+    BusRelations from dynamic PnP/bus capability and accepted relation state instead of asking every
+    successfully started devnode. Preserve first-provider discovery without service-name, image-name,
+    class-code, or fixed-device checks, then prove multiple independent bus parents and IRQ-bearing
+    children without cross-bus stalls.
 
     Wire this contract to real sibling execution lanes. The executive retains the physical IRQ cap,
     performs deterministic line fanout, and acknowledges/unmasks exactly once after ISR scanning.

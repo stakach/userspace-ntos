@@ -51,6 +51,13 @@ pub(crate) struct HostedPciInterruptRouteAssignment {
     pub(crate) physical: nt_interrupt_authority::PhysicalInterruptClaim,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedPciInterruptRouteAdmission {
+    Current,
+    Pending,
+    Blocked(nt_status::NtStatus),
+}
+
 impl HostedPciInterruptRouteClaim {
     pub(crate) fn resource_assignment(self) -> nt_pnp::PciInterruptAssignment {
         let route = self.claim.route();
@@ -65,6 +72,24 @@ impl HostedPciInterruptRouteClaim {
 }
 
 static mut HOSTED_PCI_TOPOLOGY: Option<HostedPciTopologyAuthority> = None;
+
+fn routing_is_fenced(authority: &HostedPciTopologyAuthority) -> bool {
+    authority
+        .dirty_relations
+        .iter()
+        .any(|dirty| dirty.routing_fenced)
+}
+
+fn routing_reconciliation_pending(authority: &HostedPciTopologyAuthority) -> bool {
+    routing_is_fenced(authority)
+        || (!authority.scopes.sources().is_empty()
+            && (authority.routes.inventory_generation() != Some(authority.inventory.generation())
+                || authority.routes.provider_scope_generation()
+                    != Some(authority.scopes.generation())))
+        || (authority.scopes.sources().is_empty()
+            && authority.routes.inventory_generation().is_none()
+            && !authority.dirty_relations.is_empty())
+}
 
 fn inventory_status(error: PciInventoryError) -> nt_status::NtStatus {
     match error {
@@ -170,7 +195,7 @@ pub(crate) unsafe fn acquire_hosted_pci_interrupt_route(
     let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if !authority.dirty_relations.is_empty() || authority.route_blocked.is_some() {
+    if routing_reconciliation_pending(authority) || authority.route_blocked.is_some() {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     let claim = authority
@@ -202,6 +227,36 @@ pub(crate) unsafe fn acquire_hosted_pci_interrupt_route(
     }))
 }
 
+/// Report whether this exact PCI function may enter interrupt resource arbitration. Initial
+/// provider discovery, a relevant BusRelations refresh, and route-generation reconciliation are
+/// transient ownership (`Pending`); a failed reconciliation or missing current route is terminal.
+/// Pinless functions never depend on PCI interrupt routing.
+pub(crate) unsafe fn hosted_pci_interrupt_route_admission(
+    device: &PciDevice,
+) -> HostedPciInterruptRouteAdmission {
+    if device.irq_pin == 0 {
+        return HostedPciInterruptRouteAdmission::Current;
+    }
+    let Some(authority) = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY)).as_ref() else {
+        return HostedPciInterruptRouteAdmission::Blocked(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        );
+    };
+    if let Some(blocked) = authority.route_blocked {
+        return HostedPciInterruptRouteAdmission::Blocked(blocked.status);
+    }
+    if routing_reconciliation_pending(authority) {
+        return HostedPciInterruptRouteAdmission::Pending;
+    }
+    match acquire_hosted_pci_interrupt_route(device) {
+        Ok(Some(_)) => HostedPciInterruptRouteAdmission::Current,
+        Ok(None) => HostedPciInterruptRouteAdmission::Blocked(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ),
+        Err(status) => HostedPciInterruptRouteAdmission::Blocked(status),
+    }
+}
+
 /// Revalidate a retained route immediately before resource publication and capability minting.
 pub(crate) unsafe fn validate_hosted_pci_interrupt_route(
     retained: HostedPciInterruptRouteClaim,
@@ -209,7 +264,7 @@ pub(crate) unsafe fn validate_hosted_pci_interrupt_route(
     let authority = (*core::ptr::addr_of!(HOSTED_PCI_TOPOLOGY))
         .as_ref()
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if !authority.dirty_relations.is_empty() || authority.route_blocked.is_some() {
+    if routing_reconciliation_pending(authority) || authority.route_blocked.is_some() {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     let route = authority

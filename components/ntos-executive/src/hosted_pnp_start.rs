@@ -341,6 +341,9 @@ impl OwnedHostedPnpStartBatch {
         progress: HostedPnpDevnodeProgress,
     ) -> Option<OwnedHostedPnpStartProgress> {
         match progress {
+            HostedPnpDevnodeProgress::ResourceAdmissionPending => {
+                return Some(OwnedHostedPnpStartProgress::AwaitingCompletion);
+            }
             HostedPnpDevnodeProgress::FilterPending {
                 device_id,
                 irp_id,
@@ -436,7 +439,8 @@ impl OwnedHostedPnpStartBatch {
                 ))
             }
             HostedPnpDevnodeProgress::FilterPending { .. }
-            | HostedPnpDevnodeProgress::FilterOwnershipLost { .. } => unreachable!(),
+            | HostedPnpDevnodeProgress::FilterOwnershipLost { .. }
+            | HostedPnpDevnodeProgress::ResourceAdmissionPending => unreachable!(),
         }
     }
 
@@ -1216,6 +1220,21 @@ impl PreparedHostedResourcePlan {
         };
         release_hosted_pnp_context_lease(lease.into_identity())
     }
+
+    unsafe fn interrupt_route_admission(
+        &self,
+    ) -> crate::hosted_pci_topology::HostedPciInterruptRouteAdmission {
+        match self {
+            Self::Pci { bus_resources, .. } => {
+                crate::hosted_pci_topology::hosted_pci_interrupt_route_admission(
+                    &bus_resources.device,
+                )
+            }
+            Self::Platform { .. } | Self::None => {
+                crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current
+            }
+        }
+    }
 }
 
 unsafe fn release_context_lease_after_error(
@@ -1403,6 +1422,7 @@ where
 }
 
 enum HostedPnpDevnodeProgress {
+    ResourceAdmissionPending,
     Terminal {
         device_id: u64,
         status: nt_status::NtStatus,
@@ -1442,7 +1462,6 @@ where
     H: AsRef<str>,
     C: AsRef<str>,
 {
-    report.attempted += 1;
     let prepared = match prepare_current_hosted_devnode(
         devnode.instance_id,
         devnode.hardware_ids,
@@ -1468,6 +1487,49 @@ where
         pdo_description,
         resource_plan,
     } = prepared;
+    match resource_plan.interrupt_route_admission() {
+        crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Current => {}
+        crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Pending => {
+            return match resource_plan.release_context_lease() {
+                Ok(()) => HostedPnpDevnodeProgress::ResourceAdmissionPending,
+                Err(status) => {
+                    report.attempted += 1;
+                    record_terminal_start_failure(report, status);
+                    print_resource_preparation_failure(
+                        options.trace,
+                        service_name,
+                        devnode.instance_id,
+                        status,
+                    );
+                    HostedPnpDevnodeProgress::Terminal {
+                        device_id: 0,
+                        status,
+                        receipt: None,
+                    }
+                }
+            };
+        }
+        crate::hosted_pci_topology::HostedPciInterruptRouteAdmission::Blocked(status) => {
+            let status = resource_plan
+                .release_context_lease()
+                .err()
+                .unwrap_or(status);
+            report.attempted += 1;
+            record_terminal_start_failure(report, status);
+            print_resource_preparation_failure(
+                options.trace,
+                service_name,
+                devnode.instance_id,
+                status,
+            );
+            return HostedPnpDevnodeProgress::Terminal {
+                device_id: 0,
+                status,
+                receipt: None,
+            };
+        }
+    }
+    report.attempted += 1;
     let bus_pdo = driver_launch::hosted_bus_reported_device_id(devnode.instance_id);
     if let Some(pdo_device_id) = bus_pdo {
         let (raw_boot_resources, resource_requirements) = resource_plan.native_property_blobs();
