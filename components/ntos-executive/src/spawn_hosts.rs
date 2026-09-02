@@ -752,7 +752,7 @@ unsafe fn map_region(pml4: u64, r: &Region, bank: &mut ComponentMapCapBank) {
 /// Spawn an isolated **storage** host: an RO-image component granted ONLY the AHCI BAR + a
 /// DMA frame + a small shared metadata/data run, so it drives the disk entirely from its own VSpace. The
 /// executive (Tier-1 broker) has already enabled Bus Master; the host gets no PCI-config
-/// access. `shared` carries `dma_paddr` in (@0), the verdict + INITRD info out, and the generated
+/// access. `shared` carries `dma_paddr` in (@0), the storage verdict out, and the generated
 /// hive on page 1.
 pub(crate) unsafe fn spawn_storage_host(
     entry: unsafe extern "C" fn(u64) -> !,

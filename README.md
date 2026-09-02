@@ -102,8 +102,8 @@ cd userspace-ntos
 `./run.sh` (at the repo root — distinct from `scripts/run.sh` above) is a
 self-contained launcher that:
 
-1. **Preflight-checks every prerequisite** (QEMU, `mkfs.vfat`/dosfstools,
-   `mmd`/`mcopy`/mtools, `bsdtar`/libarchive, `python3`, the Rust **nightly**
+1. **Preflight-checks every prerequisite** (QEMU, a C compiler, `tar`,
+   `bsdtar`/libarchive, `python3`, the Rust **nightly**
    toolchain + `rust-src`, and OVMF/edk2 UEFI firmware). If anything is missing
    it prints a per-platform `brew install …` / `apt install …` remediation table
    and stops — no cryptic mid-build failure.
@@ -136,7 +136,7 @@ SUCCESS — the ReactOS stack booted and the win32k desktop painted (0x003a6ea5)
 ```
 
 `--desktop` — a QEMU window opens showing the **real painted desktop**: win32k
-authentically fills the BOOTBOOT GOP framebuffer with the ReactOS desktop
+authentically fills the Simpleboot GOP framebuffer with the ReactOS desktop
 background colour `0x003a6ea5` (RGB 58,110,165) via winlogon's natural
 `SwitchDesktop` flow. This is a genuine graphics path (the real ReactOS
 `win32k.sys` + `framebuf.dll` display driver + `ftfd.dll`/Arial font stack), not

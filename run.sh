@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh — one-command launcher for the rust-micro kernel hosting the REAL
-# ReactOS user-space stack: BOOTBOOT -> rust-micro (seL4-style microkernel) ->
+# ReactOS user-space stack: Simpleboot -> rust-micro (seL4-style microkernel) ->
 # smss -> csrss -> winlogon -> win32k -> a PAINTED Windows desktop.
 #
 #   ./run.sh              # headless serial gate; requires the complete Explorer shell proof
@@ -131,13 +131,6 @@ ensure_boot_image_available() {
 # ---- [1/5] preflight dependency check -----------------------------------
 say "[1/5] checking dependencies..."
 
-# macOS: dosfstools' mkfs.vfat installs under sbin, not always on PATH.
-if [ "$(uname)" = "Darwin" ]; then
-  for d in /opt/homebrew/sbin /usr/local/sbin; do
-    case ":$PATH:" in *":$d:"*) ;; *) [ -d "$d" ] && PATH="$d:$PATH" ;; esac
-  done
-fi
-
 IS_MAC=0; [ "$(uname)" = "Darwin" ] && IS_MAC=1
 
 # tool -> "macOS remedy | Debian/Ubuntu remedy"  (assign empty so set -u is happy)
@@ -149,10 +142,9 @@ check_tool() {
   fi
 }
 check_tool qemu-system-x86_64 "brew install qemu"       "apt install qemu-system-x86"
-check_tool mkfs.vfat          "brew install dosfstools" "apt install dosfstools"
-check_tool mmd                "brew install mtools"     "apt install mtools"
-check_tool mcopy              "brew install mtools"     "apt install mtools"
+check_tool cc                 "xcode-select --install"  "apt install build-essential"
 check_tool dd                 "(base system)"           "(coreutils)"
+check_tool tar                "(base system)"           "apt install tar"
 check_tool curl               "brew install curl"       "apt install curl"
 check_tool bsdtar             "brew install libarchive" "apt install libarchive-tools"
 check_tool python3            "brew install python"     "apt install python3"

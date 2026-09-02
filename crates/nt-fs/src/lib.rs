@@ -18,6 +18,7 @@ mod file_backing;
 mod fs;
 mod hive_provider;
 mod notify;
+mod partition;
 mod path;
 mod query;
 mod snapshot_store;
@@ -38,6 +39,7 @@ pub use fs::{
 };
 pub use hive_provider::NtFileHiveIoProvider;
 pub use notify::*;
+pub use partition::*;
 pub use path::{
     is_named_pipe_path, is_under_prefix, normalize_separators, nt_file_relative_path_into,
     nt_path_to_volume_relative, nt_path_to_volume_relative_into, writable_mount_relative,

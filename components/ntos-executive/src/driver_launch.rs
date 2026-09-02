@@ -4597,7 +4597,7 @@ unsafe fn initialize_hosted_loader_block(exec_data_va: u64) {
     write_unaligned((acpi + 0x40) as *mut u64, FSD_DATA_LOADER_ACPI_CONFIG_VA);
     core::ptr::copy_nonoverlapping(b"ACPI BIOS\0".as_ptr(), identifier as *mut u8, 10);
 
-    // BOOTBOOT owns the firmware memory map. Project all of it into the exact variable-length
+    // Simpleboot owns the firmware memory map. Project all of it into the exact variable-length
     // FreeLdr/NT 5.2 resource-list shape; no fabricated empty E820 prefix is accepted here.
     let config_output =
         core::slice::from_raw_parts_mut(config as *mut u8, FSD_DATA_LOADER_CONFIG_CAPACITY);

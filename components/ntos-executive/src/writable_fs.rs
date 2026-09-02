@@ -487,7 +487,7 @@ pub(crate) fn note_profile_file_create(pi: usize, relative: &[u8]) {
 
 struct AhciSnapshotDevice {
     fat: Fat32,
-    start_lba: u32,
+    start_lba: u64,
     sectors: u32,
 }
 
@@ -502,14 +502,12 @@ impl AhciSnapshotDevice {
         })
     }
 
-    fn absolute_lba(&self, lba: u64) -> Result<u32, nt_fs::SnapshotBlockStoreError> {
-        let relative =
-            u32::try_from(lba).map_err(|_| nt_fs::SnapshotBlockStoreError::InvalidGeometry)?;
-        if relative >= self.sectors {
+    fn absolute_lba(&self, lba: u64) -> Result<u64, nt_fs::SnapshotBlockStoreError> {
+        if lba >= u64::from(self.sectors) {
             return Err(nt_fs::SnapshotBlockStoreError::InvalidGeometry);
         }
         self.start_lba
-            .checked_add(relative)
+            .checked_add(lba)
             .ok_or(nt_fs::SnapshotBlockStoreError::InvalidGeometry)
     }
 }
@@ -537,7 +535,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                 self.fat.ahci_vaddr,
                 self.fat.dma_vaddr,
                 self.fat.dma_paddr,
-                absolute as u64,
+                absolute,
             )
         };
         if tfd & 0x89 != 0 {
@@ -588,10 +586,17 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let tfd = unsafe {
-                crate::fs_loader::fat_write_sectors(
-                    &self.fat,
+                core::ptr::copy_nonoverlapping(
+                    data[byte_start..byte_end].as_ptr(),
+                    (self.fat.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
+                    byte_end - byte_start,
+                );
+                ahci_write_sectors(
+                    self.fat.ahci_vaddr,
+                    self.fat.dma_vaddr,
+                    self.fat.dma_paddr,
                     absolute,
-                    &data[byte_start..byte_end],
+                    chunk_sectors as u32,
                 )
             };
             if tfd & 0x89 != 0 {

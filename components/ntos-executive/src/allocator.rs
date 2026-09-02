@@ -43,7 +43,7 @@ pub const HEAP_BASE: usize = 0x0000_0100_2000_0000;
 /// ★ RAISED 2048 -> 4096 (8 MiB -> 16 MiB) after the growable PnP launch/status cleanup produced a
 /// real desktop proof with only about 128 KiB left under the executive bump cap while the measured
 /// root-Untyped pool still had about 59 MiB free. This is a local executive-arena ceiling, not a
-/// BOOTBOOT/initrd or general VM-memory limit.
+/// boot-image or general VM-memory limit.
 /// ★ RAISED 4096 -> 6144 (16 MiB -> 24 MiB) when real boot-hive checkpoints replaced the
 /// journal-only acknowledgement. Retaining the five primary images raised the measured live floor
 /// to 14.24 MiB and left only 861 KiB contiguous, causing Explorer process-parameter construction

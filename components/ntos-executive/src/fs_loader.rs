@@ -133,14 +133,14 @@ unsafe fn system32_cache_entries() -> Option<&'static [System32CacheEntry]> {
 }
 
 /// Read `sector` off the disk (via AHCI) and return a pointer to its 512 bytes.
-pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> *const u8 {
+pub(crate) unsafe fn fat_read_sector(fs: &Fat32, sector: u32) -> Option<*const u8> {
     fat_read_sector_checked(fs, sector)
-        .unwrap_or((fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8)
 }
 
 unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> {
+    let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, sector)?;
     let census_started = fs.census.then(disk_census_ticks);
-    let status = ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64);
+    let status = ahci_read_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba);
     disk_census_record(census_started, 1);
     if status == 0xFF {
         print_str(b"[fat-sector] read timeout sector=");
@@ -152,12 +152,15 @@ unsafe fn fat_read_sector_checked(fs: &Fat32, sector: u32) -> Option<*const u8> 
 }
 
 unsafe fn fat_read_sectors_checked(fs: &Fat32, sector: u32, count: u32) -> Option<*const u8> {
+    let disk_lba = nt_fs::checked_partition_lba(fs.volume_start_lba, sector)?;
+    let last = sector.checked_add(count.checked_sub(1)?)?;
+    nt_fs::checked_partition_lba(fs.volume_start_lba, last)?;
     let census_started = fs.census.then(disk_census_ticks);
     let status = ahci_read_sectors(
         fs.ahci_vaddr,
         fs.dma_vaddr,
         fs.dma_paddr,
-        sector as u64,
+        disk_lba,
         count,
     );
     disk_census_record(census_started, count as u64);
@@ -196,7 +199,10 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
         (fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
         data.len(),
     );
-    ahci_write_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, sector as u64)
+    let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
+        return 0xff;
+    };
+    ahci_write_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba)
 }
 
 #[allow(dead_code)]
@@ -208,6 +214,15 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
     if sectors == 0 || sectors > AHCI_MAX_SECTORS_PER_WRITE {
         return 0xff;
     }
+    let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
+        return 0xff;
+    };
+    let Some(last) = sector.checked_add(sectors - 1) else {
+        return 0xff;
+    };
+    if nt_fs::checked_partition_lba(fs.volume_start_lba, last).is_none() {
+        return 0xff;
+    }
     core::ptr::copy_nonoverlapping(
         data.as_ptr(),
         (fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
@@ -217,7 +232,7 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
         fs.ahci_vaddr,
         fs.dma_vaddr,
         fs.dma_paddr,
-        sector as u64,
+        disk_lba,
         sectors,
     )
 }
@@ -230,11 +245,11 @@ pub(crate) const WRITABLE_SNAPSHOT_RESERVE_SECTORS: u32 = WRITABLE_SNAPSHOT_RESE
 /// Return the raw disk region reserved immediately after the FAT-visible volume, if the BPB
 /// exposes a finite volume size. The image builder appends this reserve outside FAT metadata.
 #[allow(dead_code)]
-pub(crate) fn writable_snapshot_reserve(fs: &Fat32) -> Option<(u32, u32)> {
-    if fs.total_sectors == 0 {
+pub(crate) fn writable_snapshot_reserve(fs: &Fat32) -> Option<(u64, u32)> {
+    if fs.snapshot_start_lba == 0 {
         return None;
     }
-    Some((fs.total_sectors, WRITABLE_SNAPSHOT_RESERVE_SECTORS))
+    Some((fs.snapshot_start_lba, WRITABLE_SNAPSHOT_RESERVE_SECTORS))
 }
 
 /// Return the mounted FAT volume's BPB identity, trimming only the format-time
@@ -261,7 +276,7 @@ pub(crate) unsafe fn fat_volume_size(fs: &Fat32) -> Option<nt_fs::VolumeSizeInfo
             fs.ahci_vaddr,
             fs.dma_vaddr,
             fs.dma_paddr,
-            fs.fs_info_sector as u64,
+            nt_fs::checked_partition_lba(fs.volume_start_lba, fs.fs_info_sector)?,
         ) == 0xff
     {
         return None;
@@ -1629,54 +1644,102 @@ unsafe fn open_sys32_read_result(fs: &Fat32, leaf: &[u8]) -> Result<(u64, u32), 
     open_cluster_read_result(fs, cluster, size)
 }
 
-/// Mount the FAT32 volume bound to the given AHCI/DMA mappings: read sector 0, parse the BPB.
-/// Same BPB layout `storage_probe` parses; factored so both the host and the executive can mount.
-pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
-    if ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0) == 0xFF {
-        print_str(b"[fat-sector] read timeout sector=0\n");
+/// Discover the unique EFI System Partition through the protective MBR and primary GPT,
+/// validate its entry-array CRC, then mount the FAT32 volume inside that partition.
+unsafe fn read_disk_sector_into(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    lba: u64,
+    out: &mut [u8; nt_fs::DISK_SECTOR_BYTES],
+) -> Option<()> {
+    if ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, lba) == 0xff {
+        print_str(b"[fat-mount] read timeout lba=");
+        print_u64(lba);
+        print_str(b"\n");
         return None;
     }
-    let bp = |o: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + o) as *const u8);
-    let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
-    let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
-    let bps = bp16(0x0B);
-    let spc = bp(0x0D) as u32;
-    let reserved = bp16(0x0E);
-    let nfats = bp(0x10) as u32;
-    let total16 = bp16(0x13);
-    let total32 = bp32(0x20);
-    let total_sectors = if total16 != 0 { total16 } else { total32 };
-    let spf32 = bp32(0x24);
-    let root_cl = bp32(0x2C);
-    let fs_info_sector = bp16(0x30);
-    let volume_serial = bp32(0x43);
-    let mut volume_label = [0u8; 11];
-    let mut label_index = 0usize;
-    while label_index < volume_label.len() {
-        volume_label[label_index] = bp(0x47 + label_index as u64);
-        label_index += 1;
+    core::ptr::copy_nonoverlapping(
+        (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
+        out.as_mut_ptr(),
+        out.len(),
+    );
+    Some(())
+}
+
+pub(crate) unsafe fn fat32_mount_with_census(
+    ahci_vaddr: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    census: bool,
+) -> Option<Fat32> {
+    let mut sector = [0u8; nt_fs::DISK_SECTOR_BYTES];
+    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, 0, &mut sector)?;
+    nt_fs::validate_protective_mbr(&sector).ok()?;
+    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, 1, &mut sector)?;
+    let header = nt_fs::parse_gpt_header(&sector, 1).ok()?;
+    let table_bytes = usize::try_from(header.partition_entries_bytes()?).ok()?;
+    let entry_size = header.partition_entry_size as usize;
+    let mut entry = [0u8; nt_fs::DISK_SECTOR_BYTES];
+    let mut entry_used = 0usize;
+    let mut consumed = 0usize;
+    let mut crc = nt_fs::GptCrc32::new();
+    let mut esp = None;
+    while consumed < table_bytes {
+        let lba = header
+            .partition_entries_lba
+            .checked_add((consumed / nt_fs::DISK_SECTOR_BYTES) as u64)?;
+        read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, lba, &mut sector)?;
+        let take = (table_bytes - consumed).min(nt_fs::DISK_SECTOR_BYTES);
+        crc.update(&sector[..take]);
+        for byte in &sector[..take] {
+            entry[entry_used] = *byte;
+            entry_used += 1;
+            if entry_used == entry_size {
+                if let Some(partition) = nt_fs::parse_gpt_partition_entry(&entry[..entry_size], header).ok()? {
+                    if partition.is_efi_system_partition() {
+                        if esp.replace(partition).is_some() {
+                            print_str(b"[fat-mount] ambiguous EFI System Partition\n");
+                            return None;
+                        }
+                    }
+                }
+                entry_used = 0;
+            }
+        }
+        consumed += take;
     }
-    let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
-    if bps == 512 && spc >= 1 && is_fat32 {
-        Some(Fat32 {
-            census: true,
-            ahci_vaddr,
-            dma_vaddr,
-            dma_paddr,
-            scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
-            bps,
-            spc,
-            total_sectors,
-            fs_info_sector,
-            volume_serial,
-            volume_label,
-            fat_start: reserved,
-            data_start: reserved + nfats * spf32,
-            root_cl,
-        })
-    } else {
-        None
+    if entry_used != 0 || crc.finish() != header.partition_entries_crc32 {
+        print_str(b"[fat-mount] invalid GPT entry array\n");
+        return None;
     }
+    let esp = esp?;
+    let partition_sectors = esp.sector_count()?;
+    read_disk_sector_into(ahci_vaddr, dma_vaddr, dma_paddr, esp.first_lba, &mut sector)?;
+    let geometry = nt_fs::Fat32Geometry::parse(&sector, partition_sectors).ok()?;
+    let snapshot_start_lba = header.disk_sectors()?;
+    Some(Fat32 {
+        census,
+        ahci_vaddr,
+        dma_vaddr,
+        dma_paddr,
+        scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
+        volume_start_lba: esp.first_lba,
+        snapshot_start_lba,
+        bps: geometry.bytes_per_sector,
+        spc: geometry.sectors_per_cluster,
+        total_sectors: geometry.total_sectors,
+        fs_info_sector: geometry.fs_info_sector,
+        volume_serial: geometry.volume_serial,
+        volume_label: geometry.volume_label,
+        fat_start: geometry.fat_start_sector,
+        data_start: geometry.data_start_sector,
+        root_cl: geometry.root_cluster,
+    })
+}
+
+pub(crate) unsafe fn fat32_mount(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64) -> Option<Fat32> {
+    fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, true)
 }
 
 /// The executive's on-demand file-buffer POOL: a fresh VA region whose frames are allocated + mapped

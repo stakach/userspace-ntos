@@ -14380,7 +14380,7 @@ pub const FRAMEBUF_LOAD_FRAMES: u64 = 8;
 pub const KEYBOARD_LAYOUT_VA: u64 = 0x0000_0100_08A0_0000;
 pub const KEYBOARD_LAYOUT_LOAD_FRAMES: u64 = 8;
 /// The complete display PCI BAR mapped into win32k's VSpace, RW. The executive video-device
-/// boundary returns an offset in this aperture for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`; BOOTBOOT's
+/// boundary returns an offset in this aperture for `IOCTL_VIDEO_MAP_VIDEO_MEMORY`; the bootloader
 /// framebuffer fields describe the initial scanout geometry only.
 pub const WIN32K_FB_VA: u64 = 0x0000_0100_0900_0000;
 

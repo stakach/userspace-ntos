@@ -1226,8 +1226,7 @@ pub const HPET_VADDR: u64 = 0x0000_0100_105E_0000;
 pub const AHCI_VADDR: u64 = 0x0000_0100_105F_4000;
 pub const AHCI_DMA_VADDR: u64 = 0x0000_0100_105F_5000;
 /// Shared word between the executive (broker) and the isolated storage host: the AHCI's
-/// device address (identity paddr, or a VT-d IOVA once confined) in @0; verdict (u32) @8,
-/// INITRD cluster @0x10, size @0x14 out.
+/// device address (identity paddr, or a VT-d IOVA once confined) in @0 and verdict (u32) @8.
 pub const STORAGE_SHARED_VADDR: u64 = 0x0000_0100_1044_0000;
 pub const STORAGE_SHARED_FRAMES: u64 = 8;
 pub const STORAGE_HIVE_IMAGE_OFFSET: u64 = 0x1000;
@@ -28427,12 +28426,12 @@ pub(crate) static WINLOGON_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 /// GDI client too.
 pub(crate) static USERINIT_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EXPLORER_GDI_MAPPED: AtomicU64 = AtomicU64::new(0);
-/// Complete PCI memory-BAR authority containing the BOOTBOOT scanout. Phase 0 retypes this BAR once;
+/// Complete PCI memory-BAR authority containing the bootloader GOP scanout. Phase 0 retypes this BAR once;
 /// win32k and the hosted video miniport receive aliases of this same cap run.
 static FB_BAR_FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 static FB_BAR_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static FB_BAR_PADDR: AtomicU64 = AtomicU64::new(0);
-/// Byte offset of BOOTBOOT's scanout view from `FB_BAR_PADDR`.
+/// Byte offset of the bootloader scanout view from `FB_BAR_PADDR`.
 static FB_SCANOUT_BAR_OFFSET: AtomicU64 = AtomicU64::new(0);
 static FB_WIDTH: AtomicU64 = AtomicU64::new(0);
 static FB_HEIGHT: AtomicU64 = AtomicU64::new(0);
@@ -29407,6 +29406,8 @@ struct Fat32 {
     dma_vaddr: u64,
     dma_paddr: u64,
     scratch_vaddr: u64,
+    volume_start_lba: u64,
+    snapshot_start_lba: u64,
     bps: u32,           // bytes per sector
     spc: u32,           // sectors per cluster
     total_sectors: u32, // FAT-visible sector count from the BPB
@@ -30233,7 +30234,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         );
     }
 
-    // --- Phase 0a: BOOTBOOT publishes scanout geometry only. Physical authority is the unique
+    // --- Phase 0a: Simpleboot publishes scanout geometry only. Physical authority is the unique
     // PCI BAR device untyped containing that scanout. Retype and map the complete BAR once so later
     // mode changes and hosted grants cannot outrun a partial boot-mode cap set.
     {
@@ -30243,7 +30244,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         let fb_scan = bi.fb_scanline as u64;
         let fb_size = bi.fb_size as u64;
         let fb_type = bi.fb_type;
-        print_str(b"[ntos-exec] Phase 0a: BOOTBOOT framebuffer paddr=0x");
+        print_str(b"[ntos-exec] Phase 0a: Simpleboot framebuffer paddr=0x");
         print_hex((fb_paddr >> 32) as u32);
         print_hex(fb_paddr as u32);
         print_str(b" ");
@@ -31032,19 +31033,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0xAC) as *const u32) as u64,
                 Ordering::Relaxed,
             );
-            let cluster = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x10) as *const u32);
-            let size = core::ptr::read_volatile((STORAGE_SHARED_VADDR + 0x14) as *const u32);
             print_str(b"[ntos-exec] isolated storage host reported verdict=0x");
             print_hex(verdict);
-            print_str(b" INITRD cluster=");
-            print_u64(cluster as u64);
-            print_str(b" size=");
-            print_u64(size as u64);
             print_str(b"\n");
             // The host reached the disk through granted caps only, and EVERY AHCI DMA went
-            // through VT-d (IOVA -> frame). Verdict bits: 1=MBR, 2=FAT32, 4=root, 8=file.
+            // through VT-d (IOVA -> frame). Verdict bits: 1=protective MBR, 2=GPT/FAT32,
+            // 4=Simpleboot root artifacts, 8=initrd.tar.
             check(b"exec_storage_host_reported", verdict != 0, &mut passed);
-            check(b"exec_storage_host_mbr", (verdict & 1) != 0, &mut passed);
+            check(b"exec_storage_host_gpt", (verdict & 1) != 0, &mut passed);
             check(b"exec_storage_host_fat32", (verdict & 2) != 0, &mut passed);
             check(
                 b"exec_storage_host_root_dir",
@@ -31052,7 +31048,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 &mut passed,
             );
             check(
-                b"exec_storage_host_confined_read_file",
+                b"exec_storage_host_initrd_tar",
                 (verdict & 8) != 0,
                 &mut passed,
             );

@@ -1,13 +1,13 @@
 //! An isolated **storage** driver host (P2). A separate VSpace/CSpace granted ONLY the AHCI
 //! BAR + a DMA frame + a shared word by the executive (Tier-1 broker). It brings up the AHCI
-//! controller and reads real sectors + a real file (BOOTBOOT/INITRD) off the boot disk
+//! controller, validates GPT, and reads real files from the Simpleboot EFI System Partition
 //! entirely from isolation — a fault or rogue DMA is contained here, not in the executive.
 //! The executive already enabled PCI Bus Master; this host has no PCI-config access.
 //!
 //! Cap layout (all in this host's own VSpace):
 //!   * `AHCI_VADDR`           — the AHCI ABAR MMIO (granted BAR frame)
 //!   * `AHCI_DMA_VADDR`       — the DMA frame (command list + FIS + command table + data)
-//!   * `STORAGE_SHARED_VADDR` — dma_paddr in @0; verdict @8, INITRD cluster @0x10, size @0x14 out,
+//!   * `STORAGE_SHARED_VADDR` — dma_paddr in @0; verdict @8,
 //!     import table at page-0 offset, generated hive at page-1 offset
 
 use crate::*;
@@ -26,14 +26,12 @@ pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
     print_hex(dma_paddr as u32);
     print_str(b")\n");
 
-    // The entire storage stack — AHCI bring-up, sector-0 MBR read, FAT32 parse, root-dir
-    // listing, BOOTBOOT/INITRD read, and the SYSTEM.DAT registry hive read — runs here in the
+    // The entire storage stack — AHCI bring-up, GPT validation, ESP/FAT32 mount, root-dir
+    // listing, initrd.tar proof, and the SYSTEM.DAT registry hive read — runs here in the
     // isolated host's VSpace. The generated hive uses page 1 of the shared run so it cannot
     // overlap the page-0 metadata or IMPORTS.BIN table.
     let (
         verdict,
-        cluster,
-        size,
         hive_size,
         smss_size,
         imports_size,
@@ -60,8 +58,6 @@ pub unsafe extern "C" fn storage_host_entry(heap_frames: u64) -> ! {
     );
 
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 8) as *mut u32, verdict);
-    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x10) as *mut u32, cluster);
-    core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x14) as *mut u32, size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x18) as *mut u32, hive_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x20) as *mut u32, smss_size);
     core::ptr::write_volatile((STORAGE_SHARED_VADDR + 0x24) as *mut u32, imports_size);

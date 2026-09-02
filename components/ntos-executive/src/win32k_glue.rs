@@ -5426,7 +5426,7 @@ fn system32_driver_path(driver_leaf: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 unsafe fn map_display_bar_into_win32k(host_pml4: u64) {
-    // Map the full Phase-0 display BAR cap run into win32k. BOOTBOOT's framebuffer fields describe
+    // Map the full Phase-0 display BAR cap run into win32k. The bootloader framebuffer fields describe
     // only the current scanout view inside this aperture.
     let base = FB_BAR_FRAME_BASE.load(Ordering::Relaxed);
     let count = FB_BAR_FRAME_COUNT.load(Ordering::Relaxed);

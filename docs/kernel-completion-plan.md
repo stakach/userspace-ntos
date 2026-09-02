@@ -9213,6 +9213,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     BOOTBOOT-size/build-mode coupling and the follow-on top-level gate drift; keep moving toward an
     explicit manifest for the remaining NT personality artifacts rather than growing the
     BOOTBOOT-visible payload.
+
+    Simpleboot migration checkpoint (2026-09-02, desktop acceptance pending): rust-micro
+    `b8e5d418f0e5752323fbccfa4e4d74163ca4401a` replaces BOOTBOOT with a Simpleboot GPT/FAT32
+    image. The microkernel is now an ELF on the ESP and the rootserver remains a separate USTAR
+    initrd module; the image defaults to 256 MiB plus a 16 MiB persistence reserve, so the former
+    BOOTBOOT 16 MiB kernel-file ceiling is no longer part of the active boot contract. The parent
+    launcher now checks the Simpleboot image creator's real prerequisites instead of obsolete
+    dosfstools/mtools commands. This migration resolves the immediate loader-size coupling, but it
+    does not close the ownership goal: executive services, hosted drivers, win32k assets, and ntdll
+    still need an explicit versioned manifest and capability handoff rather than incidental ESP
+    filenames. The first serialized boots identified and closed three migration defects rather than
+    weakening the boot gates: read-only ReactOS files are now overlaid atomically during image
+    staging; the microkernel reads and validates the ACPI-declared PC RTC instead of publishing no
+    wall clock; and the Simpleboot framebuffer tag now returns its parsed value and rejects unknown
+    pixel layouts rather than silently selecting a format.
+
+    Storage is now partition-aware as well. The host-tested `nt-fs` GPT/BPB parser validates the
+    protective MBR, primary-header CRC, complete partition-entry-array CRC, unique EFI System
+    Partition, partition bounds, and contained FAT32 geometry. Both the isolated storage host and
+    the executive use one mount routine, every FAT-relative I/O is translated through the ESP base,
+    disk failures propagate instead of returning stale DMA contents, and writable checkpoints begin
+    after the backup GPT rather than inside the ESP. The obsolete `BOOTBOOT/INITRD` metadata side
+    channel and flat-root executable fallbacks are removed; active gates prove `kernel`,
+    `simpleboot.cfg`, and `initrd.tar` at the ESP root. Focused validation is green: `nt-fs` GPT/BPB
+    tests 6/6, `bootstrap-clock` tests 6/6, and the freestanding executive check. Pin and push the
+    repaired submodule revision, then require a fresh serialized `./run.sh --desktop` gate under the
+    3,600-second cap before accepting the migration.
   - `[x]` LSASS readiness visibility slice: `.tmp/run-desktop-lsa-readiness-dump-20260817.log`
     showed that the real LSASS/profile/userinit path can move past the previous readiness wall:
     `exec_lsass_signals_lsa_rpc_active`, `exec_winlogon_user_shell_activated`, and
@@ -22762,6 +22789,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     asserts the readiness status follows the complete child output; all 8 wrapper tests pass. Re-run
     the full desktop lane and require an uncorrupted `295/295` summary plus a successful runner exit
     before marking the sidecar cleanup complete.
+
+    The post-fix BOOTBOOT-era retry `.tmp/run-desktop-irq-sidecar-final-20260902.log` did not reach
+    the gate: after roughly five minutes it stopped at a root-thread user page fault with no fault
+    handler and produced no further output. It was terminated after the stall rather than left as a
+    long-running QEMU instance. The newly pulled Simpleboot rust-micro release changes the complete
+    boot and rootserver-delivery path, so that incomplete retry cannot accept or reject the new
+    baseline. Rebuild the image from the pinned Simpleboot revision and repeat the 3,600-second
+    serialized desktop acceptance; any repeatable fault is a microkernel/boot regression to repair,
+    not a reason to weaken the executive gate.
 
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent

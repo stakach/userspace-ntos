@@ -5,10 +5,9 @@
 use crate::*;
 
 /// The whole P2 storage stack, callable from an isolated host: bring up AHCI port 0, read
-/// sector 0 (MBR), parse the FAT32 volume, list the root directory, read BOOTBOOT/INITRD, and
-/// read the registry hive `SYSTEM.DAT` into `hive_dest`. Returns (verdict, initrd_cluster,
-/// initrd_size, hive_size). Verdict bits: 1 = port present + MBR (0xAA55), 2 = FAT32 BPB ok,
-/// 4 = root lists EFI+BOOTBOOT, 8 = INITRD read, 0x10 = SYSTEM.DAT read. READ ONLY. AHCI BAR
+/// validate GPT, mount the EFI System Partition, list its root, read `initrd.tar`, and
+/// read the registry hive `SYSTEM.DAT` into `hive_dest`. Verdict bits: 1 = port present + protective MBR, 2 = GPT/FAT32 mount,
+/// 4 = Simpleboot root artifacts, 8 = initrd.tar read, 0x10 = SYSTEM.DAT read. READ ONLY. AHCI BAR
 /// @ `ahci_vaddr`, DMA @ `dma_vaddr` (device addr `dma_paddr`) — all in the caller's VSpace.
 pub(crate) unsafe fn storage_probe(
     ahci_vaddr: u64,
@@ -26,88 +25,37 @@ pub(crate) unsafe fn storage_probe(
     nls20127_dest: u64,
     win32kbuf_dest: u64,
     winlogonbuf_dest: u64,
-) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
+) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
     let mut verdict = 0u32;
     let (mut nls_ansi_size, mut nls_oem_size, mut nls_case_size) = (0u32, 0u32, 0u32);
     // Port 0 present? PxSSTS DET [11:8] != 0.
     let ssts = core::ptr::read_volatile((ahci_vaddr + 0x100 + 0x28) as *const u32);
     let det = (ssts >> 8) & 0xF;
-    // Read sector 0 (the MBR / VBR) via a real READ DMA EXT.
+    // Read sector 0 via a real READ DMA EXT and validate the protective MBR.
     let tfd = ahci_read_sector(ahci_vaddr, dma_vaddr, dma_paddr, 0);
-    let db = |i: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + i) as *const u8);
-    let sig = (db(510) as u16) | ((db(511) as u16) << 8);
+    let mbr = core::slice::from_raw_parts(
+        (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *const u8,
+        nt_fs::DISK_SECTOR_BYTES,
+    );
+    let protective_mbr = nt_fs::validate_protective_mbr(mbr).is_ok();
     print_str(b"[storage-host] AHCI DET=");
     print_u64(det as u64);
     print_str(b" TFD=0x");
     print_hex(tfd);
-    print_str(b" sig=0x");
-    print_hex(sig as u32);
+    print_str(b" protective-mbr=");
+    print_u64(protective_mbr as u64);
     print_str(b"\n");
-    if det != 0 && (tfd & 0x89) == 0 && sig == 0xAA55 {
+    if det != 0 && (tfd & 0x89) == 0 && protective_mbr {
         verdict |= 1;
     }
-    // Parse the BPB (sector 0 is still in the buffer).
-    let bp = |o: u64| core::ptr::read_volatile((dma_vaddr + 0x800 + o) as *const u8);
-    let bp16 = |o: u64| (bp(o) as u32) | ((bp(o + 1) as u32) << 8);
-    let bp32 = |o: u64| bp16(o) | (bp16(o + 2) << 16);
-    let bps = bp16(0x0B);
-    let spc = bp(0x0D) as u32;
-    let reserved = bp16(0x0E);
-    let nfats = bp(0x10) as u32;
-    let total16 = bp16(0x13);
-    let total32 = bp32(0x20);
-    let total_sectors = if total16 != 0 { total16 } else { total32 };
-    let spf32 = bp32(0x24);
-    let root_cl = bp32(0x2C);
-    let fs_info_sector = bp16(0x30);
-    let volume_serial = bp32(0x43);
-    let mut volume_label = [0u8; 11];
-    let mut label_index = 0usize;
-    while label_index < volume_label.len() {
-        volume_label[label_index] = bp(0x47 + label_index as u64);
-        label_index += 1;
-    }
-    let is_fat32 = bp(0x52) == b'F' && bp(0x53) == b'A' && bp(0x54) == b'T';
-    print_str(b"[storage-host] FAT32 bps=");
-    print_u64(bps as u64);
-    print_str(b" spc=");
-    print_u64(spc as u64);
-    print_str(b" reserved=");
-    print_u64(reserved as u64);
-    print_str(b" nfats=");
-    print_u64(nfats as u64);
-    print_str(b" spf=");
-    print_u64(spf32 as u64);
-    print_str(b" total=");
-    print_u64(total_sectors as u64);
-    print_str(b"\n");
-    let (mut cluster, mut size, mut hive_size, mut smss_size, mut imports_size, mut ntdll_size) =
-        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
-    if bps == 512 && spc >= 1 && is_fat32 {
+    let (mut hive_size, mut smss_size, mut imports_size, mut ntdll_size) =
+        (0u32, 0u32, 0u32, 0u32);
+    if let Some(fs) = fat32_mount_with_census(ahci_vaddr, dma_vaddr, dma_paddr, false) {
         verdict |= 2;
-        let fs = Fat32 {
-            // The storage host's image is mapped read-only — the census statics are unwritable
-            // here, and a write would fault with no handler.
-            census: false,
-            ahci_vaddr,
-            dma_vaddr,
-            dma_paddr,
-            scratch_vaddr: dma_vaddr + FAT32_SCRATCH_OFFSET,
-            bps,
-            spc,
-            total_sectors,
-            fs_info_sector,
-            volume_serial,
-            volume_label,
-            fat_start: reserved,
-            data_start: reserved + nfats * spf32,
-            root_cl,
-        };
         // P7-A: source every ReactOS binary BY PATH from the real \reactos\system32 tree (LFN-aware
         // fat_open_path), NOT from the flat root ::NAME files. Each read tries the real path first
-        // and falls back to the flat 8.3 name so the boot stays green during the migration; the
-        // hit/miss counters below prove whether the WHOLE stack came from the FS (miss==0 =>
-        // verdict 0x200). `open_or_sys32!`/`open_or_path!` return dir_find's (cluster,size,attr).
+        // without accepting obsolete flat-root aliases. The counters below prove the whole stack
+        // came from the installed tree. These macros return dir_find's (cluster,size,attr) shape.
         let mut fs_hits = 0u32; // files resolved BY PATH from \reactos\...
         let mut fs_miss = 0u32; // files that fell back to the flat ::NAME
         macro_rules! open_or_sys32 {
@@ -117,13 +65,7 @@ pub(crate) unsafe fn storage_probe(
                         fs_hits += 1;
                         Some((c, s, 0u8))
                     }
-                    None => {
-                        let r = dir_find(&fs, fs.root_cl, $short);
-                        if r.is_some() {
-                            fs_miss += 1;
-                        }
-                        r
-                    }
+                    None => { fs_miss += 1; None }
                 }
             }};
         }
@@ -134,46 +76,41 @@ pub(crate) unsafe fn storage_probe(
                         fs_hits += 1;
                         Some((c, s, 0u8))
                     }
-                    None => {
-                        let r = dir_find(&fs, fs.root_cl, $short);
-                        if r.is_some() {
-                            fs_miss += 1;
-                        }
-                        r
-                    }
+                    None => { fs_miss += 1; None }
                 }
             }};
         }
         // List the root directory (a real directory read).
         print_str(b"[storage-host] root dir:");
-        let rp = fat_read_sector(&fs, fat_cluster_sector(&fs, fs.root_cl));
-        for e in 0..(fs.bps as usize / 32) {
-            let ent = rp.add(e * 32);
-            if *ent == 0x00 {
-                break;
-            }
-            let attr = *ent.add(0x0B);
-            if *ent == 0xE5 || attr == 0x0F || (attr & 0x08) != 0 {
-                continue;
-            }
-            debug_put_char(b' ');
-            for i in 0..11 {
-                let c = *ent.add(i);
-                if c != b' ' {
-                    debug_put_char(c);
+        if let Some(rp) = fat_read_sector(&fs, fat_cluster_sector(&fs, fs.root_cl)) {
+            for e in 0..(fs.bps as usize / 32) {
+                let ent = rp.add(e * 32);
+                if *ent == 0x00 {
+                    break;
+                }
+                let attr = *ent.add(0x0B);
+                if *ent == 0xE5 || attr == 0x0F || (attr & 0x08) != 0 {
+                    continue;
+                }
+                debug_put_char(b' ');
+                for i in 0..11 {
+                    let c = *ent.add(i);
+                    if c != b' ' {
+                        debug_put_char(c);
+                    }
                 }
             }
         }
         print_str(b"\n");
         let have_efi = dir_find(&fs, fs.root_cl, b"EFI        ").is_some();
-        let bootboot = dir_find(&fs, fs.root_cl, b"BOOTBOOT   ");
-        if have_efi && bootboot.is_some() {
+        let have_kernel = fat_open_path_uncached(&fs, b"kernel").is_some();
+        let have_config = fat_open_path_uncached(&fs, b"simpleboot.cfg").is_some();
+        if have_efi && have_kernel && have_config {
             verdict |= 4;
         }
-        // Navigate BOOTBOOT/ → INITRD, then read the file's first cluster.
-        if let Some((bb_cl, _, _)) = bootboot {
-            if let Some((initrd_cl, initrd_size, _)) = dir_find(&fs, bb_cl, b"INITRD     ") {
-                let fp = fat_read_sector(&fs, fat_cluster_sector(&fs, initrd_cl));
+        // Prove the USTAR rootserver archive is a real, non-empty file on the ESP.
+        if let Some((initrd_cl, initrd_size)) = fat_open_path_uncached(&fs, b"initrd.tar") {
+            if let Some(fp) = fat_read_sector(&fs, fat_cluster_sector(&fs, initrd_cl)) {
                 let mut nz = false;
                 for i in 0..512usize {
                     if *fp.add(i) != 0 {
@@ -181,7 +118,7 @@ pub(crate) unsafe fn storage_probe(
                         break;
                     }
                 }
-                print_str(b"[storage-host] BOOTBOOT/INITRD cluster=");
+                print_str(b"[storage-host] initrd.tar cluster=");
                 print_u64(initrd_cl as u64);
                 print_str(b" size=");
                 print_u64(initrd_size as u64);
@@ -189,8 +126,6 @@ pub(crate) unsafe fn storage_probe(
                 print_hex(core::ptr::read_unaligned(fp as *const u32));
                 print_hex(core::ptr::read_unaligned(fp.add(4) as *const u32));
                 print_str(b"\n");
-                cluster = initrd_cl;
-                size = initrd_size;
                 if initrd_size > 0 && nz {
                     verdict |= 8;
                 }
@@ -285,7 +220,7 @@ pub(crate) unsafe fn storage_probe(
         // The Win32 client stack (kernel32/user32/gdi32) + winsrv's transitive import closure
         // (rpcrt4/msvcrt/advapi32/ws2_32 + the vista forwarders + ws2help) — staged into the WIN32BUF
         // (its own 8 MiB region), sizes reported at STORAGE_SHARED +0x4c..+0x70.
-        for (leaf, short, off, shoff, cap) in [
+        for (leaf, _short, off, shoff, cap) in [
             (
                 b"kernel32.dll".as_slice(),
                 b"KERNEL32DLL",
@@ -379,7 +314,7 @@ pub(crate) unsafe fn storage_probe(
                 WIN32BUF_FRAMES * 0x1000 - MPR_WIN32BUF_OFFSET,
             ),
         ] {
-            if let Some((c, sz, _)) = open_or_sys32!(leaf, short) {
+            if let Some((c, sz, _)) = open_or_sys32!(leaf, _short) {
                 if sz > 0 && (sz as u64) <= cap {
                     let got = fat_read_file(&fs, c, sz, win32buf_dest + off);
                     if got == sz {
@@ -436,7 +371,7 @@ pub(crate) unsafe fn storage_probe(
             }
         }
         // NLS code-page tables — c_1252 (ANSI), c_437 (OEM), l_intl (Unicode case).
-        for (leaf, short, dest, frames, out) in [
+        for (leaf, _short, dest, frames, out) in [
             (
                 b"c_1252.nls".as_slice(),
                 b"C_1252  NLS",
@@ -459,7 +394,7 @@ pub(crate) unsafe fn storage_probe(
                 &mut nls_case_size,
             ),
         ] {
-            if let Some((c, sz, _)) = open_or_sys32!(leaf, short) {
+            if let Some((c, sz, _)) = open_or_sys32!(leaf, _short) {
                 let cap = (frames * 0x1000) as u32;
                 let want = if sz < cap { sz } else { cap };
                 let got = fat_read_file(&fs, c, want, dest);
@@ -636,8 +571,6 @@ pub(crate) unsafe fn storage_probe(
     }
     (
         verdict,
-        cluster,
-        size,
         hive_size,
         smss_size,
         imports_size,
