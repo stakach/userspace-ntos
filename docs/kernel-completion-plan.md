@@ -22656,6 +22656,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     leases drain. Both SCI and hosted PCI resource publication must consult this catalog, after which
     the temporary cross-table vector snapshot can be removed.
 
+    B3 physical interrupt-line authority contract checkpoint (2026-09-02, host validation green;
+    executive cutover in progress): the new focused `nt-interrupt-authority` crate owns physical
+    route arbitration without importing PnP policy, driver pointers, resource descriptors, or seL4
+    capabilities. It keeps route-source owner generation, physical-line generation, and connection
+    lease identity distinct. Fallible prepare/commit publication is allocation-complete before
+    mutation; compatible claims on one GSI reuse its line and vector, different GSIs cannot alias a
+    vector, and duplicate routes in one publication collapse to one owner claim. Fencing rejects new
+    leases while existing exact leases continue to resolve and hold the line/vector until release.
+    Exclusive replacement remains blocked behind an old lease, shared owners retain independent
+    leases, and stale prepared mutations cannot commit after a connection-lifetime change.
+
+    `cargo test -p nt-interrupt-authority` passes 10/10, including SCI vector 9 followed by dynamic
+    PCI GSI 23 allocation, compatible PCI reuse of SCI GSI/vector 9, electrical-policy conflict,
+    cross-GSI vector collision, batch-GSI collapse, fence/drain, shared and exclusive leases, empty
+    replacement, and stale-transaction rejection. Review adjustment: keep `nt-resource-manager` as
+    the per-devnode assignment and `IoConnectInterrupt` grant authority, keep
+    `nt-kernel-exec::InterruptLineRundown` as delivery state, and use this neutral catalog to join the
+    two lifetimes. Next wire exact claims into platform PnP contexts and PCI route publications,
+    acquire a catalog lease before `connect_interrupt_exact`, release it only after rundown and cap
+    teardown, then delete the vector snapshot and duplicate executive collision fields/checks.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child

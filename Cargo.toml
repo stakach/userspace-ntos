@@ -33,6 +33,7 @@ members = [
     "crates/nt-driver-abi",
     "crates/nt-driver-host",
     "crates/nt-kernel-exec",
+    "crates/nt-interrupt-authority",
     "crates/nt-hal-abi",
     "crates/nt-cm-resources",
     "crates/nt-acpi",
@@ -143,6 +144,7 @@ nt-compat-exports = { path = "crates/nt-compat-exports" }
 nt-driver-abi = { path = "crates/nt-driver-abi" }
 nt-driver-host = { path = "crates/nt-driver-host" }
 nt-kernel-exec = { path = "crates/nt-kernel-exec" }
+nt-interrupt-authority = { path = "crates/nt-interrupt-authority" }
 nt-hal-abi = { path = "crates/nt-hal-abi" }
 nt-cm-resources = { path = "crates/nt-cm-resources" }
 nt-acpi = { path = "crates/nt-acpi" }

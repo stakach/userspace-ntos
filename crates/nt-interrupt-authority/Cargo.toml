@@ -1,0 +1,11 @@
+[package]
+name = "nt-interrupt-authority"
+description = "Generation-owned physical interrupt-line arbitration, publication, and connection leases. no_std + alloc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
