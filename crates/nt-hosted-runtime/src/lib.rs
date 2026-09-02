@@ -7,6 +7,7 @@
 #![no_std]
 
 mod hosted_irq_arena;
+mod hosted_irq_call_stack;
 mod progress_deferral;
 
 pub use hosted_irq_arena::{
@@ -19,6 +20,10 @@ pub use hosted_irq_arena::{
     HOSTED_IRQ_ARENA_ARGUMENT_CAP, HOSTED_IRQ_ARENA_BYTES, HOSTED_IRQ_ARENA_DEPTH,
     HOSTED_IRQ_ARENA_MAGIC, HOSTED_IRQ_ARENA_PAGE_COUNT, HOSTED_IRQ_ARENA_RESULT_CAP,
     HOSTED_IRQ_ARENA_VERSION,
+};
+pub use hosted_irq_call_stack::{
+    validate_hosted_irq_call_pop, validate_hosted_irq_call_push, HostedIrqCallFrame,
+    HostedIrqCallStackError,
 };
 pub use progress_deferral::ProgressDeferralBudget;
 

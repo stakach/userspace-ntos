@@ -37,6 +37,7 @@ struct HostedIrqActiveLane {
 
 struct HostedIrqRootSession {
     lanes: Vec<HostedIrqActiveLane>,
+    call_frames: Vec<nt_hosted_runtime::HostedIrqCallFrame>,
     outer_lock: InterruptActualLockLease,
     service_locks: Vec<InterruptActualLockLease>,
 }
@@ -271,6 +272,55 @@ impl HostedIrqRootSession {
             .get(lane_index)
             .map(|state| state.lane)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
+    }
+
+    fn push_call_frame(
+        &mut self,
+        source_lane_index: usize,
+        service: nt_hosted_runtime::HostedIrqArenaToken,
+        target_lane_index: usize,
+        dispatch: nt_hosted_runtime::HostedIrqArenaToken,
+    ) -> Result<nt_hosted_runtime::HostedIrqCallFrame, nt_status::NtStatus> {
+        let source = self.lane(source_lane_index)?;
+        let target = self.lane(target_lane_index)?;
+        if self.lanes[source_lane_index].parked_services.last() != Some(&service) {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+        let frame = nt_hosted_runtime::HostedIrqCallFrame {
+            source: source.identity,
+            service,
+            target: target.identity,
+            dispatch,
+        };
+        nt_hosted_runtime::validate_hosted_irq_call_push(&self.call_frames, frame)
+            .map_err(|_| nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK))?;
+        if let Some(parent) = self
+            .call_frames
+            .iter()
+            .rev()
+            .find(|candidate| candidate.source == target.identity)
+        {
+            if self.lanes[target_lane_index].parked_services.last() != Some(&parent.service) {
+                return Err(nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK));
+            }
+        } else if dispatch.depth != 0 {
+            return Err(nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK));
+        }
+        self.call_frames
+            .try_reserve(1)
+            .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
+        self.call_frames.push(frame);
+        Ok(frame)
+    }
+
+    fn pop_call_frame(
+        &mut self,
+        frame: nt_hosted_runtime::HostedIrqCallFrame,
+    ) -> Result<(), nt_status::NtStatus> {
+        nt_hosted_runtime::validate_hosted_irq_call_pop(&self.call_frames, frame)
+            .map_err(|_| nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK))?;
+        self.call_frames.pop();
+        Ok(())
     }
 
     unsafe fn record_fault(
@@ -750,6 +800,7 @@ pub(super) unsafe fn dispatch_interrupt(
     });
     let mut session = HostedIrqRootSession {
         lanes,
+        call_frames: Vec::new(),
         outer_lock,
         service_locks: Vec::new(),
     };

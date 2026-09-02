@@ -23228,6 +23228,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-hosted-runtime` passes 103/103 tests and the freestanding executive remains green at the
     established 213-warning baseline.
 
+    B3 cross-lane call-stack checkpoint (2026-09-03, host and freestanding green; recursive
+    execution open): `nt-hosted-runtime` now validates cross-lane call frames independently of the
+    executive. A new target must begin at depth zero, the next source must be the current leaf lane,
+    an active reverse-callback target must match an exact parked ancestor transaction at depth+1,
+    and unwind must pop the exact top frame. The root session owns this global stack beside its
+    per-lane parked Service stacks and additionally proves the ancestor Service is still parked
+    before accepting a reverse dispatch. Focused runtime validation passes 107/107 tests and the
+    freestanding executive check remains green at the established 213-warning baseline. Provider
+    services still return `STATUS_NOT_SUPPORTED` until target-lane publication and lease retention
+    are wired through this stack.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
