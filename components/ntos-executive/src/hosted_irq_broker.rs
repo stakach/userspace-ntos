@@ -279,7 +279,8 @@ unsafe fn provider_callback_authority(
     if record.provider_domain.domain_id.raw() != source_lane.identity.domain_id
         || record.provider_domain.cookie != source_lane.identity.domain_cookie
         || dependency.provider_lane_generation != source_lane.identity.lane_generation
-        || command.grant != dependency.provider_grant
+        || (command.grant != dependency.provider_grant
+            && !lane_has_connection_grant(source_lane, command.grant))
         || command.target_domain_id != record.dependent_domain.domain_id.raw()
         || command.target_domain_cookie != record.dependent_domain.cookie
         || command.authority_cookie != record.provider_publication_cookie
@@ -765,6 +766,47 @@ impl HostedIrqRootSession {
         if result.reply_cap != lane.channel.reply_cap
             || result.message == crate::spawn_hosts::HostedIrqExchangeMessage::Wall
         {
+            print_str(b"[hosted-irq-arena-fault] domain=");
+            print_u64(lane.identity.domain_id);
+            print_str(b" cookie=");
+            print_u64(lane.identity.domain_cookie);
+            print_str(b" lane-generation=");
+            print_u64(lane.identity.lane_generation);
+            print_str(b" wall-label=");
+            print_u64(result.wall_label);
+            match lane.arena().control.first_fault(lane.identity) {
+                Ok(Some(fault)) => {
+                    print_str(b" kind=");
+                    print_u64(fault.kind as u32 as u64);
+                    print_str(b" code=");
+                    print_u64(fault.code);
+                    print_str(b" transaction=");
+                    print_u64(fault.transaction);
+                    print_str(b" sequence=");
+                    print_u64(fault.sequence);
+                    print_str(b" depth=");
+                    print_u64(fault.depth as u64);
+                    print_str(b" direction=");
+                    print_u64(fault.direction as u32 as u64);
+                    print_str(b" ip=0x");
+                    print_hex64(fault.instruction_pointer);
+                    print_str(b" address=0x");
+                    print_hex64(fault.address);
+                    print_str(b" parameters=0x");
+                    for (index, parameter) in fault.parameters.into_iter().enumerate() {
+                        if index != 0 {
+                            print_str(b",");
+                        }
+                        print_hex64(parameter);
+                    }
+                }
+                Ok(None) => print_str(b" first-fault=none"),
+                Err(error) => {
+                    print_str(b" first-fault-read-error=");
+                    print_u64(error as u32 as u64);
+                }
+            }
+            print_str(b"\n");
             self.record_fault(
                 lane_index,
                 reply,

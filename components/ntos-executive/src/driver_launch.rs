@@ -3352,6 +3352,9 @@ fn component_to_exec_va_for_instance(
             inst.exec_arg_va,
         )
     })
+    .or_else(|| unsafe {
+        hosted_irq_lane_component_to_exec_va(instance, component_va, bytes)
+    })
 }
 
 pub(crate) unsafe fn hosted_component_stack_qword(
@@ -12344,6 +12347,40 @@ fn hosted_worker_component_to_exec_va(
             0x1000,
             runtime.exec_scratch_va,
         )
+    })
+}
+
+unsafe fn hosted_irq_lane_component_to_exec_va(
+    instance: usize,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    let lane = hosted_irq_lanes()?.iter().find(|lane| {
+        lane.projection_instance == instance
+            && lane.state == HostedIrqLaneState::Ready
+            && lane.stack.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
+    })?;
+    let component_base = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT)?;
+    let exec_base = lane.exec_arena_va.checked_sub(FSD_IRQ_LANE_ARENA_OFFSET)?;
+    translate_component_range(
+        component_va,
+        bytes,
+        component_base,
+        FSD_WORKER_STACK_FRAMES * 0x1000,
+        exec_base,
+    )
+    .or_else(|| {
+        (lane.kpcr.mapped && lane.kpcr.exec_mapped)
+            .then(|| {
+                translate_component_range(
+                    component_va,
+                    bytes,
+                    component_base + FSD_WORKER_SCRATCH_OFFSET,
+                    0x1000,
+                    exec_base + FSD_WORKER_SCRATCH_OFFSET,
+                )
+            })
+            .flatten()
     })
 }
 
