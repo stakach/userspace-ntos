@@ -23083,8 +23083,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `nt-hosted-runtime` tests, 230/230 `nt-kernel-exec` tests, and the freestanding executive check
     at the established 213-warning baseline.
 
+    B3 provider arena-command checkpoint (2026-09-02, implementation green; two-arena broker and
+    atomic cutover open): arena ABI v3 gives every Service command a distinct `authority_cookie`
+    without growing its page. Provider import and reverse-callback requests now require that
+    nonzero authority plus exactly twelve Win64 arguments; lock and DPC services require the field
+    to remain zero. Malformed provider commands fail before page state changes. Callable-provider
+    descriptors and generated import/callback thunks now retain the exact target domain id and
+    generation cookie in addition to the provider publication or callback authority. Both thunks
+    remain within the existing 64-byte executable slot and indirect through inline immutable
+    metadata instead of consuming argument registers.
+
+    The import and reverse-callback gates now detect private-lane context before touching any shared
+    field, capture all four register plus eight stack arguments directly into the depth-owned arena
+    command, and issue the typed `ProviderImport` or `ProviderCallbackRequest` Service. A lane-side
+    rejection is a protocol fault and never enters the ordinary shared-bank path. The ordinary path
+    remains temporarily reachable only because live IRQ selection still uses it before the atomic
+    cutover. Focused `nt-hosted-runtime` validation passes 101/101 and the freestanding executive
+    check is green at the established 213-warning baseline.
+
+    Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
+    single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
+    dependency lease and drive a provider-domain arena while that Service stays open. A provider
+    `ProviderCallbackRequest` then parks the provider lane while root publishes a depth+1 callback
+    into the dependent arena. Both arenas inherit the original Interrupt or Dpc transaction class,
+    maintain separate exact tokens and lane generations, and unwind in strict cross-lane LIFO order.
+    Callable provider dependencies must retain both lanes even when a domain has no direct hardware
+    interrupt connection. An active target lane without the matching parked provider Service is a
+    fatal nesting/deadlock condition, not a reason to use the ordinary component pump.
+
     Next adapt the existing provider marshal/callback authorities to arena-owned
-    arguments and nested dispatch without the shared request banks. When all three Service families
+    arguments and implement that recursive two-arena root driver without the shared request banks.
+    Split the current provider export/callback services into explicit-argument marshal cores, retain
+    the generation-owned dependency and callback records across the parked graph, and publish the
+    exact target-domain lane grant on every cross-domain dispatch. When all three Service families
     are green, select the root driver for live ISR/DPC/provider execution and delete
     `FSD_DISPATCH_INTERRUPT`, the shared DPC ring, provider shared-bank nesting, and ordinary-bank
     busy deferral in one commit series before serialized desktop acceptance.

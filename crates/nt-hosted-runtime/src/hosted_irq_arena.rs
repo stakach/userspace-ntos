@@ -47,7 +47,7 @@ impl HostedIrqLaneIdentity {
 }
 
 pub const HOSTED_IRQ_ARENA_MAGIC: u64 = 0x4849_5251_4152_454e;
-pub const HOSTED_IRQ_ARENA_VERSION: u16 = 2;
+pub const HOSTED_IRQ_ARENA_VERSION: u16 = 3;
 pub const HOSTED_IRQ_ARENA_DEPTH: usize = 16;
 pub const HOSTED_IRQ_ARENA_ARGUMENT_CAP: usize = 12;
 pub const HOSTED_IRQ_ARENA_RESULT_CAP: usize = 4;
@@ -427,6 +427,7 @@ pub struct HostedIrqServiceCommand {
     pub service_id: u64,
     pub target_domain_id: u64,
     pub target_domain_cookie: u64,
+    pub authority_cookie: u64,
     pub grant: HostedIrqGrantIdentity,
     pub argument_count: u8,
     pub arguments: [u64; HOSTED_IRQ_ARENA_ARGUMENT_CAP],
@@ -441,15 +442,20 @@ impl HostedIrqServiceCommand {
             && self.argument_count as usize <= HOSTED_IRQ_ARENA_ARGUMENT_CAP;
         common
             && match self.kind {
-                HostedIrqServiceKind::AcquireActualLock => self.argument_count == 0,
+                HostedIrqServiceKind::AcquireActualLock => {
+                    self.authority_cookie == 0 && self.argument_count == 0
+                }
                 HostedIrqServiceKind::ReleaseActualLock => {
-                    self.argument_count == 1 && self.arguments[0] != 0
+                    self.authority_cookie == 0 && self.argument_count == 1 && self.arguments[0] != 0
                 }
                 HostedIrqServiceKind::QueueDpc => {
-                    self.argument_count == 4 && self.arguments[0] != 0
+                    self.authority_cookie == 0 && self.argument_count == 4 && self.arguments[0] != 0
                 }
                 HostedIrqServiceKind::ProviderImport
-                | HostedIrqServiceKind::ProviderCallbackRequest => true,
+                | HostedIrqServiceKind::ProviderCallbackRequest => {
+                    self.authority_cookie != 0
+                        && self.argument_count as usize == HOSTED_IRQ_ARENA_ARGUMENT_CAP
+                }
             }
     }
 }
@@ -1702,6 +1708,7 @@ impl HostedIrqSlotPage {
                     service_id: wire.operation,
                     target_domain_id: wire.target0,
                     target_domain_cookie: wire.target1,
+                    authority_cookie: wire.context,
                     grant: wire.grant,
                     argument_count: wire.argument_count as u8,
                     arguments: wire.arguments,
@@ -2032,7 +2039,7 @@ impl HostedIrqServicePage {
                 operation: command.service_id,
                 target0: command.target_domain_id,
                 target1: command.target_domain_cookie,
-                context: 0,
+                context: command.authority_cookie,
                 irql: 0,
                 grant: command.grant,
                 arguments: command.arguments,
@@ -2057,6 +2064,7 @@ impl HostedIrqServicePage {
             service_id: wire.operation,
             target_domain_id: wire.target0,
             target_domain_cookie: wire.target1,
+            authority_cookie: wire.context,
             grant: wire.grant,
             argument_count: wire.argument_count as u8,
             arguments: wire.arguments,
@@ -2253,6 +2261,7 @@ mod tests {
 
         let mut acquire = service();
         acquire.kind = HostedIrqServiceKind::AcquireActualLock;
+        acquire.authority_cookie = 0;
         acquire.argument_count = 0;
         assert!(acquire.valid());
         acquire.argument_count = 1;
@@ -2260,6 +2269,7 @@ mod tests {
 
         let mut release = service();
         release.kind = HostedIrqServiceKind::ReleaseActualLock;
+        release.authority_cookie = 0;
         release.argument_count = 1;
         assert!(release.valid());
         release.arguments[0] = 0;
@@ -2267,6 +2277,7 @@ mod tests {
 
         let mut queue_dpc = service();
         queue_dpc.kind = HostedIrqServiceKind::QueueDpc;
+        queue_dpc.authority_cookie = 0;
         queue_dpc.argument_count = 4;
         assert!(queue_dpc.valid());
         queue_dpc.arguments[0] = 0;
@@ -2274,6 +2285,17 @@ mod tests {
         queue_dpc.arguments[0] = 43;
         queue_dpc.argument_count = 3;
         assert!(!queue_dpc.valid());
+
+        let mut provider = service();
+        assert!(provider.valid());
+        provider.authority_cookie = 0;
+        assert!(!provider.valid());
+        provider.authority_cookie = 43;
+        provider.argument_count = (HOSTED_IRQ_ARENA_ARGUMENT_CAP - 1) as u8;
+        assert!(!provider.valid());
+        provider.kind = HostedIrqServiceKind::ProviderCallbackRequest;
+        provider.argument_count = HOSTED_IRQ_ARENA_ARGUMENT_CAP as u8;
+        assert!(provider.valid());
     }
 
     fn service() -> HostedIrqServiceCommand {
@@ -2282,9 +2304,10 @@ mod tests {
             service_id: 31,
             target_domain_id: 37,
             target_domain_cookie: 41,
+            authority_cookie: 43,
             grant: grant(),
-            argument_count: 2,
-            arguments: [43, 47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            argument_count: HOSTED_IRQ_ARENA_ARGUMENT_CAP as u8,
+            arguments: [47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101],
         }
     }
 

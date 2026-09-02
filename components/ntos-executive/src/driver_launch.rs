@@ -12947,6 +12947,7 @@ extern "win64" fn s_ke_insert_queue_dpc(dpc: u64, arg1: u64, arg2: u64) -> u8 {
                 service_id: dpc,
                 target_domain_id: identity.domain_id,
                 target_domain_cookie: identity.domain_cookie,
+                authority_cookie: 0,
                 grant,
                 argument_count: 4,
                 arguments,
@@ -13074,6 +13075,7 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
                 service_id: actual_lock,
                 target_domain_id: identity.domain_id,
                 target_domain_cookie: identity.domain_cookie,
+                authority_cookie: 0,
                 grant,
                 argument_count: 0,
                 arguments: [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP],
@@ -13095,6 +13097,7 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
                 service_id: actual_lock,
                 target_domain_id: identity.domain_id,
                 target_domain_cookie: identity.domain_cookie,
+                authority_cookie: 0,
                 grant,
                 argument_count: 1,
                 arguments: release_arguments,
@@ -17855,8 +17858,14 @@ fn print_hosted_provider_domain_error(error: HostedProviderDomainError) {
         }
         HostedProviderDomainError::ImageExceedsFrames => print_str(b"image-exceeds-frames"),
         HostedProviderDomainError::EmptyPoolFrames => print_str(b"empty-pool-frames"),
+        HostedProviderDomainError::EmptyProviderDomainId => {
+            print_str(b"empty-provider-domain-id")
+        }
         HostedProviderDomainError::EmptyProviderDomainCookie => {
             print_str(b"empty-provider-domain-cookie")
+        }
+        HostedProviderDomainError::EmptyProviderPublicationCookie => {
+            print_str(b"empty-provider-publication-cookie")
         }
     }
 }
@@ -17879,6 +17888,7 @@ fn print_hosted_provider_import_binding_error(error: HostedProviderImportBinding
 
 fn print_hosted_provider_import_thunk_error(error: HostedProviderImportThunkError) {
     match error {
+        HostedProviderImportThunkError::InvalidAuthority => print_str(b"thunk-invalid-authority"),
         HostedProviderImportThunkError::Overflow => print_str(b"thunk-overflow"),
         HostedProviderImportThunkError::ThunkOutsideTable => print_str(b"thunk-table-exhausted"),
         HostedProviderImportThunkError::OutputTooSmall => print_str(b"thunk-output-too-small"),
@@ -17895,6 +17905,8 @@ fn hosted_provider_domain_descriptor(
         pool_base: singleton.pool_base,
         pool_frames: singleton.pool_frames,
         export_call_gate: singleton.export_call_gate,
+        provider_domain_id: singleton.owner_domain.domain_id.raw(),
+        provider_domain_cookie: singleton.owner_domain.cookie,
         provider_publication_cookie: singleton.provider_publication_cookie,
     }
 }
@@ -18470,7 +18482,7 @@ unsafe fn register_hosted_provider_callback_record(
     callback_kind: u8,
     thunk_token: HostedThunkSlotToken,
     thunk_key: HostedThunkSlotKey,
-) -> Option<(usize, u64)> {
+) -> Option<(usize, HostedProviderCallbackRecord)> {
     let dependency =
         hosted_provider_domain_dependency_for_pair(provider_instance, dependent_instance)?;
     let dependent_inst = instance(dependent_instance)?;
@@ -18515,7 +18527,7 @@ unsafe fn register_hosted_provider_callback_record(
     } else {
         records[index] = record;
     }
-    Some((index, cookie))
+    Some((index, record))
 }
 
 unsafe fn finish_hosted_provider_callback_record(
@@ -25251,7 +25263,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
             Err(STATUS_DEVICE_NOT_READY)
         };
     }
-    let Some((record_index, callback_cookie)) = register_hosted_provider_callback_record(
+    let Some((record_index, record)) = register_hosted_provider_callback_record(
         provider_instance,
         dependent_instance,
         target,
@@ -25263,6 +25275,7 @@ unsafe fn provider_marshal_emit_callback_thunk(
         abort_instance_executable_thunk(provider_instance, reservation);
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     };
+    let callback_cookie = record.callback_cookie;
     let thunk = HostedProviderCallbackThunkPlan {
         thunk_va: reservation.run_va,
         thunk_offset: reservation
@@ -25270,6 +25283,9 @@ unsafe fn provider_marshal_emit_callback_thunk(
             .saturating_mul(HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN),
         callback_gate: hosted_provider_callback_gate_va(),
         callback_cookie,
+        provider_publication_cookie: record.provider_publication_cookie,
+        target_domain_id: record.dependent_domain.domain_id.raw(),
+        target_domain_cookie: record.dependent_domain.cookie,
     };
     let slot = core::slice::from_raw_parts_mut(
         reservation.exec_va as *mut u8,
@@ -32825,19 +32841,22 @@ core::arch::global_asm!(
     ".globl hosted_provider_export_gate",
     "hosted_provider_export_gate:",
     // Entry from a generated provider-import thunk:
-    //   rax = provider export RVA, r10 = provider-domain cookie
+    //   rax = provider export RVA, r10 = publication cookie
+    //   r11 -> { provider domain id, provider domain cookie, gate VA }
     //   rcx/rdx/r8/r9 + caller stack = original Win64 export arguments.
-    "mov r11, rsp",
-    "sub rsp, 0x48",
-    "mov [rsp + 0x20], r8",
-    "mov [rsp + 0x28], r9",
-    "mov [rsp + 0x30], r11",
-    "mov r8, rcx",
-    "mov r9, rdx",
+    "sub rsp, 0x58",
+    "mov [rsp + 0x20], rcx",
+    "mov [rsp + 0x28], rdx",
+    "mov [rsp + 0x30], r8",
+    "mov [rsp + 0x38], r9",
+    "lea rdx, [rsp + 0x58]",
+    "mov [rsp + 0x40], rdx",
     "mov rcx, rax",
     "mov rdx, r10",
+    "mov r8, [r11]",
+    "mov r9, [r11 + 8]",
     "call s_hosted_provider_export_gate_body",
-    "add rsp, 0x48",
+    "add rsp, 0x58",
     "ret",
 );
 
@@ -32855,18 +32874,22 @@ core::arch::global_asm!(
     ".globl hosted_provider_callback_gate",
     "hosted_provider_callback_gate:",
     // Entry from a generated provider reverse-callback thunk:
-    //   rax = provider callback cookie
+    //   rax = callback cookie, r10 = provider publication cookie
+    //   r11 -> { dependent domain id, dependent domain cookie, gate VA }
     //   rcx/rdx/r8/r9 + caller stack = original Win64 callback arguments.
-    "mov r11, rsp",
-    "sub rsp, 0x48",
-    "mov [rsp + 0x20], r9",
-    "mov [rsp + 0x28], r11",
-    "mov r9, r8",
-    "mov r8, rdx",
-    "mov rdx, rcx",
+    "sub rsp, 0x58",
+    "mov [rsp + 0x20], rcx",
+    "mov [rsp + 0x28], rdx",
+    "mov [rsp + 0x30], r8",
+    "mov [rsp + 0x38], r9",
+    "lea rdx, [rsp + 0x58]",
+    "mov [rsp + 0x40], rdx",
     "mov rcx, rax",
+    "mov rdx, r10",
+    "mov r8, [r11]",
+    "mov r9, [r11 + 8]",
     "call s_hosted_provider_callback_gate_body",
-    "add rsp, 0x48",
+    "add rsp, 0x58",
     "ret",
 );
 
@@ -32879,10 +32902,29 @@ fn hosted_provider_callback_gate_va() -> u64 {
     hosted_provider_callback_gate as *const () as usize as u64
 }
 
+unsafe fn capture_hosted_provider_arguments(
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    caller_rsp: u64,
+) -> [u64; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP] {
+    let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+    arguments[..4].copy_from_slice(&[arg0, arg1, arg2, arg3]);
+    let mut index = 0usize;
+    while index < SH_PROVIDER_EXPORT_STACK_QWORDS as usize {
+        arguments[4 + index] = read_volatile((caller_rsp + 0x28 + index as u64 * 8) as *const u64);
+        index += 1;
+    }
+    arguments
+}
+
 #[no_mangle]
 extern "win64" fn s_hosted_provider_export_gate_body(
     provider_export_rva: u64,
     provider_publication_cookie: u64,
+    provider_domain_id: u64,
+    provider_domain_cookie: u64,
     arg0: u64,
     arg1: u64,
     arg2: u64,
@@ -32890,6 +32932,32 @@ extern "win64" fn s_hosted_provider_export_gate_body(
     caller_rsp: u64,
 ) -> u64 {
     unsafe {
+        let arguments = capture_hosted_provider_arguments(arg0, arg1, arg2, arg3, caller_rsp);
+        if let Some((_, _, _, _, grant)) = hosted_irq_lane_context() {
+            if provider_domain_id == 0
+                || provider_domain_cookie == 0
+                || provider_publication_cookie == 0
+            {
+                hosted_irq_lane_protocol_fault(provider_export_rva);
+            }
+            let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::ProviderImport,
+                service_id: provider_export_rva,
+                target_domain_id: provider_domain_id,
+                target_domain_cookie: provider_domain_cookie,
+                authority_cookie: provider_publication_cookie,
+                grant,
+                argument_count: nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP as u8,
+                arguments,
+            });
+            if result.faulted
+                || result.status != STATUS_SUCCESS
+                || result.value_count != 1
+            {
+                hosted_irq_lane_protocol_fault(provider_export_rva);
+            }
+            return result.values[0];
+        }
         write_volatile(
             (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_ARG2) as *mut u64,
             arg2,
@@ -32930,6 +32998,9 @@ extern "win64" fn s_hosted_provider_export_gate_body(
 #[no_mangle]
 extern "win64" fn s_hosted_provider_callback_gate_body(
     callback_cookie: u64,
+    provider_publication_cookie: u64,
+    target_domain_id: u64,
+    target_domain_cookie: u64,
     arg0: u64,
     arg1: u64,
     arg2: u64,
@@ -32937,6 +33008,32 @@ extern "win64" fn s_hosted_provider_callback_gate_body(
     caller_rsp: u64,
 ) -> u64 {
     unsafe {
+        let arguments = capture_hosted_provider_arguments(arg0, arg1, arg2, arg3, caller_rsp);
+        if let Some((_, _, _, _, grant)) = hosted_irq_lane_context() {
+            if target_domain_id == 0
+                || target_domain_cookie == 0
+                || provider_publication_cookie == 0
+            {
+                hosted_irq_lane_protocol_fault(callback_cookie);
+            }
+            let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+                kind: nt_hosted_runtime::HostedIrqServiceKind::ProviderCallbackRequest,
+                service_id: callback_cookie,
+                target_domain_id,
+                target_domain_cookie,
+                authority_cookie: provider_publication_cookie,
+                grant,
+                argument_count: nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP as u8,
+                arguments,
+            });
+            if result.faulted
+                || result.status != STATUS_SUCCESS
+                || result.value_count != 1
+            {
+                hosted_irq_lane_protocol_fault(callback_cookie);
+            }
+            return result.values[0];
+        }
         write_volatile(
             (FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_ARG2) as *mut u64,
             arg2,
