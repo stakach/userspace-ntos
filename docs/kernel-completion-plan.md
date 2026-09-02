@@ -22884,6 +22884,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and exited QEMU successfully. This closes the interrupt-sidecar cleanup, Simpleboot storage, and
     boot-liveness acceptance checkpoints under the pinned rust-micro `4abaca8` baseline.
 
+    Microkernel PR #2 baseline checkpoint (2026-09-03, accepted): the parent now pins rust-micro
+    `c8093b7`, the merge of `feature/arm64-support`. Although the release adds the AArch64 boot and
+    architecture port, it also changes shared capability, endpoint, fault, invocation, scheduler,
+    rootserver, Simpleboot, and SMP code. A serialized default x86_64 build completed successfully,
+    followed by the complete QEMU kernel-spec suite. All architecture, ABI, capability, CSpace,
+    Untyped, scheduler, syscall, fault-delivery, endpoint, notification, IRQ, vspace, boot, initrd,
+    ELF, rootserver, integration, MCS, and SMP checks reported success. After `All specs passed!`,
+    the demonstration rootserver intentionally continued its `BH` scheduler output instead of
+    exiting through the verdict device; QEMU was stopped manually rather than left until the
+    3,600-second ceiling. This is a harness-exit issue after the successful verdict, not a failed
+    microkernel check. The default image builder still stages the complete ReactOS tree into a
+    254 MiB ESP and appends an unpartitioned 16 MiB snapshot reserve, both of which remain scheduled
+    for deletion in the NTFS system-volume cutover below.
+
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
     relation identity to each enumerated child, require its parent to remain Started through child
