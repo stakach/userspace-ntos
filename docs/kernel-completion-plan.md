@@ -22705,8 +22705,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Explorer framebuffer proof, and the full sentinel before removing the now-redundant semantic
     fields and collision decisions from the hardware-cap sidecar.
 
-    B3 physical interrupt-line runtime checkpoint (2026-09-02, mechanism green; revised timer proof
-    pending): serialized run `.tmp/run-desktop-physical-irq-20260902-101051.log` reached genuine
+    B3 physical interrupt-line runtime checkpoint (2026-09-02, accepted): the first serialized run
+    `.tmp/run-desktop-physical-irq-20260902-101051.log` reached genuine
     Explorer chrome and the sentinel. ACPI connected SCI GSI/vector 9, E1000 received firmware GSI
     23 with distinct translated vector 5, `IoConnectInterrupt` accepted both exact grants, the
     hardware line serviced real deliveries, and the NDIS receive, hardware ISR, and DPC gates all
@@ -22720,9 +22720,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the elapsed-time ceiling with direct one-shot evidence. The executive now counts each successful
     PIT channel-0 program, records scans that intentionally leave an idle one-shot stopped, and
     requires deliveries not to exceed successful programs plus one bounded setup residual. The
-    freestanding executive check remains green at 214 warnings. Re-run the serialized desktop lane
-    under the 3,600-second cap and require this direct proof plus all 295 gates before accepting the
-    physical authority cutover and deleting duplicate `HostedIrqLine` route semantics.
+    freestanding executive check remains green at 214 warnings. The serialized acceptance rerun
+    `.tmp/run-desktop-physical-irq-proof-20260902.log` passed all 295 gates and exited QEMU on the
+    sentinel under the 3,600-second cap. It recorded 3,729 deliveries backed by 5,943 successful
+    one-shot programs, one idle disarm observation, six unproductive wakes, and zero ACK failures.
+    ACPI SCI and E1000 kept distinct vectors, the real E1000 ISR/DPC/NDIS receive path passed, and
+    Explorer filled all 786,432 framebuffer pixels with at least 32 non-background colors. This
+    accepts the physical authority cutover. Next delete duplicate `HostedIrqLine` route semantics
+    and collision decisions while retaining only cap/event/delivery mechanism state.
 
     Reference review also found a broader PnP-model correction to retain after this acceptance run:
     NT5 orders this per devnode, not as one global enumeration barrier. Add a generation-owned parent
