@@ -6,8 +6,6 @@
 
 use super::*;
 
-const STATUS_POSSIBLE_DEADLOCK: i32 = 0xC000_0194u32 as i32;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum HostedIrqRootDispatchOutcome {
     Completed(nt_hosted_runtime::HostedIrqArenaResult),

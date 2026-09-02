@@ -23266,6 +23266,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     path, so the next checkpoint must perform one atomic cutover and remove the superseded shared
     ISR/DPC/provider nesting machinery rather than retain it as a fallback.
 
+    B3 physical-ISR arena cutover checkpoint (2026-09-03, freestanding green; desktop
+    acceptance and DPC cutover open): physical interrupt fanout now dispatches every retained
+    connection through the typed root arena and validates the exact worker completion before
+    recording the diagnostic delivery result. The component-side `FSD_DISPATCH_INTERRUPT` major,
+    its shared request-bank argument transport, and request-bank busy probing have been deleted.
+    Arena or actual-lock contention may defer a line only before the first ISR has executed; a
+    busy result after a partial shared-line scan is quarantined as a deadlock rather than replaying
+    already-run handlers. Resource projection refresh remains diagnostic state and is restored
+    around the arena dispatch, not used as call transport. `cargo fmt --all` and the freestanding
+    executive check remain green at the established 213-warning baseline. The root-owned KDPC
+    registry still needs a canonical drain path before the shared DPC ring can be deleted, so live
+    desktop acceptance follows this checkpoint and DPC cutover remains the next B3 implementation.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

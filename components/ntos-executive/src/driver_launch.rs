@@ -697,7 +697,6 @@ pub const FSD_IRQ_LANE_FAULT_LABEL: u64 = 0x787;
 pub const FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL: u64 = 0x788;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
-pub const FSD_DISPATCH_INTERRUPT: u64 = u64::MAX - 0x773;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
 pub const FSD_DISPATCH_VIDEO_INITIALIZE: u64 = u64::MAX - 0x776;
 pub const FSD_DISPATCH_VIDEO_START_IO: u64 = u64::MAX - 0x777;
@@ -4493,6 +4492,7 @@ const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const STATUS_INVALID_PARAMETER_MIX: i32 = 0xC000_0030u32 as i32;
 const STATUS_INVALID_DEVICE_REQUEST: i32 = 0xC000_0010u32 as i32;
+const STATUS_POSSIBLE_DEADLOCK: i32 = 0xC000_0194u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035u32 as i32;
@@ -32902,47 +32902,6 @@ unsafe fn fsd_dispatch_inner(req: &crate::spawn_hosts::DispatchReq) -> (i32, u64
         f(request_drv);
         return (0, 0);
     }
-    if major == FSD_DISPATCH_INTERRUPT {
-        let interrupt_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
-        let vector = read_volatile((FSD_SHARED_VADDR + SH_REQ_MINOR) as *const u64);
-        let expected_id =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ID) as *const u64);
-        let expected_vector =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_VECTOR) as *const u32);
-        let interrupt_object =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_OBJECT) as *const u64);
-        let service_routine =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ROUTINE) as *const u64);
-        let service_context =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_CONTEXT) as *const u64);
-        if interrupt_id == 0
-            || interrupt_id != expected_id
-            || expected_vector == 0
-            || vector != expected_vector as u64
-            || interrupt_object == 0
-            || service_routine == 0
-        {
-            return (0xC000_0010u32 as i32, 0); // STATUS_INVALID_DEVICE_REQUEST
-        }
-        let isr: extern "win64" fn(u64, u64) -> u8 =
-            core::mem::transmute(service_routine as *const ());
-        let claimed = isr(interrupt_object, service_context);
-        let deliveries =
-            read_volatile((FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
-            vector,
-        );
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
-            (claimed != 0) as u64,
-        );
-        write_volatile(
-            (FSD_SHARED_VADDR + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
-            deliveries.saturating_add(1),
-        );
-        return (0, (claimed != 0) as u64);
-    }
     if major == FSD_DISPATCH_CANCEL_IRP {
         let canonical_irp_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_CONTROL_ID) as *const u64);
         return if cancel_pending_irp(canonical_irp_id) {
@@ -47560,9 +47519,14 @@ unsafe fn hosted_irq_projection_matches(connection: HostedIrqConnection) -> bool
             == connection.route.tokens.floating_save
 }
 
+enum HostedIrqConnectionDispatchOutcome {
+    Completed(bool),
+    DeferredBusy,
+}
+
 unsafe fn dispatch_hosted_irq_connection(
     connection: HostedIrqConnection,
-) -> Result<bool, nt_status::NtStatus> {
+) -> Result<HostedIrqConnectionDispatchOutcome, nt_status::NtStatus> {
     if !hosted_irq_connection_active(connection) && !connection.rundown.has_delivery_lease() {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
@@ -47613,25 +47577,38 @@ unsafe fn dispatch_hosted_irq_connection(
     if !lane_live {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
-    let mut output = [];
-    let (status, information, _) = dispatch_irp_for_instance(
-        binding.instance,
-        FSD_DISPATCH_INTERRUPT,
-        route.tokens.vector as u64,
-        binding.device_object,
-        0,
-        0,
-        0,
-        route.tokens.interrupt_id,
-        0,
-        None,
-        &[],
-        &mut output,
-    )
-    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-    nt_status::NtStatus(status).to_result()?;
+    let outcome = hosted_irq_broker::dispatch_interrupt(connection);
     refresh_hosted_device_resource_state(binding, sh);
-    Ok(information != 0)
+    match outcome? {
+        hosted_irq_broker::HostedIrqRootDispatchOutcome::Completed(result) => {
+            if result.faulted || result.status != STATUS_SUCCESS || result.value_count != 1 {
+                return Err(if result.status == STATUS_SUCCESS {
+                    nt_status::NtStatus::INVALID_DEVICE_REQUEST
+                } else {
+                    nt_status::NtStatus(result.status)
+                });
+            }
+            let claimed = result.claimed();
+            let deliveries =
+                read_volatile((sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *const u64);
+            write_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERED_VECTOR) as *mut u64,
+                route.tokens.vector as u64,
+            );
+            write_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_ISR_CLAIMED) as *mut u64,
+                claimed as u64,
+            );
+            write_volatile(
+                (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
+                deliveries.saturating_add(1),
+            );
+            Ok(HostedIrqConnectionDispatchOutcome::Completed(claimed))
+        }
+        hosted_irq_broker::HostedIrqRootDispatchOutcome::DeferredBusy => {
+            Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy)
+        }
+    }
 }
 
 enum HostedIrqServiceOutcome {
@@ -47751,18 +47728,6 @@ unsafe fn quarantine_hosted_irq_delivery(
         .unwrap_or(status)
 }
 
-unsafe fn hosted_irq_connection_targets_active_bank(connection: HostedIrqConnection) -> bool {
-    let Some(binding) = hosted_device_binding_by_device_id(connection.binding.device_id)
-        .filter(|binding| *binding == connection.binding)
-    else {
-        return false;
-    };
-    [binding.instance, binding.projection_instance]
-        .into_iter()
-        .filter_map(instance)
-        .any(|inst| hosted_component_bank_active(inst.exec_shared_va))
-}
-
 unsafe fn service_hosted_irq_event(
     event_bit: u8,
 ) -> Result<HostedIrqServiceOutcome, nt_status::NtStatus> {
@@ -47832,32 +47797,6 @@ unsafe fn service_hosted_irq_event(
             nt_status::NtStatus::DEVICE_NOT_CONNECTED,
         ));
     }
-    if leased
-        .iter()
-        .any(|retained| hosted_irq_connection_targets_active_bank(retained.connection))
-    {
-        if complete_hosted_irq_connection_leases(&leased).is_err() {
-            return Err(quarantine_hosted_irq_delivery(
-                line.physical_line,
-                line.rundown.identity(),
-                delivery,
-                &leased,
-                nt_status::NtStatus::INVALID_DEVICE_REQUEST,
-            ));
-        }
-        let line_index = hosted_irq_lines()
-            .and_then(|lines| {
-                lines
-                    .iter()
-                    .position(|candidate| candidate.rundown.identity() == line.rundown.identity())
-            })
-            .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        hosted_irq_lines_mut()[line_index]
-            .rundown
-            .defer_delivery(delivery)
-            .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        return Ok(HostedIrqServiceOutcome::DeferredBusy);
-    }
     let mut scan_entries = Vec::new();
     if scan_entries.try_reserve_exact(leased.len()).is_err() {
         return Err(quarantine_hosted_irq_delivery(
@@ -47900,6 +47839,7 @@ unsafe fn service_hosted_irq_event(
         }
     };
     let mut claimed = 0u64;
+    let mut dispatched = 0u64;
     let mut scan_complete = false;
     while let Some(ready) = scan.next_isr() {
         let Some(connection) = leased
@@ -47916,7 +47856,42 @@ unsafe fn service_hosted_irq_event(
             ));
         };
         let is_claimed = match dispatch_hosted_irq_connection(connection) {
-            Ok(claimed) => claimed,
+            Ok(HostedIrqConnectionDispatchOutcome::Completed(claimed)) => {
+                dispatched = dispatched.saturating_add(1);
+                claimed
+            }
+            Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy) if dispatched == 0 => {
+                if complete_hosted_irq_connection_leases(&leased).is_err() {
+                    return Err(quarantine_hosted_irq_delivery(
+                        line.physical_line,
+                        line.rundown.identity(),
+                        delivery,
+                        &leased,
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    ));
+                }
+                let line_index = hosted_irq_lines()
+                    .and_then(|lines| {
+                        lines.iter().position(|candidate| {
+                            candidate.rundown.identity() == line.rundown.identity()
+                        })
+                    })
+                    .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                hosted_irq_lines_mut()[line_index]
+                    .rundown
+                    .defer_delivery(delivery)
+                    .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+                return Ok(HostedIrqServiceOutcome::DeferredBusy);
+            }
+            Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy) => {
+                return Err(quarantine_hosted_irq_delivery(
+                    line.physical_line,
+                    line.rundown.identity(),
+                    delivery,
+                    &leased,
+                    nt_status::NtStatus(STATUS_POSSIBLE_DEADLOCK),
+                ));
+            }
             Err(status) => {
                 return Err(quarantine_hosted_irq_delivery(
                     line.physical_line,
@@ -48066,7 +48041,7 @@ unsafe fn drain_pending_hosted_irqs_snapshot() -> u64 {
                 let count = HOSTED_IRQ_EVENTS_DEFERRED_BUSY.fetch_add(1, Ordering::Relaxed) + 1;
                 deferred |= event;
                 if count <= 16 {
-                    print_str(b"[hosted-irq] deferred busy request bank event=");
+                    print_str(b"[hosted-irq] deferred busy arena event=");
                     print_u64(event_bit as u64);
                     print_str(b"\n");
                 }
