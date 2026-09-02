@@ -23305,6 +23305,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     repair its canonical PnP continuation before evaluating the live interrupt/DPC gates; do not
     add an interrupt stimulus or success fallback.
 
+    B3 exact recursive callback-memory runtime checkpoint (2026-09-03, physical ISR, DPC, and
+    desktop green; receive acceptance open): the dedicated lane now retains executive aliases only
+    for its exact stack leaves. IPC, trampoline, KPCR, and unrelated component mappings remain
+    private. Every provider import and reverse callback receives two bounded marshal authorities:
+    the target arena-depth window and the source lane stack. The generic marshaller translates
+    dependent descriptors, buffers, output cells, packet structures, and embedded strings through
+    the latter instead of accepting an arbitrary component address. Active DPC sessions authorize
+    recursive provider calls with their exact domain cookie, lane generation, and ephemeral DPC
+    grant; connection and dependency grants remain unchanged and no broad grant fallback exists.
+
+    Serialized run `.tmp/run-b3-lane-output-buffer-20260903-092847.log`, on the merged rust-micro
+    `c8093b78e1e5d38a84cc9705ea84d1e8b0a41976` baseline, completes real E1000 miniport ISR and
+    `HandleInterrupt` callbacks, drains a real TCP/IP DPC through recursive NDIS exports, starts all
+    three selected configured devices, and reaches genuine Explorer chrome in about 115 guest
+    seconds. Explorer records begin/end paint `5/20`, 165 direct GDI returns, 172 batch records, and
+    all 786432 framebuffer pixels non-background with at least 32 colours. No provider-export,
+    interrupt-Service, arena, or DPC failure was reported. The run finishes `292/295`: the remaining
+    failures are NDIS receive indication plus interrupt/DPC acceptance evidence.
+
+    Review adjustment: the two interrupt acceptance failures were stale canonical evidence, not a
+    missing dispatch. The arena path wrote shared ISR completion fields only after refreshing the
+    device record, and DPC completion had no post-drain refresh. Completion now snapshots the exact
+    device state after each ISR result and after each owner DPC drain; the final summary also reports
+    aggregate rejected-DPC counts. Focused `nt-kernel-exec` tests pass 7/7 and the freestanding
+    executive check remains green at 213 warnings. Rerun the serialized desktop gate to validate
+    those two corrections. If only receive indication remains, trace the real E1000 RX descriptor
+    and NDIS protocol callback path; do not generate a packet, mutate a gate, or synthesize an
+    indication to satisfy acceptance.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

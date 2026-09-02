@@ -3352,9 +3352,6 @@ fn component_to_exec_va_for_instance(
             inst.exec_arg_va,
         )
     })
-    .or_else(|| unsafe {
-        hosted_irq_lane_component_to_exec_va(instance, component_va, bytes)
-    })
 }
 
 pub(crate) unsafe fn hosted_component_stack_qword(
@@ -12350,40 +12347,6 @@ fn hosted_worker_component_to_exec_va(
     })
 }
 
-unsafe fn hosted_irq_lane_component_to_exec_va(
-    instance: usize,
-    component_va: u64,
-    bytes: u64,
-) -> Option<u64> {
-    let lane = hosted_irq_lanes()?.iter().find(|lane| {
-        lane.projection_instance == instance
-            && lane.state == HostedIrqLaneState::Ready
-            && lane.stack.iter().all(|leaf| leaf.mapped && leaf.exec_mapped)
-    })?;
-    let component_base = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT)?;
-    let exec_base = lane.exec_arena_va.checked_sub(FSD_IRQ_LANE_ARENA_OFFSET)?;
-    translate_component_range(
-        component_va,
-        bytes,
-        component_base,
-        FSD_WORKER_STACK_FRAMES * 0x1000,
-        exec_base,
-    )
-    .or_else(|| {
-        (lane.kpcr.mapped && lane.kpcr.exec_mapped)
-            .then(|| {
-                translate_component_range(
-                    component_va,
-                    bytes,
-                    component_base + FSD_WORKER_SCRATCH_OFFSET,
-                    0x1000,
-                    exec_base + FSD_WORKER_SCRATCH_OFFSET,
-                )
-            })
-            .flatten()
-    })
-}
-
 fn hosted_driver_runtime_for_worker_component_range(
     instance: usize,
     component_va: u64,
@@ -16533,6 +16496,7 @@ impl HostedProviderDispatchRoute {
 
 #[derive(Clone, Copy)]
 struct ProviderMarshalState {
+    source_exact: Option<HostedProviderMarshalWindow>,
     cursor: u64,
     copyouts: [ProviderMarshalCopyout; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     copyout_count: usize,
@@ -16603,6 +16567,7 @@ struct ProviderMarshalState {
 impl ProviderMarshalState {
     const fn empty() -> Self {
         Self {
+            source_exact: None,
             cursor: 0,
             copyouts: [ProviderMarshalCopyout {
                 dependent_exec_va: 0,
@@ -17180,6 +17145,7 @@ static HOSTED_PROVIDER_PROTOCOL_RECEIVE_COMPLETE_COMPLETIONS: AtomicU64 = Atomic
 static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_CALLBACK_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -18094,6 +18060,29 @@ unsafe fn trace_hosted_provider_callback(
             }
         }
     }
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_provider_callback_failure_stage(
+    record: HostedProviderCallbackRecord,
+    stage: &[u8],
+    status: i32,
+) {
+    if HOSTED_PROVIDER_CALLBACK_FAILURE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed)
+        >= HOSTED_PROVIDER_TRACE_CAP
+    {
+        return;
+    }
+    print_str(b"[provider-callback-failure] provider-inst=");
+    print_u64(record.provider_instance as u64);
+    print_str(b" dependent-inst=");
+    print_u64(record.dependent_instance as u64);
+    print_str(b" off=0x");
+    print_hex(record.callback_offset as u32);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" status=0x");
+    print_hex(status as u32);
     print_str(b"\n");
 }
 
@@ -21972,8 +21961,13 @@ unsafe fn provider_marshal_ndis_packet_array(
         return Ok(0);
     }
     let bytes = count.checked_mul(8).ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(dependent_array_exec) =
-        component_to_exec_va_for_instance(dependent_instance, dependent_inst, arg_value, bytes)
+    let Some(dependent_array_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_instance,
+        dependent_inst,
+        arg_value,
+        bytes,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -22017,8 +22011,13 @@ unsafe fn provider_marshal_output_ndis_packet(
     marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
-    let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_instance, dependent_inst, arg_value, 8)
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_instance,
+        dependent_inst,
+        arg_value,
+        8,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -22046,7 +22045,8 @@ unsafe fn provider_marshal_output_ndis_buffer(
     if dependent_data_component_va == 0 || bytes == 0 || bytes > u32::MAX as u64 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let dependent_data_exec = component_to_exec_va_for_instance(
+    let dependent_data_exec = provider_marshal_source_to_exec(
+        state,
         dependent_instance,
         dependent_inst,
         dependent_data_component_va,
@@ -22082,8 +22082,13 @@ unsafe fn provider_marshal_output_ndis_buffer(
     } else {
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let Some(dependent_out_exec) =
-        component_to_exec_va_for_instance(dependent_instance, dependent_inst, out_arg_value, 8)
+    let Some(dependent_out_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_instance,
+        dependent_inst,
+        out_arg_value,
+        8,
+    )
     else {
         if provider_data_owned_by_bridge {
             hosted_instance_pool_free(provider_inst, provider_data_component_va);
@@ -25415,6 +25420,26 @@ fn provider_marshal_add_ndis_device_property_output(
     Some(())
 }
 
+fn provider_marshal_source_to_exec(
+    state: &ProviderMarshalState,
+    dependent_index: usize,
+    dependent_inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    state
+        .source_exact
+        .and_then(|window| window.component_to_exec(component_va, bytes))
+        .or_else(|| {
+            component_to_exec_va_for_instance(
+                dependent_index,
+                dependent_inst,
+                component_va,
+                bytes,
+            )
+        })
+}
+
 unsafe fn provider_marshal_output_cell(
     state: &mut ProviderMarshalState,
     dependent_index: usize,
@@ -25423,8 +25448,13 @@ unsafe fn provider_marshal_output_cell(
     arg_value: u64,
     bytes: u64,
 ) -> Result<u64, i32> {
-    let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, bytes)
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        bytes,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -25452,8 +25482,13 @@ unsafe fn provider_marshal_ndis_device_property_output(
     if kind == 0 || kind > NDIS_DEVICE_PROPERTY_TRANSLATED_RESOURCES {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        8,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -25481,8 +25516,13 @@ unsafe fn provider_marshal_inout_cell(
     arg_value: u64,
     bytes: u64,
 ) -> Result<u64, i32> {
-    let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, bytes)
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        bytes,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -25529,8 +25569,13 @@ unsafe fn provider_marshal_input_buffer(
     if bytes == 0 {
         return Ok(0);
     }
-    let Some(dependent_exec_va) =
-        provider_marshal_input_buffer_exec_va(dependent_index, dependent_inst, arg_value, bytes)
+    let Some(dependent_exec_va) = provider_marshal_input_buffer_exec_va(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        bytes,
+    )
     else {
         trace_provider_input_buffer_marshal_rejection(dependent_index, arg_value, bytes);
         return Err(STATUS_INVALID_PARAMETER);
@@ -25597,21 +25642,27 @@ unsafe fn hosted_dma_alias_for_component_va(
 }
 
 unsafe fn provider_marshal_input_buffer_exec_va(
+    state: &ProviderMarshalState,
     dependent_index: usize,
     dependent_inst: DriverInstance,
     component_va: u64,
     bytes: u64,
 ) -> Option<u64> {
-    component_to_exec_va_for_instance(dependent_index, dependent_inst, component_va, bytes).or_else(
-        || {
+    provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        component_va,
+        bytes,
+    )
+    .or_else(|| {
             let binding = current_hosted_device_dispatch_binding(dependent_index)?;
             let state = hosted_device_resource_state_by_device_id(binding.device_id)?;
             if state.instance != dependent_index {
                 return None;
             }
             hosted_dma_alias_for_component_va(state, component_va, bytes)
-        },
-    )
+        })
 }
 
 fn provider_marshal_u32_arg(
@@ -25637,8 +25688,13 @@ unsafe fn provider_marshal_ansi_string(
     if arg_value == 0 {
         return Ok(0);
     }
-    let Some(desc_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 16)
+    let Some(desc_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        16,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -25657,8 +25713,13 @@ unsafe fn provider_marshal_ansi_string(
     let provider_buffer_va = if length == 0 {
         0
     } else {
-        let Some(buffer_exec) =
-            component_to_exec_va_for_instance(dependent_index, dependent_inst, buffer, length)
+        let Some(buffer_exec) = provider_marshal_source_to_exec(
+            state,
+            dependent_index,
+            dependent_inst,
+            buffer,
+            length,
+        )
         else {
             return Err(STATUS_INVALID_PARAMETER);
         };
@@ -25695,8 +25756,13 @@ unsafe fn provider_marshal_resource_list(
     length_pointer: u64,
 ) -> Result<u64, i32> {
     state.resource_projection_required = true;
-    let Some(length_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, length_pointer, 4)
+    let Some(length_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        length_pointer,
+        4,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -25865,8 +25931,13 @@ unsafe fn provider_marshal_fixed_output_pointer(
     if success_value == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        8,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26160,8 +26231,13 @@ unsafe fn provider_marshal_output_pointer_from_length(
     else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
-    let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        8,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26272,7 +26348,8 @@ unsafe fn provider_marshal_ndis_request(
     if arg_value == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_request_exec) = component_to_exec_va_for_instance(
+    let Some(dependent_request_exec) = provider_marshal_source_to_exec(
+        state,
         dependent_index,
         dependent_inst,
         arg_value,
@@ -26322,8 +26399,13 @@ unsafe fn provider_marshal_ndis_request(
     if info_buffer == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_info_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, info_buffer, info_len)
+    let Some(dependent_info_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        info_buffer,
+        info_len,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26358,8 +26440,13 @@ unsafe fn provider_marshal_ndis_buffer(
         return Err(STATUS_INVALID_PARAMETER);
     }
     let mdl_bytes = nt_mdl::MDL_SIZE as u64;
-    if let Some(dependent_exec_va) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, mdl_bytes)
+    if let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        mdl_bytes,
+    )
     {
         let Some((provider_component_va, provider_exec_va)) =
             provider_marshal_alloc(state, marshal_window, mdl_bytes)
@@ -26409,8 +26496,13 @@ unsafe fn provider_marshal_unicode_string(
     marshal_window: HostedProviderMarshalWindow,
     arg_value: u64,
 ) -> Result<u64, i32> {
-    let Some(desc_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 16)
+    let Some(desc_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        16,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26428,8 +26520,13 @@ unsafe fn provider_marshal_unicode_string(
     let provider_buffer_va = if length == 0 {
         0
     } else {
-        let Some(buffer_exec) =
-            component_to_exec_va_for_instance(dependent_index, dependent_inst, buffer, length)
+        let Some(buffer_exec) = provider_marshal_source_to_exec(
+            state,
+            dependent_index,
+            dependent_inst,
+            buffer,
+            length,
+        )
         else {
             return Err(STATUS_INVALID_PARAMETER);
         };
@@ -26462,8 +26559,13 @@ unsafe fn provider_marshal_unicode_string_from_source(
     if source_arg_value == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
-    let Some(dependent_desc_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, desc_arg_value, 16)
+    let Some(dependent_desc_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        desc_arg_value,
+        16,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26473,7 +26575,8 @@ unsafe fn provider_marshal_unicode_string_from_source(
         if source_bytes >= NDIS_INIT_UNICODE_STRING_MAX_BYTES {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let Some(ch_exec) = component_to_exec_va_for_instance(
+        let Some(ch_exec) = provider_marshal_source_to_exec(
+            state,
             dependent_index,
             dependent_inst,
             source_arg_value
@@ -26495,7 +26598,8 @@ unsafe fn provider_marshal_unicode_string_from_source(
     let source_total = source_bytes
         .checked_add(2)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let Some(source_exec) = component_to_exec_va_for_instance(
+    let Some(source_exec) = provider_marshal_source_to_exec(
+        state,
         dependent_index,
         dependent_inst,
         source_arg_value,
@@ -26538,8 +26642,13 @@ unsafe fn provider_marshal_embedded_unicode_string_buffer(
     let provider_buffer_va = if length == 0 {
         0
     } else {
-        let Some(buffer_exec) =
-            component_to_exec_va_for_instance(dependent_index, dependent_inst, buffer, length)
+        let Some(buffer_exec) = provider_marshal_source_to_exec(
+            state,
+            dependent_index,
+            dependent_inst,
+            buffer,
+            length,
+        )
         else {
             return Err(STATUS_INVALID_PARAMETER);
         };
@@ -26570,8 +26679,13 @@ unsafe fn provider_marshal_miniport_characteristics(
     arg_value: u64,
     supplied_len: u64,
 ) -> Result<u64, i32> {
-    let Some(header_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    let Some(header_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        8,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26589,7 +26703,8 @@ unsafe fn provider_marshal_miniport_characteristics(
     if layout.required_len > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
         dependent_index,
         dependent_inst,
         arg_value,
@@ -26660,8 +26775,13 @@ unsafe fn provider_marshal_protocol_characteristics(
     arg_value: u64,
     supplied_len: u64,
 ) -> Result<u64, i32> {
-    let Some(header_exec) =
-        component_to_exec_va_for_instance(dependent_index, dependent_inst, arg_value, 8)
+    let Some(header_exec) = provider_marshal_source_to_exec(
+        state,
+        dependent_index,
+        dependent_inst,
+        arg_value,
+        8,
+    )
     else {
         return Err(STATUS_INVALID_PARAMETER);
     };
@@ -26679,7 +26799,8 @@ unsafe fn provider_marshal_protocol_characteristics(
     if layout.required_len > marshal_window.capacity {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
-    let Some(dependent_exec_va) = component_to_exec_va_for_instance(
+    let Some(dependent_exec_va) = provider_marshal_source_to_exec(
+        state,
         dependent_index,
         dependent_inst,
         arg_value,
@@ -26757,6 +26878,7 @@ unsafe fn prepare_provider_export_marshal(
     dependent_index: usize,
     dependent_inst: DriverInstance,
     marshal_window: HostedProviderMarshalWindow,
+    source_exact: Option<HostedProviderMarshalWindow>,
     args: &mut [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> Result<ProviderMarshalState, i32> {
     if policy.argument_count as usize > args.len() {
@@ -26766,6 +26888,7 @@ unsafe fn prepare_provider_export_marshal(
         return Err(STATUS_INVALID_PARAMETER);
     }
     let mut state = ProviderMarshalState::empty();
+    state.source_exact = source_exact;
     let mut preparation_guard = ProviderMarshalPreparationGuard::new(&state);
     let mut index = 0usize;
     while index < policy.argument_count as usize {
@@ -28550,6 +28673,7 @@ where
         dependent_index,
         dependent_inst,
         marshal_window,
+        marshal_window_source.source_exact(),
         &mut args,
     ) {
         Ok(state) => state,
@@ -29172,25 +29296,56 @@ impl HostedProviderMarshalWindow {
 
 #[derive(Clone, Copy)]
 struct HostedProviderMarshalWindowSource {
-    exact: Option<HostedProviderMarshalWindow>,
+    target_exact: Option<HostedProviderMarshalWindow>,
+    source_exact: Option<HostedProviderMarshalWindow>,
 }
 
 impl HostedProviderMarshalWindowSource {
-    const LEGACY_SHARED_BANK: Self = Self { exact: None };
+    const LEGACY_SHARED_BANK: Self = Self {
+        target_exact: None,
+        source_exact: None,
+    };
 
-    fn exact(window: HostedProviderMarshalWindow) -> Self {
+    fn exact(
+        target: HostedProviderMarshalWindow,
+        provider: HostedProviderMarshalWindow,
+    ) -> Self {
         Self {
-            exact: Some(window),
+            target_exact: Some(target),
+            source_exact: Some(provider),
         }
     }
 
     fn is_legacy_shared_bank(self) -> bool {
-        self.exact.is_none()
+        self.target_exact.is_none()
     }
 
     fn resolve(self, exec_shared_va: u64) -> Option<HostedProviderMarshalWindow> {
-        self.exact
+        self.target_exact
             .or_else(|| HostedProviderMarshalWindow::legacy(exec_shared_va))
+    }
+
+    fn source_component_to_exec(
+        self,
+        provider_instance: usize,
+        provider_inst: DriverInstance,
+        component_va: u64,
+        bytes: u64,
+    ) -> Option<u64> {
+        self.source_exact
+            .and_then(|window| window.component_to_exec(component_va, bytes))
+            .or_else(|| {
+                component_to_exec_va_for_instance(
+                    provider_instance,
+                    provider_inst,
+                    component_va,
+                    bytes,
+                )
+            })
+    }
+
+    fn source_exact(self) -> Option<HostedProviderMarshalWindow> {
+        self.source_exact
     }
 }
 
@@ -29381,6 +29536,7 @@ unsafe fn service_ndis_reset_callback(
 unsafe fn service_ndis_isr_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     marshal_window: HostedProviderMarshalWindow,
+    marshal_window_source: HostedProviderMarshalWindowSource,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29390,19 +29546,44 @@ unsafe fn service_ndis_isr_callback(
     arg1: u64,
     arg2: u64,
 ) -> Result<u64, i32> {
-    provider_callback_marshal_window(marshal_window, 0x10, 0)?;
-    let provider_recognized_exec =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, arg0, 1)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-    let provider_queue_exec =
-        component_to_exec_va_for_instance(provider_instance, provider_inst, arg1, 1)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+    if let Err(status) = provider_callback_marshal_window(marshal_window, 0x10, 0) {
+        trace_hosted_provider_callback_failure_stage(record, b"isr-marshal", status);
+        return Err(status);
+    }
+    let Some(provider_recognized_exec) = marshal_window_source.source_component_to_exec(
+        provider_instance,
+        provider_inst,
+        arg0,
+        1,
+    )
+    else {
+        trace_hosted_provider_callback_failure_stage(
+            record,
+            b"isr-recognized-pointer",
+            STATUS_INVALID_PARAMETER,
+        );
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    let Some(provider_queue_exec) = marshal_window_source.source_component_to_exec(
+        provider_instance,
+        provider_inst,
+        arg1,
+        1,
+    )
+    else {
+        trace_hosted_provider_callback_failure_stage(
+            record,
+            b"isr-queue-pointer",
+            STATUS_INVALID_PARAMETER,
+        );
+        return Err(STATUS_INVALID_PARAMETER);
+    };
     let dependent_recognized_component = marshal_window.component_base;
     let dependent_queue_component = dependent_recognized_component + 8;
     let dependent_recognized_exec = marshal_window.exec_base;
     let dependent_queue_exec = dependent_recognized_exec + 8;
     provider_marshal_zero(dependent_recognized_exec, 0x10);
-    let result = dispatch_dependent_provider_callback(
+    let result = match dispatch_dependent_provider_callback(
         dispatch,
         record,
         dependent_inst,
@@ -29414,7 +29595,13 @@ unsafe fn service_ndis_isr_callback(
             0,
         ],
         [0u64; PROVIDER_CALLBACK_STACK_QWORDS],
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(status) => {
+            trace_hosted_provider_callback_failure_stage(record, b"isr-dispatch", status);
+            return Err(status);
+        }
+    };
     copy_bytes(provider_recognized_exec, dependent_recognized_exec, 1);
     copy_bytes(provider_queue_exec, dependent_queue_exec, 1);
     Ok(result)
@@ -30655,6 +30842,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
         };
 
         if let Err(status) = preflight {
+            trace_hosted_provider_callback_failure_stage(record, b"preflight", status);
             Err(status)
         } else {
             match record.callback_kind {
@@ -30725,6 +30913,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                     NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
                         dispatch,
                             marshal_window,
+                        marshal_window_source,
                         provider_instance,
                         provider_inst,
                         record,
@@ -46316,6 +46505,7 @@ unsafe fn map_hosted_irq_component_leaf(
     temporary_exec_va: u64,
     component_rights: u64,
     contents: &[u8],
+    retain_exec_mapping: bool,
     leaf: &mut HostedIrqLaneLeaf,
 ) -> bool {
     if contents.len() > 0x1000
@@ -46351,11 +46541,17 @@ unsafe fn map_hosted_irq_component_leaf(
         temporary_exec_va as *mut u8,
         contents.len(),
     );
-    if page_unmap_r(exec_cap) == 0 {
-        leaf.exec_mapped = false;
-        if cnode_delete_recycle_r(exec_cap) == 0 {
-            leaf.exec_cap = 0;
+    if !retain_exec_mapping {
+        if page_unmap_r(exec_cap) != 0 {
+            let _ = release_hosted_irq_lane_leaf(leaf);
+            return false;
         }
+        leaf.exec_mapped = false;
+        if cnode_delete_recycle_r(exec_cap) != 0 {
+            let _ = release_hosted_irq_lane_leaf(leaf);
+            return false;
+        }
+        leaf.exec_cap = 0;
     }
     if page_map_r(component_cap, component_va, component_rights, inst.pml4) != 0 {
         let _ = release_hosted_irq_lane_leaf(leaf);
@@ -46500,6 +46696,7 @@ unsafe fn build_hosted_irq_lane(
                 exec_base + offset,
                 RW_NX,
                 &[],
+                true,
                 &mut lane.stack[index],
             ) {
                 return None;
@@ -46512,6 +46709,7 @@ unsafe fn build_hosted_irq_lane(
             exec_base.checked_add(FSD_WORKER_IPCBUF_OFFSET)?,
             RW_NX,
             &[],
+            false,
             &mut lane.ipc_buffer,
         ) {
             return None;
@@ -46531,6 +46729,7 @@ unsafe fn build_hosted_irq_lane(
             exec_base.checked_add(FSD_WORKER_TRAMP_OFFSET)?,
             2,
             &trampoline,
+            false,
             &mut lane.trampoline,
         ) {
             return None;
@@ -46542,6 +46741,7 @@ unsafe fn build_hosted_irq_lane(
             exec_base.checked_add(FSD_WORKER_SCRATCH_OFFSET)?,
             RW_NX,
             &[],
+            false,
             &mut lane.kpcr,
         ) {
             return None;
@@ -47461,10 +47661,14 @@ unsafe fn dispatch_hosted_irq_connection(
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let outcome = hosted_irq_broker::dispatch_interrupt(connection);
-    refresh_hosted_device_resource_state(binding, sh);
-    match outcome? {
-        hosted_irq_broker::HostedIrqRootDispatchOutcome::Completed(result) => {
+    match outcome {
+        Err(status) => {
+            refresh_hosted_device_resource_state(binding, sh);
+            Err(status)
+        }
+        Ok(hosted_irq_broker::HostedIrqRootDispatchOutcome::Completed(result)) => {
             if result.faulted || result.status != STATUS_SUCCESS || result.value_count != 1 {
+                refresh_hosted_device_resource_state(binding, sh);
                 return Err(if result.status == STATUS_SUCCESS {
                     nt_status::NtStatus::INVALID_DEVICE_REQUEST
                 } else {
@@ -47486,9 +47690,11 @@ unsafe fn dispatch_hosted_irq_connection(
                 (sh + SH_RESOURCE_INTERRUPT_DELIVERIES) as *mut u64,
                 deliveries.saturating_add(1),
             );
+            refresh_hosted_device_resource_state(binding, sh);
             Ok(HostedIrqConnectionDispatchOutcome::Completed(claimed))
         }
-        hosted_irq_broker::HostedIrqRootDispatchOutcome::DeferredBusy => {
+        Ok(hosted_irq_broker::HostedIrqRootDispatchOutcome::DeferredBusy) => {
+            refresh_hosted_device_resource_state(binding, sh);
             Ok(HostedIrqConnectionDispatchOutcome::DeferredBusy)
         }
     }
@@ -47900,6 +48106,11 @@ unsafe fn service_hosted_irq_event(
                 if !already_drained {
                     hosted_irq_broker::drain_dpcs(owner)?;
                 }
+                let binding = retained.connection.binding;
+                let (_, inst) = instance_by_driver_id(binding.driver_id)
+                    .filter(|(_, inst)| inst.ready)
+                    .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
+                refresh_hosted_device_resource_state(binding, inst.exec_shared_va);
             }
             Ok(HostedIrqServiceOutcome::Serviced(claimed))
         }
@@ -49990,11 +50201,13 @@ pub(crate) struct HostedInterruptDeliveryEvidence {
     pub(crate) dpc_delivered: bool,
     pub(crate) deliveries: u64,
     pub(crate) dpc_deliveries: u64,
+    pub(crate) dpc_drops: u64,
     pub(crate) pci_connected: bool,
     pub(crate) pci_delivered: bool,
     pub(crate) pci_dpc_delivered: bool,
     pub(crate) pci_deliveries: u64,
     pub(crate) pci_dpc_deliveries: u64,
+    pub(crate) pci_dpc_drops: u64,
 }
 
 /// Snapshot interrupt evidence from the canonical state of every live hosted IRQ connection.
@@ -50036,6 +50249,7 @@ pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvi
         summary.dpc_deliveries = summary
             .dpc_deliveries
             .saturating_add(evidence.dpc_deliveries);
+        summary.dpc_drops = summary.dpc_drops.saturating_add(evidence.dpc_drops);
         if state.interface_type == HOSTED_INTERFACE_TYPE_PCIBUS {
             summary.pci_connected = true;
             summary.pci_delivered |= delivered;
@@ -50046,6 +50260,7 @@ pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvi
             summary.pci_dpc_deliveries = summary
                 .pci_dpc_deliveries
                 .saturating_add(evidence.dpc_deliveries);
+            summary.pci_dpc_drops = summary.pci_dpc_drops.saturating_add(evidence.dpc_drops);
         }
     }
     summary

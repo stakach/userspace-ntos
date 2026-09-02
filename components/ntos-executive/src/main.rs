@@ -24709,14 +24709,18 @@ fn report_deferred_generic_hardware_checks(
     print_u64(pci_report.attempted);
     print_str(b"/");
     print_u64(pci_report.started);
-    print_str(b" live-irq/dpc=");
+    print_str(b" live-irq/dpc/drop=");
     print_u64(live_interrupts.deliveries);
     print_str(b"/");
     print_u64(live_interrupts.dpc_deliveries);
-    print_str(b" pci-live-irq/dpc=");
+    print_str(b"/");
+    print_u64(live_interrupts.dpc_drops);
+    print_str(b" pci-live-irq/dpc/drop=");
     print_u64(live_interrupts.pci_deliveries);
     print_str(b"/");
     print_u64(live_interrupts.pci_dpc_deliveries);
+    print_str(b"/");
+    print_u64(live_interrupts.pci_dpc_drops);
     print_str(b"\n");
 
     check(
