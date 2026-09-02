@@ -23124,6 +23124,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     earlier fault as a residual concurrency diagnostic; it is not evidence for reverting the exact
     lane ownership or adding a fallback.
 
+    B3 explicit provider-argument checkpoint (2026-09-02, freestanding green; broker selection
+    open): the legacy provider-import and reverse-callback entry points are now compatibility
+    adapters that read the old shared request bank exactly once and assemble the complete fixed
+    twelve-word Win64 frame. All provider authority checks, marshal preparation, side effects,
+    completion copyout, callback policy, and tracing run in explicit-argument cores. The private
+    arena broker can therefore supply its depth-owned command arguments directly without reading a
+    second mutable bank. This checkpoint deliberately leaves the old pump as the output dispatcher
+    until the recursive two-arena root driver exists; it does not introduce a lane fallback.
+    `cargo fmt --all` and the freestanding executive check are green at the established 213-warning
+    baseline.
+
     Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
     single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
     dependency lease and drive a provider-domain arena while that Service stays open. A provider

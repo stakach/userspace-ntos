@@ -28316,11 +28316,40 @@ pub(crate) unsafe fn service_hosted_provider_export(
     arg0: u64,
     arg1: u64,
 ) -> u64 {
-    HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let arg2 = read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG2) as *const u64);
-    let arg3 = read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64);
     let caller_rsp =
         read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_CALLER_RSP) as *const u64);
+    let mut args = [0u64; HOSTED_PROVIDER_EXPORT_ARG_CAP];
+    args[0] = arg0;
+    args[1] = arg1;
+    args[2] =
+        read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG2) as *const u64);
+    args[3] =
+        read_volatile((dependent_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64);
+    let mut stack_index = 0u64;
+    while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
+        args[4 + stack_index as usize] = read_volatile(
+            (dependent_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8)
+                as *const u64,
+        );
+        stack_index += 1;
+    }
+    service_hosted_provider_export_explicit(
+        dependent_channel,
+        provider_export_rva,
+        provider_publication_cookie,
+        caller_rsp,
+        args,
+    )
+}
+
+unsafe fn service_hosted_provider_export_explicit(
+    dependent_channel: &crate::spawn_hosts::PumpChannel,
+    provider_export_rva: u64,
+    provider_publication_cookie: u64,
+    caller_rsp: u64,
+    mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+) -> u64 {
+    HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let Some((_singleton_index, singleton)) =
         find_hosted_provider_singleton_by_cookie(provider_publication_cookie)
     else {
@@ -28408,19 +28437,6 @@ pub(crate) unsafe fn service_hosted_provider_export(
     };
     let provider_shared = provider_inst.exec_shared_va;
 
-    let mut args = [0u64; HOSTED_PROVIDER_EXPORT_ARG_CAP];
-    args[0] = arg0;
-    args[1] = arg1;
-    args[2] = arg2;
-    args[3] = arg3;
-    let mut stack_index = 0u64;
-    while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
-        args[4 + stack_index as usize] = read_volatile(
-            (dependent_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8)
-                as *const u64,
-        );
-        stack_index += 1;
-    }
     let original_args = args;
     trace_hosted_provider_export_frame(
         b"enter",
@@ -28505,7 +28521,7 @@ pub(crate) unsafe fn service_hosted_provider_export(
         (provider_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
         caller_rsp,
     );
-    stack_index = 0;
+    let mut stack_index = 0;
     while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
         write_volatile(
             (provider_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8) as *mut u64,
@@ -30358,17 +30374,31 @@ pub(crate) unsafe fn service_hosted_provider_callback(
     arg1: u64,
     arg2: u64,
 ) -> u64 {
-    HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let arg3 = read_volatile((provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64);
-    let mut provider_stack = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
+    let mut args = [0u64; HOSTED_PROVIDER_EXPORT_ARG_CAP];
+    args[0] = arg0;
+    args[1] = arg1;
+    args[2] = arg2;
+    args[3] = read_volatile((provider_channel.shared_va + SH_PROVIDER_EXPORT_ARG3) as *const u64);
     let mut stack_index = 0usize;
     while stack_index < PROVIDER_CALLBACK_STACK_QWORDS {
-        provider_stack[stack_index] = read_volatile(
+        args[4 + stack_index] = read_volatile(
             (provider_channel.shared_va + SH_PROVIDER_EXPORT_STACK_BASE + stack_index as u64 * 8)
                 as *const u64,
         );
         stack_index += 1;
     }
+    service_hosted_provider_callback_explicit(provider_channel, callback_cookie, args)
+}
+
+unsafe fn service_hosted_provider_callback_explicit(
+    provider_channel: &crate::spawn_hosts::PumpChannel,
+    callback_cookie: u64,
+    args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+) -> u64 {
+    HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let [arg0, arg1, arg2, arg3, stack0, stack1, stack2, stack3, stack4, stack5, stack6, stack7] =
+        args;
+    let provider_stack = [stack0, stack1, stack2, stack3, stack4, stack5, stack6, stack7];
     let Some((provider_instance, provider_inst)) =
         instance_by_shared_va(provider_channel.shared_va)
     else {
