@@ -973,6 +973,13 @@ impl HostedIrqRootSession {
             HostedDpcQueueResult::Queued(identity) => (true, identity),
             HostedDpcQueueResult::AlreadyQueued(identity) => (false, identity),
         };
+        trace_hosted_dpc_lifecycle(
+            b"queue",
+            lane,
+            identity.dpc_token,
+            identity.generation,
+            inserted as u64,
+        );
         let mut result = service_result(STATUS_SUCCESS, Some(inserted as u64));
         result.value_count = 2;
         result.values[1] = identity.generation;
@@ -1281,6 +1288,32 @@ enum HostedDpcRootDispatchOutcome {
 
 static HOSTED_DPC_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_SERVICE_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_DPC_LIFECYCLE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn trace_hosted_dpc_lifecycle(
+    phase: &[u8],
+    lane: HostedIrqLaneView,
+    dpc_token: u64,
+    generation: u64,
+    detail: u64,
+) {
+    if HOSTED_DPC_LIFECYCLE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    print_str(b"[hosted-dpc-lifecycle] ");
+    print_str(phase);
+    print_str(b" domain=");
+    print_u64(lane.identity.domain_id);
+    print_str(b" lane-generation=");
+    print_u64(lane.identity.lane_generation);
+    print_str(b" dpc=0x");
+    print_hex64(dpc_token);
+    print_str(b" generation=");
+    print_u64(generation);
+    print_str(b" detail=");
+    print_u64(detail);
+    print_str(b"\n");
+}
 
 fn trace_hosted_irq_service_failure(
     lane: HostedIrqLaneView,
@@ -1496,6 +1529,13 @@ unsafe fn dispatch_next_dpc(
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
     };
+    trace_hosted_dpc_lifecycle(
+        b"dispatch",
+        lane,
+        activation.identity.dpc_token,
+        activation.identity.generation,
+        activation.sequence,
+    );
     if read_unaligned((exec_dpc + KDPC_DEFERRED_ROUTINE_OFFSET) as *const u64)
         != activation.routine
         || read_unaligned((exec_dpc + KDPC_DEFERRED_CONTEXT_OFFSET) as *const u64)
@@ -1616,6 +1656,13 @@ unsafe fn dispatch_next_dpc(
     write_volatile(
         (inst.exec_shared_va + SH_DPC_DELIVERIES) as *mut u64,
         deliveries.saturating_add(1),
+    );
+    trace_hosted_dpc_lifecycle(
+        b"complete",
+        lane,
+        activation.identity.dpc_token,
+        activation.identity.generation,
+        activation.sequence,
     );
     Ok(HostedDpcRootDispatchOutcome::Completed)
 }

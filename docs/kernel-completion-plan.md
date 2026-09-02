@@ -23334,6 +23334,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and NDIS protocol callback path; do not generate a packet, mutate a gate, or synthesize an
     indication to satisfy acceptance.
 
+    Serialized acceptance `.tmp/run-b3-fresh-net-vtd-20260903-094525.log` validates the evidence
+    correction at `294/295`: all three configured devices start, aggregate live IRQ/DPC/drop is
+    `1/1/0`, both hardware delivery gates pass, and Explorer again paints all 786432 pixels with at
+    least 32 colours. A passive QEMU capture records the guest ARP request and the real SLiRP ARP
+    reply. VT-d tracing then shows device `00:03.0` translating its RX descriptor and packet-buffer
+    IOVAs (`0x2000` and `0x3000`) to the assigned E1000 DMA frames with no translation fault, after
+    which the physical interrupt is claimed. The remaining receive failure is therefore downstream
+    of real ingress, NIC filtering, and DMA: determine whether the second miniport ISR copyout asks
+    NDIS to queue its KDPC, whether root accepts and redispatches that exact KDPC generation, and
+    whether `MiniportHandleInterrupt` reaches the protocol indication callback. Keep this evidence
+    provider-neutral and bounded; remove it once the contract is covered by durable counters/tests.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

@@ -17147,6 +17147,7 @@ static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 = AtomicU6
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_ISR_RESULT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
@@ -29604,6 +29605,17 @@ unsafe fn service_ndis_isr_callback(
     };
     copy_bytes(provider_recognized_exec, dependent_recognized_exec, 1);
     copy_bytes(provider_queue_exec, dependent_queue_exec, 1);
+    if HOSTED_PROVIDER_ISR_RESULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
+        print_str(b"[provider-isr-result] provider-inst=");
+        print_u64(record.provider_instance as u64);
+        print_str(b" dependent-inst=");
+        print_u64(record.dependent_instance as u64);
+        print_str(b" recognized=");
+        print_u64(read_unaligned(dependent_recognized_exec as *const u8) as u64);
+        print_str(b" queue-dpc=");
+        print_u64(read_unaligned(dependent_queue_exec as *const u8) as u64);
+        print_str(b"\n");
+    }
     Ok(result)
 }
 
