@@ -28872,6 +28872,15 @@ enum HostedComponentDispatchError {
     Wall(crate::spawn_hosts::PumpResult),
 }
 
+type HostedProviderCallbackDispatcher<'a> = dyn FnMut(
+        HostedProviderCallbackRecord,
+        DriverInstance,
+        u64,
+        [u64; 4],
+        [u64; PROVIDER_CALLBACK_STACK_QWORDS],
+    ) -> Result<u64, HostedComponentDispatchError>
+    + 'a;
+
 unsafe fn dispatch_hosted_component_target(
     instance_index: usize,
     inst: DriverInstance,
@@ -28945,6 +28954,7 @@ unsafe fn dispatch_hosted_component_target(
 }
 
 unsafe fn dispatch_dependent_provider_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
     exec_code_va: u64,
@@ -28958,14 +28968,7 @@ unsafe fn dispatch_dependent_provider_callback(
         restore_hosted_device_resource_state(binding, dependent_shared, false)
             .map_err(|status| status.raw())?;
     }
-    match dispatch_hosted_component_target(
-        record.dependent_instance,
-        dependent_inst,
-        exec_code_va,
-        record.target,
-        args,
-        stack_args,
-    ) {
+    match dispatch(record, dependent_inst, exec_code_va, args, stack_args) {
         Ok(result) => {
             if let Some(binding) = dependent_binding {
                 refresh_hosted_device_resource_state(binding, dependent_shared);
@@ -29244,6 +29247,7 @@ unsafe fn provider_callback_marshal_window(
 }
 
 unsafe fn service_ndis_initialize_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29300,6 +29304,7 @@ unsafe fn service_ndis_initialize_callback(
     stack_args[0] = miniport_block_mirror.dependent_component_va;
     stack_args[1] = provider_stack[1];
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29324,6 +29329,7 @@ unsafe fn service_ndis_initialize_callback(
 }
 
 unsafe fn service_ndis_query_set_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29379,6 +29385,7 @@ unsafe fn service_ndis_query_set_callback(
     stack_args[0] = dependent_bytes0_component;
     stack_args[1] = dependent_bytes1_component;
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29394,6 +29401,7 @@ unsafe fn service_ndis_query_set_callback(
 }
 
 unsafe fn service_ndis_reset_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29411,6 +29419,7 @@ unsafe fn service_ndis_reset_callback(
     let dependent_reset_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
     provider_marshal_zero(dependent_reset_exec, 8);
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29422,6 +29431,7 @@ unsafe fn service_ndis_reset_callback(
 }
 
 unsafe fn service_ndis_isr_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29445,6 +29455,7 @@ unsafe fn service_ndis_isr_callback(
     let dependent_queue_exec = dependent_recognized_exec + 8;
     provider_marshal_zero(dependent_recognized_exec, 0x10);
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29462,6 +29473,7 @@ unsafe fn service_ndis_isr_callback(
 }
 
 unsafe fn service_ndis_reconfigure_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29480,6 +29492,7 @@ unsafe fn service_ndis_reconfigure_callback(
     let dependent_open_status_exec = dependent_shared + SH_PROVIDER_EXPORT_MARSHAL_BASE;
     provider_marshal_zero(dependent_open_status_exec, 8);
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29507,6 +29520,7 @@ unsafe fn provider_callback_packet_shadow(
 }
 
 unsafe fn service_ndis_send_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29531,6 +29545,7 @@ unsafe fn service_ndis_send_callback(
         shadow,
     )?;
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29566,6 +29581,7 @@ unsafe fn service_ndis_send_callback(
 }
 
 unsafe fn service_ndis_send_packets_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29578,6 +29594,7 @@ unsafe fn service_ndis_send_packets_callback(
     let count = arg2 & u32::MAX as u64;
     if count == 0 {
         return dispatch_dependent_provider_callback(
+            dispatch,
             record,
             dependent_inst,
             exec_code_va,
@@ -29618,6 +29635,7 @@ unsafe fn service_ndis_send_packets_callback(
     }
 
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29663,6 +29681,7 @@ unsafe fn service_ndis_send_packets_callback(
 }
 
 unsafe fn service_ndis_return_packet_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29680,6 +29699,7 @@ unsafe fn service_ndis_return_packet_callback(
         shadow,
     )?;
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29698,6 +29718,7 @@ unsafe fn service_ndis_return_packet_callback(
 }
 
 unsafe fn service_ndis_transfer_data_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29740,6 +29761,7 @@ unsafe fn service_ndis_transfer_data_callback(
     stack_args[0] = provider_stack[0];
     stack_args[1] = provider_stack[1];
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29853,6 +29875,7 @@ unsafe fn provider_callback_copy_unicode_string(
 }
 
 unsafe fn service_ndis_protocol_bind_adapter_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29910,6 +29933,7 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
     let mut stack_args = [0u64; PROVIDER_CALLBACK_STACK_QWORDS];
     stack_args[0] = provider_stack[0];
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -29926,6 +29950,7 @@ unsafe fn service_ndis_protocol_bind_adapter_callback(
 }
 
 unsafe fn service_ndis_protocol_pnp_event_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -29993,6 +30018,7 @@ unsafe fn service_ndis_protocol_pnp_event_callback(
     }
 
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30002,6 +30028,7 @@ unsafe fn service_ndis_protocol_pnp_event_callback(
 }
 
 unsafe fn service_ndis_protocol_send_complete_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30026,6 +30053,7 @@ unsafe fn service_ndis_protocol_send_complete_callback(
         shadow,
     )?;
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30035,6 +30063,7 @@ unsafe fn service_ndis_protocol_send_complete_callback(
 }
 
 unsafe fn service_ndis_protocol_transfer_data_complete_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30060,6 +30089,7 @@ unsafe fn service_ndis_protocol_transfer_data_complete_callback(
         shadow,
     )?;
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30069,6 +30099,7 @@ unsafe fn service_ndis_protocol_transfer_data_complete_callback(
 }
 
 unsafe fn service_ndis_protocol_receive_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30138,6 +30169,7 @@ unsafe fn service_ndis_protocol_receive_callback(
     stack_args[1] = lookahead_bytes;
     stack_args[2] = packet_bytes;
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30147,12 +30179,14 @@ unsafe fn service_ndis_protocol_receive_callback(
 }
 
 unsafe fn service_ndis_protocol_receive_complete_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
     exec_code_va: u64,
     arg0: u64,
 ) -> Result<u64, i32> {
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30162,6 +30196,7 @@ unsafe fn service_ndis_protocol_receive_complete_callback(
 }
 
 unsafe fn service_ndis_protocol_status_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30192,6 +30227,7 @@ unsafe fn service_ndis_protocol_status_callback(
         FSD_SHARED_VADDR + SH_PROVIDER_EXPORT_MARSHAL_BASE
     };
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30201,12 +30237,14 @@ unsafe fn service_ndis_protocol_status_callback(
 }
 
 unsafe fn service_ndis_protocol_status_complete_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
     exec_code_va: u64,
     arg0: u64,
 ) -> Result<u64, i32> {
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30216,6 +30254,7 @@ unsafe fn service_ndis_protocol_status_complete_callback(
 }
 
 unsafe fn service_ndis_protocol_receive_packet_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30239,6 +30278,7 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
         shadow,
     )?;
     let result = dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30265,6 +30305,7 @@ unsafe fn service_ndis_protocol_receive_packet_callback(
 }
 
 unsafe fn service_ndis_miniport_timer_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
@@ -30293,6 +30334,7 @@ unsafe fn service_ndis_miniport_timer_callback(
         return Err(STATUS_INVALID_PARAMETER);
     };
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30302,6 +30344,7 @@ unsafe fn service_ndis_miniport_timer_callback(
 }
 
 unsafe fn service_ndis_work_item_callback(
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     provider_instance: usize,
     record: HostedProviderCallbackRecord,
     dependent_inst: DriverInstance,
@@ -30337,6 +30380,7 @@ unsafe fn service_ndis_work_item_callback(
         return Err(STATUS_INVALID_PARAMETER);
     };
     dispatch_dependent_provider_callback(
+        dispatch,
         record,
         dependent_inst,
         exec_code_va,
@@ -30520,6 +30564,34 @@ unsafe fn service_hosted_provider_callback_explicit(
     callback_cookie: u64,
     args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> u64 {
+    let mut dispatch = |record: HostedProviderCallbackRecord,
+                        dependent_inst: DriverInstance,
+                        exec_code_va: u64,
+                        args: [u64; 4],
+                        stack_args: [u64; PROVIDER_CALLBACK_STACK_QWORDS]| {
+        dispatch_hosted_component_target(
+            record.dependent_instance,
+            dependent_inst,
+            exec_code_va,
+            record.target,
+            args,
+            stack_args,
+        )
+    };
+    service_hosted_provider_callback_with_dispatch(
+        provider_channel,
+        callback_cookie,
+        args,
+        &mut dispatch,
+    )
+}
+
+unsafe fn service_hosted_provider_callback_with_dispatch(
+    provider_channel: &crate::spawn_hosts::PumpChannel,
+    callback_cookie: u64,
+    args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    dispatch: &mut HostedProviderCallbackDispatcher<'_>,
+) -> u64 {
     HOSTED_PROVIDER_CALLBACK_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let [arg0, arg1, arg2, arg3, stack0, stack1, stack2, stack3, stack4, stack5, stack6, stack7] =
         args;
@@ -30618,6 +30690,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                 HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT => match record.callback_offset {
                     NDIS_MINIPORT_INITIALIZE_CALLBACK_OFFSET_X64 => {
                         service_ndis_initialize_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30632,6 +30705,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_MINIPORT_QUERY_INFORMATION_CALLBACK_OFFSET_X64 => {
                         service_ndis_query_set_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30648,6 +30722,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_MINIPORT_SET_INFORMATION_CALLBACK_OFFSET_X64 => {
                         service_ndis_query_set_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30663,6 +30738,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                         )
                     }
                     NDIS_MINIPORT_RESET_CALLBACK_OFFSET_X64 => service_ndis_reset_callback(
+                        dispatch,
                         provider_instance,
                         provider_inst,
                         record,
@@ -30672,6 +30748,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                         arg1,
                     ),
                     NDIS_MINIPORT_ISR_CALLBACK_OFFSET_X64 => service_ndis_isr_callback(
+                        dispatch,
                         provider_instance,
                         provider_inst,
                         record,
@@ -30683,6 +30760,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     ),
                     NDIS_MINIPORT_RECONFIGURE_CALLBACK_OFFSET_X64 => {
                         service_ndis_reconfigure_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30699,6 +30777,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     | NDIS_MINIPORT_HALT_CALLBACK_OFFSET_X64
                     | NDIS_MINIPORT_HANDLE_INTERRUPT_CALLBACK_OFFSET_X64 => {
                         dispatch_dependent_provider_callback(
+                            dispatch,
                             record,
                             dependent_inst,
                             exec_code_va,
@@ -30707,6 +30786,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                         )
                     }
                     NDIS_MINIPORT_SEND_CALLBACK_OFFSET_X64 => service_ndis_send_callback(
+                        dispatch,
                         provider_instance,
                         provider_inst,
                         record,
@@ -30718,6 +30798,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     ),
                     NDIS_MINIPORT_RETURN_PACKET_CALLBACK_OFFSET_X64 => {
                         service_ndis_return_packet_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30729,6 +30810,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_MINIPORT_SEND_PACKETS_CALLBACK_OFFSET_X64 => {
                         service_ndis_send_packets_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30741,6 +30823,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_MINIPORT_TRANSFER_DATA_CALLBACK_OFFSET_X64 => {
                         service_ndis_transfer_data_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30758,6 +30841,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                 HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL => match record.callback_offset {
                     NDIS_PROTOCOL_BIND_ADAPTER_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_bind_adapter_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30772,6 +30856,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_PNP_EVENT_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_pnp_event_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30783,6 +30868,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_SEND_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_send_complete_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30795,6 +30881,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_TRANSFER_DATA_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_transfer_data_complete_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30808,6 +30895,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30822,6 +30910,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_complete_callback(
+                            dispatch,
                             record,
                             dependent_inst,
                             exec_code_va,
@@ -30830,6 +30919,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_STATUS_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_status_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30843,6 +30933,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_STATUS_COMPLETE_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_status_complete_callback(
+                            dispatch,
                             record,
                             dependent_inst,
                             exec_code_va,
@@ -30851,6 +30942,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     }
                     NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64 => {
                         service_ndis_protocol_receive_packet_callback(
+                            dispatch,
                             provider_instance,
                             provider_inst,
                             record,
@@ -30864,6 +30956,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                 },
                 HOSTED_PROVIDER_CALLBACK_KIND_MINIPORT_TIMER => {
                     service_ndis_miniport_timer_callback(
+                        dispatch,
                         provider_instance,
                         record,
                         dependent_inst,
@@ -30875,6 +30968,7 @@ unsafe fn service_hosted_provider_callback_explicit(
                     )
                 }
                 HOSTED_PROVIDER_CALLBACK_KIND_NDIS_WORK_ITEM => service_ndis_work_item_callback(
+                    dispatch,
                     provider_instance,
                     record,
                     dependent_inst,

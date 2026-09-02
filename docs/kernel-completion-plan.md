@@ -23178,6 +23178,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the old pump. `cargo fmt --all` and the freestanding executive check are green at the existing
     213-warning baseline.
 
+    B3 provider-callback dispatch boundary checkpoint (2026-09-03, freestanding green; depth
+    window and broker integration open): all twenty supported NDIS callback marshal shapes now
+    receive one stack-owned callback dispatcher. Resource restoration, callback-specific pointer
+    projection and copyout, protocol accounting, failure tracing, and device-context ownership stay
+    in the shared callback core. The ordinary adapter supplies the existing component-target pump;
+    the recursive broker can instead publish the final twelve-word callback frame into the exact
+    dependent lane. There is no global dispatch hook and no retry from an arena dispatcher into the
+    ordinary pump. `cargo fmt --all` and the freestanding executive check are green at the
+    established 213-warning baseline.
+
     B3 depth-owned marshal and multi-lane session checkpoint (2026-09-02, host and freestanding
     green; marshal integration open): arena ABI v4 replaces unused dispatch-page padding with a
     0x800-byte marshal window owned by that exact lane depth. Root can obtain the window only while
