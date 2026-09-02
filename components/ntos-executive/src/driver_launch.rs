@@ -28402,8 +28402,141 @@ unsafe fn service_hosted_provider_export_explicit(
     provider_export_rva: u64,
     provider_publication_cookie: u64,
     caller_rsp: u64,
-    mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> u64 {
+    service_hosted_provider_export_with_dispatch(
+        dependent_channel,
+        provider_export_rva,
+        provider_publication_cookie,
+        caller_rsp,
+        args,
+        |singleton, provider_inst, exec_code_va, marshalled_args, caller_rsp| {
+            dispatch_hosted_provider_export_legacy(
+                singleton,
+                provider_inst,
+                exec_code_va,
+                provider_export_rva,
+                marshalled_args,
+                caller_rsp,
+            )
+        },
+    )
+}
+
+unsafe fn dispatch_hosted_provider_export_legacy(
+    singleton: HostedProviderSingleton,
+    provider_inst: DriverInstance,
+    exec_code_va: u64,
+    provider_export_rva: u64,
+    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    caller_rsp: u64,
+) -> Result<u64, i32> {
+    let provider_shared = provider_inst.exec_shared_va;
+    write_volatile(
+        (provider_shared + SH_REQ_MAJOR) as *mut u64,
+        FSD_DISPATCH_PROVIDER_EXPORT,
+    );
+    write_volatile(
+        (provider_shared + SH_REQ_MINOR) as *mut u64,
+        provider_export_rva,
+    );
+    write_volatile((provider_shared + SH_REQ_FSCTL) as *mut u64, args[0]);
+    write_volatile((provider_shared + SH_REQ_INLEN) as *mut u64, args[1]);
+    write_volatile((provider_shared + SH_REQ_OUTLEN) as *mut u64, args[2]);
+    write_volatile((provider_shared + SH_REQ_FILEID) as *mut u64, args[3]);
+    write_volatile(
+        (provider_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
+        caller_rsp,
+    );
+    let mut stack_index = 0;
+    while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
+        write_volatile(
+            (provider_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8) as *mut u64,
+            args[4 + stack_index as usize],
+        );
+        stack_index += 1;
+    }
+    write_volatile((provider_shared + SH_REQ_STATUS) as *mut i32, 0);
+    write_volatile((provider_shared + SH_REQ_INFO) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_IRP) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_IOSL) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_DATA) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
+    write_volatile((provider_shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
+
+    let ch = crate::spawn_hosts::PumpChannel {
+        fault_ep: provider_inst.fault_ep,
+        pml4: provider_inst.pml4,
+        code_va: 0,
+        image_frames: 0,
+        exec_code_va,
+        root_image_rights: 3,
+        root_image_map_owner: provider_inst.map_cap_bank.owner,
+        shared_va: provider_shared,
+        dispatch_label: FSD_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: provider_inst.tcb,
+        reply_cap: provider_inst.reply_cap,
+        client_pi: 0,
+        client_generation: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Irp,
+            io_port_faults: shared_has_port_resources(provider_shared),
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let pr = hosted_component_pump(&ch);
+    if pr.completed {
+        return Ok(read_volatile((provider_shared + SH_REQ_INFO) as *const u64));
+    }
+    let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
+        print_str(b"[provider-export] incomplete provider=");
+        print_str(singleton.provider.as_bytes());
+        print_str(b" cookie=");
+        print_u64(singleton.provider_publication_cookie);
+        print_str(b" rva=0x");
+        print_hex(provider_export_rva as u32);
+        print_str(b" status=0x");
+        print_hex(pr.status as u32);
+        print_str(b" result=");
+        print_hex64(pr.result);
+        print_str(b" wall-ip=");
+        print_hex64(pr.wall_ip);
+        print_str(b" wall-addr=");
+        print_hex64(pr.wall_addr);
+        print_str(b" wall-label=");
+        print_hex64(pr.wall_label);
+        print_str(b" wall-flags=");
+        print_hex64(pr.wall_flags);
+        print_str(b" tcb=");
+        print_hex64(provider_inst.tcb);
+        print_str(b"\n");
+    }
+    register_instance_ready(singleton.instance, false);
+    Err(STATUS_UNSUCCESSFUL)
+}
+
+unsafe fn service_hosted_provider_export_with_dispatch<F>(
+    dependent_channel: &crate::spawn_hosts::PumpChannel,
+    provider_export_rva: u64,
+    provider_publication_cookie: u64,
+    caller_rsp: u64,
+    mut args: [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    dispatch: F,
+) -> u64
+where
+    F: FnOnce(
+        HostedProviderSingleton,
+        DriverInstance,
+        u64,
+        &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+        u64,
+    ) -> Result<u64, i32>,
+{
     HOSTED_PROVIDER_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let Some((_singleton_index, singleton)) =
         find_hosted_provider_singleton_by_cookie(provider_publication_cookie)
@@ -28560,106 +28693,26 @@ unsafe fn service_hosted_provider_export_explicit(
         abort_provider_export_marshal_before_dispatch(&marshal_state);
         return hosted_provider_export_failure(STATUS_INVALID_DEVICE_REQUEST);
     }
-    write_volatile(
-        (provider_shared + SH_REQ_MAJOR) as *mut u64,
-        FSD_DISPATCH_PROVIDER_EXPORT,
-    );
-    write_volatile(
-        (provider_shared + SH_REQ_MINOR) as *mut u64,
-        provider_export_rva,
-    );
-    write_volatile((provider_shared + SH_REQ_FSCTL) as *mut u64, args[0]);
-    write_volatile((provider_shared + SH_REQ_INLEN) as *mut u64, args[1]);
-    write_volatile((provider_shared + SH_REQ_OUTLEN) as *mut u64, args[2]);
-    write_volatile((provider_shared + SH_REQ_FILEID) as *mut u64, args[3]);
-    write_volatile(
-        (provider_shared + SH_PROVIDER_EXPORT_CALLER_RSP) as *mut u64,
-        caller_rsp,
-    );
-    let mut stack_index = 0;
-    while stack_index < SH_PROVIDER_EXPORT_STACK_QWORDS {
-        write_volatile(
-            (provider_shared + SH_PROVIDER_EXPORT_STACK_BASE + stack_index * 8) as *mut u64,
-            args[4 + stack_index as usize],
-        );
-        stack_index += 1;
-    }
-    write_volatile((provider_shared + SH_REQ_STATUS) as *mut i32, 0);
-    write_volatile((provider_shared + SH_REQ_INFO) as *mut u64, 0);
-    write_volatile((provider_shared + SH_ACTIVE_IRP) as *mut u64, 0);
-    write_volatile((provider_shared + SH_ACTIVE_IOSL) as *mut u64, 0);
-    write_volatile((provider_shared + SH_ACTIVE_DATA) as *mut u64, 0);
-    write_volatile((provider_shared + SH_ACTIVE_DATA_CAP) as *mut u64, 0);
-    write_volatile((provider_shared + SH_ACTIVE_FILE_OBJECT) as *mut u64, 0);
-
     let image_frames = if provider_inst.image_frames == 0 {
         singleton.image_frames
     } else {
         provider_inst.image_frames
     };
-    let ch = crate::spawn_hosts::PumpChannel {
-        fault_ep: provider_inst.fault_ep,
-        pml4: provider_inst.pml4,
-        code_va: 0,
-        image_frames: 0,
-        exec_code_va,
-        root_image_rights: 3,
-        root_image_map_owner: provider_inst.map_cap_bank.owner,
-        shared_va: provider_shared,
-        dispatch_label: FSD_DISPATCH_LABEL,
-        demand_cap: 256,
-        trace_faults: false,
-        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        tcb: provider_inst.tcb,
-        reply_cap: provider_inst.reply_cap,
-        client_pi: 0,
-        client_generation: 0,
-        caps: crate::spawn_hosts::HostCaps {
-            dispatch_server: true,
-            kind: crate::spawn_hosts::ReqKind::Irp,
-            io_port_faults: shared_has_port_resources(provider_shared),
-            ..crate::spawn_hosts::HostCaps::default()
-        },
-    };
-    let pr = hosted_component_pump(&ch);
-    if !pr.completed {
-        let trace = HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if trace < HOSTED_PROVIDER_EXPORT_INCOMPLETE_TRACE_CAP {
-            print_str(b"[provider-export] incomplete provider=");
-            print_str(singleton.provider.as_bytes());
-            print_str(b" cookie=");
-            print_u64(provider_publication_cookie);
-            print_str(b" rva=0x");
-            print_hex(provider_export_rva as u32);
-            print_str(b" status=0x");
-            print_hex(pr.status as u32);
-            print_str(b" result=");
-            print_hex64(pr.result);
-            print_str(b" wall-ip=");
-            print_hex64(pr.wall_ip);
-            print_str(b" wall-addr=");
-            print_hex64(pr.wall_addr);
-            print_str(b" wall-label=");
-            print_hex64(pr.wall_label);
-            print_str(b" wall-flags=");
-            print_hex64(pr.wall_flags);
-            print_str(b" tcb=");
-            print_hex64(provider_inst.tcb);
-            print_str(b"\n");
+    let mut result = match dispatch(singleton, provider_inst, exec_code_va, &args, caller_rsp) {
+        Ok(result) => result,
+        Err(status) => {
+            trace_hosted_provider_export_rejection(
+                &singleton.provider,
+                provider_publication_cookie,
+                provider_export_rva,
+                status,
+                b"dispatch",
+            );
+            abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
+            return hosted_provider_export_failure(status);
         }
-        register_instance_ready(singleton.instance, false);
-        trace_hosted_provider_export_rejection(
-            &singleton.provider,
-            provider_publication_cookie,
-            provider_export_rva,
-            STATUS_UNSUCCESSFUL,
-            b"pump",
-        );
-        abort_provider_export_marshal_after_possible_dispatch(&marshal_state);
-        return hosted_provider_export_failure(STATUS_UNSUCCESSFUL);
-    }
+    };
     let provider_inst = instance(singleton.instance).unwrap_or(provider_inst);
-    let mut result = read_volatile((provider_shared + SH_REQ_INFO) as *const u64);
     if let Err(status) = complete_provider_export_side_effects(
         policy,
         &marshal_state,

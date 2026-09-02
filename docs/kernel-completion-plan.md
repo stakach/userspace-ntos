@@ -23153,6 +23153,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     is present; authority failures are fatal arena faults, and no ordinary-bank fallback is used.
     The freestanding executive check remains green at the established 213-warning baseline.
 
+    B3 provider-export dispatch boundary checkpoint (2026-09-02, freestanding green; recursive
+    broker open): provider export marshalling, resource projection, completion side effects, DMA
+    and NDIS shadow completion, copyout, and tracing now surround an explicit dispatch function.
+    The existing component pump is isolated in the legacy dispatcher and remains selected only by
+    the ordinary entry adapter while live IRQ execution has not yet cut over. The recursive arena
+    broker can therefore publish the already-marshalled twelve-word frame into the exact provider
+    lane and return its real result through the same completion core. Dispatch failure aborts the
+    possibly-executed marshal state and returns the exact provider status; it never retries through
+    the old pump. `cargo fmt --all` and the freestanding executive check are green at the existing
+    213-warning baseline.
+
     Review adjustment: this call graph cannot be implemented as another immediate-result arm in the
     single-lane root session. A dependent lane parks `ProviderImport`; root must retain the exact
     dependency lease and drive a provider-domain arena while that Service stays open. A provider
