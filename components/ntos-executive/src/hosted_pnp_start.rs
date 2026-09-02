@@ -151,7 +151,7 @@ pub(crate) struct OwnedHostedPnpStartBatch {
     report: HostedPnpStartReport,
     pending_device_id: u64,
     pending_filter: Option<PendingHostedPnpFilter>,
-    pending_relations_device_id: u64,
+    pending_relations: Option<driver_launch::HostedPnpRelationRefresh>,
     single_start_evidence: SingleStartEvidence,
 }
 
@@ -212,7 +212,7 @@ impl OwnedHostedPnpStartBatch {
             report,
             pending_device_id: 0,
             pending_filter: None,
-            pending_relations_device_id: 0,
+            pending_relations: None,
             single_start_evidence: SingleStartEvidence::NotDispatched,
         }
     }
@@ -301,7 +301,7 @@ impl OwnedHostedPnpStartBatch {
         self.pending_filter
             .as_ref()
             .is_some_and(|pending| pending.ownership_lost.is_none())
-            || self.pending_relations_device_id != 0
+            || self.pending_relations.is_some()
             || matches!(
                 self.coordinator.phase(),
                 nt_driver_start::BatchPhase::Ready | nt_driver_start::BatchPhase::Awaiting { .. }
@@ -324,8 +324,8 @@ impl OwnedHostedPnpStartBatch {
     ) -> OwnedHostedPnpStartProgress {
         assert_ne!(device_id, 0, "successful START lost its canonical device");
         match driver_launch::enqueue_hosted_initial_bus_relations(device_id) {
-            Ok(_) => {
-                self.pending_relations_device_id = device_id;
+            Ok(refresh) => {
+                self.pending_relations = Some(refresh);
                 OwnedHostedPnpStartProgress::AwaitingCompletion
             }
             Err(status) => OwnedHostedPnpStartProgress::Complete(Err(HostedPnpStartBatchFailure {
@@ -442,18 +442,18 @@ impl OwnedHostedPnpStartBatch {
 
     unsafe fn drive_inner(&mut self, pump_before_observe: bool) -> OwnedHostedPnpStartProgress {
         loop {
-            if self.pending_relations_device_id != 0 {
+            if let Some(refresh) = self.pending_relations {
                 if pump_before_observe {
                     driver_launch::pump_hosted_io_completions();
                 }
-                match driver_launch::hosted_pnp_enumeration_progress() {
-                    driver_launch::HostedPnpEnumerationProgress::Current => {
-                        self.pending_relations_device_id = 0;
+                match driver_launch::hosted_pnp_relation_progress(refresh) {
+                    driver_launch::HostedPnpRelationProgress::Current => {
+                        self.pending_relations = None;
                     }
-                    driver_launch::HostedPnpEnumerationProgress::Pending => {
+                    driver_launch::HostedPnpRelationProgress::Pending => {
                         return OwnedHostedPnpStartProgress::AwaitingCompletion;
                     }
-                    driver_launch::HostedPnpEnumerationProgress::Blocked(status) => {
+                    driver_launch::HostedPnpRelationProgress::Blocked(status) => {
                         return OwnedHostedPnpStartProgress::Complete(Err(
                             HostedPnpStartBatchFailure {
                                 status,
@@ -625,20 +625,6 @@ impl OwnedHostedPnpStartBatch {
                     }
                 }
                 nt_driver_start::BatchPhase::Ready => {
-                    match driver_launch::hosted_pnp_enumeration_progress() {
-                        driver_launch::HostedPnpEnumerationProgress::Current => {}
-                        driver_launch::HostedPnpEnumerationProgress::Pending => {
-                            return OwnedHostedPnpStartProgress::AwaitingCompletion;
-                        }
-                        driver_launch::HostedPnpEnumerationProgress::Blocked(status) => {
-                            return OwnedHostedPnpStartProgress::Complete(Err(
-                                HostedPnpStartBatchFailure {
-                                    status,
-                                    teardown_blocked: true,
-                                },
-                            ));
-                        }
-                    }
                     let devnode_index = self.coordinator.next_devnode();
                     let devnode = &self.spec.devnodes[devnode_index];
                     let progress = start_one_devnode(

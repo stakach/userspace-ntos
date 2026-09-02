@@ -22859,6 +22859,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and pinless children behind route reconciliation. Do not copy NT5's legacy PCI InterruptLine
     fallback when `_PRT` is absent; this kernel keeps the child unassigned and fails closed.
 
+    B3 generation-owned parent relation checkpoint (2026-09-02, host and freestanding validation
+    green; desktop runtime pending): `nt-pnp-manager` now gives every bus its own monotonic
+    `BusRelationIdentity` while retaining the table-wide generation only as prepare/commit
+    serialization. Every bus-reported PDO retains the exact parent devnode ID/generation and
+    relation generation that published it. Child publication requires that parent generation to be
+    `Started`, revalidates it immediately before the allocation-free commit, refreshes retained
+    children without changing their devnode generation, and rejects cross-parent reuse. Resource
+    commit now joins the child's retained parent identity to the same bus's current complete relation
+    set and rejects a stopped/replaced parent or removed/stale child.
+
+    The invalidation queue now owns the exact parent devnode generation as well as PDO/type/sequence.
+    `OwnedHostedPnpStartBatch` retains that exact invalidation and the same bus's base relation
+    generation; completion is current only after the token drains and that bus advances. The old
+    `hosted_pnp_enumeration_progress` function, its batch-wide Ready check, and the whole-topology
+    reconciliation enum/function are deleted. Unrelated buses, platform devices, and pinless PCI
+    devices no longer wait on an arbitrary relation or PCI route transaction. IRQ-bearing PCI
+    assignment remains fail-closed through the existing exact inventory/scope/route/physical-line
+    claim and its immediate pre-publication revalidation. Ordinary terminal relation failures are
+    retained by exact invalidation and release the query slot. If completion exposes a coalesced
+    successor invalidation, the PCI topology dirty owner and route fence remain live for that exact
+    successor instead of being converted into a terminal route block. An unreclaimable indeterminate
+    IRP remains quarantined as transport ownership rather than being reported as route readiness.
+
+    `nt-pnp-manager` passes 64/64 focused tests, including independent bus generations, exact
+    pending/claimed/requeued/drained invalidation identity, retained-child generation refresh,
+    prepare-to-commit parent stop fencing, unrelated-bus independence, and current-relation resource
+    admission. The freestanding executive check is green at the established 215-warning baseline,
+    formatting and diff checks are clean, and no old global enumeration-progress symbol remains.
+    Next run the serialized Simpleboot desktop lane and require parent-bound relation publication,
+    genuine PCI route/interrupt service, Explorer framebuffer proof, all gates, and the sentinel.
+
     Review adjustment: after the rebuilt provider artifact is pinned, run the serialized desktop
     acceptance with PIT IRQ evidence, provider-initialization `_PIC(1)` success before the first real
     `_PRT`, Q35 E1000 GSI 23 publication, genuine NIC delivery, Explorer framebuffer proof, and the

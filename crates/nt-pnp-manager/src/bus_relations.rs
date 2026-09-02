@@ -197,6 +197,7 @@ fn read_query_id_unit(bytes: &[u8], byte_index: usize) -> Result<u16, BusQueryId
 /// component-local projections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceRelationInvalidation {
+    pub parent: crate::DevnodeIdentity,
     pub pdo_device_id: u64,
     pub relation_type: u32,
     pub sequence: u64,
@@ -242,6 +243,7 @@ enum DeviceRelationInvalidationState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DeviceRelationInvalidationRow {
+    parent: crate::DevnodeIdentity,
     pdo_device_id: u64,
     relation_type: u32,
     state: DeviceRelationInvalidationState,
@@ -271,22 +273,47 @@ impl DeviceRelationInvalidationQueue {
         self.rows.is_empty()
     }
 
+    /// Whether the queue still owns this exact invalidation generation, pending or claimed.
+    pub fn contains(&self, invalidation: DeviceRelationInvalidation) -> bool {
+        self.rows.iter().any(|row| {
+            row.parent == invalidation.parent
+                && row.pdo_device_id == invalidation.pdo_device_id
+                && row.relation_type == invalidation.relation_type
+                && match row.state {
+                    DeviceRelationInvalidationState::Pending { sequence } => {
+                        sequence == invalidation.sequence
+                    }
+                    DeviceRelationInvalidationState::Claimed {
+                        sequence,
+                        requeue_sequence,
+                    } => {
+                        sequence == invalidation.sequence
+                            || requeue_sequence == Some(invalidation.sequence)
+                    }
+                }
+        })
+    }
+
     pub fn enqueue(
         &mut self,
-        pdo_device_id: u64,
+        parent: crate::DevnodeIdentity,
         relation_type: u32,
     ) -> Result<EnqueuedDeviceRelationInvalidation, DeviceRelationInvalidationError> {
-        if pdo_device_id == 0 {
+        let pdo_device_id = parent.pdo_object_id();
+        if parent.devnode_id() == 0 || parent.generation() == 0 || pdo_device_id == 0 {
             return Err(DeviceRelationInvalidationError::InvalidPdo);
         }
         if let Some(index) = self.rows.iter().position(|row| {
-            row.pdo_device_id == pdo_device_id && row.relation_type == relation_type
+            row.parent == parent
+                && row.pdo_device_id == pdo_device_id
+                && row.relation_type == relation_type
         }) {
             return match self.rows[index].state {
                 DeviceRelationInvalidationState::Pending { sequence } => {
                     Ok(EnqueuedDeviceRelationInvalidation {
                         disposition: DeviceRelationInvalidationDisposition::Coalesced,
                         invalidation: DeviceRelationInvalidation {
+                            parent,
                             pdo_device_id,
                             relation_type,
                             sequence,
@@ -299,6 +326,7 @@ impl DeviceRelationInvalidationQueue {
                 } => Ok(EnqueuedDeviceRelationInvalidation {
                     disposition: DeviceRelationInvalidationDisposition::Coalesced,
                     invalidation: DeviceRelationInvalidation {
+                        parent,
                         pdo_device_id,
                         relation_type,
                         sequence,
@@ -316,6 +344,7 @@ impl DeviceRelationInvalidationQueue {
                     Ok(EnqueuedDeviceRelationInvalidation {
                         disposition: DeviceRelationInvalidationDisposition::Requeued,
                         invalidation: DeviceRelationInvalidation {
+                            parent,
                             pdo_device_id,
                             relation_type,
                             sequence: requeue_sequence,
@@ -330,6 +359,7 @@ impl DeviceRelationInvalidationQueue {
             .map_err(|_| DeviceRelationInvalidationError::InsufficientResources)?;
         let sequence = self.allocate_sequence()?;
         self.rows.push(DeviceRelationInvalidationRow {
+            parent,
             pdo_device_id,
             relation_type,
             state: DeviceRelationInvalidationState::Pending { sequence },
@@ -337,6 +367,7 @@ impl DeviceRelationInvalidationQueue {
         Ok(EnqueuedDeviceRelationInvalidation {
             disposition: DeviceRelationInvalidationDisposition::Queued,
             invalidation: DeviceRelationInvalidation {
+                parent,
                 pdo_device_id,
                 relation_type,
                 sequence,
@@ -360,6 +391,7 @@ impl DeviceRelationInvalidationQueue {
             requeue_sequence: None,
         };
         Some(DeviceRelationInvalidation {
+            parent: row.parent,
             pdo_device_id: row.pdo_device_id,
             relation_type: row.relation_type,
             sequence,
@@ -378,7 +410,8 @@ impl DeviceRelationInvalidationQueue {
             .rows
             .iter()
             .position(|row| {
-                row.pdo_device_id == invalidation.pdo_device_id
+                row.parent == invalidation.parent
+                    && row.pdo_device_id == invalidation.pdo_device_id
                     && row.relation_type == invalidation.relation_type
                     && matches!(
                         row.state,
@@ -404,6 +437,7 @@ impl DeviceRelationInvalidationQueue {
                 self.rows[index].state = DeviceRelationInvalidationState::Pending { sequence };
                 Ok(DeviceRelationInvalidationCompletion::Requeued(
                     DeviceRelationInvalidation {
+                        parent: self.rows[index].parent,
                         pdo_device_id: self.rows[index].pdo_device_id,
                         relation_type: self.rows[index].relation_type,
                         sequence,
@@ -448,7 +482,8 @@ impl DeviceRelationInvalidationQueue {
         self.rows
             .iter()
             .position(|row| {
-                row.pdo_device_id == claim.pdo_device_id
+                row.parent == claim.parent
+                    && row.pdo_device_id == claim.pdo_device_id
                     && row.relation_type == claim.relation_type
                     && matches!(
                         row.state,
@@ -576,7 +611,25 @@ pub enum BusRelationError {
 #[derive(Clone, Debug)]
 struct AcceptedBusRelations {
     bus_object_id: u64,
+    relation_generation: u64,
     children: Vec<BusReportedChild>,
+}
+
+/// Exact generation of one bus's accepted complete relation set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusRelationIdentity {
+    bus_object_id: u64,
+    generation: u64,
+}
+
+impl BusRelationIdentity {
+    pub const fn bus_object_id(self) -> u64 {
+        self.bus_object_id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
 }
 
 /// Exact prepared ownership for one complete bus-relations publication. The next relation set is
@@ -586,6 +639,7 @@ pub struct PreparedBusRelations {
     base_generation: u64,
     next_generation: u64,
     bus_object_id: u64,
+    relation_generation: u64,
     next_children: Vec<BusReportedChild>,
     changes: Vec<BusRelationChange>,
 }
@@ -605,6 +659,13 @@ impl PreparedBusRelations {
 
     pub const fn bus_object_id(&self) -> u64 {
         self.bus_object_id
+    }
+
+    pub const fn relation_identity(&self) -> BusRelationIdentity {
+        BusRelationIdentity {
+            bus_object_id: self.bus_object_id,
+            generation: self.relation_generation,
+        }
     }
 }
 
@@ -631,6 +692,31 @@ impl BusRelationTable {
             .iter()
             .find(|bus| bus.bus_object_id == bus_object_id)
             .map(|bus| bus.children.as_slice())
+    }
+
+    pub fn current_relation_identity(&self, bus_object_id: u64) -> Option<BusRelationIdentity> {
+        self.buses
+            .iter()
+            .find(|bus| bus.bus_object_id == bus_object_id)
+            .map(|bus| BusRelationIdentity {
+                bus_object_id,
+                generation: bus.relation_generation,
+            })
+    }
+
+    pub fn relation_contains(
+        &self,
+        identity: BusRelationIdentity,
+        child_pdo_object_id: u64,
+    ) -> bool {
+        self.buses.iter().any(|bus| {
+            bus.bus_object_id == identity.bus_object_id
+                && bus.relation_generation == identity.generation
+                && bus
+                    .children
+                    .iter()
+                    .any(|child| child.pdo_object_id == child_pdo_object_id)
+        })
     }
 
     /// Resolve one accepted Enum instance across all buses. Global instance identity is unique;
@@ -691,6 +777,7 @@ impl BusRelationTable {
         owned.extend_from_slice(children);
         self.buses.push(AcceptedBusRelations {
             bus_object_id,
+            relation_generation: 1,
             children: owned,
         });
         self.generation = next_generation;
@@ -726,6 +813,14 @@ impl BusRelationTable {
             .find(|bus| bus.bus_object_id == bus_object_id)
             .map(|bus| bus.children.as_slice())
             .unwrap_or(&[]);
+        let relation_generation = self
+            .buses
+            .iter()
+            .find(|bus| bus.bus_object_id == bus_object_id)
+            .map(|bus| bus.relation_generation)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(BusRelationError::GenerationExhausted)?;
         validate_stable_pdo_identities(previous, children)?;
 
         let mut next_children = Vec::new();
@@ -772,6 +867,7 @@ impl BusRelationTable {
             base_generation: self.generation,
             next_generation,
             bus_object_id,
+            relation_generation,
             next_children,
             changes,
         })
@@ -793,11 +889,19 @@ impl BusRelationTable {
             .iter_mut()
             .find(|bus| bus.bus_object_id == prepared.bus_object_id)
         {
+            if prepared.relation_generation != bus.relation_generation.saturating_add(1) {
+                return Err(BusRelationError::StaleTransaction);
+            }
             bus.children = prepared.next_children;
+            bus.relation_generation = prepared.relation_generation;
         } else {
+            if prepared.relation_generation != 1 {
+                return Err(BusRelationError::StaleTransaction);
+            }
             debug_assert!(self.buses.len() < self.buses.capacity());
             self.buses.push(AcceptedBusRelations {
                 bus_object_id: prepared.bus_object_id,
+                relation_generation: prepared.relation_generation,
                 children: prepared.next_children,
             });
         }
@@ -882,6 +986,14 @@ mod tests {
             hardware,
             &[r"ROOT\USERSPACE_NTOS_TEST_DEVICE"],
         )
+    }
+
+    fn parent(pdo: u64) -> crate::DevnodeIdentity {
+        crate::DevnodeIdentity {
+            devnode_id: pdo,
+            generation: 1,
+            pdo_object_id: pdo,
+        }
     }
 
     #[test]
@@ -1144,6 +1256,10 @@ mod tests {
         table.commit_bus_relations(prepared).unwrap();
         assert_eq!(table.accepted_children(1).unwrap()[0].pdo_object_id, 10);
         assert_eq!(table.accepted_children(2).unwrap()[0].pdo_object_id, 20);
+        assert_eq!(table.current_relation_identity(1).unwrap().generation(), 1);
+        assert_eq!(table.current_relation_identity(2).unwrap().generation(), 2);
+        assert!(table.relation_contains(table.current_relation_identity(1).unwrap(), 10));
+        assert!(!table.relation_contains(table.current_relation_identity(2).unwrap(), 10));
     }
 
     #[test]
@@ -1234,8 +1350,8 @@ mod tests {
     #[test]
     fn pending_device_relation_invalidations_coalesce() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let first = queue.enqueue(10, 0).unwrap();
-        let duplicate = queue.enqueue(10, 0).unwrap();
+        let first = queue.enqueue(parent(10), 0).unwrap();
+        let duplicate = queue.enqueue(parent(10), 0).unwrap();
         assert_eq!(
             first.disposition,
             DeviceRelationInvalidationDisposition::Queued
@@ -1258,22 +1374,25 @@ mod tests {
     #[test]
     fn invalidation_during_claim_is_not_lost() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let first = queue.enqueue(10, 0).unwrap().invalidation;
+        let first = queue.enqueue(parent(10), 0).unwrap().invalidation;
         let claim = queue.claim_front().unwrap();
         assert_eq!(claim, first);
+        assert!(queue.contains(first));
 
-        let follow_up = queue.enqueue(10, 0).unwrap();
+        let follow_up = queue.enqueue(parent(10), 0).unwrap();
         assert_eq!(
             follow_up.disposition,
             DeviceRelationInvalidationDisposition::Requeued
         );
         assert!(follow_up.invalidation.sequence > claim.sequence);
-        let duplicate = queue.enqueue(10, 0).unwrap();
+        let duplicate = queue.enqueue(parent(10), 0).unwrap();
         assert_eq!(
             duplicate.disposition,
             DeviceRelationInvalidationDisposition::Coalesced
         );
         assert_eq!(duplicate.invalidation, follow_up.invalidation);
+        assert!(queue.contains(first));
+        assert!(queue.contains(follow_up.invalidation));
 
         assert_eq!(
             queue.complete(claim),
@@ -1282,17 +1401,20 @@ mod tests {
             ))
         );
         assert_eq!(queue.claim_front(), Some(follow_up.invalidation));
+        assert!(!queue.contains(first));
+        assert!(queue.contains(follow_up.invalidation));
         assert_eq!(
             queue.complete(follow_up.invalidation),
             Ok(DeviceRelationInvalidationCompletion::Drained)
         );
         assert!(queue.is_empty());
+        assert!(!queue.contains(follow_up.invalidation));
     }
 
     #[test]
     fn abort_retries_the_exact_claim_without_allocation() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let original = queue.enqueue(10, 0).unwrap().invalidation;
+        let original = queue.enqueue(parent(10), 0).unwrap().invalidation;
         let claim = queue.claim_front().unwrap();
         queue.abort(claim).unwrap();
         assert_eq!(queue.claim_front(), Some(original));
@@ -1301,8 +1423,8 @@ mod tests {
     #[test]
     fn pending_discard_rolls_back_only_the_exact_unclaimed_request() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let first = queue.enqueue(10, 0).unwrap().invalidation;
-        let second = queue.enqueue(20, 0).unwrap().invalidation;
+        let first = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        let second = queue.enqueue(parent(20), 0).unwrap().invalidation;
         let stale = DeviceRelationInvalidation {
             sequence: first.sequence + 10,
             ..first
@@ -1325,9 +1447,9 @@ mod tests {
     #[test]
     fn abort_absorbs_a_later_invalidation_into_the_retry() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let original = queue.enqueue(10, 0).unwrap().invalidation;
+        let original = queue.enqueue(parent(10), 0).unwrap().invalidation;
         let claim = queue.claim_front().unwrap();
-        let later = queue.enqueue(10, 0).unwrap().invalidation;
+        let later = queue.enqueue(parent(10), 0).unwrap().invalidation;
         assert!(later.sequence > original.sequence);
         queue.abort(claim).unwrap();
         assert_eq!(queue.claim_front(), Some(original));
@@ -1338,9 +1460,9 @@ mod tests {
     #[test]
     fn queue_orders_independent_pdos_and_relation_types_by_sequence() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let first = queue.enqueue(20, 1).unwrap().invalidation;
-        let second = queue.enqueue(10, 0).unwrap().invalidation;
-        let third = queue.enqueue(20, 0).unwrap().invalidation;
+        let first = queue.enqueue(parent(20), 1).unwrap().invalidation;
+        let second = queue.enqueue(parent(10), 0).unwrap().invalidation;
+        let third = queue.enqueue(parent(20), 0).unwrap().invalidation;
         assert_eq!(queue.claim_front(), Some(first));
         assert_eq!(queue.claim_front(), Some(second));
         queue.complete(second).unwrap();
@@ -1353,7 +1475,7 @@ mod tests {
     #[test]
     fn completion_and_abort_require_the_exact_live_claim() {
         let mut queue = DeviceRelationInvalidationQueue::new();
-        let pending = queue.enqueue(10, 0).unwrap().invalidation;
+        let pending = queue.enqueue(parent(10), 0).unwrap().invalidation;
         assert_eq!(
             queue.complete(pending),
             Err(DeviceRelationInvalidationError::StaleClaim)
@@ -1382,12 +1504,12 @@ mod tests {
     fn invalid_pdo_and_sequence_exhaustion_fail_without_queueing() {
         let mut queue = DeviceRelationInvalidationQueue::new();
         assert_eq!(
-            queue.enqueue(0, 0),
+            queue.enqueue(parent(0), 0),
             Err(DeviceRelationInvalidationError::InvalidPdo)
         );
         queue.next_sequence = u64::MAX;
         assert_eq!(
-            queue.enqueue(10, 0),
+            queue.enqueue(parent(10), 0),
             Err(DeviceRelationInvalidationError::SequenceExhausted)
         );
         assert!(queue.is_empty());

@@ -37,19 +37,18 @@ use nt_hosted_runtime::{
     hosted_provider_has_export_marshal_policies, hosted_provider_internal_marshal_policy,
     ndis_miniport_characteristics_layout, ndis_protocol_characteristics_layout,
     plan_hosted_driver_image, plan_hosted_provider_import_binding,
-    plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedOneShotCallbackError,
-    HostedOneShotCallbackState, HostedOneShotCallbackToken, HostedProviderArgumentMarshal,
-    HostedIrqGrantIdentity, HostedProviderCallbackThunkPlan, HostedProviderDomainDescriptor,
+    plan_hosted_provider_import_thunk, HostedDriverImagePlanError, HostedIrqGrantIdentity,
+    HostedOneShotCallbackError, HostedOneShotCallbackState, HostedOneShotCallbackToken,
+    HostedProviderArgumentMarshal, HostedProviderCallbackThunkPlan, HostedProviderDomainDescriptor,
     HostedProviderDomainError, HostedProviderDomainStatus, HostedProviderExportCallPlan,
     HostedProviderExportMarshalPolicy, HostedProviderExportResultSemantics,
-    HostedProviderExportSideEffect,
-    HostedProviderImportBinding, HostedProviderImportBindingError, HostedProviderImportThunkError,
-    HostedProviderImportThunkPlan, HostedProviderObjectOwner, HostedProviderReleaseProgress,
-    HostedThunkLeaseRelease, HostedThunkReservation, HostedThunkSlotKey, HostedThunkSlotRegistry,
-    HostedThunkSlotToken, NdisMiniportCharacteristicsLayoutError,
-    NdisProtocolCharacteristicsLayoutError, HOSTED_PROVIDER_EXPORT_ARG_CAP,
-    HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN, NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64,
-    NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
+    HostedProviderExportSideEffect, HostedProviderImportBinding, HostedProviderImportBindingError,
+    HostedProviderImportThunkError, HostedProviderImportThunkPlan, HostedProviderObjectOwner,
+    HostedProviderReleaseProgress, HostedThunkLeaseRelease, HostedThunkReservation,
+    HostedThunkSlotKey, HostedThunkSlotRegistry, HostedThunkSlotToken,
+    NdisMiniportCharacteristicsLayoutError, NdisProtocolCharacteristicsLayoutError,
+    HOSTED_PROVIDER_EXPORT_ARG_CAP, HOSTED_PROVIDER_IMPORT_THUNK_SLOT_LEN,
+    NDIS_MINIPORT_BLOCK_ETH_DB_OFFSET_X64, NDIS_MINIPORT_BLOCK_ETH_RX_COMPLETE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_ETH_RX_INDICATE_HANDLER_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_MINIPORT_ADAPTER_CONTEXT_OFFSET_X64,
     NDIS_MINIPORT_BLOCK_PACKET_INDICATE_HANDLER_OFFSET_X64,
@@ -92,13 +91,13 @@ use nt_io_manager::{
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
-    HostedDriverThreadError, HostedDriverThreadTable, InterruptConnectionDisposition,
+    HostedDriverThreadError, HostedDriverThreadTable,
+    InterruptConnection as KernelInterruptConnection, InterruptConnectionDisposition,
     InterruptConnectionIdentity, InterruptConnectionLease, InterruptConnectionRundown,
-    InterruptConnection as KernelInterruptConnection, InterruptLineDelivery,
-    InterruptLineDeliveryPhase, InterruptLineDisposition, InterruptLineIdentity,
-    InterruptLineRundown, InterruptLineScanCompletion, InterruptMode as KernelInterruptMode,
-    InterruptRundownState, InterruptScan, InterruptScanProgress,
-    HOSTED_DRIVER_THREAD_HANDLE_BASE, SEMAPHORE_OBJECT,
+    InterruptLineDelivery, InterruptLineDeliveryPhase, InterruptLineDisposition,
+    InterruptLineIdentity, InterruptLineRundown, InterruptLineScanCompletion,
+    InterruptMode as KernelInterruptMode, InterruptRundownState, InterruptScan,
+    InterruptScanProgress, HOSTED_DRIVER_THREAD_HANDLE_BASE, SEMAPHORE_OBJECT,
 };
 use nt_mdl::MdlRegistry;
 use nt_resource_manager::{
@@ -11344,13 +11343,7 @@ unsafe fn hosted_lower_irql(irql: u8) {
 fn hosted_irq_lane_protocol_fault(sequence: u64) -> ! {
     loop {
         unsafe {
-            let _ = call_on4(
-                (FSD_IRQ_LANE_FAULT_LABEL << 12) | 1,
-                sequence,
-                0,
-                0,
-                0,
-            );
+            let _ = call_on4((FSD_IRQ_LANE_FAULT_LABEL << 12) | 1, sequence, 0, 0, 0);
         }
     }
 }
@@ -12565,8 +12558,7 @@ extern "win64" fn s_ke_synchronize_execution(interrupt: u64, routine: u64, conte
         }
         let synchronize_irql =
             read_unaligned((interrupt + HOSTED_KINTERRUPT_SYNCHRONIZE_IRQL) as *const u8);
-        let actual_lock =
-            read_unaligned((interrupt + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64);
+        let actual_lock = read_unaligned((interrupt + HOSTED_KINTERRUPT_ACTUAL_LOCK) as *const u64);
         if actual_lock == 0 || synchronize_irql < DISPATCH_LEVEL {
             return 0;
         }
@@ -14191,15 +14183,8 @@ extern "win64" fn s_hal_acpi_query_interrupt_model(interrupt_model_out: u64) -> 
     if interrupt_model_out == 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    let (_label, status, interrupt_model, _, _) = unsafe {
-        call_on4(
-            FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL << 12,
-            0,
-            0,
-            0,
-            0,
-        )
-    };
+    let (_label, status, interrupt_model, _, _) =
+        unsafe { call_on4(FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL << 12, 0, 0, 0, 0) };
     let status = status as u32 as i32;
     if status != STATUS_SUCCESS {
         return status;
@@ -37919,6 +37904,7 @@ fn copy_hosted_relation_property_blob(
 unsafe fn prepare_hosted_relation_devnodes(
     children: &[nt_pnp_manager::BusReportedChild],
     properties: &[HostedBusChildProperties],
+    parent_relation: nt_pnp_manager::ParentRelationIdentity,
 ) -> Result<nt_pnp_manager::PreparedEnumeratedPdoBatch, HostedRelationPublishError> {
     if children.len() != properties.len() {
         return Err(HostedRelationPublishError::Barrier(
@@ -37955,11 +37941,14 @@ unsafe fn prepare_hosted_relation_devnodes(
             nt_pnp_manager::PropertyBlobState::KnownNone,
             copy_hosted_relation_property_blob(&properties.resource_requirements)?,
         );
-        records.push(nt_pnp_manager::EnumeratedPdoRecord::new(
-            hosted_relation_instance_path(child)?,
-            child.pdo_object_id,
-            pdo_properties,
-        ));
+        records.push(
+            nt_pnp_manager::EnumeratedPdoRecord::new(
+                hosted_relation_instance_path(child)?,
+                child.pdo_object_id,
+                pdo_properties,
+            )
+            .with_parent_relation(parent_relation),
+        );
     }
     hosted_pnp_manager_mut()
         .prepare_enumerated_pdo_batch(records)
@@ -38312,8 +38301,19 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let prepared = hosted_bus_relations_mut()
         .prepare_bus_relations(bus_object_id, &query.reported_children)
         .map_err(hosted_relation_error_from_pnp)?;
-    let prepared_devnodes =
-        prepare_hosted_relation_devnodes(&query.reported_children, &query.child_properties)?;
+    let parent_relation = hosted_pnp_manager_mut()
+        .claim_started_parent_relation(bus_object_id, prepared.relation_identity())
+        .map_err(hosted_relation_error_from_devnode_pnp)?;
+    if parent_relation.parent() != claim.parent {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
+    let prepared_devnodes = prepare_hosted_relation_devnodes(
+        &query.reported_children,
+        &query.child_properties,
+        parent_relation,
+    )?;
 
     let mut policies = Vec::new();
     let mut existing = Vec::new();
@@ -38348,6 +38348,11 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
         }
     }
 
+    if !hosted_pnp_manager_mut().relation_parent_is_started(parent_relation) {
+        return Err(HostedRelationPublishError::Barrier(
+            nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+        ));
+    }
     hosted_pnp_manager_mut()
         .commit_enumerated_pdo_batch(prepared_devnodes)
         .expect("published CM relation transaction invalidated its prepared PnP devnodes");
@@ -38364,11 +38369,12 @@ unsafe fn publish_hosted_bus_relations() -> Result<(), HostedRelationPublishErro
     let invalidation_completion = hosted_device_relation_invalidations_mut()
         .complete(claim)
         .expect("published relation transaction lost its exact invalidation claim");
-    let route_reconciliation_ready = crate::hosted_pci_topology::note_hosted_pci_relation_completion(
-        relation_owner,
-        invalidation_completion,
-    )
-    .expect("published relation transaction lost its PCI topology dirty claim");
+    let route_reconciliation_ready =
+        crate::hosted_pci_topology::note_hosted_pci_relation_completion(
+            relation_owner,
+            invalidation_completion,
+        )
+        .expect("published relation transaction lost its PCI topology dirty claim");
     *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
     if route_reconciliation_ready {
         // Consume the exact catalog/inventory generation at the transaction boundary that made it
@@ -38387,6 +38393,22 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
         else {
             return progress;
         };
+        if phase != HostedDeviceRelationQueryPhase::Barrier {
+            let parent = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+                .as_ref()
+                .expect("relation query disappeared during parent validation")
+                .claim
+                .parent;
+            if !hosted_pnp_manager_mut().devnode_identity_is_started(parent) {
+                set_hosted_relation_query_disposition(
+                    HostedDeviceRelationQueryDisposition::Barrier(
+                        nt_status::NtStatus::INVALID_DEVICE_REQUEST,
+                    ),
+                );
+                progress = progress.saturating_add(1);
+                continue;
+            }
+        }
         match phase {
             HostedDeviceRelationQueryPhase::AwaitingCompletion => {
                 let (irp_id, claim, origin_driver_id, completion_driver_id, completion_device_id) = {
@@ -39702,7 +39724,67 @@ unsafe fn drain_hosted_device_relation_query() -> usize {
     }
 }
 
+unsafe fn retire_hosted_device_relation_barrier() -> usize {
+    let Some((claim, irp_id, status)) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .filter(|query| query.phase == HostedDeviceRelationQueryPhase::Barrier)
+        .map(|query| {
+            (
+                query.claim,
+                query.irp_id,
+                query
+                    .barrier_status
+                    .unwrap_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+            )
+        })
+    else {
+        return 0;
+    };
+    let failures = hosted_device_relation_failures_mut();
+    if !failures.iter().any(|failure| failure.invalidation == claim)
+        && failures.try_reserve(1).is_err()
+    {
+        return 0;
+    }
+    if irp_id.raw() != 0 && io_manager_mut().irp(irp_id).is_some() {
+        if io_manager_mut().completed_irp(irp_id).is_none()
+            || io_manager_mut()
+                .acknowledge_completed_irp_strict(irp_id)
+                .is_err()
+        {
+            return 0;
+        }
+    }
+    if !hosted_device_relation_failures_mut()
+        .iter()
+        .any(|failure| failure.invalidation == claim)
+    {
+        hosted_device_relation_failures_mut().push(HostedDeviceRelationFailure {
+            invalidation: claim,
+            status,
+        });
+    }
+    let invalidation_completion = hosted_device_relation_invalidations_mut()
+        .complete(claim)
+        .expect("failed relation query lost its exact invalidation claim");
+    if matches!(
+        invalidation_completion,
+        nt_pnp_manager::DeviceRelationInvalidationCompletion::Drained
+    ) {
+        crate::hosted_pci_topology::note_hosted_pci_relation_failure(claim.pdo_device_id, status)
+            .expect("failed relation query lost its PCI topology dirty owner");
+    }
+    *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_QUERY) = None;
+    1
+}
+
 unsafe fn start_hosted_device_relation_query() -> usize {
+    if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY))
+        .as_ref()
+        .is_some_and(|query| query.phase == HostedDeviceRelationQueryPhase::Barrier)
+    {
+        return retire_hosted_device_relation_barrier();
+    }
     if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).is_some()
         || (*core::ptr::addr_of!(HOSTED_ACPI_PCI_ROUTE_QUERY)).is_some()
         || hosted_pnp_lifecycle_dispatch_active()
@@ -39726,9 +39808,7 @@ unsafe fn start_hosted_device_relation_query() -> usize {
             .expect("fenced hosted relation claim could not be returned to its queue");
         return 0;
     }
-    if hosted_pnp_manager_mut()
-        .devnode_for_pdo(claim.pdo_device_id)
-        .is_none()
+    if !hosted_pnp_manager_mut().devnode_identity_is_started(claim.parent)
         || io_manager_mut().device(pdo_device_id).is_none()
     {
         retain_hosted_relation_query_barrier(
@@ -42028,11 +42108,7 @@ struct HostedPhysicalIrqLease {
 }
 
 impl HostedIrqConnectionAuthority {
-    fn bind(
-        self,
-        binding: HostedDeviceBinding,
-        lane_generation: u64,
-    ) -> HostedIrqConnection {
+    fn bind(self, binding: HostedDeviceBinding, lane_generation: u64) -> HostedIrqConnection {
         let rundown_identity = InterruptConnectionIdentity::new(
             binding.projection_domain.domain_id.raw(),
             binding.projection_domain.cookie,
@@ -42136,8 +42212,7 @@ impl HostedIrqLaneRuntime {
             ipc_buffer: HostedIrqLaneLeaf::EMPTY,
             trampoline: HostedIrqLaneLeaf::EMPTY,
             kpcr: HostedIrqLaneLeaf::EMPTY,
-            arena: [HostedIrqLaneLeaf::EMPTY;
-                nt_hosted_runtime::HOSTED_IRQ_ARENA_PAGE_COUNT],
+            arena: [HostedIrqLaneLeaf::EMPTY; nt_hosted_runtime::HOSTED_IRQ_ARENA_PAGE_COUNT],
         }
     }
 }
@@ -42338,6 +42413,7 @@ static mut HOSTED_DEVICE_RELATION_INVALIDATIONS: Option<
 > = None;
 static mut HOSTED_BUS_RELATIONS: Option<nt_pnp_manager::BusRelationTable> = None;
 static mut HOSTED_DEVICE_RELATION_QUERY: Option<HostedDeviceRelationQuery> = None;
+static mut HOSTED_DEVICE_RELATION_FAILURES: Option<Vec<HostedDeviceRelationFailure>> = None;
 static mut HOSTED_RESOURCE_MANAGER: Option<ResourceManager> = None;
 static mut HOSTED_DMA_MANAGER: Option<HostedDmaManager> = None;
 static mut HOSTED_MDL_REGISTRY: Option<MdlRegistry> = None;
@@ -42827,6 +42903,12 @@ struct HostedDeviceRelationQuery {
     acpi_pci_scope_sources: Vec<nt_pnp::AcpiPciScopeSource>,
     acpi_pci_link_candidates: Vec<nt_pnp::AcpiPciLinkCandidateFact>,
     acpi_pci_catalog_update: Option<nt_pnp::PreparedAcpiPciScopeCatalogUpdate>,
+}
+
+#[derive(Clone, Copy)]
+struct HostedDeviceRelationFailure {
+    invalidation: nt_pnp_manager::DeviceRelationInvalidation,
+    status: nt_status::NtStatus,
 }
 
 unsafe fn note_hosted_relation_query_operation(
@@ -43497,11 +43579,25 @@ unsafe fn hosted_device_relation_invalidations_mut(
     slot.as_mut().unwrap()
 }
 
+unsafe fn hosted_device_relation_failures_mut() -> &'static mut Vec<HostedDeviceRelationFailure> {
+    let slot = &mut *core::ptr::addr_of_mut!(HOSTED_DEVICE_RELATION_FAILURES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HostedPnpEnumerationProgress {
+pub(crate) enum HostedPnpRelationProgress {
     Current,
     Pending,
     Blocked(nt_status::NtStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostedPnpRelationRefresh {
+    invalidation: nt_pnp_manager::DeviceRelationInvalidation,
+    base_relation_generation: u64,
 }
 
 fn hosted_relation_invalidation_status(
@@ -43530,8 +43626,12 @@ unsafe fn enqueue_hosted_device_relations(
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
+    let parent = hosted_pnp_manager_mut()
+        .devnode_identity_for_pdo(relation_owner.device_id)
+        .filter(|identity| hosted_pnp_manager_mut().devnode_identity_is_started(*identity))
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let enqueued = hosted_device_relation_invalidations_mut()
-        .enqueue(relation_owner.device_id, relation_type)
+        .enqueue(parent, relation_type)
         .map_err(hosted_relation_invalidation_status)?;
     if relation_type == nt_pnp_abi::BUS_RELATIONS
         && enqueued.disposition == nt_pnp_manager::DeviceRelationInvalidationDisposition::Queued
@@ -43578,39 +43678,58 @@ unsafe fn hosted_relation_owner_for_device(
 
 pub(crate) unsafe fn enqueue_hosted_initial_bus_relations(
     device_id: u64,
-) -> Result<u64, nt_status::NtStatus> {
+) -> Result<HostedPnpRelationRefresh, nt_status::NtStatus> {
     let relation_owner = hosted_relation_owner_for_device(device_id)?;
-    enqueue_hosted_device_relations(relation_owner, nt_pnp_abi::BUS_RELATIONS)
-        .map(|enqueued| enqueued.invalidation.sequence)
+    let base_relation_generation = hosted_bus_relations_mut()
+        .current_relation_identity(relation_owner.device_id)
+        .map(nt_pnp_manager::BusRelationIdentity::generation)
+        .unwrap_or(0);
+    enqueue_hosted_device_relations(relation_owner, nt_pnp_abi::BUS_RELATIONS).map(|enqueued| {
+        HostedPnpRelationRefresh {
+            invalidation: enqueued.invalidation,
+            base_relation_generation,
+        }
+    })
 }
 
-pub(crate) unsafe fn hosted_pnp_enumeration_progress() -> HostedPnpEnumerationProgress {
+pub(crate) unsafe fn hosted_pnp_relation_progress(
+    refresh: HostedPnpRelationRefresh,
+) -> HostedPnpRelationProgress {
+    if let Some(failure) = hosted_device_relation_failures_mut()
+        .iter()
+        .find(|failure| failure.invalidation == refresh.invalidation)
+        .copied()
+    {
+        return HostedPnpRelationProgress::Blocked(failure.status);
+    }
+    if !hosted_pnp_manager_mut().devnode_identity_is_started(refresh.invalidation.parent) {
+        return HostedPnpRelationProgress::Blocked(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+    }
     if let Some(query) = (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_QUERY)).as_ref() {
-        if query.phase == HostedDeviceRelationQueryPhase::Barrier {
-            return HostedPnpEnumerationProgress::Blocked(
-                query
-                    .barrier_status
-                    .unwrap_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
-            );
+        if query.claim == refresh.invalidation {
+            if query.phase == HostedDeviceRelationQueryPhase::Barrier {
+                return HostedPnpRelationProgress::Blocked(
+                    query
+                        .barrier_status
+                        .unwrap_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST),
+                );
+            }
+            return HostedPnpRelationProgress::Pending;
         }
-        return HostedPnpEnumerationProgress::Pending;
     }
     if (*core::ptr::addr_of!(HOSTED_DEVICE_RELATION_INVALIDATIONS))
         .as_ref()
-        .is_some_and(|queue| !queue.is_empty())
+        .is_some_and(|queue| queue.contains(refresh.invalidation))
     {
-        return HostedPnpEnumerationProgress::Pending;
+        return HostedPnpRelationProgress::Pending;
     }
-    match crate::hosted_pci_topology::hosted_pci_topology_reconciliation() {
-        crate::hosted_pci_topology::HostedPciTopologyReconciliation::Current => {
-            HostedPnpEnumerationProgress::Current
-        }
-        crate::hosted_pci_topology::HostedPciTopologyReconciliation::Pending => {
-            HostedPnpEnumerationProgress::Pending
-        }
-        crate::hosted_pci_topology::HostedPciTopologyReconciliation::Blocked(status) => {
-            HostedPnpEnumerationProgress::Blocked(status)
-        }
+    let advanced = hosted_bus_relations_mut()
+        .current_relation_identity(refresh.invalidation.pdo_device_id)
+        .is_some_and(|identity| identity.generation() > refresh.base_relation_generation);
+    if advanced {
+        HostedPnpRelationProgress::Current
+    } else {
+        HostedPnpRelationProgress::Blocked(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
     }
 }
 
@@ -43811,6 +43930,13 @@ unsafe fn hosted_bus_relations_mut() -> &'static mut nt_pnp_manager::BusRelation
         *slot = Some(nt_pnp_manager::BusRelationTable::new());
     }
     slot.as_mut().unwrap()
+}
+
+unsafe fn hosted_bus_relations() -> &'static nt_pnp_manager::BusRelationTable {
+    let _ = hosted_bus_relations_mut();
+    (*core::ptr::addr_of!(HOSTED_BUS_RELATIONS))
+        .as_ref()
+        .expect("hosted bus relation table was just initialized")
 }
 
 unsafe fn copy_hosted_device_relations_result(
@@ -45125,9 +45251,7 @@ unsafe fn allocate_hosted_irq_endpoint() -> Option<u64> {
     Some(cap)
 }
 
-unsafe fn attach_hosted_irq_lane_sched_context(
-    lane: &mut HostedIrqLaneRuntime,
-) -> Result<(), u64> {
+unsafe fn attach_hosted_irq_lane_sched_context(lane: &mut HostedIrqLaneRuntime) -> Result<(), u64> {
     let Some(sc) = try_alloc_slot() else {
         return Err(u64::MAX);
     };
@@ -45187,19 +45311,17 @@ unsafe fn map_hosted_irq_component_leaf(
         return false;
     }
     leaf.exec_cap = exec_cap;
-    if page_map_r(
-        exec_cap,
-        temporary_exec_va,
-        RW_NX,
-        CAP_INIT_THREAD_VSPACE,
-    ) != 0
-    {
+    if page_map_r(exec_cap, temporary_exec_va, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
         let _ = release_hosted_irq_lane_leaf(leaf);
         return false;
     }
     leaf.exec_mapped = true;
     core::ptr::write_bytes(temporary_exec_va as *mut u8, 0, 0x1000);
-    core::ptr::copy_nonoverlapping(contents.as_ptr(), temporary_exec_va as *mut u8, contents.len());
+    core::ptr::copy_nonoverlapping(
+        contents.as_ptr(),
+        temporary_exec_va as *mut u8,
+        contents.len(),
+    );
     if page_unmap_r(exec_cap) == 0 {
         leaf.exec_mapped = false;
         if cnode_delete_recycle_r(exec_cap) == 0 {
@@ -45221,11 +45343,7 @@ unsafe fn map_hosted_irq_shared_leaf(
     component_rights: u64,
     leaf: &mut HostedIrqLaneLeaf,
 ) -> bool {
-    if leaf.cap != 0
-        || leaf.mapped
-        || leaf.exec_cap != 0
-        || leaf.exec_mapped
-    {
+    if leaf.cap != 0 || leaf.mapped || leaf.exec_cap != 0 || leaf.exec_mapped {
         return false;
     }
     let (component_cap, frame_error) = alloc_frame_r();
@@ -45292,23 +45410,25 @@ unsafe fn build_hosted_irq_lane(
     })?;
     // Worker slot zero is reserved for the domain interrupt lane. PsCreateSystemThread offsets its
     // independently indexed runtime table by one, so ordinary workers can never alias this VSpace.
-    let component_base = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT)
-        .ok_or(HostedIrqLaneBuildError {
+    let component_base = hosted_worker_component_base_for_slot(FSD_IRQ_LANE_COMPONENT_SLOT).ok_or(
+        HostedIrqLaneBuildError {
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
             partial: None,
-        })?;
+        },
+    )?;
     let exec_alias_slot = HOSTED_DRIVER_WORKER_ALIAS_NEXT.fetch_add(1, Ordering::Relaxed);
-    let exec_base = hosted_worker_exec_base_for_alias(exec_alias_slot)
-        .ok_or(HostedIrqLaneBuildError {
+    let exec_base =
+        hosted_worker_exec_base_for_alias(exec_alias_slot).ok_or(HostedIrqLaneBuildError {
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
             partial: None,
         })?;
-    let badge = FSD_WORKER_BADGE_BASE
-        .checked_add(exec_alias_slot)
-        .ok_or(HostedIrqLaneBuildError {
-            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-            partial: None,
-        })?;
+    let badge =
+        FSD_WORKER_BADGE_BASE
+            .checked_add(exec_alias_slot)
+            .ok_or(HostedIrqLaneBuildError {
+                status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+                partial: None,
+            })?;
     let component_kpcr_va = component_base
         .checked_add(FSD_WORKER_SCRATCH_OFFSET)
         .ok_or(HostedIrqLaneBuildError {
@@ -45321,12 +45441,13 @@ unsafe fn build_hosted_irq_lane(
             status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
             partial: None,
         })?;
-    let exec_arena_va = exec_base
-        .checked_add(FSD_IRQ_LANE_ARENA_OFFSET)
-        .ok_or(HostedIrqLaneBuildError {
-            status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-            partial: None,
-        })?;
+    let exec_arena_va =
+        exec_base
+            .checked_add(FSD_IRQ_LANE_ARENA_OFFSET)
+            .ok_or(HostedIrqLaneBuildError {
+                status: nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+                partial: None,
+            })?;
     let mut lane = HostedIrqLaneRuntime::new(
         projection_instance,
         domain,
@@ -45431,7 +45552,13 @@ unsafe fn build_hosted_irq_lane(
             return None;
         }
         lane.cnode = try_alloc_slot()?;
-        if cnode_mint_r(CAP_INIT_THREAD_CNODE, lane.cnode, lane.raw_cnode, CN_GUARD_BADGE) != 0 {
+        if cnode_mint_r(
+            CAP_INIT_THREAD_CNODE,
+            lane.cnode,
+            lane.raw_cnode,
+            CN_GUARD_BADGE,
+        ) != 0
+        {
             recycle_deleted_root_slot(lane.cnode);
             lane.cnode = 0;
             return None;
@@ -45460,8 +45587,7 @@ unsafe fn build_hosted_irq_lane(
         if tcb_write_registers_r(lane.tcb, tramp_va, stack_top, 0) != 0 {
             return None;
         }
-        if tcb_set_gs_base(lane.tcb, component_kpcr_va) != 0
-            || tcb_set_priority(lane.tcb, 101) != 0
+        if tcb_set_gs_base(lane.tcb, component_kpcr_va) != 0 || tcb_set_priority(lane.tcb, 101) != 0
         {
             return None;
         }
@@ -45537,12 +45663,7 @@ unsafe fn retire_hosted_irq_lane_if_unreferenced(
     match state {
         HostedIrqLaneState::Ready => {
             let lane = &mut hosted_irq_lanes_mut()[index];
-            if lane.exec_arena_va == 0
-                || !lane
-                    .arena
-                    .iter()
-                    .all(|leaf| leaf.exec_mapped)
-            {
+            if lane.exec_arena_va == 0 || !lane.arena.iter().all(|leaf| leaf.exec_mapped) {
                 return Err(nt_status::NtStatus::DEVICE_BUSY);
             }
             let arena = &*(lane.exec_arena_va as *const nt_hosted_runtime::HostedIrqArena);
@@ -45648,10 +45769,7 @@ unsafe fn ensure_hosted_irq_lane(
     }
     let lane = &mut hosted_irq_lanes_mut()[lane_index];
     if lane.exec_arena_va == 0
-        || !lane
-            .arena
-            .iter()
-            .all(|leaf| leaf.exec_mapped)
+        || !lane.arena.iter().all(|leaf| leaf.exec_mapped)
         || (&*(lane.exec_arena_va as *const nt_hosted_runtime::HostedIrqArena))
             .control
             .root_activate(lane.identity)
@@ -45860,10 +45978,7 @@ unsafe fn install_hosted_irq_connection(
             || !crate::hosted_pnp_context_lease_is_live(existing.pnp_context_lease)
             || !hosted_irq_projection_matches(existing)
             || !hosted_irq_connection_line_live(existing)
-            || !hosted_physical_irq_lease_live(
-                existing.route.tokens.interrupt_id,
-                existing.route,
-            )
+            || !hosted_physical_irq_lease_live(existing.route.tokens.interrupt_id, existing.route)
         {
             return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
         }
@@ -45893,16 +46008,15 @@ unsafe fn install_hosted_irq_connection(
     }
     let state = hosted_device_resource_state_by_device_id(binding.device_id)
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    let authority = retain_hosted_irq_connection_authority(binding, state, route).map_err(
-        |rejection| {
+    let authority =
+        retain_hosted_irq_connection_authority(binding, state, route).map_err(|rejection| {
             trace_hosted_interrupt_broker_rejection(
                 rejection.name(),
                 Some(binding),
                 Some(binding.projection_instance),
             );
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
-        },
-    )?;
+        })?;
     if let Some(existing) = hosted_irq_lines().and_then(|lines| {
         lines
             .iter()
@@ -45915,10 +46029,8 @@ unsafe fn install_hosted_irq_connection(
         hosted_irq_connections_mut()
             .try_reserve(1)
             .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-        let lane_generation = ensure_hosted_irq_lane(
-            binding.projection_instance,
-            binding.projection_domain,
-        )?;
+        let lane_generation =
+            ensure_hosted_irq_lane(binding.projection_instance, binding.projection_domain)?;
         if let Err(status) = retain_hosted_physical_irq_lease(&authority) {
             return match retire_hosted_irq_lane_if_unreferenced(
                 binding.projection_instance,
@@ -45940,14 +46052,10 @@ unsafe fn install_hosted_irq_connection(
         .map_err(|_| nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
     let event_bit =
         allocate_hosted_irq_event_bit().ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let line_identity = hosted_irq_line_identity(
-        authority.physical_claim.line,
-        authority.physical_route,
-    )?;
-    let lane_generation = ensure_hosted_irq_lane(
-        binding.projection_instance,
-        binding.projection_domain,
-    )?;
+    let line_identity =
+        hosted_irq_line_identity(authority.physical_claim.line, authority.physical_route)?;
+    let lane_generation =
+        ensure_hosted_irq_lane(binding.projection_instance, binding.projection_domain)?;
     if let Err(status) = retain_hosted_physical_irq_lease(&authority) {
         return match retire_hosted_irq_lane_if_unreferenced(
             binding.projection_instance,
@@ -46008,11 +46116,13 @@ unsafe fn install_hosted_irq_connection(
             )
             .is_err();
             let lease_status = release_hosted_physical_irq_lease(tokens.interrupt_id).err();
-            return Err(if notification_retained || lane_retained || lease_status.is_some() {
-                lease_status.unwrap_or(nt_status::NtStatus::DEVICE_BUSY)
-            } else {
-                status
-            });
+            return Err(
+                if notification_retained || lane_retained || lease_status.is_some() {
+                    lease_status.unwrap_or(nt_status::NtStatus::DEVICE_BUSY)
+                } else {
+                    status
+                },
+            );
         }
     };
     hosted_irq_lines_mut().push(HostedIrqLine {
@@ -46089,10 +46199,7 @@ unsafe fn retire_hosted_irq_connection(
                     || !candidate.rundown.has_delivery_lease()
             })
         });
-        if release_hosted_irq_line_caps(
-            &mut hosted_irq_lines_mut()[index],
-            deliveries_drained,
-        ) != 0
+        if release_hosted_irq_line_caps(&mut hosted_irq_lines_mut()[index], deliveries_drained) != 0
         {
             return Err(nt_status::NtStatus::DEVICE_BUSY);
         }
@@ -46125,10 +46232,7 @@ unsafe fn retire_hosted_irq_connection(
     if let Some(index) = line_index {
         remove_released_hosted_irq_line(index, true);
     }
-    retire_hosted_irq_lane_if_unreferenced(
-        binding.projection_instance,
-        binding.projection_domain,
-    )?;
+    retire_hosted_irq_lane_if_unreferenced(binding.projection_instance, binding.projection_domain)?;
     release_hosted_physical_irq_lease(interrupt_id)?;
     hosted_irq_connections_mut().remove(connection_index);
     Ok(())
@@ -46223,10 +46327,7 @@ unsafe fn dispatch_hosted_irq_connection(
         || !crate::hosted_pnp_context_lease_is_live(connection.pnp_context_lease)
         || !hosted_irq_projection_matches(connection)
         || !hosted_irq_connection_line_live(connection)
-        || !hosted_physical_irq_lease_live(
-            connection.route.tokens.interrupt_id,
-            connection.route,
-        )
+        || !hosted_physical_irq_lease_live(connection.route.tokens.interrupt_id, connection.route)
     {
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
@@ -46285,9 +46386,9 @@ unsafe fn complete_hosted_irq_connection_leases(
     for retained in leased {
         let result = hosted_irq_connections()
             .and_then(|connections| {
-                connections.iter().position(|connection| {
-                    connection.rundown.identity() == retained.lease.identity
-                })
+                connections
+                    .iter()
+                    .position(|connection| connection.rundown.identity() == retained.lease.identity)
             })
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)
             .and_then(|index| {
@@ -46316,19 +46417,14 @@ unsafe fn mask_hosted_irq_line_terminal(
         })
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let mask = if quarantine {
-        hosted_irq_lines_mut()[line_index]
-            .rundown
-            .quarantine()
+        hosted_irq_lines_mut()[line_index].rundown.quarantine()
     } else {
         hosted_irq_lines_mut()[line_index]
             .rundown
             .begin_retirement()
     }
     .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-    if !hosted_irq_lines_mut()[line_index]
-        .rundown
-        .hardware_masked()
-    {
+    if !hosted_irq_lines_mut()[line_index].rundown.hardware_masked() {
         let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
         crate::mask_ioapic_irq_handler_checked(handler_cap)?;
         hosted_irq_lines_mut()[line_index]
@@ -46405,11 +46501,7 @@ unsafe fn service_hosted_irq_event(
     event_bit: u8,
 ) -> Result<HostedIrqServiceOutcome, nt_status::NtStatus> {
     let line_index = hosted_irq_lines()
-        .and_then(|lines| {
-            lines
-                .iter()
-                .position(|line| line.event_bit == event_bit)
-        })
+        .and_then(|lines| lines.iter().position(|line| line.event_bit == event_bit))
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
     let line = hosted_irq_lines_mut()[line_index];
     if !hosted_irq_line_active(line) {
@@ -46417,10 +46509,7 @@ unsafe fn service_hosted_irq_event(
         // retried. Rearming a partially retired level line would reopen delivery into stale state.
         return Ok(HostedIrqServiceOutcome::Serviced(0));
     }
-    let delivery = match hosted_irq_lines_mut()[line_index]
-        .rundown
-        .begin_delivery()
-    {
+    let delivery = match hosted_irq_lines_mut()[line_index].rundown.begin_delivery() {
         Ok(delivery) => delivery,
         Err(_) => {
             let identity = hosted_irq_lines_mut()[line_index].rundown.identity();
@@ -46430,17 +46519,15 @@ unsafe fn service_hosted_irq_event(
     };
     let mut leased = Vec::new();
     if let Some(live_len) = hosted_irq_connections().map(Vec::len) {
-        leased
-            .try_reserve_exact(live_len)
-            .map_err(|_| {
-                quarantine_hosted_irq_delivery(
-                    line.physical_line,
-                    line.rundown.identity(),
-                    delivery,
-                    &[],
-                    nt_status::NtStatus::INSUFFICIENT_RESOURCES,
-                )
-            })?;
+        leased.try_reserve_exact(live_len).map_err(|_| {
+            quarantine_hosted_irq_delivery(
+                line.physical_line,
+                line.rundown.identity(),
+                delivery,
+                &[],
+                nt_status::NtStatus::INSUFFICIENT_RESOURCES,
+            )
+        })?;
         for index in 0..live_len {
             let connection = hosted_irq_connections_mut()[index];
             if !hosted_irq_connection_owns_line(connection, line.physical_line)
@@ -46551,9 +46638,7 @@ unsafe fn service_hosted_irq_event(
     while let Some(ready) = scan.next_isr() {
         let Some(connection) = leased
             .iter()
-            .find(|retained| {
-                retained.connection.route.tokens.interrupt_id == ready.interrupt
-            })
+            .find(|retained| retained.connection.route.tokens.interrupt_id == ready.interrupt)
             .map(|retained| retained.connection)
         else {
             return Err(quarantine_hosted_irq_delivery(
@@ -46594,13 +46679,11 @@ unsafe fn service_hosted_irq_event(
             break;
         }
     }
-    let Some(line_index) = hosted_irq_lines()
-        .and_then(|lines| {
-            lines
-                .iter()
-                .position(|candidate| candidate.rundown.identity() == line.rundown.identity())
-        })
-    else {
+    let Some(line_index) = hosted_irq_lines().and_then(|lines| {
+        lines
+            .iter()
+            .position(|candidate| candidate.rundown.identity() == line.rundown.identity())
+    }) else {
         let _ = complete_hosted_irq_connection_leases(&leased);
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
@@ -54070,9 +54153,8 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
         mode: read_unaligned((projection + HOSTED_KINTERRUPT_MODE) as *const u8),
         share: read_unaligned((projection + HOSTED_KINTERRUPT_SHARE) as *const u8) as u16,
         affinity: read_unaligned((projection + HOSTED_KINTERRUPT_AFFINITY) as *const u64),
-        floating_save: read_unaligned(
-            (projection + HOSTED_KINTERRUPT_FLOATING_SAVE) as *const u8,
-        ) != 0,
+        floating_save: read_unaligned((projection + HOSTED_KINTERRUPT_FLOATING_SAVE) as *const u8)
+            != 0,
     };
     if request.service_routine_token != service_routine
         || request.service_context_token != service_context
@@ -54085,14 +54167,10 @@ unsafe fn publish_hosted_interrupt_connection_from_shared(
     let existing = read_volatile((sh + SH_RESOURCE_INTERRUPT_ID) as *const u64);
     if existing != 0 {
         if let Some(retiring) = hosted_irq_connections().and_then(|connections| {
-            connections
-                .iter()
-                .copied()
-                .find(|connection| {
-                    connection.route.tokens.interrupt_id == existing
-                        && connection.rundown.disposition()
-                            != InterruptConnectionDisposition::Active
-                })
+            connections.iter().copied().find(|connection| {
+                connection.route.tokens.interrupt_id == existing
+                    && connection.rundown.disposition() != InterruptConnectionDisposition::Active
+            })
         }) {
             if retiring.binding != binding {
                 return Err(nt_status::NtStatus::ACCESS_DENIED);
@@ -54698,9 +54776,23 @@ pub(crate) unsafe fn commit_hosted_device_resource_assignment(
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
     let raw = clone_pnp_resource_list(raw_resource_list)?;
     let translated = clone_pnp_resource_list(translated_resource_list)?;
-    hosted_pnp_manager_mut()
-        .commit_resource_assignment(binding.pdo_device_id, raw, translated)
-        .map_err(hosted_pnp_status)
+    if hosted_pnp_manager_mut()
+        .parent_relation_for_pdo(binding.pdo_device_id)
+        .is_some()
+    {
+        hosted_pnp_manager_mut()
+            .commit_resource_assignment_for_current_relation(
+                hosted_bus_relations(),
+                binding.pdo_device_id,
+                raw,
+                translated,
+            )
+            .map_err(hosted_pnp_status)
+    } else {
+        hosted_pnp_manager_mut()
+            .commit_resource_assignment(binding.pdo_device_id, raw, translated)
+            .map_err(hosted_pnp_status)
+    }
 }
 
 pub(crate) unsafe fn commit_hosted_no_resource_requirements(
