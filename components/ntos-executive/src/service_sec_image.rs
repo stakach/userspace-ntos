@@ -1342,6 +1342,7 @@ fn component_suspension_key(
 }
 
 unsafe fn lpc_wait_begin_after_stack_admission(
+    nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
     key: nt_component_suspension::SuspensionKey,
     reservation: nt_lpc_continuation::Reservation,
@@ -1372,6 +1373,10 @@ unsafe fn lpc_wait_begin_after_stack_admission(
                 )
                 .is_ok()
             {
+                // This broker mutation happened inside a component dispatch rather than an Nt*
+                // syscall. Publish the same progress signal so the common drain wakes a parked LPC
+                // server receiver before the executive blocks again.
+                nt_handler.lpc_endpoint_progress = true;
                 return true;
             }
             if let Some(client) = lpc_client() {
@@ -1735,6 +1740,7 @@ unsafe fn component_suspension_resume_top(
                     }
                     PendingComponentDispatch::Lpc(next) => {
                         if lpc_wait_begin_after_stack_admission(
+                            nt_handler,
                             next,
                             next_key,
                             lpc_reservation.expect("LPC re-wait has readiness reservation"),
@@ -1899,6 +1905,7 @@ unsafe fn provider_wait_admit_current(
 }
 
 unsafe fn lpc_wait_admit_current(
+    nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
     reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
@@ -1946,7 +1953,7 @@ unsafe fn lpc_wait_admit_current(
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
     }
-    let _ = lpc_wait_begin_after_stack_admission(pending, key, reservation);
+    let _ = lpc_wait_begin_after_stack_admission(nt_handler, pending, key, reservation);
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
     true
@@ -2041,6 +2048,14 @@ unsafe fn component_suspension_drain_ready(
                 drained += 1;
             }
         }
+    }
+    if nt_handler.lpc_endpoint_progress {
+        // A component-originated request bypasses ExecNtHandler's normal syscall post-action.
+        // Redrive the ordinary broker waiters here so the server can accept the request before the
+        // next recv. Component reply selection still happens only after a later received event,
+        // once the server's replying syscall has received its own native reply.
+        let _ = lpc_receive_wait_redrive_all(nt_handler);
+        let _ = lpc_request_wait_redrive_all(nt_handler);
     }
     drained
 }
@@ -16251,6 +16266,7 @@ pub(crate) unsafe fn service_sec_image(
                 } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
                     component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
                     component_suspension_park_request = lpc_wait_admit_current(
+                        &mut nt_handler,
                         pending,
                         parked_syscall_reply,
                         resume_ip,

@@ -24067,6 +24067,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     path. Only after that acceptance should the unreachable host desktop-construction function and
     its direct image-RVA constants be deleted.
 
+    B3 component-LPC receive-redrive correction (2026-09-03, freestanding green; desktop rerun
+    pending): the first serialized acceptance reached Winlogon's real "Initializing input window
+    station" path and parked one component continuation, but stopped at `220/293` after 129,360 ms.
+    The retained request had entered the LPC broker while the executive was servicing win32k, so it
+    bypassed `ExecNtHandler`'s ordinary native-syscall progress publication. The executive then
+    blocked before redriving CSRSS's already parked receive waiter, and the following iteration
+    cleared the unobserved progress state. Component LPC admission now publishes the same endpoint
+    progress bit as native LPC syscalls, and the common component-continuation drain redrives native
+    receive/request waiters before its next blocking receive. Reply selection remains deferred to a
+    later received event, preserving the ordering that completes the replying CSRSS syscall before
+    win32k resumes. The freestanding executive check remains green at 221 warnings; the next
+    serialized run must prove both system-thread requests and their provider Event completions.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional
