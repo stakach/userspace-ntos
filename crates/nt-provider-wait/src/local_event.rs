@@ -359,6 +359,23 @@ impl ProviderLocalEventCatalog {
         Ok(())
     }
 
+    /// Begin retirement of one Event so legal reinitialization can mint a fresh generation.
+    pub fn begin_retire_event(
+        &mut self,
+        id: ProviderLocalEventId,
+    ) -> Result<ProviderLocalEventRetirement, ProviderLocalEventError> {
+        let slot = self.slot(id)?;
+        let record = self.records[slot];
+        if record.has_leases() {
+            return Err(ProviderLocalEventError::ActiveLeases);
+        }
+        let canonical = record
+            .canonical
+            .ok_or(ProviderLocalEventError::NotPublished)?;
+        self.records[slot].delete_pending = true;
+        Ok(ProviderLocalEventRetirement { id, canonical })
+    }
+
     /// Mark every Event in one allocation/activation/instance delete-pending atomically.
     pub fn begin_retire_backing(
         &mut self,
@@ -647,5 +664,42 @@ mod tests {
             catalog.snapshot(second),
             Err(ProviderLocalEventError::StaleIdentity)
         );
+    }
+
+    #[test]
+    fn exact_event_reinitialization_does_not_retire_its_siblings() {
+        let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let first = catalog
+            .initialize(
+                0x8000,
+                pool(30, 1, 0),
+                ProviderEventKind::Notification,
+                false,
+            )
+            .unwrap();
+        let second = catalog
+            .initialize(
+                0x8040,
+                pool(30, 1, 0x40),
+                ProviderEventKind::Notification,
+                false,
+            )
+            .unwrap();
+        catalog.bind_canonical(first, canonical(20, 1)).unwrap();
+        catalog.bind_canonical(second, canonical(21, 1)).unwrap();
+        let retirement = catalog.begin_retire_event(first).unwrap();
+        assert!(catalog.snapshot(first).unwrap().delete_pending);
+        assert!(!catalog.snapshot(second).unwrap().delete_pending);
+        catalog.ack_retirement(retirement).unwrap();
+        let replacement = catalog
+            .initialize(
+                0x8000,
+                pool(30, 1, 0),
+                ProviderEventKind::Synchronization,
+                true,
+            )
+            .unwrap();
+        assert_ne!(replacement, first);
+        assert_eq!(catalog.resolve_body(0x8040).unwrap().id, second);
     }
 }

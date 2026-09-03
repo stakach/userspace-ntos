@@ -23747,6 +23747,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     win32k's local catalog to these broker operations and make pool release retire every embedded
     Event before freeing the allocation.
 
+    Canonical local Event operations checkpoint (2026-09-03, host/freestanding green; activation
+    deliberately deferred): provider-scoped set/reset/clear/pulse/read operations now resolve the
+    component-minted local identity under the current provider domain and mutate the same executive
+    EventStore used by native waits. Provider operations no longer require a hosted GUI client,
+    while handle/projection operations retain exact process-generation authentication. Exact
+    single-Event retirement now supports legal reinitialization without retiring sibling Events;
+    all 20 `nt-provider-wait` tests pass and the freestanding executive remains at 213 warnings.
+    A fail-closed desktop probe successfully crossed DriverEntry and later identified live Event
+    storage at `0x100079c4690` inside the reclaiming session/desktop heap, a fourth real ownership
+    class beyond image statics, provider pool, and stack activation. The partial live cutover was
+    removed. Before activation, add a host-tested allocation-generation catalog shared by the
+    session heap and nested desktop heaps, hook every allocation/free/reallocation, and classify an
+    embedded Event by the innermost live allocation. Then enable the complete broker path and rerun
+    the serialized desktop gate.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

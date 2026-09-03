@@ -838,6 +838,11 @@ pub const W32_EVENT_OP_READ: u64 = 12;
 pub const W32_EVENT_OP_PUBLISH_LOCAL: u64 = 13;
 pub const W32_EVENT_OP_RETIRE_LOCAL: u64 = 14;
 pub const W32_EVENT_OP_ACK_LOCAL_RETIREMENT: u64 = 15;
+pub const W32_EVENT_OP_SET_LOCAL: u64 = 16;
+pub const W32_EVENT_OP_RESET_LOCAL: u64 = 17;
+pub const W32_EVENT_OP_CLEAR_LOCAL: u64 = 18;
+pub const W32_EVENT_OP_PULSE_LOCAL: u64 = 19;
+pub const W32_EVENT_OP_READ_LOCAL: u64 = 20;
 
 static mut WIN32K_EVENT_PROJECTIONS: nt_kernel_exec::ProviderEventProjectionCatalog =
     nt_kernel_exec::ProviderEventProjectionCatalog::new();

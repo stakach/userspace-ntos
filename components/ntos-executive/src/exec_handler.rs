@@ -25825,6 +25825,94 @@ impl ExecNtHandler {
         Ok((id, metadata))
     }
 
+    fn provider_local_event_identity(
+        &self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<
+        (
+            nt_kernel_exec::EventObjectId,
+            usize,
+            nt_kernel_exec::EventKind,
+            bool,
+        ),
+        u32,
+    > {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) || local_identity == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let id = self
+            .event_objects
+            .id_for_provider_local(
+                nt_kernel_exec::EventObjectOwner::provider(
+                    provider.domain,
+                    provider.generation,
+                ),
+                local_identity,
+            )
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let index = usize::try_from(snapshot.native_identity).map_err(|_| STATUS_INVALID_PARAMETER)?;
+        let (kind, signaled) = self
+            .events
+            .query_existing(index as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((id, index, kind, signaled))
+    }
+
+    pub(crate) fn provider_set_local_event(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<(bool, nt_kernel_exec::EventObjectId, usize, nt_kernel_exec::EventKind), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (id, index, kind, _) =
+            self.provider_local_event_identity(provider, local_identity)?;
+        let previous = self
+            .events
+            .set_existing(index as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok((previous, id, index, kind))
+    }
+
+    pub(crate) fn provider_reset_local_event(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<bool, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (_, index, _, _) = self.provider_local_event_identity(provider, local_identity)?;
+        self.events
+            .reset_existing(index as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_clear_local_event(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        let (_, index, _, _) = self.provider_local_event_identity(provider, local_identity)?;
+        self.events
+            .clear_existing(index as u64)
+            .then_some(())
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_read_local_event(
+        &self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<bool, u32> {
+        self.provider_local_event_identity(provider, local_identity)
+            .map(|(_, _, _, signaled)| signaled)
+    }
+
     pub(crate) fn provider_retire_local_event(
         &mut self,
         provider: nt_provider_wait::ProviderDomainIdentity,

@@ -2797,15 +2797,31 @@ pub(crate) unsafe fn service_win32k_event_request(
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
     let handler = &mut *handler_ptr;
-    let Ok(pi) = usize::try_from(client_pi) else {
-        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    let provider_scoped = matches!(
+        op,
+        crate::win32k_subsystem::W32_EVENT_OP_PUBLISH_LOCAL
+            | crate::win32k_subsystem::W32_EVENT_OP_RETIRE_LOCAL
+            | crate::win32k_subsystem::W32_EVENT_OP_ACK_LOCAL_RETIREMENT
+            | crate::win32k_subsystem::W32_EVENT_OP_SET_LOCAL
+            | crate::win32k_subsystem::W32_EVENT_OP_RESET_LOCAL
+            | crate::win32k_subsystem::W32_EVENT_OP_CLEAR_LOCAL
+            | crate::win32k_subsystem::W32_EVENT_OP_PULSE_LOCAL
+            | crate::win32k_subsystem::W32_EVENT_OP_READ_LOCAL
+    );
+    let pi = if provider_scoped {
+        0
+    } else {
+        let Ok(pi) = usize::try_from(client_pi) else {
+            return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+        };
+        if client_generation == 0
+            || handler.pm_pid_for_pi(pi).is_none()
+            || handler.hosted_process_generation(pi) != Some(client_generation)
+        {
+            return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+        }
+        pi
     };
-    if client_generation == 0
-        || handler.pm_pid_for_pi(pi).is_none()
-        || handler.hosted_process_generation(pi) != Some(client_generation)
-    {
-        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-    }
     match op {
         crate::win32k_subsystem::W32_EVENT_OP_CREATE => handler
             .provider_create_event(pi, arg1 as u32, arg2 as u32, arg3 != 0)
@@ -2939,6 +2955,68 @@ pub(crate) unsafe fn service_win32k_event_request(
                     )),
                 )
                 .map(|()| (0, 0, 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_SET_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            match handler.provider_set_local_event(provider, arg1) {
+                Ok((previous, _id, index, _kind)) => {
+                    if !previous {
+                        let _ = crate::wait_wake_event_set(index, handler);
+                    }
+                    let current = handler
+                        .provider_read_local_event(provider, arg1)
+                        .expect("newly signalled local provider Event lost canonical identity");
+                    (0, u64::from(previous), u64::from(current), 0)
+                }
+                Err(status) => (status as i32, 0, 0, 0),
+            }
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_RESET_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_reset_local_event(provider, arg1)
+                .map(|previous| (0, u64::from(previous), 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_CLEAR_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_clear_local_event(provider, arg1)
+                .map(|()| (0, 0, 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_PULSE_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            match handler.provider_set_local_event(provider, arg1) {
+                Ok((previous, _id, index, _kind)) => {
+                    if previous {
+                        handler
+                            .provider_reset_local_event(provider, arg1)
+                            .expect("local provider pulse lost canonical Event identity");
+                    } else {
+                        let _ = crate::wait_wake_event_pulse(index, handler);
+                    }
+                    (0, u64::from(previous), 0, 0)
+                }
+                Err(status) => (status as i32, 0, 0, 0),
+            }
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_READ_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_read_local_event(provider, arg1)
+                .map(|signaled| (0, u64::from(signaled), 0, 0))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
