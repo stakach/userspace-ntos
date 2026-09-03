@@ -23381,7 +23381,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Receive/ReceiveComplete pair plus all 295 gates before deleting the temporary descriptor and
     wide-call traces.
 
-    Source-authority correction (2026-09-03, freestanding green; runtime pending): the first rerun
+    Source-authority correction (2026-09-03, accepted): the first rerun
     confirmed the receive buffers live at the active provider Dispatch depth, not on its worker
     stack. Root now derives a second exact source window from the parked Service depth and that
     source lane's arena layout. Provider import and reverse-callback marshalling can resolve only
@@ -23389,7 +23389,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     durable object/DMA range. No adjacent arena depth, shared request bank, or arbitrary component
     address is admitted. This fixes the ownership model for all recursive provider calls rather
     than special-casing an NDIS export. The freestanding executive check remains green at the
-    existing 213-warning baseline; serialized acceptance remains required.
+    existing 213-warning baseline. Serialized acceptance
+    `.tmp/run-desktop-20260903-102910.log` executes the real E1000 ISR and generation-owned KDPC,
+    enters NDIS's eight-argument `EthFilterDprIndicateReceive`, dispatches TCP/IP's registered
+    Receive and ReceiveComplete callbacks through the exact recursive arenas, and passes
+    `exec_provider_ndis_receive_indicated`. The same run reaches genuine Explorer chrome, paints all
+    786432 framebuffer pixels with at least 32 colours, completes `295/295`, and exits through the
+    microtest sentinel. The temporary wide-export, receive-callback, ISR-result, DPC-lifecycle, and
+    DMA descriptor probes used to isolate this fault have been removed; durable provider receive,
+    hardware IRQ/DPC, rejected-delivery, and final gate counters remain. This closes the B3 physical
+    ISR/DPC/provider-arena cutover. Continue B3 at the broader repeated driver/device and remaining
+    synthetic identity cleanup already tracked above; do not retain packet-specific proof code.
 
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active

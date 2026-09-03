@@ -17147,9 +17147,6 @@ static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 = AtomicU6
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_WIDE_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_RECEIVE_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
-static HOSTED_PROVIDER_ISR_RESULT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_WORK_QUEUE_WALL_TRACE_CAP: u64 = 8;
@@ -18086,77 +18083,6 @@ unsafe fn trace_hosted_provider_callback_failure_stage(
     print_str(stage);
     print_str(b" status=0x");
     print_hex(status as u32);
-    print_str(b"\n");
-}
-
-unsafe fn trace_hosted_provider_receive_callback(
-    phase: &[u8],
-    record: HostedProviderCallbackRecord,
-    result: Result<u64, i32>,
-) {
-    if record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
-        || !matches!(
-            record.callback_offset,
-            NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64
-                | NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64
-                | NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64
-        )
-        || HOSTED_PROVIDER_RECEIVE_CALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16
-    {
-        return;
-    }
-    print_str(b"[provider-receive-callback] ");
-    print_str(phase);
-    print_str(b" provider-inst=");
-    print_u64(record.provider_instance as u64);
-    print_str(b" dependent-inst=");
-    print_u64(record.dependent_instance as u64);
-    print_str(b" offset=0x");
-    print_hex(record.callback_offset as u32);
-    match result {
-        Ok(value) => {
-            print_str(b" result=0x");
-            print_hex64(value);
-        }
-        Err(status) => {
-            print_str(b" status=0x");
-            print_hex(status as u32);
-        }
-    }
-    print_str(b"\n");
-}
-
-unsafe fn trace_hosted_provider_wide_export(
-    phase: &[u8],
-    policy: HostedProviderExportMarshalPolicy,
-    provider_export_rva: u64,
-    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
-    result: u64,
-) {
-    if policy.argument_count < 7
-        || HOSTED_PROVIDER_WIDE_EXPORT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 12
-    {
-        return;
-    }
-    print_str(b"[provider-wide-export] ");
-    print_str(phase);
-    print_str(b" rva=0x");
-    print_hex(provider_export_rva as u32);
-    print_str(b" argc=");
-    print_u64(policy.argument_count as u64);
-    print_str(b" args=");
-    let mut index = 0usize;
-    while index < policy.argument_count as usize {
-        if index != 0 {
-            print_str(b",");
-        }
-        print_hex64(args[index]);
-        index += 1;
-    }
-    if phase == b"done" {
-        print_str(b" result=0x");
-        print_hex64(result);
-    }
     print_str(b"\n");
 }
 
@@ -28652,7 +28578,6 @@ where
     .or_else(|| hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)) else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
-    trace_hosted_provider_wide_export(b"enter", policy, provider_export_rva, &args, 0);
     let packet_array_export = provider_policy_uses_packet_array(policy);
     if packet_array_export {
         HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -28938,7 +28863,6 @@ where
         dependent_inst,
         caller_rsp,
     );
-    trace_hosted_provider_wide_export(b"done", policy, provider_export_rva, &args, result);
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");
         print_u64(provider_publication_cookie);
@@ -29690,17 +29614,6 @@ unsafe fn service_ndis_isr_callback(
     };
     copy_bytes(provider_recognized_exec, dependent_recognized_exec, 1);
     copy_bytes(provider_queue_exec, dependent_queue_exec, 1);
-    if HOSTED_PROVIDER_ISR_RESULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16 {
-        print_str(b"[provider-isr-result] provider-inst=");
-        print_u64(record.provider_instance as u64);
-        print_str(b" dependent-inst=");
-        print_u64(record.dependent_instance as u64);
-        print_str(b" recognized=");
-        print_u64(read_unaligned(dependent_recognized_exec as *const u8) as u64);
-        print_str(b" queue-dpc=");
-        print_u64(read_unaligned(dependent_queue_exec as *const u8) as u64);
-        print_str(b"\n");
-    }
     Ok(result)
 }
 
@@ -30866,7 +30779,6 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     let Some(record) = hosted_provider_callback_record(callback_cookie) else {
         return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
     };
-    trace_hosted_provider_receive_callback(b"request", record, Ok(0));
     let Some(_dependency_lease) = acquire_hosted_provider_dependency_dispatch_lease(
         record.provider_instance,
         record.dependent_instance,
@@ -31284,7 +31196,6 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     }
     HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);
-    trace_hosted_provider_receive_callback(b"done", record, result);
     match result {
         Ok(value) => value,
         Err(status) => hosted_provider_callback_failure(status),
@@ -43678,7 +43589,6 @@ static HOSTED_IRQ_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_SERVICED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_DEFERRED_BUSY: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_ACKNOWLEDGED: AtomicU64 = AtomicU64::new(0);
-static HOSTED_IRQ_DMA_COMMON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
 static mut HOSTED_PNP_PENDING_PROOFS: Option<nt_driver_start::PendingStartProofLedger> = None;
@@ -48149,9 +48059,6 @@ unsafe fn service_hosted_irq_event(
     };
     match completion {
         InterruptLineScanCompletion::Acknowledge(ack) if scan_complete => {
-            for retained in &leased {
-                trace_hosted_irq_dma_common(retained.connection.binding, b"pre-dpc");
-            }
             let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
             if handler_cap == 0 {
                 return Err(quarantine_hosted_irq_delivery(
@@ -48225,7 +48132,6 @@ unsafe fn service_hosted_irq_event(
                     hosted_irq_broker::drain_dpcs(owner)?;
                 }
                 let binding = retained.connection.binding;
-                trace_hosted_irq_dma_common(binding, b"post-dpc");
                 let (_, inst) = instance_by_driver_id(binding.driver_id)
                     .filter(|(_, inst)| inst.ready)
                     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
@@ -49759,61 +49665,6 @@ unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh:
         states[index] = state;
     } else {
         states.push(state);
-    }
-}
-
-unsafe fn trace_hosted_irq_dma_common(binding: HostedDeviceBinding, phase: &[u8]) {
-    let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) else {
-        return;
-    };
-    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
-        return;
-    };
-    let grant_logical = state.evidence.dma_common_logical;
-    let grant_len = state.evidence.dma_common_len;
-    if state.dma_broker_va == 0 || grant_logical == 0 || grant_len == 0 {
-        return;
-    }
-    let capacity = dma_allocation_record_capacity(inst.exec_shared_va);
-    let mut index = 0u64;
-    while index < capacity {
-        let Some(record) = dma_allocation_record(inst.exec_shared_va, index) else {
-            return;
-        };
-        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
-        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
-        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
-        if kind == HOSTED_DMA_RECORD_KIND_COMMON && logical != 0 && len >= 16 {
-            let Some(offset) = logical.checked_sub(grant_logical) else {
-                index += 1;
-                continue;
-            };
-            let Some(end) = offset.checked_add(len) else {
-                index += 1;
-                continue;
-            };
-            if end <= grant_len
-                && HOSTED_IRQ_DMA_COMMON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32
-            {
-                let broker_va = state.dma_broker_va + offset;
-                print_str(b"[hosted-irq-dma] ");
-                print_str(phase);
-                print_str(b" device=");
-                print_u64(binding.device_id);
-                print_str(b" record=");
-                print_u64(index);
-                print_str(b" logical=0x");
-                print_hex64(logical);
-                print_str(b" len=");
-                print_u64(len);
-                print_str(b" head=");
-                print_hex64(read_volatile(broker_va as *const u64));
-                print_str(b",");
-                print_hex64(read_volatile((broker_va + 8) as *const u64));
-                print_str(b"\n");
-            }
-        }
-        index += 1;
     }
 }
 
