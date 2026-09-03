@@ -23346,6 +23346,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     whether `MiniportHandleInterrupt` reaches the protocol indication callback. Keep this evidence
     provider-neutral and bounded; remove it once the contract is covered by durable counters/tests.
 
+    Follow-up runtime `.tmp/run-b3-isr-lifecycle-20260903-095333.log` proves that neither ISR
+    copyout nor KDPC reuse is the receive blocker. On the post-ARP interrupt the real miniport
+    returns `recognized=1, queue-dpc=1`; root accepts the same NDIS KDPC identity as a new insert,
+    dispatches sequence 7 on its exact provider lane, runs the TCP/IP send completion inside that
+    callback, and completes it without an arena, provider-Service, or DPC fault. The boot remains
+    `294/295` with a fully rendered Explorer desktop. Next inspect the canonical DMA common-buffer
+    records before and after that DPC to distinguish an unconsumed RX descriptor from a descriptor
+    consumed without protocol indication. This snapshot must use the retained device binding and
+    root's existing DMA alias, not device-name matching or an extra mapping.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

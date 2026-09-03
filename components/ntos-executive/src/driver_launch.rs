@@ -43576,6 +43576,7 @@ static HOSTED_IRQ_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_SERVICED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_DEFERRED_BUSY: AtomicU64 = AtomicU64::new(0);
 static HOSTED_IRQ_EVENTS_ACKNOWLEDGED: AtomicU64 = AtomicU64::new(0);
+static HOSTED_IRQ_DMA_COMMON_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static mut HOSTED_DEVICE_PROPERTY_TRANSFERS: Option<HostedDevicePropertyTransferTable> = None;
 static mut HOSTED_PNP_TRANSACTIONS: Option<Vec<HostedPnpTransaction>> = None;
 static mut HOSTED_PNP_PENDING_PROOFS: Option<nt_driver_start::PendingStartProofLedger> = None;
@@ -48046,6 +48047,9 @@ unsafe fn service_hosted_irq_event(
     };
     match completion {
         InterruptLineScanCompletion::Acknowledge(ack) if scan_complete => {
+            for retained in &leased {
+                trace_hosted_irq_dma_common(retained.connection.binding, b"pre-dpc");
+            }
             let handler_cap = hosted_irq_lines_mut()[line_index].handler_cap;
             if handler_cap == 0 {
                 return Err(quarantine_hosted_irq_delivery(
@@ -48119,6 +48123,7 @@ unsafe fn service_hosted_irq_event(
                     hosted_irq_broker::drain_dpcs(owner)?;
                 }
                 let binding = retained.connection.binding;
+                trace_hosted_irq_dma_common(binding, b"post-dpc");
                 let (_, inst) = instance_by_driver_id(binding.driver_id)
                     .filter(|(_, inst)| inst.ready)
                     .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
@@ -49652,6 +49657,61 @@ unsafe fn refresh_hosted_device_resource_state(binding: HostedDeviceBinding, sh:
         states[index] = state;
     } else {
         states.push(state);
+    }
+}
+
+unsafe fn trace_hosted_irq_dma_common(binding: HostedDeviceBinding, phase: &[u8]) {
+    let Some(state) = hosted_device_resource_state_by_device_id(binding.device_id) else {
+        return;
+    };
+    let Some((_, inst)) = instance_by_driver_id(binding.driver_id) else {
+        return;
+    };
+    let grant_logical = state.evidence.dma_common_logical;
+    let grant_len = state.evidence.dma_common_len;
+    if state.dma_broker_va == 0 || grant_logical == 0 || grant_len == 0 {
+        return;
+    }
+    let capacity = dma_allocation_record_capacity(inst.exec_shared_va);
+    let mut index = 0u64;
+    while index < capacity {
+        let Some(record) = dma_allocation_record(inst.exec_shared_va, index) else {
+            return;
+        };
+        let kind = read_volatile((record + SH_DMA_ALLOC_RECORD_KIND) as *const u64);
+        let logical = read_volatile((record + SH_DMA_ALLOC_RECORD_LOGICAL) as *const u64);
+        let len = read_volatile((record + SH_DMA_ALLOC_RECORD_LEN) as *const u64);
+        if kind == HOSTED_DMA_RECORD_KIND_COMMON && logical != 0 && len >= 16 {
+            let Some(offset) = logical.checked_sub(grant_logical) else {
+                index += 1;
+                continue;
+            };
+            let Some(end) = offset.checked_add(len) else {
+                index += 1;
+                continue;
+            };
+            if end <= grant_len
+                && HOSTED_IRQ_DMA_COMMON_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 32
+            {
+                let broker_va = state.dma_broker_va + offset;
+                print_str(b"[hosted-irq-dma] ");
+                print_str(phase);
+                print_str(b" device=");
+                print_u64(binding.device_id);
+                print_str(b" record=");
+                print_u64(index);
+                print_str(b" logical=0x");
+                print_hex64(logical);
+                print_str(b" len=");
+                print_u64(len);
+                print_str(b" head=");
+                print_hex64(read_volatile(broker_va as *const u64));
+                print_str(b",");
+                print_hex64(read_volatile((broker_va + 8) as *const u64));
+                print_str(b"\n");
+            }
+        }
+        index += 1;
     }
 }
 
