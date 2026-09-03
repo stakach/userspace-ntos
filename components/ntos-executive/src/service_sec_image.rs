@@ -149,12 +149,71 @@ const PROVIDER_WAIT_MAX_CONTINUATION_DEPTH: usize = 64;
 static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderEventWaitArbiter<
     nt_kernel_exec::EventLeaseId,
 > = nt_provider_wait::ProviderEventWaitArbiter::new();
-static mut PROVIDER_WAIT_CONTINUATIONS: nt_provider_wait::ProviderWaitStack<
+static mut PROVIDER_WAIT_CONTINUATIONS: nt_component_suspension::ComponentSuspensionStack<
     ProviderWaitNativeContinuation,
-> = nt_provider_wait::ProviderWaitStack::new(PROVIDER_WAIT_MAX_CONTINUATION_DEPTH);
+    i32,
+> = nt_component_suspension::ComponentSuspensionStack::new(
+    PROVIDER_WAIT_MAX_CONTINUATION_DEPTH,
+);
+static PROVIDER_WAIT_DISPATCH_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_PARKED_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_RESUMES: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_SUCCESSFUL_RESUMES: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_REARMS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_DISPATCH_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_EVENT_LEASES_ACQUIRED: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_EVENT_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_NESTED_DRAINS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_CRASH_PARKED_MASK: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RUNNABLE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProviderWaitRuntimeStats {
+    pub dispatch_admissions: u64,
+    pub parked_admissions: u64,
+    pub resumes: u64,
+    pub successful_resumes: u64,
+    pub rearms: u64,
+    pub dispatch_completions: u64,
+    pub cancellations: u64,
+    pub native_replies_abandoned: u64,
+    pub event_leases_acquired: u64,
+    pub event_leases_released: u64,
+    pub active_continuations: usize,
+    pub active_waiters: usize,
+    pub active_event_leases: usize,
+}
+
+pub(crate) fn provider_wait_record_event_lease_acquired() {
+    PROVIDER_WAIT_EVENT_LEASES_ACQUIRED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn provider_wait_record_event_lease_released() {
+    PROVIDER_WAIT_EVENT_LEASES_RELEASED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
+    unsafe {
+        ProviderWaitRuntimeStats {
+            dispatch_admissions: PROVIDER_WAIT_DISPATCH_ADMISSIONS.load(Ordering::Relaxed),
+            parked_admissions: PROVIDER_WAIT_PARKED_ADMISSIONS.load(Ordering::Relaxed),
+            resumes: PROVIDER_WAIT_RESUMES.load(Ordering::Relaxed),
+            successful_resumes: PROVIDER_WAIT_SUCCESSFUL_RESUMES.load(Ordering::Relaxed),
+            rearms: PROVIDER_WAIT_REARMS.load(Ordering::Relaxed),
+            dispatch_completions: PROVIDER_WAIT_DISPATCH_COMPLETIONS.load(Ordering::Relaxed),
+            cancellations: PROVIDER_WAIT_CANCELLATIONS.load(Ordering::Relaxed),
+            native_replies_abandoned: PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED
+                .load(Ordering::Relaxed),
+            event_leases_acquired: PROVIDER_WAIT_EVENT_LEASES_ACQUIRED.load(Ordering::Relaxed),
+            event_leases_released: PROVIDER_WAIT_EVENT_LEASES_RELEASED.load(Ordering::Relaxed),
+            active_continuations: (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).len(),
+            active_waiters: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).len(),
+            active_event_leases: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).lease_count(),
+        }
+    }
+}
 
 fn trace_stack_growth_reply(
     pi: usize,
@@ -1154,6 +1213,24 @@ fn provider_wait_expected_owner(
     owner.is_valid().then_some(owner)
 }
 
+fn component_suspension_owner(
+    owner: nt_provider_wait::ProviderWaitOwner,
+) -> nt_component_suspension::SuspensionOwner {
+    nt_component_suspension::SuspensionOwner {
+        provider_domain: owner.provider_domain,
+        provider_generation: owner.provider_generation,
+        client_pi: owner.client_pi,
+        client_generation: owner.client_generation,
+        client_tid: owner.client_tid,
+        client_badge: owner.client_badge,
+        dispatch_id: owner.dispatch_id,
+    }
+}
+
+fn provider_wait_key(wait_id: u64) -> nt_component_suspension::SuspensionKey {
+    nt_component_suspension::SuspensionKey::provider_wait(wait_id)
+}
+
 enum ProviderWaitRuntimeOutcome {
     Parked,
     Completed {
@@ -1176,17 +1253,22 @@ unsafe fn provider_wait_resume_top(
             .top()?
             .clone();
         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .begin_resume(resume.wait_id)
+            .begin_resume(resume.key)
             .expect("provider wait top changed during synchronous resume");
+        PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
+        if !resume.cancelled {
+            PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
+        }
         match win32k_glue::resume_suspended_provider_wait_component(
             frame.continuation.pending,
-            resume.wait_id,
-            resume.status,
+            resume.key.id,
+            resume.completion,
         ) {
             win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
                 let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                    .complete_dispatch(resume.wait_id, frame.owner)
+                    .complete_dispatch(resume.key, frame.owner)
                     .ok()?;
+                PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 return Some(ProviderWaitRuntimeOutcome::Completed {
                     continuation: completed.continuation,
                     dispatch,
@@ -1194,27 +1276,31 @@ unsafe fn provider_wait_resume_top(
             }
             win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
                 let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                    .complete_dispatch(resume.wait_id, frame.owner)
+                    .complete_dispatch(resume.key, frame.owner)
                     .ok()?;
+                PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 return Some(ProviderWaitRuntimeOutcome::UserCallbackSuspended(
                     completed.continuation,
                 ));
             }
             win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
                 let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                    .complete_dispatch(resume.wait_id, frame.owner)
+                    .complete_dispatch(resume.key, frame.owner)
                     .ok()?;
+                PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 return Some(ProviderWaitRuntimeOutcome::Failed {
                     continuation: completed.continuation,
                     status,
                 });
             }
             win32k_glue::ProviderWaitPumpCompletion::Reparked(next) => {
+                PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
                 let Some(next_owner) = provider_wait_expected_owner(next) else {
                     let completed =
                         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .abort_resume(resume.wait_id, frame.owner, 0xC000_000Du32 as i32)
+                            .abort_resume(resume.key, frame.owner, 0xC000_000Du32 as i32)
                             .expect("invalid provider re-wait lost its active continuation");
+                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ProviderWaitRuntimeOutcome::Failed {
                         continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
@@ -1226,18 +1312,19 @@ unsafe fn provider_wait_resume_top(
                 next_continuation.pending = next;
                 if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
                     .rearm(
-                        resume.wait_id,
-                        next_wait_id,
+                        resume.key,
+                        provider_wait_key(next_wait_id),
                         sequence,
-                        next_owner,
+                        component_suspension_owner(next_owner),
                         next_continuation,
                     )
                     .is_err()
                 {
                     let completed =
                         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .abort_resume(resume.wait_id, frame.owner, 0xC000_000Du32 as i32)
+                            .abort_resume(resume.key, frame.owner, 0xC000_000Du32 as i32)
                             .expect("rejected provider re-wait lost its active continuation");
+                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ProviderWaitRuntimeOutcome::Failed {
                         continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
@@ -1252,6 +1339,7 @@ unsafe fn provider_wait_resume_top(
                 );
                 match admission {
                     Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
+                        PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
                         return Some(ProviderWaitRuntimeOutcome::Parked);
                     }
                     Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied {
@@ -1259,15 +1347,18 @@ unsafe fn provider_wait_resume_top(
                         status,
                     }) => {
                         let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .select(wait_id, status);
+                            .select(provider_wait_key(wait_id), status);
                     }
                     Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
                         let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .select(wait_id, nt_provider_wait::STATUS_TIMEOUT);
+                            .select(provider_wait_key(wait_id), nt_provider_wait::STATUS_TIMEOUT);
                     }
                     Err(error) => {
                         let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .cancel(next_wait_id, provider_wait_status_for_error(error));
+                            .cancel(
+                                provider_wait_key(next_wait_id),
+                                provider_wait_status_for_error(error),
+                            );
                     }
                 }
             }
@@ -1296,7 +1387,7 @@ pub(crate) unsafe fn provider_wait_select_ready(nt_handler: &mut ExecNtHandler) 
         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_ready(nt_handler)
     {
         if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .select(completion.wait_id, completion.status)
+            .select(provider_wait_key(completion.wait_id), completion.status)
             .is_err()
         {
             panic!("provider wait arbiter selected an unowned continuation");
@@ -1319,7 +1410,7 @@ pub(crate) unsafe fn provider_wait_select_due(
         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_due(nt_handler, now)
     {
         if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .select(completion.wait_id, completion.status)
+            .select(provider_wait_key(completion.wait_id), completion.status)
             .is_err()
         {
             panic!("provider wait timeout selected an unowned continuation");
@@ -1359,11 +1450,17 @@ unsafe fn provider_wait_admit_current(
         abandon_native_reply: false,
     };
     if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-        .admit(wait_id, sequence, owner, continuation)
+        .admit(
+            provider_wait_key(wait_id),
+            sequence,
+            component_suspension_owner(owner),
+            continuation,
+        )
         .is_err()
     {
         return false;
     }
+    PROVIDER_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     match (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
         nt_handler,
         &pending.request,
@@ -1371,10 +1468,12 @@ unsafe fn provider_wait_admit_current(
         sequence,
         nt_time_snapshot(),
     ) {
-        Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {}
+        Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
+            PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied { wait_id, status }) => {
             if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                .select(wait_id, status)
+                .select(provider_wait_key(wait_id), status)
                 .is_err()
             {
                 panic!("provider wait immediate completion lost its continuation");
@@ -1382,7 +1481,7 @@ unsafe fn provider_wait_admit_current(
         }
         Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
             if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                .select(wait_id, nt_provider_wait::STATUS_TIMEOUT)
+                .select(provider_wait_key(wait_id), nt_provider_wait::STATUS_TIMEOUT)
                 .is_err()
             {
                 panic!("provider wait poll completion lost its continuation");
@@ -1390,7 +1489,10 @@ unsafe fn provider_wait_admit_current(
         }
         Err(error) => {
             if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                .cancel(wait_id, provider_wait_status_for_error(error))
+                .cancel(
+                    provider_wait_key(wait_id),
+                    provider_wait_status_for_error(error),
+                )
                 .is_err()
             {
                 panic!("provider wait rejection lost its continuation");
@@ -1495,7 +1597,7 @@ unsafe fn provider_wait_drain_ready(
 }
 
 unsafe fn provider_wait_prepare_abandoned_replies(
-    scope: nt_provider_wait::ProviderWaitTeardownScope,
+    scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
     loop {
         let wait_id = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
@@ -1504,12 +1606,12 @@ unsafe fn provider_wait_prepare_abandoned_replies(
             .find(|frame| {
                 scope.matches(frame.owner) && !frame.continuation.abandon_native_reply
             })
-            .map(|frame| frame.wait_id);
-        let Some(wait_id) = wait_id else {
+            .map(|frame| frame.key);
+        let Some(wait_key) = wait_id else {
             return true;
         };
         let frame = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .get_mut(wait_id)
+            .get_mut(wait_key)
             .expect("provider wait teardown target disappeared");
         let cap = frame.continuation.reply_cap;
         if cap != 0 {
@@ -1524,6 +1626,7 @@ unsafe fn provider_wait_prepare_abandoned_replies(
             }
             release_reply_pool_cap(cap);
             frame.continuation.reply_cap = 0;
+            PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED.fetch_add(1, Ordering::Relaxed);
         }
         frame.continuation.abandon_native_reply = true;
     }
@@ -1531,7 +1634,7 @@ unsafe fn provider_wait_prepare_abandoned_replies(
 
 unsafe fn provider_wait_cancel_scope(
     nt_handler: &mut ExecNtHandler,
-    scope: nt_provider_wait::ProviderWaitTeardownScope,
+    scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
     if !scope.is_valid() {
         return false;
@@ -1542,27 +1645,29 @@ unsafe fn provider_wait_cancel_scope(
     if !provider_wait_prepare_abandoned_replies(scope) {
         return false;
     }
-    while let Some(wait_id) = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+    while let Some(wait_key) = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
         .next_cancellable_in_scope(scope)
     {
         let phase = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
-            .get(wait_id)
+            .get(wait_key)
             .expect("provider wait cancellation target disappeared")
-            .phase;
+            .phase
+            .clone();
         let arbiter_completion =
             (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).cancel(
                 nt_handler,
-                wait_id,
+                wait_key.id,
                 0xC000_0120u32 as i32,
             );
-        if matches!(phase, nt_provider_wait::ProviderWaitPhase::Waiting)
+        if matches!(phase, nt_component_suspension::SuspensionPhase::Waiting)
             && arbiter_completion.is_none()
         {
             panic!("waiting provider continuation has no dispatcher arbiter owner");
         }
         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .cancel(wait_id, 0xC000_0120u32 as i32)
+            .cancel(wait_key, 0xC000_0120u32 as i32)
             .expect("provider wait teardown could not cancel its exact continuation");
+        PROVIDER_WAIT_CANCELLATIONS.fetch_add(1, Ordering::Relaxed);
     }
 
     let Some(ctx) = nt_handler.loop_ctx else {
@@ -1588,14 +1693,18 @@ pub(crate) unsafe fn provider_wait_cancel_client_thread(
     let Some(client_generation) = nt_handler.hosted_process_generation(pi) else {
         return false;
     };
+    let Some(client_badge) = nt_handler.hosted_thread_badge_for_tid(tid) else {
+        return false;
+    };
     provider_wait_cancel_scope(
         nt_handler,
-        nt_provider_wait::ProviderWaitTeardownScope::Thread {
-            provider_domain: provider.domain,
+        nt_component_suspension::SuspensionScope::Thread {
+            domain: provider.domain,
             provider_generation: provider.generation,
             client_pi: pi as u32,
             client_generation,
             client_tid: tid,
+            client_badge,
         },
     )
 }
@@ -1616,8 +1725,8 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     };
     provider_wait_cancel_scope(
         nt_handler,
-        nt_provider_wait::ProviderWaitTeardownScope::Process {
-            provider_domain: provider.domain,
+        nt_component_suspension::SuspensionScope::Process {
+            domain: provider.domain,
             provider_generation: provider.generation,
             client_pi: process_index as u32,
             client_generation,

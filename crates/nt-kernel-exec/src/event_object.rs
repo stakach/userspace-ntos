@@ -221,6 +221,30 @@ pub struct EventObjectSnapshot {
     pub signal_leases: u32,
 }
 
+impl EventObjectSnapshot {
+    /// Authorize a provider wait without treating a provider virtual address as authority.
+    ///
+    /// A provider may wait on its own embedded Event, or on a process-owned Event that the
+    /// executive has explicitly projected into that provider and still holds by pointer. The
+    /// caller supplies generation-exact provider and client owners derived from the live dispatch.
+    pub fn authorizes_provider_wait(
+        self,
+        provider_owner: EventObjectOwner,
+        client_owner: EventObjectOwner,
+    ) -> bool {
+        match self.owner {
+            EventObjectOwner::Provider { .. } => {
+                self.owner == provider_owner && self.provider_local_identity.is_some()
+            }
+            EventObjectOwner::Process { .. } => {
+                self.owner == client_owner
+                    && self.provider_body.is_some()
+                    && self.pointer_leases != 0
+            }
+        }
+    }
+}
+
 /// Quiescent provider-owned Event state that survives replacement of an executive service
 /// instance. Native dispatcher backing is deliberately not transferable: the destination creates
 /// new backing and binds it to the exact canonical identity during import.
@@ -1186,6 +1210,58 @@ mod tests {
             .unwrap();
         assert_eq!(retired.provider_local_identity, Some(11));
         assert_eq!(registry.id_for_provider_local(first_owner, 11), None);
+    }
+
+    #[test]
+    fn provider_wait_authority_accepts_exact_local_and_projected_events() {
+        let provider = EventObjectOwner::provider(7, 3);
+        let client = EventObjectOwner::new(42, 9);
+        let mut registry = EventObjectRegistry::new();
+
+        let local = registry.create_provider_local(provider, 11, 101).unwrap();
+        assert!(registry
+            .snapshot(local)
+            .unwrap()
+            .authorizes_provider_wait(provider, client));
+
+        let projected = registry.create(client, 102).unwrap();
+        registry
+            .retain_pointer_or_install(projected, 0xD000)
+            .unwrap();
+        assert!(registry
+            .snapshot(projected)
+            .unwrap()
+            .authorizes_provider_wait(provider, client));
+    }
+
+    #[test]
+    fn provider_wait_authority_rejects_stale_cross_owner_and_unprojected_events() {
+        let provider = EventObjectOwner::provider(7, 3);
+        let client = EventObjectOwner::new(42, 9);
+        let mut registry = EventObjectRegistry::new();
+
+        let local = registry.create_provider_local(provider, 11, 101).unwrap();
+        assert!(!registry.snapshot(local).unwrap().authorizes_provider_wait(
+            EventObjectOwner::provider(7, 4),
+            client,
+        ));
+
+        let projected = registry.create(client, 102).unwrap();
+        assert!(!registry
+            .snapshot(projected)
+            .unwrap()
+            .authorizes_provider_wait(provider, client));
+        registry
+            .retain_pointer_or_install(projected, 0xD000)
+            .unwrap();
+        assert!(!registry.snapshot(projected).unwrap().authorizes_provider_wait(
+            provider,
+            EventObjectOwner::new(42, 10),
+        ));
+        assert!(!registry.snapshot(projected).unwrap().authorizes_provider_wait(
+            provider,
+            EventObjectOwner::new(43, 9),
+        ));
     }
 
     #[test]

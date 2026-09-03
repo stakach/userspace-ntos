@@ -225,6 +225,10 @@ impl<C, R> ComponentSuspensionStack<C, R> {
         self.frames.iter().find(|frame| frame.key == key)
     }
 
+    pub fn get_mut(&mut self, key: SuspensionKey) -> Option<&mut SuspensionFrame<C, R>> {
+        self.frames.iter_mut().find(|frame| frame.key == key)
+    }
+
     pub fn contains_scope(&self, scope: SuspensionScope) -> bool {
         scope.is_valid() && self.frames.iter().any(|frame| scope.matches(frame.owner))
     }

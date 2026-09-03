@@ -24004,6 +24004,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     remove-before-delete helpers. The next kernel boundary is the monotonic cross-table dispatcher
     wait order, followed by typed provider object pointer/handle counts.
 
+    B3 cross-kind component-suspension checkpoint (2026-09-03, host and freestanding green;
+    desktop rerun pending): `nt-component-suspension` now owns the one physical component
+    continuation stack with generation-exact provider/process/thread/dispatch ownership and typed
+    provider-wait versus LPC-request keys. Top-only selection, cancellation, resume, rollback, and
+    same- or cross-kind re-arm are covered by ten host tests. The live provider Event-wait path now
+    uses that common LIFO owner, accepts non-alertable UserMode waits, authorizes only exact
+    provider-local or explicitly projected process Events, and accounts every continuation and
+    Event lease. The historical empty-queue `GetMessage` guard is disabled, and win32k no longer
+    asks the executive to synthesize WinSta0/Default after `NtUserInitialize`.
+
+    Removing that host-created object graph exposed the next real producer boundary. Winlogon's
+    `IntCreateWindowStation` calls `UserCreateSystemThread` for the desktop and raw-input threads;
+    each call currently reaches win32k's explicit `LpcRequestWaitReplyPort` failure, so CSRSS never
+    creates the producer that sets `gpDesktopThreadStartedEvent`. Implement ordinary `LPC_REQUEST`
+    traffic through a retained port-object endpoint, preserving immediate replies and exact message
+    identity. Then park the native win32k dispatch in the shared cross-kind stack, accept nested
+    win32k dispatches while it is parked, stage the owned reply only when its exact frame reaches
+    the top, and support both LPC-to-provider-wait and provider-wait-to-LPC re-arm. Delete the old
+    no-op port references and the unreachable host desktop-construction machinery only after a
+    serialized real-CSRSS desktop acceptance run.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

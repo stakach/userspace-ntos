@@ -3,8 +3,8 @@ use alloc::vec::Vec;
 use nt_time::{Deadline, TimeSnapshot};
 
 use crate::{
-    ProviderWaitAbiError, ProviderWaitMode, ProviderWaitObject, ProviderWaitObjectType,
-    ProviderWaitOwner, ProviderWaitRequest, ProviderWaitTimeoutKind, ProviderWaitType,
+    ProviderWaitAbiError, ProviderWaitObject, ProviderWaitObjectType, ProviderWaitOwner,
+    ProviderWaitRequest, ProviderWaitTimeoutKind, ProviderWaitType,
 };
 
 pub const STATUS_WAIT_0: i32 = 0;
@@ -34,7 +34,6 @@ pub trait ProviderEventWaitBackend {
 pub enum ProviderEventWaitError<E> {
     InvalidRequest(ProviderWaitAbiError),
     OwnerMismatch,
-    UnsupportedMode,
     UnsupportedAlertableWait,
     UnsupportedObjectType,
     InvalidAdmissionSequence,
@@ -93,6 +92,13 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         self.waiters.is_empty()
     }
 
+    pub fn lease_count(&self) -> usize {
+        self.waiters
+            .iter()
+            .map(|waiter| waiter.leases.len())
+            .sum()
+    }
+
     pub fn contains(&self, wait_id: u64) -> bool {
         self.waiters.iter().any(|waiter| waiter.wait_id == wait_id)
     }
@@ -115,9 +121,6 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
             .map_err(ProviderEventWaitError::InvalidRequest)?;
         if request.owner != expected_owner {
             return Err(ProviderEventWaitError::OwnerMismatch);
-        }
-        if request.wait_mode != ProviderWaitMode::Kernel {
-            return Err(ProviderEventWaitError::UnsupportedMode);
         }
         if request.alertable {
             return Err(ProviderEventWaitError::UnsupportedAlertableWait);
@@ -489,7 +492,7 @@ mod tests {
                     wait_id,
                     owner,
                     wait_type,
-                    wait_mode: ProviderWaitMode::Kernel,
+                    wait_mode: crate::ProviderWaitMode::Kernel,
                     alertable: false,
                     timeout_kind,
                     timeout_100ns,
@@ -627,12 +630,6 @@ mod tests {
             arbiter.admit(&mut backend, &invalid, identity, 5, now(0, 0)),
             Err(ProviderEventWaitError::UnsupportedAlertableWait)
         );
-        invalid = base;
-        invalid.header.wait_mode = ProviderWaitMode::User as u32;
-        assert_eq!(
-            arbiter.admit(&mut backend, &invalid, identity, 5, now(0, 0)),
-            Err(ProviderEventWaitError::UnsupportedMode)
-        );
         let semaphore = ProviderWaitObject::new(ProviderWaitObjectType::Semaphore, 1, 1);
         let unsupported = request(
             identity,
@@ -646,6 +643,37 @@ mod tests {
             arbiter.admit(&mut backend, &unsupported, identity, 5, now(0, 0)),
             Err(ProviderEventWaitError::UnsupportedObjectType)
         );
+        assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
+    fn non_alertable_user_mode_wait_owns_and_releases_its_event_lease() {
+        let identity = owner(14);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut user_wait = request(
+            identity,
+            23,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1)],
+        );
+        user_wait.header.wait_mode = crate::ProviderWaitMode::User as u32;
+
+        assert_eq!(
+            arbiter.admit(&mut backend, &user_wait, identity, 14, now(0, 0)),
+            Ok(ProviderEventWaitAdmission::Parked { wait_id: 23 })
+        );
+        assert_eq!(arbiter.lease_count(), 1);
+        assert_eq!(backend.lease_count(), 1);
+
+        let completion = arbiter
+            .cancel(&mut backend, 23, 0xC000_0120u32 as i32)
+            .unwrap();
+        assert!(completion.cancelled);
+        assert_eq!(arbiter.lease_count(), 0);
         assert_eq!(backend.lease_count(), 0);
     }
 

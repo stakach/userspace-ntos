@@ -132,23 +132,34 @@ impl nt_provider_wait::ProviderEventWaitBackend for ExecNtHandler {
             .event_objects
             .snapshot(id)
             .map_err(|_| STATUS_INVALID_PARAMETER)?;
-        if snapshot.owner
-            != (nt_kernel_exec::EventObjectOwner::Provider {
-                domain: owner.provider_domain,
-                generation: owner.provider_generation,
-            })
-            || !crate::win32k_provider_domain_is_current(
-                nt_provider_wait::ProviderDomainIdentity {
-                    domain: owner.provider_domain,
-                    generation: owner.provider_generation,
-                },
+        let provider = nt_provider_wait::ProviderDomainIdentity {
+            domain: owner.provider_domain,
+            generation: owner.provider_generation,
+        };
+        let Some(client_pid) = self.pm_pid_for_pi(owner.client_pi as usize) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let current_client_generation = self
+            .hosted_process_generation(owner.client_pi as usize)
+            .unwrap_or(0);
+        if !crate::win32k_provider_domain_is_current(provider)
+            || current_client_generation != owner.client_generation
+            || !snapshot.authorizes_provider_wait(
+                nt_kernel_exec::EventObjectOwner::provider(provider.domain, provider.generation),
+                nt_kernel_exec::EventObjectOwner::new(
+                    client_pid as u64,
+                    owner.client_generation,
+                ),
             )
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        self.event_objects
+        let lease = self
+            .event_objects
             .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        crate::service_sec_image::provider_wait_record_event_lease_acquired();
+        Ok(lease)
     }
 
     fn event_is_ready(&self, lease: Self::Lease) -> bool {
@@ -183,8 +194,11 @@ impl nt_provider_wait::ProviderEventWaitBackend for ExecNtHandler {
             .event_objects
             .release_wait(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
         {
-            Ok(Some(retired)) => self.finalize_retired_event_object(retired),
-            Ok(None) => {}
+            Ok(Some(retired)) => {
+                crate::service_sec_image::provider_wait_record_event_lease_released();
+                self.finalize_retired_event_object(retired)
+            }
+            Ok(None) => crate::service_sec_image::provider_wait_record_event_lease_released(),
             Err(_) => panic!("provider Event wait lost its exact lease during release"),
         }
     }

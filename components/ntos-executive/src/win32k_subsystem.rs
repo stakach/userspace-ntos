@@ -1118,7 +1118,6 @@ pub const W32_PROVIDER_WAIT_LABEL: u64 = 0x779;
 /// Request tag returned on the retained component Call after the exact wait is selected, times out,
 /// or is cancelled. The correlated status lives in the dedicated provider-wait result frame.
 pub const W32_PROVIDER_WAIT_RESUME_LABEL: u64 = 0x77A;
-
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -3772,9 +3771,9 @@ extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
 
 extern "win64" fn s_ke_wait_for_single_object(
     event: u64,
-    _wait_reason: u64,
-    wait_mode: u64,
-    alertable: u64,
+    _wait_reason: u32,
+    wait_mode: i8,
+    alertable: u8,
     timeout: u64,
 ) -> i32 {
     let Some(object) = (unsafe { provider_wait_object_for_event(event) }) else {
@@ -3855,8 +3854,8 @@ unsafe fn provider_wait_timeout(
 unsafe fn provider_wait_rendezvous(
     objects: &[nt_provider_wait::ProviderWaitObject],
     wait_type: nt_provider_wait::ProviderWaitType,
-    wait_mode: u64,
-    alertable: u64,
+    wait_mode: i8,
+    alertable: u8,
     timeout: u64,
 ) -> i32 {
     let Some(owner) = current_provider_wait_owner() else {
@@ -3892,8 +3891,8 @@ unsafe fn provider_wait_rendezvous(
                 timeout_100ns,
             },
             objects,
-        )
-        .is_err()
+    )
+    .is_err()
     {
         return 0xC000_000Du32 as i32;
     }
@@ -3949,10 +3948,10 @@ unsafe fn provider_wait_rendezvous(
 extern "win64" fn s_ke_wait_for_multiple_objects(
     count: u32,
     object_array: u64,
-    wait_type: u64,
-    _wait_reason: u64,
-    wait_mode: u64,
-    alertable: u64,
+    wait_type: u32,
+    _wait_reason: u32,
+    wait_mode: i8,
+    alertable: u8,
     timeout: u64,
     _wait_blocks: u64,
 ) -> i32 {
@@ -13675,21 +13674,14 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         let _ = refresh_default_keyboard_layout();
         let _ = bind_default_keyboard_layout_to_thread(t);
     }
-    // Post-NtUserInitialize (0x125a) HOST-PREREQUISITE SEED (once). InitializeGreCSRSS and
-    // InitFontSupport have completed, so this is the earliest valid point to create the system font,
-    // interactive object graph and PDEV. The PDEV must exist before user32's real
-    // resource-backed system-cursor/class initialization starts issuing NtGdiOpenDCW; deferring it
-    // until the later winlogon SwitchDesktop leaves every cursor display-DC open without a device.
-    // Two prerequisites cannot be produced by winlogon itself and are seeded here:
-    //   (1) the system font (arial.ttf memory-font) — else the lazy co_IntInitializeDesktopGraphics's
-    //       font realize null-derefs ("no fonts loaded at all");
-    //   (2) the WinSta0/Default Ob object graph winlogon reuses (its NtUserCreateWindowStation returns
-    //       hWinSta=0x4, and gpdeskInputDesktop is set). A bRedraw=FALSE SwitchDesktop establishes the
-    //       active desktop before co_IntGraphicsCheck creates the real device and surface.
+    // Post-NtUserInitialize (0x125a) display prerequisites (once). InitializeGreCSRSS and
+    // InitFontSupport have completed, so this is the earliest valid point to load the system font
+    // and create the PDEV before user32's resource-backed cursor/class initialization starts issuing
+    // NtGdiOpenDCW. WinSta0 and its desktops are deliberately not created here: winlogon owns that
+    // lifecycle, after CSRSS has created the API workers that service UserCreateSystemThread.
     if ssn == SSN_NT_USER_INITIALIZE_REAL && result as u32 == 0 && !DESKTOP_GFX_SEEDED {
         DESKTOP_GFX_SEEDED = true;
         load_system_font_for_client(current_client_index());
-        create_winsta_and_desktop();
         print_str(b"[win32k-gfx] creating display PDEV before user32 resources...\n");
         let change_display: extern "win64" fn(u64, u64, u64, *mut u64, u64) -> i32 =
             core::mem::transmute(
