@@ -23652,6 +23652,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive check remains green at 213 warnings; win32k continuation transport and cross-source
     consumption of shared projected objects remain open.
 
+    Provider-wait continuation checkpoint (2026-09-03, host green): the new `nt-provider-wait`
+    crate owns the bounded LIFO relationship between an isolated provider's single component
+    rendezvous and the exact native client dispatch continuation beneath it. Frames are keyed by
+    provider domain/generation plus client process/thread/generation/badge and dispatch ID. A buried
+    wait may become selected or cancelled, but only the top frame can resume; completing a nested
+    provider dispatch exposes the next selected frame without out-of-order reply. Admission can be
+    rolled back before dispatcher commit, stale/duplicate identities fail closed, and a resumed
+    dispatch that blocks again rearms the same frame while retaining its native continuation.
+    Six focused tests cover nested selection, cancellation, rearm, rollback, identity rejection,
+    and the depth bound. The next slice is the pointer-free single/multiple wait ABI and component
+    rendezvous loop; the crate is not yet wired into the pump and therefore does not close the
+    provider-wait item.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

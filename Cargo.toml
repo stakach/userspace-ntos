@@ -91,6 +91,7 @@ members = [
     "crates/nt-rtl-work-item",
     "crates/nt-rtl-timer-wait",
     "crates/nt-user-callback",
+    "crates/nt-provider-wait",
     "crates/nt-win32k-job",
     "crates/nt-syscall-abi",
     "crates/nt-ntdll-layout",
