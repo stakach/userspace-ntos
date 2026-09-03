@@ -1,6 +1,9 @@
 use alloc::vec::Vec;
 
-use crate::{ProviderDomainIdentity, ProviderWaitObject, ProviderWaitObjectType};
+use crate::{
+    ProviderAllocationCatalog, ProviderAllocationIdentity, ProviderAllocationSnapshot,
+    ProviderDomainIdentity, ProviderWaitObject, ProviderWaitObjectType,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderEventKind {
@@ -40,6 +43,14 @@ impl ProviderEventBacking {
                 dispatch_id,
                 activation_generation,
             } => dispatch_id != 0 && activation_generation != 0,
+        }
+    }
+
+    pub const fn from_allocation(allocation: ProviderAllocationSnapshot) -> Self {
+        Self::Allocation {
+            arena_id: allocation.identity.arena_id,
+            allocation_id: allocation.identity.allocation_id,
+            allocation_generation: allocation.identity.generation,
         }
     }
 }
@@ -200,7 +211,7 @@ impl ProviderLocalEventCatalog {
 
     /// Reserve a fresh local identity before asking the executive to publish a canonical Event.
     /// Existing or delete-pending storage must be retired first, even when no lease is active.
-    pub fn initialize(
+    fn initialize(
         &mut self,
         body: u64,
         storage: ProviderEventStorage,
@@ -249,6 +260,103 @@ impl ProviderLocalEventCatalog {
             ..ProviderLocalEventRecord::EMPTY
         };
         Ok(id)
+    }
+
+    pub fn initialize_static(
+        &mut self,
+        body: u64,
+        offset: u64,
+        kind: ProviderEventKind,
+        initial_state: bool,
+    ) -> Result<ProviderLocalEventId, ProviderLocalEventError> {
+        self.initialize(
+            body,
+            ProviderEventStorage {
+                backing: ProviderEventBacking::Static {
+                    instance_generation: self.provider.generation,
+                },
+                offset,
+            },
+            kind,
+            initial_state,
+        )
+    }
+
+    pub fn initialize_stack(
+        &mut self,
+        body: u64,
+        dispatch_id: u64,
+        activation_generation: u64,
+        offset: u64,
+        kind: ProviderEventKind,
+        initial_state: bool,
+    ) -> Result<ProviderLocalEventId, ProviderLocalEventError> {
+        self.initialize(
+            body,
+            ProviderEventStorage {
+                backing: ProviderEventBacking::Stack {
+                    dispatch_id,
+                    activation_generation,
+                },
+                offset,
+            },
+            kind,
+            initial_state,
+        )
+    }
+
+    pub fn initialize_allocation(
+        &mut self,
+        allocations: &ProviderAllocationCatalog,
+        body: u64,
+        storage_bytes: u64,
+        kind: ProviderEventKind,
+        initial_state: bool,
+    ) -> Result<ProviderLocalEventId, ProviderLocalEventError> {
+        let allocation = allocations
+            .containing(body, storage_bytes)
+            .map_err(|_| ProviderLocalEventError::InvalidStorage)?;
+        self.initialize_in_allocation(
+            allocations,
+            allocation.identity,
+            body,
+            storage_bytes,
+            kind,
+            initial_state,
+        )
+    }
+
+    pub fn initialize_in_allocation(
+        &mut self,
+        allocations: &ProviderAllocationCatalog,
+        allocation_identity: ProviderAllocationIdentity,
+        body: u64,
+        storage_bytes: u64,
+        kind: ProviderEventKind,
+        initial_state: bool,
+    ) -> Result<ProviderLocalEventId, ProviderLocalEventError> {
+        let allocation = allocations
+            .snapshot(allocation_identity)
+            .map_err(|_| ProviderLocalEventError::InvalidStorage)?;
+        let offset = allocation
+            .offset_of(body)
+            .ok_or(ProviderLocalEventError::InvalidStorage)?;
+        if storage_bytes == 0
+            || body
+                .checked_add(storage_bytes)
+                .is_none_or(|end| end > allocation.base + allocation.capacity)
+        {
+            return Err(ProviderLocalEventError::InvalidStorage);
+        }
+        self.initialize(
+            body,
+            ProviderEventStorage {
+                backing: ProviderEventBacking::from_allocation(allocation),
+                offset,
+            },
+            kind,
+            initial_state,
+        )
     }
 
     pub fn rollback_unpublished(
@@ -480,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_reuse_requires_exact_two_phase_retirement() {
+    fn allocation_reuse_requires_exact_two_phase_retirement() {
         let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
         let storage = allocation(11, 1, 8);
         let first = catalog
@@ -704,5 +812,49 @@ mod tests {
             .unwrap();
         assert_ne!(replacement, first);
         assert_eq!(catalog.resolve_body(0x8040).unwrap().id, second);
+    }
+
+    #[test]
+    fn allocation_event_initialization_rejects_a_stale_allocation_generation() {
+        let mut allocations = ProviderAllocationCatalog::new();
+        let first_allocation = allocations.register(1, 0x9000, 0x100).unwrap();
+        let mut events = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let first = events
+            .initialize_in_allocation(
+                &allocations,
+                first_allocation.identity,
+                0x9020,
+                0x18,
+                ProviderEventKind::Notification,
+                false,
+            )
+            .unwrap();
+        events.bind_canonical(first, canonical(30, 1)).unwrap();
+        let retirement = events.begin_retire_event(first).unwrap();
+        events.ack_retirement(retirement).unwrap();
+        allocations.retire(first_allocation.identity).unwrap();
+        let second_allocation = allocations.register(1, 0x9000, 0x100).unwrap();
+
+        assert_eq!(
+            events.initialize_in_allocation(
+                &allocations,
+                first_allocation.identity,
+                0x9020,
+                0x18,
+                ProviderEventKind::Notification,
+                false,
+            ),
+            Err(ProviderLocalEventError::InvalidStorage)
+        );
+        assert!(events
+            .initialize_in_allocation(
+                &allocations,
+                second_allocation.identity,
+                0x9020,
+                0x18,
+                ProviderEventKind::Notification,
+                false,
+            )
+            .is_ok());
     }
 }

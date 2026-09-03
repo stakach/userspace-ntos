@@ -23768,7 +23768,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     identities fail closed, and allocation ranges may overlap only through strict cross-arena
     containment. Lookup selects the smallest live containing allocation, so an Event in a desktop
     heap allocation is never attributed to the enclosing session-heap section view. Parent
-    retirement is fenced until nested live allocations retire. All 26 crate tests pass. Next hook
+    retirement is fenced until nested live allocations retire. Event initialization can no longer
+    accept a caller-fabricated allocation tuple: it derives and revalidates the exact live
+    allocation generation, and a range crossing the innermost allocation boundary fails instead of
+    falling back to its parent. All 28 crate tests pass. Next hook
     successful win32k session/desktop heap allocation, free, and moving reallocation into this
     catalog, retire embedded Events before allocator metadata changes, and only then restore the
     canonical local Event cutover.

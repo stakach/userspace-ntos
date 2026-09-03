@@ -187,7 +187,7 @@ impl ProviderAllocationCatalog {
             .ok_or(ProviderAllocationError::InvalidRange)?;
         let mut owner: Option<(usize, ProviderAllocationRecord)> = None;
         for (slot, record) in self.records.iter().copied().enumerate() {
-            if !record.live || address < record.base || end > record.end() {
+            if !record.live || address < record.base || address >= record.end() {
                 continue;
             }
             match owner {
@@ -202,6 +202,9 @@ impl ProviderAllocationCatalog {
             }
         }
         let (slot, record) = owner.ok_or(ProviderAllocationError::NotFound)?;
+        if end > record.end() {
+            return Err(ProviderAllocationError::InvalidRange);
+        }
         record.snapshot(slot)
     }
 
@@ -264,6 +267,20 @@ mod tests {
             catalog.snapshot(first.identity),
             Err(ProviderAllocationError::StaleIdentity)
         );
+        assert_eq!(
+            catalog.retire(first.identity),
+            Err(ProviderAllocationError::StaleIdentity)
+        );
+        let wrong_arena = ProviderAllocationIdentity {
+            arena_id: 2,
+            ..second.identity
+        };
+        assert_eq!(
+            catalog.retire(wrong_arena),
+            Err(ProviderAllocationError::StaleIdentity)
+        );
+        assert_eq!(catalog.snapshot(second.identity).unwrap(), second);
+        assert_eq!(catalog.exact(1, 0x1000).unwrap(), second);
     }
 
     #[test]
@@ -282,10 +299,21 @@ mod tests {
         assert_eq!(catalog.containing(0x20e8, 0x18).unwrap(), allocation);
         assert_eq!(
             catalog.containing(0x20e9, 0x18),
-            Err(ProviderAllocationError::NotFound)
+            Err(ProviderAllocationError::InvalidRange)
         );
         assert_eq!(
             catalog.containing(u64::MAX - 7, 8),
+            Err(ProviderAllocationError::InvalidRange)
+        );
+    }
+
+    #[test]
+    fn a_range_crossing_the_innermost_boundary_does_not_fall_back_to_its_parent() {
+        let mut catalog = ProviderAllocationCatalog::new();
+        catalog.register(1, 0x1000, 0x2000).unwrap();
+        catalog.register(2, 0x1800, 0x400).unwrap();
+        assert_eq!(
+            catalog.containing(0x1bf8, 0x10),
             Err(ProviderAllocationError::InvalidRange)
         );
     }
