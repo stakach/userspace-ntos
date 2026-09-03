@@ -19,6 +19,90 @@
 //! sees a host VA. Real Ob semantics reference: `references/nt5/base/ntos/ob/` (ObpCreateHandle,
 //! OBJECT_HEADER/OBJECT_TYPE); DESKTOP layout: `references/reactos/win32ss/user/ntuser/desktop.c`.
 
+use alloc::vec::Vec;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ExternalObjectReference {
+    object: u64,
+    pointer_count: u32,
+}
+
+/// Provider-backed object references projected into win32k as opaque object pointers. The table
+/// owns local pointer-count semantics over one retained provider reference; its final row is removed
+/// only after the provider confirms release, so a failed external teardown remains retryable.
+#[derive(Default)]
+pub struct ExternalObjectReferenceTable {
+    entries: Vec<ExternalObjectReference>,
+}
+
+impl ExternalObjectReferenceTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn reserve(&mut self) -> bool {
+        self.entries.try_reserve(1).is_ok()
+    }
+
+    pub fn insert_reserved(&mut self, object: u64) -> bool {
+        if object == 0 || self.entries.iter().any(|entry| entry.object == object) {
+            return false;
+        }
+        self.entries.push(ExternalObjectReference {
+            object,
+            pointer_count: 1,
+        });
+        true
+    }
+
+    pub fn contains(&self, object: u64) -> bool {
+        self.entries.iter().any(|entry| entry.object == object)
+    }
+
+    pub fn reference(&mut self, object: u64) -> Option<u32> {
+        let entry = self.entries.iter_mut().find(|entry| entry.object == object)?;
+        entry.pointer_count = entry.pointer_count.checked_add(1)?;
+        Some(entry.pointer_count)
+    }
+
+    /// Decrement a non-final reference. `None` means the exact row is at its final reference and
+    /// remains unchanged until [`complete_final_release`](Self::complete_final_release).
+    pub fn dereference_nonfinal(&mut self, object: u64) -> Result<Option<u32>, ()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.object == object)
+            .ok_or(())?;
+        if entry.pointer_count == 1 {
+            return Ok(None);
+        }
+        entry.pointer_count -= 1;
+        Ok(Some(entry.pointer_count))
+    }
+
+    pub fn complete_final_release(&mut self, object: u64) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.object == object && entry.pointer_count == 1)
+        else {
+            return false;
+        };
+        self.entries.remove(index);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// The win32k object types this layer models — the `DESKTOP` and `WINDOWSTATION_OBJECT`
 /// `OBJECT_TYPE`s (`ExDesktopObjectType` / `ExWindowStationObjectType`), plus `Other` for an object
 /// win32k creates through `ObCreateObject` whose type the caller did not recognize (still tracked so
@@ -990,5 +1074,32 @@ mod tests {
         let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
         let mut thread = [0u8; 0x300];
         assert!(!unsafe { link_thread_to_desktop(body.as_mut_ptr(), thread.as_mut_ptr()) });
+    }
+
+    #[test]
+    fn external_reference_table_releases_only_after_provider_confirmation() {
+        let mut table = ExternalObjectReferenceTable::new();
+        assert!(table.reserve());
+        assert!(table.insert_reserved(0x9100));
+        assert_eq!(table.reference(0x9100), Some(2));
+        assert_eq!(table.dereference_nonfinal(0x9100), Ok(Some(1)));
+        assert_eq!(table.dereference_nonfinal(0x9100), Ok(None));
+        assert!(table.contains(0x9100));
+        assert!(table.complete_final_release(0x9100));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn external_reference_table_rejects_stale_duplicate_and_underflow() {
+        let mut table = ExternalObjectReferenceTable::new();
+        assert!(table.reserve());
+        assert!(!table.insert_reserved(0));
+        assert!(table.insert_reserved(0x9200));
+        assert!(!table.insert_reserved(0x9200));
+        assert_eq!(table.dereference_nonfinal(0x9300), Err(()));
+        assert!(!table.complete_final_release(0x9300));
+        assert!(table.complete_final_release(0x9200));
+        assert_eq!(table.reference(0x9200), None);
+        assert_eq!(table.len(), 0);
     }
 }

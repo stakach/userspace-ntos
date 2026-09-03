@@ -510,6 +510,48 @@ impl PortCore {
         if handle == 0 {
             return None;
         }
+        if let Some(endpoint) = self
+            .kernel_endpoints
+            .iter()
+            .find(|endpoint| endpoint.handle == handle)
+        {
+            let port = self
+                .ports
+                .iter()
+                .find(|port| port.object_id == endpoint.port_object_id)?;
+            return Some(PortHandleInfo {
+                endpoint: PortHandleEndpoint::ListenPort,
+                api: port.api,
+                connection_id: 0,
+                state: None,
+                port_name: port.name.as_slice(),
+                server_id: port.owner,
+                client_id: None,
+                limits: port.limits,
+                security: None,
+            });
+        }
+        if let Some(endpoint) = self
+            .kernel_communication_endpoints
+            .iter()
+            .find(|endpoint| endpoint.handle == handle)
+        {
+            let conn = self
+                .connections
+                .iter()
+                .find(|connection| connection.id == endpoint.connection_id)?;
+            return Some(PortHandleInfo {
+                endpoint: PortHandleEndpoint::ClientCommPort,
+                api: conn.client_api,
+                connection_id: conn.id,
+                state: Some(conn.state),
+                port_name: conn.port_name.as_slice(),
+                server_id: conn.server_id,
+                client_id: Some(conn.client_id),
+                limits: conn.limits,
+                security: Some(conn.security),
+            });
+        }
         if let Some(port) = self
             .ports
             .iter()

@@ -1629,6 +1629,10 @@ mod tests {
             .handle;
         let retained = client.retain_port_object(client_port).unwrap();
         client.close_port(client_port).unwrap();
+        let retained_info = client.query_handle(retained).unwrap();
+        assert_eq!(retained_info.endpoint, handle_endpoint::CLIENT_COMM_PORT);
+        assert_eq!(retained_info.connection_id, pending.connection_id);
+        assert_eq!(retained_info.name, utf16("\\windows\\apiport"));
 
         let request = port_message(0, b"create-system-thread");
         let result = client

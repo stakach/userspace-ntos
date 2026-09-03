@@ -1141,6 +1141,8 @@ pub const W32_EVENT_OP_READ_LOCAL: u64 = 20;
 
 static mut WIN32K_EVENT_PROJECTIONS: nt_kernel_exec::ProviderEventProjectionCatalog =
     nt_kernel_exec::ProviderEventProjectionCatalog::new();
+static mut WIN32K_LPC_PORT_REFERENCES: nt_object_manager::win32k_ob::ExternalObjectReferenceTable =
+    nt_object_manager::win32k_ob::ExternalObjectReferenceTable::new();
 
 fn provider_event_projection_contains(body: u64) -> bool {
     unsafe { (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).contains(body) }
@@ -1187,9 +1189,12 @@ const LPC_SERVICE_PORT_HANDLE: u64 = 0x00;
 const LPC_SERVICE_OPERATION: u64 = 0x08;
 const LPC_SERVICE_STATUS: u64 = 0x0c;
 const LPC_SERVICE_MESSAGE_LEN: u64 = 0x10;
+const LPC_SERVICE_RESULT: u64 = 0x18;
 const LPC_SERVICE_MESSAGE: u64 = 0x100;
 const LPC_SERVICE_QUERY_HANDLE: u32 = 1;
-const LPC_SERVICE_REQUEST_PORT: u32 = 2;
+const LPC_SERVICE_RETAIN_PORT: u32 = 2;
+const LPC_SERVICE_RELEASE_PORT: u32 = 3;
+const LPC_SERVICE_RETAINED_REQUEST_PORT: u32 = 4;
 const LPC_SERVICE_MESSAGE_CAP: usize = nt_lpc_abi::PORT_MESSAGE_MAX_LEN;
 const _: () = assert!(LPC_SERVICE_MESSAGE as usize + LPC_SERVICE_MESSAGE_CAP <= WIN32K_LPC_BYTES);
 
@@ -3199,6 +3204,13 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
 }
 
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
+    if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
+        return unsafe {
+            (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES))
+                .reference(object)
+                .expect("retained LPC object disappeared during reference") as u64
+        };
+    }
     if !provider_event_projection_contains(object) {
         return object;
     }
@@ -3209,6 +3221,23 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
 }
 
 extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
+    if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
+        let remaining = unsafe {
+            (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES))
+                .dereference_nonfinal(object)
+                .expect("retained LPC object disappeared during dereference")
+        };
+        if let Some(remaining) = remaining {
+            return remaining as u64;
+        }
+        let (status, _) = unsafe { request_lpc_service(LPC_SERVICE_RELEASE_PORT, object, &[]) };
+        assert_eq!(status, 0, "retained LPC object release failed");
+        assert!(unsafe {
+            (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES))
+                .complete_final_release(object)
+        });
+        return 0;
+    }
     if !provider_event_projection_contains(object) {
         return 0;
     }
@@ -5054,12 +5083,35 @@ extern "win64" fn s_ob_reference_object_by_handle(
                 // NtCurrentThread() pseudo handle → selected dispatch ETHREAD.
                 (unsafe { current_ethread() }, u32::MAX)
             } else if obj_type == port_ty {
-                let status = unsafe { request_lpc_service(LPC_SERVICE_QUERY_HANDLE, handle, &[]) };
-                if status == 0 {
-                    (handle, u32::MAX)
+                if object_out.is_null() {
+                    return STATUS_ACCESS_VIOLATION_I32;
+                }
+                if !unsafe {
+                    (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES)).reserve()
+                } {
+                    return STATUS_NO_MEMORY;
+                }
+                let (status, endpoint) =
+                    unsafe { request_lpc_service(LPC_SERVICE_RETAIN_PORT, handle, &[]) };
+                if status == 0 && endpoint != 0 {
+                    if !unsafe {
+                        (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES))
+                            .insert_reserved(endpoint)
+                    } {
+                        let (release_status, _) = unsafe {
+                            request_lpc_service(LPC_SERVICE_RELEASE_PORT, endpoint, &[])
+                        };
+                        assert_eq!(release_status, 0, "LPC reference rollback failed");
+                        return STATUS_NO_MEMORY;
+                    }
+                    (endpoint, u32::MAX)
                 } else {
                     ob_type_mismatch_trace(handle, obj_type, b"invalid-lpc-handle");
-                    return status;
+                    return if status != 0 {
+                        status
+                    } else {
+                        STATUS_INVALID_HANDLE_I32
+                    };
                 }
             } else {
                 // Every modeled typed object resolves above; reaching here is a real object-manager
@@ -5089,7 +5141,9 @@ extern "win64" fn s_ob_reference_object_by_handle(
 /// isolated LPC service. Type zero is the documented datagram form; explicitly typed kernel
 /// notifications retain their type after validation.
 extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i32 {
-    if port_object == 0 {
+    if port_object == 0
+        || !unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(port_object) }
+    {
         return STATUS_INVALID_HANDLE_I32;
     }
     if message.is_null() {
@@ -5127,21 +5181,29 @@ extern "win64" fn s_lpc_request_port(port_object: u64, message: *const u8) -> i3
             .to_le_bytes(),
     );
 
-    unsafe { request_lpc_service(LPC_SERVICE_REQUEST_PORT, port_object, &frame[..total]) }
+    unsafe {
+        request_lpc_service(
+            LPC_SERVICE_RETAINED_REQUEST_PORT,
+            port_object,
+            &frame[..total],
+        )
+        .0
+    }
 }
 
 /// Invoke an executive-owned LPC operation from the win32k component. The shared window contains
 /// no pointers and the component cannot access the broker channel directly because its capabilities
 /// are meaningful only in the executive's CSpace.
 #[inline(never)]
-unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) -> i32 {
+unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) -> (i32, u64) {
     if message.len() > LPC_SERVICE_MESSAGE_CAP {
-        return STATUS_INVALID_PARAMETER_I32;
+        return (STATUS_INVALID_PARAMETER_I32, 0);
     }
     let sh = WIN32K_LPC_VADDR;
     write_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *mut u64, port_handle);
     write_volatile((sh + LPC_SERVICE_OPERATION) as *mut u32, operation);
     write_volatile((sh + LPC_SERVICE_STATUS) as *mut i32, 0xC000_0001u32 as i32);
+    write_volatile((sh + LPC_SERVICE_RESULT) as *mut u64, 0);
     write_volatile(
         (sh + LPC_SERVICE_MESSAGE_LEN) as *mut u32,
         message.len() as u32,
@@ -5150,7 +5212,10 @@ unsafe fn request_lpc_service(operation: u32, port_handle: u64, message: &[u8]) 
         write_volatile((sh + LPC_SERVICE_MESSAGE + index as u64) as *mut u8, *byte);
     }
     let _ = crate::driver_launch::call_on(W32_LPC_LABEL << 12);
-    read_volatile((sh + LPC_SERVICE_STATUS) as *const i32)
+    (
+        read_volatile((sh + LPC_SERVICE_STATUS) as *const i32),
+        read_volatile((sh + LPC_SERVICE_RESULT) as *const u64),
+    )
 }
 
 /// Execute a bounded request against the isolated LPC broker from the executive component pump.
@@ -5162,6 +5227,7 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
     let operation = read_volatile((sh + LPC_SERVICE_OPERATION) as *const u32);
     let port_handle = read_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *const u64);
     let message_len = read_volatile((sh + LPC_SERVICE_MESSAGE_LEN) as *const u32) as usize;
+    let mut result = 0;
 
     let status = match operation {
         LPC_SERVICE_QUERY_HANDLE if message_len == 0 => match lpc_client() {
@@ -5171,7 +5237,24 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
                 .unwrap_or_else(|s| s.raw()),
             None => 0xC000_0001u32 as i32,
         },
-        LPC_SERVICE_REQUEST_PORT if message_len <= LPC_SERVICE_MESSAGE_CAP => {
+        LPC_SERVICE_RETAIN_PORT if message_len == 0 => match lpc_client() {
+            Some(lpc) => match lpc.retain_port_object(port_handle) {
+                Ok(endpoint) => {
+                    result = endpoint;
+                    0
+                }
+                Err(status) => status.raw(),
+            },
+            None => 0xC000_0001u32 as i32,
+        },
+        LPC_SERVICE_RELEASE_PORT if message_len == 0 => match lpc_client() {
+            Some(lpc) => lpc
+                .release_port_object(port_handle)
+                .map(|()| 0)
+                .unwrap_or_else(|status| status.raw()),
+            None => 0xC000_0001u32 as i32,
+        },
+        LPC_SERVICE_RETAINED_REQUEST_PORT if message_len <= LPC_SERVICE_MESSAGE_CAP => {
             let bytes =
                 core::slice::from_raw_parts((sh + LPC_SERVICE_MESSAGE) as *const u8, message_len);
             let header = bytes.get(..4).and_then(|header| header.try_into().ok());
@@ -5183,7 +5266,12 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
             } else {
                 match lpc_client() {
                     Some(lpc) => match lpc.query_handle(port_handle) {
-                        Ok(identity) => match lpc.request_port(port_handle, bytes) {
+                        Ok(identity) => match lpc.retained_request_port(
+                            port_handle,
+                            bytes,
+                            WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed),
+                            WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed),
+                        ) {
                             Ok(()) => {
                                 if lpc_name_is(&identity.name, b"\\windows\\apiport") {
                                     CSR_KERNEL_MESSAGES_PENDING.fetch_add(1, Ordering::Relaxed);
@@ -5201,6 +5289,7 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
         _ => STATUS_INVALID_PARAMETER_I32,
     };
     write_volatile((sh + LPC_SERVICE_STATUS) as *mut i32, status);
+    write_volatile((sh + LPC_SERVICE_RESULT) as *mut u64, result);
     status
 }
 

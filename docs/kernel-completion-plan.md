@@ -24038,6 +24038,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and release these retained endpoints, then connect the synchronous import to the common
     cross-kind continuation stack and generation-correlated shared reply frame.
 
+    B3 win32k retained port-object checkpoint (2026-09-03, host and freestanding green):
+    `ObReferenceObjectByHandle(..., LpcPortObjectType, ...)` now reserves local reference state,
+    asks the LPC broker to retain the exact connection or communication-port object, and exposes
+    only the opaque endpoint to win32k. `ObReferenceObject` increments the local pointer count;
+    `ObDereferenceObject` keeps the final row authoritative until the broker confirms release.
+    Retained endpoint metadata remains queryable after the originating user handle closes, and
+    `LpcRequestPort` routes datagrams through that endpoint instead of treating an object pointer as
+    a user handle. `nt-object-manager` is green at 67 tests and the LPC server remains green at 22.
+    The freestanding executive check remains at the established 220-warning baseline. The remaining
+    blocking frontier is the synchronous `LpcRequestWaitReplyPort` continuation itself.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional
