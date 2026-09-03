@@ -31966,6 +31966,13 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if finished {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
+                if !win32k_glue::register_primary_win32k_physical_lane(
+                    WIN32K_TCB.load(Ordering::Relaxed),
+                    w_fault,
+                    REPLY_W32_SLOT.load(Ordering::Relaxed),
+                ) {
+                    panic!("primary win32k execution lane registration failed");
+                }
                 if !win32k_glue::initialize_win32k_physical_lane(host_pml4) {
                     panic!("win32k secondary execution lane failed its ready handshake");
                 }

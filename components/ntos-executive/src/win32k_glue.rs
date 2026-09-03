@@ -58,7 +58,16 @@ static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0)
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
-static mut WIN32K_PHYSICAL_LANES: Option<Vec<crate::spawn_hosts::SpawnedComponentWorker>> = None;
+#[allow(dead_code)] // The routing cutover consumes the full retained resource description.
+struct Win32kPhysicalLane {
+    binding: nt_component_suspension::LaneBinding,
+    stack_base: u64,
+    stack_frames: u64,
+    ipc_buffer_va: u64,
+    worker: Option<crate::spawn_hosts::SpawnedComponentWorker>,
+}
+
+static mut WIN32K_PHYSICAL_LANES: Option<Vec<Win32kPhysicalLane>> = None;
 static USER_CALLBACK_CANCEL_CHAINED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -71,13 +80,57 @@ const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
 );
 
-unsafe fn win32k_physical_lanes_mut(
-) -> &'static mut Vec<crate::spawn_hosts::SpawnedComponentWorker> {
+unsafe fn win32k_physical_lanes_mut() -> &'static mut Vec<Win32kPhysicalLane> {
     let slot = &mut *core::ptr::addr_of_mut!(WIN32K_PHYSICAL_LANES);
     if slot.is_none() {
         *slot = Some(Vec::new());
     }
     slot.as_mut().unwrap()
+}
+
+pub(crate) unsafe fn register_primary_win32k_physical_lane(
+    tcb: u64,
+    endpoint: u64,
+    reply_cap: u64,
+) -> bool {
+    let binding = nt_component_suspension::LaneBinding {
+        executor_id: tcb,
+        receive_endpoint: endpoint,
+        reply_object: reply_cap,
+    };
+    if !binding.is_valid() {
+        return false;
+    }
+    let lanes = win32k_physical_lanes_mut();
+    if !lanes.is_empty() || lanes.try_reserve(1).is_err() {
+        return false;
+    }
+    lanes.push(Win32kPhysicalLane {
+        binding,
+        stack_base: win32k_subsystem::WIN32K_STACK_VADDR,
+        stack_frames: 32,
+        ipc_buffer_va: crate::IPCBUF_VADDR,
+        worker: None,
+    });
+    true
+}
+
+#[allow(dead_code)]
+pub(crate) unsafe fn win32k_physical_lane_binding(
+    index: usize,
+) -> Option<nt_component_suspension::LaneBinding> {
+    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        .as_ref()?
+        .get(index)
+        .map(|lane| lane.binding)
+}
+
+#[allow(dead_code)]
+pub(crate) unsafe fn win32k_physical_lane_count() -> usize {
+    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 /// Create and park one idle physical lane in win32k's existing VSpace.
@@ -86,11 +139,14 @@ unsafe fn win32k_physical_lanes_mut(
 /// ready `Call` has been received and bound to its own reply object.
 pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let lanes = win32k_physical_lanes_mut();
-    let index = lanes.len();
-    if index >= win32k_subsystem::WIN32K_LANE_CAPACITY || lanes.try_reserve(1).is_err() {
+    if lanes.is_empty() {
         return false;
     }
-    let Some(offset) = (index as u64).checked_mul(win32k_subsystem::WIN32K_LANE_STRIDE)
+    let worker_index = lanes.iter().filter(|lane| lane.worker.is_some()).count();
+    if worker_index >= win32k_subsystem::WIN32K_LANE_CAPACITY || lanes.try_reserve(1).is_err() {
+        return false;
+    }
+    let Some(offset) = (worker_index as u64).checked_mul(win32k_subsystem::WIN32K_LANE_STRIDE)
     else {
         return false;
     };
@@ -104,7 +160,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let worker = crate::spawn_hosts::spawn_component_worker_suspended(
         &crate::spawn_hosts::SharedVspaceWorkerDescriptor {
             entry: win32k_subsystem::win32k_dispatch_lane_entry,
-            entry_arg: index as u64 + 1,
+            entry_arg: worker_index as u64 + 1,
             pml4,
             stack_base,
             stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
@@ -140,7 +196,17 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     };
     let resume = crate::spawn_hosts::resume_spawned_component_worker(&worker);
     if resume != 0 {
-        lanes.push(worker);
+        lanes.push(Win32kPhysicalLane {
+            binding: nt_component_suspension::LaneBinding {
+                executor_id: worker.tcb,
+                receive_endpoint: worker.endpoint,
+                reply_object: worker.reply_cap,
+            },
+            stack_base,
+            stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
+            ipc_buffer_va,
+            worker: Some(worker),
+        });
         return false;
     }
     let pump = crate::spawn_hosts::component_pump(&channel);
@@ -149,7 +215,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         && !pump.provider_wait_suspended
         && !pump.lpc_wait_suspended;
     print_str(b"[win32k-lane] physical lane=");
-    print_u64(index as u64 + 1);
+    print_u64(worker_index as u64 + 1);
     print_str(b" tcb=0x");
     print_hex(worker.tcb as u32);
     print_str(b" endpoint=0x");
@@ -157,7 +223,17 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     print_str(b" reply=0x");
     print_hex(worker.reply_cap as u32);
     print_str(if ready { b" ready=1\n" } else { b" ready=0\n" });
-    lanes.push(worker);
+    lanes.push(Win32kPhysicalLane {
+        binding: nt_component_suspension::LaneBinding {
+            executor_id: worker.tcb,
+            receive_endpoint: worker.endpoint,
+            reply_object: worker.reply_cap,
+        },
+        stack_base,
+        stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
+        ipc_buffer_va,
+        worker: Some(worker),
+    });
     ready
 }
 // Win32k shared views carry thousands of mapped frame/page-table caps across GUI clients. Keep the

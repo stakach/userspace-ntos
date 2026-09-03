@@ -282,6 +282,7 @@ pub enum LaneError {
 struct Lane<C, R> {
     binding: LaneBinding,
     phase: LanePhase,
+    external_tokens: Vec<u64>,
     suspensions: ComponentSuspensionStack<C, R>,
 }
 
@@ -581,6 +582,25 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         self.running
     }
 
+    pub fn next_idle(&self) -> Option<(LaneHandle, LaneBinding)> {
+        if self.running.is_some() {
+            return None;
+        }
+        self.slots.iter().enumerate().find_map(|(index, slot)| {
+            let lane = slot.lane.as_ref()?;
+            (lane.phase == LanePhase::Idle
+                && lane.external_tokens.is_empty()
+                && lane.suspensions.is_empty())
+            .then_some((
+                LaneHandle {
+                    index: index as u32,
+                    generation: slot.generation,
+                },
+                lane.binding,
+            ))
+        })
+    }
+
     pub fn allocate(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
         if !binding.is_valid() || self.max_depth_per_lane == 0 {
             return Err(LaneError::InvalidIdentity);
@@ -608,6 +628,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
             slot.lane = Some(Lane {
                 binding,
                 phase: LanePhase::Idle,
+                external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
             });
             return Ok(LaneHandle {
@@ -631,6 +652,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
             lane: Some(Lane {
                 binding,
                 phase: LanePhase::Idle,
+                external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
             }),
         });
@@ -645,7 +667,10 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         self.validate(handle, reply_object)?;
         let slot = &mut self.slots[handle.index as usize];
         let lane = slot.lane.as_ref().ok_or(LaneError::NotFound)?;
-        if lane.phase != LanePhase::Idle || !lane.suspensions.is_empty() {
+        if lane.phase != LanePhase::Idle
+            || !lane.external_tokens.is_empty()
+            || !lane.suspensions.is_empty()
+        {
             return Err(LaneError::Busy);
         }
         Ok(slot.lane.take().unwrap().binding)
@@ -663,6 +688,37 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         Ok(self.lane(handle)?.suspensions.len())
     }
 
+    pub fn external_depth(&self, handle: LaneHandle) -> Result<usize, LaneError> {
+        Ok(self.lane(handle)?.external_tokens.len())
+    }
+
+    pub fn external_top(&self, handle: LaneHandle) -> Result<Option<u64>, LaneError> {
+        Ok(self.lane(handle)?.external_tokens.last().copied())
+    }
+
+    pub fn total_suspensions(&self) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.lane.as_ref())
+            .map(|lane| lane.suspensions.len())
+            .sum()
+    }
+
+    pub fn frames(&self) -> impl Iterator<Item = (LaneHandle, &SuspensionFrame<C, R>)> {
+        self.slots.iter().enumerate().flat_map(|(index, slot)| {
+            let handle = LaneHandle {
+                index: index as u32,
+                generation: slot.generation,
+            };
+            slot.lane.as_ref().into_iter().flat_map(move |lane| {
+                lane.suspensions
+                    .frames()
+                    .iter()
+                    .map(move |frame| (handle, frame))
+            })
+        })
+    }
+
     pub fn top(&self, handle: LaneHandle) -> Result<Option<&SuspensionFrame<C, R>>, LaneError> {
         Ok(self.lane(handle)?.suspensions.top())
     }
@@ -675,6 +731,23 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         Ok(self.lane(handle)?.suspensions.get(key))
     }
 
+    pub fn frame_mut(
+        &mut self,
+        handle: LaneHandle,
+        key: SuspensionKey,
+    ) -> Result<Option<&mut SuspensionFrame<C, R>>, LaneError> {
+        Ok(self.lane_mut(handle)?.suspensions.get_mut(key))
+    }
+
+    pub fn locate(&self, key: SuspensionKey) -> Option<(LaneHandle, &SuspensionFrame<C, R>)> {
+        let handle = self.lane_for_key(key)?;
+        self.lane(handle)
+            .ok()?
+            .suspensions
+            .get(key)
+            .map(|frame| (handle, frame))
+    }
+
     pub fn begin_dispatch(
         &mut self,
         handle: LaneHandle,
@@ -685,7 +758,10 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         }
         self.validate(handle, reply_object)?;
         let lane = self.lane_mut(handle)?;
-        if lane.phase != LanePhase::Idle || !lane.suspensions.is_empty() {
+        if lane.phase != LanePhase::Idle
+            || !lane.external_tokens.is_empty()
+            || !lane.suspensions.is_empty()
+        {
             return Err(LaneError::InvalidPhase);
         }
         lane.phase = LanePhase::Running;
@@ -700,10 +776,93 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
     ) -> Result<(), LaneError> {
         self.validate_running(handle, reply_object)?;
         let lane = self.lane_mut(handle)?;
-        if !lane.suspensions.is_empty() {
+        if !lane.external_tokens.is_empty() || !lane.suspensions.is_empty() {
             return Err(LaneError::InvalidPhase);
         }
         lane.phase = LanePhase::Idle;
+        self.running = None;
+        Ok(())
+    }
+
+    /// Park a running lane in an external continuation such as a user-mode callback.
+    pub fn suspend_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        token: u64,
+    ) -> Result<(), LaneError> {
+        if token == 0 {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_running(handle, reply_object)?;
+        let max_depth = self.max_depth_per_lane;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.len() >= max_depth {
+            return Err(LaneError::Suspension(SuspensionError::Overflow));
+        }
+        lane.external_tokens
+            .try_reserve(1)
+            .map_err(|_| LaneError::NoCapacity)?;
+        lane.external_tokens.push(token);
+        lane.phase = LanePhase::Suspended;
+        self.running = None;
+        Ok(())
+    }
+
+    /// Reacquire the execution token for a lane parked by [`Self::suspend_running`].
+    pub fn resume_external(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        token: u64,
+    ) -> Result<(), LaneError> {
+        if self.running.is_some() {
+            return Err(LaneError::Busy);
+        }
+        self.validate(handle, reply_object)?;
+        let lane = self.lane_mut(handle)?;
+        if lane.phase != LanePhase::Suspended || lane.external_tokens.last().copied() != Some(token)
+        {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.phase = LanePhase::Running;
+        self.running = Some(handle);
+        Ok(())
+    }
+
+    pub fn repark_external(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        token: u64,
+    ) -> Result<(), LaneError> {
+        self.validate_running(handle, reply_object)?;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.last().copied() != Some(token) {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.phase = LanePhase::Suspended;
+        self.running = None;
+        Ok(())
+    }
+
+    pub fn complete_external(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        token: u64,
+    ) -> Result<(), LaneError> {
+        self.validate_running(handle, reply_object)?;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.last().copied() != Some(token) {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.external_tokens.pop();
+        lane.phase = if lane.external_tokens.is_empty() && lane.suspensions.is_empty() {
+            LanePhase::Idle
+        } else {
+            LanePhase::Suspended
+        };
         self.running = None;
         Ok(())
     }
@@ -964,7 +1123,7 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
             .suspensions
             .complete_dispatch(key, owner)
             .map_err(LaneError::Suspension)?;
-        lane.phase = if lane.suspensions.is_empty() {
+        lane.phase = if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
             LanePhase::Idle
         } else {
             LanePhase::Suspended
@@ -987,7 +1146,7 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
             .suspensions
             .abort_resume(key, owner, completion)
             .map_err(LaneError::Suspension)?;
-        lane.phase = if lane.suspensions.is_empty() {
+        lane.phase = if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
             LanePhase::Idle
         } else {
             LanePhase::Suspended
@@ -1212,6 +1371,9 @@ mod tests {
             .unwrap();
 
         lanes.select(lpc, 0u32).unwrap();
+        assert_eq!(lanes.total_suspensions(), 2);
+        assert_eq!(lanes.locate(lpc).map(|(lane, _)| lane), Some(winlogon));
+        assert_eq!(lanes.frames().count(), 2);
         let ready = lanes.next_resumable().unwrap();
         assert_eq!(ready.lane, winlogon);
         assert_eq!(ready.suspension.key, lpc);
@@ -1273,6 +1435,113 @@ mod tests {
             .begin_dispatch(second, binding(2).reply_object)
             .unwrap();
         assert_eq!(lanes.running(), Some(second));
+    }
+
+    #[test]
+    fn external_callback_parking_hands_the_token_to_an_idle_lane() {
+        let mut lanes = ComponentSuspensionLanes::<u64, u32>::new(2, 3);
+        let first = lanes.allocate(binding(1)).unwrap();
+        let second = lanes.allocate(binding(2)).unwrap();
+        assert_eq!(lanes.next_idle().map(|(lane, _)| lane), Some(first));
+        lanes
+            .begin_dispatch(first, binding(1).reply_object)
+            .unwrap();
+        assert_eq!(lanes.next_idle(), None);
+        assert_eq!(
+            lanes.suspend_running(first, binding(1).reply_object, 0),
+            Err(LaneError::InvalidIdentity)
+        );
+        lanes
+            .suspend_running(first, binding(1).reply_object, 0xA)
+            .unwrap();
+        assert_eq!(lanes.external_depth(first), Ok(1));
+        assert_eq!(lanes.external_top(first), Ok(Some(0xA)));
+        assert_eq!(lanes.next_idle().map(|(lane, _)| lane), Some(second));
+        lanes
+            .begin_dispatch(second, binding(2).reply_object)
+            .unwrap();
+        lanes
+            .finish_dispatch(second, binding(2).reply_object)
+            .unwrap();
+        assert_eq!(
+            lanes.resume_external(first, binding(1).reply_object, 0xB),
+            Err(LaneError::InvalidPhase)
+        );
+        lanes
+            .resume_external(first, binding(1).reply_object, 0xA)
+            .unwrap();
+        lanes
+            .suspend_running(first, binding(1).reply_object, 0xB)
+            .unwrap();
+        assert_eq!(lanes.external_depth(first), Ok(2));
+        assert_eq!(
+            lanes.resume_external(first, binding(1).reply_object, 0xA),
+            Err(LaneError::InvalidPhase)
+        );
+        lanes
+            .resume_external(first, binding(1).reply_object, 0xB)
+            .unwrap();
+        lanes
+            .complete_external(first, binding(1).reply_object, 0xB)
+            .unwrap();
+        assert_eq!(lanes.phase(first), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.external_top(first), Ok(Some(0xA)));
+        lanes
+            .resume_external(first, binding(1).reply_object, 0xA)
+            .unwrap();
+        lanes
+            .repark_external(first, binding(1).reply_object, 0xA)
+            .unwrap();
+        lanes
+            .resume_external(first, binding(1).reply_object, 0xA)
+            .unwrap();
+        lanes
+            .complete_external(first, binding(1).reply_object, 0xA)
+            .unwrap();
+        assert_eq!(lanes.phase(first), Ok(LanePhase::Idle));
+    }
+
+    #[test]
+    fn component_completion_preserves_an_outer_callback_suspension() {
+        let mut lanes = ComponentSuspensionLanes::new(1, 3);
+        let lane = lanes.allocate(binding(1)).unwrap();
+        let outer = SuspensionKey::provider_wait(1);
+
+        lanes.begin_dispatch(lane, binding(1).reply_object).unwrap();
+        lanes
+            .admit_running(lane, binding(1).reply_object, outer, 1, owner(1), 10u64)
+            .unwrap();
+        lanes.select(outer, 7u32).unwrap();
+        lanes
+            .begin_resume(lane, binding(1).reply_object, outer)
+            .unwrap();
+        lanes
+            .suspend_running(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        assert_eq!(lanes.suspension_count(lane), Ok(1));
+        assert_eq!(lanes.external_depth(lane), Ok(1));
+
+        lanes
+            .resume_external(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        assert_eq!(
+            lanes
+                .complete_running(lane, binding(1).reply_object, outer, owner(1))
+                .unwrap()
+                .continuation,
+            10
+        );
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.external_top(lane), Ok(Some(0xCA11_BACC)));
+        assert_eq!(lanes.next_idle(), None);
+
+        lanes
+            .resume_external(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        lanes
+            .complete_external(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
     }
 
     #[test]

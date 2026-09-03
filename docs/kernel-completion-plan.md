@@ -24188,6 +24188,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Next replace the singleton continuation owner with `ComponentSuspensionLanes` and adopt lane 0
     plus the ready worker into it; no worker dispatch is allowed before that state cutover.
 
+    B3 physical-catalog and callback-state checkpoint (2026-09-03): the primary TCB/endpoint/Reply
+    tuple and every secondary worker now enter one ordered physical-lane catalog with validated
+    `LaneBinding` identities; the secondary VA slot count is independent of the primary catalog
+    record, so all 48 arena slots remain available. The host-tested lane scheduler now exposes exact
+    aggregate frame/location access for teardown and an exact callback/external suspension stack.
+    Callback parking releases the serialized running token without making that physically blocked
+    lane idle; only the same handle, reply object, and top callback token can reacquire it. Nested
+    callback tokens are LIFO, and provider/LPC completion preserves any outer callback suspension
+    instead of falsely idling the lane. An idle selector refuses to choose any lane while another
+    runs. All 19 `nt-component-suspension` tests pass and the freestanding executive is green at
+    the established 221-warning baseline.
+
+    Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
+    generation-safe lane handle in provider/LPC pending records and callback dispatch context before
+    converting channels. Build one lane-channel resolver over the physical catalog, and route every
+    direct win32k entry through the same acquire/finish/suspend boundary; callers in `main.rs`,
+    `exec_handler.rs`, and post-SAS service code must not bypass it. Stack Event activations and
+    callback return eligibility must become lane-local before enabling worker dispatch. Restore
+    request-local shared fields and the bounded argument snapshot before every exact-lane resume.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional
