@@ -65,6 +65,9 @@ pub enum DeviceDescriptionError {
     BufferTooSmall,
     UnsupportedVersion,
     ReservedBitSet,
+    InvalidDmaWidth,
+    InvalidDmaSpeed,
+    InvalidTransport,
 }
 
 /// Pointer-free NT5 `DEVICE_DESCRIPTION` supplied to `IoGetDmaAdapter`.
@@ -99,6 +102,14 @@ impl Nt5DeviceDescription {
         if bytes[10] != 0 {
             return Err(DeviceDescriptionError::ReservedBitSet);
         }
+        let dma_width = read_le_u32(&bytes[24..28]);
+        if dma_width >= 3 {
+            return Err(DeviceDescriptionError::InvalidDmaWidth);
+        }
+        let dma_speed = read_le_u32(&bytes[28..32]);
+        if dma_speed >= 5 {
+            return Err(DeviceDescriptionError::InvalidDmaSpeed);
+        }
         Ok(Self {
             version,
             master: bytes[4] != 0,
@@ -111,8 +122,8 @@ impl Nt5DeviceDescription {
             bus_number: read_le_u32(&bytes[12..16]),
             dma_channel: read_le_u32(&bytes[16..20]),
             interface_type: read_le_u32(&bytes[20..24]) as i32,
-            dma_width: read_le_u32(&bytes[24..28]),
-            dma_speed: read_le_u32(&bytes[28..32]),
+            dma_width,
+            dma_speed,
             maximum_length: read_le_u32(&bytes[32..36]),
             dma_port: read_le_u32(&bytes[36..40]),
         })
@@ -124,6 +135,59 @@ impl Nt5DeviceDescription {
             maximum_length: self.maximum_length as u64,
             dma64: self.dma64,
         }
+    }
+
+    /// Losslessly normalize the NT5 structure into the four message registers following the PDO.
+    pub fn service_words(self) -> [u64; 4] {
+        let flags = u8::from(self.master)
+            | u8::from(self.scatter_gather) << 1
+            | u8::from(self.demand_mode) << 2
+            | u8::from(self.auto_initialize) << 3
+            | u8::from(self.dma32) << 4
+            | u8::from(self.ignore_count) << 5
+            | u8::from(self.dma64) << 6;
+        [
+            self.version as u64 | (flags as u64) << 32,
+            self.bus_number as u64 | (self.dma_channel as u64) << 32,
+            self.interface_type as u32 as u64
+                | (self.dma_width as u64) << 32
+                | (self.dma_speed as u64) << 40,
+            self.maximum_length as u64 | (self.dma_port as u64) << 32,
+        ]
+    }
+
+    pub fn from_service_words(words: [u64; 4]) -> Result<Self, DeviceDescriptionError> {
+        let flags = (words[0] >> 32) as u8;
+        if words[0] >> 40 != 0 || flags & 0x80 != 0 || words[2] >> 48 != 0 {
+            return Err(DeviceDescriptionError::InvalidTransport);
+        }
+        let description = Self {
+            version: words[0] as u32,
+            master: flags & 1 != 0,
+            scatter_gather: flags & 2 != 0,
+            demand_mode: flags & 4 != 0,
+            auto_initialize: flags & 8 != 0,
+            dma32: flags & 0x10 != 0,
+            ignore_count: flags & 0x20 != 0,
+            dma64: flags & 0x40 != 0,
+            bus_number: words[1] as u32,
+            dma_channel: (words[1] >> 32) as u32,
+            interface_type: words[2] as u32 as i32,
+            dma_width: (words[2] >> 32) as u8 as u32,
+            dma_speed: (words[2] >> 40) as u8 as u32,
+            maximum_length: words[3] as u32,
+            dma_port: (words[3] >> 32) as u32,
+        };
+        if description.version > NT5_DEVICE_DESCRIPTION_MAX_VERSION {
+            return Err(DeviceDescriptionError::UnsupportedVersion);
+        }
+        if description.dma_width >= 3 {
+            return Err(DeviceDescriptionError::InvalidDmaWidth);
+        }
+        if description.dma_speed >= 5 {
+            return Err(DeviceDescriptionError::InvalidDmaSpeed);
+        }
+        Ok(description)
     }
 }
 
@@ -1027,6 +1091,38 @@ mod tests {
         assert_eq!(
             Nt5DeviceDescription::parse(&reserved),
             Err(DeviceDescriptionError::ReservedBitSet)
+        );
+
+        let mut width = bytes;
+        width[24..28].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            Nt5DeviceDescription::parse(&width),
+            Err(DeviceDescriptionError::InvalidDmaWidth)
+        );
+
+        let mut speed = bytes;
+        speed[28..32].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(
+            Nt5DeviceDescription::parse(&speed),
+            Err(DeviceDescriptionError::InvalidDmaSpeed)
+        );
+    }
+
+    #[test]
+    fn nt5_device_description_service_codec_is_lossless_and_canonical() {
+        let description = Nt5DeviceDescription::parse(&nt5_device_description()).unwrap();
+        let words = description.service_words();
+
+        assert_eq!(
+            Nt5DeviceDescription::from_service_words(words),
+            Ok(description)
+        );
+
+        let mut noncanonical = words;
+        noncanonical[2] |= 1 << 63;
+        assert_eq!(
+            Nt5DeviceDescription::from_service_words(noncanonical),
+            Err(DeviceDescriptionError::InvalidTransport)
         );
     }
 

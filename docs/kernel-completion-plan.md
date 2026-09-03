@@ -23453,6 +23453,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     freestanding executive remains green at the established 213-warning baseline. Next marshal the
     exact bytes from the driver component to the authenticated root service.
 
+    B3 DMA request transport checkpoint (2026-09-03, host and freestanding green): the pointer-free
+    NT5
+    description now has a canonical, lossless four-word service encoding following the requesting
+    PDO. It carries every NT5 field without a shared mutable request bank, rejects noncanonical
+    spare bits, and validates the finite DMA width/speed enums at both raw-ABI and service decode
+    boundaries. All 28 focused DMA-manager tests pass and the freestanding executive remains green
+    at the established 213-warning baseline. Next use this codec directly in the component/root
+    call pair.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
