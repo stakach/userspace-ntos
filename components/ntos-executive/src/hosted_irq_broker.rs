@@ -448,6 +448,7 @@ impl HostedIrqRootSession {
         &self,
         source: HostedIrqLaneView,
         target: HostedIrqPreparedTarget,
+        source_depth: u8,
     ) -> Result<HostedProviderMarshalWindowSource, nt_status::NtStatus> {
         let lane = self.lane(target.lane_index)?;
         let transaction = self.lanes[target.lane_index].transaction;
@@ -471,19 +472,35 @@ impl HostedIrqRootSession {
             nt_hosted_runtime::HOSTED_IRQ_ARENA_MARSHAL_BYTES as u64,
         )
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let provider_exec_base = source
+        let source_stack_exec_base = source
             .arena_va
             .checked_sub(FSD_IRQ_LANE_ARENA_OFFSET)
             .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let provider_window = HostedProviderMarshalWindow::new(
+        let source_stack_window = HostedProviderMarshalWindow::new(
             FSD_WORKER_VADDR,
-            provider_exec_base,
+            source_stack_exec_base,
             FSD_WORKER_STACK_FRAMES * 0x1000,
+        )
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let source_marshal_offset =
+            nt_hosted_runtime::HostedIrqArenaLayout::dispatch_marshal_offset(source_depth as usize)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+        let source_marshal_window = HostedProviderMarshalWindow::new(
+            FSD_WORKER_VADDR
+                .checked_add(FSD_IRQ_LANE_ARENA_OFFSET)
+                .and_then(|base| base.checked_add(source_marshal_offset))
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?,
+            source
+                .arena_va
+                .checked_add(source_marshal_offset)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?,
+            nt_hosted_runtime::HOSTED_IRQ_ARENA_MARSHAL_BYTES as u64,
         )
         .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
         Ok(HostedProviderMarshalWindowSource::exact(
             target_window,
-            provider_window,
+            source_marshal_window,
+            source_stack_window,
         ))
     }
 
@@ -616,7 +633,8 @@ impl HostedIrqRootSession {
             Ok(target) => target,
             Err(status) => return fatal_service_result(status.raw()),
         };
-        let marshal_window_source = match self.target_marshal_window(source_lane, target) {
+        let marshal_window_source =
+            match self.target_marshal_window(source_lane, target, service.depth) {
             Ok(window) => window,
             Err(status) => {
                 let _ = self.finish_target_lane(target);
@@ -690,7 +708,8 @@ impl HostedIrqRootSession {
             Ok(target) => target,
             Err(status) => return fatal_service_result(status.raw()),
         };
-        let marshal_window_source = match self.target_marshal_window(source_lane, target) {
+        let marshal_window_source =
+            match self.target_marshal_window(source_lane, target, service.depth) {
             Ok(window) => window,
             Err(status) => {
                 let _ = self.finish_target_lane(target);

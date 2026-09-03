@@ -16496,7 +16496,7 @@ impl HostedProviderDispatchRoute {
 
 #[derive(Clone, Copy)]
 struct ProviderMarshalState {
-    source_exact: Option<HostedProviderMarshalWindow>,
+    source_windows: [Option<HostedProviderMarshalWindow>; 2],
     cursor: u64,
     copyouts: [ProviderMarshalCopyout; HOSTED_PROVIDER_EXPORT_ARG_CAP],
     copyout_count: usize,
@@ -16567,7 +16567,7 @@ struct ProviderMarshalState {
 impl ProviderMarshalState {
     const fn empty() -> Self {
         Self {
-            source_exact: None,
+            source_windows: [None; 2],
             cursor: 0,
             copyouts: [ProviderMarshalCopyout {
                 dependent_exec_va: 0,
@@ -25502,8 +25502,13 @@ fn provider_marshal_source_to_exec(
     bytes: u64,
 ) -> Option<u64> {
     state
-        .source_exact
+        .source_windows[0]
         .and_then(|window| window.component_to_exec(component_va, bytes))
+        .or_else(|| {
+            state
+                .source_windows[1]
+                .and_then(|window| window.component_to_exec(component_va, bytes))
+        })
         .or_else(|| {
             component_to_exec_va_for_instance(
                 dependent_index,
@@ -26952,7 +26957,7 @@ unsafe fn prepare_provider_export_marshal(
     dependent_index: usize,
     dependent_inst: DriverInstance,
     marshal_window: HostedProviderMarshalWindow,
-    source_exact: Option<HostedProviderMarshalWindow>,
+    source_windows: [Option<HostedProviderMarshalWindow>; 2],
     args: &mut [u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
 ) -> Result<ProviderMarshalState, i32> {
     if policy.argument_count as usize > args.len() {
@@ -26962,7 +26967,7 @@ unsafe fn prepare_provider_export_marshal(
         return Err(STATUS_INVALID_PARAMETER);
     }
     let mut state = ProviderMarshalState::empty();
-    state.source_exact = source_exact;
+    state.source_windows = source_windows;
     let mut preparation_guard = ProviderMarshalPreparationGuard::new(&state);
     let mut index = 0usize;
     while index < policy.argument_count as usize {
@@ -28748,7 +28753,7 @@ where
         dependent_index,
         dependent_inst,
         marshal_window,
-        marshal_window_source.source_exact(),
+        marshal_window_source.source_windows(),
         &mut args,
     ) {
         Ok(state) => state,
@@ -29373,22 +29378,23 @@ impl HostedProviderMarshalWindow {
 #[derive(Clone, Copy)]
 struct HostedProviderMarshalWindowSource {
     target_exact: Option<HostedProviderMarshalWindow>,
-    source_exact: Option<HostedProviderMarshalWindow>,
+    source_windows: [Option<HostedProviderMarshalWindow>; 2],
 }
 
 impl HostedProviderMarshalWindowSource {
     const LEGACY_SHARED_BANK: Self = Self {
         target_exact: None,
-        source_exact: None,
+        source_windows: [None; 2],
     };
 
     fn exact(
         target: HostedProviderMarshalWindow,
-        provider: HostedProviderMarshalWindow,
+        source_primary: HostedProviderMarshalWindow,
+        source_secondary: HostedProviderMarshalWindow,
     ) -> Self {
         Self {
             target_exact: Some(target),
-            source_exact: Some(provider),
+            source_windows: [Some(source_primary), Some(source_secondary)],
         }
     }
 
@@ -29408,8 +29414,12 @@ impl HostedProviderMarshalWindowSource {
         component_va: u64,
         bytes: u64,
     ) -> Option<u64> {
-        self.source_exact
+        self.source_windows[0]
             .and_then(|window| window.component_to_exec(component_va, bytes))
+            .or_else(|| {
+                self.source_windows[1]
+                    .and_then(|window| window.component_to_exec(component_va, bytes))
+            })
             .or_else(|| {
                 component_to_exec_va_for_instance(
                     provider_instance,
@@ -29420,8 +29430,8 @@ impl HostedProviderMarshalWindowSource {
             })
     }
 
-    fn source_exact(self) -> Option<HostedProviderMarshalWindow> {
-        self.source_exact
+    fn source_windows(self) -> [Option<HostedProviderMarshalWindow>; 2] {
+        self.source_windows
     }
 }
 
