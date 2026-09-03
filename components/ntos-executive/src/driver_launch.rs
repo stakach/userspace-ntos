@@ -17147,6 +17147,8 @@ static HOSTED_PROVIDER_PROTOCOL_RECEIVE_PACKET_COMPLETIONS: AtomicU64 = AtomicU6
 static HOSTED_PROVIDER_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_FAILURE_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_CALLBACK_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_WIDE_EXPORT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HOSTED_PROVIDER_RECEIVE_CALLBACK_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 static HOSTED_PROVIDER_ISR_RESULT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const HOSTED_PROVIDER_CALLBACK_WALL_TRACE_CAP: u64 = 8;
 static HOSTED_WORK_QUEUE_WALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -18084,6 +18086,77 @@ unsafe fn trace_hosted_provider_callback_failure_stage(
     print_str(stage);
     print_str(b" status=0x");
     print_hex(status as u32);
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_provider_receive_callback(
+    phase: &[u8],
+    record: HostedProviderCallbackRecord,
+    result: Result<u64, i32>,
+) {
+    if record.callback_kind != HOSTED_PROVIDER_CALLBACK_KIND_PROTOCOL
+        || !matches!(
+            record.callback_offset,
+            NDIS_PROTOCOL_RECEIVE_CALLBACK_OFFSET_X64
+                | NDIS_PROTOCOL_RECEIVE_COMPLETE_CALLBACK_OFFSET_X64
+                | NDIS_PROTOCOL_RECEIVE_PACKET_CALLBACK_OFFSET_X64
+        )
+        || HOSTED_PROVIDER_RECEIVE_CALLBACK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 16
+    {
+        return;
+    }
+    print_str(b"[provider-receive-callback] ");
+    print_str(phase);
+    print_str(b" provider-inst=");
+    print_u64(record.provider_instance as u64);
+    print_str(b" dependent-inst=");
+    print_u64(record.dependent_instance as u64);
+    print_str(b" offset=0x");
+    print_hex(record.callback_offset as u32);
+    match result {
+        Ok(value) => {
+            print_str(b" result=0x");
+            print_hex64(value);
+        }
+        Err(status) => {
+            print_str(b" status=0x");
+            print_hex(status as u32);
+        }
+    }
+    print_str(b"\n");
+}
+
+unsafe fn trace_hosted_provider_wide_export(
+    phase: &[u8],
+    policy: HostedProviderExportMarshalPolicy,
+    provider_export_rva: u64,
+    args: &[u64; HOSTED_PROVIDER_EXPORT_ARG_CAP],
+    result: u64,
+) {
+    if policy.argument_count < 7
+        || HOSTED_PROVIDER_WIDE_EXPORT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 12
+    {
+        return;
+    }
+    print_str(b"[provider-wide-export] ");
+    print_str(phase);
+    print_str(b" rva=0x");
+    print_hex(provider_export_rva as u32);
+    print_str(b" argc=");
+    print_u64(policy.argument_count as u64);
+    print_str(b" args=");
+    let mut index = 0usize;
+    while index < policy.argument_count as usize {
+        if index != 0 {
+            print_str(b",");
+        }
+        print_hex64(args[index]);
+        index += 1;
+    }
+    if phase == b"done" {
+        print_str(b" result=0x");
+        print_hex64(result);
+    }
     print_str(b"\n");
 }
 
@@ -28574,6 +28647,7 @@ where
     .or_else(|| hosted_provider_internal_rva_marshal_policy(singleton, provider_export_rva)) else {
         return hosted_provider_export_failure(STATUS_NOT_SUPPORTED);
     };
+    trace_hosted_provider_wide_export(b"enter", policy, provider_export_rva, &args, 0);
     let packet_array_export = provider_policy_uses_packet_array(policy);
     if packet_array_export {
         HOSTED_PROVIDER_PACKET_ARRAY_EXPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -28859,6 +28933,7 @@ where
         dependent_inst,
         caller_rsp,
     );
+    trace_hosted_provider_wide_export(b"done", policy, provider_export_rva, &args, result);
     if DEBUG_TRACE && HOSTED_PROVIDER_EXPORT_COMPLETIONS.load(Ordering::Relaxed) <= 8 {
         print_str(b"[driver-import] provider-domain export dispatched cookie=");
         print_u64(provider_publication_cookie);
@@ -30767,6 +30842,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     let Some(record) = hosted_provider_callback_record(callback_cookie) else {
         return hosted_provider_callback_failure(STATUS_INVALID_PARAMETER);
     };
+    trace_hosted_provider_receive_callback(b"request", record, Ok(0));
     let Some(_dependency_lease) = acquire_hosted_provider_dependency_dispatch_lease(
         record.provider_instance,
         record.dependent_instance,
@@ -31183,6 +31259,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
     }
     HOSTED_PROVIDER_CALLBACK_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
     trace_hosted_provider_callback(b"done", record, callback_args, &provider_stack, result);
+    trace_hosted_provider_receive_callback(b"done", record, result);
     match result {
         Ok(value) => value,
         Err(status) => hosted_provider_callback_failure(status),

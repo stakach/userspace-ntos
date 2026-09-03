@@ -23356,6 +23356,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     consumed without protocol indication. This snapshot must use the retained device binding and
     root's existing DMA alias, not device-name matching or an extra mapping.
 
+    Follow-up runtime `.tmp/run-headless-20260903-100345.log` proves the second real E1000 DPC
+    consumes the ingress descriptor. Before dispatch, the canonical RX descriptor at logical
+    `0x2000` contains length 64 and status `0x07` (`DD|EOP|IXSM`), while the canonical RX buffer at
+    logical `0x3000` contains the captured ARP reply. After the exact generation-owned KDPC returns,
+    descriptor status is zero and the packet bytes are unchanged. The same DPC calls TCP/IP's send
+    completion and NDIS later calls the protocol receive-complete handler, but no protocol Receive
+    callback is accounted; the run reaches genuine Explorer and remains `294/295` with only
+    `exec_provider_ndis_receive_indicated` failing. Review adjustment: the hardware, VT-d, ISR,
+    KDPC, and miniport descriptor ownership are closed. Trace wide recursive provider exports and
+    registered receive callbacks to isolate NDIS filter dispatch from the seven-argument callback
+    transport, then replace the diagnostic snapshots with durable lifecycle evidence.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
