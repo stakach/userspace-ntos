@@ -2105,7 +2105,10 @@ unsafe fn component_suspension_drain_ready(
             break;
         };
         match outcome {
-            ComponentSuspensionRuntimeOutcome::Parked => break,
+            // This lane yielded the execution token while re-arming a new provider/LPC wait.
+            // Another lane may already have a selected completion, so keep draining until the
+            // coordinator reports that no resumable lane remains.
+            ComponentSuspensionRuntimeOutcome::Parked => continue,
             ComponentSuspensionRuntimeOutcome::Completed {
                 continuation,
                 dispatch,

@@ -1472,6 +1472,59 @@ mod tests {
     }
 
     #[test]
+    fn reparked_lane_does_not_mask_a_selected_sibling() {
+        let mut lanes = ComponentSuspensionLanes::new(3, 3);
+        let first = lanes.allocate(binding(1)).unwrap();
+        let sibling = lanes.allocate(binding(2)).unwrap();
+        let first_wait = SuspensionKey::lpc_request(1);
+        let sibling_wait = SuspensionKey::provider_wait(2);
+        let rearmed_wait = SuspensionKey::lpc_request(3);
+
+        lanes.begin_dispatch(first, binding(1).reply_object).unwrap();
+        lanes
+            .admit_running(first, binding(1).reply_object, first_wait, 1, owner(1), 10u64)
+            .unwrap();
+        lanes
+            .begin_dispatch(sibling, binding(2).reply_object)
+            .unwrap();
+        lanes
+            .admit_running(
+                sibling,
+                binding(2).reply_object,
+                sibling_wait,
+                2,
+                owner(2),
+                20,
+            )
+            .unwrap();
+        lanes.select(first_wait, 7u32).unwrap();
+        lanes.select(sibling_wait, 8u32).unwrap();
+
+        let first_resume = lanes.next_resumable().unwrap();
+        assert_eq!(first_resume.lane, first);
+        lanes
+            .begin_resume(first, binding(1).reply_object, first_wait)
+            .unwrap();
+        lanes
+            .rearm_running(
+                first,
+                binding(1).reply_object,
+                first_wait,
+                rearmed_wait,
+                3,
+                owner(1),
+                30,
+            )
+            .unwrap();
+
+        assert_eq!(lanes.phase(first), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.top(first).unwrap().unwrap().key, rearmed_wait);
+        let sibling_resume = lanes.next_resumable().unwrap();
+        assert_eq!(sibling_resume.lane, sibling);
+        assert_eq!(sibling_resume.suspension.key, sibling_wait);
+    }
+
+    #[test]
     fn selected_outer_frame_still_waits_for_its_same_lane_top() {
         let mut lanes = ComponentSuspensionLanes::new(2, 4);
         let lane = lanes.allocate(binding(1)).unwrap();

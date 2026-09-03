@@ -24289,6 +24289,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     frontier. Also close cross-lane drain fairness: one lane re-parking must not prevent another
     already-selected lane from resuming in the same drain.
 
+    Serialized reply-barrier result (2026-09-03): `.tmp/run-desktop-20260903-210341.log` proves the
+    retained Winlogon `NtUserCreateWindowStation` lane resumed immediately after CSRSS published its
+    reply; win32k advanced into `Initializing input window station` and created a genuine CSR system
+    worker. That worker entered `ONEPARAM_ROUTINE_CREATESYSTEMTHREADS` as intended, but the raw-input
+    provider then spun indefinitely because `KeWaitForMultipleObjects` rejected its `MasterTimer`.
+    Win32k currently publishes only Event identities to the provider-wait arbiter while
+    `KeInitializeTimer`, `KeSetTimer`, and `PoRequestShutdownEvent` remain unbound compatibility
+    entries. The run was stopped after 117 seconds of guest time rather than retaining millions of
+    repeated keyboard/mouse read diagnostics. Close cross-lane drain fairness first, then give
+    component-private dispatcher timers generation-safe identities, real executive deadlines, and
+    WaitAny semantics. The raw-input lane must park on its shutdown Event plus `MasterTimer`; do not
+    suppress the diagnostics or yield synthetically.
+
+    B3 cross-lane drain-fairness checkpoint (2026-09-03, host and freestanding green): when a
+    resumed lane re-arms a provider or LPC wait, the common drain now continues until the scheduler
+    reports that no selected lane remains. It no longer stops merely because that one lane yielded
+    the execution token. The lane model covers two selected siblings where the older completion
+    re-parks under a fresh key and the second lane remains immediately resumable. All 21
+    `nt-component-suspension` tests pass and the freestanding executive remains at the established
+    221-warning baseline. The next B3 implementation is the component-private timer dispatcher
+    boundary exposed by the serialized reply-barrier run.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
