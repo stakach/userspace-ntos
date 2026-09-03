@@ -23606,6 +23606,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     post-reclaim/provider finalization as explicit monotonic phases so a `false` retry result never
     describes an already-partially-deleted process.
 
+    Provider-wait audit adjustment (2026-09-03): the first paragraph above is stale for the live
+    hosted-driver ABI. `KeWaitForSingleObject` and `KeWaitForMultipleObjects` already park exact
+    reply-cap continuations, support WaitAny/WaitAll and finite deadlines, and cover projected and
+    local Event, Semaphore, and Timer bodies. Keep that transport. The remaining dispatcher task is
+    the cross-table ordering defect: native wait blocks and GUI message wait blocks still occupy
+    separate reusable vectors, and synchronization-event wake scans native slots first. Replace
+    those two insertion orders with one monotonic executive wait sequence and delete the
+    native-first arbitration.
+
+    B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
+    `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
+    `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences
+    -> FinalizingProviderObjects -> RetiringMechanism` phases. Requeue matches immutable identity
+    independently of the advanced phase. The one-shot Process delete payload retains its primary
+    token, LPC endpoint, and deleted-thread count until each external reference is returned, and
+    the executive reports typed Pending/Complete/Stale progress instead of an ambiguous boolean.
+    The retry entry resumes an existing record without requiring the already-deleted Ps object,
+    and dynamic image attachments retire before the reusable mechanism slot. Focused
+    `nt-user-host` tests are green (16 unit plus 3 real-ntdll integration tests); the freestanding
+    executive remains green at the established 213-warning baseline.
+
+    Review adjustment: VM reclamation is the remaining deletion sub-boundary before this item can
+    close. DLL paging, shared-image, and client-frame helpers currently remove some ownership rows
+    before their capability deletion succeeds; the PML4 can also be deleted before a failing fault
+    endpoint, and one private-page-table failure accumulator is shadowed. Make every teardown row
+    retain exact ownership until successful deletion, delete the PML4 last, add injected-failure
+    retry tests, and then record serialized desktop acceptance. After that, implement typed
+    provider pointer/handle counts for Process, Thread, Token, Section, File, Device, and USER
+    objects and remove the non-Event `ObReferenceObject`/`ObDereferenceObject` no-ops and loader
+    `s_zero` bindings. Provider finalizers must remain fenced until those counts reach zero.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

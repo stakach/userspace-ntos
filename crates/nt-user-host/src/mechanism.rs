@@ -38,6 +38,39 @@ pub struct ProcessDeletionCandidate {
     /// The process published provider-owned EPROCESS/ETHREAD backing that must be finalized after
     /// the Process delete procedure. False means no provider destructor is part of this identity.
     pub provider_objects: bool,
+    pub phase: ProcessDeletionPhase,
+    /// Payload returned exactly once by the Process delete procedure. Zero means that no external
+    /// reference of that kind remains to be returned by the executive.
+    pub pending_primary_token: u32,
+    pub pending_exception_port: u64,
+    pub deleted_threads: usize,
+}
+
+/// Monotonic phases of the hosted mechanism work surrounding the Object Manager delete procedure.
+/// A retry resumes only the current phase; it never re-enters an earlier destructive operation.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ProcessDeletionPhase {
+    #[default]
+    AwaitingReferences = 0,
+    ReclaimingVm = 1,
+    DeletingProcessObject = 2,
+    ReleasingExecutiveReferences = 3,
+    FinalizingProviderObjects = 4,
+    RetiringMechanism = 5,
+}
+
+impl ProcessDeletionPhase {
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::AwaitingReferences => Some(Self::ReclaimingVm),
+            Self::ReclaimingVm => Some(Self::DeletingProcessObject),
+            Self::DeletingProcessObject => Some(Self::ReleasingExecutiveReferences),
+            Self::ReleasingExecutiveReferences => Some(Self::FinalizingProviderObjects),
+            Self::FinalizingProviderObjects => Some(Self::RetiringMechanism),
+            Self::RetiringMechanism => None,
+        }
+    }
 }
 
 impl ProcessDeletionCandidate {
@@ -47,6 +80,10 @@ impl ProcessDeletionCandidate {
             pid: 0,
             generation: 0,
             provider_objects: false,
+            phase: ProcessDeletionPhase::AwaitingReferences,
+            pending_primary_token: 0,
+            pending_exception_port: 0,
+            deleted_threads: 0,
         }
     }
 
@@ -56,6 +93,10 @@ impl ProcessDeletionCandidate {
             pid: mechanism.pid,
             generation: mechanism.generation,
             provider_objects,
+            phase: ProcessDeletionPhase::AwaitingReferences,
+            pending_primary_token: 0,
+            pending_exception_port: 0,
+            deleted_threads: 0,
         }
     }
 
@@ -67,6 +108,13 @@ impl ProcessDeletionCandidate {
         self.pi == mechanism.pi
             && self.pid == mechanism.pid
             && self.generation == mechanism.generation
+    }
+
+    pub const fn same_identity(self, other: Self) -> bool {
+        self.pi == other.pi
+            && self.pid == other.pid
+            && self.generation == other.generation
+            && self.provider_objects == other.provider_objects
     }
 }
 
@@ -104,7 +152,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
             return Err(MechanismError::InvalidIdentity);
         }
         let slot = &mut self.slots[candidate.pi];
-        if *slot == candidate {
+        if slot.same_identity(candidate) {
             return Ok(false);
         }
         if slot.is_live() {
@@ -112,6 +160,99 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         }
         *slot = candidate;
         Ok(true)
+    }
+
+    /// Advance one exact live candidate by one phase. Skips, regressions, and stale snapshots are
+    /// rejected so executive retry code cannot describe partially completed work as not started.
+    pub fn advance_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let Some(slot) = self.slots.get_mut(expected.pi) else {
+            return Err(MechanismError::SlotOutOfRange);
+        };
+        if !slot.is_live() {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        if *slot != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        let Some(next) = expected.phase.next() else {
+            return Err(MechanismError::InvalidIdentity);
+        };
+        if expected.phase == ProcessDeletionPhase::DeletingProcessObject
+            || (expected.phase == ProcessDeletionPhase::ReleasingExecutiveReferences
+                && (expected.pending_primary_token != 0 || expected.pending_exception_port != 0))
+        {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.phase = next;
+        Ok(*slot)
+    }
+
+    /// Commit the exact output of the one-shot Process delete procedure and enter external
+    /// reference release. This is the only transition out of `DeletingProcessObject`.
+    pub fn record_process_object_deletion_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+        primary_token: u32,
+        exception_port: u64,
+        deleted_threads: usize,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let Some(slot) = self.slots.get_mut(expected.pi) else {
+            return Err(MechanismError::SlotOutOfRange);
+        };
+        if !slot.is_live() || *slot != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        if expected.phase != ProcessDeletionPhase::DeletingProcessObject {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.pending_primary_token = primary_token;
+        slot.pending_exception_port = exception_port;
+        slot.deleted_threads = deleted_threads;
+        slot.phase = ProcessDeletionPhase::ReleasingExecutiveReferences;
+        Ok(*slot)
+    }
+
+    pub fn release_primary_token_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let slot = self.external_reference_slot_exact(expected)?;
+        if slot.pending_primary_token == 0 {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.pending_primary_token = 0;
+        Ok(*slot)
+    }
+
+    pub fn release_exception_port_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let slot = self.external_reference_slot_exact(expected)?;
+        if slot.pending_exception_port == 0 {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.pending_exception_port = 0;
+        Ok(*slot)
+    }
+
+    fn external_reference_slot_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<&mut ProcessDeletionCandidate, MechanismError> {
+        let Some(slot) = self.slots.get_mut(expected.pi) else {
+            return Err(MechanismError::SlotOutOfRange);
+        };
+        if !slot.is_live() || *slot != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        if expected.phase != ProcessDeletionPhase::ReleasingExecutiveReferences {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        Ok(slot)
     }
 
     pub fn get(&self, pi: usize) -> Option<ProcessDeletionCandidate> {
@@ -681,6 +822,10 @@ mod tests {
             pid: 12,
             generation: 3,
             provider_objects: true,
+            phase: ProcessDeletionPhase::AwaitingReferences,
+            pending_primary_token: 0,
+            pending_exception_port: 0,
+            deleted_threads: 0,
         };
         table.queue(candidate).unwrap();
         assert_eq!(
@@ -702,6 +847,53 @@ mod tests {
             Err(MechanismError::InvalidIdentity)
         );
         assert_eq!(table.get(1), Some(candidate));
+    }
+
+    #[test]
+    fn deletion_candidate_phases_are_exact_and_monotonic() {
+        let mechanism = ProcessMechanism {
+            pi: 1,
+            pid: 12,
+            main_tid: 20,
+            top_badge: 2,
+            generation: 7,
+        };
+        let initial = ProcessDeletionCandidate::from_mechanism(mechanism, true);
+        let mut table = ProcessDeletionCandidateTable::<3>::new();
+        table.queue(initial).unwrap();
+
+        let reclaiming = table.advance_exact(initial).unwrap();
+        assert_eq!(reclaiming.phase, ProcessDeletionPhase::ReclaimingVm);
+        assert_eq!(table.queue(initial), Ok(false));
+        assert_eq!(table.get(1), Some(reclaiming));
+        assert_eq!(
+            table.advance_exact(initial),
+            Err(MechanismError::StaleIdentity)
+        );
+
+        let deleting = table.advance_exact(reclaiming).unwrap();
+        assert_eq!(
+            table.advance_exact(deleting),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let releasing = table
+            .record_process_object_deletion_exact(deleting, 9, 17, 2)
+            .unwrap();
+        assert_eq!(
+            table.advance_exact(releasing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let releasing = table.release_primary_token_exact(releasing).unwrap();
+        let releasing = table.release_exception_port_exact(releasing).unwrap();
+        assert_eq!(releasing.deleted_threads, 2);
+        let finalizing = table.advance_exact(releasing).unwrap();
+        let retiring = table.advance_exact(finalizing).unwrap();
+        assert_eq!(retiring.phase, ProcessDeletionPhase::RetiringMechanism);
+        assert_eq!(
+            table.advance_exact(retiring),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(table.remove_exact(retiring), Ok(retiring));
     }
 
     #[test]
