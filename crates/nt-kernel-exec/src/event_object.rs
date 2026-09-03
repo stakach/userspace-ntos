@@ -94,52 +94,83 @@ pub enum ProviderEventProjectionError {
 /// broker call as a type test.
 #[derive(Debug, Default)]
 pub struct ProviderEventProjectionCatalog {
-    bodies: Vec<u64>,
+    projections: Vec<ProviderEventProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderEventProjection {
+    body: u64,
+    id: EventObjectId,
 }
 
 impl ProviderEventProjectionCatalog {
     pub const fn new() -> Self {
-        Self { bodies: Vec::new() }
+        Self {
+            projections: Vec::new(),
+        }
     }
 
     pub fn reserve_one(&mut self) -> Result<(), ProviderEventProjectionError> {
-        self.bodies
+        self.projections
             .try_reserve(1)
             .map_err(|_| ProviderEventProjectionError::OutOfMemory)
     }
 
-    pub fn register_reserved(&mut self, body: u64) -> Result<bool, ProviderEventProjectionError> {
-        if body == 0 {
+    pub fn register_reserved(
+        &mut self,
+        body: u64,
+        id: EventObjectId,
+    ) -> Result<bool, ProviderEventProjectionError> {
+        if body == 0 || id.is_null() {
             return Err(ProviderEventProjectionError::InvalidBody);
         }
-        if self.contains(body) {
-            return Ok(false);
+        if let Some(existing) = self
+            .projections
+            .iter()
+            .find(|projection| projection.body == body || projection.id == id)
+        {
+            return if existing.body == body && existing.id == id {
+                Ok(false)
+            } else {
+                Err(ProviderEventProjectionError::InvalidBody)
+            };
         }
-        if self.bodies.len() == self.bodies.capacity() {
+        if self.projections.len() == self.projections.capacity() {
             return Err(ProviderEventProjectionError::OutOfMemory);
         }
-        self.bodies.push(body);
+        self.projections.push(ProviderEventProjection { body, id });
         Ok(true)
     }
 
     pub fn contains(&self, body: u64) -> bool {
-        body != 0 && self.bodies.contains(&body)
+        self.identity(body).is_some()
+    }
+
+    pub fn identity(&self, body: u64) -> Option<EventObjectId> {
+        self.projections
+            .iter()
+            .find(|projection| body != 0 && projection.body == body)
+            .map(|projection| projection.id)
     }
 
     pub fn remove(&mut self, body: u64) -> Result<(), ProviderEventProjectionError> {
-        let Some(index) = self.bodies.iter().position(|candidate| *candidate == body) else {
+        let Some(index) = self
+            .projections
+            .iter()
+            .position(|projection| projection.body == body)
+        else {
             return Err(ProviderEventProjectionError::MissingBody);
         };
-        self.bodies.swap_remove(index);
+        self.projections.swap_remove(index);
         Ok(())
     }
 
     pub fn len(&self) -> usize {
-        self.bodies.len()
+        self.projections.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bodies.is_empty()
+        self.projections.is_empty()
     }
 }
 
@@ -928,11 +959,22 @@ mod tests {
     #[test]
     fn provider_projection_catalog_distinguishes_local_and_projected_bodies() {
         let mut catalog = ProviderEventProjectionCatalog::new();
+        let first = EventObjectId(ObjectId::new(Generation(1), 1));
+        let second = EventObjectId(ObjectId::new(Generation(1), 2));
         catalog.reserve_one().unwrap();
-        assert_eq!(catalog.register_reserved(0x1000), Ok(true));
-        assert_eq!(catalog.register_reserved(0x1000), Ok(false));
+        assert_eq!(catalog.register_reserved(0x1000, first), Ok(true));
+        assert_eq!(catalog.register_reserved(0x1000, first), Ok(false));
         assert!(catalog.contains(0x1000));
+        assert_eq!(catalog.identity(0x1000), Some(first));
         assert!(!catalog.contains(0x2000));
+        assert_eq!(
+            catalog.register_reserved(0x1000, second),
+            Err(ProviderEventProjectionError::InvalidBody)
+        );
+        assert_eq!(
+            catalog.register_reserved(0x2000, first),
+            Err(ProviderEventProjectionError::InvalidBody)
+        );
         assert_eq!(catalog.len(), 1);
         catalog.remove(0x1000).unwrap();
         assert!(catalog.is_empty());

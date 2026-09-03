@@ -31332,6 +31332,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 let _ = alloc_frame();
             }
             let shared = alloc_frame();
+            // A provider wait can outlive and nest with the ordinary syscall/callback frames.
+            let provider_wait_frame = alloc_frame();
             // The cross-AS arg-marshal frame(s) — mapped in both the executive and the component.
             let arg_base = alloc_frame();
             for _ in 1..win32k_subsystem::WIN32K_ARG_FRAMES {
@@ -31418,6 +31420,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let _ = page_map(
                 copy_cap(shared),
                 win32k_subsystem::WIN32K_SHARED_VADDR,
+                RW_NX,
+                CAP_INIT_THREAD_VSPACE,
+            );
+            let _ = page_map(
+                copy_cap(provider_wait_frame),
+                win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR,
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
             );
@@ -31676,6 +31684,15 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     source: FrameSource::Alias(shared),
                     base_va: win32k_subsystem::WIN32K_SHARED_VADDR,
                     count: 1,
+                    rights: Rights::Uniform(RW_NX),
+                    pts: 0,
+                };
+                n += 1;
+                // Provider wait request (aux PT window). It remains stable across nested dispatch.
+                regions[n] = Region {
+                    source: FrameSource::Alias(provider_wait_frame),
+                    base_va: win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR,
+                    count: win32k_subsystem::WIN32K_PROVIDER_WAIT_FRAMES,
                     rights: Rights::Uniform(RW_NX),
                     pts: 0,
                 };

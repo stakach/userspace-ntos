@@ -2813,7 +2813,14 @@ pub(crate) unsafe fn service_win32k_event_request(
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         crate::win32k_subsystem::W32_EVENT_OP_REFERENCE => handler
             .provider_reference_event(pi, arg1, arg3 as u32, arg2)
-            .map(|(body, metadata, granted_access)| (0, body, metadata, granted_access as u64))
+            .map(|(body, id, metadata, granted_access)| {
+                (
+                    0,
+                    body,
+                    id.0 .0,
+                    (metadata << 32) | u64::from(granted_access),
+                )
+            })
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         crate::win32k_subsystem::W32_EVENT_OP_CLOSE => handler
             .provider_close_event(pi, arg1)

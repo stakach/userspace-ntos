@@ -23676,6 +23676,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     bind both wait imports, and add the component rendezvous loop plus resume label; pump suspension
     and executive waiter admission remain a following slice.
 
+    Provider-wait shared-frame and projected-identity checkpoint (2026-09-03, host and freestanding
+    green): win32k and the executive now share one dedicated page at the previously unused
+    `0x0000010007190000` auxiliary-window slot. It is statically sized against
+    `ProviderWaitRequest` and cannot alias the syscall marshal, message output, registry, or
+    user-callback frames that nested dispatches overwrite. Projected Event publication now returns
+    the canonical generation-protected Event `ObjectId`; the component catalog stores an exact
+    one-to-one `(provider body, ObjectId)` relation and rejects a body or identity rebound to a
+    different object. Provider waits can therefore encode projected Events without crossing a raw
+    provider address. All 233 `nt-kernel-exec` tests pass and the freestanding executive remains at
+    the 213-warning baseline. Local embedded dispatcher objects still need canonical publication
+    before the two wait imports can cut over without retaining an immediate-success path.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

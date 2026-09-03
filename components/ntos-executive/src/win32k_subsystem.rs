@@ -134,6 +134,14 @@ const _: () = assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_
 const _: () = assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
 pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
+/// Dedicated fixed-frame provider-wait ABI. A wait may remain live while nested dispatches overwrite
+/// the general request and callback frames, so its canonical object identities cannot alias either.
+pub const WIN32K_PROVIDER_WAIT_VADDR: u64 = WIN32K_SHARED_VADDR + 0x1000;
+pub const WIN32K_PROVIDER_WAIT_FRAMES: u64 = 1;
+const _: () = assert!(
+    core::mem::size_of::<nt_provider_wait::ProviderWaitRequest>()
+        <= WIN32K_PROVIDER_WAIT_FRAMES as usize * 0x1000
+);
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
 /// component (within the pool PT window). The executive copies a dispatched syscall's user buffers
 /// here (sized per the win32k SSN signature); win32k's handler reads/writes them in its own context;
@@ -148,6 +156,9 @@ pub const WIN32K_MESSAGE_STAGE_BASE: u64 = WIN32K_ARG_VADDR + WIN32K_ARG_GENERAL
 pub const WIN32K_MESSAGE_STAGE_SLOT_BYTES: u64 = 64;
 pub const WIN32K_MESSAGE_STAGE_SLOTS: u64 = 0x1000 / WIN32K_MESSAGE_STAGE_SLOT_BYTES;
 pub const WIN32K_MESSAGE_STAGE_OUTPUT_LENGTH_OFFSET: u64 = 56;
+const _: () = assert!(
+    WIN32K_PROVIDER_WAIT_VADDR + WIN32K_PROVIDER_WAIT_FRAMES * 0x1000 <= WIN32K_ARG_VADDR
+);
 const _: () = assert!(
     WIN32K_MESSAGE_STAGE_BASE + WIN32K_MESSAGE_STAGE_SLOTS * WIN32K_MESSAGE_STAGE_SLOT_BYTES
         == WIN32K_ARG_VADDR + WIN32K_ARG_FRAMES * 0x1000
@@ -825,9 +836,12 @@ unsafe fn provider_event_projection_reserve() -> bool {
         .is_ok()
 }
 
-unsafe fn provider_event_projection_register_reserved(body: u64) -> bool {
+unsafe fn provider_event_projection_register_reserved(body: u64, raw_id: u64) -> bool {
     (&mut *core::ptr::addr_of_mut!(WIN32K_EVENT_PROJECTIONS))
-        .register_reserved(body)
+        .register_reserved(
+            body,
+            nt_kernel_exec::EventObjectId(nt_types::ObjectId(raw_id)),
+        )
         .is_ok()
 }
 
@@ -3930,15 +3944,17 @@ extern "win64" fn s_ob_reference_object_by_handle(
         if proposed == 0 {
             return STATUS_NO_MEMORY;
         }
-        let (status, body, metadata, granted_access) = unsafe {
+        let (status, body, raw_id, metadata_and_access) = unsafe {
             win32k_event_broker_call(W32_EVENT_OP_REFERENCE, handle, proposed, access)
         };
-        if status != 0 || body == 0 {
+        if status != 0 || body == 0 || raw_id == 0 {
             if !unsafe { provider_pool_release_owned(&[(proposed, size)]) } {
                 return 0xC000_0001u32 as i32;
             }
             return if status != 0 { status } else { STATUS_NO_MEMORY };
         }
+        let metadata = metadata_and_access >> 32;
+        let granted_access = metadata_and_access as u32;
         if body == proposed {
             let kind = if metadata & 1 != 0 {
                 nt_kernel_exec::kevent::EventKind::Synchronization
@@ -3955,7 +3971,7 @@ extern "win64" fn s_ob_reference_object_by_handle(
             assert_eq!(release_status, 0, "provider Event reference rollback failed");
             return 0xC000_0001u32 as i32;
         }
-        assert!(unsafe { provider_event_projection_register_reserved(body) });
+        assert!(unsafe { provider_event_projection_register_reserved(body, raw_id) });
         unsafe { write_unaligned(object_out, body) };
         if !handle_info.is_null() {
             unsafe {

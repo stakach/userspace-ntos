@@ -98,6 +98,7 @@ nt-time = { path = "../../crates/nt-time" }
 nt-persistent-clock = { path = "../../crates/nt-persistent-clock" }
 nt-thread-start = { path = "../../crates/nt-thread-start" }
 nt-user-callback = { path = "../../crates/nt-user-callback" }
+nt-provider-wait = { path = "../../crates/nt-provider-wait" }
 nt-win32k-job = { path = "../../crates/nt-win32k-job" }
 nt-user-host = { path = "../../crates/nt-user-host" }
 # The driver-visible ntoskrnl/hal export table + win32k import surface + SSDT recorder — the

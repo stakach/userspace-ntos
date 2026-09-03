@@ -25762,7 +25762,7 @@ impl ExecNtHandler {
         handle: u64,
         desired_access: u32,
         proposed_body: u64,
-    ) -> Result<(u64, u64, u32), u32> {
+    ) -> Result<(u64, nt_kernel_exec::EventObjectId, u64, u32), u32> {
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
         let (id, index) = self.event_object_for_handle_in_pi(pi, handle, desired_access)?;
         let pid = self
@@ -25785,7 +25785,7 @@ impl ExecNtHandler {
         };
         let metadata = u64::from(matches!(kind, EventKind::Synchronization))
             | (u64::from(signaled) << 1);
-        Ok((body, metadata, granted_access))
+        Ok((body, id, metadata, granted_access))
     }
 
     fn provider_event_identity(
