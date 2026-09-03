@@ -228,6 +228,15 @@ impl RecycledFramePool {
         self.frames.pop()
     }
 
+    pub fn reserve(&mut self, additional: usize) -> bool {
+        if self.frames.try_reserve(additional).is_err() {
+            self.allocation_failures = self.allocation_failures.saturating_add(1);
+            false
+        } else {
+            true
+        }
+    }
+
     pub fn try_recycle(&mut self, frame: u64) -> Result<(), u64> {
         if self.frames.try_reserve(1).is_err() {
             self.allocation_failures = self.allocation_failures.saturating_add(1);

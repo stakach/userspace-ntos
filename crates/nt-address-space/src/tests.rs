@@ -54,6 +54,7 @@ fn page_table_ownership_rejects_unaligned_windows_and_zero_caps() {
 #[test]
 fn recycled_frame_pool_grows_past_the_old_policy_limit_and_reuses_lifo() {
     let mut pool = RecycledFramePool::new();
+    assert!(pool.reserve(5_000));
     for frame in 1..=5_000 {
         assert_eq!(pool.try_recycle(frame), Ok(()));
     }

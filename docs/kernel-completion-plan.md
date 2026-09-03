@@ -23637,6 +23637,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     objects and remove the non-Event `ObReferenceObject`/`ObDereferenceObject` no-ops and loader
     `s_zero` bindings. Provider finalizers must remain fenced until those counts reach zero.
 
+    B3 VM-reclaim ownership checkpoint (2026-09-03, host and freestanding green): DLL paging and
+    shared-image mapping records now remain authoritative until their exact capability deletion
+    succeeds. Shared-image teardown reports failures into the process leaf-ownership gate instead
+    of discarding them. Registered client frames carry explicit frame/alias unmap progress;
+    borrowed caps are cleared from the exact row only after deletion, owned frames reserve their
+    recycle slot before teardown, and the row retires only after every subordinate cap is gone.
+    The VSpace fault endpoint is deleted before the PML4 so the published PML4 identity remains a
+    valid retry key, and DLL/page-table failures now accumulate instead of shadowing one another.
+    `nt-address-space` is green (66 tests), `nt-memory-manager` is green (33 tests including stale
+    reclaim-snapshot rejection), and the freestanding executive remains at 213 warnings. Run the
+    serialized desktop acceptance next; retain explicit capability-failure injection as follow-up
+    coverage rather than reintroducing remove-before-delete helpers.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

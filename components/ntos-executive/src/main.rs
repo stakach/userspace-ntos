@@ -2008,11 +2008,15 @@ impl DllArenaPagingState {
         Ok(())
     }
 
-    pub(crate) fn clear_process(&mut self, pi: usize) -> u64 {
-        if let Some(index) = self.index_for(pi) {
-            return self.records.swap_remove(index).pd_cap;
+    pub(crate) fn clear_process_exact(&mut self, pi: usize, pd_cap: u64) -> bool {
+        let Some(index) = self.index_for(pi) else {
+            return false;
+        };
+        if self.records[index].pd_cap != pd_cap {
+            return false;
         }
-        0
+        self.records.swap_remove(index);
+        true
     }
 
     pub(crate) fn stats(&self) -> DllArenaPagingStats {
@@ -8762,6 +8766,84 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> 
         })
 }
 
+unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
+    let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
+    let Some(mut record) = registry.get(pi, page) else {
+        return true;
+    };
+    if record.owns_frame && !(&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).reserve(1) {
+        return false;
+    }
+
+    if record.frame != 0 && !record.frame_unmapped {
+        if page_unmap_r(record.frame) != 0 {
+            return false;
+        }
+        record = registry
+            .mark_frame_unmapped_exact(record)
+            .expect("serialized frame reclaim must retain its exact row");
+    }
+    if record.frame != 0 && !record.owns_frame {
+        if cnode_delete_recycle_r(record.frame) != 0 {
+            return false;
+        }
+        record = registry
+            .clear_frame_cap_exact(record)
+            .expect("deleted borrowed frame cap must clear from its exact row");
+    }
+
+    if record.alias_cap != 0 {
+        if record.owns_frame && record.alias_cap == record.frame {
+            record = registry
+                .mark_alias_unmapped_exact(record)
+                .expect("owned frame alias must retain its exact row");
+            record = registry
+                .clear_alias_cap_exact(record)
+                .expect("owned frame alias must clear from its exact row");
+        } else {
+        if !record.alias_unmapped {
+            if page_unmap_r(record.alias_cap) != 0 {
+                return false;
+            }
+            record = registry
+                .mark_alias_unmapped_exact(record)
+                .expect("serialized alias reclaim must retain its exact row");
+        }
+        if cnode_delete_recycle_r(record.alias_cap) != 0 {
+            return false;
+        }
+        record = registry
+            .clear_alias_cap_exact(record)
+            .expect("deleted alias cap must clear from its exact row");
+        }
+    }
+
+    if record.source_cap != 0 {
+        if record.owns_frame && record.source_cap == record.frame {
+            record = registry
+                .clear_source_cap_exact(record)
+                .expect("owned frame alias must clear from its exact row");
+        } else {
+            if cnode_delete_recycle_r(record.source_cap) != 0 {
+                return false;
+            }
+            record = registry
+                .clear_source_cap_exact(record)
+                .expect("deleted source cap must clear from its exact row");
+        }
+    }
+
+    let removed = registry
+        .take_exact(record)
+        .expect("fully reclaimed client frame must retire its exact row");
+    if removed.owns_frame {
+        (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES))
+            .try_recycle(removed.frame)
+            .expect("pre-reserved recycled-frame slot must accept its owned frame");
+    }
+    true
+}
+
 pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u64) -> u64 {
     if size == 0 {
         return 0;
@@ -8775,19 +8857,9 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         } else {
             process_pagefile_discard(pi, page);
-            while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page)
+            if csrss_frame_get_exact_record(pi, page).is_some()
+                && csrss_frame_reclaim_exact(pi, page)
             {
-                if owns_frame {
-                    vm_frame_release(frame, alias_cap);
-                } else {
-                    recycle_mapped_cap(frame);
-                    if alias_cap != frame {
-                        recycle_mapped_cap(alias_cap);
-                    }
-                }
-                if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
-                    recycle_plain_cap(source_cap);
-                }
                 dropped = dropped.saturating_add(1);
             }
         }
@@ -8815,18 +8887,10 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
             break;
         }
         detach_win32k_attached_page_for_thread_release(pi as usize, page);
-        while let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi, page) {
-            if owns_frame {
-                vm_frame_release(frame, alias_cap);
-            } else {
-                recycle_mapped_cap(frame);
-                if alias_cap != frame {
-                    recycle_mapped_cap(alias_cap);
-                }
-            }
-            if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
-                recycle_plain_cap(source_cap);
-            }
+        if !csrss_frame_reclaim_exact(pi, page) {
+            break;
+        }
+        if csrss_frame_get_exact_record(pi, page).is_none() {
             dropped = dropped.saturating_add(1);
         }
     }
@@ -9766,16 +9830,16 @@ unsafe fn shared_image_mapping_take(pi: u64, page: u64) -> Option<u64> {
     }
 }
 
-unsafe fn shared_image_mapping_delete_cap(pi: u8, cap: SharedImageMappingCap) {
+unsafe fn shared_image_mapping_delete_cap(pi: u8, cap: SharedImageMappingCap) -> bool {
     match cap {
         SharedImageMappingCap::Root(map_cap) => {
             // Final teardown owns the process-map cap and discards it. Deleting the cap is the
             // authoritative revoke path; explicit Page_Unmap is only for paths that keep and
             // remap the same cap, such as protect/COW transitions.
-            let _ = cnode_delete_recycle_r(map_cap);
+            cnode_delete_recycle_r(map_cap) == 0
         }
         SharedImageMappingCap::Bank { cnode, slot } => {
-            let _ = image_map_cap_bank_delete(pi, cnode, slot);
+            image_map_cap_bank_delete(pi, cnode, slot)
         }
     }
 }
@@ -9793,10 +9857,14 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
                 process_pagefile_discard(pi, mapping.page);
-                if let Some(mapping) =
-                    shared_image_mapping_remove_at(chunks, chunk_index, entry_index)
-                {
-                    shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
+                if shared_image_mapping_delete_cap(mapping.pi, mapping.cap) {
+                    let removed =
+                        shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
+                    assert!(removed.is_some_and(|removed| {
+                        removed.pi == mapping.pi
+                            && removed.page == mapping.page
+                            && removed.cap == mapping.cap
+                    }));
                 } else {
                     entry_index += 1;
                 }
@@ -9808,11 +9876,12 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
     }
 }
 
-unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
+unsafe fn shared_image_mapping_unmap_process(pi: u64) -> (u64, u64) {
     let Some(chunks) = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS)).as_mut() else {
-        return 0;
+        return (0, 0);
     };
     let mut removed = 0u64;
+    let mut failures = 0u64;
     let mut chunk_index = 0usize;
     while chunk_index < chunks.len() {
         let mut entry_index = 0usize;
@@ -9821,12 +9890,17 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
         {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi {
-                if let Some(mapping) =
-                    shared_image_mapping_remove_at(chunks, chunk_index, entry_index)
-                {
-                    shared_image_mapping_delete_cap(mapping.pi, mapping.cap);
+                if shared_image_mapping_delete_cap(mapping.pi, mapping.cap) {
+                    let removed_mapping =
+                        shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
+                    assert!(removed_mapping.is_some_and(|removed| {
+                        removed.pi == mapping.pi
+                            && removed.page == mapping.page
+                            && removed.cap == mapping.cap
+                    }));
                     removed = removed.saturating_add(1);
                 } else {
+                    failures = failures.saturating_add(1);
                     entry_index += 1;
                 }
             } else {
@@ -9838,7 +9912,7 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> u64 {
     if IMAGE_MAP_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed) == 0 {
         IMAGE_MAP_CAP_BANK_NEXT.store(0, Ordering::Relaxed);
     }
-    removed
+    (removed, failures)
 }
 
 unsafe fn process_working_set_register(pi: usize) -> Result<(), u32> {
@@ -18967,17 +19041,19 @@ unsafe fn release_sec_image_vspace_caps(
             *cap = 0;
         }
     }
-    if owner.pml4 != 0 {
-        if cnode_delete_recycle_r(owner.pml4) != 0 {
-            return false;
-        }
-        owner.pml4 = 0;
-    }
     if owner.fault_endpoint != 0 {
         if cnode_delete_recycle_r(owner.fault_endpoint) != 0 {
             return false;
         }
         owner.fault_endpoint = 0;
+    }
+    // The published VSpace identity must remain live until every subordinate cap is gone so a
+    // failed teardown can re-enter with the same exact owner.
+    if owner.pml4 != 0 {
+        if cnode_delete_recycle_r(owner.pml4) != 0 {
+            return false;
+        }
+        owner.pml4 = 0;
     }
     true
 }
@@ -19351,6 +19427,7 @@ struct ProcessVmReclaimStats {
     generic_writeback_failures: u64,
     dll_views: u64,
     shared_image_maps: u64,
+    shared_image_map_failures: u64,
     win32k_client_caps: u64,
     win32k_client_cap_failures: u64,
     dll_cache_evictions: u64,
@@ -19415,14 +19492,19 @@ unsafe fn reclaim_final_process_vm(
         stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
         {
             let dll_arena_paging = &mut *ctx.dll_arena_paging;
-            let pd = dll_arena_paging.clear_process(pi);
-            if pd != 0 && cnode_delete_recycle_r(pd) != 0 {
-                stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
+            let pd = dll_arena_paging.pd_cap(pi);
+            if pd != 0 {
+                if cnode_delete_recycle_r(pd) == 0 {
+                    assert!(dll_arena_paging.clear_process_exact(pi, pd));
+                } else {
+                    stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
+                }
             }
         }
     }
 
-    stats.shared_image_maps = shared_image_mapping_unmap_process(pi as u64);
+    (stats.shared_image_maps, stats.shared_image_map_failures) =
+        shared_image_mapping_unmap_process(pi as u64);
     let win32k_reclaim = win32k_glue::release_win32k_client_cap_bank(pi);
     stats.win32k_client_caps = win32k_reclaim.caps;
     stats.win32k_client_cap_failures = win32k_reclaim.failures;
@@ -19434,13 +19516,16 @@ unsafe fn reclaim_final_process_vm(
     process_committed_mapping_reset(pi);
     process_vm_region_map_reset(pi);
     let kuser_released = kuser_page_alias_release(pi);
-    let (private_pts, mut private_pt_failures) = process_user_page_tables_release(pi, handler);
+    let (private_pts, private_pt_failures) = process_user_page_tables_release(pi, handler);
+    stats.private_pt_failures = stats
+        .private_pt_failures
+        .saturating_add(private_pt_failures);
     if !kuser_released {
-        private_pt_failures = private_pt_failures.saturating_add(1);
+        stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
     }
     stats.private_pts = private_pts;
-    stats.private_pt_failures = private_pt_failures;
     let leaf_ownership_clear = stats.generic_writeback_failures == 0
+        && stats.shared_image_map_failures == 0
         && stats.win32k_client_cap_failures == 0
         && win32k_glue::win32k_client_cap_bank_is_empty(pi)
         && client_frame_registry_process_is_empty(pi as u64)

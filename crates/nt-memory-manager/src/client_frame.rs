@@ -10,6 +10,8 @@ pub struct ClientFrameRecord {
     pub source_cap: u64,
     pub owns_frame: bool,
     pub age: u64,
+    pub frame_unmapped: bool,
+    pub alias_unmapped: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +147,8 @@ impl ClientFrameRegistry {
             source_cap,
             owns_frame,
             age,
+            frame_unmapped: false,
+            alias_unmapped: false,
         });
         self.high_water = self.high_water.max(self.records.len());
         Ok(ClientFrameInsert::Inserted { grew })
@@ -171,6 +175,95 @@ impl ClientFrameRegistry {
     pub fn take(&mut self, pi: u64, page: u64) -> Option<ClientFrameRecord> {
         let index = self.index_for(pi, page)?;
         Some(self.records.swap_remove(index))
+    }
+
+    pub fn mark_frame_unmapped_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+    ) -> Option<ClientFrameRecord> {
+        let record = self.exact_mut(expected)?;
+        if record.frame == 0 || record.frame_unmapped {
+            return None;
+        }
+        record.frame_unmapped = true;
+        Some(*record)
+    }
+
+    pub fn mark_alias_unmapped_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+    ) -> Option<ClientFrameRecord> {
+        let record = self.exact_mut(expected)?;
+        if record.alias_cap == 0 || record.alias_unmapped {
+            return None;
+        }
+        record.alias_unmapped = true;
+        Some(*record)
+    }
+
+    pub fn clear_frame_cap_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+    ) -> Option<ClientFrameRecord> {
+        let record = self.exact_mut(expected)?;
+        if record.frame == 0 || !record.frame_unmapped || record.owns_frame {
+            return None;
+        }
+        let frame = record.frame;
+        record.frame = 0;
+        if record.alias_cap == frame {
+            record.alias_cap = 0;
+            record.alias_unmapped = false;
+        }
+        if record.source_cap == frame {
+            record.source_cap = 0;
+        }
+        Some(*record)
+    }
+
+    pub fn clear_alias_cap_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+    ) -> Option<ClientFrameRecord> {
+        let record = self.exact_mut(expected)?;
+        if record.alias_cap == 0 || !record.alias_unmapped {
+            return None;
+        }
+        let alias = record.alias_cap;
+        record.alias_cap = 0;
+        record.alias_unmapped = false;
+        if record.source_cap == alias {
+            record.source_cap = 0;
+        }
+        Some(*record)
+    }
+
+    pub fn clear_source_cap_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+    ) -> Option<ClientFrameRecord> {
+        let record = self.exact_mut(expected)?;
+        if record.source_cap == 0 {
+            return None;
+        }
+        record.source_cap = 0;
+        Some(*record)
+    }
+
+    pub fn take_exact(&mut self, expected: ClientFrameRecord) -> Option<ClientFrameRecord> {
+        let index = self.index_for(expected.pi, expected.page)?;
+        if self.records[index] != expected {
+            return None;
+        }
+        Some(self.records.swap_remove(index))
+    }
+
+    fn exact_mut(&mut self, expected: ClientFrameRecord) -> Option<&mut ClientFrameRecord> {
+        let index = self.index_for(expected.pi, expected.page)?;
+        if self.records[index] != expected {
+            return None;
+        }
+        Some(&mut self.records[index])
     }
 
     pub fn first_page_for_process(&self, pi: u64) -> Option<u64> {
@@ -303,5 +396,22 @@ mod tests {
         assert!(registry.take(7, 0x1000).is_some());
         assert!(registry.is_process_empty(7));
         assert!(!registry.is_process_empty(8));
+    }
+
+    #[test]
+    fn exact_reclaim_progress_rejects_stale_snapshots() {
+        let mut registry = ClientFrameRegistry::new();
+        registry
+            .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
+            .unwrap();
+        let initial = registry.get(7, 0x1000).unwrap();
+        let frame_unmapped = registry.mark_frame_unmapped_exact(initial).unwrap();
+        assert!(registry.mark_frame_unmapped_exact(initial).is_none());
+        let frame_released = registry.clear_frame_cap_exact(frame_unmapped).unwrap();
+        let alias_unmapped = registry.mark_alias_unmapped_exact(frame_released).unwrap();
+        let alias_released = registry.clear_alias_cap_exact(alias_unmapped).unwrap();
+        let source_released = registry.clear_source_cap_exact(alias_released).unwrap();
+        assert_eq!(registry.take_exact(source_released), Some(source_released));
+        assert!(registry.is_process_empty(7));
     }
 }
