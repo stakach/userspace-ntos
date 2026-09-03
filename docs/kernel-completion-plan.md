@@ -24627,6 +24627,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Section, File, and dispatcher projections; close those typed routes and then delete the branch
     outright rather than converting it to another generic success path.
 
+    B3 video File/Device projection-lifetime tranche 8 (2026-09-04, host and freestanding green):
+    the already-bound `IoGetDeviceObjectPointer` is no longer described or implemented as an
+    unretained video shortcut. It validates both mandatory outputs, resolves the requested name
+    against the dynamically published video DeviceMap route, access-checks the request through the
+    canonical Object Manager handle, and returns initialized WDM `FILE_OBJECT`/`DEVICE_OBJECT`
+    projections only after acquiring a persistent reference token. General
+    `ObReferenceObject`/`ObDereferenceObject` calls for either projection use the same canonical
+    route owner. Route replacement and teardown now fail while any projected pointer is live rather
+    than invalidating win32k storage.
+
+    A reusable confirmation-based external-token ledger keeps each opaque Object Manager reference
+    recorded until its owner accepts release, so a rejected release remains retryable and duplicate
+    tokens cannot alias two projections. `nt-object-manager` passes all 74 tests, all 46
+    `nt-compat-exports` tests pass, and the freestanding executive release build succeeds. The
+    missing-import count remains forty-five because `IoGetDeviceObjectPointer` was already bound;
+    this tranche replaces incorrect lifetime behavior and stale `TrapIfCalled` metadata. Review
+    adjustment: the ledger is generic, but `VideoBridgeState` still represents one active video
+    route. Convert it to a device-ID keyed projection catalog before claiming multi-adapter/hotplug
+    support. Other File, Device, Section, and dispatcher projections still require typed routes
+    before deleting the general unknown-object branch.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

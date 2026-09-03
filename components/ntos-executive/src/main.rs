@@ -16241,6 +16241,18 @@ pub(crate) unsafe fn object_manager_retain_file_handle(
         .map(|(_, reference)| reference)
 }
 
+pub(crate) unsafe fn object_manager_retain_handle(
+    handle: nt_types::HandleValue,
+    desired_access: nt_types::AccessMask,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    let client = OBJECT_CLIENT_PTR
+        .as_mut()
+        .ok_or(nt_status::NtStatus::DEVICE_NOT_READY)?;
+    client
+        .reference_handle(handle, None, desired_access)
+        .map(|(object, reference)| (object.0, reference))
+}
+
 pub(crate) unsafe fn object_manager_release_reference(
     reference: u64,
 ) -> Result<(), nt_status::NtStatus> {
@@ -34753,6 +34765,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" file=0x");
         print_hex((video_file >> 32) as u32);
         print_hex(video_file as u32);
+        let (video_file_references, video_device_references) =
+            video_device::video_projection_reference_census();
+        print_str(b" refs=");
+        print_u64(video_file_references);
+        print_str(b"/");
+        print_u64(video_device_references);
         print_str(b"\n");
         check(
             b"exec_video_device_objects_registered",

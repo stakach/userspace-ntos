@@ -88,6 +88,79 @@ impl Default for OwnedObjectReferenceCounts {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ExternalReferenceToken {
+    object: u64,
+    token: u64,
+}
+
+/// Local projection references paired with opaque canonical-owner tokens. Releasing a reference is
+/// a two-phase operation: the token remains recorded until the external owner confirms release.
+#[derive(Default)]
+pub struct ExternalReferenceTokenLedger {
+    entries: Vec<ExternalReferenceToken>,
+}
+
+impl ExternalReferenceTokenLedger {
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn reserve(&mut self) -> bool {
+        self.entries.try_reserve(1).is_ok()
+    }
+
+    pub fn insert_reserved(&mut self, object: u64, token: u64) -> Option<u32> {
+        if object == 0 || token == 0 || self.entries.iter().any(|entry| entry.token == token) {
+            return None;
+        }
+        let count = self
+            .entries
+            .iter()
+            .filter(|entry| entry.object == object)
+            .count()
+            .checked_add(1)
+            .and_then(|count| u32::try_from(count).ok())?;
+        self.entries.push(ExternalReferenceToken { object, token });
+        Some(count)
+    }
+
+    pub fn release_token(&self, object: u64) -> Option<u64> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.object == object)
+            .map(|entry| entry.token)
+    }
+
+    pub fn complete_release(&mut self, object: u64, token: u64) -> Option<u32> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.object == object && entry.token == token)?;
+        let remaining = self
+            .entries
+            .iter()
+            .filter(|entry| entry.object == object)
+            .count()
+            .checked_sub(1)
+            .and_then(|count| u32::try_from(count).ok())?;
+        self.entries.remove(index);
+        Some(remaining)
+    }
+
+    pub fn count(&self, object: u64) -> u32 {
+        u32::try_from(self.entries.iter().filter(|entry| entry.object == object).count())
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ExternalObjectReference {
     object: u64,
     pointer_count: u32,
@@ -1333,5 +1406,38 @@ mod tests {
         assert!(table.complete_final_release(0x9200));
         assert_eq!(table.reference(0x9200), None);
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn external_token_ledger_keeps_release_retryable_until_confirmation() {
+        let mut ledger = ExternalReferenceTokenLedger::new();
+        assert!(ledger.reserve());
+        assert_eq!(ledger.insert_reserved(0xA100, 11), Some(1));
+        assert!(ledger.reserve());
+        assert_eq!(ledger.insert_reserved(0xA100, 12), Some(2));
+        assert!(ledger.reserve());
+        assert_eq!(ledger.insert_reserved(0xA200, 13), Some(1));
+
+        assert_eq!(ledger.release_token(0xA100), Some(12));
+        assert_eq!(ledger.release_token(0xA100), Some(12));
+        assert_eq!(ledger.complete_release(0xA100, 12), Some(1));
+        assert_eq!(ledger.release_token(0xA100), Some(11));
+        assert_eq!(ledger.count(0xA100), 1);
+        assert_eq!(ledger.count(0xA200), 1);
+        assert!(!ledger.is_empty());
+    }
+
+    #[test]
+    fn external_token_ledger_rejects_invalid_and_duplicate_tokens() {
+        let mut ledger = ExternalReferenceTokenLedger::new();
+        assert!(ledger.reserve());
+        assert_eq!(ledger.insert_reserved(0, 1), None);
+        assert_eq!(ledger.insert_reserved(1, 0), None);
+        assert_eq!(ledger.insert_reserved(1, 20), Some(1));
+        assert_eq!(ledger.insert_reserved(2, 20), None);
+        assert_eq!(ledger.complete_release(1, 21), None);
+        assert_eq!(ledger.count(1), 1);
+        assert_eq!(ledger.complete_release(1, 20), Some(0));
+        assert!(ledger.is_empty());
     }
 }

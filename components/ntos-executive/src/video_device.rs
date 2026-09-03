@@ -22,6 +22,8 @@ use nt_video_miniport::{
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 const STATUS_NO_MEMORY: i32 = 0xC000_0017u32 as i32;
+const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
 const REG_SZ: u32 = 1;
 const REG_DWORD: u32 = 4;
 
@@ -178,11 +180,18 @@ impl VideoBridgeState {
 }
 
 static mut VIDEO_STATE: VideoBridgeState = VideoBridgeState::empty();
+static mut VIDEO_PROJECTION_REFERENCES:
+    nt_object_manager::win32k_ob::ExternalReferenceTokenLedger =
+    nt_object_manager::win32k_ob::ExternalReferenceTokenLedger::new();
 
 #[inline(never)]
 pub(crate) unsafe fn publish_hosted_video_device_route(
     reg: &HostedVideoDeviceRegistration<'_>,
 ) -> bool {
+    if !(*addr_of!(VIDEO_PROJECTION_REFERENCES)).is_empty() {
+        print_hosted_video_publish_failure(b"route-busy", None);
+        return false;
+    }
     let Some(route_info) = crate::driver_launch::hosted_video_route_info(reg.device_id) else {
         print_hosted_video_publish_failure(b"route-info", None);
         return false;
@@ -214,7 +223,11 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"file-projection", None);
         return false;
     }
-    teardown_video_io_route();
+    if !teardown_video_io_route() {
+        let _ = crate::driver_launch::close_io_handle(file_handle);
+        print_hosted_video_publish_failure(b"teardown", None);
+        return false;
+    }
     (*addr_of_mut!(VIDEO_STATE)).metadata = Some(metadata);
     commit_video_io_route(
         route_info.driver_id,
@@ -226,7 +239,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         VideoRouteBackend::HostedIoManager,
     );
     if !publish_video_device_map(metadata) {
-        teardown_video_io_route();
+        let _ = teardown_video_io_route();
         (*addr_of_mut!(VIDEO_STATE)).metadata = None;
         (*addr_of_mut!(VIDEO_STATE)).ready = false;
         print_hosted_video_publish_failure(b"devicemap", None);
@@ -476,12 +489,18 @@ unsafe fn projected_video_route_ready() -> bool {
     video_state_snapshot().projected_ready()
 }
 
-unsafe fn teardown_video_io_route() {
+unsafe fn teardown_video_io_route() -> bool {
+    if !(*addr_of!(VIDEO_PROJECTION_REFERENCES)).is_empty() {
+        return false;
+    }
     let route = video_state_snapshot().route;
     if route.file_handle != 0 {
-        let _ = crate::driver_launch::close_io_handle(route.file_handle);
+        if crate::driver_launch::close_io_handle(route.file_handle).is_err() {
+            return false;
+        }
     }
     (*addr_of_mut!(VIDEO_STATE)).route = VideoIoRoute::empty();
+    true
 }
 
 unsafe fn wstr_eq_ascii(buf: u64, len_bytes: usize, pat: &[u8]) -> bool {
@@ -556,9 +575,18 @@ unsafe fn publish_video_device_map(metadata: VideoRegistrationMetadata) -> bool 
 
 pub(crate) unsafe fn video_get_device_object_pointer(
     name: u64,
+    desired_access: u64,
     fileobj_out: *mut u64,
     devobj_out: *mut u64,
 ) -> i32 {
+    if fileobj_out.is_null() || devobj_out.is_null() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    write_unaligned(fileobj_out, 0);
+    write_unaligned(devobj_out, 0);
+    if desired_access > u32::MAX as u64 {
+        return STATUS_INVALID_PARAMETER;
+    }
     if !projected_video_route_ready() || name == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
@@ -575,13 +603,72 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     if !objects.ready() {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    if !fileobj_out.is_null() {
-        write_unaligned(fileobj_out, objects.file);
+    if let Err(status) = retain_video_projection(
+        objects.file,
+        nt_types::AccessMask::from_bits_retain(desired_access as u32),
+    ) {
+        return status;
     }
-    if !devobj_out.is_null() {
-        write_unaligned(devobj_out, objects.device);
-    }
+    write_unaligned(fileobj_out, objects.file);
+    write_unaligned(devobj_out, objects.device);
     0
+}
+
+pub(crate) unsafe fn video_projection_contains(object: u64) -> bool {
+    let objects = video_state_snapshot().objects;
+    objects.ready() && (object == objects.file || object == objects.device)
+}
+
+pub(crate) unsafe fn retain_video_projection(
+    object: u64,
+    desired_access: nt_types::AccessMask,
+) -> Result<u64, i32> {
+    if !projected_video_route_ready() || !video_projection_contains(object) {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    let state = video_state_snapshot();
+    let ledger = &mut *addr_of_mut!(VIDEO_PROJECTION_REFERENCES);
+    if !ledger.reserve() {
+        return Err(STATUS_NO_MEMORY);
+    }
+    let (canonical_object, token) = crate::driver_launch::retain_io_handle_reference(
+        state.route.file_handle,
+        desired_access,
+    )
+    .map_err(|status| status.raw())?;
+    if canonical_object != state.route.file_object_id {
+        let _ = crate::driver_launch::release_io_object_reference(token);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(count) = ledger.insert_reserved(object, token) else {
+        let _ = crate::driver_launch::release_io_object_reference(token);
+        return Err(STATUS_NO_MEMORY);
+    };
+    Ok(u64::from(count) + 1)
+}
+
+pub(crate) unsafe fn release_video_projection(object: u64) -> Result<u64, i32> {
+    if !video_projection_contains(object) {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    let ledger = &mut *addr_of_mut!(VIDEO_PROJECTION_REFERENCES);
+    let Some(token) = ledger.release_token(object) else {
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    crate::driver_launch::release_io_object_reference(token).map_err(|status| status.raw())?;
+    let remaining = ledger
+        .complete_release(object, token)
+        .expect("video projection reference disappeared after canonical release");
+    Ok(u64::from(remaining) + 1)
+}
+
+pub(crate) unsafe fn video_projection_reference_census() -> (u64, u64) {
+    let objects = video_state_snapshot().objects;
+    let ledger = &*addr_of!(VIDEO_PROJECTION_REFERENCES);
+    (
+        u64::from(ledger.count(objects.file)),
+        u64::from(ledger.count(objects.device)),
+    )
 }
 
 pub(crate) unsafe fn video_device_io_control(

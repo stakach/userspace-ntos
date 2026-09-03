@@ -3502,6 +3502,12 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
             .unwrap_or_else(|status| reject_ps_broker("token pointer retain", status))
             as u64;
     }
+    if unsafe { crate::video_device::video_projection_contains(object) } {
+        return unsafe {
+            crate::video_device::retain_video_projection(object, nt_types::AccessMask::empty())
+        }
+        .unwrap_or_else(|status| panic!("video projection retain failed: {status:#010x}"));
+    }
     if !provider_event_projection_contains(object) {
         return object;
     }
@@ -3551,6 +3557,10 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
         return unsafe { release_primary_token_pointer(index) }
             .unwrap_or_else(|status| reject_ps_broker("token pointer release", status))
             as u64;
+    }
+    if unsafe { crate::video_device::video_projection_contains(object) } {
+        return unsafe { crate::video_device::release_video_projection(object) }
+            .unwrap_or_else(|status| panic!("video projection release failed: {status:#010x}"));
     }
     if !provider_event_projection_contains(object) {
         return 0;
@@ -12525,11 +12535,18 @@ extern "win64" fn s_rtl_query_registry_values(
 /// `NTSTATUS IoGetDeviceObjectPointer(PUNICODE_STRING, ACCESS_MASK, PFILE_OBJECT*, PDEVICE_OBJECT*)`.
 extern "win64" fn s_io_get_device_object_pointer(
     name: u64,
-    _access: u64,
+    access: u64,
     fileobj_out: *mut u64,
     devobj_out: *mut u64,
 ) -> i32 {
-    unsafe { crate::video_device::video_get_device_object_pointer(name, fileobj_out, devobj_out) }
+    unsafe {
+        crate::video_device::video_get_device_object_pointer(
+            name,
+            access,
+            fileobj_out,
+            devobj_out,
+        )
+    }
 }
 
 #[inline]

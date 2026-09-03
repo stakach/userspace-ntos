@@ -42980,6 +42980,17 @@ pub(crate) fn close_io_handle(handle: u64) -> Result<(), nt_status::NtStatus> {
     io_manager_mut().close(ClientId(IO_MANAGER_COMPONENT_ID), HandleValue(handle))
 }
 
+pub(crate) fn retain_io_handle_reference(
+    handle: u64,
+    desired_access: AccessMask,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    unsafe { crate::object_manager_retain_handle(HandleValue(handle), desired_access) }
+}
+
+pub(crate) fn release_io_object_reference(reference: u64) -> Result<(), nt_status::NtStatus> {
+    unsafe { crate::object_manager_release_reference(reference) }
+}
+
 unsafe fn validate_and_sync_hosted_device_projection(
     inst: DriverInstance,
     domain: HostedDomainIdentity,
