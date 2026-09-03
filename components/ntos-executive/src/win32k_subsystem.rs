@@ -4519,6 +4519,87 @@ extern "win64" fn s_io_get_stack_limits(low_limit: *mut u64, high_limit: *mut u6
     }
 }
 
+extern "win64" fn s_zw_query_default_locale(user_profile: u8, locale_id: *mut u32) -> i32 {
+    if locale_id.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        write_unaligned(
+            locale_id,
+            crate::exec_handler::default_locale_id(user_profile != 0),
+        );
+    }
+    0
+}
+
+unsafe fn registered_kernel_image_bytes(base: u64) -> Option<&'static [u8]> {
+    let length = if base == WIN32K_CODE_VA {
+        WIN32K_IMAGE_BYTES as usize
+    } else {
+        let records = GDI_DRIVER_RECORDS_PTR.load(Ordering::Acquire);
+        let count = GDI_DRIVER_RECORDS_LEN.load(Ordering::Acquire);
+        let mut found = 0usize;
+        if records != 0 {
+            for index in 0..count {
+                let record = read_volatile(gdi_driver_record_ptr(records, index));
+                if record.image == base {
+                    found = record.image_len as usize;
+                    break;
+                }
+            }
+        }
+        found
+    };
+    if length == 0 {
+        None
+    } else {
+        Some(core::slice::from_raw_parts(base as *const u8, length))
+    }
+}
+
+extern "win64" fn s_rtl_image_nt_header(base: u64) -> u64 {
+    unsafe {
+        let Some(image) = registered_kernel_image_bytes(base) else {
+            return 0;
+        };
+        nt_pe_loader::image_nt_header_offset(image)
+            .ok()
+            .and_then(|offset| base.checked_add(offset as u64))
+            .unwrap_or(0)
+    }
+}
+
+extern "win64" fn s_rtl_image_directory_entry_to_data(
+    tagged_base: u64,
+    mapped_as_image: u8,
+    directory: u32,
+    size: *mut u32,
+) -> u64 {
+    if size.is_null() {
+        reject_user_probe(nt_compat_exports::memory::UserProbeError::AccessViolation);
+    }
+    let base = tagged_base & !1;
+    let mapped_as_image = mapped_as_image != 0 && tagged_base & 1 == 0;
+    if !mapped_as_image {
+        return 0;
+    }
+    unsafe {
+        let Some(image) = registered_kernel_image_bytes(base) else {
+            return 0;
+        };
+        let Ok(Some((offset, length))) =
+            nt_pe_loader::image_directory_entry(image, true, directory as usize)
+        else {
+            return 0;
+        };
+        let Some(address) = base.checked_add(offset as u64) else {
+            return 0;
+        };
+        write_unaligned(size, length);
+        address
+    }
+}
+
 /// Allocate + initialize a DESKTOP body from the win32k pool. The DESKTOPINFO is created later from
 /// the desktop's own section-backed heap, matching ReactOS `UserInitializeDesktop`.
 unsafe fn alloc_desktop_body() -> u64 {
@@ -12741,6 +12822,15 @@ fn register_trampolines() -> bool {
         s_ex_system_time_to_local_time as usize as u64,
     );
     reg.bind("IoGetStackLimits", s_io_get_stack_limits as usize as u64);
+    reg.bind(
+        "ZwQueryDefaultLocale",
+        s_zw_query_default_locale as usize as u64,
+    );
+    reg.bind("RtlImageNtHeader", s_rtl_image_nt_header as usize as u64);
+    reg.bind(
+        "RtlImageDirectoryEntryToData",
+        s_rtl_image_directory_entry_to_data as usize as u64,
+    );
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",

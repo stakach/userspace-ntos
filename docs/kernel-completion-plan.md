@@ -24539,6 +24539,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Validation passes all 46 `nt-compat-exports` tests, all 703 `nt-ntdll` tests, and the
     freestanding executive release build with 233 warnings. Fifty-eight audited code imports remain.
 
+    B3 locale and checked-image-helper tranche 3 (2026-09-04, host and freestanding green):
+    `ZwQueryDefaultLocale` now reads the canonical live system or session LCID maintained by the
+    executive registry path. `RtlImageNtHeader` and `RtlImageDirectoryEntryToData` now use checked
+    `nt-pe-loader` APIs and only return pointers contained in a registered mapped win32k or display
+    driver image extent. Unknown bases, malformed headers, absent directories, overflow, and
+    truncated directory extents fail without manufacturing a pointer. The reusable PE helper
+    resolves and tests both mapped-image and raw-file directory layouts; the live kernel binding
+    deliberately rejects raw-file views until their base and exact extent are published by an
+    owner, rather than probing unregistered memory or assuming an image size.
+
+    Validation passes all 20 `nt-pe-loader` tests, all 46 `nt-compat-exports` tests, and the
+    freestanding executive release build with 236 warnings. Fifty-five audited code imports remain.
+    Next take the small process/thread state queries and attachment operations whose canonical
+    ownership already exists, then implement the file/Zw group through the native service boundary.
+    Keep structured exception delivery, raw PE-view publication, and image-section lifetime on the
+    explicit remaining list; do not weaken the complete import registry gate.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

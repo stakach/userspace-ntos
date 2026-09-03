@@ -2,7 +2,8 @@
 //! import listing, and malformed-image rejection (no panics).
 
 use nt_pe_loader::{
-    ImageProtection, ImportRef, LoaderWritablePageState, PeError, PeFile, Protection,
+    image_directory_entry, image_nt_header_offset, ImageProtection, ImportRef,
+    LoaderWritablePageState, PeError, PeFile, Protection,
 };
 
 // --- a minimal PE32+ image builder -----------------------------------------
@@ -122,6 +123,36 @@ fn minimal_pe_parses_and_maps() {
     let img = pe.map(BASE).unwrap();
     assert_eq!(img.entry_point(), BASE + 0x1000);
     assert_eq!(&img.bytes[0x1000..0x1002], &[0x90, 0xC3]);
+}
+
+#[test]
+fn rtl_image_helpers_resolve_mapped_and_raw_directory_offsets() {
+    let raw = build_pe(
+        BASE,
+        0x1000,
+        0x3000,
+        &[text_section(0x1000, vec![0x11; 0x40])],
+        &[(2, 0x1010, 0x10)],
+    );
+    assert_eq!(image_nt_header_offset(&raw), Ok(NT_OFF));
+    let raw_resource = image_directory_entry(&raw, false, 2).unwrap().unwrap();
+    assert_eq!(raw_resource, (FILE_ALIGN + 0x10, 0x10));
+
+    let mapped = PeFile::parse(&raw).unwrap().map(BASE).unwrap();
+    assert_eq!(image_nt_header_offset(&mapped.bytes), Ok(NT_OFF));
+    assert_eq!(
+        image_directory_entry(&mapped.bytes, true, 2),
+        Ok(Some((0x1010, 0x10)))
+    );
+    assert_eq!(image_directory_entry(&mapped.bytes, true, 15), Ok(None));
+
+    let mut malformed = mapped.bytes;
+    put_u32(&mut malformed, OPT_OFF + 112 + 2 * 8, 0x2ff8);
+    put_u32(&mut malformed, OPT_OFF + 112 + 2 * 8 + 4, 0x20);
+    assert_eq!(
+        image_directory_entry(&malformed, true, 2),
+        Err(PeError::Truncated)
+    );
 }
 
 /// `DbgkMapViewOfSection` reports `IMAGE_FILE_HEADER.{PointerToSymbolTable, NumberOfSymbols}` to a

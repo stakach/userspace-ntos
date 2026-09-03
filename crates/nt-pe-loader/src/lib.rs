@@ -197,6 +197,38 @@ pub(crate) fn bytes_at(b: &[u8], off: usize, len: usize) -> Result<&[u8], PeErro
     b.get(off..end).ok_or(PeError::Truncated)
 }
 
+/// Return the checked byte offset of a PE32+ image's NT headers.
+pub fn image_nt_header_offset(image: &[u8]) -> Result<usize, PeError> {
+    Ok(Headers::parse(image)?.nt_offset)
+}
+
+/// Resolve one PE data-directory entry to an offset in a mapped image or raw file.
+///
+/// `mapped_as_image` selects RVA-as-offset semantics for SEC_IMAGE mappings. Raw files use the
+/// section table, except header RVAs which are already file offsets. The complete directory extent
+/// must be present in `image`; malformed metadata never yields a pointer outside the supplied view.
+pub fn image_directory_entry(
+    image: &[u8],
+    mapped_as_image: bool,
+    directory: usize,
+) -> Result<Option<(usize, u32)>, PeError> {
+    let pe = PeFile::parse(image)?;
+    if directory >= pe.headers.number_of_rva_and_sizes as usize {
+        return Ok(None);
+    }
+    let entry = pe.headers.data_directory(directory);
+    if entry.virtual_address == 0 {
+        return Ok(None);
+    }
+    let offset = if mapped_as_image || entry.virtual_address < pe.headers.size_of_headers {
+        entry.virtual_address as usize
+    } else {
+        rva::rva_to_file_offset(pe.sections(), entry.virtual_address)?
+    };
+    bytes_at(image, offset, entry.size as usize)?;
+    Ok(Some((offset, entry.size)))
+}
+
 /// A parsed (but not yet mapped) PE image, borrowing the raw file bytes.
 pub struct PeFile<'a> {
     bytes: &'a [u8],

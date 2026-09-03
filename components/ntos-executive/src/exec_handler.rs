@@ -1091,6 +1091,15 @@ static NT_SYSTEM_DEFAULT_LOCALE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID
 static NT_SESSION_DEFAULT_LOCALE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
 static NT_INSTALL_UI_LANGUAGE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
 static NT_DEFAULT_UI_LANGUAGE: AtomicU32 = AtomicU32::new(NT_DEFAULT_LOCALE_ID);
+
+pub(crate) fn default_locale_id(user_profile: bool) -> u32 {
+    if user_profile {
+        NT_SESSION_DEFAULT_LOCALE.load(Ordering::Acquire)
+    } else {
+        NT_SYSTEM_DEFAULT_LOCALE.load(Ordering::Acquire)
+    }
+}
+
 static NT_PENDING_UI_LANGUAGE: AtomicU32 = AtomicU32::new(0);
 static CM_REGISTRY_BOOT_FLAG: AtomicU32 = AtomicU32::new(u32::MAX);
 static CM_REGISTRY_BOOT_SETUP: AtomicBool = AtomicBool::new(false);
