@@ -1,4 +1,4 @@
-//! Numeric `NTSTATUS` to Win32 error tables.
+//! Shared numeric `NTSTATUS` to Win32 error tables.
 //!
 //! Mechanically ported from ReactOS `sdk/lib/rtl/error.c` (the 19 ranges in
 //! `error_table[]`). Zero entries are intentional unmapped holes.

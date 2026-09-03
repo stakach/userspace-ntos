@@ -4478,6 +4478,10 @@ extern "win64" fn s_rtl_are_all_accesses_granted(granted: u32, desired: u32) -> 
     nt_compat_exports::rtl::are_all_accesses_granted(granted, desired) as u8
 }
 
+extern "win64" fn s_rtl_nt_status_to_dos_error(status: u32) -> u32 {
+    nt_compat_exports::rtl::nt_status_to_dos_error(status)
+}
+
 extern "win64" fn s_ex_system_time_to_local_time(system_time: u64, local_time: u64) {
     if system_time == 0 || local_time == 0 {
         return;
@@ -4489,6 +4493,29 @@ extern "win64" fn s_ex_system_time_to_local_time(system_time: u64, local_time: u
             local_time as *mut i64,
             nt_kernel_exec::rtl_time::system_time_to_local_time(system, bias),
         );
+    }
+}
+
+extern "win64" fn s_io_get_stack_limits(low_limit: *mut u64, high_limit: *mut u64) {
+    if low_limit.is_null() || high_limit.is_null() {
+        reject_user_probe(nt_compat_exports::memory::UserProbeError::AccessViolation);
+    }
+    let marker = 0u8;
+    let address = core::ptr::addr_of!(marker) as u64;
+    let Some((low, high)) = nt_compat_exports::memory::component_stack_limits(
+        address,
+        WIN32K_STACK_VADDR,
+        WIN32K_STACK_BYTES,
+        WIN32K_LANE_ARENA_VADDR,
+        WIN32K_LANE_STRIDE,
+        WIN32K_LANE_STACK_FRAMES * 0x1000,
+        WIN32K_LANE_CAPACITY,
+    ) else {
+        panic!("win32k execution escaped its registered component stack")
+    };
+    unsafe {
+        write_unaligned(low_limit, low);
+        write_unaligned(high_limit, high);
     }
 }
 
@@ -12706,9 +12733,14 @@ fn register_trampolines() -> bool {
         s_rtl_are_all_accesses_granted as usize as u64,
     );
     reg.bind(
+        "RtlNtStatusToDosError",
+        s_rtl_nt_status_to_dos_error as usize as u64,
+    );
+    reg.bind(
         "ExSystemTimeToLocalTime",
         s_ex_system_time_to_local_time as usize as u64,
     );
+    reg.bind("IoGetStackLimits", s_io_get_stack_limits as usize as u64);
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",

@@ -9,6 +9,12 @@
 
 use alloc::vec::Vec;
 
+mod ntstatus_to_dos_error_map;
+
+use ntstatus_to_dos_error_map::*;
+
+pub const ERROR_MR_MID_NOT_FOUND: u32 = 317;
+
 /// Kernel version exported to NT 5.2 drivers and user-mode compatibility code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NtVersion {
@@ -28,6 +34,51 @@ pub const NT_VERSION: NtVersion = NtVersion {
 /// `RtlAreAllAccessesGranted`: every desired access bit must be present in the granted mask.
 pub const fn are_all_accesses_granted(granted: u32, desired: u32) -> bool {
     desired & !granted == 0
+}
+
+fn nt_status_table_entry(status: u32) -> Option<u32> {
+    let (start, table): (u32, &[u32]) = match status {
+        0x0000_0102..=0x0000_0121 => (0x0000_0102, &TABLE_00000102),
+        0x4000_0002..=0x4000_0025 => (0x4000_0002, &TABLE_40000002),
+        0x4000_0370 => (0x4000_0370, &TABLE_40000370),
+        0x4002_0056 => (0x4002_0056, &TABLE_40020056),
+        0x4002_00AF => (0x4002_00AF, &TABLE_400200AF),
+        0x8000_0001..=0x8000_0027 => (0x8000_0001, &TABLE_80000001),
+        0x8000_0288..=0x8000_0289 => (0x8000_0288, &TABLE_80000288),
+        0x8009_0300..=0x8009_0347 => (0x8009_0300, &TABLE_80090300),
+        0x8009_2010..=0x8009_2013 => (0x8009_2010, &TABLE_80092010),
+        0x8009_6004 => (0x8009_6004, &TABLE_80096004),
+        0x8013_0001..=0x8013_0005 => (0x8013_0001, &TABLE_80130001),
+        0xC000_0001..=0xC000_019B => (0xC000_0001, &TABLE_C0000001),
+        0xC000_0202..=0xC000_038D => (0xC000_0202, &TABLE_C0000202),
+        0xC002_0001..=0xC002_0063 => (0xC002_0001, &TABLE_C0020001),
+        0xC003_0001..=0xC003_000C => (0xC003_0001, &TABLE_C0030001),
+        0xC003_0059..=0xC003_0061 => (0xC003_0059, &TABLE_C0030059),
+        0xC00A_0001..=0xC00A_0036 => (0xC00A_0001, &TABLE_C00A0001),
+        0xC013_0001..=0xC013_0016 => (0xC013_0001, &TABLE_C0130001),
+        0xC015_0001..=0xC015_0027 => (0xC015_0001, &TABLE_C0150001),
+        _ => return None,
+    };
+    Some(table[(status - start) as usize])
+}
+
+/// Convert an `NTSTATUS` to its Win32 error using the complete ReactOS/NT range table.
+pub fn nt_status_to_dos_error(mut status: u32) -> u32 {
+    if status == 0 || status & 0x2000_0000 != 0 {
+        return status;
+    }
+    if status & 0xF000_0000 == 0xD000_0000 {
+        status &= !0x1000_0000;
+    }
+    match nt_status_table_entry(status) {
+        Some(0) => return ERROR_MR_MID_NOT_FOUND,
+        Some(error) => return error,
+        None => {}
+    }
+    if matches!(status >> 16, 0xC001 | 0x8007) {
+        return status & 0xFFFF;
+    }
+    ERROR_MR_MID_NOT_FOUND
 }
 
 /// A counted UTF-16 string (Windows `UNICODE_STRING`), byte lengths.
@@ -441,6 +492,17 @@ mod tests {
         assert!(are_all_accesses_granted(0, 0));
         assert!(are_all_accesses_granted(0x001f_0003, 0x0002));
         assert!(!are_all_accesses_granted(0x0001, 0x0003));
+    }
+
+    #[test]
+    fn ntstatus_mapping_covers_tables_aliases_and_unmapped_values() {
+        assert_eq!(nt_status_to_dos_error(0), 0);
+        assert_eq!(nt_status_to_dos_error(0x0000_0102), 1460);
+        assert_eq!(nt_status_to_dos_error(0xC000_0022), 5);
+        assert_eq!(nt_status_to_dos_error(0xD000_0022), 5);
+        assert_eq!(nt_status_to_dos_error(0xC001_1234), 0x1234);
+        assert_eq!(nt_status_to_dos_error(0x8007_0057), 0x57);
+        assert_eq!(nt_status_to_dos_error(0xDEAD_BEEF), ERROR_MR_MID_NOT_FOUND);
     }
 
     #[test]

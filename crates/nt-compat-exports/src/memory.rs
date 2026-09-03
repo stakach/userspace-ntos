@@ -43,6 +43,32 @@ pub fn validate_user_probe(
     Ok(())
 }
 
+/// Resolve an address to the owning primary or repeated-lane stack interval.
+pub fn component_stack_limits(
+    address: u64,
+    primary_base: u64,
+    primary_bytes: u64,
+    lane_base: u64,
+    lane_stride: u64,
+    lane_stack_bytes: u64,
+    lane_count: usize,
+) -> Option<(u64, u64)> {
+    let primary_end = primary_base.checked_add(primary_bytes)?;
+    if (primary_base..primary_end).contains(&address) {
+        return Some((primary_base, primary_end));
+    }
+    if lane_stride == 0 || lane_stack_bytes == 0 || lane_stack_bytes > lane_stride {
+        return None;
+    }
+    let lane_offset = address.checked_sub(lane_base)?;
+    let lane = lane_offset / lane_stride;
+    if lane >= lane_count as u64 || lane_offset % lane_stride >= lane_stack_bytes {
+        return None;
+    }
+    let low = lane_base.checked_add(lane.checked_mul(lane_stride)?)?;
+    Some((low, low.checked_add(lane_stack_bytes)?))
+}
+
 /// Append one mapped page, coalescing it with the preceding record only when both the virtual and
 /// physical addresses are contiguous. Returns the new record count, or `None` when the fixed table
 /// is full or the input is invalid.
@@ -170,6 +196,30 @@ mod tests {
         assert_eq!(
             validate_user_probe(u64::MAX - 3, 8, 1),
             Err(UserProbeError::AccessViolation)
+        );
+    }
+
+    #[test]
+    fn component_stack_limits_reject_gaps_and_resolve_each_lane() {
+        assert_eq!(
+            component_stack_limits(0x1080, 0x1000, 0x100, 0x2000, 0x400, 0x200, 3),
+            Some((0x1000, 0x1100))
+        );
+        assert_eq!(
+            component_stack_limits(0x2450, 0x1000, 0x100, 0x2000, 0x400, 0x200, 3),
+            Some((0x2400, 0x2600))
+        );
+        assert_eq!(
+            component_stack_limits(0x2650, 0x1000, 0x100, 0x2000, 0x400, 0x200, 3),
+            None
+        );
+        assert_eq!(
+            component_stack_limits(0x2c00, 0x1000, 0x100, 0x2000, 0x400, 0x200, 3),
+            None
+        );
+        assert_eq!(
+            component_stack_limits(0x1000, u64::MAX, 2, 0, 1, 1, 1),
+            None
         );
     }
 }

@@ -24528,6 +24528,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     executive release build succeeds with 231 warnings. Sixty audited code imports remain before
     registry readiness and desktop boot can resume.
 
+    B3 pure kernel-helper tranche 2 (2026-09-04, host and freestanding green): the complete
+    ReactOS/NT 19-range `NTSTATUS` to Win32 error table now lives in `nt-compat-exports` and is shared
+    by both ntdll and win32k's `RtlNtStatusToDosError` import. This deletes ntdll's private copy while
+    preserving every mapped range boundary, intentional hole, customer-status pass-through,
+    `0xD...` alias, and facility low-word rule. `IoGetStackLimits` now derives the exact active
+    primary or repeated physical-lane stack interval from its real stack address through a checked
+    arena resolver; addresses in stride gaps or outside registered lanes fail closed.
+
+    Validation passes all 46 `nt-compat-exports` tests, all 703 `nt-ntdll` tests, and the
+    freestanding executive release build with 233 warnings. Fifty-eight audited code imports remain.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
