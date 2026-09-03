@@ -368,6 +368,32 @@ impl HostedPnpContextOwner {
             .push(HostedPnpOwnedRootFrame { cap, mapped });
     }
 
+    pub(crate) fn reserve_absorb(&mut self, other: &Self) -> bool {
+        self.alias_caps.try_reserve(other.alias_caps.len()).is_ok()
+            && self
+                .root_frames
+                .try_reserve(other.root_frames.len())
+                .is_ok()
+            && self
+                .va_reservations
+                .try_reserve(other.va_reservations.len())
+                .is_ok()
+    }
+
+    pub(crate) fn absorb_reserved(&mut self, mut other: Self) {
+        debug_assert!(self.alias_caps.capacity() - self.alias_caps.len() >= other.alias_caps.len());
+        debug_assert!(
+            self.root_frames.capacity() - self.root_frames.len() >= other.root_frames.len()
+        );
+        debug_assert!(
+            self.va_reservations.capacity() - self.va_reservations.len()
+                >= other.va_reservations.len()
+        );
+        self.alias_caps.append(&mut other.alias_caps);
+        self.root_frames.append(&mut other.root_frames);
+        self.va_reservations.append(&mut other.va_reservations);
+    }
+
     pub(crate) unsafe fn rollback_to(&mut self, checkpoint: HostedPnpOwnerCheckpoint) -> bool {
         let mut ok = true;
         while self.alias_caps.len() > checkpoint.alias_caps {
@@ -611,6 +637,103 @@ pub(crate) unsafe fn hosted_pnp_context_lease_is_live(lease: ContextLeaseIdentit
         .registry
         .description_by_identity(lease)
         .is_ok()
+}
+
+pub(crate) unsafe fn hosted_pnp_pci_window_by_lease(
+    lease: ContextLeaseIdentity,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Result<
+    (nt_pnp::PciDevice, HostedPnpPciResourceDescriptor),
+    nt_status::NtStatus,
+> {
+    let description = hosted_pnp_context_authority_mut()
+        .registry
+        .description_by_identity(lease)
+        .map_err(|_| nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let device = description
+        .pci_devices
+        .iter()
+        .find(|device| device.bus == bus && device.dev == dev && device.func == func)
+        .cloned()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    let window = description
+        .pci_windows
+        .iter()
+        .find(|window| window.bus == bus && window.dev == dev && window.func == func)
+        .cloned()
+        .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+    Ok((device, window))
+}
+
+pub(crate) unsafe fn commit_hosted_pnp_pci_dma_window(
+    lease: ContextLeaseIdentity,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    dma: HostedPciDmaWindow,
+    staged_owner: HostedPnpContextOwner,
+) -> Result<HostedPnpPciResourceDescriptor, nt_status::NtStatus> {
+    let mut staged_owner = Some(staged_owner);
+    let access = hosted_pnp_context_authority_mut()
+        .registry
+        .with_parts_mut_by_identity(lease, |description, owner| {
+            let window = description
+                .pci_windows
+                .iter_mut()
+                .find(|window| window.bus == bus && window.dev == dev && window.func == func)
+                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
+            if window.dma_frame_base != 0
+                || window.dma_pages != 0
+                || window.dma_va != 0
+                || window.dma_seed_va != 0
+                || window.dma_logical != 0
+                || window.dma_len != 0
+            {
+                return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION);
+            }
+            let staged = staged_owner.as_ref().unwrap();
+            if !owner.reserve_absorb(staged) {
+                return Err(nt_status::NtStatus::INSUFFICIENT_RESOURCES);
+            }
+            window.dma_frame_base = dma.frame_base;
+            window.dma_pages = dma.pages;
+            window.dma_va = dma.va;
+            window.dma_seed_va = dma.seed_va;
+            window.dma_logical = dma.logical;
+            window.dma_len = dma.len;
+            owner.absorb_reserved(staged_owner.take().unwrap());
+            Ok(window.clone())
+        });
+    let committed = match access {
+        Ok(committed) => committed,
+        Err(_) => {
+            if let Some(owner) = staged_owner {
+                retire_or_retain(owner)?;
+            }
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    };
+    match committed {
+        Ok(window) => Ok(window),
+        Err(status) => {
+            if let Some(owner) = staged_owner {
+                retire_or_retain(owner)?;
+            }
+            Err(status)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostedPciDmaWindow {
+    pub(crate) frame_base: u64,
+    pub(crate) pages: u64,
+    pub(crate) va: u64,
+    pub(crate) seed_va: u64,
+    pub(crate) logical: u64,
+    pub(crate) len: u64,
 }
 
 pub(crate) unsafe fn release_hosted_pnp_context_lease(

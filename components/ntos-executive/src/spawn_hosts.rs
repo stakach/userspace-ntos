@@ -2296,6 +2296,27 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_DMA_ADAPTER_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let (status, adapter_id, map_registers) =
+                crate::driver_launch::service_hosted_driver_dma_adapter(
+                    ch,
+                    msg.m0,
+                    [msg.m1, msg.m2, msg.m3, msg.m4],
+                    *reply_cap,
+                );
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                3,
+                status as u32 as u64,
+                adapter_id,
+                map_registers,
+                0
+            );
+            continue;
         } else if label
             == crate::driver_launch::FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
             && ch.caps.kind == ReqKind::Irp

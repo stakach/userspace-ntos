@@ -688,6 +688,7 @@ pub const FSD_IRQ_LANE_FAULT_LABEL: u64 = 0x787;
 pub const FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL: u64 = 0x788;
 pub const FSD_SERVICE_QUEUE_DPC_LABEL: u64 = 0x789;
 pub const FSD_SERVICE_FLUSH_DPCS_LABEL: u64 = 0x78A;
+pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -728,6 +729,7 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
             | FSD_SERVICE_QUEUE_DPC_LABEL
             | FSD_SERVICE_FLUSH_DPCS_LABEL
+            | FSD_SERVICE_DMA_ADAPTER_LABEL
     )
 }
 
@@ -9330,25 +9332,57 @@ extern "win64" fn s_io_disconnect_interrupt(pkinterrupt: u64) {
     }
 }
 
-/// `PDMA_ADAPTER IoGetDmaAdapter(PDEVICE_OBJECT, PDEVICE_DESCRIPTION, PULONG)` — build a
-/// driver-local DMA adapter projection only when PnP granted this devnode a DMA common buffer.
+/// `PDMA_ADAPTER IoGetDmaAdapter(PDEVICE_OBJECT, PDEVICE_DESCRIPTION, PULONG)` — request the
+/// exact PDO generation's bus DMA authority, then build a driver-local adapter projection.
 extern "win64" fn s_io_get_dma_adapter(
-    _pdo: u64,
-    _device_description: u64,
+    pdo: u64,
+    device_description: u64,
     number_of_map_registers: *mut u32,
 ) -> u64 {
     unsafe {
+        if pdo == 0 || device_description == 0 {
+            return 0;
+        }
+        let bytes = core::slice::from_raw_parts(
+            device_description as *const u8,
+            nt_dma_manager::NT5_DEVICE_DESCRIPTION_SIZE,
+        );
+        let description = match nt_dma_manager::Nt5DeviceDescription::parse(bytes) {
+            Ok(description) => description,
+            Err(_) => return 0,
+        };
+        let words = description.service_words();
+        let (_label, status, granted_adapter_id, granted_map_registers, _) = call_on5(
+            (FSD_SERVICE_DMA_ADAPTER_LABEL << 12) | 5,
+            pdo,
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+        );
+        if status as u32 as i32 != STATUS_SUCCESS
+            || granted_adapter_id == 0
+            || granted_map_registers == 0
+            || granted_map_registers > u32::MAX as u64
+        {
+            return 0;
+        }
         let adapter_id = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_ID) as *const u64);
         let grant_va = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_VA) as *const u64);
         let grant_len = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LEN) as *const u64);
         let grant_logical = read_volatile((FSD_SHARED_VADDR + SH_DMA_COMMON_LOGICAL) as *const u64);
-        if adapter_id == 0 || grant_va == 0 || grant_len == 0 || grant_logical == 0 {
+        if adapter_id == 0
+            || adapter_id != granted_adapter_id
+            || grant_va == 0
+            || grant_len == 0
+            || grant_logical == 0
+        {
             return 0;
         }
         let active_adapter = read_volatile((FSD_SHARED_VADDR + SH_DMA_ADAPTER_BLOB) as *const u64);
         if dma_adapter_blob_matches(active_adapter, adapter_id) {
             if !number_of_map_registers.is_null() {
-                write_unaligned(number_of_map_registers, 64);
+                write_unaligned(number_of_map_registers, granted_map_registers as u32);
             }
             return active_adapter;
         }
@@ -9457,7 +9491,7 @@ extern "win64" fn s_io_get_dma_adapter(
         );
         write_volatile((FSD_SHARED_VADDR + SH_DMA_OPS_BLOB) as *mut u64, ops);
         if !number_of_map_registers.is_null() {
-            write_unaligned(number_of_map_registers, 64);
+            write_unaligned(number_of_map_registers, granted_map_registers as u32);
         }
         adapter
     }
@@ -52340,6 +52374,228 @@ pub(crate) fn service_hosted_driver_pci_config(
         Ok(()) => (STATUS_SUCCESS, access.length as u64),
         Err(status) => (status.raw(), 0),
     }
+}
+
+pub(crate) fn service_hosted_driver_dma_adapter(
+    ch: &crate::spawn_hosts::PumpChannel,
+    pdo_object: u64,
+    words: [u64; 4],
+    active_reply_cap: u64,
+) -> (i32, u64, u64) {
+    let description = match nt_dma_manager::Nt5DeviceDescription::from_service_words(words) {
+        Ok(description) => description,
+        Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
+    };
+    let (instance_index, inst, device_id) =
+        match authenticated_hosted_pdo(ch, pdo_object, active_reply_cap) {
+            Ok(authenticated) => authenticated,
+            Err(status) => return (status.raw(), 0, 0),
+        };
+    let Some(binding) = hosted_device_binding_by_device_id(device_id.raw()) else {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+    };
+    if !binding.used
+        || binding.projection_instance != instance_index
+        || instance_domain_identity(inst) != Some(binding.projection_domain)
+        || binding.pdo_object != pdo_object
+        || ch.shared_va != inst.exec_shared_va
+    {
+        return (STATUS_ACCESS_DENIED, 0, 0);
+    }
+    let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(device_id.raw()) }) else {
+        return (STATUS_DEVICE_NOT_READY, 0, 0);
+    };
+    let Some(context_lease) = state.pnp_context_lease else {
+        return (STATUS_DEVICE_NOT_READY, 0, 0);
+    };
+    if state.interface_type != HOSTED_INTERFACE_TYPE_PCIBUS
+        || description.interface_type as u32 != HOSTED_INTERFACE_TYPE_PCIBUS
+        || description.bus_number != state.bus_number
+        || !description.master
+        || description.maximum_length == 0
+        || state.address & !0x001F_0007 != 0
+    {
+        return (STATUS_INVALID_PARAMETER, 0, 0);
+    }
+    let dev = (state.address >> 16) as u8;
+    let func = state.address as u8;
+    let window = match unsafe {
+        crate::request_hosted_pnp_pci_dma_window(
+            context_lease,
+            state.bus_number as u8,
+            dev,
+            func,
+        )
+    } {
+        Ok(window) => window,
+        Err(status) => return (status.raw(), 0, 0),
+    };
+    if description.maximum_length as u64 > window.dma_len {
+        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+    }
+
+    let request = description.adapter_request();
+    let adapter = match unsafe {
+        hosted_dma_manager_mut().request_adapter(hosted_dma_owner(binding), request)
+    } {
+        Ok(adapter) => adapter,
+        Err(error) => return (hosted_dma_status(error).raw(), 0, 0),
+    };
+    let targets = [binding.instance, binding.projection_instance];
+    let mut target_runtimes = [None, None];
+    for (position, target_index) in targets.into_iter().enumerate() {
+        if position != 0 && target_index == targets[0] {
+            continue;
+        }
+        let Some(target) = instance(target_index) else {
+            if adapter.created {
+                unsafe {
+                    hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
+                }
+            }
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+        };
+        let Some(domain) = instance_domain_identity(target) else {
+            if adapter.created {
+                unsafe {
+                    hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
+                }
+            }
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+        };
+        target_runtimes[position] = Some((target_index, target, domain));
+    }
+    if state.dma_frame_base == 0 {
+        let map_cap_count = usize::try_from(window.dma_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(target_runtimes.iter().flatten().count()));
+        if map_cap_count.is_none_or(|count| unsafe {
+            reserve_hosted_resource_map_caps(count).is_err()
+        })
+        {
+            if adapter.created {
+                unsafe {
+                    hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
+                }
+            }
+            return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+        }
+        for (target_index, target, domain) in target_runtimes.into_iter().flatten() {
+            if let Err(status) = unsafe {
+                map_hosted_resource_frame_run(
+                    target_index,
+                    target,
+                    domain,
+                    binding.device_id,
+                    context_lease,
+                    window.dma_va,
+                    window.dma_frame_base,
+                    window.dma_pages,
+                    RW_NX,
+                )
+            } {
+                for cleanup_index in targets {
+                    if let Some(cleanup) = instance(cleanup_index) {
+                        if let Some(cleanup_domain) = instance_domain_identity(cleanup) {
+                            unsafe {
+                                clear_hosted_resource_map_caps_for_device(
+                                    cleanup_index,
+                                    cleanup_domain,
+                                    binding.device_id,
+                                    Some(context_lease),
+                                );
+                            }
+                        }
+                    }
+                }
+                if adapter.created {
+                    unsafe {
+                        hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
+                    }
+                }
+                return (status.raw(), 0, 0);
+            }
+        }
+        let bus_master_bits = match unsafe {
+            crate::pnp::acquire_pci_command_for_resources(
+                state.bus_number,
+                state.address,
+                false,
+                false,
+                true,
+            )
+        } {
+            Ok(bits) => bits,
+            Err(status) => {
+                for cleanup_index in targets {
+                    if let Some(cleanup) = instance(cleanup_index) {
+                        if let Some(cleanup_domain) = instance_domain_identity(cleanup) {
+                            unsafe {
+                                clear_hosted_resource_map_caps_for_device(
+                                    cleanup_index,
+                                    cleanup_domain,
+                                    binding.device_id,
+                                    Some(context_lease),
+                                );
+                            }
+                        }
+                    }
+                }
+                if adapter.created {
+                    unsafe {
+                        hosted_dma_manager_mut().revoke_owner(hosted_dma_owner(binding));
+                    }
+                }
+                return (status.raw(), 0, 0);
+            }
+        };
+        let Some(current) = (unsafe { hosted_device_resource_states_mut() })
+            .iter_mut()
+            .find(|current| current.device_id == binding.device_id)
+        else {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+        };
+        current.dma_broker_va = window.dma_seed_va;
+        current.dma_frame_base = window.dma_frame_base;
+        current.dma_pages = window.dma_pages;
+        current.pci_command_owned_bits |= bus_master_bits;
+        unsafe {
+            write_volatile((ch.shared_va + SH_DMA_COMMON_VA) as *mut u64, window.dma_va);
+            write_volatile((ch.shared_va + SH_DMA_COMMON_LEN) as *mut u64, window.dma_len);
+            write_volatile(
+                (ch.shared_va + SH_DMA_COMMON_LOGICAL) as *mut u64,
+                window.dma_logical,
+            );
+            write_volatile(
+                (ch.shared_va + SH_DMA_ADAPTER_ID) as *mut u64,
+                adapter.adapter_id,
+            );
+            clear_dma_allocation_records(ch.shared_va);
+        }
+    } else {
+        let shared_adapter =
+            unsafe { read_volatile((ch.shared_va + SH_DMA_ADAPTER_ID) as *const u64) };
+        let shared_va = unsafe { read_volatile((ch.shared_va + SH_DMA_COMMON_VA) as *const u64) };
+        let shared_len =
+            unsafe { read_volatile((ch.shared_va + SH_DMA_COMMON_LEN) as *const u64) };
+        let shared_logical =
+            unsafe { read_volatile((ch.shared_va + SH_DMA_COMMON_LOGICAL) as *const u64) };
+        if state.dma_frame_base != window.dma_frame_base
+            || state.dma_pages != window.dma_pages
+            || state.dma_broker_va != window.dma_seed_va
+            || shared_adapter != adapter.adapter_id
+            || shared_va != window.dma_va
+            || shared_len != window.dma_len
+            || shared_logical != window.dma_logical
+        {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+        }
+    }
+    (
+        STATUS_SUCCESS,
+        adapter.adapter_id,
+        adapter.num_map_registers as u64,
+    )
 }
 
 pub(crate) fn service_hosted_driver_interrupt(

@@ -23462,6 +23462,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     at the established 213-warning baseline. Next use this codec directly in the component/root
     call pair.
 
+    B3 dynamic `IoGetDmaAdapter` cutover (2026-09-03, host and freestanding green; runtime
+    acceptance pending): hosted PCI discovery now publishes only registry-selected bus resources.
+    The class-code `hosted_pci_driver_needs_dma` policy, eager DMA/IOMMU allocator, START-time DMA
+    projection, and their discovery counters have been deleted. The component snapshots and parses
+    the caller's real NT5 `DEVICE_DESCRIPTION`, sends its canonical request plus PDO over dedicated
+    service `0x78B`, and has no local success fallback. Root authenticates the caller domain, PDO,
+    devnode resource state, exact PnP context lease, PCI identity, and bus properties. On the first
+    valid request it builds a staged per-function IOMMU hierarchy and frame window, reserves both
+    component and root alias VAs, commits all capabilities to that exact context generation, maps
+    the window into the owning/projection domains, requests the canonical DMA adapter, and acquires
+    only the newly required PCI bus-master bit. Exact retries must match context, state, shared
+    projection, and adapter properties. Context retirement now owns the DMA frames, IOMMU/map caps,
+    aliases, and VA reservations. Focused validation remains green at 16 PnP-context and 28
+    DMA-manager tests; the freestanding executive check is green at the established 213-warning
+    baseline. Next run serialized desktop acceptance and require the real E1000 DMA/IRQ/receive path
+    plus the complete framebuffer and gate sentinel; fix the dynamic boundary itself if it fails.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
