@@ -23400,7 +23400,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ISR/DPC/provider-arena cutover. Continue B3 at the broader repeated driver/device and remaining
     synthetic identity cleanup already tracked above; do not retain packet-specific proof code.
 
-    B3 pre-hive NIC identity removal (2026-09-03, implementation complete; runtime pending): the
+    B3 pre-hive NIC identity removal (2026-09-03, accepted): the
     executive no longer counts network-class PCI functions, chooses a singleton NIC, claims its
     BARs before Configuration Manager exists, or carries that anonymous grant into later discovery.
     The isolated AHCI bootstrap maps its own IOPT root, which is the microkernel operation that
@@ -23409,9 +23409,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     device by exact PCI identity, including a separate IOMMU context when its hardware contract
     requires DMA. The two historical pre-hive grant gates have been deleted; the existing
     `exec_hosted_pci_grants_discovered_from_registry` gate remains the single production authority.
-    Validate with a serialized desktop boot that reports both selected PCI devnodes as newly
-    claimed, one DMA grant for the NIC, no missing or failed grants, live E1000 IRQ/DPC/receive, and
-    genuine Explorer paint.
+    Serialized desktop run `.tmp/run-desktop-20260903-104326.log` shows the AHCI IOPT enabling VT-d
+    before registry discovery, then reports `selected=2 existing=0 claimed=2 dma=1
+    dma-not-required=1` with no missing or failed grants. It retains the real E1000
+    IRQ/DPC/Receive path, paints all 786432 Explorer framebuffer pixels with at least 32 colours,
+    completes every remaining gate at `293/293` (the two deleted gates accounted only for the
+    removed pre-hive mechanism), and exits through the microtest sentinel.
+
+    Review adjustment: the remaining `hosted_pci_driver_needs_dma` class-code predicate still
+    decides in advance whether a selected device receives an IOMMU window. Replace that policy with
+    a generation-owned bus DMA request made through the device stack when `IoGetDmaAdapter` (or its
+    NDIS wrapper) supplies the device and `DEVICE_DESCRIPTION`. The root bus should validate the
+    devnode/resource owner, allocate and map the exact per-device window once, publish it to the
+    requesting component, and retire it with the device generation. Do not infer DMA capability
+    from PCI class, allocate windows to every device, or retain the eager path as a fallback.
 
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
