@@ -442,8 +442,9 @@ impl DmaManager {
 
     /// `AllocateCommonBuffer` (spec §11.1): allocate a fake logical address for a
     /// common buffer backed by `backing_va` (a real Driver-Host address). Validates
-    /// the adapter is owned + active, and the length fits the adapter maximum + the
-    /// device's address-bit limit (§10.4).
+    /// the adapter is owned + active and the allocation fits the device's address-bit
+    /// limit (§10.4). `DEVICE_DESCRIPTION.MaximumLength` limits one transfer, not a
+    /// persistent common-buffer allocation.
     pub fn alloc_common_buffer(
         &mut self,
         owner: DmaOwner,
@@ -466,11 +467,8 @@ impl DmaManager {
         length: u64,
         backing_va: u64,
     ) -> Result<CommonBufferGrant, DmaError> {
-        let (max_length, dma64) = {
-            let a = self.adapter(adapter_id, owner)?;
-            (a.max_length, a.dma64)
-        };
-        if logical_base == 0 || length == 0 || length > max_length {
+        let dma64 = self.adapter(adapter_id, owner)?.dma64;
+        if logical_base == 0 || length == 0 {
             return Err(DmaError::OutOfRange);
         }
         let logical_end = logical_base
@@ -1224,6 +1222,18 @@ mod tests {
     }
 
     #[test]
+    fn common_buffer_may_exceed_the_adapter_maximum_transfer_length() {
+        let mut d = DmaManager::new();
+        let adapter = d.register_adapter(owner(), true, 1514, true);
+        let grant = d
+            .register_common_buffer_at(owner(), adapter, 0x1000, 4096, 0x2_0000)
+            .unwrap();
+
+        assert_eq!(grant.logical_base, 0x1000);
+        assert_eq!(d.decode_owner_logical(owner(), 0x1fff, 1), Ok(0x2_0fff));
+    }
+
+    #[test]
     fn broker_registered_common_buffer_rejects_logical_overlap() {
         let mut d = DmaManager::new();
         let a = d.register_adapter(owner(), true, 4096, true);
@@ -1327,17 +1337,23 @@ mod tests {
     }
 
     #[test]
-    fn adapter_ownership_and_limits() {
+    fn adapter_ownership_and_address_limits() {
         let mut d = DmaManager::new();
-        let a = d.register_adapter(owner(), true, 4096, true);
+        let a = d.register_adapter(owner(), true, 4096, false);
         let other = DmaOwner::new(2, 200, 20);
         assert_eq!(
             d.alloc_common_buffer(other, a, 4096, 0),
             Err(DmaError::WrongOwner)
         );
-        // Oversize rejected.
+        assert!(d.alloc_common_buffer(owner(), a, 8192, 0).is_ok());
+        // A 32-bit device still cannot address a common buffer crossing 4 GiB.
         assert_eq!(
-            d.alloc_common_buffer(owner(), a, 8192, 0),
+            d.register_common_buffer_at(owner(), a, 0xffff_f000, 8192, 0),
+            Err(DmaError::OutOfRange)
+        );
+        // MaximumLength continues to bound an individual transfer mapping.
+        assert_eq!(
+            d.register_mapping_at(owner(), a, 0x4000, 0, 8192),
             Err(DmaError::OutOfRange)
         );
     }

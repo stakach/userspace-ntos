@@ -23479,6 +23479,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     baseline. Next run serialized desktop acceptance and require the real E1000 DMA/IRQ/receive path
     plus the complete framebuffer and gate sentinel; fix the dynamic boundary itself if it fails.
 
+    B3 dynamic DMA runtime checkpoint (2026-09-03, real device path green; terminal PnP and pool
+    ownership open): the first serialized acceptance exposed an authority bug at the new root
+    service: it authenticated the caller's projected PDO correctly, but then looked up a dispatch
+    binding by that PDO identity even though bindings are keyed by the driver's FDO. Root now obtains
+    the active projection binding, validates its dependent PDO identity, projection object, domain,
+    and channel against the authenticated request, and resolves resources by its FDO. Commit
+    `85947667` removes that accidental identity coupling. Serialized run
+    `.tmp/run-desktop-20260903-111333-dma-projection.log` then obtains real adapter ID 1 on demand,
+    publishes a 272 KiB aperture to E1000, maps the real common buffers and scatter/gather transfer,
+    services and claims the physical IRQ, runs its generation-owned DPC, exchanges ARP through
+    TCP/IP, and renders all 786432 Explorer framebuffer pixels with at least 32 colours in about 119
+    guest seconds. It exits through the sentinel at `291/293`; only the terminal PnP Start ownership
+    and hosted-driver pool-integrity gates remain.
+
+    Review adjustment: provider DMA-state replay was rejecting the E1000 descriptor rings because
+    the canonical manager incorrectly applied `DEVICE_DESCRIPTION.MaximumLength` to persistent
+    common buffers. NT uses that field to size a transfer and its map-register capacity; the
+    ReactOS HAL common-buffer allocator independently constrains addressability and allocation
+    boundaries. Common-buffer registration now validates ownership, non-zero/range arithmetic,
+    overlap, and the device address-width ceiling without applying the transfer cap. Transfer
+    mappings remain capped. All 29 focused DMA-manager tests pass, including a larger common buffer
+    on an adapter with a 1514-byte transfer maximum, and the freestanding executive remains green.
+    Rerun serialized acceptance after repairing the remaining exact PnP continuation and projected
+    NDIS buffer ownership; do not turn either failure into success evidence or retain a fallback.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
