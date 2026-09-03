@@ -110,6 +110,86 @@ pub(crate) struct ProviderLocalEventTransfer {
     state: Option<(nt_kernel_exec::EventKind, bool)>,
 }
 
+impl nt_provider_wait::ProviderEventWaitBackend for ExecNtHandler {
+    type Lease = nt_kernel_exec::EventLeaseId;
+    type Error = u32;
+
+    fn acquire_event_wait(
+        &mut self,
+        owner: nt_provider_wait::ProviderWaitOwner,
+        object: nt_provider_wait::ProviderWaitObject,
+    ) -> Result<Self::Lease, Self::Error> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if object.typed() != Some(nt_provider_wait::ProviderWaitObjectType::Event) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let id = nt_kernel_exec::EventObjectId::from_wire_parts(
+            object.object_id,
+            object.object_generation,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)?;
+        if snapshot.owner
+            != (nt_kernel_exec::EventObjectOwner::Provider {
+                domain: owner.provider_domain,
+                generation: owner.provider_generation,
+            })
+            || !crate::win32k_provider_domain_is_current(
+                nt_provider_wait::ProviderDomainIdentity {
+                    domain: owner.provider_domain,
+                    generation: owner.provider_generation,
+                },
+            )
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.event_objects
+            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    fn event_is_ready(&self, lease: Self::Lease) -> bool {
+        let id = self
+            .event_objects
+            .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
+            .expect("provider Event wait lost its canonical lease");
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .expect("provider Event wait lease resolved a stale object");
+        self.events.read_state(snapshot.native_identity)
+    }
+
+    fn consume_ready_event(&mut self, lease: Self::Lease) {
+        let id = self
+            .event_objects
+            .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
+            .expect("provider Event wait lost its canonical lease");
+        let snapshot = self
+            .event_objects
+            .snapshot(id)
+            .expect("provider Event wait lease resolved a stale object");
+        assert!(
+            self.events.consume_existing(snapshot.native_identity),
+            "provider Event wait selected an unsignalled object"
+        );
+    }
+
+    fn release_event_wait(&mut self, lease: Self::Lease) {
+        match self
+            .event_objects
+            .release_wait(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
+        {
+            Ok(Some(retired)) => self.finalize_retired_event_object(retired),
+            Ok(None) => {}
+            Err(_) => panic!("provider Event wait lost its exact lease during release"),
+        }
+    }
+}
+
 struct CapturedNamedObjectAttributes {
     root: u64,
     attributes: u32,

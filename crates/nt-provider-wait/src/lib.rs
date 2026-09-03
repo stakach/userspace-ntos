@@ -12,11 +12,13 @@ use alloc::vec::Vec;
 
 mod abi;
 mod allocation;
+mod arbiter;
 mod domain;
 mod local_event;
 
 pub use abi::*;
 pub use allocation::*;
+pub use arbiter::*;
 pub use domain::*;
 pub use local_event::*;
 

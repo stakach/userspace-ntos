@@ -23867,15 +23867,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     consumes a locally mirrored synchronization Event. Do not diagnose or paper over that stall in
     policy code; replace the immediate-success body with the canonical provider-wait transport.
 
-    Build the next provider-wait slice as a host-tested Event-only
-    executive arbiter. It must copy the shared request at admission, require the exact provider and
-    client owner tuple, acquire and release canonical `ProviderWait` Event leases transactionally,
-    use the executive's global dispatcher admission sequence, implement WaitAny/WaitAll plus exact
-    deadlines, and compose with the existing LIFO continuation stack. Unsupported object types,
-    UserMode, and alertable semantics fail before mutation. Add checked Event wire-identity
-    conversion instead of masked `ObjectId::new` construction. Only after that core is green may
-    `KeWaitForSingleObject` and `KeWaitForMultipleObjects` cut over atomically to the shared-page
-    request/resume transport; delete the old immediate-success single-wait body in that same step.
+    Event-only provider-wait arbiter checkpoint (2026-09-03, host/freestanding green):
+    `nt-provider-wait` now copies the shared request before validation, authenticates the complete
+    provider/client/dispatch owner tuple, rejects UserMode, alertable, and non-Event requests before
+    acquiring anything, and transactionally acquires every canonical lease before publishing a
+    waiter. It implements WaitAny/WaitAll consumption, poll, relative and absolute deadlines,
+    cancellation, oldest-ready selection by the executive-supplied global dispatcher sequence, and
+    exact reverse-order lease release. Seven focused arbiter tests bring the crate to 38 passing
+    tests. Canonical Event wire decoding now rejects zero, oversized, or truncating slot/generation
+    fields, bringing `nt-kernel-exec` to 241 passing tests. The real executive adapter accepts only
+    Events owned by the current provider domain/generation, uses the dedicated `ProviderWait` lease
+    class, and reaches readiness and consumption only through the executive-owned `EventStore`.
+    The freestanding executive remains at the 213-warning baseline.
+
+    Next compose arbiter completion with the existing LIFO continuation stack and the component
+    pump's non-reply suspension mechanism. `KeWaitForSingleObject` and
+    `KeWaitForMultipleObjects` must cut over atomically to the dedicated shared-page request/resume
+    transport; delete the old immediate-success single-wait body in that same step. Provider waits
+    must participate in the same native/GUI/provider signal arbitration and timer deadline minimum,
+    and process/thread/provider teardown must cancel and release every exact wait before identity
+    reuse. Do not add an immediate-result fallback if admission or resume validation fails.
 
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic

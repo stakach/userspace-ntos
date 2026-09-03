@@ -19,6 +19,16 @@ impl EventObjectId {
     pub const fn is_null(self) -> bool {
         self.0.is_null()
     }
+
+    /// Decode the provider-wait wire form without truncating either packed field.
+    pub fn from_wire_parts(one_based_slot: u64, generation: u64) -> Option<Self> {
+        let slot = one_based_slot.checked_sub(1)?;
+        let generation = u32::try_from(generation).ok()?;
+        if generation == 0 || slot >= (1u64 << 40) {
+            return None;
+        }
+        Some(Self(ObjectId::new(Generation(generation), slot)))
+    }
 }
 
 /// Unique ownership token for one parked wait. Releasing a stale or already-released token fails.
@@ -1460,5 +1470,19 @@ mod tests {
                 .native_identity,
             81
         );
+    }
+
+    #[test]
+    fn provider_wait_wire_identity_conversion_is_checked() {
+        let id = EventObjectId::from_wire_parts(7, 3).unwrap();
+        assert_eq!(id.0.slot(), 6);
+        assert_eq!(id.0.generation(), Generation(3));
+        assert_eq!(EventObjectId::from_wire_parts(0, 3), None);
+        assert_eq!(EventObjectId::from_wire_parts(7, 0), None);
+        assert_eq!(
+            EventObjectId::from_wire_parts(7, u64::from(u32::MAX) + 1),
+            None
+        );
+        assert_eq!(EventObjectId::from_wire_parts((1u64 << 40) + 1, 3), None);
     }
 }
