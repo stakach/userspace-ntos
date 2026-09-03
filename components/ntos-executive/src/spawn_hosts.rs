@@ -1394,10 +1394,10 @@ static PUMP_DISPATCH_DEPTH: AtomicU64 = AtomicU64::new(0);
 /// High-water of [`PUMP_DISPATCH_DEPTH`] over the boot. >= 2 means a nested dispatch really ran with
 /// an outer dispatch still outstanding on the SAME single reply object.
 pub(crate) static PUMP_MAX_DISPATCH_DEPTH: AtomicU64 = AtomicU64::new(0);
-/// ★ RISK R6 — dispatches currently SUSPENDED inside a usermode callback, i.e. pumps that returned
-/// while deliberately NOT replying, leaving `R` bound to the component's callback `Call`. Every one
-/// of them MUST eventually be resumed by one of the three resume sites (`NtCallbackReturn`,
-/// dead-client unwind, cancel); a non-zero value at quiesce is a component wedged holding `R`.
+/// Dispatches currently suspended behind a typed user callback, provider wait, or LPC wait. The
+/// component's `Call` remains bound to its reply object until the exact continuation resumes. At
+/// quiescence this gauge must equal the coordinator's live typed waits plus active callback frames;
+/// an unmatched value is a component wedged while holding its reply object.
 pub(crate) static SUSPENDED_COMPONENT_OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 
 /// Current outstanding win32k dispatch nesting depth (0 = win32k holds no outstanding dispatch).
@@ -3397,11 +3397,11 @@ unsafe fn pump_service_io_port_fault(
 }
 
 #[inline(never)]
-fn pump_leave_depth(owns_depth: bool, callback_suspended: bool) {
-    // Retire this level from the depth GAUGE unless it is now suspended inside a usermode callback
-    // (in which case it stays outstanding until a resume pump completes it). Observability only.
+fn pump_leave_depth(owns_depth: bool, component_suspended: bool) {
+    // Retire this level from the depth gauge unless a typed callback/provider/LPC continuation now
+    // owns it. Suspended levels remain outstanding until the exact resume pump completes them.
     if owns_depth {
-        if callback_suspended {
+        if component_suspended {
             SUSPENDED_COMPONENT_OUTSTANDING.fetch_add(1, Ordering::Relaxed);
         } else {
             dispatch_depth_leave();

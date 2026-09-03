@@ -70,7 +70,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             fault_ep: worker_ep,
             cid_proc,
             cid_thread,
-            prio: 106, // above winlogon-main(102) so it runs when winlogon's main parks/blocks
+            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 19: winlogon (pi 2) runs on OUR ntdll's NATIVE seL4-Call transport, so its rpcrt4
             // server WORKER thread must too. All three worker slots run in winlogon's VSpace (pi 2) with
             // distinct TEB-derived IPC buffers. Their faults still arrive on the badged MAIN fault-EP (the
@@ -233,7 +233,7 @@ pub(crate) unsafe fn spawn_slot_thread(
             fault_ep,
             cid_proc,
             cid_thread,
-            prio: 106,
+            prio: HOSTED_USER_THREAD_PRIORITY,
             native,
             diag: false,
         },
@@ -279,7 +279,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            prio: 104, // above winlogon(102)/services(103) so it runs when services' main parks
+            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 33: services (pi 3) runs on OUR ntdll's NATIVE seL4-Call transport, so its SCM RPC
             // listener thread must too. native:true plus its TEB-derived private IPC buffer makes its
             // Call dispatch (MR0=SSN), so it runs its rpcrt4 ncacn_np receive loop
@@ -330,7 +330,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            prio: 105, // above winlogon(102)/services(103)/svc-listener(104) so it runs once lsass' main parks/blocks
+            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 24: lsass (pi 4) runs on OUR ntdll's NATIVE seL4-Call transport, so its LSA server
             // thread must too. native:true makes its Call dispatch (MR0=SSN) through its TEB-derived
             // private IPC buffer.
@@ -378,7 +378,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            prio: 105,
+            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
             native: true,
             diag: false,
@@ -419,7 +419,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
             fault_ep: listener_ep,
             cid_proc,
             cid_thread,
-            prio: 105,
+            prio: HOSTED_USER_THREAD_PRIORITY,
             // BATCH 24: native transport (mirror listener1) — lsass runs on our native ntdll.
             native: true,
             diag: false,

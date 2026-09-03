@@ -6002,6 +6002,12 @@ fn provider_wait_transport_spec(passed: &mut u64) {
     print_u64(stats.dispatch_completions);
     print_str(b"/");
     print_u64(stats.active_continuations as u64);
+    print_str(b" component admitted/complete/live=");
+    print_u64(stats.component_dispatch_admissions);
+    print_str(b"/");
+    print_u64(stats.component_dispatch_completions);
+    print_str(b"/");
+    print_u64(stats.active_component_continuations as u64);
     print_str(b" parked/resume/ok/rearm=");
     print_u64(stats.parked_admissions);
     print_str(b"/");
@@ -6029,10 +6035,10 @@ fn provider_wait_transport_spec(passed: &mut u64) {
             && stats.parked_admissions >= 1
             && stats.resumes >= 1
             && stats.successful_resumes >= 1
-            && stats.dispatch_admissions
+            && stats.component_dispatch_admissions
                 == stats
-                    .dispatch_completions
-                    .saturating_add(stats.active_continuations as u64)
+                    .component_dispatch_completions
+                    .saturating_add(stats.active_component_continuations as u64)
             && stats.active_waiters <= stats.active_continuations
             && stats.active_dispatcher_leases >= stats.active_waiters
             && stats.dispatcher_leases_acquired
@@ -19248,6 +19254,10 @@ unsafe fn notify_thread_termination_ports(tid: u64, handler: &mut ExecNtHandler)
             }
         }
     }
+    // Termination post-actions run after the ordinary syscall-phase LPC redrive. Wake the generic
+    // broker waiters at this producer boundary so a queued client-died message cannot depend on a
+    // later, unrelated syscall for delivery to the real server worker.
+    let _ = crate::service_sec_image::lpc_endpoint_redrive_all(handler);
 }
 
 fn hosted_process_has_one_mechanism_left(
@@ -27299,6 +27309,14 @@ struct LoaderThreadContext {
     initial_teb: nt_thread_start::InitialTeb64,
 }
 
+/// Initial seL4 priority for every hosted Windows user thread.
+///
+/// NT priority changes belong to the thread scheduler interface, not to spawn-site boot ordering.
+/// Keeping process mains, RPC listeners, and thread-pool workers in the same initial class also
+/// preserves round-robin progress when a busy GUI/RPC worker repeatedly blocks and wakes on the
+/// executive endpoint.
+const HOSTED_USER_THREAD_PRIORITY: u8 = 100;
+
 struct HostedThread {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
     /// image/ntdll/PEB/KUSER mappings.
@@ -27333,9 +27351,8 @@ struct HostedThread {
     /// The `ClientId` written into the TEB (`0,0` leaves the TEB's zero-fill).
     cid_proc: u64,
     cid_thread: u64,
-    /// Scheduling priority (default 100). The services RPC listener uses a value above the hosted
-    /// processes so that, once services' main thread parks (NtTerminateThread), the listener is the
-    /// highest runnable thread → it faults into the main multiplex (proving the N-threads mechanism).
+    /// Initial scheduling priority. Hosted Windows threads begin in the same base class; real NT
+    /// priority changes are applied through the scheduler API after creation.
     prio: u8,
     /// NATIVE seL4-Call transport (ntdll_plan Step 6.A / BATCH 6). When set, this thread runs on
     /// OUR ntdll's native transport: its explicit `Call(CT_FAULT, label=0x4E54)` dispatches natively
@@ -27930,7 +27947,14 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
         return HostedThreadSpawnResult::failed();
     }
     let _ = tcb_set_gs_base(tcb, t.teb_va);
-    let _ = tcb_set_priority(tcb, if t.prio != 0 { t.prio as u64 } else { 100 });
+    let _ = tcb_set_priority(
+        tcb,
+        if t.prio != 0 {
+            t.prio as u64
+        } else {
+            HOSTED_USER_THREAD_PRIORITY as u64
+        },
+    );
     if t.diag {
         print_str(b"[spawn-diag] tcb=0x");
         print_hex(tcb as u32);
@@ -35140,14 +35164,19 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // Win32k transport remains proven by the live workload itself: ReactOS reaches real nested
     // user-mode callbacks and Explorer shell work, every win32k dispatch completes through the
-    // kernel-bound reply object, no reply errors occur, and quiesce has no suspended component left
-    // holding `R_w32`.
+    // kernel-bound reply object, no reply errors occur, and every component still suspended at
+    // quiescence is accounted for by a typed provider/LPC continuation or an active user callback.
     let w32_call_requests = spawn_hosts::pump_call_requests(spawn_hosts::ReqKind::Syscall);
     let w32_call_dispatches = spawn_hosts::pump_call_dispatches(spawn_hosts::ReqKind::Syscall);
     let w32_reply_errors = spawn_hosts::PUMP_REPLY_ERRORS.load(Ordering::Relaxed);
     let w32_max_depth = spawn_hosts::PUMP_MAX_DISPATCH_DEPTH.load(Ordering::Relaxed);
     let w32_suspended_outstanding =
         spawn_hosts::SUSPENDED_COMPONENT_OUTSTANDING.load(Ordering::Relaxed);
+    let component_wait_stats = service_sec_image::provider_wait_runtime_stats();
+    let (active_user_callbacks, _) = win32k_glue::user_callback_stack_depths();
+    let typed_suspended_outstanding = component_wait_stats
+        .active_component_continuations
+        .saturating_add(active_user_callbacks);
     let w32_retired = win32k_glue::WIN32K_RETIRED.load(Ordering::Relaxed);
     print_str(b"[harness] win32k transport=Call requests=");
     print_u64(w32_call_requests);
@@ -35161,6 +35190,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     print_u64(w32_max_depth);
     print_str(b" suspended-outstanding=");
     print_u64(w32_suspended_outstanding);
+    print_str(b" typed-wait/callback=");
+    print_u64(typed_suspended_outstanding as u64);
     print_str(b" walled=");
     print_u64(w32_retired);
     print_str(b" nested-scenario=retired\n");
@@ -35172,7 +35203,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // The property was demonstrated at depth >= 2 (a nested dispatch really ran on the same
             // reply object while an outer dispatch was still outstanding on it).
             && w32_max_depth >= 2
-            && w32_suspended_outstanding == 0
+            && w32_suspended_outstanding == typed_suspended_outstanding as u64
             && w32_retired == 0,
         &mut passed,
     );

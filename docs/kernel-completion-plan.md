@@ -24415,8 +24415,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     continuation transfer on the same generation-bearing lane, with a focused host regression, then
     rerun the desktop gate. Do not convert either suspension into a fabricated callback result.
 
-    B3 callback-to-wait transfer checkpoint (2026-09-03, desktop recovery accepted; final
-    accounting cleanup pending): `nt-component-suspension` now atomically replaces a running
+    B3 callback-to-wait transfer checkpoint (2026-09-03, desktop recovery accepted; accounting
+    complete): `nt-component-suspension` now atomically replaces a running
     external callback token
     with a typed provider/LPC suspension, without exposing the lane as idle. Callback completion
     returns an explicit completed/provider-wait/LPC-wait transition instead of collapsing every
@@ -24445,6 +24445,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the remaining transport-accounting failures `exec_win32k_transport_call_nested` (four live
     component suspensions at the final quiesce snapshot) and `exec_provider_wait_transport_owned`
     (525 admissions, 522 completions, four live waits) without weakening either gate.
+
+    B3 exact continuation-accounting and scheduling checkpoint (2026-09-03, freestanding and
+    desktop green): provider and LPC admissions now enter one component-continuation ledger, and
+    every completed, failed, rejected, or callback-suspending terminal transition retires exactly
+    one admission. The provider gate enforces `admitted = completed + live` over the complete typed
+    continuation table rather than incorrectly treating live LPC requests as leaked provider waits.
+    The win32k transport gate independently requires its suspended-dispatch gauge to equal the
+    coordinator's live typed continuations plus active user callbacks, so a real leak remains a
+    failure while legitimate long-lived system-thread waits remain admitted.
+
+    All LPC producer boundaries now call one generic receive/request redrive helper. In particular,
+    process/thread termination notification messages wake already parked CSR server workers at the
+    mutation boundary instead of depending on an unrelated later syscall. The historical hosted
+    thread priority ladder is also deleted: process mains, RPC listeners, and thread-pool workers
+    start in the same scheduler class, while real NT priority changes remain the scheduler API's
+    responsibility. This prevents a repeatedly waking GUI/RPC worker from starving an already
+    runnable process main and removes boot-order policy from spawn sites.
+
+    Serialized proof `.tmp/run-desktop-20260903-234119.log` crosses profile creation and hive load,
+    launches genuine userinit and Explorer, executes real callback/window/GDI traffic, paints shell
+    chrome, passes the CSR message plane, balances the provider/component ledgers at `9/6/4` and
+    `10/6/4`, passes all `293/293` executive gates, and exits on the guest sentinel. Temporary
+    registry/reply tracing used to identify the starvation defect was removed. The continuation and
+    lane-scheduling sub-boundary is accepted; do not reintroduce static worker priorities, polling
+    wakeups, or zero-live accounting gates.
+
+    Next resume B3's remaining mechanism debt: implement typed provider pointer/handle counts and
+    finalizer fences for Process, Thread, Token, Section, File, Device, and USER objects; then audit
+    production device/runtime publication for remaining one-boot fixture identities. Keep the
+    accepted continuation ledger and serialized desktop gate green through each slice.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

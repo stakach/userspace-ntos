@@ -317,11 +317,13 @@ pub(crate) unsafe fn replace_external_component_execution_lane(
 }
 
 static PROVIDER_WAIT_DISPATCH_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+static COMPONENT_WAIT_DISPATCH_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_PARKED_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_RESUMES: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_SUCCESSFUL_RESUMES: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_REARMS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_DISPATCH_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+static COMPONENT_WAIT_DISPATCH_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_DISPATCHER_LEASES_ACQUIRED: AtomicU64 = AtomicU64::new(0);
@@ -334,16 +336,19 @@ static WATCHDOG_RUNNABLE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
 pub(crate) struct ProviderWaitRuntimeStats {
     pub dispatch_admissions: u64,
+    pub component_dispatch_admissions: u64,
     pub parked_admissions: u64,
     pub resumes: u64,
     pub successful_resumes: u64,
     pub rearms: u64,
     pub dispatch_completions: u64,
+    pub component_dispatch_completions: u64,
     pub cancellations: u64,
     pub native_replies_abandoned: u64,
     pub dispatcher_leases_acquired: u64,
     pub dispatcher_leases_released: u64,
     pub active_continuations: usize,
+    pub active_component_continuations: usize,
     pub active_waiters: usize,
     pub active_dispatcher_leases: usize,
 }
@@ -360,11 +365,15 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
     unsafe {
         ProviderWaitRuntimeStats {
             dispatch_admissions: PROVIDER_WAIT_DISPATCH_ADMISSIONS.load(Ordering::Relaxed),
+            component_dispatch_admissions: COMPONENT_WAIT_DISPATCH_ADMISSIONS
+                .load(Ordering::Relaxed),
             parked_admissions: PROVIDER_WAIT_PARKED_ADMISSIONS.load(Ordering::Relaxed),
             resumes: PROVIDER_WAIT_RESUMES.load(Ordering::Relaxed),
             successful_resumes: PROVIDER_WAIT_SUCCESSFUL_RESUMES.load(Ordering::Relaxed),
             rearms: PROVIDER_WAIT_REARMS.load(Ordering::Relaxed),
             dispatch_completions: PROVIDER_WAIT_DISPATCH_COMPLETIONS.load(Ordering::Relaxed),
+            component_dispatch_completions: COMPONENT_WAIT_DISPATCH_COMPLETIONS
+                .load(Ordering::Relaxed),
             cancellations: PROVIDER_WAIT_CANCELLATIONS.load(Ordering::Relaxed),
             native_replies_abandoned: PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED
                 .load(Ordering::Relaxed),
@@ -379,6 +388,8 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
                     )
                 })
                 .count(),
+            active_component_continuations: (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                .total_suspensions(),
             active_waiters: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).len(),
             active_dispatcher_leases: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).lease_count(),
         }
@@ -1736,6 +1747,7 @@ unsafe fn component_suspension_resume_top(
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 }
+                COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 return Some(ComponentSuspensionRuntimeOutcome::Completed {
                     continuation: completed.continuation,
                     dispatch,
@@ -1756,6 +1768,7 @@ unsafe fn component_suspension_resume_top(
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 }
+                COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 return Some(ComponentSuspensionRuntimeOutcome::UserCallbackSuspended(
                     completed.continuation,
                 ));
@@ -1767,6 +1780,7 @@ unsafe fn component_suspension_resume_top(
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 }
+                COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 return Some(ComponentSuspensionRuntimeOutcome::Failed {
                     continuation: completed.continuation,
                     status,
@@ -1787,6 +1801,7 @@ unsafe fn component_suspension_resume_top(
                         )
                         .expect("invalid component re-wait lost its active continuation");
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                    COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ComponentSuspensionRuntimeOutcome::Failed {
                         continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
@@ -1805,6 +1820,7 @@ unsafe fn component_suspension_resume_top(
                                     ComponentSuspensionCompletion::provider(0xC000_009Au32 as i32),
                                 )
                                 .expect("LPC readiness reservation failure lost its continuation");
+                            COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                             return Some(ComponentSuspensionRuntimeOutcome::Failed {
                                 continuation: completed.continuation,
                                 status: 0xC000_009Au32 as i32,
@@ -1844,6 +1860,7 @@ unsafe fn component_suspension_resume_top(
                         )
                         .expect("rejected component re-wait lost its active continuation");
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                    COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ComponentSuspensionRuntimeOutcome::Failed {
                         continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
@@ -2074,6 +2091,7 @@ unsafe fn provider_wait_admit_retained(
         return false;
     }
     PROVIDER_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+    COMPONENT_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     match (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
         nt_handler,
         &pending.request,
@@ -2253,6 +2271,7 @@ unsafe fn lpc_wait_admit_retained(
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
     }
+    COMPONENT_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
     let _ = lpc_wait_begin_after_stack_admission(nt_handler, pending, key, reservation);
     true
 }
@@ -2399,8 +2418,7 @@ unsafe fn component_suspension_drain_ready(
         // A component-originated request bypasses ExecNtHandler's normal syscall post-action.
         // Redrive the ordinary broker waiters here so the server can accept the request before the
         // next recv. Reply selection is owned by the server's explicit native-reply/park barrier.
-        let _ = lpc_receive_wait_redrive_all(nt_handler);
-        let _ = lpc_request_wait_redrive_all(nt_handler);
+        let _ = lpc_endpoint_redrive_all(nt_handler);
     }
     drained
 }
@@ -12405,8 +12423,7 @@ pub(crate) unsafe fn service_sec_image(
                 // manager IRP for its File and requestor thread.
                 let _ = file_irp_drain_redrive_all(&mut nt_handler);
                 if nt_handler.lpc_endpoint_progress {
-                    let _ = lpc_receive_wait_redrive_all(&mut nt_handler);
-                    let _ = lpc_request_wait_redrive_all(&mut nt_handler);
+                    let _ = lpc_endpoint_redrive_all(&mut nt_handler);
                 }
                 if let Some(completion) = nt_handler.lpc_connect_completion.take() {
                     let _ = lpc_connect_wait_complete(&mut nt_handler, completion);
@@ -23705,6 +23722,16 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.current_badge = saved_badge;
     nt_handler.current_user_memory = saved_user_memory;
     woken
+}
+
+/// Drain broker progress into every typed LPC waiter. Producers that mutate the broker outside the
+/// ordinary native-syscall dispatch phase call this at the mutation boundary so a parked server or
+/// requester cannot remain asleep until an unrelated syscall happens to enter the service loop.
+pub(crate) unsafe fn lpc_endpoint_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    if !nt_handler.lpc_endpoint_progress {
+        return 0;
+    }
+    lpc_receive_wait_redrive_all(nt_handler) + lpc_request_wait_redrive_all(nt_handler)
 }
 
 unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
