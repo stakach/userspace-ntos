@@ -1156,6 +1156,10 @@ pub const W32_PS_LABEL: u64 = 0x77D;
 pub const W32_PS_OP_QUERY_PROCESS: u64 = 1;
 pub const W32_PS_OP_QUERY_THREAD: u64 = 2;
 pub const W32_PS_OP_SET_THREAD_PRIORITY: u64 = 3;
+pub const W32_PS_OP_LOOKUP_PROCESS: u64 = 4;
+pub const W32_PS_OP_LOOKUP_THREAD: u64 = 5;
+pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
+pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -2963,19 +2967,37 @@ extern "win64" fn s_zw_query_information_token(
 /// its runtime-owned EPROCESS body. Unknown non-zero PIDs remain visible as failure so callers do not
 /// silently attach to the wrong GUI process identity.
 extern "win64" fn s_ps_lookup_process_by_id(process_id: u64, process_out: *mut u64) -> i32 {
-    unsafe {
-        if process_id == 0 {
-            return 0xC000_000Bu32 as i32; // STATUS_INVALID_CID
-        }
-        let process = eprocess_for_pid(process_id);
-        if process == 0 {
-            return 0xC000_000Bu32 as i32; // STATUS_INVALID_CID
-        }
-        if !process_out.is_null() {
-            write_volatile(process_out, process);
-        }
+    if process_out.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
     }
-    0 // STATUS_SUCCESS
+    unsafe { write_volatile(process_out, 0) };
+    let (status, process, _, _) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_LOOKUP_PROCESS, process_id, 0) };
+    if status != 0 {
+        return status;
+    }
+    if process == 0 {
+        reject_ps_broker("process lookup returned a null object", STATUS_INVALID_HANDLE_I32);
+    }
+    unsafe { write_volatile(process_out, process) };
+    0
+}
+
+extern "win64" fn s_ps_lookup_thread_by_id(thread_id: u64, thread_out: *mut u64) -> i32 {
+    if thread_out.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe { write_volatile(thread_out, 0) };
+    let (status, thread, _, _) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_LOOKUP_THREAD, thread_id, 0) };
+    if status != 0 {
+        return status;
+    }
+    if thread == 0 {
+        reject_ps_broker("thread lookup returned a null object", STATUS_INVALID_HANDLE_I32);
+    }
+    unsafe { write_volatile(thread_out, thread) };
+    0
 }
 /// `PVOID PsGetCurrentProcessWin32Process()` — the selected client's process win32 slot.
 extern "win64" fn s_get_current_win32process() -> u64 {
@@ -3368,6 +3390,17 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
                 .expect("retained LPC object disappeared during reference") as u64
         };
     }
+    if unsafe {
+        process_context_index_for_eprocess(object).is_some()
+            || thread_context_index_for_ethread(object).is_some()
+    } {
+        let (status, references, _, _) =
+            unsafe { win32k_ps_broker_call(W32_PS_OP_RETAIN_POINTER, object, 0) };
+        if status != 0 {
+            reject_ps_broker("object pointer retain", status);
+        }
+        return references;
+    }
     if !provider_event_projection_contains(object) {
         return object;
     }
@@ -3401,6 +3434,17 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
                 .complete_final_release(object)
         });
         return 0;
+    }
+    if unsafe {
+        process_context_index_for_eprocess(object).is_some()
+            || thread_context_index_for_ethread(object).is_some()
+    } {
+        let (status, references, _, _) =
+            unsafe { win32k_ps_broker_call(W32_PS_OP_RELEASE_POINTER, object, 0) };
+        if status != 0 {
+            reject_ps_broker("object pointer release", status);
+        }
+        return references;
     }
     if !provider_event_projection_contains(object) {
         return 0;
@@ -13269,6 +13313,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "PsLookupProcessByProcessId",
         s_ps_lookup_process_by_id as usize as u64,
+    );
+    reg.bind(
+        "PsLookupThreadByThreadId",
+        s_ps_lookup_thread_by_id as usize as u64,
     );
     reg.bind(
         "PsGetProcessExitStatus",

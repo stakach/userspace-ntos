@@ -22236,6 +22236,8 @@ impl ExecNtHandler {
             });
             print_str(b" wait=");
             print_u64(blockers.process_wait_references as u64);
+            print_str(b" ptr-refs=");
+            print_u64(blockers.process_kernel_pointer_references as u64);
             print_str(b" debug=");
             print_u64(blockers.debug_port_present as u64);
             print_str(b" own-handles=");
@@ -22254,6 +22256,8 @@ impl ExecNtHandler {
             print_u64(blockers.missing_threads as u64);
             print_str(b" thread-wait=");
             print_u64(blockers.thread_wait_references as u64);
+            print_str(b" thread-ptr-refs=");
+            print_u64(blockers.thread_kernel_pointer_references as u64);
             print_str(b" term-ports=");
             print_u64(blockers.thread_termination_ports as u64);
             print_str(b" impersonations=");

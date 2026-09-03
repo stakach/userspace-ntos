@@ -24575,6 +24575,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     pointer references for `PsLookupThreadByThreadId`, then build generation-safe process attachment
     state with actual VSpace selection before binding the Ke attach/detach family.
 
+    B3 typed Ps pointer-reference tranche 5 (2026-09-04, host and freestanding green):
+    `PsLookupProcessByProcessId` and newly bound `PsLookupThreadByThreadId` now resolve CIDs through
+    the canonical Process Manager and acquire a checked kernel pointer reference before publishing
+    the stable EPROCESS/ETHREAD projection. Provider-side `ObReferenceObject` and
+    `ObDereferenceObject` route known Ps projections back through the same broker. Process and thread
+    pointer counts are overflow/underflow checked and now participate in aborted-creation cleanup,
+    dormant ETHREAD reuse, Process deletion readiness, and pending-deletion diagnostics. CID
+    truncation, unknown identities, stale projections, and duplicate release are rejected.
+
+    All 152 `nt-process` tests pass, including terminal objects held live by independent process and
+    thread pointer references. The freestanding executive release build succeeds with 244 warnings.
+    Forty-seven audited code imports remain. Token, Device, and other provider object kinds still
+    need equivalent typed reference routes before the permissive unknown-object tail can be deleted
+    from the general Ob trampolines; do not mistake Ps coverage for completion of that cleanup.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

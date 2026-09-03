@@ -4702,6 +4702,36 @@ pub(crate) unsafe fn service_win32k_ps_request(
             .set_kernel_thread_priority(object, value as u32 as i32)
             .map(|previous| (0, u64::from(previous as u32), 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_PS_OP_LOOKUP_PROCESS => {
+            let Ok(pid) = nt_process::ProcessId::try_from(object) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            handler
+                .pm
+                .lookup_kernel_process_by_id(pid)
+                .map(|(object, references)| (0, object, u64::from(references), 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_PS_OP_LOOKUP_THREAD => {
+            let Ok(tid) = nt_process::ThreadId::try_from(object) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            handler
+                .pm
+                .lookup_kernel_thread_by_id(tid)
+                .map(|(object, references)| (0, object, u64::from(references), 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_PS_OP_RETAIN_POINTER => handler
+            .pm
+            .retain_kernel_object_pointer(object)
+            .map(|references| (0, u64::from(references), 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_PS_OP_RELEASE_POINTER => handler
+            .pm
+            .release_kernel_object_pointer(object)
+            .map(|references| (0, u64::from(references), 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
     }
 }

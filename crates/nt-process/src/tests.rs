@@ -2011,7 +2011,18 @@ fn kernel_provider_state_uses_canonical_process_and_thread_objects() {
     );
     assert_eq!(pm.set_kernel_thread_priority(1, 10), Err(STATUS_INVALID_HANDLE));
 
+    assert_eq!(pm.lookup_kernel_process_by_id(pid), Ok((EPROCESS, 1)));
+    assert_eq!(pm.lookup_kernel_thread_by_id(tid), Ok((ETHREAD, 1)));
+    assert_eq!(pm.retain_kernel_object_pointer(EPROCESS), Ok(2));
+    assert_eq!(pm.retain_kernel_object_pointer(ETHREAD), Ok(2));
+    assert_eq!(pm.release_kernel_object_pointer(EPROCESS), Ok(1));
+    assert_eq!(pm.release_kernel_object_pointer(ETHREAD), Ok(1));
+
     pm.terminate_process(pid, 0xC000_0123).unwrap();
+    let blockers = pm.process_object_delete_blockers(pid).unwrap();
+    assert_eq!(blockers.process_kernel_pointer_references, 1);
+    assert_eq!(blockers.thread_kernel_pointer_references, 1);
+    assert!(!blockers.delete_ready());
     assert_eq!(
         pm.kernel_process_state(EPROCESS),
         Some(KernelProcessState {
@@ -2024,8 +2035,15 @@ fn kernel_provider_state_uses_canonical_process_and_thread_objects() {
     assert_eq!(thread.exit_status, 0xC000_0123);
     assert!(thread.terminating);
     assert!(thread.system_thread);
+    assert_eq!(pm.release_kernel_object_pointer(EPROCESS), Ok(0));
+    assert_eq!(pm.release_kernel_object_pointer(ETHREAD), Ok(0));
+    assert_eq!(
+        pm.release_kernel_object_pointer(ETHREAD),
+        Err(STATUS_INVALID_PARAMETER)
+    );
     assert_eq!(pm.kernel_process_state(1), None);
     assert_eq!(pm.kernel_thread_state(1), None);
+    assert_eq!(pm.retain_kernel_object_pointer(1), Err(STATUS_INVALID_HANDLE));
 }
 
 #[test]

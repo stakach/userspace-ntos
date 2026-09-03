@@ -631,6 +631,8 @@ pub struct NtProcess {
     pub exit_status: Option<u32>,
     /// Dispatcher references held by parked waits independently of user handles.
     wait_references: u32,
+    /// Kernel pointer references acquired through Ps/Ob independently of handles and waits.
+    kernel_pointer_references: u32,
     /// Stable primary-token identity. The external token store owns the object bytes and reference
     /// count; the process holds one reference while this slot is populated.
     primary_token: Option<TokenId>,
@@ -712,6 +714,7 @@ pub struct ProcessObjectDeletion {
 pub struct ProcessObjectDeleteBlockers {
     pub state: Option<ProcessState>,
     pub process_wait_references: u32,
+    pub process_kernel_pointer_references: u32,
     pub debug_port_present: bool,
     pub own_handle_slots: usize,
     pub external_process_handles: usize,
@@ -719,6 +722,7 @@ pub struct ProcessObjectDeleteBlockers {
     pub missing_threads: usize,
     pub live_threads: usize,
     pub thread_wait_references: u32,
+    pub thread_kernel_pointer_references: u32,
     pub thread_termination_ports: usize,
     pub thread_impersonations: usize,
     pub external_thread_handles: usize,
@@ -730,12 +734,14 @@ impl ProcessObjectDeleteBlockers {
     pub const fn delete_ready(self) -> bool {
         matches!(self.state, Some(ProcessState::Terminated))
             && self.process_wait_references == 0
+            && self.process_kernel_pointer_references == 0
             && !self.debug_port_present
             && self.own_handle_slots == 0
             && self.external_process_handles == 0
             && self.missing_threads == 0
             && self.live_threads == 0
             && self.thread_wait_references == 0
+            && self.thread_kernel_pointer_references == 0
             && self.thread_termination_ports == 0
             && self.external_thread_handles == 0
     }
@@ -919,6 +925,8 @@ pub struct NtThread {
     pub exit_status: Option<u32>,
     /// Dispatcher references held by parked waits independently of user handles.
     wait_references: u32,
+    /// Kernel pointer references acquired through Ps/Ob independently of handles and waits.
+    kernel_pointer_references: u32,
     pub create_time_100ns: i64,
     pub exit_time_100ns: i64,
     pub kernel_time_100ns: i64,
@@ -1211,6 +1219,7 @@ impl ProcessManager {
                 state,
                 exit_status: None,
                 wait_references: 0,
+                kernel_pointer_references: 0,
                 primary_token: None,
                 win32_process: None,
                 kernel_process_object: None,
@@ -1350,12 +1359,15 @@ impl ProcessManager {
         let Some(process) = self.processes.get(&pid) else {
             return None;
         };
-        if process.handles.iter().any(|slot| !slot.is_free()) {
+        if process.kernel_pointer_references != 0
+            || process.handles.iter().any(|slot| !slot.is_free())
+        {
             return None;
         }
         for tid in &process.threads {
             let thread = self.threads.get(tid)?;
             if thread.wait_references != 0
+                || thread.kernel_pointer_references != 0
                 || !thread.termination_ports.is_empty()
                 || thread.impersonation.is_some()
             {
@@ -1980,6 +1992,7 @@ impl ProcessManager {
                 is_system_thread,
                 exit_status: None,
                 wait_references: 0,
+                kernel_pointer_references: 0,
                 create_time_100ns: 0,
                 exit_time_100ns: 0,
                 kernel_time_100ns: 0,
@@ -2113,6 +2126,25 @@ impl ProcessManager {
         })
     }
 
+    /// Acquire a kernel pointer reference by CID and return the stable EPROCESS projection.
+    pub fn lookup_kernel_process_by_id(
+        &mut self,
+        pid: ProcessId,
+    ) -> Result<(u64, u32), u32> {
+        let process = self
+            .processes
+            .get_mut(&pid)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let object = process
+            .kernel_process_object
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        process.kernel_pointer_references = process
+            .kernel_pointer_references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok((object, process.kernel_pointer_references))
+    }
+
     /// `PsSetProcessWin32Process`: park win32k's `W32PROCESS` pointer on `pid`.
     /// Returns `false` for an unknown process.
     pub fn set_process_win32(&mut self, pid: ProcessId, win32process: u64) -> bool {
@@ -2218,6 +2250,67 @@ impl ProcessManager {
             freeze_count: thread.freeze_count,
             priority: thread.priority,
         })
+    }
+
+    /// Acquire a kernel pointer reference by CID and return the stable ETHREAD projection.
+    pub fn lookup_kernel_thread_by_id(
+        &mut self,
+        tid: ThreadId,
+    ) -> Result<(u64, u32), u32> {
+        let thread = self
+            .threads
+            .get_mut(&tid)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let object = thread
+            .kernel_thread_object
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        thread.kernel_pointer_references = thread
+            .kernel_pointer_references
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok((object, thread.kernel_pointer_references))
+    }
+
+    /// Acquire an additional Ps/Ob pointer reference to a known EPROCESS or ETHREAD projection.
+    pub fn retain_kernel_object_pointer(&mut self, object: u64) -> Result<u32, u32> {
+        if let Some(pid) = self.pid_for_kernel_process_object(object) {
+            return self
+                .lookup_kernel_process_by_id(pid)
+                .map(|(_, references)| references);
+        }
+        if let Some(tid) = self.tid_for_kernel_thread_object(object) {
+            return self
+                .lookup_kernel_thread_by_id(tid)
+                .map(|(_, references)| references);
+        }
+        Err(STATUS_INVALID_HANDLE)
+    }
+
+    /// Release one Ps/Ob pointer reference from a known EPROCESS or ETHREAD projection.
+    pub fn release_kernel_object_pointer(&mut self, object: u64) -> Result<u32, u32> {
+        if let Some(pid) = self.pid_for_kernel_process_object(object) {
+            let process = self
+                .processes
+                .get_mut(&pid)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            process.kernel_pointer_references = process
+                .kernel_pointer_references
+                .checked_sub(1)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            return Ok(process.kernel_pointer_references);
+        }
+        if let Some(tid) = self.tid_for_kernel_thread_object(object) {
+            let thread = self
+                .threads
+                .get_mut(&tid)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            thread.kernel_pointer_references = thread
+                .kernel_pointer_references
+                .checked_sub(1)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            return Ok(thread.kernel_pointer_references);
+        }
+        Err(STATUS_INVALID_HANDLE)
     }
 
     /// Set `KTHREAD.Priority` through a stable `ETHREAD` projection and return its previous value.
@@ -2915,6 +3008,7 @@ impl ProcessManager {
         self.thread(tid).is_some_and(|thread| {
             thread.state == ThreadState::Terminated
                 && thread.wait_references == 0
+                && thread.kernel_pointer_references == 0
                 && thread.termination_ports.is_empty()
                 && thread.impersonation.is_none()
                 && thread.win32_thread.is_none()
@@ -2956,6 +3050,7 @@ impl ProcessManager {
         let reusable = match thread.state {
             ThreadState::Initialized => {
                 thread.wait_references == 0
+                    && thread.kernel_pointer_references == 0
                     && thread.termination_ports.is_empty()
                     && thread.impersonation.is_none()
                     && thread.user_apc_queue.is_empty()
@@ -3017,6 +3112,7 @@ impl ProcessManager {
         let reusable = match current.state {
             ThreadState::Initialized => {
                 current.wait_references == 0
+                    && current.kernel_pointer_references == 0
                     && current.termination_ports.is_empty()
                     && current.impersonation.is_none()
                     && current.user_apc_queue.is_empty()
@@ -3653,6 +3749,7 @@ impl ProcessManager {
         let mut blockers = ProcessObjectDeleteBlockers {
             state: Some(process.state),
             process_wait_references: process.wait_references,
+            process_kernel_pointer_references: process.kernel_pointer_references,
             debug_port_present: process.debug_port.is_some(),
             own_handle_slots: process
                 .handles
@@ -3697,6 +3794,9 @@ impl ProcessManager {
             blockers.thread_wait_references = blockers
                 .thread_wait_references
                 .saturating_add(thread.wait_references);
+            blockers.thread_kernel_pointer_references = blockers
+                .thread_kernel_pointer_references
+                .saturating_add(thread.kernel_pointer_references);
             blockers.thread_termination_ports = blockers
                 .thread_termination_ports
                 .saturating_add(thread.termination_ports.len());
