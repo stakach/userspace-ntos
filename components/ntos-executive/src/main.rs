@@ -21845,17 +21845,6 @@ fn hosted_pci_dma_domain(device: &nt_pnp::PciDevice) -> u64 {
     1 + hosted_pci_request_id(device)
 }
 
-fn hosted_pci_device_by_location<'a>(
-    devices: &'a [nt_pnp::PciDevice],
-    bus: u8,
-    dev: u8,
-    func: u8,
-) -> Option<&'a nt_pnp::PciDevice> {
-    devices
-        .iter()
-        .find(|device| device.bus == bus && device.dev == dev && device.func == func)
-}
-
 unsafe fn allocate_hosted_pci_dma_grant(
     pages: u64,
     logical: u64,
@@ -30466,9 +30455,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
     let mut found_storage = false;
     let (mut storage_bar5, mut storage_irq) = (0u32, 0u32);
     let (mut storage_bus, mut storage_dev, mut storage_func) = (0u8, 0u8, 0u8);
-    let mut network_device_count = 0u64;
-    let (mut pre_hive_nic_irq, mut pre_hive_nic_bus, mut pre_hive_nic_dev, mut pre_hive_nic_func) =
-        (0u32, 0u8, 0u8, 0u8);
     for d in &pci_devices {
         count += 1;
         let (bus, dev, func) = (d.bus, d.dev, d.func);
@@ -30501,17 +30487,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             storage_dev = dev;
             storage_func = func;
         }
-        // Pre-hive bootstrap can only pick a network function when the bus has one candidate.
-        // Once multiple NICs are present, the later registry-devnode path owns selection.
-        if d.base_class() == nt_pnp::PCI_CLASS_NETWORK {
-            network_device_count = network_device_count.saturating_add(1);
-            if network_device_count == 1 {
-                pre_hive_nic_irq = irq;
-                pre_hive_nic_bus = bus;
-                pre_hive_nic_dev = dev;
-                pre_hive_nic_func = func;
-            }
-        }
     }
     print_str(b"[ntos-exec] PCI functions in configured hierarchy = ");
     print_u64(count);
@@ -30530,97 +30505,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" (a real device to hand an isolated driver host)\n");
     }
 
-    // Register a pre-storage PCI grant only when the pre-hive bus scan has exactly one network
-    // function. This runs before AHCI so the first VT-d device context is installed without
-    // depending on the storage host, but it does not drive e1000 registers directly. Multiple NICs
-    // are deliberately deferred to the later registry-selected launch-plan discovery; class-code
-    // selection cannot know which devnode/service owns the grant.
-    let mut hosted_pci_hardware_grants = Vec::new();
-    let mut hosted_pci_existing_grants = 0u64;
-    let mut hosted_pci_existing_grant_failures = 0u64;
-    let mut hosted_pci_dma_grants = 0u64;
-    let mut hosted_pci_dma_grant_failures = 0u64;
-    let pre_hive_network_grant_required = network_device_count == 1;
-    if network_device_count > 1 {
-        print_str(b"[driver-launch] pre-storage hosted PCI grant deferred: network-candidates=");
-        print_u64(network_device_count);
-        print_str(b" (registry devnode selection required)\n");
-    }
-    if pre_hive_network_grant_required {
-        if let Some(device) = hosted_pci_device_by_location(
-            &pci_devices,
-            pre_hive_nic_bus,
-            pre_hive_nic_dev,
-            pre_hive_nic_func,
-        ) {
-            if let Some(memory) = claim_hosted_pci_memory_grants(bi, device) {
-                print_str(b"[driver-launch] pre-storage hosted PCI grant bus=");
-                print_u64(pre_hive_nic_bus as u64);
-                print_str(b" dev=");
-                print_u64(pre_hive_nic_dev as u64);
-                print_str(b" func=");
-                print_u64(pre_hive_nic_func as u64);
-                print_str(b" memory-bars=");
-                print_u64(memory.len() as u64);
-                print_str(b" (irq ");
-                print_u64(pre_hive_nic_irq as u64);
-                print_str(b")\n");
-                let (dma_grant, dma_iommu) = allocate_mapped_hosted_pci_dma_grant(device);
-                print_str(b"[driver-launch] pre-storage hosted PCI DMA mint=");
-                print_u64(dma_iommu.mint_err);
-                print_str(b" iopt=");
-                print_u64(dma_iommu.iopt_err);
-                print_str(b" map=");
-                print_u64(dma_iommu.map_io_err);
-                print_str(b"\n");
-                if let Some(dma_grant) = dma_grant {
-                    hosted_pci_dma_grants += 1;
-                    if let Some(grant) =
-                        HostedPciHardwareGrant::for_device(device, memory, Some(dma_grant))
-                    {
-                        hosted_pci_hardware_grants.push(grant);
-                        hosted_pci_existing_grants += 1;
-                    } else {
-                        hosted_pci_existing_grant_failures += 1;
-                    }
-                } else {
-                    hosted_pci_dma_grant_failures += 1;
-                    hosted_pci_existing_grant_failures += 1;
-                }
-            } else {
-                hosted_pci_existing_grant_failures += 1;
-            }
-        } else {
-            hosted_pci_existing_grant_failures += 1;
-        }
-    }
-    print_str(b"[driver-launch] hosted existing PCI grant registration count=");
-    print_u64(hosted_pci_existing_grants);
-    print_str(b" failures=");
-    print_u64(hosted_pci_existing_grant_failures);
-    print_str(b" dma=");
-    print_u64(hosted_pci_dma_grants);
-    print_str(b" dma-failures=");
-    print_u64(hosted_pci_dma_grant_failures);
-    print_str(b"\n");
-    check(
-        b"exec_hosted_pci_existing_grant_brokered",
-        !pre_hive_network_grant_required
-            || (hosted_pci_existing_grants != 0 && hosted_pci_existing_grant_failures == 0),
-        &mut passed,
-    );
-    check(
-        b"exec_hosted_pci_dma_grant_iommu_brokered",
-        !pre_hive_network_grant_required
-            || (hosted_pci_dma_grants != 0 && hosted_pci_dma_grant_failures == 0),
-        &mut passed,
-    );
     // --- P2: real block I/O in an ISOLATED host with VT-d-CONFINED DMA. The executive is the
     // Tier-1 broker: it enables Bus Master, claims the AHCI BAR + a DMA frame, gives the AHCI
     // its OWN VT-d IO context (the DMA frame mapped at an IOVA — the device can reach NOTHING
     // else), and hands the isolated storage host only those caps. The host drives the disk
-    // from its own VSpace, addressing memory by IOVA. Runs AFTER the pre-storage PCI grant
-    // registration so VT-d translation is already ON; the AHCI just adds its own context. READ ONLY.
+    // from its own VSpace, addressing memory by IOVA. Installing the AHCI IOPT root enables VT-d
+    // translation lazily; later PnP-selected devices receive their own contexts. READ ONLY.
     if found_storage {
         let ahci_bar = (storage_bar5 & 0xFFFF_FFF0) as u64;
         print_str(b"[ntos-exec] P2: AHCI ABAR=");
@@ -32319,6 +32209,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         scm_service_selection.demand_driver_ready(),
         &mut passed,
     );
+    let mut hosted_pci_hardware_grants = Vec::new();
     let hosted_pci_grant_discovery = discover_hosted_pci_hardware_grants_for_launch_plans(
         bi,
         &pci_devices,

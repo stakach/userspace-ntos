@@ -2786,10 +2786,9 @@ than add ACPI service-name handling.
 - `[~]` B3: Bind PnP devnodes to driver services from registry `Enum`/`Services` data and let
   drivers create device objects/interfaces through I/O Manager mechanisms. The reusable PnP broker
   no longer exposes the old class-code driver binding helper; PCI resource selection for hosted
-  drivers now uses registry devnode ID matching. The only remaining class-code scan is the local
-  pre-hive bootstrap grant used before storage hives are available, and that path grants only when
-  exactly one network-class function exists; multiple NICs defer selection to the later
-  registry-devnode path. The display stack now uses the registry-selected hosted
+  drivers now uses registry devnode ID matching. The pre-hive network-class grant has also been
+  removed: selected devices receive MMIO and IOMMU-confined DMA only after registry/devnode
+  correlation. The display stack now uses the registry-selected hosted
   `bochsmp.sys`/`framebuf.dll` route for `\Device\Video<N>` publication, DeviceMap metadata, direct
   win32k `EngDeviceIoControl` routing, resource-shaped Bochs VRAM reporting, and
   caller-address-space framebuffer mapping through the hosted `VideoPortMapMemory` path. The old
@@ -23400,6 +23399,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hardware IRQ/DPC, rejected-delivery, and final gate counters remain. This closes the B3 physical
     ISR/DPC/provider-arena cutover. Continue B3 at the broader repeated driver/device and remaining
     synthetic identity cleanup already tracked above; do not retain packet-specific proof code.
+
+    B3 pre-hive NIC identity removal (2026-09-03, implementation complete; runtime pending): the
+    executive no longer counts network-class PCI functions, chooses a singleton NIC, claims its
+    BARs before Configuration Manager exists, or carries that anonymous grant into later discovery.
+    The isolated AHCI bootstrap maps its own IOPT root, which is the microkernel operation that
+    enables VT-d translation lazily. After hives and service launch plans exist, the generic
+    registry/devnode discovery path now starts with an empty grant set and claims every selected
+    device by exact PCI identity, including a separate IOMMU context when its hardware contract
+    requires DMA. The two historical pre-hive grant gates have been deleted; the existing
+    `exec_hosted_pci_grants_discovered_from_registry` gate remains the single production authority.
+    Validate with a serialized desktop boot that reports both selected PCI devnodes as newly
+    claimed, one DMA grant for the NIC, no missing or failed grants, live E1000 IRQ/DPC/receive, and
+    genuine Explorer paint.
 
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
