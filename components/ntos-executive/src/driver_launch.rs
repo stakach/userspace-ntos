@@ -52386,23 +52386,25 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         Ok(description) => description,
         Err(_) => return (STATUS_INVALID_PARAMETER, 0, 0),
     };
-    let (instance_index, inst, device_id) =
+    let (instance_index, inst, pdo_device_id) =
         match authenticated_hosted_pdo(ch, pdo_object, active_reply_cap) {
             Ok(authenticated) => authenticated,
             Err(status) => return (status.raw(), 0, 0),
         };
-    let Some(binding) = hosted_device_binding_by_device_id(device_id.raw()) else {
-        return (STATUS_INVALID_DEVICE_REQUEST, 0, 0);
+    let binding = match current_hosted_device_dispatch_binding_for_projection(instance_index) {
+        Ok(binding) => binding,
+        Err(_) => return (STATUS_INVALID_DEVICE_REQUEST, 0, 0),
     };
     if !binding.used
         || binding.projection_instance != instance_index
         || instance_domain_identity(inst) != Some(binding.projection_domain)
+        || binding.pdo_device_id != pdo_device_id.raw()
         || binding.pdo_object != pdo_object
         || ch.shared_va != inst.exec_shared_va
     {
         return (STATUS_ACCESS_DENIED, 0, 0);
     }
-    let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(device_id.raw()) }) else {
+    let Some(state) = (unsafe { hosted_device_resource_state_by_device_id(binding.device_id) }) else {
         return (STATUS_DEVICE_NOT_READY, 0, 0);
     };
     let Some(context_lease) = state.pnp_context_lease else {
