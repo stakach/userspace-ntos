@@ -228,6 +228,16 @@ impl ProviderAllocationCatalog {
         &mut self,
         identity: ProviderAllocationIdentity,
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
+        let snapshot = self.validate_retirement(identity)?;
+        let slot = self.slot(identity)?;
+        self.records[slot].live = false;
+        Ok(snapshot)
+    }
+
+    pub fn validate_retirement(
+        &self,
+        identity: ProviderAllocationIdentity,
+    ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
         let slot = self.slot(identity)?;
         let retiring = self.records[slot];
         if self.records.iter().enumerate().any(|(index, record)| {
@@ -238,9 +248,7 @@ impl ProviderAllocationCatalog {
         }) {
             return Err(ProviderAllocationError::ContainsLiveAllocations);
         }
-        let snapshot = retiring.snapshot(slot)?;
-        self.records[slot].live = false;
-        Ok(snapshot)
+        retiring.snapshot(slot)
     }
 
     fn slot(&self, identity: ProviderAllocationIdentity) -> Result<usize, ProviderAllocationError> {

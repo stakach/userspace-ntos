@@ -23777,6 +23777,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     catalog, retire embedded Events before allocator metadata changes, and only then restore the
     canonical local Event cutover.
 
+    Session/desktop heap allocation hook checkpoint (2026-09-03, host/freestanding green): every
+    successful root session-heap or nested `RtlAllocateHeap` allocation now registers its exact
+    arena/allocation generation before the pointer is returned. Hosted USER/desktop heap creation
+    is accepted only over a catalogued live outer allocation and mints a new arena identity for the
+    heap incarnation; `hosted_heap_bounds` rejects unregistered or stale heap headers. Free
+    preflights both the allocator header and catalog retirement, refuses an outer free while child
+    allocations remain, then retires the exact allocation and hosted-arena row after allocator
+    mutation succeeds. Moving realloc keeps both identities live during copy and rolls the new
+    allocation back if retiring the old one fails. The freestanding executive remains at the
+    213-warning baseline. Next apply the same ownership boundary to provider-pool and FTYP
+    allocations, add Event-aware pre-free/move fencing, and run the serialized desktop gate before
+    enabling Event publication.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

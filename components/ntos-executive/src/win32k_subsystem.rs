@@ -130,6 +130,20 @@ const WIN32K_ETHREAD_BYTES: u64 = 0x400;
 /// desktop heaps then allocate inside their own section views, using the same block allocator.
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
+const PROVIDER_ARENA_ROOT_HEAP_ID: u64 = 1;
+const PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID: u64 = 4;
+static PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID: AtomicU64 =
+    AtomicU64::new(PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID);
+static mut WIN32K_PROVIDER_ALLOCATIONS: Option<nt_provider_wait::ProviderAllocationCatalog> = None;
+static mut WIN32K_HOSTED_HEAP_ARENAS: Option<Vec<HostedHeapArena>> = None;
+
+#[derive(Clone, Copy)]
+struct HostedHeapArena {
+    base: u64,
+    bytes: u64,
+    identity: nt_provider_wait::ProviderArenaIdentity,
+    backing: nt_provider_wait::ProviderAllocationIdentity,
+}
 const _: () = assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_POOL_VADDR);
 const _: () = assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
 /// Shared handoff page (executive ↔ host). Within the pool's 2 MiB PT window (0x0700..0x0720).
@@ -412,6 +426,121 @@ fn registered_provider_wait_domain() -> Option<nt_provider_wait::ProviderDomainI
         )
         .identity()
     }
+}
+
+fn root_heap_arena_identity() -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    registered_provider_wait_domain().map(|provider| nt_provider_wait::ProviderArenaIdentity {
+        id: PROVIDER_ARENA_ROOT_HEAP_ID,
+        generation: provider.generation,
+    })
+}
+
+unsafe fn initialize_provider_allocation_tracking() -> bool {
+    if registered_provider_wait_domain().is_none()
+        || (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).is_some()
+        || (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).is_some()
+    {
+        return false;
+    }
+    *core::ptr::addr_of_mut!(WIN32K_PROVIDER_ALLOCATIONS) =
+        Some(nt_provider_wait::ProviderAllocationCatalog::new());
+    *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS) = Some(Vec::new());
+    PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID
+        .store(PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID, Ordering::Relaxed);
+    true
+}
+
+unsafe fn provider_allocations_mut(
+) -> Option<&'static mut nt_provider_wait::ProviderAllocationCatalog> {
+    (&mut *core::ptr::addr_of_mut!(WIN32K_PROVIDER_ALLOCATIONS)).as_mut()
+}
+
+unsafe fn provider_heap_arena_identity(
+    arena_base: u64,
+) -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    if arena_base == WIN32K_HEAP_VADDR {
+        return root_heap_arena_identity();
+    }
+    (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
+        .as_ref()?
+        .iter()
+        .find(|arena| arena.base == arena_base)
+        .map(|arena| arena.identity)
+}
+
+fn mint_hosted_heap_arena_identity() -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    let generation = registered_provider_wait_domain()?.generation;
+    loop {
+        let id = PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID.load(Ordering::Relaxed);
+        let next = id.checked_add(1)?;
+        if PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID
+            .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(nt_provider_wait::ProviderArenaIdentity { id, generation });
+        }
+    }
+}
+
+unsafe fn register_hosted_heap_arena(base: u64, bytes: u64) -> bool {
+    let Some(root) = root_heap_arena_identity() else {
+        return false;
+    };
+    let Some(allocations) = provider_allocations_mut() else {
+        return false;
+    };
+    let Ok(backing) = allocations.exact(root, base) else {
+        return false;
+    };
+    if backing.capacity < bytes {
+        return false;
+    }
+    let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() else {
+        return false;
+    };
+    if let Some(existing) = arenas.iter().find(|arena| arena.base == base) {
+        return existing.bytes == bytes && existing.backing == backing.identity;
+    }
+    if arenas.try_reserve(1).is_err() {
+        return false;
+    }
+    let Some(identity) = mint_hosted_heap_arena_identity() else {
+        return false;
+    };
+    arenas.push(HostedHeapArena {
+        base,
+        bytes,
+        identity,
+        backing: backing.identity,
+    });
+    true
+}
+
+unsafe fn hosted_heap_arena_backed_by(
+    backing: nt_provider_wait::ProviderAllocationIdentity,
+) -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS))
+        .as_ref()?
+        .iter()
+        .find(|arena| arena.backing == backing)
+        .map(|arena| arena.identity)
+}
+
+unsafe fn retire_hosted_heap_arena(
+    identity: nt_provider_wait::ProviderArenaIdentity,
+    backing: nt_provider_wait::ProviderAllocationIdentity,
+) -> bool {
+    let Some(arenas) = (&mut *core::ptr::addr_of_mut!(WIN32K_HOSTED_HEAP_ARENAS)).as_mut() else {
+        return false;
+    };
+    let Some(index) = arenas
+        .iter()
+        .position(|arena| arena.identity == identity && arena.backing == backing)
+    else {
+        return false;
+    };
+    arenas.swap_remove(index);
+    true
 }
 
 pub fn registered_win32k_callouts() -> Option<nt_process::Win32Callouts> {
@@ -4319,7 +4448,7 @@ const HEAP_REALLOC_IN_PLACE_ONLY: u64 = 0x0000_0010;
 
 /// Allocate from a hosted heap arena. The block header stores the aligned payload capacity; free
 /// blocks use the second header word as a next pointer, and live blocks carry a marker.
-unsafe fn heap_alloc_in(
+unsafe fn heap_alloc_in_raw(
     arena_base: u64,
     arena_bytes: u64,
     size: u64,
@@ -4393,6 +4522,34 @@ unsafe fn heap_alloc_in(
     payload
 }
 
+unsafe fn heap_alloc_in(
+    arena_base: u64,
+    arena_bytes: u64,
+    size: u64,
+    zero: bool,
+    label: &[u8],
+) -> u64 {
+    let Some(arena) = provider_heap_arena_identity(arena_base) else {
+        return 0;
+    };
+    let payload = heap_alloc_in_raw(arena_base, arena_bytes, size, zero, label);
+    if payload == 0 {
+        return 0;
+    }
+    let Some(capacity) = heap_block_capacity_in(arena_base, arena_bytes, payload) else {
+        return 0;
+    };
+    let registered = provider_allocations_mut()
+        .and_then(|allocations| allocations.register(arena, payload, capacity).ok())
+        .is_some();
+    if registered {
+        payload
+    } else {
+        let _ = heap_free_in_raw(arena_base, arena_bytes, payload);
+        0
+    }
+}
+
 unsafe fn heap_block_capacity_in(arena_base: u64, arena_bytes: u64, p: u64) -> Option<u64> {
     let arena_start = arena_base + POOL_DATA_OFF;
     let arena_end = arena_base + arena_bytes;
@@ -4411,7 +4568,7 @@ unsafe fn heap_block_capacity_in(arena_base: u64, arena_bytes: u64, p: u64) -> O
     Some(cap)
 }
 
-unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
+unsafe fn heap_free_in_raw(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     let Some(cap) = heap_block_capacity_in(arena_base, arena_bytes, p) else {
         return false;
     };
@@ -4482,6 +4639,33 @@ unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     true
 }
 
+unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
+    let Some(arena) = provider_heap_arena_identity(arena_base) else {
+        return false;
+    };
+    let Some(allocations) = provider_allocations_mut() else {
+        return false;
+    };
+    let Ok(allocation) = allocations.exact(arena, p) else {
+        return false;
+    };
+    if heap_block_capacity_in(arena_base, arena_bytes, p) != Some(allocation.capacity)
+        || allocations
+            .validate_retirement(allocation.identity)
+            .is_err()
+    {
+        return false;
+    }
+    let nested_arena = hosted_heap_arena_backed_by(allocation.identity);
+    if !heap_free_in_raw(arena_base, arena_bytes, p) {
+        return false;
+    }
+    if allocations.retire(allocation.identity).is_err() {
+        return false;
+    }
+    nested_arena.is_none_or(|identity| retire_hosted_heap_arena(identity, allocation.identity))
+}
+
 unsafe fn heap_realloc_in(
     arena_base: u64,
     arena_bytes: u64,
@@ -4528,8 +4712,12 @@ unsafe fn heap_realloc_in(
         newp as *mut u8,
         core::cmp::min(old_cap, size) as usize,
     );
-    heap_free_in(arena_base, arena_bytes, p);
-    newp
+    if heap_free_in(arena_base, arena_bytes, p) {
+        newp
+    } else {
+        let _ = heap_free_in(arena_base, arena_bytes, newp);
+        0
+    }
 }
 
 unsafe fn heap_alloc(size: u64, zero: bool) -> u64 {
@@ -4556,6 +4744,7 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
         || base.checked_add(reserve_size).is_none_or(|end| end > arena_end)
         || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, base)
             .is_none_or(|capacity| capacity < reserve_size)
+        || !register_hosted_heap_arena(base, reserve_size)
     {
         return 0;
     }
@@ -4588,6 +4777,13 @@ unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
         || heap.checked_add(size).is_none_or(|end| end > arena_end)
         || heap_block_capacity_in(WIN32K_HEAP_VADDR, arena_bytes, heap)
             .is_none_or(|capacity| capacity < size)
+    {
+        return None;
+    }
+    let arenas = (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).as_ref()?;
+    if !arenas
+        .iter()
+        .any(|arena| arena.base == heap && arena.bytes == size)
     {
         return None;
     }
@@ -11902,6 +12098,10 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
     }
     if registered_provider_wait_domain().is_none() {
         print_str(b"[win32k-host] ERROR: provider wait domain is not published\n");
+        park();
+    }
+    if !initialize_provider_allocation_tracking() {
+        print_str(b"[win32k-host] ERROR: provider allocation tracking initialization failed\n");
         park();
     }
     // NOW RUNS ON THE SHARED HARNESS (Phase B, Step 4b). The DriverEntry preamble (build DRIVER_OBJECT
