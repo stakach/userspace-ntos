@@ -23462,8 +23462,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     at the established 213-warning baseline. Next use this codec directly in the component/root
     call pair.
 
-    B3 dynamic `IoGetDmaAdapter` cutover (2026-09-03, host and freestanding green; runtime
-    acceptance pending): hosted PCI discovery now publishes only registry-selected bus resources.
+    B3 dynamic `IoGetDmaAdapter` cutover (2026-09-03, accepted): hosted PCI discovery now publishes
+    only registry-selected bus resources.
     The class-code `hosted_pci_driver_needs_dma` policy, eager DMA/IOMMU allocator, START-time DMA
     projection, and their discovery counters have been deleted. The component snapshots and parses
     the caller's real NT5 `DEVICE_DESCRIPTION`, sends its canonical request plus PDO over dedicated
@@ -23501,8 +23501,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     overlap, and the device address-width ceiling without applying the transfer cap. Transfer
     mappings remain capped. All 29 focused DMA-manager tests pass, including a larger common buffer
     on an adapter with a 1514-byte transfer maximum, and the freestanding executive remains green.
-    Rerun serialized acceptance after repairing the remaining exact PnP continuation and projected
-    NDIS buffer ownership; do not turn either failure into success evidence or retain a fallback.
+    B3 dynamic DMA acceptance checkpoint (2026-09-03, complete): serialized run
+    `.tmp/run-desktop-20260903-112845.log` obtains the E1000 adapter and DMA aperture only through
+    the authenticated `IoGetDmaAdapter` request, completes its forwarded START IRP through the real
+    two-stage NDIS completion contract, services physical IRQ/DPC and TCP/IP traffic, and reports
+    zero pool double frees. Explorer paints all 786432 framebuffer pixels with at least 32 colours;
+    the run completes `293/293` in about 117 guest seconds and exits through the sentinel. The
+    temporary START-IRP trace was removed after proving the first completion stops at
+    `STATUS_MORE_PROCESSING_REQUIRED` and the post-initialize completion reaches terminal ownership.
+
+    Review adjustment: the passing boot does not make the hosted NDIS buffer lifetime canonical.
+    ReactOS implements `NdisFreeBuffer` as `IoFreeMdl`, while the current bridge retains a
+    provider/dependent MDL projection record past the dependent free and stores private registry
+    identity in the public `MDL.Next` chain field. Implement an authenticated hosted `IoFreeMdl`
+    broker that resolves the exact dependent domain and MDL projection, retires provider and
+    dependent ownership exactly once, and replace `MDL.Next` identity with a side table keyed by
+    authenticated owner plus MDL address. Address reuse, stale generations, and duplicate frees
+    must fail without freeing a new allocation. Delete the local-only lifetime path in the cutover.
 
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
