@@ -4165,6 +4165,7 @@ impl ExecNtHandler {
         write_field!(lpc_connect_completion, None);
         write_field!(lpc_request_park, None);
         write_field!(lpc_endpoint_progress, false);
+        write_field!(lpc_reply_published, false);
         write_field!(lpc_connection_views, alloc::vec::Vec::with_capacity(32));
         write_field!(lpc_connections, alloc::vec::Vec::with_capacity(16));
         write_field!(pm, pm);
@@ -31434,6 +31435,7 @@ impl ExecNtHandler {
         match lpc.reply_port(args[0], &message) {
             Ok(()) => {
                 self.lpc_endpoint_progress = true;
+                self.lpc_reply_published = true;
                 self.set_current_thread_lpc_server_context(0, 0);
                 nt_syscall::STATUS_SUCCESS
             }
@@ -31756,6 +31758,7 @@ impl ExecNtHandler {
         match lpc.reply_wait_receive_with_reply(port_handle, &reply) {
             Ok(received) => {
                 self.lpc_endpoint_progress |= !reply.is_empty();
+                self.lpc_reply_published |= !reply.is_empty();
                 crate::service_sec_image::lpc_receive_wait_cancel_reservation(reservation);
                 if let Err(status) = self.lpc_publish_received_message(
                     self.pi,
@@ -31769,6 +31772,7 @@ impl ExecNtHandler {
             }
             Err(status) if status.raw() as u32 == STATUS_PENDING => {
                 self.lpc_endpoint_progress |= !reply.is_empty();
+                self.lpc_reply_published |= !reply.is_empty();
                 if !reply.is_empty() {
                     self.set_current_thread_lpc_server_context(0, 0);
                 }

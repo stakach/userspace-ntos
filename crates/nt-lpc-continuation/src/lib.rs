@@ -427,6 +427,15 @@ impl<C> BrokerRequestWaitTable<C> {
         self.inner.is_empty()
     }
 
+    /// Whether a committed broker reply needs inspection after the current native reply.
+    ///
+    /// The server's native syscall must observe its result before the retained component client can
+    /// resume. Conversely, an idle system cannot depend on an unrelated future endpoint event to
+    /// discover that reply. This predicate keeps the barrier conditional on exact retained ownership.
+    pub fn requires_post_reply_inspection(&self, reply_published: bool) -> bool {
+        reply_published && !self.is_empty()
+    }
+
     pub fn slot_count(&self) -> usize {
         self.inner.slot_count()
     }
@@ -828,6 +837,21 @@ mod tests {
         assert_eq!(table.publish(current, broker_request(8, 2)), Ok(0));
         assert_eq!(table.get(0).unwrap().continuation, 2);
         assert_eq!(table.take(0).unwrap().identity.message_id, 8);
+    }
+
+    #[test]
+    fn broker_request_requires_post_reply_inspection_only_for_owned_reply() {
+        let mut table = BrokerRequestWaitTable::new();
+        assert!(!table.requires_post_reply_inspection(false));
+        assert!(!table.requires_post_reply_inspection(true));
+
+        let reservation = table.reserve().unwrap();
+        table.publish(reservation, broker_request(8, 2)).unwrap();
+        assert!(!table.requires_post_reply_inspection(false));
+        assert!(table.requires_post_reply_inspection(true));
+
+        assert_eq!(table.take(0).unwrap().identity.message_id, 8);
+        assert!(!table.requires_post_reply_inspection(true));
     }
 
     #[test]

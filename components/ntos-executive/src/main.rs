@@ -24414,10 +24414,13 @@ struct ExecNtHandler {
     lpc_connect_completion: Option<PendingLpcConnectCompletion>,
     /// Allocation-reserved synchronous request keyed by broker-authored message identity.
     lpc_request_park: Option<PendingLpcRequestPark>,
-    /// A reply was published to the LPC broker during this dispatch. The service loop consumes the
-    /// edge once to redrive generic receive continuations without polling every parked port after
-    /// every unrelated syscall.
+    /// The LPC broker changed in a way that can satisfy an ordinary receive or request waiter. The
+    /// service loop consumes the edge once instead of polling every parked port after unrelated
+    /// syscalls.
     lpc_endpoint_progress: bool,
+    /// This syscall committed an LPC reply. Retained component clients may inspect it only after the
+    /// replying server's native result is delivered or its reply-wait receive half is parked.
+    lpc_reply_published: bool,
     /// ★ CROSS-VSPACE `NtCreateThread` (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`):
     /// the handler did the POLICY (handle + `PROCESS_CREATE_THREAD` access check, the target's real
     /// ETHREAD, the `*ThreadHandle`/`*ClientId` out-params) and asks the LOOP to build the

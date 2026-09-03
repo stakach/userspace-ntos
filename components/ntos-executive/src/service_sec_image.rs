@@ -1583,6 +1583,18 @@ unsafe fn lpc_component_wait_select_ready() -> u64 {
     selected
 }
 
+unsafe fn lpc_component_reply_commit_drain(
+    nt_handler: &mut ExecNtHandler,
+    procs: &mut [ProcExec],
+    pfilled: &mut [[u64; 512]],
+) -> u64 {
+    let selected = lpc_component_wait_select_ready();
+    if selected != 0 {
+        let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
+    }
+    selected
+}
+
 enum ComponentPumpCompletion {
     Completed(win32k_glue::CompletedWin32kDispatch),
     Reparked(PendingComponentDispatch),
@@ -2175,8 +2187,7 @@ unsafe fn component_suspension_drain_ready(
     if nt_handler.lpc_endpoint_progress {
         // A component-originated request bypasses ExecNtHandler's normal syscall post-action.
         // Redrive the ordinary broker waiters here so the server can accept the request before the
-        // next recv. Component reply selection still happens only after a later received event,
-        // once the server's replying syscall has received its own native reply.
+        // next recv. Reply selection is owned by the server's explicit native-reply/park barrier.
         let _ = lpc_receive_wait_redrive_all(nt_handler);
         let _ = lpc_request_wait_redrive_all(nt_handler);
     }
@@ -11298,13 +11309,10 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.pending_file_irp_drain.is_none(),
                     "previous syscall leaked a File IRP drain reservation"
                 );
-                // Poll component LPC completions only after `reply_recv` has returned another
-                // event. This guarantees the independent server syscall which published the LPC
-                // reply has already received its own native reply before win32k is resumed.
-                let _ = lpc_component_wait_select_ready();
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.lpc_endpoint_progress = false;
+                nt_handler.lpc_reply_published = false;
                 if let Some(stale) = nt_handler.lpc_receive_park.take() {
                     lpc_receive_wait_cancel_reservation(stale.reservation);
                     panic!("previous syscall leaked an LPC receive continuation reservation");
@@ -17202,14 +17210,29 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    trace_indefinite_wait_park(
-                        &nt_handler,
-                        badge,
-                        live_top_badges(&nt_handler),
-                        crash_parked,
-                        wait_parked,
-                    );
-                    mark_wait_parked!(pi, resume_ip);
+                    let server_tid = nt_handler.current_tid;
+                    if nt_handler.lpc_reply_published {
+                        let _ = lpc_component_reply_commit_drain(
+                            &mut nt_handler,
+                            procs,
+                            pfilled,
+                        );
+                    }
+                    // The component drain can synchronously publish another broker request and
+                    // redrive this exact server receive. Record a wait only if its retained owner
+                    // still exists after that ownership boundary.
+                    if lpc_thread_has_wait(server_tid, badge) {
+                        trace_indefinite_wait_park(
+                            &nt_handler,
+                            badge,
+                            live_top_badges(&nt_handler),
+                            crash_parked,
+                            wait_parked,
+                        );
+                        mark_wait_parked!(pi, resume_ip);
+                    } else {
+                        wait_parked = wait_parked_owner_mask(&nt_handler);
+                    }
                     let _ = finalize_service_loop_state(&mut nt_handler);
                     let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                     badge = received.0;
@@ -17849,7 +17872,10 @@ pub(crate) unsafe fn service_sec_image(
                         .map(|identity| (identity, result as u32))
                 })
                 .flatten();
-            let (nb, nmi, nm0, nm1, nm2, nm3) = if reply_main == 0 {
+            let inspect_component_lpc_after_reply =
+                (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
+                    .requires_post_reply_inspection(nt_handler.lpc_reply_published);
+            let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
                 let (r0, r1, r2, r3) = stage_serviced_syscall_reply(
                     native_call_transport,
@@ -17861,7 +17887,7 @@ pub(crate) unsafe fn service_sec_image(
                     sp,
                     flags,
                 );
-                reply_recv_badge(fault_ep, 18, r0, r1, r2, r3)
+                (reply_recv_badge(fault_ep, 18, r0, r1, r2, r3), true)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
                 // fault reply the redirect staged, not with a syscall result. User APC delivery uses
@@ -17882,28 +17908,48 @@ pub(crate) unsafe fn service_sec_image(
                         flags,
                     )
                 };
-                client_reply_recv_badge(fault_ep, reply_main, len, r0, r1, r2, r3)
+                if inspect_component_lpc_after_reply {
+                    // The broker reply is visible, but its server must observe this native reply
+                    // before the retained component client resumes. Calls made during the bounded
+                    // drain queue on the endpoint until `recv_full_r12` re-registers this Reply.
+                    let delivered = client_reply_on(reply_main, len, r0, r1, r2, r3);
+                    assert!(
+                        delivered,
+                        "LPC server native reply failed before component continuation selection"
+                    );
+                    let _ =
+                        lpc_component_reply_commit_drain(&mut nt_handler, procs, pfilled);
+                    (recv_full_r12(fault_ep, reply_main), delivered)
+                } else {
+                    let received =
+                        client_reply_recv_badge(fault_ep, reply_main, len, r0, r1, r2, r3);
+                    let delivered = received.0 != COMPOSITE_SEND_ERROR_BADGE;
+                    (received, delivered)
+                }
             };
             if let Some(status) = native_load_reply_status {
-                // The combined send/receive has returned, so the bound Reply object consumed the
-                // exact terminal status before the next event was received. rust-micro reserves
-                // one impossible receive badge to report a send-half failure without pretending a
-                // receive occurred.
-                let delivered = nb != COMPOSITE_SEND_ERROR_BADGE;
+                // The checked reply path consumed the bound Reply object before returning. The
+                // combined path reserves one impossible receive badge to report a send-half failure
+                // without pretending a receive occurred.
                 nt_handler
                     .native_driver_load_report
-                    .record_reply(status, delivered);
-                assert!(delivered, "NtLoadDriver bound reply failed before receive");
+                    .record_reply(status, native_reply_delivered);
+                assert!(
+                    native_reply_delivered,
+                    "NtLoadDriver bound reply failed before receive"
+                );
             }
             if let Some((identity, status)) = live_action_reply {
-                let delivered = nb != COMPOSITE_SEND_ERROR_BADGE;
                 nt_handler
-                    .pnp_record_live_action_reply(identity, status, delivered)
+                    .pnp_record_live_action_reply(identity, status, native_reply_delivered)
                     .expect("live PnP notification reply did not match its UserResponse result");
             }
             if let Some((identity, status)) = start_device_reply {
-                let delivered = nb != COMPOSITE_SEND_ERROR_BADGE;
-                match nt_handler.pnp_record_start_device_reply(identity, status, delivered) {
+                match nt_handler.pnp_record_start_device_reply(
+                    identity,
+                    status,
+                    native_reply_delivered,
+                ) {
                     Ok(()) | Err(nt_pnp_manager::StartDeviceLedgerError::ReplyFailed) => {}
                     Err(_) => panic!("StartDevice reply did not match its exact result"),
                 }

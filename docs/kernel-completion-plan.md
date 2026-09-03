@@ -24266,6 +24266,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and the freestanding executive remains at 221 warnings. Next run the serialized desktop gate and
     trace both physical growth and the first failure after the genuine system threads coexist.
 
+    Serialized demand-lane result (2026-09-03): the boot again reached 221/293 and exited through
+    the sentinel, but no third root dispatch arrived after Winlogon's retained
+    `NtUserCreateWindowStation` LPC request and CSRSS's permanent
+    `ONEPARAM_ROUTINE_CREATESYSTEMTHREADS` provider wait occupied the two existing lanes. This
+    disproves physical capacity as the immediate stall. The LPC server committed Winlogon's reply
+    through `NtReplyWaitReceivePort`, parked its receive half, and left the broker reply ready with
+    no unrelated event to drive the old top-of-loop readiness poll. Demand provisioning remains the
+    correct capacity policy, but its desktop acceptance follows this reply-publication repair.
+
+    B3 retained-LPC reply barrier checkpoint (2026-09-03, host and freestanding green; desktop run
+    pending): the executive now distinguishes an actual broker reply publication from generic LPC
+    endpoint progress. A pending `NtReplyWaitReceivePort` first transfers the server's native
+    continuation into the generation-exact receive table, then selects and drains exact retained
+    component requests before blocking again. Direct-return `NtReplyPort` and reply-wait calls use
+    the checked bound-reply primitive, drain only after successful native reply delivery, and then
+    re-register the Reply object with an ordinary receive. The event-dependent readiness poll has
+    been deleted rather than retained as a fallback. `nt-lpc-continuation` now host-tests the
+    reply-publication plus occupied-owner barrier and passes all 15 tests; the freestanding executive
+    remains at 221 warnings. Next run the serialized desktop gate, require the retained Winlogon LPC
+    lane to resume without a timer or unrelated hosted event, then repair the first newly exposed
+    frontier. Also close cross-lane drain fairness: one lane re-parking must not prevent another
+    already-selected lane from resuming in the same drain.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
