@@ -298,6 +298,21 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     });
     true
 }
+
+unsafe fn acquire_or_provision_win32k_execution_lane(
+) -> Option<nt_component_suspension::LaneHandle> {
+    if let Some(lane) = crate::service_sec_image::acquire_idle_component_execution_lane() {
+        return Some(lane);
+    }
+    if !crate::service_sec_image::component_execution_lane_needs_capacity() {
+        return None;
+    }
+    let pml4 = WIN32K_HOST_PML4.load(Ordering::Acquire);
+    if pml4 == 0 || !initialize_win32k_physical_lane(pml4) {
+        return None;
+    }
+    crate::service_sec_image::acquire_idle_component_execution_lane()
+}
 // Win32k shared views carry thousands of mapped frame/page-table caps across GUI clients. Keep the
 // root CSpace to process-global names and move these high-volume mapping caps into lazy global
 // child-CNode segments; a small ownership index keeps per-process teardown exact.
@@ -6629,7 +6644,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     } else if nested_user_callback {
         None
     } else {
-        crate::service_sec_image::acquire_idle_component_execution_lane()
+        acquire_or_provision_win32k_execution_lane()
     };
     let Some(lane) = lane else {
         if nested_user_callback {

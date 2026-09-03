@@ -236,6 +236,10 @@ pub(crate) unsafe fn acquire_idle_component_execution_lane(
     Some(lane)
 }
 
+pub(crate) unsafe fn component_execution_lane_needs_capacity() -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).needs_idle_lane()
+}
+
 pub(crate) unsafe fn resume_external_component_execution_lane(
     lane: nt_component_suspension::LaneHandle,
     token: u64,

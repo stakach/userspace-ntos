@@ -24257,6 +24257,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     adjustment: demand-provision a worker only after a fresh non-callback dispatch finds no idle
     lane, then retry scheduler acquisition; do not provision for exact same-lane callback recursion.
 
+    B3 demand-lane provisioning checkpoint (2026-09-03, host and freestanding green; desktop run
+    pending): the lane scheduler now exposes one explicit growth predicate which is true only when
+    no lane is executing, every registered lane is retained, and capacity remains. Fresh root
+    win32k dispatch uses that predicate to create one shared-VSpace worker and retry exact idle-lane
+    acquisition. Same-thread callback recursion never provisions and must reacquire its owned lane.
+    The focused scheduler suite passes all 20 tests, including the two-retained-lane growth shape,
+    and the freestanding executive remains at 221 warnings. Next run the serialized desktop gate and
+    trace both physical growth and the first failure after the genuine system threads coexist.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

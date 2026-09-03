@@ -606,6 +606,12 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         })
     }
 
+    /// A fresh root dispatch may add a physical lane only when the component is not executing,
+    /// every registered lane is retained, and the configured lane bound has not been reached.
+    pub fn needs_idle_lane(&self) -> bool {
+        self.running.is_none() && self.next_idle().is_none() && self.len() < self.max_lanes
+    }
+
     pub fn allocate(&mut self, binding: LaneBinding) -> Result<LaneHandle, LaneError> {
         if !binding.is_valid() || self.max_depth_per_lane == 0 {
             return Err(LaneError::InvalidIdentity);
@@ -1508,6 +1514,43 @@ mod tests {
             .begin_dispatch(second, binding(2).reply_object)
             .unwrap();
         assert_eq!(lanes.running(), Some(second));
+    }
+
+    #[test]
+    fn physical_growth_is_requested_only_when_all_existing_lanes_are_retained() {
+        let mut lanes = ComponentSuspensionLanes::<u64, u32>::new(3, 2);
+        let first = lanes.allocate(binding(1)).unwrap();
+        let second = lanes.allocate(binding(2)).unwrap();
+        assert!(!lanes.needs_idle_lane());
+
+        lanes.begin_dispatch(first, binding(1).reply_object).unwrap();
+        assert!(!lanes.needs_idle_lane());
+        lanes
+            .admit_running(
+                first,
+                binding(1).reply_object,
+                SuspensionKey::lpc_request(1),
+                1,
+                owner(1),
+                10u64,
+            )
+            .unwrap();
+        assert!(!lanes.needs_idle_lane());
+        lanes.begin_dispatch(second, binding(2).reply_object).unwrap();
+        lanes
+            .admit_running(
+                second,
+                binding(2).reply_object,
+                SuspensionKey::provider_wait(2),
+                2,
+                owner(2),
+                20,
+            )
+            .unwrap();
+        assert!(lanes.needs_idle_lane());
+
+        lanes.allocate(binding(3)).unwrap();
+        assert!(!lanes.needs_idle_lane());
     }
 
     #[test]
