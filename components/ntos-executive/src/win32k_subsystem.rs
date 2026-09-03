@@ -158,6 +158,7 @@ static mut WIN32K_STACK_EVENT_ACTIVATIONS:
 static mut WIN32K_DRIVER_STACK_EVENT_ACTIVATION: Option<ProviderStackEventActivation> = None;
 static WIN32K_DRIVER_OBJECT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_COMPONENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WIN32K_SHUTDOWN_EVENT: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_DRIVER_ENTRY_DISPATCH_ID: u64 = u64::MAX;
 const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
@@ -4137,6 +4138,27 @@ extern "win64" fn s_ke_wait_for_single_object(
 static PROVIDER_WAIT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static LPC_WAIT_NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+fn trace_provider_wait_component(stage: &[u8], value0: u64, value1: u64, value2: u64) {
+    let n = PROVIDER_WAIT_COMPONENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 32 {
+        return;
+    }
+    print_str(b"[win32k-provider-wait] #");
+    print_u64(n + 1);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" v0=0x");
+    print_hex((value0 >> 32) as u32);
+    print_hex(value0 as u32);
+    print_str(b" v1=0x");
+    print_hex((value1 >> 32) as u32);
+    print_hex(value1 as u32);
+    print_str(b" v2=0x");
+    print_hex((value2 >> 32) as u32);
+    print_hex(value2 as u32);
+    print_str(b"\n");
+}
+
 fn next_provider_wait_id() -> Option<u64> {
     PROVIDER_WAIT_NEXT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -4193,6 +4215,14 @@ unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWait
         client_badge: header.client_badge,
         dispatch_id: header.dispatch_id,
     };
+    if !owner.is_valid() {
+        trace_provider_wait_component(
+            b"invalid-owner",
+            (u64::from(header.client_pi) << 32) | client_generation,
+            header.client_tid,
+            header.dispatch_id,
+        );
+    }
     owner.is_valid().then_some(owner)
 }
 
@@ -4256,6 +4286,7 @@ unsafe fn provider_wait_rendezvous(
     )
     .is_err()
     {
+        trace_provider_wait_component(b"invalid-request", wait_id, objects.len() as u64, timeout);
         return 0xC000_000Du32 as i32;
     }
     write_volatile(core::ptr::addr_of_mut!((*page).request), request);
@@ -4268,8 +4299,20 @@ unsafe fn provider_wait_rendezvous(
         (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
     let owner_header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
     let Some(wait_context) = callback_request_context_for_request(&owner_header) else {
+        trace_provider_wait_component(
+            b"missing-context",
+            (u64::from(owner_header.client_pi) << 32) | owner_header.client_tid,
+            owner_header.client_badge,
+            owner_header.dispatch_id,
+        );
         return 0xC000_000Du32 as i32;
     };
+    trace_provider_wait_component(
+        b"admit",
+        wait_id,
+        (u64::from(owner.client_pi) << 32) | owner.client_tid,
+        objects.len() as u64,
+    );
     let mut outgoing = W32_PROVIDER_WAIT_LABEL << 12;
     loop {
         let (_label, tag, _, _, _) = crate::driver_launch::call_on(outgoing);
@@ -4302,7 +4345,10 @@ unsafe fn provider_wait_rendezvous(
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                 outgoing = W32_DISPATCH_LABEL << 12;
             }
-            _ => return 0xC000_0001u32 as i32,
+            _ => {
+                trace_provider_wait_component(b"unexpected-tag", wait_id, tag, outgoing);
+                return 0xC000_0001u32 as i32;
+            }
         }
     }
 }
@@ -4333,6 +4379,12 @@ extern "win64" fn s_ke_wait_for_multiple_objects(
     for index in 0..count as usize {
         let event = unsafe { read_unaligned((object_array + index as u64 * 8) as *const u64) };
         let Some(object) = (unsafe { provider_wait_object_for_dispatcher(event) }) else {
+            trace_provider_wait_component(
+                b"unresolved-object",
+                event,
+                index as u64,
+                count as u64,
+            );
             return 0xC000_000Du32 as i32;
         };
         objects[index] = object;

@@ -482,6 +482,7 @@ static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_LOCAL_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_TIMER_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -1830,6 +1831,38 @@ fn trace_provider_local_event(
         print_str(b" native=");
         print_u64(native_identity);
     }
+    print_str(b"\n");
+}
+
+fn trace_provider_timer(
+    op: &[u8],
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    local_identity: u64,
+    object: Option<nt_provider_wait::ProviderWaitObject>,
+    detail: u64,
+) {
+    let n = PROVIDER_TIMER_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    print_str(b"[provider-timer] #");
+    print_u64(n + 1);
+    print_str(b" op=");
+    print_str(op);
+    print_str(b" provider=");
+    print_u64(provider.domain);
+    print_str(b"/");
+    print_u64(provider.generation);
+    print_str(b" local=0x");
+    print_hex_u64(local_identity);
+    if let Some(object) = object {
+        print_str(b" canonical=");
+        print_u64(object.object_id);
+        print_str(b"/");
+        print_u64(object.object_generation);
+    }
+    print_str(b" detail=");
+    print_u64(detail);
     print_str(b"\n");
 }
 
@@ -3919,6 +3952,7 @@ impl ExecNtHandler {
         require_boot_system: bool,
         bootstrap_system_journal_records: u32,
         provider_local_events: Vec<ProviderLocalEventTransfer>,
+        provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
     ) -> &'static mut Self {
         // The REAL SECURITY + SAM hives the storage host read BY PATH off
         // `\reactos\system32\config\{security,sam}`. Borrow the staged bytes (no copy) and parse
@@ -4110,7 +4144,7 @@ impl ExecNtHandler {
             event_objects,
             nt_kernel_exec::EventObjectRegistry::with_capacity(192, 192)
         );
-        write_field!(provider_timers, None);
+        write_field!(provider_timers, provider_timers);
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
         write_field!(job_time_sample_deadline, u64::MAX);
@@ -26111,6 +26145,12 @@ impl ExecNtHandler {
         Ok(transfer)
     }
 
+    pub(crate) fn take_provider_timer_table(
+        &mut self,
+    ) -> Option<nt_provider_wait::ProviderTimerTable> {
+        self.provider_timers.take()
+    }
+
     fn import_provider_local_events(
         &mut self,
         transfer: Vec<ProviderLocalEventTransfer>,
@@ -26330,10 +26370,23 @@ impl ExecNtHandler {
         } else {
             nt_provider_wait::ProviderTimerKind::Synchronization
         };
-        timers
-            .publish(local_identity, kind)
-            .map(nt_provider_wait::ProviderTimerId::wait_object)
-            .map_err(|_| STATUS_INVALID_PARAMETER)
+        match timers.publish(local_identity, kind) {
+            Ok(id) => {
+                let object = id.wait_object();
+                trace_provider_timer(b"publish", provider, local_identity, Some(object), 0);
+                Ok(object)
+            }
+            Err(error) => {
+                trace_provider_timer(
+                    b"publish-fail",
+                    provider,
+                    local_identity,
+                    None,
+                    error as u64,
+                );
+                Err(STATUS_INVALID_PARAMETER)
+            }
+        }
     }
 
     pub(crate) fn provider_set_local_timer(
@@ -26347,17 +26400,28 @@ impl ExecNtHandler {
         if !crate::win32k_provider_domain_is_current(provider) {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        self.provider_timers
+        let timers = self.provider_timers
             .as_mut()
             .filter(|timers| timers.provider() == provider)
-            .ok_or(STATUS_INVALID_PARAMETER)?
-            .set_local(
-                local_identity,
-                due_time_100ns,
-                period_ms,
-                crate::nt_time_snapshot(),
-            )
-            .map_err(|_| STATUS_INVALID_PARAMETER)
+            .ok_or_else(|| {
+                trace_provider_timer(b"set-no-table", provider, local_identity, None, 0);
+                STATUS_INVALID_PARAMETER
+            })?;
+        match timers.set_local(
+            local_identity,
+            due_time_100ns,
+            period_ms,
+            crate::nt_time_snapshot(),
+        ) {
+            Ok(active) => {
+                trace_provider_timer(b"set", provider, local_identity, None, u64::from(active));
+                Ok(active)
+            }
+            Err(error) => {
+                trace_provider_timer(b"set-fail", provider, local_identity, None, error as u64);
+                Err(STATUS_INVALID_PARAMETER)
+            }
+        }
     }
 
     pub(crate) fn provider_cancel_local_timer(

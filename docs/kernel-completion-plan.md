@@ -24341,6 +24341,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     back to the component before permitting timer-backed storage to be freed; neither capability is
     represented by a fallback in the current boundary.
 
+    B3 provider Timer live-handler cutover checkpoint (2026-09-03, freestanding and partial runtime
+    green; wait admission under diagnosis): the first serialized run exposed an ownership break at
+    the bootstrap-to-live executive transition. Win32k published `MasterTimer` while the bootstrap
+    handler owned the provider Timer table, then the live handler started with an empty table and
+    rejected the later `KeSetTimer`. The transition now moves the complete generation-owned Timer
+    table alongside the existing local Event transfers before replacing the static handler storage;
+    it does not recreate identities or copy raw provider addresses. A subsequent serialized run
+    proves the same canonical Timer survives the cutover and the real `KeSetTimer` succeeds. The raw
+    input lane still returns before reaching the executive wait broker, so bounded component-side
+    diagnostics now distinguish object resolution, owner derivation, request validation, context
+    capture, and actual admission. The immediate gate remains a genuine mixed Event/Timer
+    `KeWaitForMultipleObjects` park and Timer wake, followed by DPC delivery and deferred-retirement
+    acknowledgement.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

@@ -4009,14 +4009,27 @@ unsafe fn clear_service_delay_drain_context() {
     SERVICE_CRASH_PARKED_MASK.store(0, Ordering::Release);
 }
 
-unsafe fn take_provider_local_event_transfer() -> Vec<ProviderLocalEventTransfer> {
+struct ProviderDispatcherTransfer {
+    local_events: Vec<ProviderLocalEventTransfer>,
+    timers: Option<nt_provider_wait::ProviderTimerTable>,
+}
+
+unsafe fn take_provider_dispatcher_transfer() -> ProviderDispatcherTransfer {
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     let transfer = if handler_ptr.is_null() {
-        Vec::new()
+        ProviderDispatcherTransfer {
+            local_events: Vec::new(),
+            timers: None,
+        }
     } else {
-        (&*handler_ptr)
+        let local_events = (&*handler_ptr)
             .export_provider_local_events()
-            .expect("provider-local Event state must be quiescent at live-service transition")
+            .expect("provider-local Event state must be quiescent at live-service transition");
+        let timers = (&mut *handler_ptr).take_provider_timer_table();
+        ProviderDispatcherTransfer {
+            local_events,
+            timers,
+        }
     };
     // Provider requests are serialized through root. Hide the obsolete owner before replacing its
     // static storage; the new handler is published only after all transferred backing exists.
@@ -7774,17 +7787,21 @@ pub(crate) unsafe fn service_sec_image(
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let provider_local_events = if live_service {
-        take_provider_local_event_transfer()
+    let provider_dispatcher = if live_service {
+        take_provider_dispatcher_transfer()
     } else {
-        Vec::new()
+        ProviderDispatcherTransfer {
+            local_events: Vec::new(),
+            timers: None,
+        }
     };
     let mut nt_handler = reset_exec_nt_handler(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
         live_service,
         bootstrap_system_journal_records,
-        provider_local_events,
+        provider_dispatcher.local_events,
+        provider_dispatcher.timers,
     );
     if live_service {
         print_str(b"[sec-init] handler-ready\n");

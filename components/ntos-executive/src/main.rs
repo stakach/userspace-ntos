@@ -25112,6 +25112,7 @@ unsafe fn reset_exec_nt_handler(
     require_boot_system: bool,
     bootstrap_system_journal_records: u32,
     provider_local_events: Vec<exec_handler::ProviderLocalEventTransfer>,
+    provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
 ) -> &'static mut ExecNtHandler {
     let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
     // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the
@@ -25124,6 +25125,7 @@ unsafe fn reset_exec_nt_handler(
         require_boot_system,
         bootstrap_system_journal_records,
         provider_local_events,
+        provider_timers,
     )
 }
 
