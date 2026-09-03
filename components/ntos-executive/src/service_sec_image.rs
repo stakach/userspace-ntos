@@ -195,7 +195,14 @@ struct ComponentNativeContinuation {
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
+    callback_context: Option<win32k_glue::RetainedUserCallbackContext>,
     abandon_native_reply: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ComponentCallbackTransfer {
+    token: u64,
+    context: win32k_glue::RetainedUserCallbackContext,
 }
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
@@ -2007,7 +2014,7 @@ unsafe fn provider_wait_admit_retained(
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
-    callback_token: Option<u64>,
+    callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     if reply_cap == 0 {
         return false;
@@ -2017,6 +2024,17 @@ unsafe fn provider_wait_admit_retained(
     };
     let wait_id = pending.request.header.wait_id;
     let sequence = next_dispatcher_wait_sequence();
+    let (resume_ip, resume_sp, resume_flags, callback_context) =
+        if let Some(transfer) = callback_transfer {
+            (
+                transfer.context.resume_ip(),
+                transfer.context.resume_sp(),
+                transfer.context.resume_flags(),
+                Some(transfer.context),
+            )
+        } else {
+            (resume_ip, resume_sp, resume_flags, None)
+        };
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
         reply_cap,
@@ -2024,6 +2042,7 @@ unsafe fn provider_wait_admit_retained(
         resume_ip,
         resume_sp,
         resume_flags,
+        callback_context,
         abandon_native_reply: false,
     };
     let lane = pending.dispatch.lane;
@@ -2031,11 +2050,11 @@ unsafe fn provider_wait_admit_retained(
         return false;
     };
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(token) = callback_token {
+    let admitted = if let Some(transfer) = callback_transfer {
         lanes.transfer_external_to_suspension_running(
             lane,
             binding.reply_object,
-            token,
+            transfer.token,
             provider_wait_key(wait_id),
             sequence,
             component_suspension_owner(owner),
@@ -2134,7 +2153,7 @@ unsafe fn provider_wait_admit_current(
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
-    callback_token: Option<u64>,
+    callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
@@ -2151,7 +2170,7 @@ unsafe fn provider_wait_admit_current(
         resume_ip,
         resume_sp,
         resume_flags,
-        callback_token,
+        callback_transfer,
     ) {
         return false;
     }
@@ -2168,7 +2187,7 @@ unsafe fn lpc_wait_admit_retained(
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
-    callback_token: Option<u64>,
+    callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
         return false;
@@ -2183,6 +2202,17 @@ unsafe fn lpc_wait_admit_retained(
     };
     let key = nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation);
     let sequence = next_dispatcher_wait_sequence();
+    let (resume_ip, resume_sp, resume_flags, callback_context) =
+        if let Some(transfer) = callback_transfer {
+            (
+                transfer.context.resume_ip(),
+                transfer.context.resume_sp(),
+                transfer.context.resume_flags(),
+                Some(transfer.context),
+            )
+        } else {
+            (resume_ip, resume_sp, resume_flags, None)
+        };
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
         reply_cap,
@@ -2190,6 +2220,7 @@ unsafe fn lpc_wait_admit_retained(
         resume_ip,
         resume_sp,
         resume_flags,
+        callback_context,
         abandon_native_reply: false,
     };
     let lane = pending.dispatch.lane;
@@ -2198,11 +2229,11 @@ unsafe fn lpc_wait_admit_retained(
         return false;
     };
     let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let admitted = if let Some(token) = callback_token {
+    let admitted = if let Some(transfer) = callback_transfer {
         lanes.transfer_external_to_suspension_running(
             lane,
             binding.reply_object,
-            token,
+            transfer.token,
             key,
             sequence,
             component_suspension_owner(owner),
@@ -2233,7 +2264,7 @@ unsafe fn lpc_wait_admit_current(
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
-    callback_token: Option<u64>,
+    callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
@@ -2250,13 +2281,27 @@ unsafe fn lpc_wait_admit_current(
         resume_ip,
         resume_sp,
         resume_flags,
-        callback_token,
+        callback_transfer,
     ) {
         return false;
     }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
     true
+}
+
+unsafe fn reply_component_native_continuation(
+    continuation: ComponentNativeContinuation,
+    status: u64,
+) -> bool {
+    if let Some(context) = continuation.callback_context {
+        if !win32k_glue::restore_retained_user_callback_context(context, status) {
+            return false;
+        }
+        client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0)
+    } else {
+        reply_parked_syscall(continuation.reply_cap, continuation.reply, status)
+    }
 }
 
 unsafe fn component_suspension_drain_ready(
@@ -2304,7 +2349,7 @@ unsafe fn component_suspension_drain_ready(
                     } else {
                         0xC000_0001u32 as u64
                     };
-                    reply_parked_syscall(continuation.reply_cap, continuation.reply, status);
+                    assert!(reply_component_native_continuation(continuation, status));
                     release_reply_pool_cap(continuation.reply_cap);
                 }
                 drained += 1;
@@ -2324,11 +2369,10 @@ unsafe fn component_suspension_drain_ready(
                         client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0);
                     } else {
                         let cancelled = win32k_glue::cancel_suspended_user_callback();
-                        reply_parked_syscall(
-                            continuation.reply_cap,
-                            continuation.reply,
+                        assert!(reply_component_native_continuation(
+                            continuation,
                             cancelled.0 as u32 as u64,
-                        );
+                        ));
                     }
                     release_reply_pool_cap(continuation.reply_cap);
                 }
@@ -2341,11 +2385,10 @@ unsafe fn component_suspension_drain_ready(
                 if continuation.abandon_native_reply {
                     assert_eq!(continuation.reply_cap, 0);
                 } else {
-                    reply_parked_syscall(
-                        continuation.reply_cap,
-                        continuation.reply,
+                    assert!(reply_component_native_continuation(
+                        continuation,
                         status as u32 as u64,
-                    );
+                    ));
                     release_reply_pool_cap(continuation.reply_cap);
                 }
                 drained += 1;
@@ -2887,6 +2930,7 @@ unsafe fn drain_deferred_user_callback_returns(
                 win32k_glue::CompletedUserCallback::ProviderWaitSuspended {
                     pending,
                     callback_token,
+                    callback_context,
                 } => {
                     assert!(provider_wait_admit_retained(
                         nt_handler,
@@ -2896,7 +2940,10 @@ unsafe fn drain_deferred_user_callback_returns(
                         deferred.reply.resume_ip(),
                         deferred.reply.resume_sp(),
                         deferred.reply.resume_flags(),
-                        Some(callback_token),
+                        Some(ComponentCallbackTransfer {
+                            token: callback_token,
+                            context: callback_context,
+                        }),
                     ));
                     retained_reply = true;
                     let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
@@ -2904,6 +2951,7 @@ unsafe fn drain_deferred_user_callback_returns(
                 win32k_glue::CompletedUserCallback::LpcWaitSuspended {
                     pending,
                     callback_token,
+                    callback_context,
                 } => {
                     assert!(lpc_wait_admit_retained(
                         nt_handler,
@@ -2913,7 +2961,10 @@ unsafe fn drain_deferred_user_callback_returns(
                         deferred.reply.resume_ip(),
                         deferred.reply.resume_sp(),
                         deferred.reply.resume_flags(),
-                        Some(callback_token),
+                        Some(ComponentCallbackTransfer {
+                            token: callback_token,
+                            context: callback_context,
+                        }),
                     ));
                     retained_reply = true;
                     let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
@@ -11367,6 +11418,7 @@ pub(crate) unsafe fn service_sec_image(
                                 win32k_glue::CompletedUserCallback::ProviderWaitSuspended {
                                     pending,
                                     callback_token,
+                                    callback_context,
                                 } => {
                                     let dispatch_id = pending.dispatch.dispatch_id;
                                     assert!(provider_wait_admit_current(
@@ -11376,7 +11428,10 @@ pub(crate) unsafe fn service_sec_image(
                                         resume_ip,
                                         sp,
                                         flags,
-                                        Some(callback_token),
+                                        Some(ComponentCallbackTransfer {
+                                            token: callback_token,
+                                            context: callback_context,
+                                        }),
                                     ));
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;
@@ -11405,6 +11460,7 @@ pub(crate) unsafe fn service_sec_image(
                                 win32k_glue::CompletedUserCallback::LpcWaitSuspended {
                                     pending,
                                     callback_token,
+                                    callback_context,
                                 } => {
                                     let dispatch_id = pending.dispatch.dispatch_id;
                                     assert!(lpc_wait_admit_current(
@@ -11414,7 +11470,10 @@ pub(crate) unsafe fn service_sec_image(
                                         resume_ip,
                                         sp,
                                         flags,
-                                        Some(callback_token),
+                                        Some(ComponentCallbackTransfer {
+                                            token: callback_token,
+                                            context: callback_context,
+                                        }),
                                     ));
                                     procs[pi].faults = faults;
                                     procs[pi].first = first;

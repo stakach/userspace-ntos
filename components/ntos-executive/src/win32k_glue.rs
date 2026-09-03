@@ -598,6 +598,27 @@ unsafe fn release_dispatch_output_stage(context: nt_user_callback::DispatchConte
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct RetainedUserCallbackContext {
+    client_tcb: u64,
+    saved_user_context: [u64; 20],
+    outer_resume_ip: u64,
+}
+
+impl RetainedUserCallbackContext {
+    pub(crate) const fn resume_ip(self) -> u64 {
+        self.outer_resume_ip
+    }
+
+    pub(crate) const fn resume_sp(self) -> u64 {
+        self.saved_user_context[nt_user_callback::USER_CONTEXT_RSP]
+    }
+
+    pub(crate) const fn resume_flags(self) -> u64 {
+        self.saved_user_context[nt_user_callback::USER_CONTEXT_RFLAGS]
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum CompletedUserCallback {
     Completed {
         outer_dispatch: Option<CompletedWin32kDispatch>,
@@ -605,10 +626,12 @@ pub(crate) enum CompletedUserCallback {
     ProviderWaitSuspended {
         pending: PendingProviderWaitDispatch,
         callback_token: u64,
+        callback_context: RetainedUserCallbackContext,
     },
     LpcWaitSuspended {
         pending: PendingLpcWaitDispatch,
         callback_token: u64,
+        callback_context: RetainedUserCallbackContext,
     },
 }
 
@@ -1377,6 +1400,30 @@ pub(crate) unsafe fn complete_nested_user_callback_dispatch(
     true
 }
 
+unsafe fn complete_wait_resumed_user_callback_dispatch(
+    client: Win32kClientContext,
+    dispatch_id: u64,
+    nested_user_callback: bool,
+) -> bool {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
+    let Some(top) = stack.top_for(&identity).copied() else {
+        return !nested_user_callback;
+    };
+    if top.kind != nt_user_callback::ContinuationKind::Win32kDispatch
+        || top.state != nt_user_callback::ContinuationState::Running
+        || top.dispatch_id != dispatch_id
+    {
+        return false;
+    }
+    if stack.complete_dispatch(identity, dispatch_id).is_err() {
+        return false;
+    }
+    USER_CALLBACK_CONTINUATION_UNWINDS.fetch_add(1, Ordering::Relaxed);
+    reassert_top_client_callback_window(&identity);
+    true
+}
+
 unsafe fn write_callback_failure_reply(request: nt_user_callback::CallbackHeader, status: i32) {
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
@@ -1430,17 +1477,82 @@ unsafe fn begin_controlled_continuation(
     // this callback was raised inside has to be recorded first. Another thread's chain being live
     // is irrelevant.
     let root = stack.is_empty_for(&client);
-    if (root && stack.push_dispatch(client, request.dispatch_id).is_err())
-        || stack.push_callback(correlation).is_err()
-        || active
-            .push_with_active_client_metadata(request, active_client)
-            .is_err()
+    if root {
+        if let Err(error) = stack.push_dispatch(client, request.dispatch_id) {
+            trace_callback_continuation_rejection(b"root-dispatch", error, request, stack);
+            abort_controlled_user_callbacks();
+            return false;
+        }
+    }
+    if let Err(error) = stack.push_callback(correlation) {
+        trace_callback_continuation_rejection(b"callback", error, request, stack);
+        abort_controlled_user_callbacks();
+        return false;
+    }
+    if active
+        .push_with_active_client_metadata(request, active_client)
+        .is_err()
     {
+        print_str(b"[user-callback-continuation] reject active-frame dispatch=");
+        print_u64(request.dispatch_id);
+        print_str(b" callback=");
+        print_u64(request.callback_id as u64);
+        print_str(b" active-depth=");
+        print_u64(active.len() as u64);
+        print_str(b"\n");
         abort_controlled_user_callbacks();
         return false;
     }
     USER_CALLBACK_CONTINUATION_PUSHES.fetch_add(if root { 2 } else { 1 }, Ordering::Relaxed);
     true
+}
+
+unsafe fn trace_callback_continuation_rejection(
+    phase: &[u8],
+    error: nt_user_callback::ContinuationError,
+    request: nt_user_callback::CallbackHeader,
+    stack: &nt_user_callback::ContinuationStack,
+) {
+    let client = nt_user_callback::ClientThreadIdentity::new(
+        request.client_pi,
+        request.client_tid,
+        request.client_badge,
+    );
+    print_str(b"[user-callback-continuation] reject phase=");
+    print_str(phase);
+    print_str(b" error=");
+    print_str(match error {
+        nt_user_callback::ContinuationError::Overflow => b"overflow",
+        nt_user_callback::ContinuationError::Underflow => b"underflow",
+        nt_user_callback::ContinuationError::Sequence => b"sequence",
+        nt_user_callback::ContinuationError::Kind => b"kind",
+        nt_user_callback::ContinuationError::State => b"state",
+        nt_user_callback::ContinuationError::Client => b"client",
+        nt_user_callback::ContinuationError::Correlation => b"correlation",
+    });
+    print_str(b" request-dispatch=");
+    print_u64(request.dispatch_id);
+    print_str(b" callback=");
+    print_u64(request.callback_id as u64);
+    print_str(b" depth=");
+    print_u64(stack.len_for(&client) as u64);
+    if let Some(top) = stack.top_for(&client) {
+        print_str(b" top-kind=");
+        print_u64(match top.kind {
+            nt_user_callback::ContinuationKind::Win32kDispatch => 1,
+            nt_user_callback::ContinuationKind::UserCallback => 2,
+        });
+        print_str(b" top-state=");
+        print_u64(match top.state {
+            nt_user_callback::ContinuationState::Running => 1,
+            nt_user_callback::ContinuationState::Suspended => 2,
+        });
+        print_str(b" top-dispatch=");
+        print_u64(top.dispatch_id);
+        print_str(b" top-callback=");
+        print_u64(top.callback_id as u64);
+    }
+    print_str(b"\n");
 }
 
 unsafe fn unwind_controlled_callback(request: nt_user_callback::CallbackHeader) -> bool {
@@ -2581,6 +2693,18 @@ pub(crate) unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: b
     reply_info >> 12
 }
 
+pub(crate) unsafe fn restore_retained_user_callback_context(
+    context: RetainedUserCallbackContext,
+    result: u64,
+) -> bool {
+    let completed = nt_user_callback::completed_outer_context(
+        &context.saved_user_context,
+        result,
+        context.outer_resume_ip,
+    );
+    tcb_write_regs20(context.client_tcb, &completed, false) == 0
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct TcbBreakpoint {
     pub(crate) vaddr: u64,
@@ -3290,9 +3414,11 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(pump.status);
     }
-    if pending.nested_user_callback
-        && !complete_nested_user_callback_dispatch(client, pending.dispatch.dispatch_id)
-    {
+    if !complete_wait_resumed_user_callback_dispatch(
+        client,
+        pending.dispatch.dispatch_id,
+        pending.nested_user_callback,
+    ) {
         release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
@@ -3504,9 +3630,11 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(pump.status);
     }
-    if pending.nested_user_callback
-        && !complete_nested_user_callback_dispatch(client, pending.dispatch.dispatch_id)
-    {
+    if !complete_wait_resumed_user_callback_dispatch(
+        client,
+        pending.dispatch.dispatch_id,
+        pending.nested_user_callback,
+    ) {
         release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
@@ -3894,6 +4022,46 @@ pub(crate) unsafe fn retire_dead_user_callback_client(client_pi: u32, pid: u64) 
     true
 }
 
+unsafe fn stage_returned_user_callback_context(
+    frame: nt_user_callback::ActiveCallbackFrame,
+    client: Win32kClientContext,
+    api_index: u32,
+    result: u64,
+    return_rsp: u64,
+    phase: &[u8],
+) -> Option<RetainedUserCallbackContext> {
+    let tcb = (frame.client_tcb() > 1).then_some(frame.client_tcb())?;
+    let outer_resume_ip = resolve_callback_resume_ip(
+        client,
+        frame.outer_resume_ip(),
+        frame.saved_user_context(),
+        phase,
+    )?;
+    let context = RetainedUserCallbackContext {
+        client_tcb: tcb,
+        saved_user_context: *frame.saved_user_context(),
+        outer_resume_ip,
+    };
+    let completed = nt_user_callback::completed_outer_context(
+        frame.saved_user_context(),
+        result,
+        outer_resume_ip,
+    );
+    let mut return_context = [0u64; 20];
+    tcb_read_regs20(tcb, &mut return_context);
+    trace_user_callback_context(
+        phase,
+        client,
+        api_index,
+        &return_context,
+        frame.saved_user_context(),
+        &completed,
+        outer_resume_ip,
+        return_rsp,
+    );
+    (tcb_write_regs20(tcb, &completed, false) == 0).then_some(context)
+}
+
 pub(crate) unsafe fn complete_controlled_user_callback(
     client_pi: u32,
     client_badge: u64,
@@ -4210,10 +4378,24 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             arg_snapshot_len,
             arg_snapshot,
         };
+        let Some(callback_context) = stage_returned_user_callback_context(
+            completed_frame,
+            completed_context,
+            request.api_index,
+            component.result,
+            return_rsp,
+            b"provider-wait-outer",
+        ) else {
+            release_dispatch_output_stage(dispatch_context);
+            abort_controlled_user_callbacks();
+            return None;
+        };
+        USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
         print_str(b"[user-callback] B transferred callback return to provider wait\n");
         return Some(CompletedUserCallback::ProviderWaitSuspended {
             pending,
             callback_token: u64::from(request.callback_id),
+            callback_context,
         });
     }
     if component.lpc_wait_suspended {
@@ -4228,10 +4410,24 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             abort_controlled_user_callbacks();
             return None;
         };
+        let Some(callback_context) = stage_returned_user_callback_context(
+            completed_frame,
+            completed_context,
+            request.api_index,
+            component.result,
+            return_rsp,
+            b"lpc-wait-outer",
+        ) else {
+            release_dispatch_output_stage(dispatch_context);
+            abort_controlled_user_callbacks();
+            return None;
+        };
+        USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
         print_str(b"[user-callback] B transferred callback return to LPC wait\n");
         return Some(CompletedUserCallback::LpcWaitSuspended {
             pending,
             callback_token: u64::from(request.callback_id),
+            callback_context,
         });
     }
     if !component.completed {
@@ -4257,42 +4453,20 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // `IntRestoreTebWndCallback` — can have left win32k's untranslated PWND in CLIENTINFO.CallbackWnd,
     // so restate the enclosing frame's bridged triple before the client runs again.
     reassert_top_client_callback_window(&identity);
-    let Some(tcb) = (completed_frame.client_tcb() > 1).then_some(completed_frame.client_tcb())
-    else {
-        release_dispatch_output_stage(dispatch_context);
-        return None;
-    };
-    let Some(completed_outer_resume_ip) = resolve_callback_resume_ip(
+    if stage_returned_user_callback_context(
+        completed_frame,
         completed_context,
-        completed_frame.outer_resume_ip(),
-        completed_frame.saved_user_context(),
+        request.api_index,
+        component.result,
+        return_rsp,
         b"completed-outer",
-    ) else {
+    )
+    .is_none()
+    {
         abort_controlled_user_callbacks();
         print_str(b"[user-callback] completed callback missing executable outer resume=0x");
         print_crash_hex64(completed_frame.outer_resume_ip());
         print_str(b"\n");
-        release_dispatch_output_stage(dispatch_context);
-        return None;
-    };
-    let completed = nt_user_callback::completed_outer_context(
-        completed_frame.saved_user_context(),
-        component.result,
-        completed_outer_resume_ip,
-    );
-    let mut return_context = [0u64; 20];
-    tcb_read_regs20(tcb, &mut return_context);
-    trace_user_callback_context(
-        b"complete",
-        completed_context,
-        request.api_index,
-        &return_context,
-        completed_frame.saved_user_context(),
-        &completed,
-        completed_outer_resume_ip,
-        return_rsp,
-    );
-    if tcb_write_regs20(tcb, &completed, false) != 0 {
         release_dispatch_output_stage(dispatch_context);
         return None;
     }

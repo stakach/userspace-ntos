@@ -24415,16 +24415,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     continuation transfer on the same generation-bearing lane, with a focused host regression, then
     rerun the desktop gate. Do not convert either suspension into a fabricated callback result.
 
-    B3 callback-to-wait transfer checkpoint (2026-09-03, host and freestanding green; desktop run
-    pending): `nt-component-suspension` now atomically replaces a running external callback token
+    B3 callback-to-wait transfer checkpoint (2026-09-03, desktop recovery accepted; final
+    accounting cleanup pending): `nt-component-suspension` now atomically replaces a running
+    external callback token
     with a typed provider/LPC suspension, without exposing the lane as idle. Callback completion
     returns an explicit completed/provider-wait/LPC-wait transition instead of collapsing every
     non-completed pump result into `STATUS_NO_CALLBACK_ACTIVE`. Both the immediate and deferred
     `NtCallbackReturn` paths retain their real native reply object until the exact wait completes;
     the obsolete retire-only executive wrapper is removed. The focused lane suite passes 22 tests
-    and the freestanding executive remains at 227 warnings. Rerun the serialized desktop gate and
-    require the prior `WM_WINDOWPOSCHANGED` transition to reach profile creation without critical
-    winlogon termination.
+    and the freestanding executive remains at 227 warnings.
+
+    The first runtime retry proved the atomic lane transfer but exposed a second continuation error:
+    the retained reply eventually restored the `NtCallbackReturn` trap register file, causing the
+    syscall that must never return to raise `STATUS_NO_CALLBACK_ACTIVE`. Retained callbacks now carry
+    their exact saved outer register context and TCB identity through provider/LPC waits. The outer
+    context is staged before wait ownership transfers, finalized with the eventual win32k result,
+    and released through a raw reply rather than the ordinary parked-syscall decoder. If a resumed
+    wait raises another callback, that same staged context is its parent.
+
+    A diagnostic retry then found a stale continuation-stack root: callback-to-wait completion had
+    retired nested dispatches but left a root callback-owned dispatch behind. Provider and LPC
+    completion now retire an exact matching running callback dispatch whether it is root or nested;
+    callback-free waits remain unchanged, and mismatched kind/state/identity fails closed. Serialized
+    desktop proof `.tmp/run-desktop-20260903-225854.log` reaches real profile hive load, userinit,
+    Explorer, 663 Explorer api0 redirects with zero callback failures, GDI batch flush, shell chrome
+    paint, and the sentinel. Callback redirects/returns and continuation pushes/unwinds are exact at
+    `2360/2360` and `19424/19424`. The prior `WM_WINDOWPOSCHANGED` transition no longer returns from
+    `NtCallbackReturn`, terminates winlogon, or leaves a stale dispatch. The run is `291/293`: close
+    the remaining transport-accounting failures `exec_win32k_transport_call_nested` (four live
+    component suspensions at the final quiesce snapshot) and `exec_provider_wait_transport_owned`
+    (525 admissions, 522 completions, four live waits) without weakening either gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
