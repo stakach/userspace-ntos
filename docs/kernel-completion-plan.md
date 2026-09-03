@@ -23444,6 +23444,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exact devnode generation. Next use this API behind an executive wrapper while wiring the
     authenticated `IoGetDmaAdapter` request service.
 
+    B3 NT5 DMA request ABI checkpoint (2026-09-03, host and freestanding green): `nt-dma-manager`
+    now owns
+    a pointer-free parser for the 40-byte NT5 `DEVICE_DESCRIPTION` layout shared by the ReactOS and
+    NT5 references. It accepts versions 0 through 2, rejects truncated, newer, and reserved-bit
+    forms, preserves the complete bus/channel/interface/width/speed request, and derives the typed
+    adapter properties used by the manager. All 27 focused DMA-manager tests pass and the
+    freestanding executive remains green at the established 213-warning baseline. Next marshal the
+    exact bytes from the driver component to the authenticated root service.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

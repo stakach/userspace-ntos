@@ -57,6 +57,76 @@ pub struct DmaAdapterRequest {
     pub dma64: bool,
 }
 
+pub const NT5_DEVICE_DESCRIPTION_SIZE: usize = 40;
+pub const NT5_DEVICE_DESCRIPTION_MAX_VERSION: u32 = 2;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceDescriptionError {
+    BufferTooSmall,
+    UnsupportedVersion,
+    ReservedBitSet,
+}
+
+/// Pointer-free NT5 `DEVICE_DESCRIPTION` supplied to `IoGetDmaAdapter`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Nt5DeviceDescription {
+    pub version: u32,
+    pub master: bool,
+    pub scatter_gather: bool,
+    pub demand_mode: bool,
+    pub auto_initialize: bool,
+    pub dma32: bool,
+    pub ignore_count: bool,
+    pub dma64: bool,
+    pub bus_number: u32,
+    pub dma_channel: u32,
+    pub interface_type: i32,
+    pub dma_width: u32,
+    pub dma_speed: u32,
+    pub maximum_length: u32,
+    pub dma_port: u32,
+}
+
+impl Nt5DeviceDescription {
+    pub fn parse(bytes: &[u8]) -> Result<Self, DeviceDescriptionError> {
+        if bytes.len() < NT5_DEVICE_DESCRIPTION_SIZE {
+            return Err(DeviceDescriptionError::BufferTooSmall);
+        }
+        let version = read_le_u32(&bytes[0..4]);
+        if version > NT5_DEVICE_DESCRIPTION_MAX_VERSION {
+            return Err(DeviceDescriptionError::UnsupportedVersion);
+        }
+        if bytes[10] != 0 {
+            return Err(DeviceDescriptionError::ReservedBitSet);
+        }
+        Ok(Self {
+            version,
+            master: bytes[4] != 0,
+            scatter_gather: bytes[5] != 0,
+            demand_mode: bytes[6] != 0,
+            auto_initialize: bytes[7] != 0,
+            dma32: bytes[8] != 0,
+            ignore_count: bytes[9] != 0,
+            dma64: bytes[11] != 0,
+            bus_number: read_le_u32(&bytes[12..16]),
+            dma_channel: read_le_u32(&bytes[16..20]),
+            interface_type: read_le_u32(&bytes[20..24]) as i32,
+            dma_width: read_le_u32(&bytes[24..28]),
+            dma_speed: read_le_u32(&bytes[28..32]),
+            maximum_length: read_le_u32(&bytes[32..36]),
+            dma_port: read_le_u32(&bytes[36..40]),
+        })
+    }
+
+    pub fn adapter_request(self) -> DmaAdapterRequest {
+        DmaAdapterRequest {
+            scatter_gather: self.scatter_gather,
+            maximum_length: self.maximum_length as u64,
+            dma64: self.dma64,
+        }
+    }
+}
+
 /// Result of an idempotent adapter request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DmaAdapterGrant {
@@ -860,6 +930,10 @@ fn read_le_u16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes([bytes[0], bytes[1]])
 }
 
+fn read_le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 fn read_le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -880,6 +954,80 @@ mod tests {
             maximum_length: 4096,
             dma64: true,
         }
+    }
+
+    fn nt5_device_description() -> [u8; NT5_DEVICE_DESCRIPTION_SIZE] {
+        let mut bytes = [0u8; NT5_DEVICE_DESCRIPTION_SIZE];
+        bytes[0..4].copy_from_slice(&2u32.to_le_bytes());
+        bytes[4] = 1;
+        bytes[5] = 1;
+        bytes[8] = 1;
+        bytes[11] = 1;
+        bytes[12..16].copy_from_slice(&7u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&3u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&5u32.to_le_bytes());
+        bytes[24..28].copy_from_slice(&2u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&0x20_000u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&0xcf8u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn nt5_device_description_decodes_without_driver_pointers() {
+        let description = Nt5DeviceDescription::parse(&nt5_device_description()).unwrap();
+
+        assert_eq!(
+            description,
+            Nt5DeviceDescription {
+                version: 2,
+                master: true,
+                scatter_gather: true,
+                demand_mode: false,
+                auto_initialize: false,
+                dma32: true,
+                ignore_count: false,
+                dma64: true,
+                bus_number: 7,
+                dma_channel: 3,
+                interface_type: 5,
+                dma_width: 2,
+                dma_speed: 1,
+                maximum_length: 0x20_000,
+                dma_port: 0xcf8,
+            }
+        );
+        assert_eq!(
+            description.adapter_request(),
+            DmaAdapterRequest {
+                scatter_gather: true,
+                maximum_length: 0x20_000,
+                dma64: true,
+            }
+        );
+    }
+
+    #[test]
+    fn nt5_device_description_rejects_truncated_new_or_reserved_forms() {
+        let bytes = nt5_device_description();
+        assert_eq!(
+            Nt5DeviceDescription::parse(&bytes[..NT5_DEVICE_DESCRIPTION_SIZE - 1]),
+            Err(DeviceDescriptionError::BufferTooSmall)
+        );
+
+        let mut unsupported = bytes;
+        unsupported[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            Nt5DeviceDescription::parse(&unsupported),
+            Err(DeviceDescriptionError::UnsupportedVersion)
+        );
+
+        let mut reserved = bytes;
+        reserved[10] = 1;
+        assert_eq!(
+            Nt5DeviceDescription::parse(&reserved),
+            Err(DeviceDescriptionError::ReservedBitSet)
+        );
     }
 
     #[test]
