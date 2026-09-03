@@ -24648,6 +24648,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     support. Other File, Device, Section, and dispatcher projections still require typed routes
     before deleting the general unknown-object branch.
 
+    B3 typed pointer-reference tranche 9 (2026-09-04, host and freestanding green):
+    `ObReferenceObjectByPointer` is now bound for every object projection whose lifetime owner is
+    already explicit: USER Desktop/WindowStation bodies, canonical EPROCESS/ETHREAD projections,
+    provider Events, retained LPC ports, primary Tokens, and video File/Device projections. The
+    entry point rejects `NULL`, invalid processor modes, unknown bodies, and mismatched non-NULL
+    object types. User-mode callers requesting access cannot bypass an absent security check; they
+    receive `STATUS_ACCESS_DENIED`. Kernel callers acquire the same checked pointer reference as
+    the existing per-kind retain path, including the real win32k window-station call site.
+
+    The host-tested USER table now exposes exact body-kind classification without leaking slot
+    representation. `nt-object-manager` passes all 74 tests, all 46 `nt-compat-exports` tests pass,
+    and the freestanding executive release build succeeds. Forty-four audited code imports remain.
+    This binding is deliberately partial rather than permissive: Section and unmodeled dispatcher,
+    File, and Device projections still fail closed. Add those owners before deleting the general
+    unknown-object reference tail.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

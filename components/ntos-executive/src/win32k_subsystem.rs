@@ -3473,6 +3473,68 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
     nt_object_manager::win32k_ob::classify(obj_type)
 }
 
+extern "win64" fn s_ob_reference_object_by_pointer(
+    object: u64,
+    desired_access: u32,
+    object_type: u64,
+    access_mode: u8,
+) -> i32 {
+    const STATUS_ACCESS_DENIED: i32 = 0xC000_0022u32 as i32;
+    if object == 0 {
+        return STATUS_INVALID_HANDLE_I32;
+    }
+    if access_mode > 1 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    if access_mode != 0 && desired_access != 0 {
+        return STATUS_ACCESS_DENIED;
+    }
+
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
+    if let Some(kind) = table.kind_by_body(object) {
+        if kind == ObKind::Other {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        if !nt_object_manager::win32k_ob::object_type_matches(kind, object_type) {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        return table
+            .reference_by_body(object)
+            .map(|_| 0)
+            .unwrap_or(STATUS_INSUFFICIENT_RESOURCES_I32);
+    }
+
+    let expected_type = if unsafe { process_context_index_for_eprocess(object).is_some() } {
+        nt_object_manager::object_type::process_object_type_addr()
+    } else if unsafe { thread_context_index_for_ethread(object).is_some() } {
+        nt_object_manager::object_type::thread_object_type_addr()
+    } else if unsafe { provider_event_projection_contains(object) } {
+        nt_object_manager::object_type::event_object_type_addr()
+    } else if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
+        nt_object_manager::object_type::port_object_type_addr()
+    } else {
+        0
+    };
+    if expected_type != 0 {
+        if object_type != 0 && object_type != expected_type {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        s_ob_reference_object(object);
+        return 0;
+    }
+    if unsafe {
+        token_context_index(object).is_some()
+            || crate::video_device::video_projection_contains(object)
+    } {
+        if object_type != 0 {
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        s_ob_reference_object(object);
+        return 0;
+    }
+    STATUS_INVALID_HANDLE_I32
+}
+
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
     if let Some(count) = unsafe {
         (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).reference_by_body(object)
@@ -13170,6 +13232,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "ObReferenceObjectByHandle",
         s_ob_reference_object_by_handle as usize as u64,
+    );
+    reg.bind(
+        "ObReferenceObjectByPointer",
+        s_ob_reference_object_by_pointer as usize as u64,
     );
     reg.bind(
         "ObOpenObjectByName",

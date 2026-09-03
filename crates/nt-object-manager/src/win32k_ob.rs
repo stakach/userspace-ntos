@@ -675,6 +675,15 @@ impl ObHandleTable {
             .map(|entry| (entry.pointer_count, entry.handle_count))
     }
 
+    /// Return the canonical USER object kind containing `body`.
+    pub fn kind_by_body(&self, body: u64) -> Option<ObKind> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|entry| entry.body == body)
+            .map(|entry| entry.kind)
+    }
+
     /// Acquire one pointer reference by object body, as `ObReferenceObject` does.
     pub fn reference_by_body(&mut self, body: u64) -> Option<u32> {
         self.slots
@@ -992,6 +1001,9 @@ mod tests {
         assert_eq!(t.lookup(desk), Some((ObKind::Desktop, 0xD00D_0000)));
         assert_eq!(t.lookup(winsta), Some((ObKind::WindowStation, 0x5700_0000)));
         assert_eq!(t.lookup_body(desk), 0xD00D_0000);
+        assert_eq!(t.kind_by_body(0xD00D_0000), Some(ObKind::Desktop));
+        assert_eq!(t.kind_by_body(0x5700_0000), Some(ObKind::WindowStation));
+        assert_eq!(t.kind_by_body(0xDEAD), None);
     }
 
     #[test]
