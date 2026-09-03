@@ -44,6 +44,25 @@ pub enum DmaError {
     OutOfRange,
     /// The logical address is not owned by / mapped for this device (§19.2).
     LogicalViolation,
+    /// A live adapter already exists for the owner with different properties.
+    AdapterConflict,
+}
+
+/// Bus-facing properties supplied by `IoGetDmaAdapter` after validating the caller's
+/// `DEVICE_DESCRIPTION`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DmaAdapterRequest {
+    pub scatter_gather: bool,
+    pub maximum_length: u64,
+    pub dma64: bool,
+}
+
+/// Result of an idempotent adapter request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DmaAdapterGrant {
+    pub adapter_id: u64,
+    pub num_map_registers: u32,
+    pub created: bool,
 }
 
 struct Adapter {
@@ -193,6 +212,53 @@ impl DmaManager {
             active: true,
         });
         id
+    }
+
+    /// Resolve one live DMA adapter for an exact hosted devnode generation.
+    ///
+    /// An exact retry returns the existing adapter. A different request cannot mutate a live
+    /// adapter, and a retired owner generation never aliases a replacement adapter ID.
+    pub fn request_adapter(
+        &mut self,
+        owner: DmaOwner,
+        request: DmaAdapterRequest,
+    ) -> Result<DmaAdapterGrant, DmaError> {
+        if owner.driver_host_id == 0
+            || owner.driver_host_cookie == 0
+            || owner.devnode_id == 0
+            || request.maximum_length == 0
+        {
+            return Err(DmaError::OutOfRange);
+        }
+        if let Some(adapter) = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.owner == owner && adapter.active)
+        {
+            if adapter.sg_supported != request.scatter_gather
+                || adapter.max_length != request.maximum_length
+                || adapter.dma64 != request.dma64
+            {
+                return Err(DmaError::AdapterConflict);
+            }
+            return Ok(DmaAdapterGrant {
+                adapter_id: adapter.id,
+                num_map_registers: adapter.num_map_registers,
+                created: false,
+            });
+        }
+
+        let adapter_id = self.register_adapter(
+            owner,
+            request.scatter_gather,
+            request.maximum_length,
+            request.dma64,
+        );
+        Ok(DmaAdapterGrant {
+            adapter_id,
+            num_map_registers: 64,
+            created: true,
+        })
     }
 
     pub fn num_map_registers(&self, adapter_id: u64) -> Option<u32> {
@@ -806,6 +872,86 @@ mod tests {
 
     fn owner() -> DmaOwner {
         DmaOwner::new(1, 100, 10)
+    }
+
+    fn adapter_request() -> DmaAdapterRequest {
+        DmaAdapterRequest {
+            scatter_gather: true,
+            maximum_length: 4096,
+            dma64: true,
+        }
+    }
+
+    #[test]
+    fn adapter_request_is_exact_and_idempotent() {
+        let mut d = DmaManager::new();
+        let first = d.request_adapter(owner(), adapter_request()).unwrap();
+        let replay = d.request_adapter(owner(), adapter_request()).unwrap();
+
+        assert!(first.created);
+        assert_eq!(first.num_map_registers, 64);
+        assert_eq!(
+            replay,
+            DmaAdapterGrant {
+                created: false,
+                ..first
+            }
+        );
+        assert_eq!(d.num_map_registers(first.adapter_id), Some(64));
+    }
+
+    #[test]
+    fn live_adapter_request_rejects_property_changes_without_mutation() {
+        let mut d = DmaManager::new();
+        let first = d.request_adapter(owner(), adapter_request()).unwrap();
+
+        assert_eq!(
+            d.request_adapter(
+                owner(),
+                DmaAdapterRequest {
+                    maximum_length: 8192,
+                    ..adapter_request()
+                }
+            ),
+            Err(DmaError::AdapterConflict)
+        );
+        assert_eq!(
+            d.request_adapter(owner(), adapter_request())
+                .unwrap()
+                .adapter_id,
+            first.adapter_id
+        );
+    }
+
+    #[test]
+    fn retired_adapter_request_allocates_a_fresh_identity() {
+        let mut d = DmaManager::new();
+        let first = d.request_adapter(owner(), adapter_request()).unwrap();
+        d.put_adapter(first.adapter_id);
+        let replacement = d.request_adapter(owner(), adapter_request()).unwrap();
+
+        assert!(replacement.created);
+        assert_ne!(replacement.adapter_id, first.adapter_id);
+        assert_eq!(
+            d.alloc_common_buffer(owner(), first.adapter_id, 16, 0x1000),
+            Err(DmaError::Inactive)
+        );
+    }
+
+    #[test]
+    fn adapter_request_rejects_incomplete_owner_and_zero_length() {
+        let mut d = DmaManager::new();
+        assert_eq!(
+            d.request_adapter(
+                DmaOwner::new(0, 100, 10),
+                DmaAdapterRequest {
+                    maximum_length: 0,
+                    ..adapter_request()
+                }
+            ),
+            Err(DmaError::OutOfRange)
+        );
+        assert_eq!(d.num_map_registers(1), None);
     }
 
     #[test]

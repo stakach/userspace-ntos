@@ -48252,6 +48252,7 @@ fn hosted_dma_status(error: DmaError) -> nt_status::NtStatus {
         DmaError::StaleId | DmaError::Inactive | DmaError::OutOfRange => {
             nt_status::NtStatus::INVALID_DEVICE_REQUEST
         }
+        DmaError::AdapterConflict => nt_status::NtStatus::CONFLICTING_ADDRESSES,
     }
 }
 

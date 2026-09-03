@@ -23424,6 +23424,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     requesting component, and retire it with the device generation. Do not infer DMA capability
     from PCI class, allocate windows to every device, or retain the eager path as a fallback.
 
+    B3 dynamic DMA request core checkpoint (2026-09-03, host and freestanding green; executive
+    wiring open): `nt-dma-manager` now accepts a typed `DmaAdapterRequest` only for a complete
+    driver-host cookie and devnode identity. The first request creates an adapter, an exact retry
+    returns the same adapter and map-register count, conflicting live properties fail without
+    mutation, and put/revoke forces the next generation to receive a fresh adapter ID. Focused
+    validation passes all 25 DMA-manager tests and the freestanding executive check at the existing
+    213-warning baseline. Next carry validated `DEVICE_DESCRIPTION` properties over a dedicated
+    authenticated component service, create the IOMMU/window ownership on the first request, and
+    delete `hosted_pci_driver_needs_dma` plus eager DMA fields from PCI discovery.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
