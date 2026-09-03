@@ -24330,7 +24330,11 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `KeCancelTimer`, `KeReadStateTimer`, and `PoRequestShutdownEvent` imports. The executive owns
     timer state and deadlines, feeds the earliest provider Timer into the existing one-shot timer
     source, expires due timers, and selects matching parked provider waits. The provider-wait suite
-    passes 56 tests and the freestanding executive remains at 227 warnings. Next prove in the
+    passes 56 tests and both freestanding debug and release executive builds remain at 227 warnings.
+    The canonical table is created lazily on the first publication from the dynamically registered
+    provider; executive construction has no win32k identity dependency, and a replacement provider
+    generation cannot inherit the old table. Per-source timer telemetry also covers the new drain
+    slot. Next prove in the
     serialized desktop run that the raw-input system lane blocks on the genuine shutdown
     Event/`MasterTimer` set and wakes to process timers without the prior tight input-read loop.
     After that gate, complete Timer DPC delivery and propagate final deferred-retirement completion

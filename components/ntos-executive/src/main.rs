@@ -7391,9 +7391,9 @@ pub(crate) static DRAIN_REARM_TICKS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to eleven wake paths; one of them owns
-/// the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 12;
+/// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
+/// one of them owns the whole boot, so they are timed individually.
+pub(crate) const SUBDRAIN_N: usize = 13;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -24321,7 +24321,7 @@ struct ExecNtHandler {
     event_objects: nt_kernel_exec::EventObjectRegistry,
     /// Canonical dispatcher state for provider-owned kernel Timers. Component addresses never
     /// enter this table; provider-local identities resolve to generation-fenced Timer IDs.
-    provider_timers: nt_provider_wait::ProviderTimerTable,
+    provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
     /// Native waitable timers, keyed by `obj_ns` timer entries. Dispatcher signal state is stored in
     /// `events`; this table holds due-time, period, and optional APC metadata.
     user_timers: nt_user_timer::TimerTable,

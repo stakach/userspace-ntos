@@ -497,6 +497,10 @@ impl ProviderTimerTable {
         })
     }
 
+    pub const fn provider(&self) -> ProviderDomainIdentity {
+        self.provider
+    }
+
     pub fn publish(
         &mut self,
         local_identity: u64,

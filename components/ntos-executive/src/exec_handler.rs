@@ -173,6 +173,8 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
             Some(nt_provider_wait::ProviderWaitObjectType::Timer) => {
                 ProviderDispatcherLease::Timer(
                     self.provider_timers
+                        .as_mut()
+                        .ok_or(STATUS_INVALID_PARAMETER)?
                         .acquire_wait(owner, object)
                         .map_err(|_| STATUS_INVALID_PARAMETER)?,
                 )
@@ -198,6 +200,8 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
             }
             ProviderDispatcherLease::Timer(lease) => self
                 .provider_timers
+                .as_ref()
+                .expect("provider Timer table disappeared with a live wait lease")
                 .is_ready(lease)
                 .expect("provider Timer wait lost its canonical lease"),
         }
@@ -221,6 +225,8 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
             }
             ProviderDispatcherLease::Timer(lease) => self
                 .provider_timers
+                .as_mut()
+                .expect("provider Timer table disappeared with a live wait lease")
                 .consume_ready(lease)
                 .expect("provider Timer wait selected an unsignalled object"),
         }
@@ -238,6 +244,8 @@ impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
             },
             ProviderDispatcherLease::Timer(lease) => {
                 self.provider_timers
+                    .as_mut()
+                    .expect("provider Timer table disappeared with a live wait lease")
                     .release_wait(lease)
                     .expect("provider Timer wait lost its exact lease during release");
             }
@@ -4060,8 +4068,6 @@ impl ExecNtHandler {
         let time_configuration = SystemTimeConfiguration::default();
         let time_zone_information = time_configuration.information;
         let real_time_is_universal = time_configuration.real_time_is_universal;
-        let provider_timer_domain = crate::current_win32k_provider_domain()
-            .expect("executive construction requires the registered win32k provider domain");
         let BootstrapProcessManagerSeed {
             pm,
             pids: bootstrap_pids,
@@ -4104,11 +4110,7 @@ impl ExecNtHandler {
             event_objects,
             nt_kernel_exec::EventObjectRegistry::with_capacity(192, 192)
         );
-        write_field!(
-            provider_timers,
-            nt_provider_wait::ProviderTimerTable::new(provider_timer_domain)
-                .expect("registered win32k provider domain must be valid")
-        );
+        write_field!(provider_timers, None);
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
         write_field!(job_time_sample_deadline, u64::MAX);
@@ -26312,12 +26314,23 @@ impl ExecNtHandler {
         if !crate::win32k_provider_domain_is_current(provider) || timer_type > 1 {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        if self.provider_timers.is_none() {
+            self.provider_timers = Some(
+                nt_provider_wait::ProviderTimerTable::new(provider)
+                    .map_err(|_| STATUS_INVALID_PARAMETER)?,
+            );
+        }
+        let timers = self
+            .provider_timers
+            .as_mut()
+            .filter(|timers| timers.provider() == provider)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
         let kind = if timer_type == 0 {
             nt_provider_wait::ProviderTimerKind::Notification
         } else {
             nt_provider_wait::ProviderTimerKind::Synchronization
         };
-        self.provider_timers
+        timers
             .publish(local_identity, kind)
             .map(nt_provider_wait::ProviderTimerId::wait_object)
             .map_err(|_| STATUS_INVALID_PARAMETER)
@@ -26335,6 +26348,9 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_timers
+            .as_mut()
+            .filter(|timers| timers.provider() == provider)
+            .ok_or(STATUS_INVALID_PARAMETER)?
             .set_local(
                 local_identity,
                 due_time_100ns,
@@ -26354,6 +26370,9 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_timers
+            .as_mut()
+            .filter(|timers| timers.provider() == provider)
+            .ok_or(STATUS_INVALID_PARAMETER)?
             .cancel_local(local_identity)
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
@@ -26369,9 +26388,14 @@ impl ExecNtHandler {
         }
         let id = self
             .provider_timers
+            .as_ref()
+            .filter(|timers| timers.provider() == provider)
+            .ok_or(STATUS_INVALID_PARAMETER)?
             .id_for_local(local_identity)
             .ok_or(STATUS_INVALID_PARAMETER)?;
         self.provider_timers
+            .as_ref()
+            .expect("provider Timer table disappeared during an immutable query")
             .read_state(id)
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
@@ -26386,6 +26410,9 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_timers
+            .as_mut()
+            .filter(|timers| timers.provider() == provider)
+            .ok_or(STATUS_INVALID_PARAMETER)?
             .request_retire_local(local_identity)
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
@@ -26400,6 +26427,9 @@ impl ExecNtHandler {
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.provider_timers
+            .as_mut()
+            .filter(|timers| timers.provider() == provider)
+            .ok_or(STATUS_INVALID_PARAMETER)?
             .ack_retirement(retirement)
             .map_err(|_| STATUS_INVALID_PARAMETER)
     }
@@ -26408,7 +26438,9 @@ impl ExecNtHandler {
         &self,
         now: nt_delay_execution::TimeSnapshot,
     ) -> Option<u64> {
-        self.provider_timers.next_deadline(now)
+        self.provider_timers
+            .as_ref()
+            .and_then(|timers| timers.next_deadline(now))
     }
 
     pub(crate) fn provider_timer_expire_due(
@@ -26416,7 +26448,10 @@ impl ExecNtHandler {
         now: nt_delay_execution::TimeSnapshot,
     ) -> u64 {
         let mut expired = 0u64;
-        while self.provider_timers.expire_next_due(now).is_some() {
+        let Some(timers) = self.provider_timers.as_mut() else {
+            return 0;
+        };
+        while timers.expire_next_due(now).is_some() {
             expired = expired.saturating_add(1);
         }
         expired
