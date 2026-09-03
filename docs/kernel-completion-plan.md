@@ -24095,6 +24095,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     next serialized run must show CSRSS dispatching both system-thread requests rather than
     rejecting the first receive.
 
+    B3 related-port reply correction (2026-09-03, host and freestanding green; desktop rerun
+    pending): the next serialized run proved that CSRSS accepted the ordinary retained request,
+    created a genuine CSR worker, and advanced from the old `STATUS_INVALID_PARAMETER` receive
+    failure. It then replied through handle `0x1c`, the Winlogon CSR process's server communication
+    port, while the request remained owned by retained named-port object `0x12`; the broker correctly
+    rejected that previously unmodeled route as `STATUS_REPLY_MESSAGE_MISMATCH`. ReactOS's native
+    request loop confirms this is the classic LPC contract: it receives on `CsrApiPort`, locates the
+    request's `CSR_THREAD`, then selects `CsrThread->Process->ClientPort` for the reply. `nt-port-core`
+    now authorizes that related server handle only when its API, named connection port, and client
+    process match, then completes only the exact retained request identity. A wrong process,
+    unrelated port, stale request, or wrong message ID remains rejected. The exact route is covered
+    in both the core and client/server adapter tests; all 21 `nt-port-core` and 23 `nt-lpc-server`
+    tests pass, and the freestanding executive remains green at 221 warnings. Rerun desktop and
+    require both retained replies to resume their win32k continuations in LIFO order.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

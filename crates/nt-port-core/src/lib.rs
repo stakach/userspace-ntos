@@ -1692,29 +1692,87 @@ impl PortCore {
             let delivered_index = connection
                 .delivered_requests
                 .iter()
-                .position(|request| request.identity == identity)
+                .position(|request| request.identity == identity);
+            if let Some(delivered_index) = delivered_index {
+                if bytes.len() > connection.limits.max_message as usize {
+                    return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+                }
+                let old_charge = connection.delivered_requests[delivered_index].pool_charge;
+                let account = connection.pool_account;
+                let provenance = MessageProvenance {
+                    connection_id: connection.id,
+                    client: identity.client,
+                };
+                let stored = self.allocate_stored_message(
+                    account,
+                    old_charge,
+                    bytes,
+                    attrs,
+                    provenance,
+                    0,
+                    Some(identity),
+                )?;
+                let connection = &mut self.connections[connection_index];
+                connection.delivered_requests.remove(delivered_index);
+                connection.client_inbox.push(stored);
+                return Ok(());
+            }
+
+            // Classic LPC servers select a client's communication port after receiving a
+            // kernel-originated request on the related named connection port. The retained object
+            // and exact request identity still own the reply; the server handle is only an
+            // authorized route back to that object.
+            if connection.client_id.process != identity.client.process {
+                return Err(NtStatus::REPLY_MESSAGE_MISMATCH);
+            }
+            let related_port = self
+                .ports
+                .iter()
+                .find(|port| {
+                    port.api == connection.server_api && port.name == connection.port_name
+                })
                 .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
-            if bytes.len() > connection.limits.max_message as usize {
+            let endpoint_index = self
+                .kernel_endpoints
+                .iter()
+                .position(|endpoint| {
+                    endpoint.port_object_id == related_port.object_id
+                        && endpoint
+                            .delivered_requests
+                            .iter()
+                            .any(|request| request.identity == identity)
+                })
+                .ok_or(NtStatus::REPLY_MESSAGE_MISMATCH)?;
+            if bytes.len() > related_port.limits.max_message as usize {
                 return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
             }
-            let old_charge = connection.delivered_requests[delivered_index].pool_charge;
-            let account = connection.pool_account;
-            let provenance = MessageProvenance {
-                connection_id: connection.id,
-                client: identity.client,
-            };
+            let delivered_index = self.kernel_endpoints[endpoint_index]
+                .delivered_requests
+                .iter()
+                .position(|request| request.identity == identity)
+                .expect("matching retained-port request was selected");
+            let old_charge = self.kernel_endpoints[endpoint_index].delivered_requests
+                [delivered_index]
+                .pool_charge;
+            let account = related_port.pool_account;
             let stored = self.allocate_stored_message(
                 account,
                 old_charge,
                 bytes,
                 attrs,
-                provenance,
+                MessageProvenance {
+                    connection_id: 0,
+                    client: identity.client,
+                },
                 0,
                 Some(identity),
             )?;
-            let connection = &mut self.connections[connection_index];
-            connection.delivered_requests.remove(delivered_index);
-            connection.client_inbox.push(stored);
+            self.kernel_endpoints[endpoint_index]
+                .delivered_requests
+                .remove(delivered_index);
+            self.kernel_endpoints[endpoint_index]
+                .client_inbox
+                .push(stored);
             return Ok(());
         }
 
@@ -2915,6 +2973,60 @@ mod tests {
             core.release_connection_port(kernel),
             Err(NtStatus::INVALID_PORT_HANDLE)
         );
+    }
+
+    #[test]
+    fn related_server_port_replies_to_retained_connection_port_request() {
+        let mut core = PortCore::new();
+        core.set_accept_policy(AcceptPolicy::Manual);
+        let listen = core.create_port(&utf16("\\Windows\\ApiPort"), PortApi::Lpc);
+        let client_id = ClientId {
+            process: 0x220,
+            thread: 0x224,
+        };
+        let connection = match core
+            .connect_with_client_id(
+                &utf16("\\Windows\\ApiPort"),
+                PortApi::Lpc,
+                0,
+                &[],
+                client_id,
+            )
+            .unwrap()
+        {
+            ConnectOutcome::Pending { connection_id } => connection_id,
+            _ => unreachable!(),
+        };
+        core.receive(listen).unwrap();
+        let server = core.accept(connection, true, 0).unwrap();
+        let client = core.complete(connection).unwrap().0;
+        let kernel = core.retain_connection_port(listen).unwrap();
+        let identity = MessageIdentity {
+            client: client_id,
+            message_id: 17,
+        };
+
+        core.send_kernel_request_message(kernel, b"request", MessageAttrs::default(), identity)
+            .unwrap();
+        assert_eq!(
+            core.receive_message(listen).unwrap().unwrap().bytes,
+            b"request"
+        );
+        core.send_reply_message(server, b"reply", MessageAttrs::default(), identity)
+            .unwrap();
+        assert_eq!(
+            core.receive_reply_message(kernel, identity)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"reply"
+        );
+
+        core.release_connection_port(kernel).unwrap();
+        core.close_port(client);
+        core.close_port(server);
+        core.close_port(listen);
+        assert_eq!(core.port_count(), 0);
     }
 
     #[test]

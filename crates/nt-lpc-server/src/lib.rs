@@ -1514,6 +1514,17 @@ mod tests {
         let listen = client
             .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
             .unwrap();
+        let pending = client
+            .connect_port_with_client_id(&utf16("\\Windows\\ApiPort"), 0, &[], 0x220, 0x224)
+            .unwrap();
+        client.reply_wait_receive(listen).unwrap();
+        let server_port = client
+            .accept_connect(pending.connection_id, true, 0)
+            .unwrap();
+        let client_port = client
+            .complete_connect(pending.connection_id)
+            .unwrap()
+            .handle;
         let retained = client.retain_port_object(listen).unwrap();
         let request = port_message(0, b"create-system-thread");
         let result = client
@@ -1539,7 +1550,7 @@ mod tests {
         let mut reply = received.connection_info;
         reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
         assert_eq!(
-            client.reply_wait_receive_with_reply(listen, &reply),
+            client.reply_wait_receive_with_reply(server_port, &reply),
             Err(NtStatus::PENDING)
         );
         assert_eq!(
@@ -1550,6 +1561,8 @@ mod tests {
         );
 
         client.release_port_object(retained).unwrap();
+        client.close_port(client_port).unwrap();
+        client.close_port(server_port).unwrap();
         client.close_port(listen).unwrap();
         assert_eq!(server.port_count(), 0);
     }
