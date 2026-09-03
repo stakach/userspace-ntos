@@ -24476,6 +24476,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     production device/runtime publication for remaining one-boot fixture identities. Keep the
     accepted continuation ledger and serialized desktop gate green through each slice.
 
+    B3 USER-object reference-accounting checkpoint (2026-09-04, host and freestanding green;
+    desktop acceptance pending): the host-tested win32k Object Manager now retains canonical
+    pointer and handle counts for each Desktop/WindowStation body. The initial published handle owns
+    one pointer reference, duplicate/open-by-pointer handles increment both counts, close decrements
+    both, and `ObReferenceObject` plus `ObReferenceObjectByHandle` acquire a transient pointer
+    reference that `ObDereferenceObject` releases without crossing the handle-owned floor. All
+    aliases resolve back to the same canonical count pair, overflow fails before publication, and a
+    stale or duplicate close cannot mutate ownership. The live win32k imports use these operations;
+    the prior USER-object reference/dereference no-op is deleted. `nt-object-manager` is green at
+    69 tests and the freestanding executive remains at 227 warnings.
+
+    This slice deliberately does not free session-pool bodies yet. Final deletion must first own the
+    Desktop/WindowStation delete procedure, namespace/cache unlink, named-desktop aliases, security
+    state, and pool allocation as one retryable finalizer; dropping the body when a counter reaches
+    zero without those owners would be another leak/corruption fallback. Next add that finalizer and
+    canonical-handle close, then extend the same typed external-reference contract to Process,
+    Thread, Token, Section, File, and Device projections before provider teardown is allowed.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

@@ -3246,6 +3246,11 @@ fn classify_type(obj_type: u64) -> Option<ObKind> {
 }
 
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
+    if let Some(count) = unsafe {
+        (&mut *core::ptr::addr_of_mut!(OBJ_TABLE)).reference_by_body(object)
+    } {
+        return count as u64;
+    }
     if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
         return unsafe {
             (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES))
@@ -3263,6 +3268,13 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
 }
 
 extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
+    if unsafe { (&*core::ptr::addr_of!(OBJ_TABLE)).counts_by_body(object) }.is_some() {
+        return unsafe {
+            (&mut *core::ptr::addr_of_mut!(OBJ_TABLE))
+                .dereference_by_body(object)
+                .expect("USER object pointer reference underflow") as u64
+        };
+    }
     if unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(object) } {
         let remaining = unsafe {
             (&mut *core::ptr::addr_of_mut!(WIN32K_LPC_PORT_REFERENCES))
@@ -5427,7 +5439,7 @@ extern "win64" fn s_ob_reference_object_by_handle(
         }
         return 0;
     }
-    let table = unsafe { &*core::ptr::addr_of!(OBJ_TABLE) };
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(OBJ_TABLE) };
     let (obj, granted_access) = match table.lookup(handle) {
         Some((kind, body)) => {
             if !nt_object_manager::win32k_ob::object_type_matches(kind, obj_type) {
@@ -5441,6 +5453,9 @@ extern "win64" fn s_ob_reference_object_by_handle(
                 ObKind::Desktop => 0x000f_01ff,
                 ObKind::Other => u32::MAX,
             };
+            if table.reference_by_body(body).is_none() {
+                return STATUS_INSUFFICIENT_RESOURCES_I32;
+            }
             (body, access)
         }
         None => {

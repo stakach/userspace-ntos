@@ -208,6 +208,8 @@ pub const OB_SECURITY_DESCRIPTOR_MAX: usize = 1024;
 struct ObjectEntry {
     kind: ObKind,
     body: u64,
+    pointer_count: u32,
+    handle_count: u32,
     security_len: usize,
     security: [u8; OB_SECURITY_DESCRIPTOR_MAX],
 }
@@ -217,6 +219,11 @@ impl ObjectEntry {
         Self {
             kind,
             body,
+            // A published USER object starts with one handle. ObInsertObject consumes the creator
+            // reference while establishing that handle, so the initial pointer and handle counts
+            // are both one.
+            pointer_count: 1,
+            handle_count: 1,
             security_len: 0,
             security: [0; OB_SECURITY_DESCRIPTOR_MAX],
         }
@@ -238,6 +245,40 @@ impl ObjectEntry {
 
     fn set_body(&mut self, body: u64) {
         self.body = body;
+    }
+
+    fn reference(&mut self) -> Option<u32> {
+        self.pointer_count = self.pointer_count.checked_add(1)?;
+        Some(self.pointer_count)
+    }
+
+    fn dereference(&mut self) -> Option<u32> {
+        if self.pointer_count <= self.handle_count {
+            return None;
+        }
+        self.pointer_count -= 1;
+        Some(self.pointer_count)
+    }
+
+    fn open_handle(&mut self) -> bool {
+        let Some(pointer_count) = self.pointer_count.checked_add(1) else {
+            return false;
+        };
+        let Some(handle_count) = self.handle_count.checked_add(1) else {
+            return false;
+        };
+        self.pointer_count = pointer_count;
+        self.handle_count = handle_count;
+        true
+    }
+
+    fn close_handle(&mut self) -> bool {
+        if self.handle_count <= 1 || self.pointer_count < self.handle_count {
+            return false;
+        }
+        self.handle_count -= 1;
+        self.pointer_count -= 1;
+        true
     }
 
     fn security_descriptor(&self) -> Option<&[u8]> {
@@ -425,6 +466,14 @@ impl ObHandleTable {
     pub fn duplicate(&mut self, handle: u64) -> Option<u64> {
         let (kind, body) = self.lookup(handle)?;
         let index = self.aliases.iter().position(Option::is_none)?;
+        let canonical = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.kind == kind && entry.body == body)?;
+        if !canonical.open_handle() {
+            return None;
+        }
         self.aliases[index] = Some((kind, body));
         Some(OB_ALIAS_HANDLE_BASE + (index as u64) * 4)
     }
@@ -436,13 +485,22 @@ impl ObHandleTable {
             return false;
         }
         let index = ((handle - OB_ALIAS_HANDLE_BASE) >> 2) as usize;
-        match self.aliases.get_mut(index) {
-            Some(slot @ Some(_)) => {
-                *slot = None;
-                true
-            }
-            _ => false,
+        let Some((kind, body)) = self.aliases.get(index).copied().flatten() else {
+            return false;
+        };
+        let Some(canonical) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.kind == kind && entry.body == body)
+        else {
+            return false;
+        };
+        if !canonical.close_handle() {
+            return false;
         }
+        self.aliases[index] = None;
+        true
     }
 
     /// Resolve a handle to its `(kind, body)`, or `None` if it is not a registered win32k object
@@ -467,6 +525,34 @@ impl ObHandleTable {
     /// Resolve a handle to its body, or 0 if it is not a registered win32k object handle.
     pub fn lookup_body(&self, handle: u64) -> u64 {
         self.lookup(handle).map(|(_, body)| body).unwrap_or(0)
+    }
+
+    /// Return `(pointer_count, handle_count)` for the canonical object containing `body`.
+    pub fn counts_by_body(&self, body: u64) -> Option<(u32, u32)> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|entry| entry.body == body)
+            .map(|entry| (entry.pointer_count, entry.handle_count))
+    }
+
+    /// Acquire one pointer reference by object body, as `ObReferenceObject` does.
+    pub fn reference_by_body(&mut self, body: u64) -> Option<u32> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.body == body)?
+            .reference()
+    }
+
+    /// Release one non-handle pointer reference by object body. The handle-owned floor cannot be
+    /// crossed; final handle teardown remains a separate operation with an explicit finalizer.
+    pub fn dereference_by_body(&mut self, body: u64) -> Option<u32> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.body == body)?
+            .dereference()
     }
 
     fn window_station_body_for_handle(&self, root_handle: u64) -> Option<u64> {
@@ -788,14 +874,45 @@ mod tests {
     fn duplicate_aliases_the_typed_object_and_closes_independently() {
         let mut t = ObHandleTable::new();
         let original = t.register(ObKind::Desktop, 0xD00D_0000);
+        assert_eq!(t.counts_by_body(0xD00D_0000), Some((1, 1)));
         let duplicate = t.duplicate(original).unwrap();
+        assert_eq!(t.counts_by_body(0xD00D_0000), Some((2, 2)));
         assert_ne!(duplicate, original);
         assert_eq!(t.lookup(duplicate), t.lookup(original));
         assert!(t.close(duplicate));
+        assert_eq!(t.counts_by_body(0xD00D_0000), Some((1, 1)));
         assert_eq!(t.lookup(duplicate), None);
         assert_eq!(t.lookup(original), Some((ObKind::Desktop, 0xD00D_0000)));
         assert!(!t.close(duplicate));
         assert_eq!(t.duplicate(original), Some(duplicate));
+    }
+
+    #[test]
+    fn user_pointer_references_cannot_cross_the_handle_owned_floor() {
+        let mut t = ObHandleTable::new();
+        let handle = t.register(ObKind::WindowStation, 0x5700_0000);
+
+        assert_eq!(t.counts_by_body(0x5700_0000), Some((1, 1)));
+        assert_eq!(t.reference_by_body(0x5700_0000), Some(2));
+        assert_eq!(t.counts_by_body(0x5700_0000), Some((2, 1)));
+        assert_eq!(t.dereference_by_body(0x5700_0000), Some(1));
+        assert_eq!(t.dereference_by_body(0x5700_0000), None);
+        assert_eq!(t.lookup(handle), Some((ObKind::WindowStation, 0x5700_0000)));
+        assert_eq!(t.counts_by_body(0x5700_0000), Some((1, 1)));
+    }
+
+    #[test]
+    fn duplicate_handle_and_pointer_references_balance_independently() {
+        let mut t = ObHandleTable::new();
+        let handle = t.register(ObKind::Desktop, 0xD00D_0000);
+        let alias = t.duplicate(handle).unwrap();
+
+        assert_eq!(t.reference_by_body(0xD00D_0000), Some(3));
+        assert_eq!(t.counts_by_body(0xD00D_0000), Some((3, 2)));
+        assert!(t.close(alias));
+        assert_eq!(t.counts_by_body(0xD00D_0000), Some((2, 1)));
+        assert_eq!(t.dereference_by_body(0xD00D_0000), Some(1));
+        assert_eq!(t.counts_by_body(0xD00D_0000), Some((1, 1)));
     }
 
     #[test]
