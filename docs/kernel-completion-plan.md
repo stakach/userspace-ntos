@@ -24785,6 +24785,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the same durable transaction, then converge and delete the hosted-driver path-only mutation
     machinery.
 
+    B3 durable kernel registry create tranche 16 (2026-09-04, host and freestanding green):
+    win32k's seven-argument `ZwCreateKey` import now captures the x64 `OBJECT_ATTRIBUTES`, counted
+    UTF-16 key/class names, relative root handle, create options, and optional disposition in the
+    component before sending a pointer-free request. Existing SYSTEM keys acquire a fresh CM lease
+    and return `REG_OPENED_EXISTING_KEY` without a mutation. Missing keys are first resolved through
+    CM to their physical control-set path; the broker must open and close the immediate parent
+    before it submits `CreateKey`, preventing CM's lower recursive helper from manufacturing absent
+    intermediate keys. A new key and optional class are one durable generation-checked mutation,
+    followed by a fresh lease and `REG_CREATED_NEW_KEY` result. Failed handle publication closes the
+    lease, and kernel-mode failure does not pre-zero caller outputs.
+
+    All 22 `nt-config-client` tests and all 46 `nt-compat-exports` tests pass, and the freestanding
+    executive release build succeeds at the 254-warning baseline. Thirty-five audited code imports
+    remain. This closes the nonvolatile SYSTEM create path, not the entire contract: CM must gain a
+    volatile namespace before `REG_OPTION_VOLATILE`, link/open-link ownership before link options,
+    privilege-backed backup/restore behavior, new-key security-descriptor inheritance/application,
+    and mutable HKU/HKLM-non-SYSTEM leases. Those legal but unowned option/namespace requests fail
+    explicitly; they never fall through to the old generic or overlay stores. Next converge the
+    hosted-driver registry broker on these lease/durability rules and delete its path-only handles
+    and recursive generic SYSTEM mutations.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

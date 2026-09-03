@@ -11933,6 +11933,17 @@ const WIN32K_REGISTRY_OP_APPEND_SET_VALUE: u64 = 7;
 const WIN32K_REGISTRY_OP_COMMIT_SET_VALUE: u64 = 8;
 const WIN32K_REGISTRY_OP_ABORT_SET_VALUE: u64 = 9;
 const WIN32K_REGISTRY_OP_DELETE_VALUE: u64 = 10;
+const WIN32K_REGISTRY_OP_CREATE_KEY: u64 = 11;
+const REG_OPTION_VOLATILE: u32 = 0x0000_0001;
+const REG_OPTION_CREATE_LINK: u32 = 0x0000_0002;
+const REG_OPTION_BACKUP_RESTORE: u32 = 0x0000_0004;
+const REG_OPTION_OPEN_LINK: u32 = 0x0000_0008;
+const REG_OPTION_VALID_MASK: u32 = REG_OPTION_VOLATILE
+    | REG_OPTION_CREATE_LINK
+    | REG_OPTION_BACKUP_RESTORE
+    | REG_OPTION_OPEN_LINK;
+const REG_CREATED_NEW_KEY: u64 = 1;
+const REG_OPENED_EXISTING_KEY: u64 = 2;
 const _: () = assert!(
     WIN32K_REGISTRY_DATA_OFF + WIN32K_REGISTRY_VALUE_CAP as u64 <= WIN32K_REGISTRY_BYTES as u64
 );
@@ -12635,6 +12646,113 @@ unsafe fn service_win32k_registry_delete_value(handle: u64) -> Result<(), i32> {
     .map_err(|status| status as i32)
 }
 
+unsafe fn service_win32k_registry_create(
+    root: u64,
+    create_options: u64,
+    class_present: u64,
+) -> Result<(u64, u64), i32> {
+    if create_options > u32::MAX as u64 || class_present > 1 {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let create_options = create_options as u32;
+    if create_options & !REG_OPTION_VALID_MASK != 0 {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    if create_options != 0 {
+        return Err(STATUS_NOT_SUPPORTED_I32);
+    }
+    let path_len = read_volatile(
+        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_KEY_LEN) as *const u32,
+    ) as usize;
+    let class_len = read_volatile(
+        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_LEN) as *const u32,
+    ) as usize;
+    if path_len == 0
+        || (class_present == 0 && class_len != 0)
+        || WIN32K_REGISTRY_KEY_OFF
+            .checked_add(path_len as u64)
+            .and_then(|offset| offset.checked_add(class_len as u64))
+            .is_none_or(|end| end > WIN32K_REGISTRY_BYTES as u64)
+    {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let path = read_win32k_registry_bytes(WIN32K_REGISTRY_KEY_LEN, WIN32K_REGISTRY_KEY_OFF)
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    let class = if class_present != 0 {
+        let bytes = read_win32k_registry_bytes(
+            WIN32K_REGISTRY_VALUE_LEN,
+            WIN32K_REGISTRY_KEY_OFF + path_len as u64,
+        )
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+        Some(
+            alloc::string::String::from_utf8(bytes)
+                .map_err(|_| STATUS_INVALID_PARAMETER_I32)?,
+        )
+    } else {
+        None
+    };
+    let absolute = if win32k_reg_path_is_absolute(&path) {
+        system_hive_absolute_path(&path)?
+    } else {
+        system_hive_relative_path_from_handle(root, &path)?
+    };
+
+    match open_cm_system_hive_target(&absolute) {
+        Ok(target) => {
+            let handle = match register_win32k_reg_handle(target) {
+                Ok(handle) => handle,
+                Err(target) => {
+                    let _ = close_win32k_reg_target(target);
+                    return Err(STATUS_NO_MEMORY);
+                }
+            };
+            return Ok((handle, REG_OPENED_EXISTING_KEY));
+        }
+        Err(STATUS_OBJECT_NAME_NOT_FOUND) => {}
+        Err(status) => return Err(status),
+    }
+
+    let resolved = crate::config_manager_resolve_system_hive_path(&absolute)?;
+    let Some(separator) = resolved.physical_path.rfind('\\') else {
+        return Err(0xC000_003Au32 as i32); // STATUS_OBJECT_PATH_NOT_FOUND
+    };
+    let parent = &resolved.physical_path[..separator];
+    if parent.is_empty() {
+        return Err(0xC000_003Au32 as i32);
+    }
+    let parent_lease = match crate::config_manager_open_system_hive_key(parent) {
+        Ok(opened) => opened.lease,
+        Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Err(0xC000_003Au32 as i32),
+        Err(status) => return Err(status),
+    };
+    crate::config_manager_close_system_hive_key(parent_lease)?;
+
+    let mut mutations = Vec::new();
+    mutations
+        .try_reserve_exact(1 + usize::from(class.is_some()))
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
+    mutations.push(nt_config_client::SystemHiveMutation::CreateKey {
+        path: &resolved.physical_path,
+    });
+    if let Some(class) = class.as_deref() {
+        mutations.push(nt_config_client::SystemHiveMutation::SetKeyClass {
+            path: &resolved.physical_path,
+            class_name: Some(class),
+        });
+    }
+    crate::persist_and_publish_system_hive_mutation(&mutations)
+        .map_err(|status| status as i32)?;
+    let target = open_cm_system_hive_target(&resolved.physical_path)?;
+    let handle = match register_win32k_reg_handle(target) {
+        Ok(handle) => handle,
+        Err(target) => {
+            let _ = close_win32k_reg_target(target);
+            return Err(STATUS_NO_MEMORY);
+        }
+    };
+    Ok((handle, REG_CREATED_NEW_KEY))
+}
+
 unsafe fn service_win32k_registry_open(root: u64, path: &[u8]) -> Result<u64, i32> {
     let target = if !win32k_reg_path_is_absolute(path) {
         let absolute = system_hive_relative_path_from_handle(root, path)?;
@@ -12875,6 +12993,12 @@ pub(crate) unsafe fn service_registry_request(
             Ok(()) => (0, 0, 0),
             Err(status) => (status, 0, 0),
         },
+        WIN32K_REGISTRY_OP_CREATE_KEY => {
+            match service_win32k_registry_create(arg, param1, param2) {
+                Ok((handle, disposition)) => (0, handle, disposition),
+                Err(status) => (status, 0, 0),
+            }
+        }
         _ => (STATUS_INVALID_PARAMETER_I32, 0, 0),
     }
 }
@@ -12902,6 +13026,84 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_
             return status;
         }
         write_unaligned(handle_out, hkey);
+    }
+    0
+}
+
+/// `NTSTATUS ZwCreateKey(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, ULONG, PUNICODE_STRING,
+/// ULONG, PULONG)`. CM resolves the final physical SYSTEM path; the broker validates its parent and
+/// durably creates only that final child before returning a newly leased provider handle.
+extern "win64" fn s_zw_create_key(
+    handle_out: *mut u64,
+    _desired_access: u64,
+    object_attributes: u64,
+    _title_index: u64,
+    class: u64,
+    create_options: u64,
+    disposition: *mut u32,
+) -> i32 {
+    if handle_out.is_null() || object_attributes == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    if create_options > u32::MAX as u64
+        || create_options as u32 & !REG_OPTION_VALID_MASK != 0
+    {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    unsafe {
+        if read_unaligned(object_attributes as *const u32) < 48 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let object_name = read_unaligned((object_attributes + 0x10) as *const u64);
+        let path = match read_unicode_string_utf8(object_name, false) {
+            Ok(path) if !path.is_empty() => path,
+            Ok(_) => return STATUS_INVALID_PARAMETER_I32,
+            Err(status) => return status,
+        };
+        let class = if class == 0 {
+            None
+        } else {
+            match read_unicode_string_utf8(class, false) {
+                Ok(class) => Some(class),
+                Err(status) => return status,
+            }
+        };
+        let class_len = class.as_ref().map_or(0, Vec::len);
+        if WIN32K_REGISTRY_KEY_OFF
+            .checked_add(path.len() as u64)
+            .and_then(|offset| offset.checked_add(class_len as u64))
+            .is_none_or(|end| end > WIN32K_REGISTRY_BYTES as u64)
+        {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        if !write_win32k_registry_bytes(
+            WIN32K_REGISTRY_KEY_LEN,
+            WIN32K_REGISTRY_KEY_OFF,
+            &path,
+        ) {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        if !write_win32k_registry_bytes(
+            WIN32K_REGISTRY_VALUE_LEN,
+            WIN32K_REGISTRY_KEY_OFF + path.len() as u64,
+            class.as_deref().unwrap_or(&[]),
+        ) {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let root = read_unaligned((object_attributes + 8) as *const u64);
+        let (status, handle, create_disposition) = win32k_registry_broker_call_with_params(
+            WIN32K_REGISTRY_OP_CREATE_KEY,
+            root,
+            create_options,
+            u64::from(class.is_some()),
+        );
+        if status != 0 {
+            return status;
+        }
+        write_unaligned(handle_out, handle);
+        if !disposition.is_null() {
+            write_unaligned(disposition, create_disposition as u32);
+        }
     }
     0
 }
@@ -14300,6 +14502,10 @@ fn register_trampolines() -> bool {
     reg.bind("NtOpenFile", s_zw_open_file_fail as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
+    reg.bind(
+        "ZwCreateKey",
+        s_zw_create_key as *const () as usize as u64,
+    );
     reg.bind(
         "ZwSetValueKey",
         s_zw_set_value_key as *const () as usize as u64,
