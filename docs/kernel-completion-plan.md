@@ -24108,7 +24108,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unrelated port, stale request, or wrong message ID remains rejected. The exact route is covered
     in both the core and client/server adapter tests; all 21 `nt-port-core` and 23 `nt-lpc-server`
     tests pass, and the freestanding executive remains green at 221 warnings. Rerun desktop and
-    require both retained replies to resume their win32k continuations in LIFO order.
+    require both retained replies to resume their exact win32k execution lanes.
+
+    B3 independent win32k execution-lane correction (2026-09-03, architecture frontier): the
+    related-port rerun accepted CSRSS's reply and created the first genuine system thread, but then
+    stopped with two component suspensions. The new CSRSS worker enters
+    `ONEPARAM_ROUTINE_CREATESYSTEMTHREADS`; `UserSystemThreadProc` becomes the permanent desktop or
+    RIT thread and is expected to remain inside win32k, commonly blocked in a provider Event wait.
+    The current single component TCB executes that dispatch inside the older LPC wait's nested C
+    stack, so global LIFO resumption incorrectly makes the ready outer request depend on an
+    intentionally long-lived inner thread. This contradicts the earlier requirement that a blocked
+    provider dispatch must not monopolize win32k's only execution context.
+
+    Replace that physical nesting with a dynamic pool of serialized win32k execution lanes. Every
+    lane shares win32k's VSpace and kernel state but owns a distinct stack, IPC buffer, endpoint,
+    MCS reply object, TCB, and generation. At most one lane may execute win32k code at a time; a lane
+    that reaches a provider, LPC, or user-callback suspension retains its own component reply object
+    and yields the execution token, allowing an idle or newly allocated lane to accept another NT
+    thread's dispatch. Readiness resumes the exact lane regardless of other lanes' wait duration.
+    Before waking it, restore the copied client/dispatch context and bounded shared request pages;
+    after it blocks or completes, return the execution token and retain or recycle that exact lane.
+    Model lane allocation, generation, idle/running/suspended transitions, exact reply ownership,
+    teardown, and no-capacity failure in a host-tested crate before wiring the seL4 TCB pool. Delete
+    the global `WIN32K_TCB`/`REPLY_W32_SLOT` authority and global-LIFO cross-thread rule in the same
+    cutover; retain LIFO only for genuinely nested callbacks within one lane. Acceptance requires
+    both system threads to coexist, both provider waits to remain independently resumable, the outer
+    Winlogon window-station call to complete, and the genuine desktop gate to return green.
+
+    B3 lane-state foundation checkpoint (2026-09-03): `nt-component-suspension` now owns a bounded,
+    generation-safe `ComponentSuspensionLanes` table above the existing per-lane LIFO stack. Each
+    lane has an exact executor/endpoint/reply-object binding and explicit idle, running, and
+    suspended states; a single running token serializes access to win32k's shared VSpace. Suspension
+    keys and dispatch ownership remain globally unique, lane reuse rejects stale generations, and
+    release is permitted only after the lane is idle and empty. Global readiness chooses the oldest
+    selected lane top while a selected frame buried on the same lane remains ineligible. The focused
+    model includes the real deadlock shape: Winlogon's selected LPC lane completes while an unrelated
+    desktop-system-thread lane remains permanently provider-blocked. All 16 crate tests pass.
+
+    Review adjustment: wire the table before adding worker TCBs so every physical resource has one
+    state owner. Factor a secondary component entry that skips `DriverEntry`, then create distinct
+    endpoint/reply-object/TCB/stack/IPC-buffer/CSpace bindings in the shared win32k VSpace. Route
+    unrelated native client threads to idle or newly allocated lanes; only true same-thread callback
+    recursion may remain on the current lane. Make callback and stack-Event LIFO state lane-local,
+    register every worker stack range, and restore typed request snapshots plus current KPCR/client
+    context before waking a selected lane. Do not copy provider-global shared-page metadata and do
+    not permit two lane TCBs to run win32k concurrently.
 
 ## NTFS System-Volume Workstream
 
