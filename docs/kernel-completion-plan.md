@@ -24494,6 +24494,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     canonical-handle close, then extend the same typed external-reference contract to Process,
     Thread, Token, Section, File, and Device projections before provider teardown is allowed.
 
+    B3 fail-closed win32k import checkpoint (2026-09-04, host and freestanding green; desktop
+    deliberately blocked at the newly exposed implementation frontier): the PE loaders no longer
+    route an absent kernel import to a zero-return trampoline. Both win32k and display-driver loads
+    reject an unresolved import before executing driver code, and registry readiness now requires a
+    nonzero binding for every one of the 224 declared `ntoskrnl.exe` imports plus the one `hal.dll`
+    import. The audit reports every missing name together rather than hiding later gaps behind the
+    first IAT slot.
+
+    `ProbeForRead` and `ProbeForWrite`, the first missing imports reached by the actual image, now
+    share a host-tested NT x64 range/alignment contract. Zero-length probes do not inspect the
+    address or alignment, overflow and `MmUserProbeAddress` crossings fail, and write probes touch
+    each spanned page so the ordinary fault path validates write access. Invalid probes currently
+    fail loudly because kernel-to-caller structured exception delivery is still open; they never
+    return synthetic success. All 43 `nt-compat-exports` tests pass and the freestanding executive
+    release build succeeds with 228 warnings.
+
+    Bounded runtime audit `.tmp/run-import-audit-20260904.log` rejects win32k initialization and
+    enumerates exactly 63 remaining unbound code imports (the 11 table-driven data exports are all
+    present): 6 MM/image helpers, 4 exception/version/time helpers, 13 Ps/thread attachment helpers,
+    5 Object Manager/security helpers, 15 Zw/Nt services, and 20 I/O/PnP/RTL/bugcheck helpers. This
+    is now an explicit implementation queue, not a loader fallback. Implement and host-test those
+    groups against the existing subsystem owners, add real structured exception raising for probe
+    failures, and keep the complete registry gate enabled. Restore the serialized desktop baseline
+    only by reaching zero missing imports; do not weaken the gate or restore the zero trampoline.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

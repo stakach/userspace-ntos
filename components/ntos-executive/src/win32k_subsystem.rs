@@ -17,9 +17,9 @@
 //!   * the EXECUTIVE (which owns the heap + the staged image at `WIN32KBUF`) parses the PE,
 //!     copies its 8 sections into a run of untyped-backed frames at [`WIN32K_CODE_VA`]
 //!     (VIRTUAL layout — not a `PeFile::map()` Vec, which the 128 KiB bump heap can't hold),
-//!     applies the 1920 DIR64 relocations in place, and patches the IAT: init-path imports ->
-//!     real trampolines below, data-export globals -> non-null placeholder cells, everything
-//!     else -> the legacy zero stub. See [`load_into`].
+//!     applies the 1920 DIR64 relocations in place, and patches the IAT from the complete,
+//!     registration-driven kernel/HAL export catalog. An unresolved import rejects the image.
+//!     See [`load_into`].
 //!   * the COMPONENT (the spawned Subsystem-class component) maps the image W^X (RX code / RW
 //!     data), a pool arena, the data-export region, and calls `DriverEntry(DRIVER_OBJECT*,
 //!     UNICODE_STRING*)` with its fault endpoint armed. On return it writes a verdict + the
@@ -37,6 +37,7 @@ use nt_compat_exports::{
         WIN32K_SERVICE_TABLE_INDEX as NT_WIN32K_SERVICE_TABLE_INDEX,
     },
     DriverExportRegistry, DriverExportRegistryStats, DRIVER_EXPORT_INITIAL_RESERVE,
+    WIN32K_HAL_IMPORTS, WIN32K_NTOSKRNL_IMPORTS,
 };
 use nt_kernel_exec::provider_pool as shared_pool;
 
@@ -1842,9 +1843,45 @@ unsafe fn uservm_release(base: u64) -> bool {
 
 // --- ntoskrnl trampolines (extern "win64"; win64 args = rcx, rdx, r8, r9, stack) -------------
 
-extern "win64" fn s_zero() -> u64 {
-    0
+fn reject_user_probe(error: nt_compat_exports::memory::UserProbeError) -> ! {
+    print_str(b"[win32k-probe] invalid user buffer reason=");
+    print_u64(match error {
+        nt_compat_exports::memory::UserProbeError::InvalidAlignment => 1,
+        nt_compat_exports::memory::UserProbeError::DatatypeMisalignment => 2,
+        nt_compat_exports::memory::UserProbeError::AccessViolation => 3,
+    });
+    print_str(b"\n");
+    panic!("win32k user-buffer probe failed")
 }
+
+extern "win64" fn s_probe_for_read(address: u64, length: u64, alignment: u64) {
+    if let Err(error) = nt_compat_exports::memory::validate_user_probe(address, length, alignment) {
+        reject_user_probe(error);
+    }
+}
+
+extern "win64" fn s_probe_for_write(address: u64, length: u64, alignment: u64) {
+    if let Err(error) = nt_compat_exports::memory::validate_user_probe(address, length, alignment) {
+        reject_user_probe(error);
+    }
+    if length == 0 {
+        return;
+    }
+    let last = address + length - 1;
+    let end = (last & !0xfff) + 0x1000;
+    let mut current = address;
+    loop {
+        unsafe {
+            let value = read_volatile(current as *const u8);
+            write_volatile(current as *mut u8, value);
+        }
+        current = (current & !0xfff) + 0x1000;
+        if current == end {
+            break;
+        }
+    }
+}
+
 extern "win64" fn s_true() -> u64 {
     1
 }
@@ -12599,9 +12636,9 @@ extern "win64" fn removed_s_ke_user_mode_callback_synthetic_baseline(
 static mut WIN32K_EXPORTS: DriverExportRegistry = DriverExportRegistry::new();
 static mut WIN32K_EXPORTS_READY: bool = false;
 
-/// Bind the first-batch trampolines into [`WIN32K_EXPORTS`]. Idempotent (`bind` updates in place),
-/// so it is safe to call from any loader (win32k / dxg / driver) regardless of order; each bound VA
-/// is IDENTICAL to what the `match` in [`export_addr`] would return, so resolution is unchanged.
+/// Bind the complete win32k kernel/HAL import surface into [`WIN32K_EXPORTS`]. Idempotent (`bind`
+/// updates in place), so it is safe to call from any loader (win32k / dxg / driver) regardless of
+/// order. Readiness is published only after every declared import has a nonzero binding.
 fn register_trampolines() -> bool {
     // SAFETY: single-threaded executive; the registry is only ever touched here + in export_addr.
     let reg = unsafe { &mut *core::ptr::addr_of_mut!(WIN32K_EXPORTS) };
@@ -12620,6 +12657,8 @@ fn register_trampolines() -> bool {
     );
     reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as usize as u64);
     reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
+    reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
+    reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",
@@ -13176,15 +13215,22 @@ fn register_trampolines() -> bool {
         );
         di += 1;
     }
-    reg.stats().allocation_failures == 0
+    let mut complete = reg.stats().allocation_failures == 0;
+    for name in WIN32K_NTOSKRNL_IMPORTS
+        .iter()
+        .chain(WIN32K_HAL_IMPORTS.iter())
+    {
+        if reg.lookup(name).is_none_or(|address| address == 0) {
+            unsafe { log_unresolved_win32k_import(name.as_bytes()) };
+            complete = false;
+        }
+    }
+    complete
 }
 
 /// Resolve an import name to its IAT-slot value: a code trampoline VA, or (for the 11 data
-/// exports) the data-cell address. Pure registry resolve now (Workstream B): the executive
-/// registered every real trampoline + data cell by name into the `nt-compat-exports`
-/// [`Win32kExportRegistry`]. The remaining unregistered declared imports retain the existing zero
-/// trampoline until their real implementations are added and the loader can become fully
-/// fail-closed.
+/// exports) the data-cell address. An absent binding returns zero so the PE loader can reject the
+/// image before any driver code executes; unresolved imports never receive a success trampoline.
 pub(crate) fn initialize_export_registry() -> bool {
     unsafe {
         if !WIN32K_EXPORTS_READY {
@@ -13205,11 +13251,7 @@ pub fn export_addr(name: &str) -> u64 {
     if !initialize_export_registry() {
         return 0;
     }
-    unsafe {
-        (*core::ptr::addr_of!(WIN32K_EXPORTS))
-            .lookup(name)
-            .unwrap_or(s_zero as usize as u64)
-    }
+    unsafe { (*core::ptr::addr_of!(WIN32K_EXPORTS)).lookup(name).unwrap_or(0) }
 }
 
 /// (name, cell value). The six **object-type** cells (`Ps*Type`, `Ex*ObjectType`, `LpcPortObjectType`)
@@ -13466,6 +13508,12 @@ unsafe fn log_unresolved_gdi_driver_import(import_name: &[u8]) {
     print_str(b"\n");
 }
 
+unsafe fn log_unresolved_win32k_import(import_name: &[u8]) {
+    print_str(b"[win32k-import] unresolved ");
+    print_str(import_name);
+    print_str(b"\n");
+}
+
 unsafe fn reject_win32k_nls(reason: &[u8]) -> bool {
     print_str(b"[win32k-nls] reject image: ");
     print_str(reason);
@@ -13680,6 +13728,10 @@ pub unsafe fn load_into(src_va: u64, _src_size: usize, nls_sizes: [usize; 3]) ->
                     // Pure registry resolve: code trampoline VAs AND the 11 data-cell addresses
                     // both come from export_addr now (data cells folded into the registry).
                     let addr = export_addr(name);
+                    if addr == 0 {
+                        log_unresolved_win32k_import(name.as_bytes());
+                        return None;
+                    }
                     write_unaligned((slots + k * 8) as *mut u64, addr);
                 }
                 k += 1;
@@ -16633,7 +16685,12 @@ pub unsafe fn load_driver_into(
                         (addr, false)
                     } else {
                         let name = core::str::from_utf8_unchecked(import_name);
-                        (export_addr(name), false)
+                        let addr = export_addr(name);
+                        if addr == 0 {
+                            log_unresolved_gdi_driver_import(import_name);
+                            return None;
+                        }
+                        (addr, false)
                     };
                     trace_gdi_driver_import(import_name, slots + k * 8, addr, direct);
                     write_unaligned((slots + k * 8) as *mut u64, addr);

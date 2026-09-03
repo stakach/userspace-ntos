@@ -247,8 +247,8 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("LpcRequestPort", Partial, "typed kernel datagrams route through the isolated LPC broker"),
     e("LpcPortObjectType", Partial, "data export: broker-validated LPC port object-type pointer"),
     // --- Probe ---
-    e("ProbeForWrite", Partial, "user-buffer bounds check against MmUserProbeAddress"),
-    e("ProbeForRead", Partial, "user-buffer bounds check against MmUserProbeAddress"),
+    e("ProbeForWrite", Partial, "validates the NT user range/alignment and touches every spanned page; structured exception delivery remains"),
+    e("ProbeForRead", Partial, "validates the NT user range/alignment; structured exception delivery remains"),
     // --- Nt ---
     e("NtQuerySystemInformation", StubSuccess, "system-information classes return canned values"),
     e("NtAddAtom", Partial, "global atom add routed to the Rtl atom table"),

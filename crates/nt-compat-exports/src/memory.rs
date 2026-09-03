@@ -8,6 +8,41 @@ pub struct PhysicalMapping {
     pub length: u64,
 }
 
+/// Highest address accepted by NT's user-buffer probe helpers on this x64 target.
+pub const MM_USER_PROBE_ADDRESS: u64 = 0x0000_7fff_ffff_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserProbeError {
+    InvalidAlignment,
+    DatatypeMisalignment,
+    AccessViolation,
+}
+
+/// Validate the address, length, and alignment portion of `ProbeForRead`/`ProbeForWrite`.
+/// A zero-length probe succeeds without inspecting either pointer or alignment, matching NT.
+pub fn validate_user_probe(
+    address: u64,
+    length: u64,
+    alignment: u64,
+) -> Result<(), UserProbeError> {
+    if length == 0 {
+        return Ok(());
+    }
+    if !matches!(alignment, 1 | 2 | 4 | 8 | 16) {
+        return Err(UserProbeError::InvalidAlignment);
+    }
+    if address & (alignment - 1) != 0 {
+        return Err(UserProbeError::DatatypeMisalignment);
+    }
+    let last = address
+        .checked_add(length - 1)
+        .ok_or(UserProbeError::AccessViolation)?;
+    if last >= MM_USER_PROBE_ADDRESS {
+        return Err(UserProbeError::AccessViolation);
+    }
+    Ok(())
+}
+
 /// Append one mapped page, coalescing it with the preceding record only when both the virtual and
 /// physical addresses are contiguous. Returns the new record count, or `None` when the fixed table
 /// is full or the input is invalid.
@@ -114,5 +149,27 @@ mod tests {
         let mut mappings = [PhysicalMapping::default(); 1];
         assert!(append_physical_page(&mut mappings, 0, 0x1001, 0x2000, 0x1000).is_none());
         assert!(append_physical_page(&mut mappings, 0, 0x1000, 0x2000, 0x1800).is_none());
+    }
+
+    #[test]
+    fn user_probe_matches_nt_range_and_alignment_rules() {
+        assert_eq!(validate_user_probe(0, 0, 0), Ok(()));
+        assert_eq!(validate_user_probe(0x1000, 8, 8), Ok(()));
+        assert_eq!(
+            validate_user_probe(0x1001, 8, 8),
+            Err(UserProbeError::DatatypeMisalignment)
+        );
+        assert_eq!(
+            validate_user_probe(0x1000, 8, 3),
+            Err(UserProbeError::InvalidAlignment)
+        );
+        assert_eq!(
+            validate_user_probe(MM_USER_PROBE_ADDRESS - 1, 2, 1),
+            Err(UserProbeError::AccessViolation)
+        );
+        assert_eq!(
+            validate_user_probe(u64::MAX - 3, 8, 1),
+            Err(UserProbeError::AccessViolation)
+        );
     }
 }
