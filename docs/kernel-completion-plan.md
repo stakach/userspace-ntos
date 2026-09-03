@@ -24162,6 +24162,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     initialization. The freestanding executive check remains green at 221 warnings. Next give this
     entry real shared-VSpace worker resources and register those bindings with the lane table.
 
+    B3 physical-lane checkpoint (2026-09-03, freestanding and microkernel handshake green): the
+    component spawner now has a narrow existing-VSpace worker mechanism. It allocates a disjoint
+    stack and IPC page plus an endpoint, Reply object, guarded CSpace, TCB, and scheduling context;
+    only the provider PML4 and initialized image state are shared. Win32k owns a collision-checked
+    48-slot VA arena ending below the FSD image and retains every worker capability in one physical
+    lane registry. Boot now creates one secondary lane, resumes it at the post-DriverEntry dispatch
+    entry, and requires its initial ready `Call` to bind successfully before continuing. The
+    freestanding check remains green at the established 221-warning count.
+
+    Serialized run `.tmp/run-desktop-20260903-193856.log` proved the real lane handshake with
+    `tcb=0x1099d`, `endpoint=0x10999`, `reply=0x1099a`, and `ready=1`; it then progressed to the
+    expected old `dispatch-depth=2 suspended-outstanding=2` stop because dispatch routing still
+    targets lane 0. The run was terminated at that known boundary. Next adopt both physical lanes
+    into the tested lane table, make the unique IPC-buffer VA visible to five-word component calls,
+    and route unrelated native threads to the idle lane before rerunning desktop.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

@@ -58,6 +58,7 @@ static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0)
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+static mut WIN32K_PHYSICAL_LANES: Option<Vec<crate::spawn_hosts::SpawnedComponentWorker>> = None;
 static USER_CALLBACK_CANCEL_CHAINED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -69,6 +70,96 @@ static WIN32K_MESSAGE_STAGE_LEASES: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(
     nt_user_callback::CLIENT_TOKEN_USER_SID_MAX == win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX
 );
+
+unsafe fn win32k_physical_lanes_mut(
+) -> &'static mut Vec<crate::spawn_hosts::SpawnedComponentWorker> {
+    let slot = &mut *core::ptr::addr_of_mut!(WIN32K_PHYSICAL_LANES);
+    if slot.is_none() {
+        *slot = Some(Vec::new());
+    }
+    slot.as_mut().unwrap()
+}
+
+/// Create and park one idle physical lane in win32k's existing VSpace.
+///
+/// This is deliberately separate from dispatch routing: the lane is not eligible until its initial
+/// ready `Call` has been received and bound to its own reply object.
+pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
+    let lanes = win32k_physical_lanes_mut();
+    let index = lanes.len();
+    if index >= win32k_subsystem::WIN32K_LANE_CAPACITY || lanes.try_reserve(1).is_err() {
+        return false;
+    }
+    let Some(offset) = (index as u64).checked_mul(win32k_subsystem::WIN32K_LANE_STRIDE)
+    else {
+        return false;
+    };
+    let Some(stack_base) = win32k_subsystem::WIN32K_LANE_ARENA_VADDR.checked_add(offset) else {
+        return false;
+    };
+    let Some(ipc_buffer_va) = stack_base.checked_add(win32k_subsystem::WIN32K_LANE_IPCBUF_OFFSET)
+    else {
+        return false;
+    };
+    let worker = crate::spawn_hosts::spawn_component_worker_suspended(
+        &crate::spawn_hosts::SharedVspaceWorkerDescriptor {
+            entry: win32k_subsystem::win32k_dispatch_lane_entry,
+            entry_arg: index as u64 + 1,
+            pml4,
+            stack_base,
+            stack_frames: win32k_subsystem::WIN32K_LANE_STACK_FRAMES,
+            ipc_buffer_va,
+            prio: 100,
+            gs_base: Some(win32k_subsystem::WIN32K_KPCR_VA),
+            ensure_paging: ensure_w32_client_paging,
+        },
+    );
+    let channel = crate::spawn_hosts::PumpChannel {
+        fault_ep: worker.endpoint,
+        pml4,
+        code_va: win32k_subsystem::WIN32K_CODE_VA,
+        image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
+        root_image_rights: 3,
+        root_image_map_owner: crate::WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Relaxed) as u16,
+        shared_va: win32k_subsystem::WIN32K_SHARED_VADDR,
+        dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
+        demand_cap: 256,
+        trace_faults: true,
+        initial: crate::spawn_hosts::InitialAction::RecvFirst,
+        tcb: worker.tcb,
+        reply_cap: worker.reply_cap,
+        client_pi: 0,
+        client_generation: 0,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Syscall,
+            sparse_vspace: true,
+            ..crate::spawn_hosts::HostCaps::default()
+        },
+    };
+    let resume = crate::spawn_hosts::resume_spawned_component_worker(&worker);
+    if resume != 0 {
+        lanes.push(worker);
+        return false;
+    }
+    let pump = crate::spawn_hosts::component_pump(&channel);
+    let ready = pump.completed
+        && !pump.callback_suspended
+        && !pump.provider_wait_suspended
+        && !pump.lpc_wait_suspended;
+    print_str(b"[win32k-lane] physical lane=");
+    print_u64(index as u64 + 1);
+    print_str(b" tcb=0x");
+    print_hex(worker.tcb as u32);
+    print_str(b" endpoint=0x");
+    print_hex(worker.endpoint as u32);
+    print_str(b" reply=0x");
+    print_hex(worker.reply_cap as u32);
+    print_str(if ready { b" ready=1\n" } else { b" ready=0\n" });
+    lanes.push(worker);
+    ready
+}
 // Win32k shared views carry thousands of mapped frame/page-table caps across GUI clients. Keep the
 // root CSpace to process-global names and move these high-volume mapping caps into lazy global
 // child-CNode segments; a small ownership index keeps per-process teardown exact.

@@ -70,6 +70,19 @@ pub const WIN32K_POOL_FRAMES: u64 = 2048; // 8 MiB, pre-mapped
 /// IDENTITY VA (STACK_BASE region) via the per-client attach — so that VA MUST be free in win32k's
 /// own VSpace (else win32k's own stack shadows it and the client pointer reads win32k's stack garbage).
 pub const WIN32K_STACK_VADDR: u64 = 0x0000_0100_0D00_0000;
+/// On-demand physical execution lanes share win32k's VSpace but own disjoint stacks and IPC pages.
+/// The arena ends before the FSD image at 0x100_0E00_0000.
+pub const WIN32K_LANE_ARENA_VADDR: u64 = 0x0000_0100_0D20_0000;
+pub const WIN32K_LANE_STRIDE: u64 = 0x0004_0000;
+pub const WIN32K_LANE_STACK_FRAMES: u64 = 32;
+pub const WIN32K_LANE_IPCBUF_OFFSET: u64 = 0x0002_0000;
+pub const WIN32K_LANE_CAPACITY: usize = 48;
+const _: () = assert!(
+    WIN32K_LANE_ARENA_VADDR + WIN32K_LANE_CAPACITY as u64 * WIN32K_LANE_STRIDE
+        <= crate::driver_launch::FSD_CODE_VA
+);
+const _: () = assert!(WIN32K_LANE_STACK_FRAMES * 0x1000 <= WIN32K_LANE_IPCBUF_OFFSET);
+const _: () = assert!(WIN32K_LANE_IPCBUF_OFFSET + 0x1000 <= WIN32K_LANE_STRIDE);
 /// The 2 MiB PT window (0x0700_0000..0x0720_0000) that holds the DATA/SHARED/SENTINEL/ARG frames
 /// (the pool used to share it; now the pool has its own window above). Both the executive-load view
 /// and the host-run view map a page table here for those frames.

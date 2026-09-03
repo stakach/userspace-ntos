@@ -31966,6 +31966,9 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             if finished {
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
+                if !win32k_glue::initialize_win32k_physical_lane(host_pml4) {
+                    panic!("win32k secondary execution lane failed its ready handshake");
+                }
                 register_win32k_gdi_loader(host_pml4);
                 // Host win32k's non-native static import DLLs and patch their IAT descriptors before
                 // any routed NtUser/NtGdi dispatch can call them.

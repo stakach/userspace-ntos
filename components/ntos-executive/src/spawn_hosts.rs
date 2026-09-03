@@ -206,6 +206,35 @@ pub(crate) struct SpawnedComponent {
     pub ipc_buffer_frame: u64,
 }
 
+/// Resources for one additional TCB in an already initialized component VSpace.
+pub(crate) struct SharedVspaceWorkerDescriptor {
+    pub entry: unsafe extern "C" fn(u64) -> !,
+    pub entry_arg: u64,
+    pub pml4: u64,
+    pub stack_base: u64,
+    pub stack_frames: u64,
+    pub ipc_buffer_va: u64,
+    pub prio: u64,
+    pub gs_base: Option<u64>,
+    pub ensure_paging: unsafe fn(u64, u64) -> bool,
+}
+
+/// Root-owned capabilities which keep one shared-VSpace component worker alive.
+#[allow(dead_code)] // All fields become active when lane teardown lands with the routing cutover.
+pub(crate) struct SpawnedComponentWorker {
+    pub endpoint: u64,
+    pub reply_cap: u64,
+    pub tcb: u64,
+    pub cnode: u64,
+    pub raw_cnode: u64,
+    pub sched_context: u64,
+    pub stack_frame_base: u64,
+    pub stack_frame_count: u64,
+    pub ipc_buffer_frame: u64,
+    pub stack_base: u64,
+    pub ipc_buffer_va: u64,
+}
+
 static COMPONENT_HANDOFF_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 const COMPONENT_HANDOFF_TRACE_CAP: u64 = 48;
 static COMPONENT_SPAWN_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -549,6 +578,127 @@ pub(crate) unsafe fn resume_spawned_component(component: &SpawnedComponent) -> u
     trace_component_spawn_stage(b"resume-end", component.tcb, error);
     trace_component_handoff(b"component-resume", component.tcb, 0, error);
     error
+}
+
+pub(crate) unsafe fn resume_spawned_component_worker(worker: &SpawnedComponentWorker) -> u64 {
+    trace_component_spawn_stage(b"worker-resume-begin", worker.tcb, worker.sched_context);
+    let error = tcb_resume_r(worker.tcb);
+    trace_component_spawn_stage(b"worker-resume-end", worker.tcb, error);
+    error
+}
+
+/// Build a separate physical execution lane in an existing component VSpace.
+///
+/// Only the address space and initialized component state are shared. The worker owns a distinct
+/// stack, IPC buffer, endpoint, MCS reply object, CSpace, TCB, and scheduling context, allowing it
+/// to remain blocked without retaining another lane's physical C stack or reply binding.
+pub(crate) unsafe fn spawn_component_worker_suspended(
+    d: &SharedVspaceWorkerDescriptor,
+) -> SpawnedComponentWorker {
+    if d.pml4 == 0 || d.stack_frames == 0 || d.stack_base == 0 || d.ipc_buffer_va == 0 {
+        print_str(b"[component-spawn] invalid shared-VSpace worker descriptor\n");
+        park();
+    }
+
+    let stack_frame_base = component_alloc_frame_run(b"worker-stack-frame-run", d.stack_frames);
+    let mut index = 0u64;
+    while index < d.stack_frames {
+        let va = d.stack_base + index * 0x1000;
+        if !(d.ensure_paging)(va, d.pml4) {
+            print_str(b"[component-spawn] worker stack paging failed\n");
+            park();
+        }
+        let error = page_map_r(stack_frame_base + index, va, RW_NX, d.pml4);
+        component_expect(b"worker-stack-map", va, error);
+        index += 1;
+    }
+
+    if !(d.ensure_paging)(d.ipc_buffer_va, d.pml4) {
+        print_str(b"[component-spawn] worker IPC paging failed\n");
+        park();
+    }
+    let ipc_buffer_frame = component_alloc_slot(b"worker-ipc-slot");
+    component_retype(
+        b"worker-ipc-retype",
+        OBJ_X86_4K_PAGE,
+        PAGING_BITS,
+        ipc_buffer_frame,
+    );
+    component_expect(
+        b"worker-ipc-map",
+        d.ipc_buffer_va,
+        page_map_r(ipc_buffer_frame, d.ipc_buffer_va, RW_NX, d.pml4),
+    );
+
+    let endpoint = component_alloc_slot(b"worker-endpoint-slot");
+    component_retype(b"worker-endpoint-retype", OBJ_ENDPOINT, 0, endpoint);
+    let reply_cap = component_alloc_slot(b"worker-reply-slot");
+    component_retype(b"worker-reply-retype", OBJ_REPLY, 0, reply_cap);
+
+    let raw_cnode = component_alloc_slot(b"worker-cnode-raw-slot");
+    component_retype(b"worker-cnode-raw-retype", OBJ_CNODE, CN_RADIX, raw_cnode);
+    let cnode = component_alloc_slot(b"worker-cnode-slot");
+    component_expect(
+        b"worker-cnode-mint",
+        raw_cnode,
+        cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw_cnode, CN_GUARD_BADGE),
+    );
+    component_expect(
+        b"worker-cnode-pml4-copy",
+        d.pml4,
+        cnode_copy_at_r(cnode, CT_PML4, d.pml4),
+    );
+    component_expect(
+        b"worker-cnode-endpoint-copy",
+        endpoint,
+        cnode_copy_at_r(cnode, CT_FAULT, endpoint),
+    );
+
+    let tcb = component_alloc_slot(b"worker-tcb-slot");
+    component_retype(b"worker-tcb-retype", OBJ_TCB, 0, tcb);
+    component_expect(
+        b"worker-tcb-set-space",
+        tcb,
+        tcb_set_space_r(tcb, CT_FAULT, cnode, d.pml4),
+    );
+    component_expect(
+        b"worker-tcb-set-ipcbuf",
+        tcb,
+        tcb_set_ipc_buffer_r(tcb, d.ipc_buffer_va, ipc_buffer_frame),
+    );
+    let stack_top = d.stack_base + d.stack_frames * 0x1000 - 16;
+    component_expect(
+        b"worker-tcb-write-registers",
+        tcb,
+        tcb_write_registers_r(tcb, d.entry as u64, stack_top, d.entry_arg),
+    );
+    let _ = tcb_set_priority(tcb, d.prio);
+    if let Some(gs_base) = d.gs_base {
+        let _ = tcb_set_gs_base(tcb, gs_base);
+    }
+    let sched_context = match attach_sched_context(tcb) {
+        Ok(sched_context) => sched_context,
+        Err(error) => {
+            print_str(b"[component-spawn] worker scheduling-context attach failed error=");
+            print_u64(error);
+            print_str(b"\n");
+            park();
+        }
+    };
+
+    SpawnedComponentWorker {
+        endpoint,
+        reply_cap,
+        tcb,
+        cnode,
+        raw_cnode,
+        sched_context,
+        stack_frame_base,
+        stack_frame_count: d.stack_frames,
+        ipc_buffer_frame,
+        stack_base: d.stack_base,
+        ipc_buffer_va: d.ipc_buffer_va,
+    }
 }
 
 unsafe fn spawn_component_inner(d: &ComponentDescriptor, resume: bool) -> SpawnedComponent {
