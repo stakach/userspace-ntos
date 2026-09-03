@@ -131,6 +131,8 @@ const WIN32K_ETHREAD_BYTES: u64 = 0x400;
 pub const WIN32K_HEAP_VADDR: u64 = 0x0000_0100_0740_0000;
 pub const WIN32K_HEAP_FRAMES: u64 = 4096;
 const PROVIDER_ARENA_ROOT_HEAP_ID: u64 = 1;
+const PROVIDER_ARENA_SHARED_POOL_ID: u64 = 2;
+const PROVIDER_ARENA_FTYP_POOL_ID: u64 = 3;
 const PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID: u64 = 4;
 static PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID: AtomicU64 =
     AtomicU64::new(PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID);
@@ -429,8 +431,12 @@ fn registered_provider_wait_domain() -> Option<nt_provider_wait::ProviderDomainI
 }
 
 fn root_heap_arena_identity() -> Option<nt_provider_wait::ProviderArenaIdentity> {
+    fixed_provider_arena_identity(PROVIDER_ARENA_ROOT_HEAP_ID)
+}
+
+fn fixed_provider_arena_identity(id: u64) -> Option<nt_provider_wait::ProviderArenaIdentity> {
     registered_provider_wait_domain().map(|provider| nt_provider_wait::ProviderArenaIdentity {
-        id: PROVIDER_ARENA_ROOT_HEAP_ID,
+        id,
         generation: provider.generation,
     })
 }
@@ -453,6 +459,38 @@ unsafe fn initialize_provider_allocation_tracking() -> bool {
 unsafe fn provider_allocations_mut(
 ) -> Option<&'static mut nt_provider_wait::ProviderAllocationCatalog> {
     (&mut *core::ptr::addr_of_mut!(WIN32K_PROVIDER_ALLOCATIONS)).as_mut()
+}
+
+unsafe fn register_provider_allocation(
+    arena: nt_provider_wait::ProviderArenaIdentity,
+    base: u64,
+    capacity: u64,
+) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
+    provider_allocations_mut()?.register(arena, base, capacity).ok()
+}
+
+unsafe fn validate_provider_allocation_retirement(
+    arena: nt_provider_wait::ProviderArenaIdentity,
+    base: u64,
+    required: u64,
+) -> Option<nt_provider_wait::ProviderAllocationSnapshot> {
+    let allocations = provider_allocations_mut()?;
+    let allocation = allocations.exact(arena, base).ok()?;
+    if allocation.capacity < required
+        || allocations
+            .validate_retirement(allocation.identity)
+            .is_err()
+    {
+        return None;
+    }
+    Some(allocation)
+}
+
+unsafe fn retire_provider_allocation(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
+    provider_allocations_mut()
+        .is_some_and(|allocations| allocations.retire(allocation.identity).is_ok())
 }
 
 unsafe fn provider_heap_arena_identity(
@@ -1124,24 +1162,43 @@ pub fn provider_pool_census() -> ProviderPoolCensus {
 }
 
 unsafe fn provider_pool_alloc(size: u64, zero: bool) -> u64 {
-    let Some(_guard) = provider_pool_lock() else {
-        print_str(b"[win32k-host] provider pool is not initialized\n");
-        crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+    let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return 0;
     };
-    let mut memory = ProviderPoolMemory;
-    match shared_pool::allocate(&mut memory, size, zero) {
-        Ok(allocation) => WIN32K_POOL_VADDR + allocation.payload_offset,
-        Err(error) => {
+    let allocation = {
+        let Some(_guard) = provider_pool_lock() else {
+            print_str(b"[win32k-host] provider pool is not initialized\n");
             crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
-            print_str(b"[win32k-host] provider pool allocation failed reason=");
-            print_u64(error as u64);
-            print_str(b" size=0x");
-            print_hex(size as u32);
-            print_str(b"\n");
-            0
+            return 0;
+        };
+        let mut memory = ProviderPoolMemory;
+        match shared_pool::allocate(&mut memory, size, zero) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+                print_str(b"[win32k-host] provider pool allocation failed reason=");
+                print_u64(error as u64);
+                print_str(b" size=0x");
+                print_hex(size as u32);
+                print_str(b"\n");
+                return 0;
+            }
+        }
+    };
+    let payload = WIN32K_POOL_VADDR + allocation.payload_offset;
+    if register_provider_allocation(arena, payload, allocation.capacity).is_some() {
+        return payload;
+    }
+    if let Some(_guard) = provider_pool_lock() {
+        let mut memory = ProviderPoolMemory;
+        if shared_pool::allocation_identity(&memory, allocation.payload_offset)
+            == Ok(allocation.identity)
+        {
+            let _ = shared_pool::free(&mut memory, allocation.payload_offset);
         }
     }
+    crate::WIN32K_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+    0
 }
 
 fn provider_pool_contains(p: u64) -> bool {
@@ -1183,26 +1240,67 @@ unsafe fn provider_pool_validate_owned(objects: &[(u64, u64)]) -> bool {
 }
 
 unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
-    let Some(_guard) = provider_pool_lock() else {
+    let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_SHARED_POOL_ID) else {
         return false;
     };
-    let mut memory = ProviderPoolMemory;
-    for (index, &(pointer, required)) in objects.iter().enumerate() {
-        if pointer == 0
-            || !provider_pool_contains(pointer)
-            || objects[..index]
-                .iter()
-                .any(|&(previous, _)| previous == pointer)
-            || !matches!(
-                shared_pool::allocation_capacity(&memory, pointer - WIN32K_POOL_VADDR),
-                Ok(capacity) if capacity >= required
-            )
-        {
+    let mut shared_identities = Vec::new();
+    let mut tracked_allocations = Vec::new();
+    if shared_identities.try_reserve(objects.len()).is_err()
+        || tracked_allocations.try_reserve(objects.len()).is_err()
+    {
+        return false;
+    }
+    {
+        let Some(_guard) = provider_pool_lock() else {
             return false;
+        };
+        let memory = ProviderPoolMemory;
+        for (index, &(pointer, required)) in objects.iter().enumerate() {
+            if pointer == 0
+                || !provider_pool_contains(pointer)
+                || objects[..index]
+                    .iter()
+                    .any(|&(previous, _)| previous == pointer)
+            {
+                return false;
+            }
+            let offset = pointer - WIN32K_POOL_VADDR;
+            let Ok(capacity) = shared_pool::allocation_capacity(&memory, offset) else {
+                return false;
+            };
+            let Ok(identity) = shared_pool::allocation_identity(&memory, offset) else {
+                return false;
+            };
+            if capacity < required {
+                return false;
+            }
+            shared_identities.push(identity);
         }
     }
-    for &(pointer, _) in objects {
-        if shared_pool::free(&mut memory, pointer - WIN32K_POOL_VADDR).is_err() {
+    for &(pointer, required) in objects {
+        let Some(allocation) =
+            validate_provider_allocation_retirement(arena, pointer, required)
+        else {
+            return false;
+        };
+        tracked_allocations.push(allocation);
+    }
+    {
+        let Some(_guard) = provider_pool_lock() else {
+            return false;
+        };
+        let mut memory = ProviderPoolMemory;
+        for (index, &(pointer, _)) in objects.iter().enumerate() {
+            let offset = pointer - WIN32K_POOL_VADDR;
+            if shared_pool::allocation_identity(&memory, offset) != Ok(shared_identities[index])
+                || shared_pool::free(&mut memory, offset).is_err()
+            {
+                return false;
+            }
+        }
+    }
+    for allocation in tracked_allocations {
+        if !retire_provider_allocation(allocation) {
             return false;
         }
     }
@@ -1210,11 +1308,7 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
 }
 
 unsafe fn provider_pool_free(p: u64) -> bool {
-    let Some(_guard) = provider_pool_lock() else {
-        return false;
-    };
-    let mut memory = ProviderPoolMemory;
-    shared_pool::free(&mut memory, p - WIN32K_POOL_VADDR).is_ok()
+    provider_pool_release_owned(&[(p, 1)])
 }
 
 unsafe fn provider_pool_note_invalid_free() {
@@ -1243,7 +1337,7 @@ fn align16(size: u64) -> u64 {
     (size + 15) & !15
 }
 
-unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
+unsafe fn reclaiming_pool_alloc_raw(size: u64) -> u64 {
     if size == 0 {
         return 0;
     }
@@ -1295,21 +1389,48 @@ unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
     hdr + FTYP_HDR_SIZE
 }
 
-unsafe fn reclaiming_pool_free(p: u64) -> bool {
+unsafe fn reclaiming_pool_capacity(p: u64) -> Option<u64> {
     let arena_start = WIN32K_FTYP_VADDR + POOL_DATA_OFF;
     let arena_end = WIN32K_FTYP_VADDR + WIN32K_FTYP_FRAMES * 0x1000;
     if p < arena_start + FTYP_HDR_SIZE || p >= arena_end || (p & 15) != 0 {
-        return false;
+        return None;
     }
     let hdr = p - FTYP_HDR_SIZE;
     let cap = read_volatile(hdr as *const u64);
     let marker = read_volatile((hdr + 8) as *const u64);
     if marker != FTYP_ALLOC_MARKER || cap == 0 || (cap & 15) != 0 {
-        return false;
+        return None;
     }
     if hdr < arena_start || hdr + FTYP_HDR_SIZE + cap > arena_end {
-        return false;
+        return None;
     }
+    Some(cap)
+}
+
+unsafe fn reclaiming_pool_alloc(size: u64) -> u64 {
+    let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_FTYP_POOL_ID) else {
+        return 0;
+    };
+    let payload = reclaiming_pool_alloc_raw(size);
+    if payload == 0 {
+        return 0;
+    }
+    let Some(capacity) = reclaiming_pool_capacity(payload) else {
+        return 0;
+    };
+    if register_provider_allocation(arena, payload, capacity).is_some() {
+        payload
+    } else {
+        let _ = reclaiming_pool_free_raw(payload);
+        0
+    }
+}
+
+unsafe fn reclaiming_pool_free_raw(p: u64) -> bool {
+    let Some(cap) = reclaiming_pool_capacity(p) else {
+        return false;
+    };
+    let hdr = p - FTYP_HDR_SIZE;
 
     let head = (WIN32K_FTYP_VADDR + 8) as *mut u64;
     let mut prev = 0u64;
@@ -1374,6 +1495,21 @@ unsafe fn reclaiming_pool_free(p: u64) -> bool {
         }
     }
     true
+}
+
+unsafe fn reclaiming_pool_free(p: u64) -> bool {
+    let Some(arena) = fixed_provider_arena_identity(PROVIDER_ARENA_FTYP_POOL_ID) else {
+        return false;
+    };
+    let Some(allocation) = validate_provider_allocation_retirement(arena, p, 1) else {
+        return false;
+    };
+    if reclaiming_pool_capacity(p) != Some(allocation.capacity)
+        || !reclaiming_pool_free_raw(p)
+    {
+        return false;
+    }
+    retire_provider_allocation(allocation)
 }
 
 /// User-mode VM arena for `ZwAllocateVirtualMemory(NtCurrentProcess(), ...)`. win32k's GDI attribute

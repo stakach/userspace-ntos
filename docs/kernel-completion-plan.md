@@ -23802,6 +23802,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and the freestanding executive remains at 213 warnings. Rerun the desktop gate before extending
     the allocation catalog to the provider-pool/FTYP paths.
 
+    Provider-pool repair gate and remaining arena hooks (2026-09-03): the serialized rerun proves
+    the version-3 provider pool remains healthy through the interactive path (`oom/corrupt=0/0`,
+    no invalid frees). It then quiesced at the pre-existing winlogon SAS wait before userinit, with
+    no Explorer process; this is not accepted desktop proof and leaves local Event activation as
+    the next boot boundary. The component now also registers every successful shared provider-pool
+    and FTYP allocation under fixed provider-generation arenas. Shared-pool free snapshots and
+    revalidates the allocator's native identity across the component-local preflight, batch free
+    retains all-or-nothing validation, and both paths retire the exact side-catalog identity only
+    after allocator mutation succeeds. The freestanding executive remains at 213 warnings. Next
+    instantiate the local Event catalog, retire allocation-backed Events before these free paths,
+    forbid moving realloc of an allocation containing an Event, and restore canonical Event
+    publication/set/reset/clear/pulse/read before the next desktop gate.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences
