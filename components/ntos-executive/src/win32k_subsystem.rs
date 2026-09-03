@@ -2079,6 +2079,70 @@ unsafe fn token_context_index(token: u64) -> Option<usize> {
     None
 }
 
+unsafe fn retain_primary_token_pointer(process_index: usize) -> Result<u32, i32> {
+    let Some(mut references) = process_ctx_token_references(process_index) else {
+        return Err(STATUS_INVALID_HANDLE_I32);
+    };
+    let Some(count) = references.reference() else {
+        return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
+    };
+    let process = process_ctx_eprocess(process_index);
+    let (status, _, _, _) = win32k_ps_broker_call(W32_PS_OP_RETAIN_POINTER, process, 0);
+    if status != 0 {
+        return Err(status);
+    }
+    set_process_ctx_token_references(process_index, references);
+    Ok(count)
+}
+
+unsafe fn release_primary_token_pointer(process_index: usize) -> Result<u32, i32> {
+    let Some(mut references) = process_ctx_token_references(process_index) else {
+        return Err(STATUS_INVALID_HANDLE_I32);
+    };
+    let Some(count) = references.dereference() else {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    };
+    let process = process_ctx_eprocess(process_index);
+    let (status, _, _, _) = win32k_ps_broker_call(W32_PS_OP_RELEASE_POINTER, process, 0);
+    if status != 0 {
+        return Err(status);
+    }
+    set_process_ctx_token_references(process_index, references);
+    Ok(count)
+}
+
+unsafe fn retain_primary_token_handle(process_index: usize) -> Result<(), i32> {
+    let Some(mut references) = process_ctx_token_references(process_index) else {
+        return Err(STATUS_INVALID_HANDLE_I32);
+    };
+    if references.open_handle().is_none() {
+        return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
+    }
+    let process = process_ctx_eprocess(process_index);
+    let (status, _, _, _) = win32k_ps_broker_call(W32_PS_OP_RETAIN_POINTER, process, 0);
+    if status != 0 {
+        return Err(status);
+    }
+    set_process_ctx_token_references(process_index, references);
+    Ok(())
+}
+
+unsafe fn release_primary_token_handle(process_index: usize) -> Result<(), i32> {
+    let Some(mut references) = process_ctx_token_references(process_index) else {
+        return Err(STATUS_INVALID_HANDLE_I32);
+    };
+    if references.close_handle().is_none() {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let process = process_ctx_eprocess(process_index);
+    let (status, _, _, _) = win32k_ps_broker_call(W32_PS_OP_RELEASE_POINTER, process, 0);
+    if status != 0 {
+        return Err(status);
+    }
+    set_process_ctx_token_references(process_index, references);
+    Ok(())
+}
+
 unsafe fn primary_token_authentication_id(token: u64) -> Option<u64> {
     token_context_index(token).and_then(|_| {
         let auth = read_volatile((token + TOKEN_AUTHENTICATION_ID_OFF) as *const u64);
@@ -2163,34 +2227,36 @@ unsafe fn token_handle_slot(handle: u64) -> Option<u64> {
     (index < WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed)).then_some(index)
 }
 
-unsafe fn register_token_handle(token: u64) -> u64 {
-    if token_context_index(token).is_none() {
-        return 0;
-    }
+unsafe fn register_token_handle(token: u64) -> Result<u64, i32> {
+    let Some(process_index) = token_context_index(token) else {
+        return Err(STATUS_INVALID_HANDLE_I32);
+    };
     let len = WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed);
     let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Acquire);
     if base != 0 {
         for index in 0..len {
             if read_volatile(token_handle_slot_ptr(base, index)) == 0 {
                 let handle = WIN32K_TOKEN_HANDLE_BASE + index * 4;
+                retain_primary_token_handle(process_index)?;
                 write_volatile(token_handle_slot_ptr(base, index), token);
-                return handle;
+                return Ok(handle);
             }
         }
     }
     let Some(required) = len.checked_add(1) else {
-        return 0;
+        return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
     };
     if !ensure_token_handle_capacity(required) {
-        return 0;
+        return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
     }
     let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Acquire);
     if base == 0 {
-        return 0;
+        return Err(STATUS_INSUFFICIENT_RESOURCES_I32);
     }
+    retain_primary_token_handle(process_index)?;
     write_volatile(token_handle_slot_ptr(base, len), token);
     WIN32K_TOKEN_HANDLE_LEN.store(required, Ordering::Relaxed);
-    WIN32K_TOKEN_HANDLE_BASE + len * 4
+    Ok(WIN32K_TOKEN_HANDLE_BASE + len * 4)
 }
 
 unsafe fn token_for_handle(handle: u64) -> Option<u64> {
@@ -2203,21 +2269,31 @@ unsafe fn token_for_handle(handle: u64) -> Option<u64> {
     (token_context_index(token).is_some()).then_some(token)
 }
 
-unsafe fn close_token_handle(handle: u64) -> bool {
+unsafe fn close_token_handle(handle: u64) -> Result<bool, i32> {
     let Some(slot) = token_handle_slot(handle) else {
-        return false;
+        return Ok(false);
     };
     let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Acquire);
     if base == 0 {
-        return false;
+        return Ok(false);
     }
     let ptr = token_handle_slot_ptr(base, slot);
     let token = read_volatile(ptr);
     if token == 0 {
-        return false;
+        return Ok(false);
     }
+    let Some(process_index) = token_context_index(token) else {
+        return Err(STATUS_INVALID_HANDLE_I32);
+    };
+    release_primary_token_handle(process_index)?;
     write_volatile(ptr, 0);
-    true
+    let mut new_len = WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed);
+    while new_len != 0 && read_volatile(token_handle_slot_ptr(base, new_len - 1)) == 0 {
+        new_len -= 1;
+    }
+    WIN32K_TOKEN_HANDLE_LEN.store(new_len, Ordering::Release);
+    WIN32K_CONTEXT_TOKEN_HANDLE_RELEASES.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
 }
 
 fn round_up4(value: usize) -> Option<usize> {
@@ -2845,6 +2921,18 @@ extern "win64" fn s_ps_reference_primary_token(process: u64) -> u64 {
                 print_u64(process_ctx_pid(index));
                 print_str(b"\n");
             }
+            return 0;
+        }
+        if let Err(status) = retain_primary_token_pointer(index) {
+            let n = WIN32K_PRIMARY_TOKEN_REFERENCE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            if n < 16 {
+                print_str(b"[win32k-token] ERROR: PsReferencePrimaryToken retain failed pid=");
+                print_u64(process_ctx_pid(index));
+                print_str(b" status=0x");
+                print_hex(status as u32);
+                print_str(b"\n");
+            }
+            return 0;
         }
         token
     }
@@ -2915,10 +3003,10 @@ extern "win64" fn s_zw_open_process_token(
         if token == 0 {
             return STATUS_NO_TOKEN_I32;
         }
-        let handle = register_token_handle(token);
-        if handle == 0 {
-            return STATUS_NO_MEMORY;
-        }
+        let handle = match register_token_handle(token) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
         write_unaligned(token_handle, handle);
         0
     }
@@ -3409,6 +3497,11 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
         }
         return references;
     }
+    if let Some(index) = unsafe { token_context_index(object) } {
+        return unsafe { retain_primary_token_pointer(index) }
+            .unwrap_or_else(|status| reject_ps_broker("token pointer retain", status))
+            as u64;
+    }
     if !provider_event_projection_contains(object) {
         return object;
     }
@@ -3453,6 +3546,11 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
             reject_ps_broker("object pointer release", status);
         }
         return references;
+    }
+    if let Some(index) = unsafe { token_context_index(object) } {
+        return unsafe { release_primary_token_pointer(index) }
+            .unwrap_or_else(|status| reject_ps_broker("token pointer release", status))
+            as u64;
     }
     if !provider_event_projection_contains(object) {
         return 0;
@@ -5711,13 +5809,31 @@ extern "win64" fn s_ob_reference_object_by_handle(
     object_out: *mut u64,
     handle_info: *mut u8,
 ) -> i32 {
-    if !object_out.is_null() {
-        unsafe { write_unaligned(object_out, 0) };
+    if object_out.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe { write_unaligned(object_out, 0) };
+    if let Some(token) = unsafe { token_for_handle(handle) } {
+        if obj_type != 0 {
+            ob_type_mismatch_trace(handle, obj_type, b"primary-token");
+            return STATUS_OBJECT_TYPE_MISMATCH;
+        }
+        let Some(index) = (unsafe { token_context_index(token) }) else {
+            return STATUS_INVALID_HANDLE_I32;
+        };
+        if let Err(status) = unsafe { retain_primary_token_pointer(index) } {
+            return status;
+        }
+        unsafe { write_unaligned(object_out, token) };
+        if !handle_info.is_null() {
+            unsafe {
+                write_unaligned(handle_info as *mut u32, 0);
+                write_unaligned(handle_info.add(4) as *mut u32, TOKEN_QUERY_ACCESS as u32);
+            }
+        }
+        return 0;
     }
     if obj_type == nt_object_manager::object_type::event_object_type_addr() {
-        if object_out.is_null() {
-            return STATUS_ACCESS_VIOLATION_I32;
-        }
         if !unsafe { provider_event_projection_reserve() } {
             return STATUS_NO_MEMORY;
         }
@@ -5847,9 +5963,17 @@ extern "win64" fn s_ob_reference_object_by_handle(
             }
         }
     };
-    if !object_out.is_null() {
-        unsafe { write_unaligned(object_out, obj) };
+    if unsafe {
+        process_context_index_for_eprocess(obj).is_some()
+            || thread_context_index_for_ethread(obj).is_some()
+    } {
+        let (status, _, _, _) =
+            unsafe { win32k_ps_broker_call(W32_PS_OP_RETAIN_POINTER, obj, 0) };
+        if status != 0 {
+            return status;
+        }
     }
+    unsafe { write_unaligned(object_out, obj) };
     if !handle_info.is_null() {
         unsafe {
             // OBJECT_HANDLE_INFORMATION { ULONG HandleAttributes; ACCESS_MASK GrantedAccess; }
@@ -6236,8 +6360,10 @@ extern "win64" fn s_ob_close_handle(handle: u64, _mode: u64) -> i32 {
     if handle == FAKE_PROCESS_HANDLE {
         return 0;
     }
-    if unsafe { close_token_handle(handle) } {
-        return 0;
+    match unsafe { close_token_handle(handle) } {
+        Ok(true) => return 0,
+        Ok(false) => {}
+        Err(status) => return status,
     }
     let (event_status, _, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_CLOSE, handle, 0, 0) };
@@ -7937,6 +8063,7 @@ struct Win32kProcessContextRecord {
     client_peb: u64,
     token_authentication_id: u64,
     primary_token: u64,
+    token_references: nt_object_manager::win32k_ob::OwnedObjectReferenceCounts,
 }
 
 #[derive(Clone, Copy)]
@@ -8083,6 +8210,25 @@ unsafe fn process_ctx_ptr(index: usize) -> Option<*mut Win32kProcessContextRecor
     }
     let base = WIN32K_PROCESS_CTX_PTR.load(Ordering::Acquire);
     (base != 0).then_some(process_ctx_record_ptr(base, index))
+}
+
+unsafe fn process_ctx_token_references(
+    index: usize,
+) -> Option<nt_object_manager::win32k_ob::OwnedObjectReferenceCounts> {
+    process_ctx_ptr(index)
+        .map(|ptr| read_volatile(core::ptr::addr_of!((*ptr).token_references)))
+}
+
+unsafe fn set_process_ctx_token_references(
+    index: usize,
+    references: nt_object_manager::win32k_ob::OwnedObjectReferenceCounts,
+) {
+    if let Some(ptr) = process_ctx_ptr(index) {
+        write_volatile(
+            core::ptr::addr_of_mut!((*ptr).token_references),
+            references,
+        );
+    }
 }
 
 unsafe fn thread_ctx_ptr(index: usize) -> Option<*mut Win32kThreadContextRecord> {
@@ -8473,32 +8619,6 @@ unsafe fn finalize_thread_ctx_record(index: usize) -> bool {
     true
 }
 
-unsafe fn clear_token_handle_publications(token: u64) -> u64 {
-    if token == 0 {
-        return 0;
-    }
-    let base = WIN32K_TOKEN_HANDLE_SLOTS_PTR.load(Ordering::Acquire);
-    let len = WIN32K_TOKEN_HANDLE_LEN.load(Ordering::Relaxed);
-    if base == 0 {
-        return 0;
-    }
-    let mut cleared = 0u64;
-    for slot in 0..len {
-        let pointer = token_handle_slot_ptr(base, slot);
-        if read_volatile(pointer) == token {
-            write_volatile(pointer, 0);
-            cleared += 1;
-        }
-    }
-    let mut new_len = len;
-    while new_len != 0 && read_volatile(token_handle_slot_ptr(base, new_len - 1)) == 0 {
-        new_len -= 1;
-    }
-    WIN32K_TOKEN_HANDLE_LEN.store(new_len, Ordering::Release);
-    WIN32K_CONTEXT_TOKEN_HANDLE_RELEASES.fetch_add(cleared, Ordering::Relaxed);
-    cleared
-}
-
 unsafe fn finalize_process_ctx_record(index: usize) -> bool {
     let Some(ptr) = process_ctx_ptr(index) else {
         return note_context_retirement_failure(b"process", index as u64);
@@ -8511,6 +8631,7 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         || record.w32process != 0
         || read_volatile((record.eprocess + EPROCESS_WIN32PROCESS_OFF) as *const u64) != 0
         || (0..thread_ctx_len()).any(|thread| thread_ctx_pid(thread) == record.pid)
+        || !record.token_references.can_finalize()
     {
         return note_context_retirement_failure(b"process", record.pid);
     }
@@ -8546,7 +8667,6 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
         return note_context_retirement_failure(b"process-owned-storage", record.pid);
     }
 
-    clear_token_handle_publications(record.primary_token);
     if read_volatile((WIN32K_KPCR_VA + 0x60) as *const u64) == record.eprocess {
         write_volatile((WIN32K_KPCR_VA + 0x60) as *mut u64, 0);
     }
@@ -8590,6 +8710,8 @@ unsafe fn finalize_process_ctx_record(index: usize) -> bool {
             client_peb: 0,
             token_authentication_id: 0,
             primary_token: 0,
+            token_references:
+                nt_object_manager::win32k_ob::OwnedObjectReferenceCounts::new(),
         },
     );
     true
@@ -8672,6 +8794,8 @@ pub(crate) struct Win32kContextLifetimeCensus {
     pub ethread_frees: u64,
     pub token_allocations: u64,
     pub token_frees: u64,
+    pub token_pointer_references: u64,
+    pub token_handle_references: u64,
     pub callout_teb_allocations: u64,
     pub callout_teb_frees: u64,
     pub backing_frees: u64,
@@ -8687,6 +8811,16 @@ pub(crate) fn win32k_context_lifetime_census() -> Win32kContextLifetimeCensus {
         let thread_rows_live = (0..thread_ctx_len())
             .filter(|&index| thread_ctx_tid(index) != 0)
             .count() as u64;
+        let (token_pointer_references, token_handle_references) = (0..process_ctx_len())
+            .filter_map(|index| process_ctx_token_references(index))
+            .fold((0u64, 0u64), |(pointers, handles), references| {
+                (
+                    pointers.saturating_add(u64::from(
+                        references.pointer_count().saturating_sub(1),
+                    )),
+                    handles.saturating_add(u64::from(references.handle_count())),
+                )
+            });
         Win32kContextLifetimeCensus {
             process_rows_live,
             thread_rows_live,
@@ -8696,6 +8830,8 @@ pub(crate) fn win32k_context_lifetime_census() -> Win32kContextLifetimeCensus {
             ethread_frees: WIN32K_CONTEXT_ETHREAD_FREES.load(Ordering::Relaxed),
             token_allocations: WIN32K_CONTEXT_TOKEN_ALLOCATIONS.load(Ordering::Relaxed),
             token_frees: WIN32K_CONTEXT_TOKEN_FREES.load(Ordering::Relaxed),
+            token_pointer_references,
+            token_handle_references,
             callout_teb_allocations: WIN32K_CONTEXT_CALLOUT_TEB_ALLOCATIONS.load(Ordering::Relaxed),
             callout_teb_frees: WIN32K_CONTEXT_CALLOUT_TEB_FREES.load(Ordering::Relaxed),
             backing_frees: WIN32K_CONTEXT_BACKING_FREES.load(Ordering::Relaxed),
@@ -9958,6 +10094,8 @@ unsafe fn ensure_process_context(
             client_peb,
             token_authentication_id: 0,
             primary_token: 0,
+            token_references:
+                nt_object_manager::win32k_ob::OwnedObjectReferenceCounts::new(),
         },
     );
     initialize_eprocess_body(eprocess, pid, client_peb);

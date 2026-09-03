@@ -10629,6 +10629,10 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(context_lifetime.token_allocations);
     print_str(b"/");
     print_u64(context_lifetime.token_frees);
+    print_str(b" refs=");
+    print_u64(context_lifetime.token_pointer_references);
+    print_str(b"/");
+    print_u64(context_lifetime.token_handle_references);
     print_str(b" teb=");
     print_u64(context_lifetime.callout_teb_allocations);
     print_str(b"/");

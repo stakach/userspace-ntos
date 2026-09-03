@@ -45,7 +45,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("MmMapViewInSessionSpace", Partial, "section create/map routed to nt-memory-manager (system/session views share the host AS)"),
     e("MmHighestUserAddress", Partial, "data export: fixed x64 system/user address boundary constant"),
     // --- Ob ---
-    e("ObfReferenceObject", Partial, "typed USER/Event/LPC references plus brokered EPROCESS/ETHREAD pointer references"),
+    e("ObfReferenceObject", Partial, "typed USER/Event/LPC/Token references plus brokered EPROCESS/ETHREAD pointer references"),
     e("ObCloseHandle", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObOpenObjectByPointer", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObCreateObject", Partial, "object reference/handle/security ops routed to nt-object-manager"),
@@ -56,8 +56,8 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ObAssignSecurity", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObReferenceObjectByPointer", Partial, "object reference/handle/security ops routed to nt-object-manager"),
     e("ObInsertObject", Partial, "object reference/handle/security ops routed to nt-object-manager"),
-    e("ObReferenceObjectByHandle", Partial, "object reference/handle/security ops routed to nt-object-manager"),
-    e("ObfDereferenceObject", Partial, "typed USER/Event/LPC releases plus brokered EPROCESS/ETHREAD pointer releases"),
+    e("ObReferenceObjectByHandle", Partial, "typed USER/Event/LPC/Token and pseudo-handle references with canonical owner retention"),
+    e("ObfDereferenceObject", Partial, "typed USER/Event/LPC/Token releases plus brokered EPROCESS/ETHREAD pointer releases"),
     // --- Ps ---
     e("PsGetThreadWin32Thread", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),
     e("PsGetProcessId", Partial, "process/thread identity + state queries routed to nt-process"),
@@ -79,7 +79,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("PsGetThreadProcess", Partial, "process/thread identity + state queries routed to nt-process"),
     e("PsReferenceImpersonationToken", Partial, "token references routed to nt-security's token store"),
     e("PsIsThreadTerminating", Partial, "live ETHREAD termination state queried through the executive Ps broker"),
-    e("PsReferencePrimaryToken", Partial, "token references routed to nt-security's token store"),
+    e("PsReferencePrimaryToken", Partial, "primary-token projection acquires a checked pointer reference and retains its canonical EPROCESS owner"),
     e("PsGetThreadFreezeCount", Partial, "live ETHREAD freeze state queried through the executive Ps broker"),
     e("PsIsSystemThread", Partial, "live ETHREAD system-thread identity queried through the executive Ps broker"),
     e("PsGetProcessWin32WindowStation", Partial, "Win32 per-process/thread context pointer-slot in nt-process (ProcessManager win32 accessors)"),

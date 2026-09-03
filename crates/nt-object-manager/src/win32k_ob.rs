@@ -21,6 +21,72 @@
 
 use alloc::vec::Vec;
 
+/// Pointer and handle counts for a provider-owned object projection. The provider retains one
+/// owner reference for the lifetime of the projection; every published handle owns one additional
+/// pointer reference, and transient kernel references may not cross that combined floor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OwnedObjectReferenceCounts {
+    pointer_count: u32,
+    handle_count: u32,
+}
+
+impl OwnedObjectReferenceCounts {
+    pub const fn new() -> Self {
+        Self {
+            pointer_count: 1,
+            handle_count: 0,
+        }
+    }
+
+    pub const fn pointer_count(self) -> u32 {
+        self.pointer_count
+    }
+
+    pub const fn handle_count(self) -> u32 {
+        self.handle_count
+    }
+
+    pub const fn can_finalize(self) -> bool {
+        self.pointer_count == 1 && self.handle_count == 0
+    }
+
+    pub fn reference(&mut self) -> Option<u32> {
+        self.pointer_count = self.pointer_count.checked_add(1)?;
+        Some(self.pointer_count)
+    }
+
+    pub fn dereference(&mut self) -> Option<u32> {
+        if self.pointer_count <= self.handle_count.saturating_add(1) {
+            return None;
+        }
+        self.pointer_count -= 1;
+        Some(self.pointer_count)
+    }
+
+    pub fn open_handle(&mut self) -> Option<(u32, u32)> {
+        let pointer_count = self.pointer_count.checked_add(1)?;
+        let handle_count = self.handle_count.checked_add(1)?;
+        self.pointer_count = pointer_count;
+        self.handle_count = handle_count;
+        Some((pointer_count, handle_count))
+    }
+
+    pub fn close_handle(&mut self) -> Option<(u32, u32)> {
+        if self.handle_count == 0 || self.pointer_count <= self.handle_count {
+            return None;
+        }
+        self.pointer_count -= 1;
+        self.handle_count -= 1;
+        Some((self.pointer_count, self.handle_count))
+    }
+}
+
+impl Default for OwnedObjectReferenceCounts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ExternalObjectReference {
     object: u64,
@@ -1191,6 +1257,55 @@ mod tests {
         let mut body = [0u8; DESKTOP_BODY_SIZE as usize];
         let mut thread = [0u8; 0x300];
         assert!(!unsafe { link_thread_to_desktop(body.as_mut_ptr(), thread.as_mut_ptr()) });
+    }
+
+    #[test]
+    fn owned_object_counts_keep_handle_and_owner_pointer_floors() {
+        let mut counts = OwnedObjectReferenceCounts::new();
+        assert!(counts.can_finalize());
+        assert_eq!(counts.open_handle(), Some((2, 1)));
+        assert_eq!(counts.reference(), Some(3));
+        assert_eq!(counts.dereference(), Some(2));
+        assert_eq!(counts.dereference(), None);
+        assert_eq!(counts.close_handle(), Some((1, 0)));
+        assert!(counts.can_finalize());
+        assert_eq!(counts.close_handle(), None);
+        assert_eq!(counts.dereference(), None);
+    }
+
+    #[test]
+    fn owned_object_counts_balance_multiple_handles_and_pointers() {
+        let mut counts = OwnedObjectReferenceCounts::new();
+        assert_eq!(counts.open_handle(), Some((2, 1)));
+        assert_eq!(counts.open_handle(), Some((3, 2)));
+        assert_eq!(counts.reference(), Some(4));
+        assert_eq!(counts.close_handle(), Some((3, 1)));
+        assert_eq!(counts.dereference(), Some(2));
+        assert_eq!(counts.close_handle(), Some((1, 0)));
+        assert!(counts.can_finalize());
+    }
+
+    #[test]
+    fn owned_object_counts_reject_overflow_without_partial_mutation() {
+        let mut counts = OwnedObjectReferenceCounts {
+            pointer_count: u32::MAX,
+            handle_count: 7,
+        };
+        assert_eq!(counts.reference(), None);
+        assert_eq!(counts.open_handle(), None);
+        assert_eq!(counts.pointer_count(), u32::MAX);
+        assert_eq!(counts.handle_count(), 7);
+
+        counts = OwnedObjectReferenceCounts {
+            pointer_count: u32::MAX - 1,
+            handle_count: u32::MAX,
+        };
+        assert_eq!(counts.open_handle(), None);
+        assert_eq!(counts.pointer_count(), u32::MAX - 1);
+        assert_eq!(counts.handle_count(), u32::MAX);
+        assert_eq!(counts.close_handle(), None);
+        assert_eq!(counts.pointer_count(), u32::MAX - 1);
+        assert_eq!(counts.handle_count(), u32::MAX);
     }
 
     #[test]

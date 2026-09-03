@@ -24607,6 +24607,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     projections and delete the permissive unknown-object reference tail only after Device, Section,
     File, and remaining dispatcher kinds have explicit routes.
 
+    B3 primary-Token reference-accounting tranche 7 (2026-09-04, host and freestanding green):
+    each provider primary-token projection now has host-tested owner, pointer, and handle counts.
+    The process context owns the base reference; every `ZwOpenProcessToken` handle and every
+    `PsReferencePrimaryToken`, `ObReferenceObject`, or `ObReferenceObjectByHandle` pointer retain
+    acquires a matching reference on the canonical EPROCESS through the generation-checked Ps
+    broker. Close/dereference paths release the exact corresponding ownership, reject stale handles
+    and underflow, and preserve retryable state when the broker rejects a transition. Process
+    finalization now refuses live Token handles or pointers instead of clearing the handle table and
+    freeing reachable storage. The lifetime census exposes current Token pointer/handle references.
+
+    This review also fixed process/thread pseudo-handle references: successful
+    `ObReferenceObjectByHandle` resolution now retains the returned canonical EPROCESS/ETHREAD, so
+    its later `ObDereferenceObject` is balanced. `nt-object-manager` passes all 72 tests, including
+    owner-floor, independent handle/pointer balance, and overflow regressions; all 46
+    `nt-compat-exports` tests and the freestanding executive release build pass. The missing-import
+    count remains forty-five because this tranche corrected already-bound lifetime behavior. The
+    permissive unknown-object branch remains temporarily reachable for unclassified Device,
+    Section, File, and dispatcher projections; close those typed routes and then delete the branch
+    outright rather than converting it to another generic success path.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
