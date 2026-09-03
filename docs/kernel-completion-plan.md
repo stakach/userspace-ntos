@@ -24556,6 +24556,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Keep structured exception delivery, raw PE-view publication, and image-section lifetime on the
     explicit remaining list; do not weaken the complete import registry gate.
 
+    B3 executive-owned Ps broker tranche 4 (2026-09-04, host and freestanding green): win32k no
+    longer needs a component-local copy of mutable process/thread policy to implement six Ps state
+    queries. A new re-entrant scalar broker resolves stable EPROCESS/ETHREAD projections through the
+    sole live `ProcessManager` and returns canonical process exit status/called state/session ID and
+    thread exit/system/freeze state. `KeSetPriorityThread` now validates the NT priority range,
+    atomically returns the prior canonical priority, and commits the new value through that same
+    owner. Unknown or stale object projections and stale client generations fail closed; query
+    trampolines fail loudly because their native ABI has no status return in which to hide a broker
+    error.
+
+    `nt-process` now has host-tested kernel-provider snapshots and keeps `KTHREAD.FreezeCount`
+    distinct from ordinary suspend count. All 152 `nt-process` tests and all 46
+    `nt-compat-exports` tests pass; the freestanding executive release build succeeds with 243
+    warnings. Forty-eight audited code imports remain. `PsIsSystemProcess` deliberately remains
+    unbound until the executive publishes a real initial System-process object; treating hosted
+    SMSS (the first client PID) as System would recreate a static identity bug. Next add typed Ps
+    pointer references for `PsLookupThreadByThreadId`, then build generation-safe process attachment
+    state with actual VSpace selection before binding the Ke attach/detach family.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

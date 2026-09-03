@@ -470,6 +470,24 @@ pub struct ProcessBasicInformation {
     pub inherited_from_unique_process_id: ProcessId,
 }
 
+/// Canonical process state exposed to kernel-mode providers that hold an `EPROCESS` pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelProcessState {
+    pub exit_status: u32,
+    pub exit_process_called: bool,
+    pub session_id: u32,
+}
+
+/// Canonical thread state exposed to kernel-mode providers that hold an `ETHREAD` pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelThreadState {
+    pub exit_status: u32,
+    pub terminating: bool,
+    pub system_thread: bool,
+    pub freeze_count: u32,
+    pub priority: i32,
+}
+
 /// What a successful [`ProcessManager::wait_for_debug_event`] hands back: the rendered
 /// `DBGUI_WAIT_STATE_CHANGE` plus the handles/`CLIENT_ID` the host needs to finish the call.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -918,6 +936,8 @@ pub struct NtThread {
     /// object descriptor that user-mode security setup can query or replace.
     security_descriptor: Vec<u8>,
     pub suspend_count: u32,
+    /// `KTHREAD.FreezeCount`. Ordinary thread suspension is tracked separately.
+    freeze_count: u32,
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
     /// (read back with `PsGetThreadWin32Thread`). `None` until win32k attaches.
     pub win32_thread: Option<u64>,
@@ -1969,6 +1989,7 @@ impl ProcessManager {
                 impersonation: None,
                 security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
                 suspend_count: 0,
+                freeze_count: 0,
                 win32_thread: None,
                 kernel_thread_object: None,
                 teb_base: 0,
@@ -2078,6 +2099,20 @@ impl ProcessManager {
         })
     }
 
+    /// Resolve an `EPROCESS` projection back to the Process Manager's live state.
+    pub fn kernel_process_state(&self, eprocess: u64) -> Option<KernelProcessState> {
+        let pid = self.pid_for_kernel_process_object(eprocess)?;
+        let process = self.processes.get(&pid)?;
+        Some(KernelProcessState {
+            exit_status: process.exit_status.unwrap_or(STATUS_PENDING),
+            exit_process_called: matches!(
+                process.state,
+                ProcessState::Exiting | ProcessState::Terminated
+            ),
+            session_id: process.session_id,
+        })
+    }
+
     /// `PsSetProcessWin32Process`: park win32k's `W32PROCESS` pointer on `pid`.
     /// Returns `false` for an unknown process.
     pub fn set_process_win32(&mut self, pid: ProcessId, win32process: u64) -> bool {
@@ -2170,6 +2205,43 @@ impl ProcessManager {
         self.threads.iter().find_map(|(&tid, thread)| {
             (thread.kernel_thread_object == Some(ethread)).then_some(tid)
         })
+    }
+
+    /// Resolve an `ETHREAD` projection back to the Process Manager's live state.
+    pub fn kernel_thread_state(&self, ethread: u64) -> Option<KernelThreadState> {
+        let tid = self.tid_for_kernel_thread_object(ethread)?;
+        let thread = self.threads.get(&tid)?;
+        Some(KernelThreadState {
+            exit_status: thread.exit_status.unwrap_or(STATUS_PENDING),
+            terminating: thread.state == ThreadState::Terminated,
+            system_thread: thread.is_system_thread,
+            freeze_count: thread.freeze_count,
+            priority: thread.priority,
+        })
+    }
+
+    /// Set `KTHREAD.Priority` through a stable `ETHREAD` projection and return its previous value.
+    pub fn set_kernel_thread_priority(
+        &mut self,
+        ethread: u64,
+        mut priority: i32,
+    ) -> Result<i32, u32> {
+        if !(LOW_PRIORITY..=HIGH_PRIORITY).contains(&priority) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let tid = self
+            .tid_for_kernel_thread_object(ethread)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let thread = self
+            .threads
+            .get_mut(&tid)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let previous = thread.priority;
+        if priority == LOW_PRIORITY && thread.base_priority != LOW_PRIORITY {
+            priority = LOW_PRIORITY + 1;
+        }
+        thread.priority = priority;
+        Ok(previous)
     }
 
     /// `PsSetProcessWindowStation`: bind a `WINDOWSTATION` to `pid`.
@@ -2986,6 +3058,7 @@ impl ProcessManager {
         thread.user_time_100ns = 0;
         thread.termination_ports.clear();
         thread.suspend_count = plan.create_suspended as u32;
+        thread.freeze_count = 0;
         thread.win32_thread = None;
         thread.teb_base = plan.teb_base;
         thread.affinity_mask = affinity_mask;

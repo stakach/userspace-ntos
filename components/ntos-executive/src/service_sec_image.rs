@@ -4643,6 +4643,69 @@ pub(crate) unsafe fn service_win32k_event_request(
     }
 }
 
+/// Service Ps queries issued by the win32k component against the canonical Process Manager.
+/// Stable EPROCESS/ETHREAD projections cross this boundary; mutable Ps state does not.
+pub(crate) unsafe fn service_win32k_ps_request(
+    client_pi: u64,
+    client_generation: u64,
+    op: u64,
+    object: u64,
+    value: u64,
+) -> (i32, u64, u64, u64) {
+    const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
+    const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+    const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler_ptr.is_null() {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    }
+    let handler = &mut *handler_ptr;
+    let Ok(pi) = usize::try_from(client_pi) else {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    };
+    if client_generation == 0
+        || handler.pm_pid_for_pi(pi).is_none()
+        || handler.hosted_process_generation(pi) != Some(client_generation)
+    {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    }
+
+    match op {
+        crate::win32k_subsystem::W32_PS_OP_QUERY_PROCESS => handler
+            .pm
+            .kernel_process_state(object)
+            .map(|state| {
+                (
+                    0,
+                    u64::from(state.exit_status),
+                    u64::from(state.session_id),
+                    u64::from(state.exit_process_called),
+                )
+            })
+            .unwrap_or((STATUS_INVALID_HANDLE, 0, 0, 0)),
+        crate::win32k_subsystem::W32_PS_OP_QUERY_THREAD => handler
+            .pm
+            .kernel_thread_state(object)
+            .map(|state| {
+                let flags = u64::from(state.terminating) | (u64::from(state.system_thread) << 1);
+                (
+                    0,
+                    u64::from(state.exit_status),
+                    u64::from(state.freeze_count),
+                    flags | (u64::from(state.priority as u32) << 32),
+                )
+            })
+            .unwrap_or((STATUS_INVALID_HANDLE, 0, 0, 0)),
+        crate::win32k_subsystem::W32_PS_OP_SET_THREAD_PRIORITY => handler
+            .pm
+            .set_kernel_thread_priority(object, value as u32 as i32)
+            .map(|previous| (0, u64::from(previous as u32), 0, 0))
+            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
+    }
+}
+
 unsafe fn delay_timer_rearm_after_park(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,

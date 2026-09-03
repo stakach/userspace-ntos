@@ -1470,6 +1470,7 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == crate::win32k_subsystem::W32_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_EVENT_LABEL && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_PS_LABEL && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -2435,6 +2436,29 @@ unsafe fn component_pump_loop(
                     msg.m1,
                     msg.m2,
                     msg.m3,
+                )
+            };
+            pump_reply_recv4_into!(
+                ch,
+                *reply_cap,
+                msg,
+                4,
+                status as u32 as u64,
+                out1,
+                out2,
+                out3
+            );
+            continue;
+        } else if label == crate::win32k_subsystem::W32_PS_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, out1, out2, out3) = unsafe {
+                crate::service_sec_image::service_win32k_ps_request(
+                    ch.client_pi,
+                    ch.client_generation,
+                    msg.m0,
+                    msg.m1,
+                    msg.m2,
                 )
             };
             pump_reply_recv4_into!(

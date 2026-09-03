@@ -1967,6 +1967,68 @@ fn win32_process_thread_context_slots() {
 }
 
 #[test]
+fn kernel_provider_state_uses_canonical_process_and_thread_objects() {
+    const EPROCESS: u64 = 0xFFFF_8000_1000_0000;
+    const ETHREAD: u64 = 0xFFFF_8000_2000_0000;
+    let mut pm = ProcessManager::new();
+    let pid = pm.create_process("provider.exe", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, true).unwrap();
+    assert!(pm.publish_process_kernel_object(pid, EPROCESS));
+    assert!(pm.publish_thread_kernel_object(tid, ETHREAD));
+    pm.set_process_session_id(pid, 3).unwrap();
+
+    assert_eq!(
+        pm.kernel_process_state(EPROCESS),
+        Some(KernelProcessState {
+            exit_status: STATUS_PENDING,
+            exit_process_called: false,
+            session_id: 3,
+        })
+    );
+    assert_eq!(
+        pm.kernel_thread_state(ETHREAD),
+        Some(KernelThreadState {
+            exit_status: STATUS_PENDING,
+            terminating: false,
+            system_thread: true,
+            freeze_count: 0,
+            priority: DEFAULT_PROCESS_BASE_PRIORITY,
+        })
+    );
+    assert_eq!(
+        pm.set_kernel_thread_priority(ETHREAD, 12),
+        Ok(DEFAULT_PROCESS_BASE_PRIORITY)
+    );
+    assert_eq!(pm.kernel_thread_state(ETHREAD).unwrap().priority, 12);
+    assert_eq!(pm.set_kernel_thread_priority(ETHREAD, LOW_PRIORITY), Ok(12));
+    assert_eq!(
+        pm.kernel_thread_state(ETHREAD).unwrap().priority,
+        LOW_PRIORITY + 1
+    );
+    assert_eq!(
+        pm.set_kernel_thread_priority(ETHREAD, HIGH_PRIORITY + 1),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    assert_eq!(pm.set_kernel_thread_priority(1, 10), Err(STATUS_INVALID_HANDLE));
+
+    pm.terminate_process(pid, 0xC000_0123).unwrap();
+    assert_eq!(
+        pm.kernel_process_state(EPROCESS),
+        Some(KernelProcessState {
+            exit_status: 0xC000_0123,
+            exit_process_called: true,
+            session_id: 3,
+        })
+    );
+    let thread = pm.kernel_thread_state(ETHREAD).unwrap();
+    assert_eq!(thread.exit_status, 0xC000_0123);
+    assert!(thread.terminating);
+    assert!(thread.system_thread);
+    assert_eq!(pm.kernel_process_state(1), None);
+    assert_eq!(pm.kernel_thread_state(1), None);
+}
+
+#[test]
 fn win32_callouts_established_once() {
     let mut pm = ProcessManager::new();
     assert_eq!(pm.win32_callouts(), None);

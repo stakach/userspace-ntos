@@ -1150,6 +1150,12 @@ pub const W32_PROVIDER_WAIT_LABEL: u64 = 0x779;
 pub const W32_PROVIDER_WAIT_RESUME_LABEL: u64 = 0x77A;
 pub const W32_LPC_WAIT_LABEL: u64 = 0x77B;
 pub const W32_LPC_WAIT_RESUME_LABEL: u64 = 0x77C;
+/// Scalar Ps state queries and mutations. Stable EPROCESS/ETHREAD projections cross the component
+/// boundary; the executive-owned Process Manager remains the sole mutable state owner.
+pub const W32_PS_LABEL: u64 = 0x77D;
+pub const W32_PS_OP_QUERY_PROCESS: u64 = 1;
+pub const W32_PS_OP_QUERY_THREAD: u64 = 2;
+pub const W32_PS_OP_SET_THREAD_PRIORITY: u64 = 3;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -2735,6 +2741,73 @@ extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
         }
         0
     }
+}
+
+unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, u64, u64) {
+    let (_label, status, out1, out2, out3) =
+        crate::driver_launch::call_on4((W32_PS_LABEL << 12) | 3, op, object, value, 0);
+    (status as u32 as i32, out1, out2, out3)
+}
+
+#[cold]
+fn reject_ps_broker(operation: &'static str, status: i32) -> ! {
+    panic!("executive Ps broker rejected {operation}: {status:#010x}")
+}
+
+fn query_kernel_process_state(process: u64) -> (u32, u32, u64) {
+    let (status, exit_status, session_id, flags) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_PROCESS, process, 0) };
+    if status != 0 {
+        reject_ps_broker("process query", status);
+    }
+    (exit_status as u32, session_id as u32, flags)
+}
+
+fn query_kernel_thread_state(thread: u64) -> (u32, u32, u64) {
+    let (status, exit_status, freeze_count, flags_and_priority) =
+        unsafe { win32k_ps_broker_call(W32_PS_OP_QUERY_THREAD, thread, 0) };
+    if status != 0 {
+        reject_ps_broker("thread query", status);
+    }
+    (exit_status as u32, freeze_count as u32, flags_and_priority)
+}
+
+extern "win64" fn s_ps_get_process_exit_status(process: u64) -> i32 {
+    query_kernel_process_state(process).0 as i32
+}
+
+extern "win64" fn s_ps_get_current_process_session_id() -> u32 {
+    query_kernel_process_state(s_current_process()).1
+}
+
+extern "win64" fn s_ps_get_process_exit_process_called(process: u64) -> u8 {
+    (query_kernel_process_state(process).2 & 1 != 0) as u8
+}
+
+extern "win64" fn s_ps_is_thread_terminating(thread: u64) -> u8 {
+    (query_kernel_thread_state(thread).2 & 1 != 0) as u8
+}
+
+extern "win64" fn s_ps_get_thread_freeze_count(thread: u64) -> u32 {
+    query_kernel_thread_state(thread).1
+}
+
+extern "win64" fn s_ps_is_system_thread(thread: u64) -> u8 {
+    (query_kernel_thread_state(thread).2 & 2 != 0) as u8
+}
+
+extern "win64" fn s_ke_set_priority_thread(thread: u64, priority: i32) -> i32 {
+    let (status, previous, _, _) = unsafe {
+        win32k_ps_broker_call(
+            W32_PS_OP_SET_THREAD_PRIORITY,
+            thread,
+            priority as u32 as u64,
+        )
+    };
+    if status != 0 {
+        reject_ps_broker("thread priority update", status);
+    }
+    previous as u32 as i32
 }
 
 /// `PACCESS_TOKEN PsReferencePrimaryToken(PEPROCESS Process)` — reference the selected process's
@@ -13196,6 +13269,34 @@ fn register_trampolines() -> bool {
     reg.bind(
         "PsLookupProcessByProcessId",
         s_ps_lookup_process_by_id as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessExitStatus",
+        s_ps_get_process_exit_status as usize as u64,
+    );
+    reg.bind(
+        "PsGetCurrentProcessSessionId",
+        s_ps_get_current_process_session_id as usize as u64,
+    );
+    reg.bind(
+        "PsGetProcessExitProcessCalled",
+        s_ps_get_process_exit_process_called as usize as u64,
+    );
+    reg.bind(
+        "PsIsThreadTerminating",
+        s_ps_is_thread_terminating as usize as u64,
+    );
+    reg.bind(
+        "PsGetThreadFreezeCount",
+        s_ps_get_thread_freeze_count as usize as u64,
+    );
+    reg.bind(
+        "PsIsSystemThread",
+        s_ps_is_system_thread as usize as u64,
+    );
+    reg.bind(
+        "KeSetPriorityThread",
+        s_ke_set_priority_thread as usize as u64,
     );
     reg.bind("KeGetCurrentThread", s_current_thread as usize as u64);
     reg.bind(
