@@ -23698,6 +23698,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     freestanding executive remains at 213 warnings. Next add canonical publication for embedded
     local dispatcher objects and use these domain credentials to authenticate every wait request.
 
+    Provider-owned Event registry checkpoint (2026-09-03, host and freestanding green): canonical
+    Event provenance now distinguishes process-owned objects from provider-domain/generation-owned
+    embedded objects. Provider-local publication accepts only a nonzero component-minted local
+    identity and resolves it back under the exact owner; collisions within one provider generation
+    fail, while equal local values in distinct provider domains remain independent. Provider waits
+    have their own generation-exact lease class, included in the same deletion fence as handle,
+    pointer, native-wait, GUI-wait, and queued-signal leases. All 234 `nt-kernel-exec` tests pass and
+    the freestanding executive remains at 213 warnings.
+
+    Reference review adjustment: `KeInitializeEvent` allocates no separate object and there is no
+    `KeDeleteEvent`; lifetime follows the caller's storage. Win32k uses stack events, pool-embedded
+    events, provider-instance statics, and Object Manager projections. The component-local catalog
+    must therefore mint identities from `(provider generation, storage class, backing allocation or
+    activation generation, address offset, event generation)`, reject reinitialization while any
+    wait/signal lease exists, retire every pool Event before allocation reuse, and retire stack
+    Events with their dispatch activation. Set/reset/clear/pulse/read must update the executive's
+    authoritative dispatcher state and only mirror the returned state into the local `KEVENT`.
+    Implement this storage-scoped catalog next; a raw address or session-lifetime local-event row is
+    not an acceptable shortcut.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

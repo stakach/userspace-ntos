@@ -34,24 +34,39 @@ impl EventLeaseId {
     }
 }
 
-/// Process generation that created the object. Handles may subsequently be duplicated elsewhere;
-/// this remains immutable provenance and prevents a recycled process slot from claiming the object.
+/// Immutable provenance for a canonical Event object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EventObjectOwner {
-    pub process_id: u64,
-    pub process_generation: u64,
+pub enum EventObjectOwner {
+    Process {
+        process_id: u64,
+        process_generation: u64,
+    },
+    Provider {
+        domain: u64,
+        generation: u64,
+    },
 }
 
 impl EventObjectOwner {
     pub const fn new(process_id: u64, process_generation: u64) -> Self {
-        Self {
+        Self::Process {
             process_id,
             process_generation,
         }
     }
 
+    pub const fn provider(domain: u64, generation: u64) -> Self {
+        Self::Provider { domain, generation }
+    }
+
     const fn is_valid(self) -> bool {
-        self.process_id != 0 && self.process_generation != 0
+        match self {
+            Self::Process {
+                process_id,
+                process_generation,
+            } => process_id != 0 && process_generation != 0,
+            Self::Provider { domain, generation } => domain != 0 && generation != 0,
+        }
     }
 }
 
@@ -61,6 +76,7 @@ impl EventObjectOwner {
 pub enum EventLeaseKind {
     NativeWait,
     GuiWait,
+    ProviderWait,
 }
 
 /// Why a registry operation was refused.
@@ -73,6 +89,7 @@ pub enum EventObjectError {
     StaleLease,
     WrongLeaseKind,
     ProviderBodyInUse,
+    ProviderIdentityInUse,
     NativeIdentityInUse,
     ReferenceOverflow,
     OutOfMemory,
@@ -181,11 +198,13 @@ pub struct EventObjectSnapshot {
     pub owner: EventObjectOwner,
     pub native_identity: u64,
     pub provider_body: Option<u64>,
+    pub provider_local_identity: Option<u64>,
     pub delete_pending: bool,
     pub handle_leases: u32,
     pub pointer_leases: u32,
     pub native_wait_leases: u32,
     pub gui_wait_leases: u32,
+    pub provider_wait_leases: u32,
     pub signal_leases: u32,
 }
 
@@ -196,6 +215,7 @@ pub struct RetiredEventObject {
     pub owner: EventObjectOwner,
     pub native_identity: u64,
     pub provider_body: Option<u64>,
+    pub provider_local_identity: Option<u64>,
 }
 
 /// Result of the non-allocating signal enqueue operation.
@@ -227,11 +247,13 @@ struct EventRecord {
     owner: EventObjectOwner,
     native_identity: u64,
     provider_body: Option<u64>,
+    provider_local_identity: Option<u64>,
     delete_pending: bool,
     handle_leases: u32,
     pointer_leases: u32,
     native_wait_leases: u32,
     gui_wait_leases: u32,
+    provider_wait_leases: u32,
     signal: SignalState,
 }
 
@@ -242,11 +264,13 @@ impl EventRecord {
         owner: EventObjectOwner::new(0, 0),
         native_identity: 0,
         provider_body: None,
+        provider_local_identity: None,
         delete_pending: false,
         handle_leases: 0,
         pointer_leases: 0,
         native_wait_leases: 0,
         gui_wait_leases: 0,
+        provider_wait_leases: 0,
         signal: SignalState::None,
     };
 
@@ -255,6 +279,7 @@ impl EventRecord {
             + u64::from(self.pointer_leases)
             + u64::from(self.native_wait_leases)
             + u64::from(self.gui_wait_leases)
+            + u64::from(self.provider_wait_leases)
             + u64::from(!matches!(self.signal, SignalState::None))
     }
 
@@ -264,11 +289,13 @@ impl EventRecord {
             owner: self.owner,
             native_identity: self.native_identity,
             provider_body: self.provider_body,
+            provider_local_identity: self.provider_local_identity,
             delete_pending: self.delete_pending,
             handle_leases: self.handle_leases,
             pointer_leases: self.pointer_leases,
             native_wait_leases: self.native_wait_leases,
             gui_wait_leases: self.gui_wait_leases,
+            provider_wait_leases: self.provider_wait_leases,
             signal_leases: u32::from(!matches!(self.signal, SignalState::None)),
         }
     }
@@ -375,6 +402,28 @@ impl EventObjectRegistry {
         owner: EventObjectOwner,
         native_identity: u64,
     ) -> Result<EventObjectId, EventObjectError> {
+        self.create_inner(owner, native_identity, None)
+    }
+
+    /// Publish a provider-embedded Event without exposing its component virtual address.
+    pub fn create_provider_local(
+        &mut self,
+        owner: EventObjectOwner,
+        provider_local_identity: u64,
+        native_identity: u64,
+    ) -> Result<EventObjectId, EventObjectError> {
+        if !matches!(owner, EventObjectOwner::Provider { .. }) || provider_local_identity == 0 {
+            return Err(EventObjectError::InvalidOwner);
+        }
+        self.create_inner(owner, native_identity, Some(provider_local_identity))
+    }
+
+    fn create_inner(
+        &mut self,
+        owner: EventObjectOwner,
+        native_identity: u64,
+        provider_local_identity: Option<u64>,
+    ) -> Result<EventObjectId, EventObjectError> {
         if !owner.is_valid() {
             return Err(EventObjectError::InvalidOwner);
         }
@@ -388,12 +437,22 @@ impl EventObjectRegistry {
         {
             return Err(EventObjectError::NativeIdentityInUse);
         }
+        if provider_local_identity.is_some_and(|identity| {
+            self.events.iter().any(|record| {
+                record.live
+                    && record.owner == owner
+                    && record.provider_local_identity == Some(identity)
+            })
+        }) {
+            return Err(EventObjectError::ProviderIdentityInUse);
+        }
         let (slot, generation) = self.allocate_event_slot()?;
         self.events[slot] = EventRecord {
             generation,
             live: true,
             owner,
             native_identity,
+            provider_local_identity,
             ..EventRecord::EMPTY
         };
         Ok(EventObjectId(ObjectId::new(generation, slot as u64)))
@@ -412,6 +471,22 @@ impl EventObjectRegistry {
             .iter()
             .enumerate()
             .find(|(_, record)| record.live && record.provider_body == Some(body))
+            .map(|(slot, record)| EventObjectId(ObjectId::new(record.generation, slot as u64)))
+    }
+
+    pub fn id_for_provider_local(
+        &self,
+        owner: EventObjectOwner,
+        provider_local_identity: u64,
+    ) -> Option<EventObjectId> {
+        self.events
+            .iter()
+            .enumerate()
+            .find(|(_, record)| {
+                record.live
+                    && record.owner == owner
+                    && record.provider_local_identity == Some(provider_local_identity)
+            })
             .map(|(slot, record)| EventObjectId(ObjectId::new(record.generation, slot as u64)))
     }
 
@@ -550,6 +625,14 @@ impl EventObjectRegistry {
                     return Err(error);
                 }
             }
+            EventLeaseKind::ProviderWait => {
+                if let Err(error) =
+                    Self::increment(&mut self.events[event_slot].provider_wait_leases)
+                {
+                    self.leases[lease_slot].generation = generation;
+                    return Err(error);
+                }
+            }
         }
         self.leases[lease_slot] = LeaseRecord {
             generation,
@@ -588,6 +671,7 @@ impl EventObjectRegistry {
         let count = match expected {
             EventLeaseKind::NativeWait => &mut self.events[event_slot].native_wait_leases,
             EventLeaseKind::GuiWait => &mut self.events[event_slot].gui_wait_leases,
+            EventLeaseKind::ProviderWait => &mut self.events[event_slot].provider_wait_leases,
         };
         if *count == 0 {
             return Err(EventObjectError::StaleLease);
@@ -752,6 +836,7 @@ impl EventObjectRegistry {
             owner: record.owner,
             native_identity: record.native_identity,
             provider_body: record.provider_body,
+            provider_local_identity: record.provider_local_identity,
         })
     }
 
@@ -834,6 +919,9 @@ mod tests {
             .acquire_wait(id, EventLeaseKind::NativeWait)
             .unwrap();
         let gui = registry.acquire_wait(id, EventLeaseKind::GuiWait).unwrap();
+        let provider = registry
+            .acquire_wait(id, EventLeaseKind::ProviderWait)
+            .unwrap();
         registry.queue_signal(id).unwrap();
         registry.request_delete(id).unwrap();
 
@@ -845,6 +933,10 @@ mod tests {
             .is_none());
         assert!(registry
             .release_wait(gui, EventLeaseKind::GuiWait)
+            .unwrap()
+            .is_none());
+        assert!(registry
+            .release_wait(provider, EventLeaseKind::ProviderWait)
             .unwrap()
             .is_none());
         let pending = registry.take_next_signal().unwrap();
@@ -888,6 +980,44 @@ mod tests {
             Err(EventObjectError::ProviderBodyInUse)
         );
         assert_eq!(registry.provider_body(a), Ok(Some(0xA000)));
+    }
+
+    #[test]
+    fn provider_local_identity_is_scoped_and_generation_fenced() {
+        let mut registry = EventObjectRegistry::new();
+        let first_owner = EventObjectOwner::provider(7, 1);
+        let second_owner = EventObjectOwner::provider(8, 1);
+        let first = registry
+            .create_provider_local(first_owner, 11, 101)
+            .unwrap();
+        let second = registry
+            .create_provider_local(second_owner, 11, 102)
+            .unwrap();
+        assert_eq!(registry.id_for_provider_local(first_owner, 11), Some(first));
+        assert_eq!(
+            registry.id_for_provider_local(second_owner, 11),
+            Some(second)
+        );
+        assert_eq!(
+            registry.create_provider_local(first_owner, 11, 103),
+            Err(EventObjectError::ProviderIdentityInUse)
+        );
+        assert_eq!(
+            registry.create_provider_local(EventObjectOwner::new(42, 1), 12, 104),
+            Err(EventObjectError::InvalidOwner)
+        );
+
+        let lease = registry
+            .acquire_wait(first, EventLeaseKind::ProviderWait)
+            .unwrap();
+        registry.request_delete(first).unwrap();
+        assert!(registry.snapshot(first).unwrap().delete_pending);
+        let retired = registry
+            .release_wait(lease, EventLeaseKind::ProviderWait)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.provider_local_identity, Some(11));
+        assert_eq!(registry.id_for_provider_local(first_owner, 11), None);
     }
 
     #[test]
