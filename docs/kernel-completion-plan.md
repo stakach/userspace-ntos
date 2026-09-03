@@ -23630,6 +23630,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     validation passes all 233 `nt-kernel-exec` tests and the freestanding executive check with the
     established 213-warning baseline.
 
+    Serialized desktop acceptance (2026-09-03):
+    `.tmp/run-desktop-wait-order-20260903-122839.log` boots through the merged rust-micro PR #2
+    baseline `c8093b78e1e5d38a84cc9705ea84d1e8b0a41976`, launches real userinit and Explorer, completes
+    661 redirected api0 callbacks with no callback failure, paints 786,432/786,432 framebuffer
+    pixels with at least 32 colors, passes 293/293 gates, and exits on the guest sentinel. The first
+    census arrived at 97,997 ms guest time. This accepts the native/GUI ordering checkpoint without
+    accepting the still-open provider convergence work.
+
     This checkpoint is intentionally partial: the generic driver-host queue and the live win32k
     provider still have separate wait ownership, and the latter's single-object entry remains an
     immediate-success implementation while multiple-object wait is unbound. Do not mark the
