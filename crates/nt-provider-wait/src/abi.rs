@@ -2,6 +2,7 @@ use crate::ProviderWaitOwner;
 
 pub const PROVIDER_WAIT_ABI_MAGIC: u32 = u32::from_le_bytes(*b"PWT1");
 pub const PROVIDER_WAIT_ABI_VERSION: u16 = 1;
+pub const PROVIDER_WAIT_SHARED_MAGIC: u32 = u32::from_le_bytes(*b"PWS1");
 pub const PROVIDER_WAIT_MAX_OBJECTS: usize = 64;
 pub const PROVIDER_WAIT_OBJECT_FLAG_NONE: u32 = 0;
 
@@ -207,6 +208,79 @@ pub struct ProviderWaitRequest {
 
 const _: () = assert!(core::mem::size_of::<ProviderWaitRequest>() <= 0x1000);
 const _: () = assert!(core::mem::align_of::<ProviderWaitRequest>() == 8);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderWaitSharedControl {
+    pub magic: u32,
+    pub version: u16,
+    pub control_size: u16,
+    pub page_size: u32,
+    pub reserved: u32,
+    pub provider_domain: u64,
+    pub provider_generation: u64,
+}
+
+impl ProviderWaitSharedControl {
+    pub const EMPTY: Self = Self {
+        magic: 0,
+        version: 0,
+        control_size: 0,
+        page_size: 0,
+        reserved: 0,
+        provider_domain: 0,
+        provider_generation: 0,
+    };
+
+    pub const fn published(identity: crate::ProviderDomainIdentity) -> Self {
+        Self {
+            magic: PROVIDER_WAIT_SHARED_MAGIC,
+            version: PROVIDER_WAIT_ABI_VERSION,
+            control_size: core::mem::size_of::<Self>() as u16,
+            page_size: core::mem::size_of::<ProviderWaitSharedPage>() as u32,
+            reserved: 0,
+            provider_domain: identity.domain,
+            provider_generation: identity.generation,
+        }
+    }
+
+    pub const fn identity(self) -> Option<crate::ProviderDomainIdentity> {
+        let identity = crate::ProviderDomainIdentity {
+            domain: self.provider_domain,
+            generation: self.provider_generation,
+        };
+        if self.magic == PROVIDER_WAIT_SHARED_MAGIC
+            && self.version == PROVIDER_WAIT_ABI_VERSION
+            && self.control_size as usize == core::mem::size_of::<Self>()
+            && self.page_size as usize == core::mem::size_of::<ProviderWaitSharedPage>()
+            && self.reserved == 0
+            && identity.is_valid()
+        {
+            Some(identity)
+        } else {
+            None
+        }
+    }
+}
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderWaitSharedPage {
+    pub control: ProviderWaitSharedControl,
+    pub request: ProviderWaitRequest,
+}
+
+impl ProviderWaitSharedPage {
+    pub const fn empty() -> Self {
+        Self {
+            control: ProviderWaitSharedControl::EMPTY,
+            request: ProviderWaitRequest::empty(),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ProviderWaitSharedPage>() <= 0x1000);
+const _: () = assert!(core::mem::align_of::<ProviderWaitSharedPage>() == 8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderWaitRequestMetadata {
@@ -490,5 +564,22 @@ mod tests {
             request.validate(),
             Err(ProviderWaitAbiError::InvalidAlertable)
         );
+    }
+
+    #[test]
+    fn shared_control_rejects_unpublished_or_stale_layouts() {
+        let identity = crate::ProviderDomainIdentity {
+            domain: 4,
+            generation: 2,
+        };
+        let mut page = ProviderWaitSharedPage::empty();
+        assert_eq!(page.control.identity(), None);
+        page.control = ProviderWaitSharedControl::published(identity);
+        assert_eq!(page.control.identity(), Some(identity));
+        page.control.provider_generation = 0;
+        assert_eq!(page.control.identity(), None);
+        page.control = ProviderWaitSharedControl::published(identity);
+        page.control.page_size -= 1;
+        assert_eq!(page.control.identity(), None);
     }
 }

@@ -23688,6 +23688,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the 213-warning baseline. Local embedded dispatcher objects still need canonical publication
     before the two wait imports can cut over without retaining an immediate-success path.
 
+    Provider-wait domain-identity checkpoint (2026-09-03, host and freestanding green): provider
+    wait domains are no longer inferred from a TCB cap, SSDT index, image name, or constant. The
+    host-tested catalog allocates reusable domain slots with a monotonically advancing generation,
+    rejects stale retirement, and refuses retirement while exact waits remain active. The dedicated
+    shared page now has a versioned control header followed by the fixed request frame; root
+    publishes the allocated win32k domain identity after mapping, and the component refuses to enter
+    DriverEntry unless that header and layout validate. All 14 `nt-provider-wait` tests pass and the
+    freestanding executive remains at 213 warnings. Next add canonical publication for embedded
+    local dispatcher objects and use these domain credentials to authenticate every wait request.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

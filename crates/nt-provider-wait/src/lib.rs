@@ -11,8 +11,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod abi;
+mod domain;
 
 pub use abi::*;
+pub use domain::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderWaitOwner {

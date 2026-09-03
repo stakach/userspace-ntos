@@ -139,7 +139,7 @@ pub const WIN32K_SHARED_VADDR: u64 = 0x0000_0100_0718_0000;
 pub const WIN32K_PROVIDER_WAIT_VADDR: u64 = WIN32K_SHARED_VADDR + 0x1000;
 pub const WIN32K_PROVIDER_WAIT_FRAMES: u64 = 1;
 const _: () = assert!(
-    core::mem::size_of::<nt_provider_wait::ProviderWaitRequest>()
+    core::mem::size_of::<nt_provider_wait::ProviderWaitSharedPage>()
         <= WIN32K_PROVIDER_WAIT_FRAMES as usize * 0x1000
 );
 /// The cross-address-space ARG-MARSHAL frame: mapped RW in BOTH the executive and the win32k
@@ -398,6 +398,19 @@ pub fn registered_win32k_service_metadata() -> Option<(u64, u32, u64)> {
         } else {
             Some((base, count, argument_table))
         }
+    }
+}
+
+fn registered_provider_wait_domain() -> Option<nt_provider_wait::ProviderDomainIdentity> {
+    unsafe {
+        read_volatile(
+            core::ptr::addr_of!(
+                (*(WIN32K_PROVIDER_WAIT_VADDR
+                    as *const nt_provider_wait::ProviderWaitSharedPage))
+                .control
+            ),
+        )
+        .identity()
     }
 }
 
@@ -11877,6 +11890,10 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
     }
     if !provider_pool_ready() {
         print_str(b"[win32k-host] ERROR: provider pool metadata is not initialized\n");
+        park();
+    }
+    if registered_provider_wait_domain().is_none() {
+        print_str(b"[win32k-host] ERROR: provider wait domain is not published\n");
         park();
     }
     // NOW RUNS ON THE SHARED HARNESS (Phase B, Step 4b). The DriverEntry preamble (build DRIVER_OBJECT

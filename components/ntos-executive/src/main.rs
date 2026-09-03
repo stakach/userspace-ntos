@@ -28461,6 +28461,18 @@ static FONTBUF_START: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 static WIN32K_STACK_FRAMES: AtomicU64 = AtomicU64::new(0);
 static WIN32K_TCB: AtomicU64 = AtomicU64::new(0);
+static mut PROVIDER_WAIT_DOMAINS: nt_provider_wait::ProviderDomainCatalog =
+    nt_provider_wait::ProviderDomainCatalog::new();
+static WIN32K_PROVIDER_DOMAIN: AtomicU64 = AtomicU64::new(0);
+static WIN32K_PROVIDER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn win32k_provider_domain_is_current(
+    identity: nt_provider_wait::ProviderDomainIdentity,
+) -> bool {
+    identity.domain == WIN32K_PROVIDER_DOMAIN.load(Ordering::Acquire)
+        && identity.generation == WIN32K_PROVIDER_GENERATION.load(Ordering::Acquire)
+        && unsafe { (&*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS)).contains(identity) }
+}
 /// One-shot guard: the dispatch-path backtrace mirror PT has been created (SYS_SEND paging is
 /// fire-and-forget so we can't re-map the PT idempotently).
 static WIN32K_DISP_BT_PT: AtomicU64 = AtomicU64::new(0);
@@ -31429,6 +31441,21 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 RW_NX,
                 CAP_INIT_THREAD_VSPACE,
             );
+            let provider_wait_identity = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_DOMAINS))
+                .register()
+                .expect("win32k provider-domain allocation failed");
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(
+                    (*(win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+                        as *mut nt_provider_wait::ProviderWaitSharedPage))
+                    .control
+                ),
+                nt_provider_wait::ProviderWaitSharedControl::published(provider_wait_identity),
+            );
+            WIN32K_PROVIDER_DOMAIN.store(provider_wait_identity.domain, Ordering::Release);
+            WIN32K_PROVIDER_GENERATION
+                .store(provider_wait_identity.generation, Ordering::Release);
+            assert!(win32k_provider_domain_is_current(provider_wait_identity));
             for i in 0..win32k_subsystem::WIN32K_ARG_FRAMES {
                 let _ = page_map(
                     copy_cap(arg_base + i),
