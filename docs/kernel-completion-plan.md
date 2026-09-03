@@ -23644,6 +23644,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     dispatcher item complete until both use the executive continuation arbiter and the obsolete
     provider/isolated-host wait bodies have been deleted.
 
+    Generic hosted-driver ordering checkpoint (2026-09-03, freestanding green): the live hosted
+    Event/Semaphore/Timer broker no longer mints a private, zero-based wait sequence or selects the
+    first ready vector slot. It takes the same nonzero executive admission sequence as native and
+    GUI waits, and chooses the oldest ready continuation by that sequence even after cancellation
+    or vector compaction. This removes one independent ordering authority. The freestanding
+    executive check remains green at 213 warnings; win32k continuation transport and cross-source
+    consumption of shared projected objects remain open.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

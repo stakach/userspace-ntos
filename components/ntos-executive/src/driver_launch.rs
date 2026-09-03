@@ -887,7 +887,6 @@ static HOSTED_DRIVER_WAIT_MULTIPLE_BLOCKING: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_MULTIPLE_PARKED: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_MULTIPLE_WOKEN: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_WAIT_MULTIPLE_WAKE_ERRORS: AtomicU64 = AtomicU64::new(0);
-static HOSTED_DRIVER_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_SET_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_PULSE_EVENT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static HOSTED_DRIVER_RELEASE_SEMAPHORE_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -12585,7 +12584,7 @@ fn park_hosted_driver_wait(
         wait_all,
         api_multiple,
         deadline,
-        sequence: HOSTED_DRIVER_WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        sequence: crate::next_dispatcher_wait_sequence(),
     });
     if !rotate_hosted_driver_active_reply(instance, active_reply_cap, fresh) {
         let _ = waiters.pop();
@@ -12819,13 +12818,18 @@ fn wake_hosted_driver_waiters_for_instance(instance: usize) -> u64 {
             let Some(waiters) = (*core::ptr::addr_of!(HOSTED_DRIVER_WAITERS)).as_ref() else {
                 return woken;
             };
-            waiters.iter().position(|waiter| {
-                waiter.instance == instance
-                    && matches!(
-                        hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all),
-                        Ok(Some(_))
-                    )
-            })
+            waiters
+                .iter()
+                .enumerate()
+                .filter(|(_, waiter)| {
+                    waiter.instance == instance
+                        && matches!(
+                            hosted_dispatcher_wait_ready(&waiter.objects, waiter.wait_all),
+                            Ok(Some(_))
+                        )
+                })
+                .min_by_key(|(_, waiter)| waiter.sequence)
+                .map(|(index, _)| index)
         };
         let Some(index) = ready_index else {
             break;
