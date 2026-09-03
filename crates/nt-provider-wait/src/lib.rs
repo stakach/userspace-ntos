@@ -45,6 +45,121 @@ impl ProviderWaitOwner {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderWaitTeardownScope {
+    Provider {
+        provider_domain: u64,
+        provider_generation: u64,
+    },
+    Process {
+        provider_domain: u64,
+        provider_generation: u64,
+        client_pi: u32,
+        client_generation: u64,
+    },
+    Thread {
+        provider_domain: u64,
+        provider_generation: u64,
+        client_pi: u32,
+        client_generation: u64,
+        client_tid: u64,
+    },
+}
+
+impl ProviderWaitTeardownScope {
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::Provider {
+                provider_domain,
+                provider_generation,
+            }
+            | Self::Process {
+                provider_domain,
+                provider_generation,
+                ..
+            }
+            | Self::Thread {
+                provider_domain,
+                provider_generation,
+                ..
+            } => {
+                if provider_domain == 0 || provider_generation == 0 {
+                    return false;
+                }
+            }
+        }
+        match self {
+            Self::Provider { .. } => true,
+            Self::Process {
+                client_generation, ..
+            } => client_generation != 0,
+            Self::Thread {
+                client_generation,
+                client_tid,
+                ..
+            } => client_generation != 0 && client_tid != 0,
+        }
+    }
+
+    pub const fn matches(self, owner: ProviderWaitOwner) -> bool {
+        if !self.is_valid()
+            || owner.provider_domain != self.provider_domain()
+            || owner.provider_generation != self.provider_generation()
+        {
+            return false;
+        }
+        match self {
+            Self::Provider { .. } => true,
+            Self::Process {
+                client_pi,
+                client_generation,
+                ..
+            } => owner.client_pi == client_pi && owner.client_generation == client_generation,
+            Self::Thread {
+                client_pi,
+                client_generation,
+                client_tid,
+                ..
+            } => {
+                owner.client_pi == client_pi
+                    && owner.client_generation == client_generation
+                    && owner.client_tid == client_tid
+            }
+        }
+    }
+
+    const fn provider_domain(self) -> u64 {
+        match self {
+            Self::Provider {
+                provider_domain, ..
+            }
+            | Self::Process {
+                provider_domain, ..
+            }
+            | Self::Thread {
+                provider_domain, ..
+            } => provider_domain,
+        }
+    }
+
+    const fn provider_generation(self) -> u64 {
+        match self {
+            Self::Provider {
+                provider_generation,
+                ..
+            }
+            | Self::Process {
+                provider_generation,
+                ..
+            }
+            | Self::Thread {
+                provider_generation,
+                ..
+            } => provider_generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderWaitPhase {
     Waiting,
     Selected { status: i32 },
@@ -118,8 +233,36 @@ impl<C> ProviderWaitStack<C> {
         self.frames.last()
     }
 
+    pub fn frames(&self) -> &[ProviderWaitFrame<C>] {
+        &self.frames
+    }
+
     pub fn get(&self, wait_id: u64) -> Option<&ProviderWaitFrame<C>> {
         self.frames.iter().find(|frame| frame.wait_id == wait_id)
+    }
+
+    pub fn get_mut(&mut self, wait_id: u64) -> Option<&mut ProviderWaitFrame<C>> {
+        self.frames
+            .iter_mut()
+            .find(|frame| frame.wait_id == wait_id)
+    }
+
+    pub fn contains_scope(&self, scope: ProviderWaitTeardownScope) -> bool {
+        scope.is_valid() && self.frames.iter().any(|frame| scope.matches(frame.owner))
+    }
+
+    pub fn next_cancellable_in_scope(&self, scope: ProviderWaitTeardownScope) -> Option<u64> {
+        if !scope.is_valid() {
+            return None;
+        }
+        self.frames.iter().find_map(|frame| {
+            (scope.matches(frame.owner)
+                && matches!(
+                    frame.phase,
+                    ProviderWaitPhase::Waiting | ProviderWaitPhase::Selected { .. }
+                ))
+            .then_some(frame.wait_id)
+        })
     }
 
     /// Reserve and publish a new blocked dispatch before the dispatcher arbiter commits its wait.
@@ -310,6 +453,35 @@ impl<C> ProviderWaitStack<C> {
             continuation: frame.continuation,
         })
     }
+
+    /// Abort a top dispatch after provider-side re-arm validation failed. This consumes the same
+    /// continuation ownership as normal completion, without leaving an unreachable `Resuming`
+    /// frame behind.
+    pub fn abort_resume(
+        &mut self,
+        wait_id: u64,
+        owner: ProviderWaitOwner,
+        status: i32,
+    ) -> Result<CompletedProviderWait<C>, ProviderWaitError> {
+        let frame = self.frames.last().ok_or(ProviderWaitError::NotFound)?;
+        if frame.wait_id != wait_id {
+            return Err(ProviderWaitError::NotTop);
+        }
+        if frame.owner != owner {
+            return Err(ProviderWaitError::InvalidIdentity);
+        }
+        if !matches!(frame.phase, ProviderWaitPhase::Resuming { .. }) {
+            return Err(ProviderWaitError::InvalidPhase);
+        }
+        let frame = self.frames.pop().unwrap();
+        Ok(CompletedProviderWait {
+            wait_id: frame.wait_id,
+            owner: frame.owner,
+            status,
+            cancelled: true,
+            continuation: frame.continuation,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +609,64 @@ mod tests {
         assert_eq!(
             stack.admit(502, 2, owner(2, 20), 2),
             Err(ProviderWaitError::Overflow)
+        );
+    }
+
+    #[test]
+    fn teardown_scopes_match_exact_provider_process_and_thread_generations() {
+        let first = owner(1, 10);
+        let second = owner(2, 20);
+        let mut stack = ProviderWaitStack::new(4);
+        stack.admit(601, 1, first, 1).unwrap();
+        stack.admit(602, 2, second, 2).unwrap();
+
+        let thread = ProviderWaitTeardownScope::Thread {
+            provider_domain: 7,
+            provider_generation: 3,
+            client_pi: 10,
+            client_generation: 11,
+            client_tid: 110,
+        };
+        assert!(stack.contains_scope(thread));
+        assert_eq!(stack.next_cancellable_in_scope(thread), Some(601));
+        stack.cancel(601, STATUS_CANCELLED).unwrap();
+        assert_eq!(stack.next_cancellable_in_scope(thread), None);
+        assert!(stack.contains_scope(thread));
+
+        let stale_process = ProviderWaitTeardownScope::Process {
+            provider_domain: 7,
+            provider_generation: 3,
+            client_pi: 10,
+            client_generation: 12,
+        };
+        assert!(!stack.contains_scope(stale_process));
+        assert!(stack.contains_scope(ProviderWaitTeardownScope::Provider {
+            provider_domain: 7,
+            provider_generation: 3,
+        }));
+        assert!(!stack.contains_scope(ProviderWaitTeardownScope::Provider {
+            provider_domain: 7,
+            provider_generation: 4,
+        }));
+    }
+
+    #[test]
+    fn failed_rearm_aborts_and_returns_the_continuation_once() {
+        let identity = owner(7, 30);
+        let mut stack = ProviderWaitStack::new(2);
+        stack.admit(701, 1, identity, 0xcafe).unwrap();
+        stack.select(701, STATUS_WAIT_0).unwrap();
+        stack.begin_resume(701).unwrap();
+        let completed = stack
+            .abort_resume(701, identity, STATUS_CANCELLED)
+            .unwrap();
+        assert_eq!(completed.continuation, 0xcafe);
+        assert_eq!(completed.status, STATUS_CANCELLED);
+        assert!(completed.cancelled);
+        assert!(stack.is_empty());
+        assert_eq!(
+            stack.abort_resume(701, identity, STATUS_CANCELLED),
+            Err(ProviderWaitError::NotFound)
         );
     }
 }

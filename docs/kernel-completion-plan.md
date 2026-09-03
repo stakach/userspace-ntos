@@ -23946,6 +23946,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     admission, Event or timeout selection, LIFO resume, exact native reply, and zero leaked leases
     before declaring the wait boundary complete.
 
+    Provider-wait client teardown checkpoint (2026-09-03, host/freestanding green): wait-stack
+    ownership now has exact provider, process-generation, and thread-generation teardown scopes.
+    Process and thread mechanism retirement first recycle every matching parked native reply object,
+    remove the matching arbiter admission (releasing Event leases in reverse order), mark the exact
+    continuation `STATUS_CANCELLED`, and drive only the exposed component LIFO top. A cancelled
+    frame buried beneath another client's live dispatch remains owned and prevents TCB/VSpace
+    retirement until the component stack exposes it; no arbitrary frame removal or reply fallback is
+    permitted. The abandoned client receives no late reply or callback redirect. Failed provider
+    re-arm validation now consumes its `Resuming` frame and returns the native continuation exactly
+    once instead of leaving a stale frame after releasing its reply cap. Focused
+    `nt-provider-wait` validation is green at 41 tests and the freestanding executive check passes.
+    Provider-generation shutdown still needs an actual provider lifecycle hook, and the desktop
+    workload still needs a genuine provider-side wait admission/resume proof before this boundary
+    closes.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

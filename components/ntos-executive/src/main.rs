@@ -19393,6 +19393,11 @@ unsafe fn terminate_hosted_thread_mechanism(
         None => return false,
         Some(_) => return false,
     };
+    // A provider-side KeWait owns both the component rendezvous and this thread's native reply.
+    // Unwind it before win32k context or TCB retirement so neither side can retain a dead client.
+    if !crate::service_sec_image::provider_wait_cancel_client_thread(handler, tid) {
+        return false;
+    }
     notify_thread_termination_ports(tid, handler);
     if !crate::service_sec_image::gui_message_wait_abandon_thread(handler, tid) {
         return false;
@@ -19590,6 +19595,11 @@ unsafe fn terminate_hosted_process_mechanisms(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> usize {
+    // Cancel the complete process generation first. This drains nested waits in component LIFO
+    // order and prevents partial thread teardown from stranding a buried native continuation.
+    if !crate::service_sec_image::provider_wait_cancel_client_process(handler, process_index) {
+        return 0;
+    }
     let mut reclaimed = 0usize;
     let pid = handler.pm_pid_for_pi(process_index as usize);
     let thread_count = pid

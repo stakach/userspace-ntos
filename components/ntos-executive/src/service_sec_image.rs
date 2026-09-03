@@ -142,6 +142,7 @@ struct ProviderWaitNativeContinuation {
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
+    abandon_native_reply: bool,
 }
 
 const PROVIDER_WAIT_MAX_CONTINUATION_DEPTH: usize = 64;
@@ -1174,15 +1175,9 @@ unsafe fn provider_wait_resume_top(
         let frame = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
             .top()?
             .clone();
-        if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
             .begin_resume(resume.wait_id)
-            .is_err()
-        {
-            return Some(ProviderWaitRuntimeOutcome::Failed {
-                continuation: frame.continuation,
-                status: 0xC000_0001u32 as i32,
-            });
-        }
+            .expect("provider wait top changed during synchronous resume");
         match win32k_glue::resume_suspended_provider_wait_component(
             frame.continuation.pending,
             resume.wait_id,
@@ -1216,8 +1211,12 @@ unsafe fn provider_wait_resume_top(
             }
             win32k_glue::ProviderWaitPumpCompletion::Reparked(next) => {
                 let Some(next_owner) = provider_wait_expected_owner(next) else {
+                    let completed =
+                        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                            .abort_resume(resume.wait_id, frame.owner, 0xC000_000Du32 as i32)
+                            .expect("invalid provider re-wait lost its active continuation");
                     return Some(ProviderWaitRuntimeOutcome::Failed {
-                        continuation: frame.continuation,
+                        continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
                     });
                 };
@@ -1235,8 +1234,12 @@ unsafe fn provider_wait_resume_top(
                     )
                     .is_err()
                 {
+                    let completed =
+                        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                            .abort_resume(resume.wait_id, frame.owner, 0xC000_000Du32 as i32)
+                            .expect("rejected provider re-wait lost its active continuation");
                     return Some(ProviderWaitRuntimeOutcome::Failed {
-                        continuation: frame.continuation,
+                        continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
                     });
                 }
@@ -1353,6 +1356,7 @@ unsafe fn provider_wait_admit_current(
         resume_ip,
         resume_sp,
         resume_flags,
+        abandon_native_reply: false,
     };
     if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
         .admit(wait_id, sequence, owner, continuation)
@@ -1414,67 +1418,211 @@ unsafe fn provider_wait_drain_ready(
                 continuation,
                 dispatch,
             } => {
-                let pi = continuation.pending.client.pi as usize;
-                let copied = if let Some(process) = procs.get(pi) {
-                    process.pml4 != 0
-                        && process_completed_user_callback_outer_dispatch(
-                            nt_handler,
-                            pi,
-                            process.pml4,
-                            continuation.pending.client.badge,
-                            continuation.pending.client.tid,
-                            dispatch,
-                            &mut pfilled[pi],
-                            process.faults as usize,
-                            process.scratch_base,
-                        )
+                if continuation.abandon_native_reply {
+                    assert_eq!(continuation.reply_cap, 0);
                 } else {
-                    false
-                };
-                let status = if copied {
-                    dispatch.status
-                } else {
-                    0xC000_0001u32 as u64
-                };
-                reply_parked_syscall(continuation.reply_cap, continuation.reply, status);
-                release_reply_pool_cap(continuation.reply_cap);
+                    let pi = continuation.pending.client.pi as usize;
+                    let copied = if let Some(process) = procs.get(pi) {
+                        process.pml4 != 0
+                            && process_completed_user_callback_outer_dispatch(
+                                nt_handler,
+                                pi,
+                                process.pml4,
+                                continuation.pending.client.badge,
+                                continuation.pending.client.tid,
+                                dispatch,
+                                &mut pfilled[pi],
+                                process.faults as usize,
+                                process.scratch_base,
+                            )
+                    } else {
+                        false
+                    };
+                    let status = if copied {
+                        dispatch.status
+                    } else {
+                        0xC000_0001u32 as u64
+                    };
+                    reply_parked_syscall(continuation.reply_cap, continuation.reply, status);
+                    release_reply_pool_cap(continuation.reply_cap);
+                }
                 drained += 1;
             }
             ProviderWaitRuntimeOutcome::UserCallbackSuspended(continuation) => {
-                let client = continuation.pending.client;
-                if win32k_glue::begin_controlled_user_callback_redirect(
-                    client,
-                    continuation.resume_ip,
-                    continuation.resume_sp,
-                    continuation.resume_flags,
-                ) {
-                    client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0);
+                if continuation.abandon_native_reply {
+                    assert_eq!(continuation.reply_cap, 0);
+                    let _ = win32k_glue::cancel_suspended_user_callback();
                 } else {
-                    let cancelled = win32k_glue::cancel_suspended_user_callback();
-                    reply_parked_syscall(
-                        continuation.reply_cap,
-                        continuation.reply,
-                        cancelled.0 as u32 as u64,
-                    );
+                    let client = continuation.pending.client;
+                    if win32k_glue::begin_controlled_user_callback_redirect(
+                        client,
+                        continuation.resume_ip,
+                        continuation.resume_sp,
+                        continuation.resume_flags,
+                    ) {
+                        client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0);
+                    } else {
+                        let cancelled = win32k_glue::cancel_suspended_user_callback();
+                        reply_parked_syscall(
+                            continuation.reply_cap,
+                            continuation.reply,
+                            cancelled.0 as u32 as u64,
+                        );
+                    }
+                    release_reply_pool_cap(continuation.reply_cap);
                 }
-                release_reply_pool_cap(continuation.reply_cap);
                 drained += 1;
             }
             ProviderWaitRuntimeOutcome::Failed {
                 continuation,
                 status,
             } => {
-                reply_parked_syscall(
-                    continuation.reply_cap,
-                    continuation.reply,
-                    status as u32 as u64,
-                );
-                release_reply_pool_cap(continuation.reply_cap);
+                if continuation.abandon_native_reply {
+                    assert_eq!(continuation.reply_cap, 0);
+                } else {
+                    reply_parked_syscall(
+                        continuation.reply_cap,
+                        continuation.reply,
+                        status as u32 as u64,
+                    );
+                    release_reply_pool_cap(continuation.reply_cap);
+                }
                 drained += 1;
             }
         }
     }
     drained
+}
+
+unsafe fn provider_wait_prepare_abandoned_replies(
+    scope: nt_provider_wait::ProviderWaitTeardownScope,
+) -> bool {
+    loop {
+        let wait_id = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+            .frames()
+            .iter()
+            .find(|frame| {
+                scope.matches(frame.owner) && !frame.continuation.abandon_native_reply
+            })
+            .map(|frame| frame.wait_id);
+        let Some(wait_id) = wait_id else {
+            return true;
+        };
+        let frame = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            .get_mut(wait_id)
+            .expect("provider wait teardown target disappeared");
+        let cap = frame.continuation.reply_cap;
+        if cap != 0 {
+            let deleted = cnode_delete_r(cap);
+            let retyped = if deleted == 0 {
+                untyped_retype_r(CAP_INIT_UNTYPED, OBJ_REPLY, 0, 1, cap)
+            } else {
+                u64::MAX
+            };
+            if deleted != 0 || retyped != 0 {
+                return false;
+            }
+            release_reply_pool_cap(cap);
+            frame.continuation.reply_cap = 0;
+        }
+        frame.continuation.abandon_native_reply = true;
+    }
+}
+
+unsafe fn provider_wait_cancel_scope(
+    nt_handler: &mut ExecNtHandler,
+    scope: nt_provider_wait::ProviderWaitTeardownScope,
+) -> bool {
+    if !scope.is_valid() {
+        return false;
+    }
+    if !(&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).contains_scope(scope) {
+        return true;
+    }
+    if !provider_wait_prepare_abandoned_replies(scope) {
+        return false;
+    }
+    while let Some(wait_id) = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+        .next_cancellable_in_scope(scope)
+    {
+        let phase = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+            .get(wait_id)
+            .expect("provider wait cancellation target disappeared")
+            .phase;
+        let arbiter_completion =
+            (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).cancel(
+                nt_handler,
+                wait_id,
+                0xC000_0120u32 as i32,
+            );
+        if matches!(phase, nt_provider_wait::ProviderWaitPhase::Waiting)
+            && arbiter_completion.is_none()
+        {
+            panic!("waiting provider continuation has no dispatcher arbiter owner");
+        }
+        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            .cancel(wait_id, 0xC000_0120u32 as i32)
+            .expect("provider wait teardown could not cancel its exact continuation");
+    }
+
+    let Some(ctx) = nt_handler.loop_ctx else {
+        return false;
+    };
+    let _ = provider_wait_drain_ready(nt_handler, &mut *ctx.procs, &mut *ctx.pfilled);
+    !(&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).contains_scope(scope)
+}
+
+pub(crate) unsafe fn provider_wait_cancel_client_thread(
+    nt_handler: &mut ExecNtHandler,
+    tid: u64,
+) -> bool {
+    if (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).is_empty() {
+        return true;
+    }
+    let Some(provider) = crate::current_win32k_provider_domain() else {
+        return false;
+    };
+    let Some(pi) = nt_handler.hosted_thread_pi_for_tid(tid) else {
+        return false;
+    };
+    let Some(client_generation) = nt_handler.hosted_process_generation(pi) else {
+        return false;
+    };
+    provider_wait_cancel_scope(
+        nt_handler,
+        nt_provider_wait::ProviderWaitTeardownScope::Thread {
+            provider_domain: provider.domain,
+            provider_generation: provider.generation,
+            client_pi: pi as u32,
+            client_generation,
+            client_tid: tid,
+        },
+    )
+}
+
+pub(crate) unsafe fn provider_wait_cancel_client_process(
+    nt_handler: &mut ExecNtHandler,
+    process_index: u8,
+) -> bool {
+    if (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).is_empty() {
+        return true;
+    }
+    let Some(provider) = crate::current_win32k_provider_domain() else {
+        return false;
+    };
+    let Some(client_generation) = nt_handler.hosted_process_generation(process_index as usize)
+    else {
+        return false;
+    };
+    provider_wait_cancel_scope(
+        nt_handler,
+        nt_provider_wait::ProviderWaitTeardownScope::Process {
+            provider_domain: provider.domain,
+            provider_generation: provider.generation,
+            client_pi: process_index as u32,
+            client_generation,
+        },
+    )
 }
 
 fn provider_wait_top_owns_dispatch(dispatch_id: u64) -> bool {
