@@ -23725,8 +23725,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     signal leases fence deletion, all Events in one backing allocation/activation enter retirement
     atomically, and exact executive acknowledgement is required before an address can be reused.
     Publication failure has an exact rollback path. All 19 crate tests pass and the freestanding
-    executive remains at 213 warnings. Next expose generation identity from the shared provider
-    pool, then instantiate this catalog in win32k and broker local Event publication/retirement.
+    executive remains at 213 warnings.
+
+    Provider-pool generation checkpoint (2026-09-03, host and freestanding green): the shared pool
+    header is now versioned for allocation identity and retains a monotonically advancing generation
+    at each payload slot across free/reuse. A live allocation exposes only `(payload offset,
+    allocation generation)` after full allocator validation; freed pointers and stale generations
+    fail closed, and generation exhaustion cannot publish an allocation. All 235 `nt-kernel-exec`
+    tests pass and the freestanding executive remains at 213 warnings. Next instantiate the
+    storage-scoped catalog in win32k and broker embedded Event publication/retirement against the
+    provider domain registered in the shared wait page.
 
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic

@@ -6,15 +6,17 @@
 //! mutating it and uses offsets exclusively, making the mechanics host-testable.
 
 pub const ALIGNMENT: u64 = 16;
-pub const HEADER_SIZE: u64 = 16;
+pub const HEADER_SIZE: u64 = 32;
 pub const DATA_OFFSET: u64 = 0x1000;
 pub const LOCK_OFFSET: u64 = 0x10;
 pub const MAGIC_OFFSET: u64 = 0x18;
-pub const MAGIC: u64 = 0x504f_4f4c_0000_0001;
+pub const MAGIC: u64 = 0x504f_4f4c_0000_0002;
 
 const BUMP_OFFSET: u64 = 0;
 const FREE_HEAD_OFFSET: u64 = 8;
 const ALLOC_MARKER: u64 = 0xffff_ffff_ffff_fffc;
+const ALLOCATION_GENERATION_OFFSET: u64 = 16;
+const HEADER_RESERVED_OFFSET: u64 = 24;
 const STATS_ALLOCATIONS: u64 = 0x20;
 const STATS_FREES: u64 = 0x28;
 const STATS_REUSES: u64 = 0x30;
@@ -51,6 +53,13 @@ pub struct Allocation {
     pub payload_offset: u64,
     pub capacity: u64,
     pub reused: bool,
+    pub identity: AllocationIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationIdentity {
+    pub allocation_id: u64,
+    pub allocation_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +70,7 @@ pub enum PoolError {
     OutOfMemory,
     InvalidPointer,
     NotAllocated,
+    GenerationExhausted,
     Corrupt,
 }
 
@@ -124,6 +134,23 @@ pub fn is_initialized<M: PoolMemory>(memory: &M) -> bool {
 /// Return the aligned capacity of an exact live allocation without mutating allocator state.
 /// Embedders use this to validate typed ownership before clearing the final published pointer.
 pub fn allocation_capacity<M: PoolMemory>(memory: &M, payload: u64) -> Result<u64, PoolError> {
+    live_allocation(memory, payload).map(|(capacity, _)| capacity)
+}
+
+/// Return the exact generation of a live allocation. A recycled payload offset never retains the
+/// previous identity, allowing embedded dispatcher objects to fence address reuse.
+pub fn allocation_identity<M: PoolMemory>(
+    memory: &M,
+    payload: u64,
+) -> Result<AllocationIdentity, PoolError> {
+    let (_, generation) = live_allocation(memory, payload)?;
+    Ok(AllocationIdentity {
+        allocation_id: payload,
+        allocation_generation: generation,
+    })
+}
+
+fn live_allocation<M: PoolMemory>(memory: &M, payload: u64) -> Result<(u64, u64), PoolError> {
     if !initialized(memory) {
         return Err(PoolError::NotInitialized);
     }
@@ -137,6 +164,8 @@ pub fn allocation_capacity<M: PoolMemory>(memory: &M, payload: u64) -> Result<u6
     let header = payload - HEADER_SIZE;
     let capacity = read(memory, header)?;
     let marker = read(memory, header + 8)?;
+    let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?;
+    let reserved = read(memory, header + HEADER_RESERVED_OFFSET)?;
     let end = header
         .checked_add(HEADER_SIZE)
         .and_then(|value| value.checked_add(capacity))
@@ -145,7 +174,10 @@ pub fn allocation_capacity<M: PoolMemory>(memory: &M, payload: u64) -> Result<u6
     if marker != ALLOC_MARKER || capacity == 0 || capacity & (ALIGNMENT - 1) != 0 || end > bump {
         return Err(PoolError::NotAllocated);
     }
-    Ok(capacity)
+    if generation == 0 || reserved != 0 {
+        return Err(PoolError::Corrupt);
+    }
+    Ok((capacity, generation))
 }
 
 fn note_corruption<M: PoolMemory>(memory: &mut M) -> PoolError {
@@ -184,6 +216,9 @@ fn validate_free_list<M: PoolMemory>(memory: &M) -> Result<(), PoolError> {
             return Err(PoolError::Corrupt);
         }
         let next = read(memory, node + 8)?;
+        if read(memory, node + HEADER_RESERVED_OFFSET)? != 0 {
+            return Err(PoolError::Corrupt);
+        }
         if next != 0 && next < end {
             return Err(PoolError::Corrupt);
         }
@@ -216,6 +251,9 @@ pub fn allocate<M: PoolMemory>(
         let capacity = read(memory, node)?;
         let next = read(memory, node + 8)?;
         if capacity >= wanted {
+            let generation = read(memory, node + ALLOCATION_GENERATION_OFFSET)?
+                .checked_add(1)
+                .ok_or(PoolError::GenerationExhausted)?;
             let allocation_capacity;
             if capacity
                 .checked_sub(wanted)
@@ -224,6 +262,8 @@ pub fn allocate<M: PoolMemory>(
                 let split = node + HEADER_SIZE + wanted;
                 write(memory, split, capacity - wanted - HEADER_SIZE)?;
                 write(memory, split + 8, next)?;
+                write(memory, split + ALLOCATION_GENERATION_OFFSET, 0)?;
+                write(memory, split + HEADER_RESERVED_OFFSET, 0)?;
                 if previous == 0 {
                     write(memory, FREE_HEAD_OFFSET, split)?;
                 } else {
@@ -240,6 +280,8 @@ pub fn allocate<M: PoolMemory>(
                 allocation_capacity = capacity;
             }
             write(memory, node + 8, ALLOC_MARKER)?;
+            write(memory, node + ALLOCATION_GENERATION_OFFSET, generation)?;
+            write(memory, node + HEADER_RESERVED_OFFSET, 0)?;
             let payload = node + HEADER_SIZE;
             if zero && !memory.zero(payload, size) {
                 return Err(note_corruption(memory));
@@ -249,6 +291,10 @@ pub fn allocate<M: PoolMemory>(
                 payload_offset: payload,
                 capacity: allocation_capacity,
                 reused: true,
+                identity: AllocationIdentity {
+                    allocation_id: payload,
+                    allocation_generation: generation,
+                },
             });
         }
         previous = node;
@@ -265,8 +311,13 @@ pub fn allocate<M: PoolMemory>(
         add_stat(memory, STATS_OOM, 1);
         return Err(PoolError::OutOfMemory);
     }
+    let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?
+        .checked_add(1)
+        .ok_or(PoolError::GenerationExhausted)?;
     write(memory, header, wanted)?;
     write(memory, header + 8, ALLOC_MARKER)?;
+    write(memory, header + ALLOCATION_GENERATION_OFFSET, generation)?;
+    write(memory, header + HEADER_RESERVED_OFFSET, 0)?;
     write(memory, BUMP_OFFSET, end)?;
     set_max(memory, STATS_ARENA_HIGH_WATER, end);
     let payload = header + HEADER_SIZE;
@@ -278,6 +329,10 @@ pub fn allocate<M: PoolMemory>(
         payload_offset: payload,
         capacity: wanted,
         reused: false,
+        identity: AllocationIdentity {
+            allocation_id: payload,
+            allocation_generation: generation,
+        },
     })
 }
 
@@ -310,6 +365,8 @@ pub fn free<M: PoolMemory>(memory: &mut M, payload: u64) -> Result<u64, PoolErro
     let header = payload - HEADER_SIZE;
     let capacity = read(memory, header)?;
     let marker = read(memory, header + 8)?;
+    let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?;
+    let reserved = read(memory, header + HEADER_RESERVED_OFFSET)?;
     let end = header
         .checked_add(HEADER_SIZE)
         .and_then(|v| v.checked_add(capacity))
@@ -318,6 +375,9 @@ pub fn free<M: PoolMemory>(memory: &mut M, payload: u64) -> Result<u64, PoolErro
     if marker != ALLOC_MARKER || capacity == 0 || capacity & (ALIGNMENT - 1) != 0 || end > bump {
         add_stat(memory, STATS_INVALID_FREES, 1);
         return Err(PoolError::NotAllocated);
+    }
+    if generation == 0 || reserved != 0 {
+        return Err(note_corruption(memory));
     }
 
     let mut previous = 0u64;
@@ -498,6 +558,31 @@ mod tests {
                 .all(|byte| *byte == 0)
         );
         free(&mut memory, zeroed.payload_offset).unwrap();
+        free(&mut memory, blocker.payload_offset).unwrap();
+    }
+
+    #[test]
+    fn allocation_identity_changes_when_an_address_is_reused() {
+        let mut memory = arena();
+        let first = allocate(&mut memory, 32, false).unwrap();
+        let blocker = allocate(&mut memory, 32, false).unwrap();
+        assert_eq!(
+            allocation_identity(&memory, first.payload_offset),
+            Ok(first.identity)
+        );
+        free(&mut memory, first.payload_offset).unwrap();
+        assert_eq!(
+            allocation_identity(&memory, first.payload_offset),
+            Err(PoolError::NotAllocated)
+        );
+        let second = allocate(&mut memory, 32, false).unwrap();
+        assert_eq!(second.payload_offset, first.payload_offset);
+        assert_eq!(second.identity.allocation_id, first.identity.allocation_id);
+        assert_eq!(
+            second.identity.allocation_generation,
+            first.identity.allocation_generation + 1
+        );
+        free(&mut memory, second.payload_offset).unwrap();
         free(&mut memory, blocker.payload_offset).unwrap();
     }
 
