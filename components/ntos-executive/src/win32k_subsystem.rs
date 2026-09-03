@@ -9344,17 +9344,7 @@ unsafe fn callback_request_context_for_request(
 }
 
 unsafe fn restore_user_callback_request_context(context: Win32kCallbackRequestContext) -> bool {
-    if !restore_current_context_for_user_callback_resume_inner(
-        context.pi,
-        context.pid,
-        context.tid,
-        context.client_teb,
-        context.supplied_eprocess,
-        context.supplied_ethread,
-        context.process_role,
-        true,
-        false,
-    ) {
+    if !restore_user_callback_execution_context(context, false) {
         return false;
     }
     let callback_frame =
@@ -9364,6 +9354,23 @@ unsafe fn restore_user_callback_request_context(context: Win32kCallbackRequestCo
         context.request_header,
     );
     true
+}
+
+unsafe fn restore_user_callback_execution_context(
+    context: Win32kCallbackRequestContext,
+    trace_resume: bool,
+) -> bool {
+    restore_current_context_for_user_callback_resume_inner(
+        context.pi,
+        context.pid,
+        context.tid,
+        context.client_teb,
+        context.supplied_eprocess,
+        context.supplied_ethread,
+        context.process_role,
+        true,
+        trace_resume,
+    )
 }
 
 pub(crate) unsafe fn restore_current_context_for_user_callback_resume(
@@ -12386,17 +12393,7 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
             let (_label, tag, _, _, _) = crate::driver_launch::call_on(out);
             match tag {
                 W32_USER_CALLBACK_RESUME_LABEL => {
-                    if !restore_current_context_for_user_callback_resume_inner(
-                        callback_request_context.pi,
-                        callback_request_context.pid,
-                        callback_request_context.tid,
-                        callback_request_context.client_teb,
-                        callback_request_context.supplied_eprocess,
-                        callback_request_context.supplied_ethread,
-                        callback_request_context.process_role,
-                        true,
-                        true,
-                    ) {
+                    if !restore_user_callback_execution_context(callback_request_context, true) {
                         return 0xC000_000Du32 as i32;
                     }
                     break;
@@ -12421,7 +12418,10 @@ extern "win64" fn s_ke_user_mode_callback_rendezvous(
         if nt_user_callback::validate_reply(&request, &reply).is_err() {
             return 0xC000_0001u32 as i32;
         }
-        if !restore_user_callback_request_context(callback_request_context) {
+        // The validated Reply header is the legal predecessor of the next callback request.
+        // Restore the caller's execution context without replacing that header with this
+        // callback's earlier Request state.
+        if !restore_user_callback_execution_context(callback_request_context, false) {
             return 0xC000_000Du32 as i32;
         }
 

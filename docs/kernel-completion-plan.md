@@ -24387,11 +24387,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     input Event/Timer waits re-arm successfully, and win32k creates and publishes the genuine
     window station and default desktop.
 
-    The same run reaches concurrent service startup but winlogon later retrieves private message
-    `0x659` and faults on a null dereference at winlogon RVA `0x55a0`, before userinit is launched.
-    Treat that as the current desktop-regression frontier. Identify the exact message contract and
-    missing state transition, restore the real producer/consumer semantics, and re-run the desktop
-    gate before proceeding to Timer DPC delivery and deferred-retirement acknowledgement.
+    B3 callback reply-state checkpoint (2026-09-03, freestanding and runtime green; desktop recovery
+    continuing): the first header repair exposed a second, distinct state transition. Nested
+    provider/LPC dispatches must republish the suspended `Request` header, but the final callback
+    return must leave the validated `Reply` header in place because `begin_request` accepts only
+    `Idle` or `Reply`. The restore boundary now separates execution-context restoration from
+    request-header restoration. A serialized run proves the complete SAS-window create sequence
+    (`WM_NCCREATE`, `WM_NCCALCSIZE`, `WM_CREATE`, and subsequent state messages), eliminates the
+    `WLX_WM_SAS` null dereference, paints the real login dialog, injects and renders the user name,
+    delivers Return, enters authentication, and demand-loads `shell32`.
+
+    Review adjustment: msgina's status dialog legitimately owns a 20 ms animation timer. The run's
+    apparent timer stall was unbounded serial instrumentation amplifying that normal workload into
+    millions of synchronous writes; it was still making forward progress when stopped. Bound the
+    generic win32k dispatch, nested-dispatch, callback, and message diagnostics while retaining
+    milestone/error records, then rerun the serialized desktop gate to identify the first semantic
+    frontier after authentication. Do not suppress, coalesce, or synthesize the guest timer.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
