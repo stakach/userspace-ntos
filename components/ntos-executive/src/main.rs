@@ -3639,10 +3639,19 @@ fn w32_total_dispatch_row_stats() -> (usize, usize, u64, u64) {
 /// per-dispatch trace prints). OFF by default → clean serial; enable with `--features debug-trace`.
 /// NEVER gates milestone markers, spec PASS/FAIL, or the gate summary — only verbose trace noise.
 pub(crate) const DEBUG_TRACE: bool = cfg!(feature = "debug-trace");
-/// BATCH 43: throttle counter for the high-frequency win32k class-loop SSN (0x103d/0x10b4) per-dispatch
-/// serial logs. Only the first ~12 are printed; serial writes are the dominant TCG per-round-trip cost
-/// and the boot budget is tight now that winlogon crosses its win32k class wall and runs heavier work.
-pub(crate) static W32_HOT_LOG: AtomicU64 = AtomicU64::new(0);
+/// Keep normal serial diagnostics finite without hiding late liveness. The initial window preserves
+/// enough local context for bring-up; power-of-two samples retain evidence that a hot path is still
+/// advancing without making synchronous debug output part of the guest's scheduling behavior.
+pub(crate) fn trace_ordinal_sample(ordinal: u64, initial_window: u64) -> bool {
+    ordinal <= initial_window || ordinal.is_power_of_two()
+}
+
+pub(crate) fn bounded_trace_sample(counter: &AtomicU64, initial_window: u64) -> bool {
+    trace_ordinal_sample(counter.fetch_add(1, Ordering::Relaxed) + 1, initial_window)
+}
+
+/// Counts every dispatched win32k syscall; only sampled entries are written to serial.
+pub(crate) static W32_DISPATCH_TRACE: AtomicU64 = AtomicU64::new(0);
 /// BATCH 43: GLOBAL throttle for the `[w32disp] skip int 0x2c assert` diagnostic (was a per-dispatch
 /// local counter that re-armed 40 lines every win32k dispatch → hundreds of serial lines). First 40
 /// total, then suppress.

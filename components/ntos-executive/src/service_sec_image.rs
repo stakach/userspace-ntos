@@ -9,6 +9,7 @@ static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
+static WINLOGON_MESSAGE_TRACE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_STEADY_PAGES: u64 = 16;
@@ -12695,13 +12696,10 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                 }
-                // BATCH 43: throttle the per-dispatch header for the HIGH-FREQUENCY class-registration
-                // loop SSNs (0x103d NtUserFindExistingCursorIcon / 0x10b4 NtUserRegisterClassExWOW), which
-                // each fire dozens of times during user32 RegisterSystemClasses. Serial writes dominate the
-                // TCG per-round-trip cost and the boot budget is tight now that winlogon crosses its win32k
-                // wall (BATCH 43). Print the first 6 of each, then suppress; all OTHER SSNs always print.
-                let w32_hot = m0 == 0x103d || m0 == 0x10b4;
-                let w32_log = !w32_hot || W32_HOT_LOG.fetch_add(1, Ordering::Relaxed) < 12;
+                // Serial output is synchronous under TCG. Sample the generic dispatch stream rather
+                // than maintaining a list of currently hot SSNs; exact per-client/per-SSN counters
+                // remain available in the census, and every provider wall still prints below.
+                let w32_log = bounded_trace_sample(&W32_DISPATCH_TRACE, 128);
                 if w32_log {
                     print_str(b"[win32k-svc] ");
                     print_str(win32k_client_label(&nt_handler, pi));
@@ -16492,15 +16490,23 @@ pub(crate) unsafe fn service_sec_image(
                         } else {
                             smss_stack_read(msg_ptr + 0x10)
                         };
-                        print_str(b"[wl-diag] GetMessage retrieved MSG hwnd=0x");
-                        print_hex(hwnd as u32);
-                        print_str(b" message=0x");
-                        print_hex(message as u32);
-                        print_str(b" wParam=0x");
-                        print_hex(wparam as u32);
-                        print_str(b" (ret=0x");
-                        print_hex(r.0 as u32);
-                        print_str(b")\n");
+                        let message_is_milestone = matches!(
+                            message as u32,
+                            nt_user_callback::WLX_WM_SAS | 0x0100 | 0x0102
+                        );
+                        if message_is_milestone
+                            || bounded_trace_sample(&WINLOGON_MESSAGE_TRACE, 64)
+                        {
+                            print_str(b"[wl-diag] GetMessage retrieved MSG hwnd=0x");
+                            print_hex(hwnd as u32);
+                            print_str(b" message=0x");
+                            print_hex(message as u32);
+                            print_str(b" wParam=0x");
+                            print_hex(wparam as u32);
+                            print_str(b" (ret=0x");
+                            print_hex(r.0 as u32);
+                            print_str(b")\n");
+                        }
                         if r.0 == 1 {
                             // Count the injected credential keystrokes that genuinely came back
                             // out of win32k's real message queue into the dialog's real pump.
@@ -16925,8 +16931,8 @@ pub(crate) unsafe fn service_sec_image(
                         st = 0xC000_0001;
                     }
                 }
-                // Throttle the status line for the same hot class-loop SSNs. Real provider walls
-                // still print, but an intentional wait-park is not a failed provider dispatch.
+                // Use the request's sampling decision for the matching status line. Real provider
+                // walls still print, but an intentional wait-park is not a failed dispatch.
                 if !redirected_user_callback
                     && !wl_milestone_park
                     && !gui_message_wait_park_request

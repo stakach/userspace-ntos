@@ -1311,7 +1311,7 @@ pub(crate) unsafe fn begin_nested_user_callback_dispatch(
         }
     }
     USER_CALLBACK_CONTINUATION_PUSHES.fetch_add(1, Ordering::Relaxed);
-    USER_CALLBACK_NESTED_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    let nested_ordinal = USER_CALLBACK_NESTED_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
     USER_CALLBACK_NESTED_SSN_1298.fetch_add(
         (ssn == nt_user_callback::NTUSER_SET_WINDOW_LONG_PTR_SSN) as u64,
         Ordering::Relaxed,
@@ -1320,9 +1320,11 @@ pub(crate) unsafe fn begin_nested_user_callback_dispatch(
         (ssn == nt_user_callback::NTUSER_REGISTER_HOT_KEY_SSN) as u64,
         Ordering::Relaxed,
     );
-    print_str(b"[user-callback] nested win32k dispatch ssn=0x");
-    print_hex(ssn as u32);
-    print_str(b" pushed above api0 callback\n");
+    if trace_ordinal_sample(nested_ordinal, 128) {
+        print_str(b"[user-callback] nested win32k dispatch ssn=0x");
+        print_hex(ssn as u32);
+        print_str(b" pushed above api0 callback\n");
+    }
     Ok(true)
 }
 
@@ -2319,6 +2321,10 @@ pub(crate) unsafe fn service_user_callback(
         } else {
             u32::MAX
         };
+    let callback_trace = matches!(
+        window_message,
+        0x0001 | 0x0002 | 0x0010 | 0x0081 | 0x0082 | 0x0110 | 0x0111
+    ) || trace_ordinal_sample(u64::from(request.callback_id), 128);
     let window_hwnd = if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
         && request.input_length as usize >= 0x40
     {
@@ -2483,15 +2489,17 @@ pub(crate) unsafe fn service_user_callback(
                 USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(request.dispatch_id, Ordering::Relaxed);
             }
             suspend_component = true;
-            print_str(b"[user-callback] selected real callback api=");
-            print_u64(request.api_index as u64);
-            if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
-                print_str(b" msg=0x");
-                print_hex(window_message);
+            if callback_trace {
+                print_str(b"[user-callback] selected real callback api=");
+                print_u64(request.api_index as u64);
+                if request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC {
+                    print_str(b" msg=0x");
+                    print_hex(window_message);
+                }
+                print_str(b" depth=");
+                print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
+                print_str(b"\n");
             }
-            print_str(b" depth=");
-            print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
-            print_str(b"\n");
             if callback_client_is_explorer(client)
                 && request.api_index == nt_user_callback::USER32_CALLBACK_WINDOWPROC
             {
@@ -2502,7 +2510,11 @@ pub(crate) unsafe fn service_user_callback(
 
     if suspend_component {
         capture_suspended_published_win32k_context(client);
-        print_str(b"[user-callback] B component continuation parked in callback receive loop\n");
+        if callback_trace {
+            print_str(
+                b"[user-callback] B component continuation parked in callback receive loop\n",
+            );
+        }
         Some(UserCallbackDisposition::SuspendComponent)
     } else {
         const STATUS_UNSUCCESSFUL: i32 = 0xc000_0001u32 as i32;
@@ -3942,6 +3954,10 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     } else {
         0
     };
+    let callback_trace = matches!(
+        request_window_message,
+        0x0001 | 0x0002 | 0x0010 | 0x0081 | 0x0082 | 0x0110 | 0x0111
+    ) || trace_ordinal_sample(u64::from(request.callback_id), 128);
     if result_length != 0 {
         if (client_is_winlogon || client_is_explorer) && request_window_message == 0x0081 {
             let expected = nt_user_callback::UserCallbackStackLayout::below(
@@ -4028,6 +4044,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     if client_is_winlogon
         && WINLOGON_DIALOG_MODAL_READY.load(Ordering::Relaxed) != 0
         && request_window_message != u32::MAX
+        && callback_trace
     {
         print_str(b"[user-callback] IDD real api0 proc=0x");
         let proc = callback_payload_u64(frame, 0);
@@ -4081,9 +4098,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         USER_CALLBACK_SAS_SEQUENCE_ACTIVE.store(0, Ordering::Relaxed);
         USER_CALLBACK_SAS_SEQUENCE_CALLBACK_ID.store(0, Ordering::Relaxed);
     }
-    print_str(
-        b"[user-callback] A real callback completed through NtCallbackReturn; resuming B component\n",
-    );
+    if callback_trace {
+        print_str(
+            b"[user-callback] A real callback completed through NtCallbackReturn; resuming B component\n",
+        );
+    }
     let Ok(completed_frame) = active.pop(correlation) else {
         abort_controlled_user_callbacks();
         return None;
@@ -4149,7 +4168,9 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             return None;
         }
         USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[user-callback] B yielded another callback; reused outer trap context\n");
+        if callback_trace {
+            print_str(b"[user-callback] B yielded another callback; reused outer trap context\n");
+        }
         return Some(CompletedUserCallback {
             outer_dispatch: None,
         });
@@ -4217,9 +4238,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
-    print_str(b"[user-callback] B completed; restored A with result in RAX depth=");
-    print_u64(active.len() as u64);
-    print_str(b"\n");
+    if callback_trace {
+        print_str(b"[user-callback] B completed; restored A with result in RAX depth=");
+        print_u64(active.len() as u64);
+        print_str(b"\n");
+    }
     let mut outer_dispatch = CompletedWin32kDispatch::new(
         dispatch_context.ssn,
         dispatch_context.args,

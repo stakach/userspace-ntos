@@ -24397,12 +24397,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `WLX_WM_SAS` null dereference, paints the real login dialog, injects and renders the user name,
     delivers Return, enters authentication, and demand-loads `shell32`.
 
-    Review adjustment: msgina's status dialog legitimately owns a 20 ms animation timer. The run's
-    apparent timer stall was unbounded serial instrumentation amplifying that normal workload into
-    millions of synchronous writes; it was still making forward progress when stopped. Bound the
-    generic win32k dispatch, nested-dispatch, callback, and message diagnostics while retaining
-    milestone/error records, then rerun the serialized desktop gate to identify the first semantic
-    frontier after authentication. Do not suppress, coalesce, or synthesize the guest timer.
+    B3 bounded-instrumentation checkpoint (2026-09-03, freestanding and runtime green): msgina's
+    status dialog legitimately owns a 20 ms animation timer. The apparent stall was unbounded
+    synchronous serial instrumentation, not a guest timer defect. A shared initial-window plus
+    power-of-two sampler now covers the generic win32k dispatch, nested-dispatch, callback, and
+    winlogon message streams. Exact counters, errors, and semantic callback milestones remain
+    unconditional. The serialized gate completes after 48,828 ms of guest time with a 1.25 MB log,
+    versus a stopped 20 MB run after more than 157 seconds, without suppressing, coalescing, or
+    synthesizing the guest timer.
+
+    That run exposes the next exact B3 ownership failure after credential submission. A
+    `WM_WINDOWPOSCHANGED` callback returns and the resumed win32k lane immediately suspends again on
+    provider/LPC work. The callback path retires the external token but does not transfer the native
+    continuation into the new retained record; it then reports component completion failure.
+    Winlogon's worker subsequently raises `STATUS_NO_CALLBACK_ACTIVE` and critical-process
+    termination stops the gate before profile creation. Implement callback-to-provider/LPC
+    continuation transfer on the same generation-bearing lane, with a focused host regression, then
+    rerun the desktop gate. Do not convert either suspension into a fabricated callback result.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
