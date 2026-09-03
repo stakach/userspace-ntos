@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn secured_virtual_memory_ranges_fence_delete_and_protection() {
+    let mut secured = SecuredVirtualMemoryTable::new();
+    let read = secured
+        .secure(7, 0x10_0800, 0x1800, SecuredVirtualMemoryAccess::ReadOnly)
+        .unwrap();
+    let write = secured
+        .secure(7, 0x20_0000, 0x1000, SecuredVirtualMemoryAccess::ReadWrite)
+        .unwrap();
+
+    assert!(secured.conflicts_with_delete(7, 0x10_0000, 0x1000));
+    assert!(!secured.conflicts_with_delete(7, 0x10_0000, 0x800));
+    assert!(!secured.conflicts_with_delete(8, 0x10_0000, 0x2000));
+    assert!(secured.conflicts_with_delete(7, u64::MAX - 1, 4));
+    assert!(secured.permits_protection(7, 0x10_1000, 0x1000, PAGE_EXECUTE_READ));
+    assert!(!secured.permits_protection(7, 0x10_1000, 0x1000, PAGE_NOACCESS));
+    assert!(secured.permits_protection(7, 0x20_0000, 0x1000, PAGE_READWRITE));
+    assert!(!secured.permits_protection(7, 0x20_0000, 0x1000, PAGE_READONLY));
+    assert!(!secured.permits_protection(7, 0x20_0000, 0x1000, PAGE_READWRITE | PAGE_GUARD));
+
+    assert_eq!(secured.unsecure(7, read).unwrap().base, 0x10_0800);
+    assert_eq!(secured.unsecure(8, write), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(
+        secured.unsecure(7, write).unwrap().access,
+        SecuredVirtualMemoryAccess::ReadWrite
+    );
+    assert!(secured.is_empty());
+}
+
+#[test]
+fn secured_virtual_memory_handles_do_not_alias_and_owner_retirement_is_exact() {
+    let mut secured = SecuredVirtualMemoryTable::default();
+    let first = secured
+        .secure(10, 0x4000, 0x1000, SecuredVirtualMemoryAccess::ReadOnly)
+        .unwrap();
+    let second = secured
+        .secure(11, 0x4000, 0x1000, SecuredVirtualMemoryAccess::ReadOnly)
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(secured.retire_owner(10), 1);
+    assert_eq!(secured.len(), 1);
+    assert_eq!(secured.unsecure(10, first), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(secured.unsecure(11, second).unwrap().owner, 11);
+}
+
+#[test]
 fn page_table_ownership_is_transactional_and_process_scoped() {
     let mut owner = VmPageTableOwnership::new();
     let p1a = owner.prepare_insert(1, 0x1000_0000).unwrap().unwrap();

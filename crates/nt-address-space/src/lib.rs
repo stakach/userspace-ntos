@@ -26,6 +26,126 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const ALLOCATION_GRANULARITY: u64 = 64 * 1024;
 pub const PAGE_TABLE_SPAN: u64 = 2 * 1024 * 1024;
 
+/// Access promise retained by `MmSecureVirtualMemory` until the matching opaque handle is released.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SecuredVirtualMemoryAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SecuredVirtualMemoryRange {
+    pub handle: u64,
+    pub owner: u64,
+    pub base: u64,
+    pub size: u64,
+    pub access: SecuredVirtualMemoryAccess,
+}
+
+/// Process-address-space security leases used by `MmSecureVirtualMemory`.
+///
+/// The table owns only lifetime and conflict policy. The executive validates that the requested
+/// interval is one committed VAD with the promised access before inserting a lease.
+pub struct SecuredVirtualMemoryTable {
+    ranges: Vec<SecuredVirtualMemoryRange>,
+    next_handle: u64,
+}
+
+impl Default for SecuredVirtualMemoryTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecuredVirtualMemoryTable {
+    pub const fn new() -> Self {
+        Self {
+            ranges: Vec::new(),
+            next_handle: 1,
+        }
+    }
+
+    pub fn secure(
+        &mut self,
+        owner: u64,
+        base: u64,
+        size: u64,
+        access: SecuredVirtualMemoryAccess,
+    ) -> Result<u64, u32> {
+        if owner == 0 || size == 0 || base.checked_add(size).is_none() || self.next_handle == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.ranges
+            .try_reserve(1)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.checked_add(1).unwrap_or(0);
+        self.ranges.push(SecuredVirtualMemoryRange {
+            handle,
+            owner,
+            base,
+            size,
+            access,
+        });
+        Ok(handle)
+    }
+
+    pub fn unsecure(&mut self, owner: u64, handle: u64) -> Result<SecuredVirtualMemoryRange, u32> {
+        let index = self
+            .ranges
+            .iter()
+            .position(|range| range.owner == owner && range.handle == handle)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        Ok(self.ranges.swap_remove(index))
+    }
+
+    pub fn conflicts_with_delete(&self, owner: u64, base: u64, size: u64) -> bool {
+        self.ranges
+            .iter()
+            .any(|range| range.owner == owner && ranges_overlap(range.base, range.size, base, size))
+    }
+
+    pub fn permits_protection(&self, owner: u64, base: u64, size: u64, protection: u32) -> bool {
+        self.ranges.iter().all(|range| {
+            if range.owner != owner || !ranges_overlap(range.base, range.size, base, size) {
+                return true;
+            }
+            match range.access {
+                SecuredVirtualMemoryAccess::ReadOnly => {
+                    protection_allows_fault_access(protection, FaultAccess::Read)
+                }
+                SecuredVirtualMemoryAccess::ReadWrite => {
+                    protection_allows_fault_access(protection, FaultAccess::Write)
+                }
+            }
+        })
+    }
+
+    pub fn retire_owner(&mut self, owner: u64) -> usize {
+        let before = self.ranges.len();
+        self.ranges.retain(|range| range.owner != owner);
+        before - self.ranges.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
+fn ranges_overlap(left_base: u64, left_size: u64, right_base: u64, right_size: u64) -> bool {
+    let Some(left_end) = left_base.checked_add(left_size) else {
+        return true;
+    };
+    let Some(right_end) = right_base.checked_add(right_size) else {
+        return true;
+    };
+    left_base < right_end && right_base < left_end
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct VmPageTableOwnershipStats {
     pub records: usize,
@@ -394,6 +514,11 @@ fn protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool 
         FaultAccess::Write => writable(protection),
         FaultAccess::Execute => executable(protection),
     }
+}
+
+/// Return whether an already committed private or mapped page preserves the requested access.
+pub fn protection_permits(protection: u32, access: FaultAccess) -> bool {
+    protection_allows_fault_access(protection, access)
 }
 
 fn mapped_protection_allows_fault_access(protection: u32, access: FaultAccess) -> bool {

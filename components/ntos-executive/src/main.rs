@@ -19537,6 +19537,15 @@ unsafe fn reclaim_final_process_vm(
         return ProcessVmReclaimStats::default();
     }
 
+    // Process exit tears down the entire address space, so secured ranges cannot outlive their
+    // canonical EPROCESS owner. This is intentionally retirement, not an unmap conflict check.
+    if let Some(owner) = handler
+        .pm_pid_for_pi(pi)
+        .and_then(|pid| handler.pm.process_kernel_object(pid))
+    {
+        let _ = handler.secured_virtual_memory.retire_owner(owner);
+    }
+
     // Process teardown ends every virtual lock before any backing cap can be reclaimed. The lock
     // owner is the address-space slot, whose lifetime ends at this exact boundary.
     let _ = vm_page_lock_retire_owner(pi as u64);
@@ -24333,6 +24342,9 @@ struct ExecNtHandler {
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// SYSTEM-hive policy describing whether the platform RTC stores UTC rather than local time.
     real_time_is_universal: bool,
+    /// Kernel-secured user ranges keyed by the canonical EPROCESS projection that owns the VAD.
+    /// These leases fence native protection, decommit, release, and view-unmap operations.
+    secured_virtual_memory: nt_address_space::SecuredVirtualMemoryTable,
     /// The minimal object-manager namespace (index 0 = root `\`). Entries are inline and the owned
     /// vector grows beyond its boot reserve when required.
     obj_ns: alloc::vec::Vec<ObjEntry>,

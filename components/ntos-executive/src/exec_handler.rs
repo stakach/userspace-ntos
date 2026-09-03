@@ -4213,6 +4213,10 @@ impl ExecNtHandler {
         write_field!(registry_user_root_security_descriptor, None);
         write_field!(time_zone_information, time_zone_information);
         write_field!(real_time_is_universal, real_time_is_universal);
+        write_field!(
+            secured_virtual_memory,
+            nt_address_space::SecuredVirtualMemoryTable::new()
+        );
         write_field!(obj_ns, build_initial_object_namespace());
         write_field!(events, nt_kernel_exec::EventStore::with_capacity(192));
         write_field!(
@@ -19020,6 +19024,18 @@ impl ExecNtHandler {
                 Ok(plan) => plan,
                 Err(status) => return status,
             };
+            let secure_owner = match self.pm.process_kernel_object(target_pid) {
+                Some(owner) => owner,
+                None => return nt_process::STATUS_INVALID_HANDLE,
+            };
+            if !self.secured_virtual_memory.permits_protection(
+                secure_owner,
+                plan.base,
+                plan.size,
+                new_protection,
+            ) {
+                return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+            }
             let before_commit = before_committed.process_commit_bytes();
             let after_commit = after_committed.process_commit_bytes();
             let added_commit = after_commit.saturating_sub(before_commit);
@@ -19140,6 +19156,18 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        let secure_owner = match self.pm.process_kernel_object(target_pid) {
+            Some(owner) => owner,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        if !self.secured_virtual_memory.permits_protection(
+            secure_owner,
+            plan.base,
+            plan.size,
+            new_protection,
+        ) {
+            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+        }
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         crate::note_high_water(
             &crate::VM_PROTECTION_OVERRIDE_HW,
@@ -19500,6 +19528,97 @@ impl ExecNtHandler {
             protect: nt_address_space::PAGE_NOACCESS,
             type_: 0,
         })
+    }
+
+    pub(crate) unsafe fn service_win32k_secure_virtual_memory(
+        &mut self,
+        target_pi: usize,
+        address: u64,
+        size: u64,
+        protection: u32,
+    ) -> Result<u64, u32> {
+        let access = match protection {
+            nt_address_space::PAGE_READONLY => {
+                nt_address_space::SecuredVirtualMemoryAccess::ReadOnly
+            }
+            nt_address_space::PAGE_READWRITE => {
+                nt_address_space::SecuredVirtualMemoryAccess::ReadWrite
+            }
+            _ => return Err(nt_address_space::STATUS_INVALID_PAGE_PROTECTION),
+        };
+        let end = address
+            .checked_add(size)
+            .filter(|end| size != 0 && *end <= USER_ADDRESS_LIMIT)
+            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        let pid = self
+            .pm_pid_for_pi(target_pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let owner = self
+            .pm
+            .process_kernel_object(pid)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let first = self.query_memory_basic_information(target_pi, address)?;
+        if first.state != nt_address_space::MEM_COMMIT
+            || !nt_address_space::protection_permits(
+                first.protect,
+                match access {
+                    nt_address_space::SecuredVirtualMemoryAccess::ReadOnly => {
+                        nt_address_space::FaultAccess::Read
+                    }
+                    nt_address_space::SecuredVirtualMemoryAccess::ReadWrite => {
+                        nt_address_space::FaultAccess::Write
+                    }
+                },
+            )
+        {
+            return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+        }
+        let allocation_base = first.allocation_base;
+        let mut cursor = address;
+        while cursor < end {
+            let information = self.query_memory_basic_information(target_pi, cursor)?;
+            if information.state != nt_address_space::MEM_COMMIT
+                || information.allocation_base != allocation_base
+                || !nt_address_space::protection_permits(
+                    information.protect,
+                    match access {
+                        nt_address_space::SecuredVirtualMemoryAccess::ReadOnly => {
+                            nt_address_space::FaultAccess::Read
+                        }
+                        nt_address_space::SecuredVirtualMemoryAccess::ReadWrite => {
+                            nt_address_space::FaultAccess::Write
+                        }
+                    },
+                )
+            {
+                return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+            }
+            let region_end = information
+                .base_address
+                .checked_add(information.region_size)
+                .filter(|region_end| *region_end > cursor)
+                .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
+            cursor = region_end.min(end);
+        }
+        self.secured_virtual_memory
+            .secure(owner, address, size, access)
+    }
+
+    pub(crate) fn service_win32k_unsecure_virtual_memory(
+        &mut self,
+        target_pi: usize,
+        handle: u64,
+    ) -> Result<(), u32> {
+        let pid = self
+            .pm_pid_for_pi(target_pi)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let owner = self
+            .pm
+            .process_kernel_object(pid)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        self.secured_virtual_memory
+            .unsecure(owner, handle)
+            .map(|_| ())
     }
 
     pub(crate) unsafe fn nt_query_virtual_memory_with_user_memory(
@@ -19891,6 +20010,17 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        let secure_owner = match self.pm.process_kernel_object(target_pid) {
+            Some(owner) => owner,
+            None => return nt_process::STATUS_INVALID_HANDLE,
+        };
+        if self.secured_virtual_memory.conflicts_with_delete(
+            secure_owner,
+            plan.base,
+            plan.size,
+        ) {
+            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+        }
         let released_commit = before
             .private_committed_bytes()
             .saturating_sub(after.private_committed_bytes());
@@ -40122,6 +40252,16 @@ impl ExecNtHandler {
                     if let Some((_section_index, view)) =
                         generic_sections.view_for_page(target_pi, base)
                     {
+                        let Some(secure_owner) = self.pm.process_kernel_object(target_pid) else {
+                            return nt_process::STATUS_INVALID_HANDLE;
+                        };
+                        if self.secured_virtual_memory.conflicts_with_delete(
+                            secure_owner,
+                            view.base,
+                            view.size,
+                        ) {
+                            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+                        }
                         let mapped_commit =
                             process_committed_allocation_commit_bytes(target_pi as u64, view.base)
                                 .unwrap_or(0);
@@ -40183,9 +40323,33 @@ impl ExecNtHandler {
                 if let Some(ctx) = self.loop_ctx {
                     let reg = &mut *ctx.reg;
                     if let Some((slot, _)) = reg.dll_for_page(target_pi, base) {
-                        let image_base = reg.get(slot).map(|dll| dll.base).unwrap_or(base);
+                        let (image_base, image_size) = reg
+                            .get(slot)
+                            .map(|dll| (dll.base, dll.image_size))
+                            .unwrap_or((base, 0x1000));
                         let allocation =
                             process_committed_image_allocation(target_pi as u64, image_base);
+                        let (unmap_base, unmap_size) = allocation.map_or(
+                            (image_base, image_size),
+                            |allocation| {
+                                (
+                                    allocation.allocation_base,
+                                    allocation
+                                        .allocation_end
+                                        .saturating_sub(allocation.allocation_base),
+                                )
+                            },
+                        );
+                        let Some(secure_owner) = self.pm.process_kernel_object(target_pid) else {
+                            return nt_process::STATUS_INVALID_HANDLE;
+                        };
+                        if self.secured_virtual_memory.conflicts_with_delete(
+                            secure_owner,
+                            unmap_base,
+                            unmap_size,
+                        ) {
+                            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+                        }
                         let image_commit =
                             process_committed_allocation_commit_bytes(target_pi as u64, image_base)
                                 .unwrap_or(0);

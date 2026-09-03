@@ -1166,6 +1166,11 @@ pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
 pub const W32_ATOM_LABEL: u64 = 0x77E;
 pub const W32_ATOM_OP_ADD_NAME: u64 = 1;
 pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
+/// Process-scoped `MmSecureVirtualMemory` leases. The executive validates the current client VAD
+/// and owns the opaque lease; win32k receives no mutable MM state or raw executive pointer.
+pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
+pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
+pub const W32_MM_SECURE_OP_UNSECURE: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -2840,6 +2845,42 @@ unsafe fn win32k_atom_broker_call(operation: u64, value: u64) -> (i32, u64) {
     let (_label, status, atom, _, _) =
         crate::driver_launch::call_on4((W32_ATOM_LABEL << 12) | 2, operation, value, 0, 0);
     (status as u32 as i32, atom)
+}
+
+unsafe fn win32k_mm_secure_broker_call(
+    operation: u64,
+    address_or_handle: u64,
+    size: u64,
+    protection: u64,
+) -> (i32, u64) {
+    let (_label, status, handle, _, _) = crate::driver_launch::call_on4(
+        (W32_MM_SECURE_LABEL << 12) | 4,
+        operation,
+        address_or_handle,
+        size,
+        protection,
+    );
+    (status as u32 as i32, handle)
+}
+
+extern "win64" fn s_mm_secure_virtual_memory(address: u64, size: u64, protection: u32) -> u64 {
+    let (status, handle) = unsafe {
+        win32k_mm_secure_broker_call(
+            W32_MM_SECURE_OP_SECURE,
+            address,
+            size,
+            u64::from(protection),
+        )
+    };
+    if status == 0 { handle } else { 0 }
+}
+
+extern "win64" fn s_mm_unsecure_virtual_memory(handle: u64) {
+    let (status, _) =
+        unsafe { win32k_mm_secure_broker_call(W32_MM_SECURE_OP_UNSECURE, handle, 0, 0) };
+    if status != 0 {
+        panic!("executive MM secure broker rejected unsecure: {status:#010x}");
+    }
 }
 
 #[cold]
@@ -14454,6 +14495,14 @@ fn register_trampolines() -> bool {
     reg.bind(
         "MmUnmapViewOfSection",
         s_mm_unmap_view_of_section as usize as u64,
+    );
+    reg.bind(
+        "MmSecureVirtualMemory",
+        s_mm_secure_virtual_memory as usize as u64,
+    );
+    reg.bind(
+        "MmUnsecureVirtualMemory",
+        s_mm_unsecure_virtual_memory as usize as u64,
     );
     // --- batch 3: lookaside-list init (nt_kernel_exec::init_general_lookaside) ---
     reg.bind(

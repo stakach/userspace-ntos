@@ -24831,6 +24831,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unchanged 254-warning baseline. The audited win32k import count remains thirty-five because
     this tranche closes a hosted-driver provider boundary rather than another win32k import.
 
+    B3 secured client-memory tranche 18 (2026-09-04, host and freestanding green):
+    `MmSecureVirtualMemory` now validates the authenticated current process range against the
+    executive's live VM metadata, requires one committed allocation with the requested read or
+    write access, and returns a monotonically allocated opaque lease. The lease table is keyed by
+    the canonical EPROCESS projection and lives in `nt-address-space`; exact-owner unsecure is the
+    only normal release path, stale or cross-process tokens fail closed, and final process VM
+    reclaim retires every remaining lease before the address-space slot can be reused.
+
+    Native protect, decommit/release, generic-section unmap, and image unmap paths now consult the
+    same lease owner. Protection changes must preserve the promised access and cannot add guard or
+    no-access semantics; any overlapping deletion returns `STATUS_INVALID_PAGE_PROTECTION`. The
+    win32k component has only an authenticated scalar request boundary and never receives VAD state
+    or an executive pointer. `MmSecureVirtualMemory` preserves the NT NULL-on-validation-failure
+    contract, while invalid `MmUnsecureVirtualMemory` use fails loudly instead of being ignored.
+    The old unbound imports have no local token fallback.
+
+    All 68 `nt-address-space` tests and all 46 `nt-compat-exports` tests pass. The freestanding
+    executive release build succeeds at 256 warnings. Thirty-three audited code imports remain.
+    Next implement the exception-raising group (`ExRaiseAccessViolation`, `ExRaiseStatus`, and the
+    unwind boundary) as real kernel-to-provider structured exception delivery; do not turn failed
+    probes into ordinary return values or component-local traps.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
