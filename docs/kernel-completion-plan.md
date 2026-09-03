@@ -24415,6 +24415,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     continuation transfer on the same generation-bearing lane, with a focused host regression, then
     rerun the desktop gate. Do not convert either suspension into a fabricated callback result.
 
+    B3 callback-to-wait transfer checkpoint (2026-09-03, host and freestanding green; desktop run
+    pending): `nt-component-suspension` now atomically replaces a running external callback token
+    with a typed provider/LPC suspension, without exposing the lane as idle. Callback completion
+    returns an explicit completed/provider-wait/LPC-wait transition instead of collapsing every
+    non-completed pump result into `STATUS_NO_CALLBACK_ACTIVE`. Both the immediate and deferred
+    `NtCallbackReturn` paths retain their real native reply object until the exact wait completes;
+    the obsolete retire-only executive wrapper is removed. The focused lane suite passes 22 tests
+    and the freestanding executive remains at 227 warnings. Rerun the serialized desktop gate and
+    require the prior `WM_WINDOWPOSCHANGED` transition to reach profile creation without critical
+    winlogon termination.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

@@ -916,6 +916,50 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         Ok(())
     }
 
+    /// Replace the running top external continuation with a typed component suspension.
+    ///
+    /// A callback return can resume the component directly into a provider or LPC wait. The
+    /// callback token and the new wait then describe one continuous physical-lane ownership chain;
+    /// exposing an idle or merely-running lane between them would allow unrelated work to enter.
+    pub fn transfer_external_to_suspension_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        external_token: u64,
+        key: SuspensionKey,
+        admission_sequence: u64,
+        owner: SuspensionOwner,
+        continuation: C,
+    ) -> Result<(), LaneError> {
+        if external_token == 0 {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_running(handle, reply_object)?;
+        if self.slots.iter().any(|slot| {
+            slot.lane.as_ref().is_some_and(|lane| {
+                lane.suspensions.get(key).is_some()
+                    || lane.suspensions.frames().iter().any(|frame| {
+                        frame.owner.provider_domain == owner.provider_domain
+                            && frame.owner.provider_generation == owner.provider_generation
+                            && frame.owner.dispatch_id == owner.dispatch_id
+                    })
+            })
+        }) {
+            return Err(LaneError::Suspension(SuspensionError::DuplicateIdentity));
+        }
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.last().copied() != Some(external_token) {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.suspensions
+            .admit(key, admission_sequence, owner, continuation)
+            .map_err(LaneError::Suspension)?;
+        lane.external_tokens.pop();
+        lane.phase = LanePhase::Suspended;
+        self.running = None;
+        Ok(())
+    }
+
     pub fn admit_running(
         &mut self,
         handle: LaneHandle,
@@ -1732,6 +1776,46 @@ mod tests {
         lanes
             .finish_dispatch(lane, binding(1).reply_object)
             .unwrap();
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
+    }
+
+    #[test]
+    fn callback_return_transfers_directly_to_a_provider_wait() {
+        let mut lanes = ComponentSuspensionLanes::new(1, 3);
+        let lane = lanes.allocate(binding(1)).unwrap();
+        let wait = SuspensionKey::provider_wait(0x77);
+
+        lanes.begin_dispatch(lane, binding(1).reply_object).unwrap();
+        lanes
+            .suspend_running(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        lanes
+            .resume_external(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        lanes
+            .transfer_external_to_suspension_running(
+                lane,
+                binding(1).reply_object,
+                0xCA11_BACC,
+                wait,
+                1,
+                owner(1),
+                42u64,
+            )
+            .unwrap();
+
+        assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.external_depth(lane), Ok(0));
+        assert_eq!(lanes.suspension_count(lane), Ok(1));
+        assert_eq!(lanes.next_idle(), None);
+        lanes.select(wait, 7u32).unwrap();
+        lanes
+            .begin_resume(lane, binding(1).reply_object, wait)
+            .unwrap();
+        let completed = lanes
+            .complete_running(lane, binding(1).reply_object, wait, owner(1))
+            .unwrap();
+        assert_eq!(completed.continuation, 42);
         assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
     }
 

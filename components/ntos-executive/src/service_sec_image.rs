@@ -309,18 +309,6 @@ pub(crate) unsafe fn replace_external_component_execution_lane(
         .is_ok()
 }
 
-pub(crate) unsafe fn retire_external_component_execution_lane(
-    lane: nt_component_suspension::LaneHandle,
-    token: u64,
-) -> bool {
-    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
-    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
-        return false;
-    };
-    lanes
-        .retire_external_running(lane, reply_object, token)
-        .is_ok()
-}
 static PROVIDER_WAIT_DISPATCH_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_PARKED_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_RESUMES: AtomicU64 = AtomicU64::new(0);
@@ -2011,19 +1999,17 @@ pub(crate) unsafe fn provider_timer_wake_due(
     expired.saturating_add(provider_wait_select_ready(nt_handler))
 }
 
-unsafe fn provider_wait_admit_current(
+unsafe fn provider_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
+    reply_cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
+    callback_token: Option<u64>,
 ) -> bool {
-    let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
-        return false;
-    };
-    if active_reply == 0 || fresh_reply == active_reply {
+    if reply_cap == 0 {
         return false;
     }
     let Some(owner) = provider_wait_expected_owner(pending) else {
@@ -2033,7 +2019,7 @@ unsafe fn provider_wait_admit_current(
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
-        reply_cap: active_reply,
+        reply_cap,
         reply,
         resume_ip,
         resume_sp,
@@ -2044,8 +2030,19 @@ unsafe fn provider_wait_admit_current(
     let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
         return false;
     };
-    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .admit_running(
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let admitted = if let Some(token) = callback_token {
+        lanes.transfer_external_to_suspension_running(
+            lane,
+            binding.reply_object,
+            token,
+            provider_wait_key(wait_id),
+            sequence,
+            component_suspension_owner(owner),
+            continuation,
+        )
+    } else {
+        lanes.admit_running(
             lane,
             binding.reply_object,
             provider_wait_key(wait_id),
@@ -2053,8 +2050,8 @@ unsafe fn provider_wait_admit_current(
             component_suspension_owner(owner),
             continuation,
         )
-        .is_err()
-    {
+    };
+    if admitted.is_err() {
         return false;
     }
     PROVIDER_WAIT_DISPATCH_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
@@ -2127,28 +2124,56 @@ unsafe fn provider_wait_admit_current(
             }
         }
     }
+    true
+}
+
+unsafe fn provider_wait_admit_current(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingProviderWaitDispatch,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+    callback_token: Option<u64>,
+) -> bool {
+    let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
+        return false;
+    };
+    if active_reply == 0 || fresh_reply == active_reply {
+        return false;
+    }
+    if !provider_wait_admit_retained(
+        nt_handler,
+        pending,
+        active_reply,
+        reply,
+        resume_ip,
+        resume_sp,
+        resume_flags,
+        callback_token,
+    ) {
+        return false;
+    }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
     true
 }
 
-unsafe fn lpc_wait_admit_current(
+unsafe fn lpc_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
+    reply_cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
+    callback_token: Option<u64>,
 ) -> bool {
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
         return false;
     };
-    let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
-        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-        return false;
-    };
-    if active_reply == 0 || fresh_reply == active_reply {
+    if reply_cap == 0 {
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
     }
@@ -2160,7 +2185,7 @@ unsafe fn lpc_wait_admit_current(
     let sequence = next_dispatcher_wait_sequence();
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
-        reply_cap: active_reply,
+        reply_cap,
         reply,
         resume_ip,
         resume_sp,
@@ -2172,8 +2197,19 @@ unsafe fn lpc_wait_admit_current(
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
     };
-    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .admit_running(
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let admitted = if let Some(token) = callback_token {
+        lanes.transfer_external_to_suspension_running(
+            lane,
+            binding.reply_object,
+            token,
+            key,
+            sequence,
+            component_suspension_owner(owner),
+            continuation,
+        )
+    } else {
+        lanes.admit_running(
             lane,
             binding.reply_object,
             key,
@@ -2181,12 +2217,43 @@ unsafe fn lpc_wait_admit_current(
             component_suspension_owner(owner),
             continuation,
         )
-        .is_err()
-    {
+    };
+    if admitted.is_err() {
         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
         return false;
     }
     let _ = lpc_wait_begin_after_stack_admission(nt_handler, pending, key, reservation);
+    true
+}
+
+unsafe fn lpc_wait_admit_current(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingLpcWaitDispatch,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+    callback_token: Option<u64>,
+) -> bool {
+    let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
+        return false;
+    };
+    if active_reply == 0 || fresh_reply == active_reply {
+        return false;
+    }
+    if !lpc_wait_admit_retained(
+        nt_handler,
+        pending,
+        active_reply,
+        reply,
+        resume_ip,
+        resume_sp,
+        resume_flags,
+        callback_token,
+    ) {
+        return false;
+    }
     wait_reply_pool_mark_used(fresh_index);
     REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
     true
@@ -2766,6 +2833,7 @@ unsafe fn drain_deferred_user_callback_returns(
         );
         let mut effects_ok;
         let mut outer_dispatch_completed = false;
+        let mut retained_reply = false;
         if let Some(completion) = completion {
             let completion_pi = deferred.pi as usize;
             effects_ok = completion_pi < MAX_PI;
@@ -2776,41 +2844,79 @@ unsafe fn drain_deferred_user_callback_returns(
                     deferred.tid,
                 );
             }
-            if let Some(dispatch) = completion.outer_dispatch {
-                if effects_ok {
-                    let completion_pml4 = procs[completion_pi].pml4;
-                    let completion_scratch_base = procs[completion_pi].scratch_base;
-                    let completion_faults = if completion_pi == current_pi {
-                        current_faults
-                    } else {
-                        procs[completion_pi].faults as usize
-                    };
-                    effects_ok = if completion_pi == current_pi {
-                        process_completed_user_callback_outer_dispatch(
-                            nt_handler,
-                            completion_pi,
-                            completion_pml4,
-                            deferred.badge,
-                            deferred.tid,
-                            dispatch,
-                            current_filled_pages,
-                            completion_faults,
-                            completion_scratch_base,
-                        )
-                    } else {
-                        process_completed_user_callback_outer_dispatch(
-                            nt_handler,
-                            completion_pi,
-                            completion_pml4,
-                            deferred.badge,
-                            deferred.tid,
-                            dispatch,
-                            &mut pfilled[completion_pi],
-                            completion_faults,
-                            completion_scratch_base,
-                        )
-                    };
-                    outer_dispatch_completed = effects_ok;
+            match completion {
+                win32k_glue::CompletedUserCallback::Completed { outer_dispatch } => {
+                    if let Some(dispatch) = outer_dispatch {
+                        if effects_ok {
+                            let completion_pml4 = procs[completion_pi].pml4;
+                            let completion_scratch_base = procs[completion_pi].scratch_base;
+                            let completion_faults = if completion_pi == current_pi {
+                                current_faults
+                            } else {
+                                procs[completion_pi].faults as usize
+                            };
+                            effects_ok = if completion_pi == current_pi {
+                                process_completed_user_callback_outer_dispatch(
+                                    nt_handler,
+                                    completion_pi,
+                                    completion_pml4,
+                                    deferred.badge,
+                                    deferred.tid,
+                                    dispatch,
+                                    current_filled_pages,
+                                    completion_faults,
+                                    completion_scratch_base,
+                                )
+                            } else {
+                                process_completed_user_callback_outer_dispatch(
+                                    nt_handler,
+                                    completion_pi,
+                                    completion_pml4,
+                                    deferred.badge,
+                                    deferred.tid,
+                                    dispatch,
+                                    &mut pfilled[completion_pi],
+                                    completion_faults,
+                                    completion_scratch_base,
+                                )
+                            };
+                            outer_dispatch_completed = effects_ok;
+                        }
+                    }
+                }
+                win32k_glue::CompletedUserCallback::ProviderWaitSuspended {
+                    pending,
+                    callback_token,
+                } => {
+                    assert!(provider_wait_admit_retained(
+                        nt_handler,
+                        pending,
+                        deferred.reply_cap,
+                        deferred.reply,
+                        deferred.reply.resume_ip(),
+                        deferred.reply.resume_sp(),
+                        deferred.reply.resume_flags(),
+                        Some(callback_token),
+                    ));
+                    retained_reply = true;
+                    let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
+                }
+                win32k_glue::CompletedUserCallback::LpcWaitSuspended {
+                    pending,
+                    callback_token,
+                } => {
+                    assert!(lpc_wait_admit_retained(
+                        nt_handler,
+                        pending,
+                        deferred.reply_cap,
+                        deferred.reply,
+                        deferred.reply.resume_ip(),
+                        deferred.reply.resume_sp(),
+                        deferred.reply.resume_flags(),
+                        Some(callback_token),
+                    ));
+                    retained_reply = true;
+                    let _ = component_suspension_drain_ready(nt_handler, procs, pfilled);
                 }
             }
         } else {
@@ -2831,24 +2937,26 @@ unsafe fn drain_deferred_user_callback_returns(
                 print_str(b"[gui-msg-wait] deferred callback drain aborted unsafe redrive\n");
             }
         }
-        client_reply_on(deferred.reply_cap, 0, 0, 0, 0, 0);
-        release_reply_pool_cap(deferred.reply_cap);
-        let n = USER_CALLBACK_DEFERRED_RETURNS_WOKEN.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
-            let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
-            print_str(b"[user-callback] drained deferred NtCallbackReturn #");
-            print_u64(n + 1);
-            print_str(b" pi=");
-            print_u64(deferred.pi as u64);
-            print_str(b" badge=");
-            print_u64(deferred.badge);
-            print_str(b" tid=");
-            print_u64(deferred.tid);
-            print_str(b" depth=");
-            print_u64(active_depth as u64);
-            print_str(b"/");
-            print_u64(continuation_depth as u64);
-            print_str(b"\n");
+        if !retained_reply {
+            client_reply_on(deferred.reply_cap, 0, 0, 0, 0, 0);
+            release_reply_pool_cap(deferred.reply_cap);
+            let n = USER_CALLBACK_DEFERRED_RETURNS_WOKEN.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                let (active_depth, continuation_depth) = win32k_glue::user_callback_stack_depths();
+                print_str(b"[user-callback] drained deferred NtCallbackReturn #");
+                print_u64(n + 1);
+                print_str(b" pi=");
+                print_u64(deferred.pi as u64);
+                print_str(b" badge=");
+                print_u64(deferred.badge);
+                print_str(b" tid=");
+                print_u64(deferred.tid);
+                print_str(b" depth=");
+                print_u64(active_depth as u64);
+                print_str(b"/");
+                print_u64(continuation_depth as u64);
+                print_str(b"\n");
+            }
         }
     }
 }
@@ -11215,40 +11323,122 @@ pub(crate) unsafe fn service_sec_image(
                                     b"[win32k-context] ERROR: callback completion could not publish Ps identity\n",
                                 );
                             }
-                            let mut outer_dispatch_completed = false;
-                            if let Some(dispatch) = completion.outer_dispatch {
-                                if !process_completed_user_callback_outer_dispatch(
-                                    nt_handler,
-                                    pi,
-                                    pml4,
-                                    badge,
-                                    current_tid,
-                                    dispatch,
-                                    filled_pages,
-                                    faults as usize,
-                                    scratch_base,
-                                ) {
-                                    park_and_log!(
-                                        pi,
-                                        b"userconnect-copyout",
-                                        dispatch.ssn,
-                                        dispatch.args[1]
-                                    );
-                                } else {
-                                    outer_dispatch_completed = true;
+                            match completion {
+                                win32k_glue::CompletedUserCallback::Completed {
+                                    outer_dispatch,
+                                } => {
+                                    let mut outer_dispatch_completed = false;
+                                    if let Some(dispatch) = outer_dispatch {
+                                        if !process_completed_user_callback_outer_dispatch(
+                                            nt_handler,
+                                            pi,
+                                            pml4,
+                                            badge,
+                                            current_tid,
+                                            dispatch,
+                                            filled_pages,
+                                            faults as usize,
+                                            scratch_base,
+                                        ) {
+                                            park_and_log!(
+                                                pi,
+                                                b"userconnect-copyout",
+                                                dispatch.ssn,
+                                                dispatch.args[1]
+                                            );
+                                        } else {
+                                            outer_dispatch_completed = true;
+                                        }
+                                    }
+                                    if outer_dispatch_completed {
+                                        pfilled[pi] = *filled_pages;
+                                        let (_, _, safe) = drain_selected_gui_event_signals(
+                                            &mut nt_handler,
+                                            pfilled,
+                                            procs,
+                                        );
+                                        if !safe {
+                                            print_str(
+                                                b"[gui-msg-wait] callback drain aborted unsafe redrive\n",
+                                            );
+                                        }
+                                    }
                                 }
-                            }
-                            if outer_dispatch_completed {
-                                pfilled[pi] = *filled_pages;
-                                let (_, _, safe) = drain_selected_gui_event_signals(
-                                    &mut nt_handler,
-                                    pfilled,
-                                    procs,
-                                );
-                                if !safe {
-                                    print_str(
-                                        b"[gui-msg-wait] callback drain aborted unsafe redrive\n",
+                                win32k_glue::CompletedUserCallback::ProviderWaitSuspended {
+                                    pending,
+                                    callback_token,
+                                } => {
+                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    assert!(provider_wait_admit_current(
+                                        &mut nt_handler,
+                                        pending,
+                                        parked_syscall_reply,
+                                        resume_ip,
+                                        sp,
+                                        flags,
+                                        Some(callback_token),
+                                    ));
+                                    procs[pi].faults = faults;
+                                    procs[pi].first = first;
+                                    procs[pi].ntfaults = ntfaults;
+                                    pfilled[pi] = *filled_pages;
+                                    let _ = component_suspension_drain_ready(
+                                        &mut nt_handler,
+                                        procs,
+                                        pfilled,
                                     );
+                                    if component_suspension_top_owns_dispatch(dispatch_id) {
+                                        mark_wait_parked!(pi, resume_ip);
+                                    }
+                                    let _ = finalize_service_loop_state(&mut nt_handler);
+                                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                        recv_full_r12(fault_ep, new_reply);
+                                    badge = nb;
+                                    mi = nmi;
+                                    m0 = nm0;
+                                    m1 = nm1;
+                                    m2 = nm2;
+                                    m3 = nm3;
+                                    continue;
+                                }
+                                win32k_glue::CompletedUserCallback::LpcWaitSuspended {
+                                    pending,
+                                    callback_token,
+                                } => {
+                                    let dispatch_id = pending.dispatch.dispatch_id;
+                                    assert!(lpc_wait_admit_current(
+                                        &mut nt_handler,
+                                        pending,
+                                        parked_syscall_reply,
+                                        resume_ip,
+                                        sp,
+                                        flags,
+                                        Some(callback_token),
+                                    ));
+                                    procs[pi].faults = faults;
+                                    procs[pi].first = first;
+                                    procs[pi].ntfaults = ntfaults;
+                                    pfilled[pi] = *filled_pages;
+                                    let _ = component_suspension_drain_ready(
+                                        &mut nt_handler,
+                                        procs,
+                                        pfilled,
+                                    );
+                                    if component_suspension_top_owns_dispatch(dispatch_id) {
+                                        mark_wait_parked!(pi, resume_ip);
+                                    }
+                                    let _ = finalize_service_loop_state(&mut nt_handler);
+                                    let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                                    let (nb, nmi, nm0, nm1, nm2, nm3) =
+                                        recv_full_r12(fault_ep, new_reply);
+                                    badge = nb;
+                                    mi = nmi;
+                                    m0 = nm0;
+                                    m1 = nm1;
+                                    m2 = nm2;
+                                    m3 = nm3;
+                                    continue;
                                 }
                             }
                             drain_deferred_user_callback_returns(
@@ -16593,6 +16783,7 @@ pub(crate) unsafe fn service_sec_image(
                         resume_ip,
                         sp,
                         flags,
+                        None,
                     );
                     assert!(
                         component_suspension_park_request,
@@ -16611,6 +16802,7 @@ pub(crate) unsafe fn service_sec_image(
                         resume_ip,
                         sp,
                         flags,
+                        None,
                     );
                     assert!(
                         component_suspension_park_request,

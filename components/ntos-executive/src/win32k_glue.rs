@@ -598,8 +598,18 @@ unsafe fn release_dispatch_output_stage(context: nt_user_callback::DispatchConte
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CompletedUserCallback {
-    pub outer_dispatch: Option<CompletedWin32kDispatch>,
+pub(crate) enum CompletedUserCallback {
+    Completed {
+        outer_dispatch: Option<CompletedWin32kDispatch>,
+    },
+    ProviderWaitSuspended {
+        pending: PendingProviderWaitDispatch,
+        callback_token: u64,
+    },
+    LpcWaitSuspended {
+        pending: PendingLpcWaitDispatch,
+        callback_token: u64,
+    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -3136,7 +3146,9 @@ unsafe fn resume_suspended_user_callback_component(
                 )
             })
     } else if pr.provider_wait_suspended || pr.lpc_wait_suspended {
-        crate::service_sec_image::retire_external_component_execution_lane(lane, callback_token)
+        // The native NtCallbackReturn continuation must be attached before this callback token is
+        // removed. Its service-loop consumer performs one atomic token-to-wait transfer.
+        true
     } else if pr.completed {
         crate::service_sec_image::complete_external_component_execution_lane(lane, callback_token)
     } else {
@@ -4171,8 +4183,55 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         if callback_trace {
             print_str(b"[user-callback] B yielded another callback; reused outer trap context\n");
         }
-        return Some(CompletedUserCallback {
+        return Some(CompletedUserCallback::Completed {
             outer_dispatch: None,
+        });
+    }
+    let nested_user_callback = active.top_for(&identity).is_some();
+    let arg_snapshot_len = completed_frame.arg_snapshot_len();
+    let mut arg_snapshot = [0u8; COMPLETED_ARG_SNAPSHOT_BYTES];
+    if arg_snapshot_len as usize > arg_snapshot.len() {
+        release_dispatch_output_stage(dispatch_context);
+        abort_controlled_user_callbacks();
+        return None;
+    }
+    if arg_snapshot_len != 0 {
+        arg_snapshot[..arg_snapshot_len as usize]
+            .copy_from_slice(&completed_frame.arg_snapshot()[..arg_snapshot_len as usize]);
+    }
+    if component.provider_wait_suspended {
+        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+            as *const nt_provider_wait::ProviderWaitSharedPage;
+        let pending = PendingProviderWaitDispatch {
+            request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+            dispatch: dispatch_context,
+            client: completed_context,
+            nested_user_callback,
+            arg_snapshot_len,
+            arg_snapshot,
+        };
+        print_str(b"[user-callback] B transferred callback return to provider wait\n");
+        return Some(CompletedUserCallback::ProviderWaitSuspended {
+            pending,
+            callback_token: u64::from(request.callback_id),
+        });
+    }
+    if component.lpc_wait_suspended {
+        let Some(pending) = capture_lpc_wait_repark(
+            dispatch_context,
+            completed_context,
+            nested_user_callback,
+            arg_snapshot_len,
+            arg_snapshot,
+        ) else {
+            release_dispatch_output_stage(dispatch_context);
+            abort_controlled_user_callbacks();
+            return None;
+        };
+        print_str(b"[user-callback] B transferred callback return to LPC wait\n");
+        return Some(CompletedUserCallback::LpcWaitSuspended {
+            pending,
+            callback_token: u64::from(request.callback_id),
         });
     }
     if !component.completed {
@@ -4290,7 +4349,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     } else {
         release_dispatch_output_stage(dispatch_context);
     }
-    Some(CompletedUserCallback {
+    Some(CompletedUserCallback::Completed {
         outer_dispatch: Some(outer_dispatch),
     })
 }
