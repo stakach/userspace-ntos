@@ -23790,6 +23790,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     allocations, add Event-aware pre-free/move fencing, and run the serialized desktop gate before
     enabling Event publication.
 
+    Provider-pool generation repair (2026-09-03, host/freestanding green; desktop rerun pending):
+    the first serialized heap-hook gate reached the interactive win32k path but later reported
+    repeated provider-pool `GenerationExhausted` failures and stopped before winlogon completed.
+    The version-2 pool allocator had read the next generation from prospective header bytes after
+    tail trimming; a changed allocation layout can place that header inside arbitrary former
+    payload, so the value is not authoritative. Version 3 now allocates every generation from a
+    pool-wide monotonic counter in protected metadata and writes it into the live header. A focused
+    tail-relayout test poisons the future header bytes with `u64::MAX` and proves subsequent
+    allocation still receives the next canonical generation. All 238 `nt-kernel-exec` tests pass
+    and the freestanding executive remains at 213 warnings. Rerun the desktop gate before extending
+    the allocation catalog to the provider-pool/FTYP paths.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

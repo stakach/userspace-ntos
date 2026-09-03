@@ -10,7 +10,7 @@ pub const HEADER_SIZE: u64 = 32;
 pub const DATA_OFFSET: u64 = 0x1000;
 pub const LOCK_OFFSET: u64 = 0x10;
 pub const MAGIC_OFFSET: u64 = 0x18;
-pub const MAGIC: u64 = 0x504f_4f4c_0000_0002;
+pub const MAGIC: u64 = 0x504f_4f4c_0000_0003;
 
 const BUMP_OFFSET: u64 = 0;
 const FREE_HEAD_OFFSET: u64 = 8;
@@ -26,6 +26,7 @@ const STATS_LIVE_HIGH_WATER: u64 = 0x48;
 const STATS_ARENA_HIGH_WATER: u64 = 0x50;
 const STATS_OOM: u64 = 0x58;
 const STATS_CORRUPTION: u64 = 0x60;
+const NEXT_ALLOCATION_GENERATION: u64 = 0x68;
 
 /// Minimal memory boundary used by both the volatile provider mapping and host specs.
 pub trait PoolMemory {
@@ -126,13 +127,21 @@ pub fn initialize<M: PoolMemory>(memory: &mut M) -> Result<(), PoolError> {
     if memory.len() < DATA_OFFSET + HEADER_SIZE + ALIGNMENT {
         return Err(PoolError::ArenaTooSmall);
     }
-    for offset in (0..=STATS_CORRUPTION).step_by(8) {
+    for offset in (0..=NEXT_ALLOCATION_GENERATION).step_by(8) {
         write(memory, offset, 0)?;
     }
     write(memory, BUMP_OFFSET, DATA_OFFSET)?;
     write(memory, STATS_ARENA_HIGH_WATER, DATA_OFFSET)?;
     write(memory, MAGIC_OFFSET, MAGIC)?;
     Ok(())
+}
+
+fn next_allocation_generation<M: PoolMemory>(memory: &mut M) -> Result<u64, PoolError> {
+    let generation = read(memory, NEXT_ALLOCATION_GENERATION)?
+        .checked_add(1)
+        .ok_or(PoolError::GenerationExhausted)?;
+    write(memory, NEXT_ALLOCATION_GENERATION, generation)?;
+    Ok(generation)
 }
 
 pub fn is_initialized<M: PoolMemory>(memory: &M) -> bool {
@@ -311,9 +320,7 @@ pub fn allocate<M: PoolMemory>(
         let capacity = read(memory, node)?;
         let next = read(memory, node + 8)?;
         if capacity >= wanted {
-            let generation = read(memory, node + ALLOCATION_GENERATION_OFFSET)?
-                .checked_add(1)
-                .ok_or(PoolError::GenerationExhausted)?;
+            let generation = next_allocation_generation(memory)?;
             let allocation_capacity;
             if capacity
                 .checked_sub(wanted)
@@ -371,9 +378,7 @@ pub fn allocate<M: PoolMemory>(
         add_stat(memory, STATS_OOM, 1);
         return Err(PoolError::OutOfMemory);
     }
-    let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?
-        .checked_add(1)
-        .ok_or(PoolError::GenerationExhausted)?;
+    let generation = next_allocation_generation(memory)?;
     write(memory, header, wanted)?;
     write(memory, header + 8, ALLOC_MARKER)?;
     write(memory, header + ALLOCATION_GENERATION_OFFSET, generation)?;
@@ -638,12 +643,30 @@ mod tests {
         let second = allocate(&mut memory, 32, false).unwrap();
         assert_eq!(second.payload_offset, first.payload_offset);
         assert_eq!(second.identity.allocation_id, first.identity.allocation_id);
-        assert_eq!(
-            second.identity.allocation_generation,
-            first.identity.allocation_generation + 1
-        );
+        assert!(second.identity.allocation_generation > first.identity.allocation_generation);
         free(&mut memory, second.payload_offset).unwrap();
         free(&mut memory, blocker.payload_offset).unwrap();
+    }
+
+    #[test]
+    fn generation_does_not_trust_payload_bytes_after_tail_relayout() {
+        let mut memory = arena();
+        let first = allocate(&mut memory, 32, false).unwrap();
+        let tail = allocate(&mut memory, 256, false).unwrap();
+        assert!(memory.write_u64(tail.payload_offset + 16, u64::MAX));
+        free(&mut memory, first.payload_offset).unwrap();
+        free(&mut memory, tail.payload_offset).unwrap();
+
+        let resized_prefix = allocate(&mut memory, 64, false).unwrap();
+        let successor = allocate(&mut memory, 32, false).unwrap();
+        assert_eq!(successor.payload_offset, tail.payload_offset + 32);
+        assert_eq!(successor.identity.allocation_generation, 4);
+        assert_eq!(
+            allocation_identity(&memory, successor.payload_offset),
+            Ok(successor.identity)
+        );
+        free(&mut memory, successor.payload_offset).unwrap();
+        free(&mut memory, resized_prefix.payload_offset).unwrap();
     }
 
     #[test]
