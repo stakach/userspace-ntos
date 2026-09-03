@@ -4335,12 +4335,6 @@ unsafe fn provider_wait_rendezvous(
                 if !restore_user_callback_request_context(wait_context) {
                     return 0xC000_000Du32 as i32;
                 }
-                write_volatile(
-                    core::ptr::addr_of_mut!((*(callback_frame
-                        as *mut nt_user_callback::CallbackFrame))
-                        .header),
-                    owner_header,
-                );
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                 outgoing = W32_DISPATCH_LABEL << 12;
@@ -5835,12 +5829,6 @@ extern "win64" fn s_lpc_request_wait_reply_port(
                     if !restore_user_callback_request_context(wait_context) {
                         return STATUS_INVALID_PARAMETER_I32;
                     }
-                    write_volatile(
-                        core::ptr::addr_of_mut!((*(callback_frame
-                            as *mut nt_user_callback::CallbackFrame))
-                            .header),
-                        owner_header,
-                    );
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                     write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                     outgoing = W32_DISPATCH_LABEL << 12;
@@ -9291,6 +9279,7 @@ unsafe fn publish_selected_context(process_index: usize, thread_index: usize) {
 
 #[derive(Clone, Copy)]
 struct Win32kCallbackRequestContext {
+    request_header: nt_user_callback::CallbackHeader,
     pi: u32,
     pid: u64,
     tid: u64,
@@ -9330,6 +9319,7 @@ unsafe fn callback_request_context_for_request(
     let supplied_ethread = thread_ctx_ethread(thread_index);
 
     Some(Win32kCallbackRequestContext {
+        request_header: *request,
         pi: request.client_pi,
         pid,
         tid: request.client_tid,
@@ -9354,7 +9344,7 @@ unsafe fn callback_request_context_for_request(
 }
 
 unsafe fn restore_user_callback_request_context(context: Win32kCallbackRequestContext) -> bool {
-    restore_current_context_for_user_callback_resume_inner(
+    if !restore_current_context_for_user_callback_resume_inner(
         context.pi,
         context.pid,
         context.tid,
@@ -9364,7 +9354,16 @@ unsafe fn restore_user_callback_request_context(context: Win32kCallbackRequestCo
         context.process_role,
         true,
         false,
-    )
+    ) {
+        return false;
+    }
+    let callback_frame =
+        (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *mut nt_user_callback::CallbackFrame;
+    write_volatile(
+        core::ptr::addr_of_mut!((*callback_frame).header),
+        context.request_header,
+    );
+    true
 }
 
 pub(crate) unsafe fn restore_current_context_for_user_callback_resume(

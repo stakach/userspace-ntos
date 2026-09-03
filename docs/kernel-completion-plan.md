@@ -24376,6 +24376,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     waits. Resolve that ownership/continuation failure before Timer DPC and retirement work so the
     genuine desktop baseline remains intact.
 
+    B3 callback request-context checkpoint (2026-09-03, freestanding and runtime green; desktop
+    recovery continuing): the nested wait failure was not a dispatcher-object ownership defect.
+    Independent physical lanes share the provider request frame, and another lane could replace its
+    callback header while the window-station lane was suspended. Provider/LPC resume restored the
+    exact process, thread, lane, and shared request fields but reconstructed only selected header
+    paths. `Win32kCallbackRequestContext` now captures the complete request header and the central
+    context restore writes it back before every resumed dispatch; the two ad hoc header repairs were
+    removed. A serialized run proves the former `OwnerMismatch` rejections are gone, repeated raw
+    input Event/Timer waits re-arm successfully, and win32k creates and publishes the genuine
+    window station and default desktop.
+
+    The same run reaches concurrent service startup but winlogon later retrieves private message
+    `0x659` and faults on a null dereference at winlogon RVA `0x55a0`, before userinit is launched.
+    Treat that as the current desktop-regression frontier. Identify the exact message contract and
+    missing state transition, restore the real producer/consumer semantics, and re-run the desktop
+    gate before proceeding to Timer DPC delivery and deferred-retirement acknowledgement.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
