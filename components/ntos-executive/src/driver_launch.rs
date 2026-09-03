@@ -30331,6 +30331,7 @@ unsafe fn service_ndis_protocol_transfer_data_complete_callback(
 unsafe fn service_ndis_protocol_receive_callback(
     dispatch: &mut HostedProviderCallbackDispatcher<'_>,
     marshal_window: HostedProviderMarshalWindow,
+    marshal_window_source: HostedProviderMarshalWindowSource,
     provider_instance: usize,
     provider_inst: DriverInstance,
     record: HostedProviderCallbackRecord,
@@ -30359,19 +30360,32 @@ unsafe fn service_ndis_protocol_receive_callback(
     let provider_header_exec = if header_bytes == 0 {
         0
     } else {
-        provider_receive_buffer_exec_va(provider_instance, provider_inst, arg2, header_bytes)
+        marshal_window_source
+            .source_component_to_exec(provider_instance, provider_inst, arg2, header_bytes)
+            .or_else(|| {
+                provider_receive_buffer_exec_va(provider_instance, provider_inst, arg2, header_bytes)
+            })
             .ok_or(STATUS_INVALID_PARAMETER)?
     };
     let provider_lookahead_exec = if lookahead_bytes == 0 {
         0
     } else {
-        provider_receive_buffer_exec_va(
-            provider_instance,
-            provider_inst,
-            lookahead_component,
-            lookahead_bytes,
-        )
-        .ok_or(STATUS_INVALID_PARAMETER)?
+        marshal_window_source
+            .source_component_to_exec(
+                provider_instance,
+                provider_inst,
+                lookahead_component,
+                lookahead_bytes,
+            )
+            .or_else(|| {
+                provider_receive_buffer_exec_va(
+                    provider_instance,
+                    provider_inst,
+                    lookahead_component,
+                    lookahead_bytes,
+                )
+            })
+            .ok_or(STATUS_INVALID_PARAMETER)?
     };
 
     let dependent_base_component = marshal_window.component_base;
@@ -31159,6 +31173,7 @@ unsafe fn service_hosted_provider_callback_with_dispatch(
                         service_ndis_protocol_receive_callback(
                             dispatch,
                             marshal_window,
+                            marshal_window_source,
                             provider_instance,
                             provider_inst,
                             record,

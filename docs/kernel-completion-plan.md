@@ -23368,6 +23368,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registered receive callbacks to isolate NDIS filter dispatch from the seven-argument callback
     transport, then replace the diagnostic snapshots with durable lifecycle evidence.
 
+    Wide-callback diagnosis `.tmp/run-desktop-20260903-101656.log` isolates the remaining rejection:
+    the real eight-argument `EthFilterDprIndicateReceive` export enters NDIS with the hardware ARP
+    buffers, NDIS invokes the registered TCP/IP Receive callback, and that callback returns
+    `STATUS_INVALID_PARAMETER`; the following one-argument ReceiveComplete callback succeeds. The
+    receive marshaller was the last callback shape resolving header/lookahead pointers only through
+    durable component and NDIS-buffer ownership. During recursive arena dispatch those pointers
+    belong to the exact NDIS source-depth marshal window. It now resolves both ranges through that
+    exact source authority before consulting durable NDIS-buffer ownership, matching the ISR
+    callback's arena-memory rule. The freestanding executive check is green at the existing
+    213-warning baseline. Next rerun serialized desktop acceptance and require the real protocol
+    Receive/ReceiveComplete pair plus all 295 gates before deleting the temporary descriptor and
+    wide-call traces.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on
