@@ -23434,6 +23434,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     authenticated component service, create the IOMMU/window ownership on the first request, and
     delete `hosted_pci_driver_needs_dma` plus eager DMA fields from PCI discovery.
 
+    B3 dynamic DMA PnP ownership checkpoint (2026-09-03, host and freestanding green): the generic
+    `nt-pnp-context` registry now provides closure-scoped mutable access to a description and owner
+    only through an exact live `(context generation, lease token)` identity. A leased retired
+    generation remains independently mutable until its last lease is released; stale and forged
+    identities cannot mutate the active replacement. All 16 focused context tests pass and the
+    freestanding executive check remains green at the established 213-warning baseline. This is
+    the ownership primitive needed to attach a first-use DMA window and its capabilities to the
+    exact devnode generation. Next use this API behind an executive wrapper while wiring the
+    authenticated `IoGetDmaAdapter` request service.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

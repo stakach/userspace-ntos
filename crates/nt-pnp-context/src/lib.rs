@@ -483,6 +483,20 @@ impl<D, O> ContextRegistry<D, O> {
             .ok_or(LeaseError::UnknownLease)
     }
 
+    pub fn with_parts_mut_by_identity<R>(
+        &mut self,
+        lease: ContextLeaseIdentity,
+        mutate: impl FnOnce(&mut D, &mut O) -> R,
+    ) -> Result<R, LeaseError> {
+        let record = self
+            .record_mut(lease.context)
+            .ok_or(LeaseError::UnknownContext)?;
+        if !record.contains(lease) {
+            return Err(LeaseError::UnknownLease);
+        }
+        Ok(mutate(&mut record.description, &mut record.owner))
+    }
+
     pub fn release(&mut self, lease: ContextLeaseIdentity) -> Result<Option<O>, LeaseError> {
         if let Some(active) = self.active.as_mut() {
             if active.id == lease.context {
@@ -509,6 +523,13 @@ impl<D, O> ContextRegistry<D, O> {
             .as_ref()
             .filter(|record| record.id == id)
             .or_else(|| self.retired.iter().find(|record| record.id == id))
+    }
+
+    fn record_mut(&mut self, id: ContextId) -> Option<&mut ContextRecord<D, O>> {
+        if self.active.as_ref().is_some_and(|record| record.id == id) {
+            return self.active.as_mut();
+        }
+        self.retired.iter_mut().find(|record| record.id == id)
     }
 }
 
@@ -579,6 +600,51 @@ mod tests {
 
         assert_eq!(registry.description(&lease), Ok(&"first"));
         assert_eq!(registry.release(lease.into_identity()), Ok(Some(10)));
+    }
+
+    #[test]
+    fn exact_lease_mutates_its_retired_generation_only() {
+        let mut registry = ContextRegistry::new();
+        registry.publish(1, 10).unwrap();
+        let retired = registry.acquire_active().unwrap().into_identity();
+        registry.publish(2, 20).unwrap();
+        let active = registry.acquire_active().unwrap().into_identity();
+
+        assert_eq!(
+            registry.with_parts_mut_by_identity(retired, |description, owner| {
+                *description += 10;
+                *owner += 100;
+                (*description, *owner)
+            }),
+            Ok((11, 110))
+        );
+        assert_eq!(registry.description_by_identity(retired), Ok(&11));
+        assert_eq!(registry.description_by_identity(active), Ok(&2));
+        assert_eq!(registry.release(retired), Ok(Some(110)));
+    }
+
+    #[test]
+    fn stale_or_forged_lease_cannot_mutate_active_generation() {
+        let mut registry = ContextRegistry::new();
+        registry.publish(1, 10).unwrap();
+        let stale = registry.acquire_active().unwrap().into_identity();
+        registry.publish(2, 20).unwrap();
+        assert_eq!(registry.release(stale), Ok(Some(10)));
+        let live = registry.acquire_active().unwrap().into_identity();
+        let forged = ContextLeaseIdentity {
+            context: live.context(),
+            token: NonZeroU64::new(stale.token()).unwrap(),
+        };
+
+        assert_eq!(
+            registry.with_parts_mut_by_identity(stale, |description, _| *description = 99),
+            Err(LeaseError::UnknownContext)
+        );
+        assert_eq!(
+            registry.with_parts_mut_by_identity(forged, |description, _| *description = 99),
+            Err(LeaseError::UnknownLease)
+        );
+        assert_eq!(registry.active_description(), Some(&2));
     }
 
     #[test]
