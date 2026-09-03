@@ -125,6 +125,8 @@ pub(crate) struct HostCaps {
     pub client_attach: bool,
     /// win32k: service the nested callback rendezvous label while an outer dispatch is active.
     pub usermode_callback: bool,
+    /// win32k: retain a provider dispatch whose kernel-mode wait is owned by the executive.
+    pub provider_wait: bool,
     /// win32k: carry wide (>4) stack args through caller RSP or explicit `SH_REQ_A4..` staging.
     // Capability-surface documentation (§2.3) — see `usermode_callback`; not read by the pump.
     #[allow(dead_code)]
@@ -1307,6 +1309,7 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (crate::driver_launch::is_fsd_component_service_label(label)
             && ch.caps.kind == ReqKind::Irp)
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
+        || (label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL && ch.caps.provider_wait)
         || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
@@ -1314,8 +1317,7 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
         || (label == crate::win32k_subsystem::W32_LPC_LABEL && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_REGISTRY_LABEL
             && ch.caps.kind == ReqKind::Syscall)
-        || (label == crate::win32k_subsystem::W32_EVENT_LABEL
-            && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_EVENT_LABEL && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -1511,6 +1513,7 @@ macro_rules! pump_reply_recv4_into {
 struct PumpLoopOutcome {
     completed: bool,
     callback_suspended: bool,
+    provider_wait_suspended: bool,
     scheduler_yielded: bool,
     wall_ip: u64,
     wall_addr: u64,
@@ -1528,6 +1531,7 @@ impl PumpLoopOutcome {
         Self {
             completed: false,
             callback_suspended: false,
+            provider_wait_suspended: false,
             scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
@@ -1773,6 +1777,8 @@ pub(crate) struct PumpResult {
     pub reply_cap: u64,
     pub completed: bool,
     pub callback_suspended: bool,
+    /// The component is blocked in its provider-wait rendezvous and its reply object remains bound.
+    pub provider_wait_suspended: bool,
     /// The component request is still live, but hosted scheduler work must run before its pump
     /// continues. The caller resumes with `RecvFirst` on this same reply object.
     pub scheduler_yielded: bool,
@@ -2062,15 +2068,26 @@ pub(crate) unsafe fn component_hosted_irq_exchange(
 /// On a COMPLETED dispatch (server re-parked) the pump bumps [`HARNESS_IRP_DISPATCHES`] /
 /// [`HARNESS_SYSCALL_DISPATCHES`] per `caps.kind` — the durable proof the traffic is on the harness.
 pub(crate) unsafe fn component_pump(ch: &PumpChannel) -> PumpResult {
-    component_pump_inner(ch, false)
+    component_pump_inner(ch, PumpResume::None)
 }
 
 pub(crate) unsafe fn component_pump_resume_user_callback(ch: &PumpChannel) -> PumpResult {
-    component_pump_inner(ch, true)
+    component_pump_inner(ch, PumpResume::UserCallback)
+}
+
+pub(crate) unsafe fn component_pump_resume_provider_wait(ch: &PumpChannel) -> PumpResult {
+    component_pump_inner(ch, PumpResume::ProviderWait)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PumpResume {
+    None,
+    UserCallback,
+    ProviderWait,
 }
 
 #[inline(never)]
-unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> PumpResult {
+unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResult {
     // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
     // wide-arg source selection — caller RSP for real syscalls or explicit SH_REQ_A4.. staging for
     // executive-originated calls — is done by the win32k caller wrapper `win32k_dispatch_wide`
@@ -2088,8 +2105,8 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
     // The request TAG rides in MR0, NOT in the message label. A fresh dispatch hands over
     // `dispatch_label`; the callback-RESUME pump hands over `W32_USER_CALLBACK_RESUME_LABEL` on the
     // SAME outstanding Call — which is the whole of what used to be a bespoke resume preamble.
-    let request_tag = pump_request_tag(ch, resume_user_callback);
-    let owns_depth = pump_enter_depth(ch, resume_user_callback);
+    let request_tag = pump_request_tag(ch, resume);
+    let owns_depth = pump_enter_depth(ch, resume);
     let mut reply_cap = ch.reply_cap;
     if ch.initial == InitialAction::RecvFirst {
         trace_component_handoff(b"pump-recvfirst-enter", ch.tcb, reply_cap, request_tag);
@@ -2108,29 +2125,33 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume_user_callback: bool) -> 
         };
         trace_component_handoff(b"pump-recvfirst-exit", ch.tcb, reply_cap, detail);
     }
-    pump_leave_depth(owns_depth, outcome.callback_suspended);
+    pump_leave_depth(
+        owns_depth,
+        outcome.callback_suspended || outcome.provider_wait_suspended,
+    );
     pump_suspend_walled_component(ch, outcome);
     pump_result_from_outcome(ch, outcome, reply_cap)
 }
 
 #[inline(never)]
-fn pump_request_tag(ch: &PumpChannel, resume_user_callback: bool) -> u64 {
-    if resume_user_callback {
-        crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL
-    } else {
-        ch.dispatch_label
+fn pump_request_tag(ch: &PumpChannel, resume: PumpResume) -> u64 {
+    match resume {
+        PumpResume::None => ch.dispatch_label,
+        PumpResume::UserCallback => crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
+        PumpResume::ProviderWait => crate::win32k_subsystem::W32_PROVIDER_WAIT_RESUME_LABEL,
     }
 }
 
 #[inline(never)]
-fn pump_enter_depth(ch: &PumpChannel, resume_user_callback: bool) -> bool {
+fn pump_enter_depth(ch: &PumpChannel, resume: PumpResume) -> bool {
     // Nesting OBSERVABILITY only (no correlation depends on it): a pump that hands over a request
     // owns one outstanding dispatch level; a RESUME pump inherits the level its suspension left
     // outstanding. The `RecvFirst` DriverEntry-init shape owns none (the component's ready Call is a
     // completion that answers no request).
-    let owns_depth = ch.caps.usermode_callback
-        && (resume_user_callback || ch.initial == InitialAction::ReplyRequest);
-    if resume_user_callback {
+    let resumes_suspended = resume != PumpResume::None;
+    let owns_depth = (ch.caps.usermode_callback || ch.caps.provider_wait)
+        && (resumes_suspended || ch.initial == InitialAction::ReplyRequest);
+    if resumes_suspended {
         SUSPENDED_COMPONENT_OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
     } else if owns_depth {
         dispatch_depth_enter();
@@ -2203,6 +2224,14 @@ unsafe fn component_pump_loop(
                 crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL
             );
             continue;
+        } else if label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL
+            && ch.caps.provider_wait
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            // The executive validates and admits the copied shared-page request only after the
+            // native caller's continuation storage is reserved. Keep this Call bound until then.
+            outcome.provider_wait_suspended = true;
+            break;
         } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall
         {
@@ -2321,18 +2350,11 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Irp
         {
             let status = crate::driver_launch::service_hosted_driver_mdl(
-                ch,
-                msg.m0,
-                msg.m1,
-                msg.m2,
-                msg.m3,
-                msg.badge,
-                *reply_cap,
+                ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.badge, *reply_cap,
             );
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
             continue;
-        } else if label
-            == crate::driver_launch::FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
+        } else if label == crate::driver_launch::FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
             let (status, interrupt_model) =
@@ -2421,13 +2443,7 @@ unsafe fn component_pump_loop(
         {
             let (status, inserted, generation) =
                 crate::driver_launch::service_hosted_driver_queue_dpc(
-                    ch,
-                    msg.m0,
-                    msg.m1,
-                    msg.m2,
-                    msg.m3,
-                    msg.m4,
-                    *reply_cap,
+                    ch, msg.m0, msg.m1, msg.m2, msg.m3, msg.m4, *reply_cap,
                 );
             pump_reply_recv4_into!(
                 ch,
@@ -2443,8 +2459,7 @@ unsafe fn component_pump_loop(
         } else if label == crate::driver_launch::FSD_SERVICE_FLUSH_DPCS_LABEL
             && ch.caps.kind == ReqKind::Irp
         {
-            let status =
-                crate::driver_launch::service_hosted_driver_flush_dpcs(ch, *reply_cap);
+            let status = crate::driver_launch::service_hosted_driver_flush_dpcs(ch, *reply_cap);
             pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_PULL_IRP_INPUT_LABEL
@@ -3243,7 +3258,11 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
     // pumps it a second time (`dispatch_irp` → `register_instance_ready(inst,false)`;
     // `win32k_dispatch_wide` → `WIN32K_RETIRED`). A walled component is dead, and it now says so.
     // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
-    if !outcome.completed && !outcome.callback_suspended && !outcome.scheduler_yielded {
+    if !outcome.completed
+        && !outcome.callback_suspended
+        && !outcome.provider_wait_suspended
+        && !outcome.scheduler_yielded
+    {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
         pump_wall_state_diag(ch, outcome);
         let e = if ch.tcb != 0 {
@@ -3300,7 +3319,10 @@ unsafe fn pump_result_from_outcome(
                 (result as u32 as i32, result)
             }
         }
-    } else if outcome.callback_suspended || outcome.scheduler_yielded {
+    } else if outcome.callback_suspended
+        || outcome.provider_wait_suspended
+        || outcome.scheduler_yielded
+    {
         let status = nt_user_callback::STATUS_PENDING;
         (status, status as u32 as u64)
     } else {
@@ -3313,6 +3335,7 @@ unsafe fn pump_result_from_outcome(
         reply_cap,
         completed: outcome.completed,
         callback_suspended: outcome.callback_suspended,
+        provider_wait_suspended: outcome.provider_wait_suspended,
         scheduler_yielded: outcome.scheduler_yielded,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,

@@ -23893,6 +23893,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     These routines remain deliberately unbound until pump suspension and executive continuation
     admission land in one atomic cutover; the live single-object import still has its old body.
 
+    Provider-wait pump ownership checkpoint (2026-09-03, freestanding green; not activated): the
+    common component pump now distinguishes a retained provider wait from both a user-mode callback
+    and a wall. A dedicated win32k capability admits the provider-wait label, leaves the component
+    `Call` bound without replying, carries that state through timer fairness and pump-depth
+    accounting, and provides the matching resume entry point and tag. `win32k_glue` copies the
+    request before another nested dispatch can reuse the shared page and retains the exact dispatch
+    output lease plus dynamic client identity in a single pending handoff record. The current
+    freestanding executive remains green. This is transport plumbing only: no import is bound and
+    no request is admitted until the executive can first reserve the native continuation and rotate
+    `REPLY_MAIN` transactionally.
+
     Next compose arbiter completion with the existing LIFO continuation stack and the component
     pump's non-reply suspension mechanism. `KeWaitForSingleObject` and
     `KeWaitForMultipleObjects` must cut over atomically to the dedicated shared-page request/resume

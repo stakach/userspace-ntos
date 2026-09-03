@@ -56,6 +56,7 @@ static USER_CALLBACK_DEAD_CLIENT_UNWINDS: AtomicU64 = AtomicU64::new(0);
 /// either returned by the client or torn down because the client died).
 static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CANCEL_CHAINED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -372,6 +373,15 @@ type UserCallbackDispatchContext = nt_user_callback::DispatchContext;
 
 static mut USER_CALLBACK_CURRENT_DISPATCH: UserCallbackDispatchContext =
     UserCallbackDispatchContext::EMPTY;
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingProviderWaitDispatch {
+    pub request: nt_provider_wait::ProviderWaitRequest,
+    pub dispatch: nt_user_callback::DispatchContext,
+    pub client: Win32kClientContext,
+}
+
+static mut PROVIDER_WAIT_PENDING_DISPATCH: Option<PendingProviderWaitDispatch> = None;
 static WIN32K_NEXT_DISPATCH_DEBUG_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// Times the bridge invariant was re-asserted, and times it had actually been CLOBBERED (a foreign
 /// writer had replaced the bridged `PWND`) — the durable proof this is a live correctness fix.
@@ -1144,6 +1154,16 @@ unsafe fn unwind_controlled_dispatch(request: nt_user_callback::CallbackHeader) 
 
 pub(crate) fn take_user_callback_pump_suspended() -> bool {
     USER_CALLBACK_LAST_PUMP_SUSPENDED.swap(0, Ordering::AcqRel) != 0
+}
+
+pub(crate) unsafe fn take_pending_provider_wait_dispatch() -> Option<PendingProviderWaitDispatch> {
+    if PROVIDER_WAIT_LAST_PUMP_SUSPENDED.swap(0, Ordering::AcqRel) == 0 {
+        return None;
+    }
+    core::ptr::replace(
+        core::ptr::addr_of_mut!(PROVIDER_WAIT_PENDING_DISPATCH),
+        None,
+    )
 }
 
 pub(crate) fn real_wm_paint_callback_returns() -> u64 {
@@ -2542,7 +2562,7 @@ unsafe fn redirect_pending_user_callback(
 pub(crate) static WIN32K_RETIRED: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
-    if pr.completed || pr.callback_suspended {
+    if pr.completed || pr.callback_suspended || pr.provider_wait_suspended {
         return;
     }
     if WIN32K_RETIRED.swap(1, Ordering::Relaxed) == 0 {
@@ -2617,6 +2637,7 @@ unsafe fn resume_suspended_user_callback_component(
             reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
             completed: false,
             callback_suspended: false,
+            provider_wait_suspended: false,
             scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
@@ -2672,6 +2693,7 @@ unsafe fn resume_suspended_user_callback_component(
             reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
             completed: false,
             callback_suspended: false,
+            provider_wait_suspended: false,
             scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
@@ -2709,6 +2731,7 @@ unsafe fn resume_suspended_user_callback_component(
             kind: crate::spawn_hosts::ReqKind::Syscall,
             client_attach: true,
             usermode_callback: true,
+            provider_wait: true,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
@@ -5987,8 +6010,9 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
-        client_attach: attach_client,
+            client_attach: attach_client,
             usermode_callback: callback_capable,
+            provider_wait: request_kind == win32k_subsystem::WIN32K_REQUEST_SSDT,
             wide_arg_marshal: true,
             assert_skip: true,
             sparse_vspace: true,
@@ -6010,6 +6034,26 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     if pr.callback_suspended {
         capture_suspended_published_win32k_context(callback_client);
     }
+    if pr.provider_wait_suspended {
+        let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+            as *const nt_provider_wait::ProviderWaitSharedPage;
+        let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+        core::ptr::write(
+            core::ptr::addr_of_mut!(PROVIDER_WAIT_PENDING_DISPATCH),
+            Some(PendingProviderWaitDispatch {
+                request,
+                dispatch: UserCallbackDispatchContext {
+                    dispatch_id,
+                    ssn,
+                    args: completion_args,
+                    caller_sp,
+                    output_stage,
+                },
+                client,
+            }),
+        );
+        PROVIDER_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
+    }
     if nested_user_callback {
         if pr.callback_suspended {
             return (pr.result, false);
@@ -6027,7 +6071,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
             return (pr.result, false);
         }
     }
-    if callback_capable && !pr.callback_suspended {
+    if callback_capable && !pr.callback_suspended && !pr.provider_wait_suspended {
         unregister_user_callback_client_for_dispatch(
             dispatch_id,
             client.pi,
