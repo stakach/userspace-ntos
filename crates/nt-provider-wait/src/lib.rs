@@ -11,10 +11,12 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod abi;
+mod allocation;
 mod domain;
 mod local_event;
 
 pub use abi::*;
+pub use allocation::*;
 pub use domain::*;
 pub use local_event::*;
 

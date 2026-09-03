@@ -14,7 +14,8 @@ pub enum ProviderEventBacking {
     Static {
         instance_generation: u64,
     },
-    Pool {
+    Allocation {
+        arena_id: u64,
         allocation_id: u64,
         allocation_generation: u64,
     },
@@ -30,10 +31,11 @@ impl ProviderEventBacking {
             Self::Static {
                 instance_generation,
             } => instance_generation == provider.generation,
-            Self::Pool {
+            Self::Allocation {
+                arena_id,
                 allocation_id,
                 allocation_generation,
-            } => allocation_id != 0 && allocation_generation != 0,
+            } => arena_id != 0 && allocation_id != 0 && allocation_generation != 0,
             Self::Stack {
                 dispatch_id,
                 activation_generation,
@@ -466,9 +468,10 @@ mod tests {
         ProviderWaitObject::new(ProviderWaitObjectType::Event, slot, generation)
     }
 
-    fn pool(allocation_id: u64, generation: u64, offset: u64) -> ProviderEventStorage {
+    fn allocation(allocation_id: u64, generation: u64, offset: u64) -> ProviderEventStorage {
         ProviderEventStorage {
-            backing: ProviderEventBacking::Pool {
+            backing: ProviderEventBacking::Allocation {
+                arena_id: 1,
                 allocation_id,
                 allocation_generation: generation,
             },
@@ -479,7 +482,7 @@ mod tests {
     #[test]
     fn pool_reuse_requires_exact_two_phase_retirement() {
         let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
-        let storage = pool(11, 1, 8);
+        let storage = allocation(11, 1, 8);
         let first = catalog
             .initialize(0x1008, storage, ProviderEventKind::Notification, false)
             .unwrap();
@@ -501,7 +504,7 @@ mod tests {
         assert_eq!(
             catalog.initialize(
                 0x1008,
-                pool(11, 2, 8),
+                allocation(11, 2, 8),
                 ProviderEventKind::Notification,
                 true
             ),
@@ -512,7 +515,7 @@ mod tests {
         let second = catalog
             .initialize(
                 0x1008,
-                pool(11, 2, 8),
+                allocation(11, 2, 8),
                 ProviderEventKind::Notification,
                 true,
             )
@@ -527,7 +530,7 @@ mod tests {
     #[test]
     fn wait_and_signal_leases_fence_backing_retirement() {
         let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
-        let storage = pool(12, 4, 0);
+        let storage = allocation(12, 4, 0);
         let id = catalog
             .initialize(0x2000, storage, ProviderEventKind::Synchronization, false)
             .unwrap();
@@ -561,8 +564,8 @@ mod tests {
     #[test]
     fn a_backing_with_multiple_events_retires_atomically() {
         let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
-        let first_storage = pool(13, 1, 0x20);
-        let second_storage = pool(13, 1, 0x60);
+        let first_storage = allocation(13, 1, 0x20);
+        let second_storage = allocation(13, 1, 0x60);
         let first = catalog
             .initialize(
                 0x3020,
@@ -637,7 +640,7 @@ mod tests {
         let first = catalog
             .initialize(
                 0x6000,
-                pool(20, 1, 0),
+                allocation(20, 1, 0),
                 ProviderEventKind::Notification,
                 false,
             )
@@ -645,7 +648,7 @@ mod tests {
         let second = catalog
             .initialize(
                 0x7000,
-                pool(21, 1, 0),
+                allocation(21, 1, 0),
                 ProviderEventKind::Notification,
                 false,
             )
@@ -672,7 +675,7 @@ mod tests {
         let first = catalog
             .initialize(
                 0x8000,
-                pool(30, 1, 0),
+                allocation(30, 1, 0),
                 ProviderEventKind::Notification,
                 false,
             )
@@ -680,7 +683,7 @@ mod tests {
         let second = catalog
             .initialize(
                 0x8040,
-                pool(30, 1, 0x40),
+                allocation(30, 1, 0x40),
                 ProviderEventKind::Notification,
                 false,
             )
@@ -694,7 +697,7 @@ mod tests {
         let replacement = catalog
             .initialize(
                 0x8000,
-                pool(30, 1, 0),
+                allocation(30, 1, 0),
                 ProviderEventKind::Synchronization,
                 true,
             )

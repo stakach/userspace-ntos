@@ -23762,6 +23762,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     embedded Event by the innermost live allocation. Then enable the complete broker path and rerun
     the serialized desktop gate.
 
+    Nested provider-allocation identity checkpoint (2026-09-03, host green):
+    `nt-provider-wait` now owns a component-private generation catalog for reclaimable allocations.
+    Arena identity scopes allocation identity, address reuse advances the generation, stale exact
+    identities fail closed, and allocation ranges may overlap only through strict cross-arena
+    containment. Lookup selects the smallest live containing allocation, so an Event in a desktop
+    heap allocation is never attributed to the enclosing session-heap section view. Parent
+    retirement is fenced until nested live allocations retire. All 26 crate tests pass. Next hook
+    successful win32k session/desktop heap allocation, free, and moving reallocation into this
+    catalog, retire embedded Events before allocator metadata changes, and only then restore the
+    canonical local Event cutover.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences
