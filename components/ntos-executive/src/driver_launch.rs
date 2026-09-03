@@ -58528,6 +58528,23 @@ pub(crate) fn hosted_file_alignment_requirement(file_id: u64) -> Option<u32> {
     manager.file_alignment_requirement(file_id).ok()
 }
 
+/// Resolve the current top device for an executive-owned File through the canonical attachment
+/// topology. Both the generation-protected device id and Object Manager identity are returned so a
+/// component can validate its local WDM projection before publishing it to imported kernel code.
+pub(crate) fn related_io_device_identity_for_file(
+    file_id: u64,
+) -> Result<(u64, u64), nt_status::NtStatus> {
+    let manager = io_manager_mut();
+    let file_id = FileId(file_id);
+    manager
+        .file(file_id)
+        .filter(|file| file.client_id == ClientId(IO_MANAGER_COMPONENT_ID) && file.state.is_open())
+        .ok_or(nt_status::NtStatus::INVALID_HANDLE)?;
+    manager
+        .related_device_identity_for_file(file_id)
+        .map(|(device, object)| (device.raw(), object.0))
+}
+
 /// Allocate the kernel-only target-parent File after the source kind is known. Access is derived
 /// from provider attributes, while device ownership comes from the canonical source File.
 pub(crate) fn allocate_hosted_set_file_name_target(

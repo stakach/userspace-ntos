@@ -484,6 +484,22 @@ impl<P> IoManager<P> {
         self.top_of_device_stack(device)
     }
 
+    /// Resolve both stable identities for the device currently related to `file`.
+    ///
+    /// Component projection layers use the Object Manager identity to prove that a cached WDM
+    /// address still represents the canonical device selected by the live attachment topology.
+    pub fn related_device_identity_for_file(
+        &self,
+        file: FileId,
+    ) -> Result<(DeviceId, ObjectId), NtStatus> {
+        let device = self.related_device_for_file(file)?;
+        let object = self
+            .device(device)
+            .ok_or(NtStatus::INVALID_PARAMETER)?
+            .object_id;
+        Ok((device, object))
+    }
+
     /// The alignment requirement of the live device currently related to `file`. Attachment
     /// topology is resolved at query time, matching `IoGetRelatedDeviceObject(FileObject)`.
     pub fn file_alignment_requirement(&self, file: FileId) -> Result<u32, NtStatus> {
@@ -3896,12 +3912,20 @@ mod tests {
             .0;
         om.device_mut(lower).unwrap().alignment_requirement = 0x1ff;
         assert_eq!(om.related_device_for_file(file), Ok(lower));
+        assert_eq!(
+            om.related_device_identity_for_file(file),
+            Ok((lower, om.device(lower).unwrap().object_id))
+        );
         assert_eq!(om.file_alignment_requirement(file), Ok(0x1ff));
 
         assert_eq!(om.attach_device_to_stack(middle, lower), Ok(lower));
         assert_eq!(om.attach_device_to_stack(top, lower), Ok(middle));
         om.device_mut(top).unwrap().alignment_requirement = 0xfff;
         assert_eq!(om.related_device_for_file(file), Ok(top));
+        assert_eq!(
+            om.related_device_identity_for_file(file),
+            Ok((top, om.device(top).unwrap().object_id))
+        );
         assert_eq!(om.file_alignment_requirement(file), Ok(0xfff));
         assert_eq!(om.top_of_device_stack(lower), Ok(top));
 

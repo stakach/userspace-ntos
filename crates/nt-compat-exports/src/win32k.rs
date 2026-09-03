@@ -230,7 +230,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("IoGetCurrentProcess", Partial, "returns the current EPROCESS via nt-process"),
     e("IoSynchronousInvalidateDeviceRelations", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
     e("IoOpenDeviceRegistryKey", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
-    e("IoGetRelatedDeviceObject", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
+    e("IoGetRelatedDeviceObject", Partial, "resolves the canonical live attachment-stack top and returns it only through an exact win32k video Device projection"),
     e("IoGetDeviceObjectPointer", Partial, "opens the dynamically published video route, access-checks it through Object Manager, and returns retained WDM File/Device projections"),
     e("IofCallDriver", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),
     e("IoBuildSynchronousFsdRequest", TrapIfCalled, "device-stack I/O not reached on the win32k init path; traps if called"),

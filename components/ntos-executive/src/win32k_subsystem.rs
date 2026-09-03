@@ -12611,6 +12611,15 @@ extern "win64" fn s_io_get_device_object_pointer(
     }
 }
 
+/// `PDEVICE_OBJECT IoGetRelatedDeviceObject(PFILE_OBJECT)`.
+extern "win64" fn s_io_get_related_device_object(file_object: u64) -> u64 {
+    unsafe {
+        crate::video_device::video_related_device_object(file_object).unwrap_or_else(|status| {
+            panic!("IoGetRelatedDeviceObject rejected File projection: {:#010x}", status.raw())
+        })
+    }
+}
+
 #[inline]
 unsafe fn write_eng_device_io_control_bytes_returned(bytes_ret: *mut u32, value: u32) {
     if !bytes_ret.is_null() {
@@ -13647,6 +13656,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "IoGetDeviceObjectPointer",
         s_io_get_device_object_pointer as usize as u64,
+    );
+    reg.bind(
+        "IoGetRelatedDeviceObject",
+        s_io_get_related_device_object as usize as u64,
     );
     reg.bind(
         "KeUserModeCallback",

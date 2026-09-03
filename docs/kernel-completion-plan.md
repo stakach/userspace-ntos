@@ -24664,6 +24664,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     File, and Device projections still fail closed. Add those owners before deleting the general
     unknown-object reference tail.
 
+    B3 live related-device tranche 10 (2026-09-04, host and freestanding green):
+    `IoGetRelatedDeviceObject` no longer remains an absent win32k import or reads a cached
+    `FILE_OBJECT.DeviceObject` field. The host-tested canonical I/O Manager resolves each File to
+    the current top of its live attachment stack and returns both its generation-protected Device
+    id and Object Manager identity. The executive admits only its own open File generation, and the
+    video bridge returns a win32k-visible Device pointer only when both canonical identities still
+    match the dynamically published projection. Unknown Files, deleted devices, and a newly
+    attached top device without a projection fail loudly rather than returning a stale lower
+    device.
+
+    `nt-io-manager` passes all 251 tests, including lower-to-top attachment rerouting; all 46
+    `nt-compat-exports` tests pass, and the freestanding executive release build succeeds.
+    Forty-three audited code imports remain. This is the exact current video route, not a claim of
+    generic win32k projection coverage: convert `VideoBridgeState` into a device-ID keyed catalog and
+    publish projections for attachment-stack participants before multi-adapter or filter-stack
+    support is complete.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
