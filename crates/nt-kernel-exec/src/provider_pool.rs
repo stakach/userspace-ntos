@@ -63,6 +63,14 @@ pub struct AllocationIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationLocation {
+    pub identity: AllocationIdentity,
+    pub payload_offset: u64,
+    pub capacity: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PoolError {
     ArenaTooSmall,
     NotInitialized,
@@ -148,6 +156,58 @@ pub fn allocation_identity<M: PoolMemory>(
         allocation_id: payload,
         allocation_generation: generation,
     })
+}
+
+/// Locate the live allocation containing an embedded provider object. Free blocks and header bytes
+/// never resolve, and `required` must fit wholly within the same payload.
+pub fn containing_allocation<M: PoolMemory>(
+    memory: &M,
+    address: u64,
+    required: u64,
+) -> Result<AllocationLocation, PoolError> {
+    if !initialized(memory) {
+        return Err(PoolError::NotInitialized);
+    }
+    if required == 0 {
+        return Err(PoolError::InvalidSize);
+    }
+    validate_free_list(memory)?;
+    let required_end = address
+        .checked_add(required)
+        .ok_or(PoolError::InvalidPointer)?;
+    let bump = read(memory, BUMP_OFFSET)?;
+    let mut header = DATA_OFFSET;
+    while header < bump {
+        let capacity = read(memory, header)?;
+        if capacity == 0 || capacity & (ALIGNMENT - 1) != 0 {
+            return Err(PoolError::Corrupt);
+        }
+        let payload = header.checked_add(HEADER_SIZE).ok_or(PoolError::Corrupt)?;
+        let end = payload.checked_add(capacity).ok_or(PoolError::Corrupt)?;
+        if end > bump {
+            return Err(PoolError::Corrupt);
+        }
+        if address >= payload && required_end <= end {
+            if read(memory, header + 8)? != ALLOC_MARKER {
+                return Err(PoolError::NotAllocated);
+            }
+            let generation = read(memory, header + ALLOCATION_GENERATION_OFFSET)?;
+            if generation == 0 || read(memory, header + HEADER_RESERVED_OFFSET)? != 0 {
+                return Err(PoolError::Corrupt);
+            }
+            return Ok(AllocationLocation {
+                identity: AllocationIdentity {
+                    allocation_id: payload,
+                    allocation_generation: generation,
+                },
+                payload_offset: payload,
+                capacity,
+                offset: address - payload,
+            });
+        }
+        header = end;
+    }
+    Err(PoolError::InvalidPointer)
 }
 
 fn live_allocation<M: PoolMemory>(memory: &M, payload: u64) -> Result<(u64, u64), PoolError> {
@@ -584,6 +644,31 @@ mod tests {
         );
         free(&mut memory, second.payload_offset).unwrap();
         free(&mut memory, blocker.payload_offset).unwrap();
+    }
+
+    #[test]
+    fn containing_allocation_identifies_embedded_storage_and_bounds() {
+        let mut memory = arena();
+        let allocation = allocate(&mut memory, 96, false).unwrap();
+        let embedded = allocation.payload_offset + 24;
+        assert_eq!(
+            containing_allocation(&memory, embedded, 32),
+            Ok(AllocationLocation {
+                identity: allocation.identity,
+                payload_offset: allocation.payload_offset,
+                capacity: allocation.capacity,
+                offset: 24,
+            })
+        );
+        assert_eq!(
+            containing_allocation(&memory, embedded, 80),
+            Err(PoolError::InvalidPointer)
+        );
+        free(&mut memory, allocation.payload_offset).unwrap();
+        assert_eq!(
+            containing_allocation(&memory, embedded, 32),
+            Err(PoolError::InvalidPointer)
+        );
     }
 
     #[test]

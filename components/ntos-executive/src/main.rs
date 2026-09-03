@@ -28473,6 +28473,15 @@ pub(crate) fn win32k_provider_domain_is_current(
         && identity.generation == WIN32K_PROVIDER_GENERATION.load(Ordering::Acquire)
         && unsafe { (&*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS)).contains(identity) }
 }
+
+pub(crate) fn current_win32k_provider_domain(
+) -> Option<nt_provider_wait::ProviderDomainIdentity> {
+    let identity = nt_provider_wait::ProviderDomainIdentity {
+        domain: WIN32K_PROVIDER_DOMAIN.load(Ordering::Acquire),
+        generation: WIN32K_PROVIDER_GENERATION.load(Ordering::Acquire),
+    };
+    win32k_provider_domain_is_current(identity).then_some(identity)
+}
 /// One-shot guard: the dispatch-path backtrace mirror PT has been created (SYS_SEND paging is
 /// fire-and-forget so we can't re-map the PT idempotently).
 static WIN32K_DISP_BT_PT: AtomicU64 = AtomicU64::new(0);

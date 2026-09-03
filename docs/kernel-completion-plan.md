@@ -23736,6 +23736,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     storage-scoped catalog in win32k and broker embedded Event publication/retirement against the
     provider domain registered in the shared wait page.
 
+    Provider-local Event broker checkpoint (2026-09-03, host and freestanding green): the Event
+    registry now retains retired provider-local identities as tombstones until an exact component
+    acknowledgement, preventing canonical slot reuse during the storage retirement handshake. The
+    win32k Event broker accepts publish, begin-retire, and acknowledge-retirement operations only
+    for the currently registered provider domain; publication creates a real anonymous dispatcher
+    Event and returns its typed slot/generation rather than a provider pointer. Pool lookup can now
+    identify an Event embedded anywhere within a validated live allocation. All 237
+    `nt-kernel-exec` tests pass and the freestanding executive remains at 213 warnings. Next bind
+    win32k's local catalog to these broker operations and make pool release retire every embedded
+    Event before freeing the allocation.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

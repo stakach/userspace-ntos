@@ -25788,6 +25788,98 @@ impl ExecNtHandler {
         Ok((body, id, metadata, granted_access))
     }
 
+    pub(crate) fn provider_publish_local_event(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+        event_type: u32,
+        initial_state: bool,
+    ) -> Result<(nt_kernel_exec::EventObjectId, u64), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+        if !crate::win32k_provider_domain_is_current(provider)
+            || local_identity == 0
+            || event_type > 1
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let index = self
+            .obj_create_anon_event(event_type == 1, initial_state)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        let owner = nt_kernel_exec::EventObjectOwner::provider(
+            provider.domain,
+            provider.generation,
+        );
+        let id = match self.event_objects.create_provider_local(
+            owner,
+            local_identity,
+            index as u64,
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                self.rollback_new_event(index);
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+        };
+        let metadata = u64::from(event_type == 1) | (u64::from(initial_state) << 1);
+        Ok((id, metadata))
+    }
+
+    pub(crate) fn provider_retire_local_event(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<Option<nt_kernel_exec::EventObjectId>, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) || local_identity == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let owner = nt_kernel_exec::EventObjectOwner::provider(
+            provider.domain,
+            provider.generation,
+        );
+        if let Some(id) = self
+            .event_objects
+            .pending_provider_local_reclaim(owner, local_identity)
+        {
+            return Ok(Some(id));
+        }
+        let id = self
+            .event_objects
+            .id_for_provider_local(owner, local_identity)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        match self.event_objects.request_delete(id) {
+            Ok(Some(retired)) => {
+                self.finalize_retired_event_object(retired);
+                Ok(Some(id))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => Err(STATUS_INVALID_PARAMETER),
+        }
+    }
+
+    pub(crate) fn provider_ack_local_event_retirement(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+        id: nt_kernel_exec::EventObjectId,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.event_objects
+            .complete_provider_local_reclaim(
+                id,
+                nt_kernel_exec::EventObjectOwner::provider(
+                    provider.domain,
+                    provider.generation,
+                ),
+                local_identity,
+            )
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
     fn provider_event_identity(
         &self,
         body: u64,

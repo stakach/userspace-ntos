@@ -2886,6 +2886,61 @@ pub(crate) unsafe fn service_win32k_event_request(
             .provider_read_event(arg1)
             .map(|signaled| (0, u64::from(signaled), 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_EVENT_OP_PUBLISH_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_publish_local_event(provider, arg1, arg2 as u32, arg3 != 0)
+                .map(|(id, metadata)| {
+                    (
+                        0,
+                        id.0.slot().checked_add(1).unwrap_or(0),
+                        u64::from(id.0.generation().0),
+                        metadata,
+                    )
+                })
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_RETIRE_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_retire_local_event(provider, arg1)
+                .map(|ready| match ready {
+                    Some(id) => (
+                        0,
+                        id.0.slot().checked_add(1).unwrap_or(0),
+                        u64::from(id.0.generation().0),
+                        0,
+                    ),
+                    None => (0x0000_0103, 0, 0, 0),
+                })
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_EVENT_OP_ACK_LOCAL_RETIREMENT => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            let Some(slot) = arg2.checked_sub(1) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            let Ok(generation) = u32::try_from(arg3) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            handler
+                .provider_ack_local_event_retirement(
+                    provider,
+                    arg1,
+                    nt_kernel_exec::EventObjectId(nt_types::ObjectId::new(
+                        nt_types::Generation(generation),
+                        slot,
+                    )),
+                )
+                .map(|()| (0, 0, 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
     }
 }

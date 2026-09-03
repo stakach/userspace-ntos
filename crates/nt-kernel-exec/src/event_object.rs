@@ -90,6 +90,7 @@ pub enum EventObjectError {
     WrongLeaseKind,
     ProviderBodyInUse,
     ProviderIdentityInUse,
+    InvalidProviderIdentity,
     NativeIdentityInUse,
     ReferenceOverflow,
     OutOfMemory,
@@ -368,11 +369,11 @@ impl EventObjectRegistry {
     }
 
     fn allocate_event_slot(&mut self) -> Result<(usize, Generation), EventObjectError> {
-        if let Some(slot) = self
-            .events
-            .iter()
-            .position(|record| !record.live && record.provider_body.is_none())
-        {
+        if let Some(slot) = self.events.iter().position(|record| {
+            !record.live
+                && record.provider_body.is_none()
+                && record.provider_local_identity.is_none()
+        }) {
             return Ok((slot, self.events[slot].generation.next()));
         }
         self.events
@@ -799,6 +800,20 @@ impl EventObjectRegistry {
         })
     }
 
+    /// Resolve an exact retired provider-local identity awaiting component storage acknowledgement.
+    pub fn pending_provider_local_reclaim(
+        &self,
+        owner: EventObjectOwner,
+        provider_local_identity: u64,
+    ) -> Option<EventObjectId> {
+        self.events.iter().enumerate().find_map(|(slot, record)| {
+            (!record.live
+                && record.owner == owner
+                && record.provider_local_identity == Some(provider_local_identity))
+            .then(|| EventObjectId(ObjectId::new(record.generation, slot as u64)))
+        })
+    }
+
     /// Acknowledge that win32k freed one exact retired provider body. Stale ids, live objects, and
     /// mismatched bodies fail closed so a delayed acknowledgement cannot unlock a reused slot.
     pub fn complete_provider_reclaim(
@@ -821,6 +836,37 @@ impl EventObjectRegistry {
             return Err(EventObjectError::InvalidProviderBody);
         }
         record.provider_body = None;
+        Ok(())
+    }
+
+    /// Acknowledge retirement of one exact provider-embedded Event. Until this arrives, the
+    /// canonical slot remains a tombstone and cannot be recycled for an unrelated object.
+    pub fn complete_provider_local_reclaim(
+        &mut self,
+        id: EventObjectId,
+        owner: EventObjectOwner,
+        provider_local_identity: u64,
+    ) -> Result<(), EventObjectError> {
+        if id.is_null()
+            || !owner.is_valid()
+            || !matches!(owner, EventObjectOwner::Provider { .. })
+            || provider_local_identity == 0
+        {
+            return Err(EventObjectError::InvalidProviderIdentity);
+        }
+        let slot = usize::try_from(id.0.slot()).map_err(|_| EventObjectError::StaleObject)?;
+        let record = self
+            .events
+            .get_mut(slot)
+            .ok_or(EventObjectError::StaleObject)?;
+        if record.live || record.generation != id.0.generation() {
+            return Err(EventObjectError::StaleObject);
+        }
+        if record.owner != owner || record.provider_local_identity != Some(provider_local_identity)
+        {
+            return Err(EventObjectError::InvalidProviderIdentity);
+        }
+        record.provider_local_identity = None;
         Ok(())
     }
 
@@ -1018,6 +1064,33 @@ mod tests {
             .unwrap();
         assert_eq!(retired.provider_local_identity, Some(11));
         assert_eq!(registry.id_for_provider_local(first_owner, 11), None);
+    }
+
+    #[test]
+    fn retired_provider_local_identity_fences_slot_reuse_until_exact_ack() {
+        let mut registry = EventObjectRegistry::new();
+        let owner = EventObjectOwner::provider(7, 2);
+        let first = registry.create_provider_local(owner, 41, 101).unwrap();
+        let retired = registry.request_delete(first).unwrap().unwrap();
+        assert_eq!(
+            registry.pending_provider_local_reclaim(owner, 41),
+            Some(first)
+        );
+
+        let second = registry.create_provider_local(owner, 42, 102).unwrap();
+        assert_ne!(first.0.slot(), second.0.slot());
+        assert_eq!(
+            registry.complete_provider_local_reclaim(first, owner, 99),
+            Err(EventObjectError::InvalidProviderIdentity)
+        );
+        registry
+            .complete_provider_local_reclaim(first, owner, 41)
+            .unwrap();
+        assert_eq!(registry.pending_provider_local_reclaim(owner, 41), None);
+
+        let third = registry.create_provider_local(owner, 43, 103).unwrap();
+        assert_eq!(third.0.slot(), first.0.slot());
+        assert_ne!(third.0.generation(), retired.id.0.generation());
     }
 
     #[test]
