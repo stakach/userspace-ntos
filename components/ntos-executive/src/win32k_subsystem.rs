@@ -5651,7 +5651,7 @@ unsafe fn hosted_heap_init(base: u64, reserve_size: u64) -> u64 {
     base
 }
 
-unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
+unsafe fn shared_hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
     let arena_start = WIN32K_HEAP_VADDR + POOL_DATA_OFF;
     let arena_bytes = WIN32K_HEAP_FRAMES * 0x1000;
     let arena_end = WIN32K_HEAP_VADDR + arena_bytes;
@@ -5673,14 +5673,20 @@ unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
     {
         return None;
     }
-    let arenas = (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).as_ref()?;
-    if !arenas
-        .iter()
-        .any(|arena| arena.base == heap && arena.bytes == size)
-    {
-        return None;
-    }
     Some((heap, size))
+}
+
+/// Validate a provider heap in the provider address space. The arena and allocation catalogs use
+/// provider-private `Vec` storage and must never be dereferenced by the executive copy of this
+/// module; callers that only consume already-published scalar mapping facts use
+/// [`shared_hosted_heap_bounds`] instead.
+unsafe fn hosted_heap_bounds(heap: u64) -> Option<(u64, u64)> {
+    let bounds = shared_hosted_heap_bounds(heap)?;
+    let arenas = (&*core::ptr::addr_of!(WIN32K_HOSTED_HEAP_ARENAS)).as_ref()?;
+    arenas
+        .iter()
+        .any(|arena| arena.base == heap && arena.bytes == bounds.1)
+        .then_some(bounds)
 }
 
 pub(crate) fn win32k_user_heap_delta() -> u64 {
@@ -5867,6 +5873,47 @@ unsafe fn write_thread_client_desktop_info(
     Some((client_deskinfo, delta, client_pcti))
 }
 
+unsafe fn prepare_thread_desktop_client_info(pti: u64) -> Option<()> {
+    if pti == 0 {
+        return None;
+    }
+    let desk_body = read_volatile((pti + THREADINFO_RPDESK_OFF) as *const u64);
+    let server_deskinfo = ensure_desktop_runtime_fields(desk_body)?;
+    if read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64) != server_deskinfo {
+        write_volatile(
+            (pti + THREADINFO_PDESKINFO_OFF) as *mut u64,
+            server_deskinfo,
+        );
+    }
+    write_thread_client_desktop_info(pti, desk_body, server_deskinfo)?;
+    Some(())
+}
+
+unsafe fn prepared_process_desktop_mapping(
+    ppi: u64,
+    kernel_base: u64,
+    user_base: u64,
+    limit: u64,
+) -> bool {
+    if ppi == 0 {
+        return false;
+    }
+    let mut mapping = read_volatile(
+        (ppi + PROCESSINFO_HEAP_MAPPINGS_OFF + W32HEAP_MAPPING_NEXT_OFF) as *const u64,
+    );
+    let mut scanned = 0usize;
+    while mapping != 0 && scanned < 64 {
+        if read_volatile((mapping + W32HEAP_MAPPING_KERNEL_OFF) as *const u64) == kernel_base {
+            return read_volatile((mapping + W32HEAP_MAPPING_USER_OFF) as *const u64) == user_base
+                && read_volatile((mapping + W32HEAP_MAPPING_LIMIT_OFF) as *const u64) == limit
+                && read_volatile((mapping + W32HEAP_MAPPING_COUNT_OFF) as *const u32) != 0;
+        }
+        mapping = read_volatile((mapping + W32HEAP_MAPPING_NEXT_OFF) as *const u64);
+        scanned += 1;
+    }
+    false
+}
+
 pub(crate) unsafe fn desktop_client_info_for_w32thread(pti: u64) -> Option<(u64, u64, u64, u64)> {
     if pti == 0 {
         return None;
@@ -5875,18 +5922,49 @@ pub(crate) unsafe fn desktop_client_info_for_w32thread(pti: u64) -> Option<(u64,
     if desk_body == 0 {
         return None;
     }
-    let server_deskinfo = ensure_desktop_runtime_fields(desk_body)?;
-    if server_deskinfo == 0 {
+    let hsection = read_volatile((desk_body + DESKTOP_HSECTION_OFF) as *const u64);
+    if !is_section(hsection as *const u8) {
         return None;
     }
-    if read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64) != server_deskinfo {
-        write_volatile(
-            (pti + THREADINFO_PDESKINFO_OFF) as *mut u64,
-            server_deskinfo,
-        );
+    let pheap = read_volatile((desk_body + DESKTOP_PHEAP_OFF) as *const u64);
+    let (kernel_base, limit) = shared_hosted_heap_bounds(pheap)?;
+    let server_deskinfo = read_volatile((pti + THREADINFO_PDESKINFO_OFF) as *const u64);
+    if server_deskinfo == 0
+        || server_deskinfo != read_volatile((desk_body + 0x08) as *const u64)
+        || heap_block_capacity_in(kernel_base, limit, server_deskinfo)
+            .is_none_or(|capacity| capacity < DESKTOPINFO_MIN_ALLOC)
+        || read_volatile(server_deskinfo as *const u64) != kernel_base
+        || read_volatile((server_deskinfo + 0x08) as *const u64) != kernel_base + limit
+    {
+        return None;
     }
-    let (client_deskinfo, delta, client_pcti) =
-        write_thread_client_desktop_info(pti, desk_body, server_deskinfo)?;
+    let user_base = win32k_heap_server_to_client(kernel_base)?;
+    let ppi = read_u64_field_if_present(pti, THREADINFO_PPI_OFF);
+    if !prepared_process_desktop_mapping(ppi, kernel_base, user_base, limit) {
+        return None;
+    }
+    let delta = kernel_base - user_base;
+    let client_deskinfo = desktop_heap_client_address(
+        server_deskinfo,
+        kernel_base,
+        user_base,
+        limit,
+    )?;
+    let pcti = read_volatile((pti + THREADINFO_PCTI_OFF) as *const u64);
+    if heap_block_capacity_in(kernel_base, limit, pcti)
+        .is_none_or(|capacity| capacity < CLIENTTHREADINFO_SIZE)
+    {
+        return None;
+    }
+    let client_pcti = desktop_heap_client_address(pcti, kernel_base, user_base, limit)?;
+    let pci = read_volatile((pti + THREADINFO_PCLIENTINFO_OFF) as *const u64);
+    if pci == 0
+        || read_volatile((pci + CLIENTINFO_PDESKINFO_OFF) as *const u64) != client_deskinfo
+        || read_volatile((pci + CLIENTINFO_ULCLIENTDELTA_OFF) as *const u64) != delta
+        || read_volatile((pci + CLIENTINFO_PCLIENTTHREADINFO_OFF) as *const u64) != client_pcti
+    {
+        return None;
+    }
     Some((client_deskinfo, pti, delta, client_pcti))
 }
 
@@ -13627,6 +13705,10 @@ unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) 
         print_hex(mdev as u32);
         print_str(b"\n");
     }
+    // Desktop-heap mutation belongs to the win32k provider. Prepare the selected thread's client
+    // mapping while the provider-private allocation and Event catalogs are addressable; the
+    // executive consumes only the resulting scalar pointers after this dispatch completes.
+    let _ = prepare_thread_desktop_client_info(t);
     if output_stage_valid {
         let staged_message = read_volatile((a0 + 8) as *const u32);
         let output_length =

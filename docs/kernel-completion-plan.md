@@ -23926,6 +23926,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     measured transport/lifecycle failures, then add exact process/thread/provider teardown
     cancellation before declaring this wait boundary accepted. Do not add a fallback.
 
+    Provider-private desktop-heap boundary correction and desktop acceptance (2026-09-03): the
+    first post-cutover runs stopped before SAS because the executive-side client-info helper
+    dereferenced `Vec` storage owned by win32k's private allocator. The raw desktop objects and heap
+    mappings were valid; only the provider-private allocation/arena catalogs were nonsensical in the
+    executive VSpace. Desktop mapping preparation now runs at the end of each win32k dispatch while
+    those catalogs are addressable. The executive performs no provider-heap mutation and consumes
+    only the resulting scalar THREADINFO/PROCESSINFO mapping facts, validating the shared heap
+    headers, live allocations, section descriptor, mapping count, and translated CLIENTINFO values.
+    The diagnostic cross-domain reads were removed.
+
+    Serialized run `.tmp/run-desktop-20260903-164804.log` passes all 293 gates, launches genuine
+    userinit and Explorer, records 661 real api0 redirects without callback failures, flushes 172 GDI
+    batch records, paints all 786,432 framebuffer pixels with at least 32 colours, and exits on the
+    sentinel. This accepts the desktop regression correction and proves the provider-wait cutover is
+    non-regressing. The workload did not call win32k's `KeWaitForSingleObject` or
+    `KeWaitForMultipleObjects`, so live delayed/resume proof remains open. Next add exact
+    process/thread/provider teardown cancellation and a real provider-side wait exercise; require
+    admission, Event or timeout selection, LIFO resume, exact native reply, and zero leaked leases
+    before declaring the wait boundary complete.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences
