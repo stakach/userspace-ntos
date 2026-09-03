@@ -105,6 +105,11 @@ const GUID_DEVICE_SURPRISE_REMOVAL_BYTES: [u8; 16] = [
     0x00, 0xf0, 0x5a, 0xce, 0xdd, 0x80, 0xd2, 0x11, 0xa8, 0x8d, 0x00, 0xa0, 0xc9, 0x69, 0x6b, 0x4b,
 ];
 
+pub(crate) struct ProviderLocalEventTransfer {
+    record: nt_kernel_exec::ProviderLocalEventTransferRecord,
+    state: Option<(nt_kernel_exec::EventKind, bool)>,
+}
+
 struct CapturedNamedObjectAttributes {
     root: u64,
     attributes: u32,
@@ -332,6 +337,8 @@ static EXPLORER_TP_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static IO_COMPLETION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WAIT_OBJECT_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NAMED_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_LOCAL_EVENT_TRACE_N: AtomicU64 = AtomicU64::new(0);
+static EVENT_DELETE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_POST_LSA_REGISTRY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static TP_WORKER_PREFERRED_BUSY_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static NT_YIELD_EXECUTION_TRACE_N: AtomicU64 = AtomicU64::new(0);
@@ -1644,6 +1651,40 @@ fn trace_named_event_object(
             print_str(b" signaled=");
             print_u64(signaled as u64);
         }
+    }
+    print_str(b"\n");
+}
+
+fn trace_provider_local_event(
+    op: &[u8],
+    provider: nt_provider_wait::ProviderDomainIdentity,
+    local_identity: u64,
+    id: Option<nt_kernel_exec::EventObjectId>,
+    native_identity: u64,
+) {
+    let n = PROVIDER_LOCAL_EVENT_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    print_str(b"[provider-local-event] #");
+    print_u64(n + 1);
+    print_str(b" op=");
+    print_str(op);
+    print_str(b" provider=");
+    print_u64(provider.domain);
+    print_str(b"/");
+    print_u64(provider.generation);
+    print_str(b" local=0x");
+    print_hex_u64(local_identity);
+    if let Some(id) = id {
+        print_str(b" canonical=");
+        print_u64(id.0.slot().saturating_add(1));
+        print_str(b"/");
+        print_u64(u64::from(id.0.generation().0));
+    }
+    if native_identity != 0 {
+        print_str(b" native=");
+        print_u64(native_identity);
     }
     print_str(b"\n");
 }
@@ -3733,6 +3774,7 @@ impl ExecNtHandler {
         driver_starts: DriverStartBootstrap,
         require_boot_system: bool,
         bootstrap_system_journal_records: u32,
+        provider_local_events: Vec<ProviderLocalEventTransfer>,
     ) -> &'static mut Self {
         // The REAL SECURITY + SAM hives the storage host read BY PATH off
         // `\reactos\system32\config\{security,sam}`. Borrow the staged bytes (no copy) and parse
@@ -4062,6 +4104,9 @@ impl ExecNtHandler {
             bootstrap_system_journal_records != 0
         );
         let handler = &mut *slot;
+        handler
+            .import_provider_local_events(provider_local_events)
+            .expect("transfer quiescent provider-local Events into live executive");
         for (pi, &pid) in bootstrap_pids.iter().enumerate() {
             let main_tid = bootstrap_main_tids[pi];
             if pid != 0 && main_tid != 0 {
@@ -4100,6 +4145,14 @@ impl ExecNtHandler {
         handler.provision_kernel_srm_objects();
         trace_setup_provision_phase(b"srm-end", 0);
         if require_boot_system {
+            handler.activate_live_boot_policy();
+        } else {
+            unsafe { publish_time_zone(&handler.time_zone_information, nt_system_time_100ns()) };
+        }
+        handler
+    }
+
+    unsafe fn activate_live_boot_policy(&mut self) {
             trace_setup_provision_phase(b"timezone-begin", 0);
             let configuration = match query_system_time_configuration() {
                 Ok(configuration) => {
@@ -4107,7 +4160,7 @@ impl ExecNtHandler {
                     configuration
                 }
                 Err(STATUS_OBJECT_NAME_NOT_FOUND) => {
-                    if let Err(status) = handler.provision_reactos_time_zone_setup() {
+                    if let Err(status) = self.provision_reactos_time_zone_setup() {
                         print_str(b"[timezone-setup] installation failed status=0x");
                         print_hex(status);
                         print_str(b"\n");
@@ -4130,32 +4183,28 @@ impl ExecNtHandler {
                     panic!("validate persisted ReactOS timezone through Config Manager");
                 }
             };
-            handler.time_zone_information = configuration.information;
-            handler.real_time_is_universal = configuration.real_time_is_universal;
-            unsafe { publish_time_zone(&handler.time_zone_information, nt_system_time_100ns()) };
+            self.time_zone_information = configuration.information;
+            self.real_time_is_universal = configuration.real_time_is_universal;
+            unsafe { publish_time_zone(&self.time_zone_information, nt_system_time_100ns()) };
             trace_setup_provision_phase(b"timezone-end", 1);
             trace_setup_provision_phase(b"locale-begin", 0);
-            unsafe { handler.provision_default_user_locale() };
+            unsafe { self.provision_default_user_locale() };
             trace_setup_provision_phase(b"locale-end", 0);
             trace_setup_provision_phase(b"profile-shell-begin", 0);
-            handler.provision_default_user_shell_folders();
+            self.provision_default_user_shell_folders();
             trace_setup_provision_phase(b"profile-shell-end", 0);
             trace_setup_provision_phase(b"profile-image-begin", 0);
-            handler.provision_default_user_ntuser_dat_image();
+            self.provision_default_user_ntuser_dat_image();
             trace_setup_provision_phase(b"profile-image-end", 0);
             trace_setup_provision_phase(b"network-begin", 0);
-            handler.provision_reactos_network_setup();
+            self.provision_reactos_network_setup();
             trace_setup_provision_phase(b"network-end", 0);
             trace_setup_provision_phase(b"print-begin", 0);
-            handler.provision_reactos_print_setup();
+            self.provision_reactos_print_setup();
             trace_setup_provision_phase(b"print-end", 0);
             trace_setup_provision_phase(b"shell-com-begin", 0);
-            handler.provision_reactos_explorer_shell_com_classes();
+            self.provision_reactos_explorer_shell_com_classes();
             trace_setup_provision_phase(b"shell-com-end", 0);
-        } else {
-            unsafe { publish_time_zone(&handler.time_zone_information, nt_system_time_100ns()) };
-        }
-        handler
     }
 
     /// Seed the kernel-owned SRM synchronization object that ReactOS creates from ntoskrnl's
@@ -11883,7 +11932,7 @@ impl ExecNtHandler {
         };
         if self.event_objects.retain_handle(id).is_err() {
             if registered {
-                let _ = self.event_objects.request_delete(id);
+                let _ = self.request_event_object_delete(id, b"mint-retain-rollback", true);
             }
             return None;
         }
@@ -11893,7 +11942,7 @@ impl ExecNtHandler {
             Err(_) => {
                 let _ = self.event_objects.release_handle(id);
                 if registered {
-                    let _ = self.event_objects.request_delete(id);
+                    let _ = self.request_event_object_delete(id, b"mint-insert-rollback", true);
                 }
                 None
             }
@@ -25624,9 +25673,15 @@ impl ExecNtHandler {
             if self
                 .event_objects
                 .snapshot(id)
-                .is_ok_and(|snapshot| snapshot.handle_leases == 0)
+                .is_ok_and(|snapshot| {
+                    snapshot.handle_leases == 0
+                        && matches!(
+                            snapshot.owner,
+                            nt_kernel_exec::EventObjectOwner::Process { .. }
+                        )
+                })
             {
-                let _ = self.event_objects.request_delete(id);
+                let _ = self.request_event_object_delete(id, b"new-event-rollback", true);
             }
         }
         if index + 1 == self.obj_ns.len() {
@@ -25693,6 +25748,16 @@ impl ExecNtHandler {
         let Ok(snapshot) = self.event_objects.snapshot(id) else {
             return;
         };
+        if let nt_kernel_exec::EventObjectOwner::Provider { domain, generation } = snapshot.owner {
+            trace_provider_local_event(
+                b"skip-handle-delete",
+                nt_provider_wait::ProviderDomainIdentity { domain, generation },
+                snapshot.provider_local_identity.unwrap_or(0),
+                Some(id),
+                snapshot.native_identity,
+            );
+            return;
+        }
         let Some(entry) = self.obj_ns.get(index) else {
             return;
         };
@@ -25711,9 +25776,54 @@ impl ExecNtHandler {
         if wait_references != 0 {
             return;
         }
-        if let Ok(Some(retired)) = self.event_objects.request_delete(id) {
+        if let Ok(Some(retired)) =
+            self.request_event_object_delete(id, b"last-process-handle", true)
+        {
             self.finalize_retired_event_object(retired);
         }
+    }
+
+    fn request_event_object_delete(
+        &mut self,
+        id: nt_kernel_exec::EventObjectId,
+        reason: &[u8],
+        require_process_owner: bool,
+    ) -> Result<Option<nt_kernel_exec::RetiredEventObject>, nt_kernel_exec::EventObjectError> {
+        let snapshot = self.event_objects.snapshot(id)?;
+        let trace = EVENT_DELETE_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if trace < 128 {
+            print_str(b"[event-delete] #");
+            print_u64(trace + 1);
+            print_str(b" reason=");
+            print_str(reason);
+            print_str(b" canonical=");
+            print_u64(id.0.slot().saturating_add(1));
+            print_str(b"/");
+            print_u64(u64::from(id.0.generation().0));
+            print_str(b" provider-local=");
+            print_u64(u64::from(snapshot.provider_local_identity.is_some()));
+            print_str(b" delete-pending=");
+            print_u64(u64::from(snapshot.delete_pending));
+            print_str(b"\n");
+        }
+        if let nt_kernel_exec::EventObjectOwner::Provider { domain, generation } = snapshot.owner {
+            trace_provider_local_event(
+                reason,
+                nt_provider_wait::ProviderDomainIdentity { domain, generation },
+                snapshot.provider_local_identity.unwrap_or(0),
+                Some(id),
+                snapshot.native_identity,
+            );
+        }
+        if require_process_owner
+            && (!matches!(
+                snapshot.owner,
+                nt_kernel_exec::EventObjectOwner::Process { .. }
+            ) || snapshot.provider_local_identity.is_some())
+        {
+            return Err(nt_kernel_exec::EventObjectError::InvalidOwner);
+        }
+        self.event_objects.request_delete(id)
     }
 
     fn release_event_handle_reference(&mut self, id: nt_kernel_exec::EventObjectId) {
@@ -25821,8 +25931,85 @@ impl ExecNtHandler {
                 return Err(STATUS_INSUFFICIENT_RESOURCES);
             }
         };
+        trace_provider_local_event(
+            b"publish",
+            provider,
+            local_identity,
+            Some(id),
+            index as u64,
+        );
         let metadata = u64::from(event_type == 1) | (u64::from(initial_state) << 1);
         Ok((id, metadata))
+    }
+
+    pub(crate) fn export_provider_local_events(
+        &self,
+    ) -> Result<Vec<ProviderLocalEventTransfer>, nt_kernel_exec::EventObjectError> {
+        let records = self.event_objects.provider_local_transfer_records()?;
+        let mut transfer = Vec::new();
+        transfer
+            .try_reserve_exact(records.len())
+            .map_err(|_| nt_kernel_exec::EventObjectError::OutOfMemory)?;
+        for record in records {
+            let state = if record.live {
+                Some(
+                    self.events
+                        .query_existing(record.source_native_identity)
+                        .ok_or(nt_kernel_exec::EventObjectError::InvalidNativeIdentity)?,
+                )
+            } else {
+                None
+            };
+            transfer.push(ProviderLocalEventTransfer { record, state });
+        }
+        Ok(transfer)
+    }
+
+    fn import_provider_local_events(
+        &mut self,
+        transfer: Vec<ProviderLocalEventTransfer>,
+    ) -> Result<(), nt_kernel_exec::EventObjectError> {
+        for item in transfer {
+            let native_identity = if let Some((kind, signaled)) = item.state {
+                let index = self
+                    .obj_create_anon_event(
+                        matches!(kind, nt_kernel_exec::EventKind::Synchronization),
+                        signaled,
+                    )
+                    .ok_or(nt_kernel_exec::EventObjectError::OutOfMemory)?;
+                Some(index as u64)
+            } else {
+                None
+            };
+            if let Err(error) = self
+                .event_objects
+                .import_provider_local_transfer(item.record, native_identity)
+            {
+                if let Some(native_identity) = native_identity {
+                    if let Ok(index) = usize::try_from(native_identity) {
+                        self.rollback_new_event(index);
+                    }
+                }
+                return Err(error);
+            }
+            let nt_kernel_exec::EventObjectOwner::Provider { domain, generation } =
+                item.record.owner
+            else {
+                unreachable!("provider Event transfer validated its owner")
+            };
+            trace_provider_local_event(
+                if item.record.live {
+                    b"transfer-live"
+                } else {
+                    b"transfer-tombstone"
+                },
+                nt_provider_wait::ProviderDomainIdentity { domain, generation },
+                item.record.provider_local_identity,
+                Some(item.record.id),
+                native_identity.unwrap_or(0),
+            );
+        }
+        Ok(())
     }
 
     fn provider_local_event_identity(
@@ -25930,13 +26117,15 @@ impl ExecNtHandler {
             .event_objects
             .pending_provider_local_reclaim(owner, local_identity)
         {
+            trace_provider_local_event(b"retire-pending", provider, local_identity, Some(id), 0);
             return Ok(Some(id));
         }
         let id = self
             .event_objects
             .id_for_provider_local(owner, local_identity)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-        match self.event_objects.request_delete(id) {
+        trace_provider_local_event(b"retire", provider, local_identity, Some(id), 0);
+        match self.request_event_object_delete(id, b"provider-retire", false) {
             Ok(Some(retired)) => {
                 self.finalize_retired_event_object(retired);
                 Ok(Some(id))
@@ -25956,6 +26145,7 @@ impl ExecNtHandler {
         if !crate::win32k_provider_domain_is_current(provider) {
             return Err(STATUS_INVALID_PARAMETER);
         }
+        trace_provider_local_event(b"ack", provider, local_identity, Some(id), 0);
         self.event_objects
             .complete_provider_local_reclaim(
                 id,

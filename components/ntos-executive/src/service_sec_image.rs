@@ -1,7 +1,7 @@
 //! `service_sec_image` — the per-process SEC_IMAGE demand-fault service loop.
 //! Extracted verbatim from `main.rs` (pure reorg; no logic change).
 #![allow(clippy::all)]
-use crate::exec_handler::HostedCreatePublication;
+use crate::exec_handler::{HostedCreatePublication, ProviderLocalEventTransfer};
 use crate::*;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
@@ -2761,6 +2761,21 @@ unsafe fn clear_service_delay_drain_context() {
     SERVICE_DELAY_DRAIN_HANDLER.store(0, Ordering::Release);
     W32_CLIENT_PI.store(u64::MAX, Ordering::Release);
     SERVICE_CRASH_PARKED_MASK.store(0, Ordering::Release);
+}
+
+unsafe fn take_provider_local_event_transfer() -> Vec<ProviderLocalEventTransfer> {
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    let transfer = if handler_ptr.is_null() {
+        Vec::new()
+    } else {
+        (&*handler_ptr)
+            .export_provider_local_events()
+            .expect("provider-local Event state must be quiescent at live-service transition")
+    };
+    // Provider requests are serialized through root. Hide the obsolete owner before replacing its
+    // static storage; the new handler is published only after all transferred backing exists.
+    clear_service_delay_drain_context();
+    transfer
 }
 
 #[inline]
@@ -6431,11 +6446,17 @@ pub(crate) unsafe fn service_sec_image(
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
+    let provider_local_events = if live_service {
+        take_provider_local_event_transfer()
+    } else {
+        Vec::new()
+    };
     let mut nt_handler = reset_exec_nt_handler(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
         live_service,
         bootstrap_system_journal_records,
+        provider_local_events,
     );
     if live_service {
         print_str(b"[sec-init] handler-ready\n");

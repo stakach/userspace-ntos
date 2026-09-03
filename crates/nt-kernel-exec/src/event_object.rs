@@ -95,6 +95,8 @@ pub enum EventObjectError {
     ReferenceOverflow,
     OutOfMemory,
     SignalNotDelivering,
+    TransferActiveReferences,
+    TransferConflict,
 }
 
 /// Component-side ownership errors for projected provider Event bodies.
@@ -207,6 +209,19 @@ pub struct EventObjectSnapshot {
     pub gui_wait_leases: u32,
     pub provider_wait_leases: u32,
     pub signal_leases: u32,
+}
+
+/// Quiescent provider-owned Event state that survives replacement of an executive service
+/// instance. Native dispatcher backing is deliberately not transferable: the destination creates
+/// new backing and binds it to the exact canonical identity during import.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLocalEventTransferRecord {
+    pub id: EventObjectId,
+    pub owner: EventObjectOwner,
+    pub source_native_identity: u64,
+    pub provider_local_identity: u64,
+    pub live: bool,
+    pub delete_pending: bool,
 }
 
 /// Resources returned to the executive only after deletion is requested and every lease drains.
@@ -494,6 +509,103 @@ impl EventObjectRegistry {
     pub fn snapshot(&self, id: EventObjectId) -> Result<EventObjectSnapshot, EventObjectError> {
         let slot = self.event_slot(id)?;
         Ok(self.events[slot].snapshot(slot))
+    }
+
+    /// Capture provider-local Events without transferring an in-flight reference or signal. The
+    /// service transition is serialized, but this validation prevents a future caller from moving
+    /// an Event while a waiter, projected pointer, handle, or queued signal still owns it.
+    pub fn provider_local_transfer_records(
+        &self,
+    ) -> Result<Vec<ProviderLocalEventTransferRecord>, EventObjectError> {
+        let count = self
+            .events
+            .iter()
+            .filter(|record| record.provider_local_identity.is_some())
+            .count();
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(count)
+            .map_err(|_| EventObjectError::OutOfMemory)?;
+        for (slot, record) in self.events.iter().copied().enumerate() {
+            let Some(provider_local_identity) = record.provider_local_identity else {
+                continue;
+            };
+            if !matches!(record.owner, EventObjectOwner::Provider { .. })
+                || record.provider_body.is_some()
+                || record.total_leases() != 0
+                || (record.live && record.delete_pending)
+                || (!record.live && !record.delete_pending)
+            {
+                return Err(EventObjectError::TransferActiveReferences);
+            }
+            records.push(ProviderLocalEventTransferRecord {
+                id: EventObjectId(ObjectId::new(record.generation, slot as u64)),
+                owner: record.owner,
+                source_native_identity: record.native_identity,
+                provider_local_identity,
+                live: record.live,
+                delete_pending: record.delete_pending,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Install one transferred provider-local Event at its original canonical slot/generation.
+    /// Live Events require newly-created native backing; tombstones intentionally have none.
+    pub fn import_provider_local_transfer(
+        &mut self,
+        transfer: ProviderLocalEventTransferRecord,
+        native_identity: Option<u64>,
+    ) -> Result<(), EventObjectError> {
+        if transfer.id.is_null()
+            || !transfer.owner.is_valid()
+            || !matches!(transfer.owner, EventObjectOwner::Provider { .. })
+            || transfer.provider_local_identity == 0
+            || transfer.id.0.generation().0 == 0
+            || transfer.live == transfer.delete_pending
+        {
+            return Err(EventObjectError::TransferConflict);
+        }
+        let native_identity = match (transfer.live, native_identity) {
+            (true, Some(identity)) if identity != 0 => identity,
+            (false, None) => 0,
+            _ => return Err(EventObjectError::InvalidNativeIdentity),
+        };
+        if self.events.iter().any(|record| {
+            (transfer.live && record.live && record.native_identity == native_identity)
+                || (record.provider_local_identity == Some(transfer.provider_local_identity)
+                    && record.owner == transfer.owner)
+        }) {
+            return Err(EventObjectError::TransferConflict);
+        }
+        let slot = usize::try_from(transfer.id.0.slot())
+            .map_err(|_| EventObjectError::TransferConflict)?;
+        if slot >= self.events.len() {
+            self.events
+                .try_reserve(slot + 1 - self.events.len())
+                .map_err(|_| EventObjectError::OutOfMemory)?;
+            while self.events.len() <= slot {
+                self.events.push(EventRecord::EMPTY);
+            }
+        }
+        let destination = self.events[slot];
+        if destination.live
+            || destination.generation.0 != 0
+            || destination.provider_body.is_some()
+            || destination.provider_local_identity.is_some()
+        {
+            return Err(EventObjectError::TransferConflict);
+        }
+        self.events[slot] = EventRecord {
+            generation: transfer.id.0.generation(),
+            live: transfer.live,
+            owner: transfer.owner,
+            native_identity,
+            provider_local_identity: Some(transfer.provider_local_identity),
+            delete_pending: transfer.delete_pending,
+            ..EventRecord::EMPTY
+        };
+        Ok(())
     }
 
     pub fn install_provider_body(
@@ -1091,6 +1203,69 @@ mod tests {
         let third = registry.create_provider_local(owner, 43, 103).unwrap();
         assert_eq!(third.0.slot(), first.0.slot());
         assert_ne!(third.0.generation(), retired.id.0.generation());
+    }
+
+    #[test]
+    fn provider_local_transfer_preserves_live_ids_and_retirement_tombstones() {
+        let owner = EventObjectOwner::provider(7, 2);
+        let mut source = EventObjectRegistry::new();
+        let live = source.create_provider_local(owner, 41, 101).unwrap();
+        let tombstone = source.create_provider_local(owner, 42, 102).unwrap();
+        source.request_delete(tombstone).unwrap().unwrap();
+
+        let records = source.provider_local_transfer_records().unwrap();
+        assert_eq!(records.len(), 2);
+        let mut destination = EventObjectRegistry::new();
+        for record in records {
+            destination
+                .import_provider_local_transfer(record, record.live.then_some(201))
+                .unwrap();
+        }
+
+        assert_eq!(destination.id_for_provider_local(owner, 41), Some(live));
+        assert_eq!(destination.snapshot(live).unwrap().native_identity, 201);
+        assert_eq!(
+            destination.pending_provider_local_reclaim(owner, 42),
+            Some(tombstone)
+        );
+        destination
+            .complete_provider_local_reclaim(tombstone, owner, 42)
+            .unwrap();
+        let reused = destination.create_provider_local(owner, 43, 202).unwrap();
+        assert_eq!(reused.0.slot(), tombstone.0.slot());
+        assert_ne!(reused.0.generation(), tombstone.0.generation());
+    }
+
+    #[test]
+    fn provider_local_transfer_rejects_active_references_and_import_conflicts() {
+        let provider_owner = EventObjectOwner::provider(9, 3);
+        let mut source = EventObjectRegistry::new();
+        let id = source
+            .create_provider_local(provider_owner, 51, 301)
+            .unwrap();
+        let lease = source
+            .acquire_wait(id, EventLeaseKind::ProviderWait)
+            .unwrap();
+        assert_eq!(
+            source.provider_local_transfer_records(),
+            Err(EventObjectError::TransferActiveReferences)
+        );
+        source
+            .release_wait(lease, EventLeaseKind::ProviderWait)
+            .unwrap();
+        let record = source.provider_local_transfer_records().unwrap()[0];
+
+        let mut destination = EventObjectRegistry::new();
+        destination.create(owner(1), 401).unwrap();
+        assert_eq!(
+            destination.import_provider_local_transfer(record, Some(402)),
+            Err(EventObjectError::TransferConflict)
+        );
+        let mut destination = EventObjectRegistry::new();
+        assert_eq!(
+            destination.import_provider_local_transfer(record, None),
+            Err(EventObjectError::InvalidNativeIdentity)
+        );
     }
 
     #[test]

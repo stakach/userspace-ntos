@@ -142,6 +142,7 @@ static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatal
 static mut WIN32K_STACK_EVENT_ACTIVATIONS: Option<Vec<ProviderStackEventActivation>> = None;
 static mut WIN32K_DRIVER_STACK_EVENT_ACTIVATION: Option<ProviderStackEventActivation> = None;
 static PROVIDER_STACK_ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_DRIVER_ENTRY_DISPATCH_ID: u64 = u64::MAX;
 const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
 
@@ -506,6 +507,7 @@ unsafe fn initialize_provider_local_event_tracking() -> bool {
     *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS) = Some(Vec::new());
     *core::ptr::addr_of_mut!(WIN32K_DRIVER_STACK_EVENT_ACTIVATION) = None;
     PROVIDER_STACK_ACTIVATION_GENERATION.store(1, Ordering::Relaxed);
+    PROVIDER_LOCAL_EVENT_INITIALIZATIONS.store(0, Ordering::Relaxed);
     true
 }
 
@@ -3382,6 +3384,20 @@ unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
         Err(nt_provider_wait::ProviderLocalEventError::NotFound) => return true,
         Err(_) => return false,
     };
+    let trace = PROVIDER_LOCAL_EVENT_INITIALIZATIONS.load(Ordering::Relaxed) <= 16;
+    if trace {
+        print_str(b"[win32k-event] reinitialize body=0x");
+        print_hex((body >> 32) as u32);
+        print_hex(body as u32);
+        print_str(b" local=0x");
+        print_hex((existing.id.raw() >> 32) as u32);
+        print_hex(existing.id.raw() as u32);
+        print_str(b" canonical=");
+        print_u64(u64::from(existing.canonical.is_some()));
+        print_str(b" leases=");
+        print_u64(u64::from(existing.wait_leases) + u64::from(existing.signal_leases));
+        print_str(b"\n");
+    }
     if existing.canonical.is_none() {
         let rolled_back = provider_local_events_mut()
             .is_some_and(|events| events.rollback_unpublished(existing.id).is_ok());
@@ -3410,6 +3426,28 @@ unsafe fn initialize_provider_local_event(
     kind: nt_provider_wait::ProviderEventKind,
     initial_state: bool,
 ) -> bool {
+    let initialization = PROVIDER_LOCAL_EVENT_INITIALIZATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    if initialization <= 16 {
+        print_str(b"[win32k-event] initialize #");
+        print_u64(initialization);
+        print_str(b" body=0x");
+        print_hex((event >> 32) as u32);
+        print_hex(event as u32);
+        print_str(b" kind=");
+        print_u64(u64::from(matches!(
+            kind,
+            nt_provider_wait::ProviderEventKind::Synchronization
+        )));
+        print_str(b" allocation-catalog=");
+        print_u64(u64::from(
+            (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).is_some(),
+        ));
+        print_str(b" local-catalog=");
+        print_u64(u64::from(
+            (&*core::ptr::addr_of!(WIN32K_LOCAL_EVENTS)).is_some(),
+        ));
+        print_str(b"\n");
+    }
     if !retire_existing_provider_local_event(event) {
         return false;
     }
@@ -3456,6 +3494,7 @@ unsafe fn initialize_provider_local_event(
             }
         }
     } else {
+        print_str(b"[win32k-event] provider allocation catalog missing during initialization\n");
         None
     }
     .or_else(|| {
@@ -3486,6 +3525,14 @@ unsafe fn initialize_provider_local_event(
         None
     });
     let Some(id) = id else {
+        print_str(b"[win32k-event] no owned storage classification body=0x");
+        print_hex((event >> 32) as u32);
+        print_hex(event as u32);
+        print_str(b" provider-pool=");
+        print_u64(u64::from(provider_pool_contains(event)));
+        print_str(b" stack-activation=");
+        print_u64(u64::from(active_provider_stack_event_activation().is_some()));
+        print_str(b"\n");
         return false;
     };
     let event_type = u64::from(matches!(
@@ -3521,15 +3568,36 @@ unsafe fn initialize_provider_local_event(
         object_id,
         object_generation,
     );
-    if provider_local_events_mut()
+    let bind_result = provider_local_events_mut()
         .expect("local Event catalog disappeared")
-        .bind_canonical(id, canonical)
-        .is_err()
-    {
+        .bind_canonical(id, canonical);
+    if let Err(error) = bind_result {
+        print_str(b"[win32k-event] canonical bind rejected reason=");
+        print_u64(error as u64);
+        print_str(b" local=0x");
+        print_hex((id.raw() >> 32) as u32);
+        print_hex(id.raw() as u32);
+        print_str(b" canonical=");
+        print_u64(object_id);
+        print_str(b"/");
+        print_u64(object_generation);
+        print_str(b"\n");
         if !rollback_provider_local_event_publication(id, true) {
             print_str(b"[win32k-event] canonical bind rollback incomplete\n");
         }
         return false;
+    }
+    if initialization <= 16 {
+        print_str(b"[win32k-event] published #");
+        print_u64(initialization);
+        print_str(b" local=0x");
+        print_hex((id.raw() >> 32) as u32);
+        print_hex(id.raw() as u32);
+        print_str(b" canonical=");
+        print_u64(object_id);
+        print_str(b"/");
+        print_u64(object_generation);
+        print_str(b"\n");
     }
     let kernel_kind = match kind {
         nt_provider_wait::ProviderEventKind::Notification => {

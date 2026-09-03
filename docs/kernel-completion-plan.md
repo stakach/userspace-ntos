@@ -23815,9 +23815,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     forbid moving realloc of an allocation containing an Event, and restore canonical Event
     publication/set/reset/clear/pulse/read before the next desktop gate.
 
-    Provider-local Event activation checkpoint (2026-09-03, host/freestanding green; runtime
-    correction in progress): win32k now instantiates one component-private local Event catalog from the dynamically
-    registered provider domain before DriverEntry. `KeInitializeEvent` classifies storage only as
+    Provider-local Event activation checkpoint (2026-09-03, host/freestanding green; canonical
+    transfer accepted, provider wait pending): win32k now instantiates one component-private local
+    Event catalog from the dynamically registered provider domain before DriverEntry.
+    `KeInitializeEvent` classifies storage only as
     the innermost live allocation generation, the current nested dispatch/DriverEntry stack
     activation, or provider-image static data; an unknown address fails closed. Publication mints a
     real canonical executive Event, and set/reset/clear/pulse/read now cross the provider-scoped
@@ -23840,15 +23841,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     packing, and duplicate detection includes the typed object namespace. `nt-provider-wait`
     passes all 31 tests and the freestanding executive remains at the 213-warning baseline.
 
-    Two serialized activation runs reached real win32k SSN `0x10FA`, then failed closed while
+    Two initial serialized activation runs reached real win32k SSN `0x10FA`, then failed closed while
     `PROCESSINFO.InputIdleEvent` was initialized for the second time at body
     `0x000001000a061d70`; evidence is in
     `.tmp/run-desktop-provider-local-events-20260903.log` and
     `.tmp/run-desktop-provider-local-events-v2-20260903.log`. This is not desktop acceptance. The
-    next run must use the new broker-publication diagnostics to resolve that exact two-phase
-    reinitialization failure before provider waits are wired.
+    next run used the new broker-publication diagnostics to resolve that exact two-phase
+    reinitialization failure. The root cause was not the reinitialization handshake: DriverEntry
+    published canonical Events into the bootstrap executive handler, then live-service setup
+    replaced that handler and its Event registry. Live activation now exports only quiescent
+    provider-local Event records, recreates their anonymous dispatcher backing in the live handler,
+    and imports the exact canonical slot/generation plus tombstone state before publishing the new
+    handler. Active references, a provider projection, occupied identities, inconsistent
+    live/delete state, and missing backing all fail closed. Focused transfer tests bring
+    `nt-kernel-exec` to 240 passing tests; the freestanding executive remains at the 213-warning
+    baseline.
 
-    Once activation is accepted, build the next provider-wait slice as a host-tested Event-only
+    The serialized transfer gate in
+    `.tmp/run-desktop-provider-event-transfer-v13-20260903.log` proves canonical identities
+    `1/1` through `5/1` (including reinitialized `4/2`) survive into fresh live backing and that no
+    `CanonicalIdentityInUse` failure remains. The run completes its guest gate without a component
+    fault or stale-handler runtime regression, but it is not desktop acceptance: winlogon stops
+    before the SAS window, userinit, and Explorer. This exposes the deliberately unimplemented wait
+    boundary: win32k's `KeWaitForSingleObject` still returns `STATUS_WAIT_0` immediately and only
+    consumes a locally mirrored synchronization Event. Do not diagnose or paper over that stall in
+    policy code; replace the immediate-success body with the canonical provider-wait transport.
+
+    Build the next provider-wait slice as a host-tested Event-only
     executive arbiter. It must copy the shared request at admission, require the exact provider and
     client owner tuple, acquire and release canonical `ProviderWait` Event leases transactionally,
     use the executive's global dispatcher admission sequence, implement WaitAny/WaitAll plus exact
