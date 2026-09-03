@@ -152,13 +152,15 @@ static PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID: AtomicU64 =
 static mut WIN32K_PROVIDER_ALLOCATIONS: Option<nt_provider_wait::ProviderAllocationCatalog> = None;
 static mut WIN32K_HOSTED_HEAP_ARENAS: Option<Vec<HostedHeapArena>> = None;
 static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatalog> = None;
-static mut WIN32K_STACK_EVENT_ACTIVATIONS: Option<Vec<ProviderStackEventActivation>> = None;
+static mut WIN32K_STACK_EVENT_ACTIVATIONS:
+    Option<nt_provider_wait::ProviderStackActivationCatalog> = None;
 static mut WIN32K_DRIVER_STACK_EVENT_ACTIVATION: Option<ProviderStackEventActivation> = None;
 static WIN32K_DRIVER_OBJECT: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_STACK_ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_DRIVER_ENTRY_DISPATCH_ID: u64 = u64::MAX;
 const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
+const WIN32K_PRIMARY_STACK_LANE_ID: u64 = 1;
+const WIN32K_STACK_ACTIVATION_DEPTH: usize = 64;
 
 #[derive(Clone, Copy)]
 struct HostedHeapArena {
@@ -168,20 +170,7 @@ struct HostedHeapArena {
     backing: nt_provider_wait::ProviderAllocationIdentity,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct ProviderStackEventActivation {
-    dispatch_id: u64,
-    generation: u64,
-}
-
-impl ProviderStackEventActivation {
-    const fn backing(self) -> nt_provider_wait::ProviderEventBacking {
-        nt_provider_wait::ProviderEventBacking::Stack {
-            dispatch_id: self.dispatch_id,
-            activation_generation: self.generation,
-        }
-    }
-}
+type ProviderStackEventActivation = nt_provider_wait::ProviderStackEventActivation;
 
 struct ProviderStackEventActivationGuard {
     activation: ProviderStackEventActivation,
@@ -517,10 +506,25 @@ unsafe fn initialize_provider_local_event_tracking() -> bool {
     let Ok(events) = nt_provider_wait::ProviderLocalEventCatalog::new(provider) else {
         return false;
     };
+    let Ok(mut stack_activations) = nt_provider_wait::ProviderStackActivationCatalog::new(
+        WIN32K_LANE_CAPACITY + 1,
+        WIN32K_STACK_ACTIVATION_DEPTH,
+    ) else {
+        return false;
+    };
+    if stack_activations
+        .register_lane(
+            WIN32K_PRIMARY_STACK_LANE_ID,
+            WIN32K_STACK_VADDR,
+            WIN32K_STACK_BYTES,
+        )
+        .is_err()
+    {
+        return false;
+    }
     *core::ptr::addr_of_mut!(WIN32K_LOCAL_EVENTS) = Some(events);
-    *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS) = Some(Vec::new());
+    *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS) = Some(stack_activations);
     *core::ptr::addr_of_mut!(WIN32K_DRIVER_STACK_EVENT_ACTIVATION) = None;
-    PROVIDER_STACK_ACTIVATION_GENERATION.store(1, Ordering::Relaxed);
     PROVIDER_LOCAL_EVENT_INITIALIZATIONS.store(0, Ordering::Relaxed);
     true
 }
@@ -535,39 +539,32 @@ unsafe fn provider_local_events(
     (&*core::ptr::addr_of!(WIN32K_LOCAL_EVENTS)).as_ref()
 }
 
+#[inline(always)]
+fn current_stack_pointer() -> u64 {
+    let stack_pointer: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rsp",
+            out(reg) stack_pointer,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    stack_pointer
+}
+
 unsafe fn active_provider_stack_event_activation() -> Option<ProviderStackEventActivation> {
-    (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
-        .as_ref()?
-        .last()
-        .copied()
+    let activations = (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_ref()?;
+    let (binding, _) = activations.resolve(current_stack_pointer(), 1).ok()?;
+    activations.active(binding.handle).ok()
 }
 
 unsafe fn begin_provider_stack_event_activation(
     dispatch_id: u64,
 ) -> Option<ProviderStackEventActivationGuard> {
-    if dispatch_id == 0 {
-        return None;
-    }
-    let generation = loop {
-        let generation = PROVIDER_STACK_ACTIVATION_GENERATION.load(Ordering::Relaxed);
-        let next = generation.checked_add(1)?;
-        if generation == 0 {
-            return None;
-        }
-        if PROVIDER_STACK_ACTIVATION_GENERATION
-            .compare_exchange_weak(generation, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            break generation;
-        }
-    };
-    let activation = ProviderStackEventActivation {
-        dispatch_id,
-        generation,
-    };
-    let stack = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()?;
-    stack.try_reserve(1).ok()?;
-    stack.push(activation);
+    let activation = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_mut()?
+        .begin_for_stack_pointer(current_stack_pointer(), dispatch_id)
+        .ok()?;
     Some(ProviderStackEventActivationGuard { activation })
 }
 
@@ -3418,16 +3415,18 @@ unsafe fn retire_provider_local_events_for_backing(
 unsafe fn finish_provider_stack_event_activation(
     activation: ProviderStackEventActivation,
 ) -> bool {
-    if active_provider_stack_event_activation() != Some(activation) {
+    let Some(activations) =
+        (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()
+    else {
+        return false;
+    };
+    if activations.active(activation.lane).ok() != Some(activation) {
         return false;
     }
     if !retire_provider_local_events_for_backing(activation.backing()) {
         return false;
     }
-    (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
-        .as_mut()
-        .and_then(Vec::pop)
-        == Some(activation)
+    activations.finish(activation).is_ok()
 }
 
 unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
@@ -3553,19 +3552,23 @@ unsafe fn initialize_provider_local_event(
         None
     }
     .or_else(|| {
-        let end = event.checked_add(event_bytes)?;
-        if event >= WIN32K_STACK_VADDR && end <= WIN32K_STACK_VADDR + WIN32K_STACK_BYTES {
-            let activation = active_provider_stack_event_activation()?;
-            return provider_local_events_mut()?.initialize_stack(
+        let (activation, offset) =
+            (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+                .as_ref()?
+                .classify_event_storage(current_stack_pointer(), event, event_bytes)
+                .ok()?;
+        provider_local_events_mut()?
+            .initialize_stack(
                 event,
+                activation.lane_id,
+                u64::from(activation.lane.generation()),
                 activation.dispatch_id,
                 activation.generation,
-                event - WIN32K_STACK_VADDR,
+                offset,
                 kind,
                 initial_state,
-            ).ok();
-        }
-        None
+            )
+            .ok()
     })
     .or_else(|| {
         let end = event.checked_add(event_bytes)?;
@@ -13428,10 +13431,40 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
 /// same VSpace, so it enters only the persistent dispatch loop.
 #[no_mangle]
 #[link_section = ".text.win32k_dispatch_lane_entry"]
-pub unsafe extern "C" fn win32k_dispatch_lane_entry(_unused: u64) -> ! {
+pub unsafe extern "C" fn win32k_dispatch_lane_entry(lane_ordinal: u64) -> ! {
     let drv = WIN32K_DRIVER_OBJECT.load(Ordering::Acquire);
     if drv == 0 {
         print_str(b"[win32k-host] ERROR: secondary lane started before DriverEntry completed\n");
+        park();
+    }
+    let Some(worker_index) = lane_ordinal.checked_sub(1) else {
+        print_str(b"[win32k-host] ERROR: secondary lane ordinal is zero\n");
+        park();
+    };
+    if worker_index >= WIN32K_LANE_CAPACITY as u64 {
+        print_str(b"[win32k-host] ERROR: secondary lane ordinal exceeds capacity\n");
+        park();
+    }
+    let Some(stack_base) = worker_index
+        .checked_mul(WIN32K_LANE_STRIDE)
+        .and_then(|offset| WIN32K_LANE_ARENA_VADDR.checked_add(offset))
+    else {
+        print_str(b"[win32k-host] ERROR: secondary lane stack range overflow\n");
+        park();
+    };
+    let registered = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_mut()
+        .is_some_and(|activations| {
+            activations
+                .register_lane(
+                    WIN32K_PRIMARY_STACK_LANE_ID + lane_ordinal,
+                    stack_base,
+                    WIN32K_LANE_STACK_FRAMES * 0x1000,
+                )
+                .is_ok()
+        });
+    if !registered {
+        print_str(b"[win32k-host] ERROR: secondary stack lane registration failed\n");
         park();
     }
     crate::spawn_hosts::component_dispatch_loop(

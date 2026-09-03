@@ -15,12 +15,14 @@ mod allocation;
 mod arbiter;
 mod domain;
 mod local_event;
+mod stack_activation;
 
 pub use abi::*;
 pub use allocation::*;
 pub use arbiter::*;
 pub use domain::*;
 pub use local_event::*;
+pub use stack_activation::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderWaitOwner {

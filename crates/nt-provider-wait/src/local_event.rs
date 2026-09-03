@@ -24,6 +24,8 @@ pub enum ProviderEventBacking {
         allocation_generation: u64,
     },
     Stack {
+        lane_id: u64,
+        lane_generation: u64,
         dispatch_id: u64,
         activation_generation: u64,
     },
@@ -47,9 +49,16 @@ impl ProviderEventBacking {
                     && allocation_generation != 0
             }
             Self::Stack {
+                lane_id,
+                lane_generation,
                 dispatch_id,
                 activation_generation,
-            } => dispatch_id != 0 && activation_generation != 0,
+            } => {
+                lane_id != 0
+                    && lane_generation != 0
+                    && dispatch_id != 0
+                    && activation_generation != 0
+            }
         }
     }
 
@@ -293,6 +302,8 @@ impl ProviderLocalEventCatalog {
     pub fn initialize_stack(
         &mut self,
         body: u64,
+        lane_id: u64,
+        lane_generation: u64,
         dispatch_id: u64,
         activation_generation: u64,
         offset: u64,
@@ -303,6 +314,8 @@ impl ProviderLocalEventCatalog {
             body,
             ProviderEventStorage {
                 backing: ProviderEventBacking::Stack {
+                    lane_id,
+                    lane_generation,
                     dispatch_id,
                     activation_generation,
                 },
@@ -755,6 +768,8 @@ mod tests {
         let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
         let stack = ProviderEventStorage {
             backing: ProviderEventBacking::Stack {
+                lane_id: 5,
+                lane_generation: 7,
                 dispatch_id: 41,
                 activation_generation: 2,
             },

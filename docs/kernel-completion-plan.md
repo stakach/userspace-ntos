@@ -24225,6 +24225,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     warnings. Next run the serialized desktop gate, fix the first real lane transition failure, then
     make stack-Event activation ownership lane-local before expanding the worker pool.
 
+    B3 lane-cutover runtime review (2026-09-03): serialized run
+    `.tmp/run-desktop-20260903-203031.log` exits through the normal sentinel without an invariant
+    panic, but stops at 221/293 with two legitimate retained calls occupying both physical lanes.
+    Winlogon's `NtUserCreateWindowStation` is retained across its second CSRSS request while the
+    first `ONEPARAM_ROUTINE_CREATESYSTEMTHREADS` worker has become a permanent desktop/RIT provider
+    thread. A primary plus one secondary lane is therefore structurally insufficient; fresh root
+    dispatch must provision another physical lane on demand and retry exact idle-lane acquisition.
+    Before enabling that pool, replace the process-global stack-Event activation vector with a
+    generation-fenced per-lane catalog and register every primary/worker stack range.
+
+    The cutover audit also adds six no-shortcut acceptance items: callback abort must unwind each
+    exact external lane token; callback resumption into provider/LPC suspension must transfer the
+    native continuation into a retained record on that same lane; malformed provider/LPC capture
+    must not leave the coordinator Running; `KeGdiFlushUserBatch` must propagate any typed
+    suspension before a following dispatch; every retained-resume validation failure must unwind
+    the exact lane; and partial physical-worker creation must roll back all resources. Cover these
+    state transitions in host tests where possible, then require the serialized desktop gate after
+    demand provisioning. Also trace the rearmed Winlogon LPC request through related-port redrive so
+    a lack of later hosted events cannot conceal a receive-wakeup defect.
+
+    B3 lane-local stack-Event checkpoint (2026-09-03, host and freestanding green):
+    `nt-provider-wait` now owns a bounded, generation-safe physical-stack catalog. Every lane has an
+    exact non-overlapping stack range and its own activation stack; same-lane activations remain
+    strict LIFO, while unrelated lanes can retire independently. Stack-backed Event identities now
+    carry lane ID and lane generation as well as dispatch and activation generations. Win32k
+    registers the primary stack during provider initialization and each worker stack before entering
+    its dispatch loop, resolves the executing lane from `RSP`, and rejects Event storage belonging
+    to another lane. The seven new ownership tests bring `nt-provider-wait` to 49 passing tests, and
+    the freestanding executive check remains green at the established 221-warning baseline. Review
+    adjustment: demand-provision a worker only after a fresh non-callback dispatch finds no idle
+    lane, then retry scheduler acquisition; do not provision for exact same-lane callback recursion.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
