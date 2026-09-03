@@ -23606,14 +23606,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     post-reclaim/provider finalization as explicit monotonic phases so a `false` retry result never
     describes an already-partially-deleted process.
 
-    Provider-wait audit adjustment (2026-09-03): the first paragraph above is stale for the live
-    hosted-driver ABI. `KeWaitForSingleObject` and `KeWaitForMultipleObjects` already park exact
-    reply-cap continuations, support WaitAny/WaitAll and finite deadlines, and cover projected and
-    local Event, Semaphore, and Timer bodies. Keep that transport. The remaining dispatcher task is
-    the cross-table ordering defect: native wait blocks and GUI message wait blocks still occupy
-    separate reusable vectors, and synchronization-event wake scans native slots first. Replace
-    those two insertion orders with one monotonic executive wait sequence and delete the
-    native-first arbitration.
+    Provider-wait audit correction (2026-09-03): the generic driver-host broker already parks
+    reply-cap continuations for Event/Semaphore/Timer WaitAny/WaitAll and deadlines, but the live
+    win32k provider path does not use it. Win32k's `KeWaitForSingleObject` still consumes at most one
+    inline synchronization Event and otherwise returns `STATUS_WAIT_0` unconditionally;
+    `KeWaitForMultipleObjects` is unbound. Converge both on one executive arbiter and delete the
+    generic-host-only authority and every isolated host's immediate-success wait body at cutover.
+    The native and GUI wait blocks also occupy separate reusable vectors, and synchronization-event
+    wake scans native slots first. Give native, GUI, and provider continuations one monotonic wait
+    sequence and delete that table/slot-order arbitration. A blocked provider dispatch must detach
+    its continuation and return win32k's sole component TCB to the receive loop; it cannot leave an
+    ordinary component Service call parked.
+
+    Cross-table wait-order checkpoint (2026-09-03, host and freestanding green): native dispatcher
+    waits and GUI message waits now receive one nonzero executive admission sequence. Native wake
+    evaluation walks that sequence rather than reusable waiter slots, preserving FIFO acquisition
+    for synchronization objects while retaining WaitAny's lowest ready input index and WaitAll's
+    atomic readiness/consumption boundary. GUI selection, cancellation reassignment, Event set, and
+    Event pulse use the same order; synchronization Events therefore go to the oldest eligible
+    native or GUI continuation rather than always preferring the native table. The host-tested
+    `oldest_dispatcher_wait_source` arbiter includes the provider continuation class so the next
+    cutover can join the same ordering contract without another two-table special case. Focused
+    validation passes all 233 `nt-kernel-exec` tests and the freestanding executive check with the
+    established 213-warning baseline.
+
+    This checkpoint is intentionally partial: the generic driver-host queue and the live win32k
+    provider still have separate wait ownership, and the latter's single-object entry remains an
+    immediate-success implementation while multiple-object wait is unbound. Do not mark the
+    dispatcher item complete until both use the executive continuation arbiter and the obsolete
+    provider/isolated-host wait bodies have been deleted.
 
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic

@@ -252,6 +252,7 @@ const GUI_MESSAGE_WAITER_INITIAL_RESERVE: usize = 16;
 #[derive(Clone, Copy)]
 struct GuiMessageWaiter {
     used: bool,
+    sequence: u64,
     pi: u32,
     process_generation: u64,
     badge: u64,
@@ -272,6 +273,7 @@ struct GuiMessageWaiter {
 impl GuiMessageWaiter {
     const EMPTY: Self = Self {
         used: false,
+        sequence: 0,
         pi: 0,
         process_generation: 0,
         badge: 0,
@@ -900,13 +902,32 @@ unsafe fn gui_message_wait_has_selected(event: nt_kernel_exec::EventObjectId) ->
 
 unsafe fn gui_message_wait_reassign_selected(event: nt_kernel_exec::EventObjectId) -> bool {
     let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let Some(waiter) = waiters.iter_mut().find(|waiter| {
-        waiter.used && waiter.queue_event == event && !waiter.event_selected
-    }) else {
+    let Some(index) = waiters
+        .iter()
+        .enumerate()
+        .filter(|(_, waiter)| {
+            waiter.used && waiter.queue_event == event && !waiter.event_selected
+        })
+        .min_by_key(|(_, waiter)| waiter.sequence)
+        .map(|(index, _)| index)
+    else {
         return false;
     };
+    let waiter = &mut waiters[index];
     waiter.event_selected = true;
     true
+}
+
+pub(crate) unsafe fn gui_message_wait_oldest_unselected_sequence(
+    event: nt_kernel_exec::EventObjectId,
+) -> Option<u64> {
+    (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
+        .iter()
+        .filter(|waiter| {
+            waiter.used && waiter.queue_event == event && !waiter.event_selected
+        })
+        .map(|waiter| waiter.sequence)
+        .min()
 }
 
 unsafe fn gui_message_waiter_cancel_slot(
@@ -1020,9 +1041,15 @@ unsafe fn gui_message_wait_select_level_inner(
     let already_selected = waiters
         .iter()
         .any(|waiter| waiter.used && waiter.queue_event == event && waiter.event_selected);
-    let Some(waiter) = waiters.iter_mut().find(|waiter| {
-        waiter.used && waiter.queue_event == event && !waiter.event_selected
-    }) else {
+    let Some(index) = waiters
+        .iter()
+        .enumerate()
+        .filter(|(_, waiter)| {
+            waiter.used && waiter.queue_event == event && !waiter.event_selected
+        })
+        .min_by_key(|(_, waiter)| waiter.sequence)
+        .map(|(index, _)| index)
+    else {
         if already_selected && queue_signal {
             nt_handler
                 .queue_event_signal(event)
@@ -1030,6 +1057,7 @@ unsafe fn gui_message_wait_select_level_inner(
         }
         return already_selected;
     };
+    let waiter = &mut waiters[index];
     waiter.event_selected = true;
     nt_handler
         .consume_event_by_id(event)
@@ -1050,12 +1078,18 @@ pub(crate) unsafe fn gui_message_wait_select_pulse(
         return false;
     }
     let waiters = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
-    let Some(waiter) = waiters
-        .iter_mut()
-        .find(|waiter| waiter.used && waiter.queue_event == event && !waiter.event_selected)
+    let Some(index) = waiters
+        .iter()
+        .enumerate()
+        .filter(|(_, waiter)| {
+            waiter.used && waiter.queue_event == event && !waiter.event_selected
+        })
+        .min_by_key(|(_, waiter)| waiter.sequence)
+        .map(|(index, _)| index)
     else {
         return false;
     };
+    let waiter = &mut waiters[index];
     waiter.event_selected = true;
     nt_handler
         .queue_event_signal(event)
@@ -22178,6 +22212,7 @@ unsafe fn gui_message_wait_park(
         let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
         table[slot] = GuiMessageWaiter {
             used: true,
+            sequence: crate::next_dispatcher_wait_sequence(),
             pi,
             process_generation,
             badge,

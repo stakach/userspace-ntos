@@ -52,6 +52,29 @@ pub enum DispatcherWaitTimeout {
     Blocking,
 }
 
+/// Continuation class competing for one dispatcher-object state transition.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DispatcherWaitSource {
+    Native,
+    Gui,
+    Provider,
+}
+
+/// Select by the executive-wide admission sequence, independent of backing-table slot order.
+pub fn oldest_dispatcher_wait_source(
+    candidates: &[(DispatcherWaitSource, Option<u64>)],
+) -> Option<DispatcherWaitSource> {
+    candidates
+        .iter()
+        .filter_map(|(source, sequence)| {
+            sequence
+                .filter(|value| *value != 0)
+                .map(|value| (*source, value))
+        })
+        .min_by_key(|(_, sequence)| *sequence)
+        .map(|(source, _)| source)
+}
+
 pub fn classify_dispatcher_wait_timeout(timeout: Option<i64>) -> DispatcherWaitTimeout {
     match timeout {
         None => DispatcherWaitTimeout::Infinite,
@@ -205,6 +228,26 @@ mod tests {
 
     fn stores() -> (EventStore, SemaphoreStore, MutantStore) {
         (EventStore::new(), SemaphoreStore::new(), MutantStore::new())
+    }
+
+    #[test]
+    fn dispatcher_transition_uses_global_admission_order_across_sources() {
+        assert_eq!(
+            oldest_dispatcher_wait_source(&[
+                (DispatcherWaitSource::Native, Some(41)),
+                (DispatcherWaitSource::Gui, Some(17)),
+                (DispatcherWaitSource::Provider, Some(29)),
+            ]),
+            Some(DispatcherWaitSource::Gui)
+        );
+        assert_eq!(
+            oldest_dispatcher_wait_source(&[
+                (DispatcherWaitSource::Native, None),
+                (DispatcherWaitSource::Gui, Some(0)),
+                (DispatcherWaitSource::Provider, Some(3)),
+            ]),
+            Some(DispatcherWaitSource::Provider)
+        );
     }
 
     #[test]

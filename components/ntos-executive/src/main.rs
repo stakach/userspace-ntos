@@ -2564,6 +2564,7 @@ const WAITER_MAX_EVENTS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct ObjectWaiterRecord {
+    sequence: u64,
     objects: [WaitObject; WAITER_MAX_EVENTS],
     event_leases: [nt_kernel_exec::EventLeaseId; WAITER_MAX_EVENTS],
     result_indices: [u8; WAITER_MAX_EVENTS],
@@ -2586,6 +2587,7 @@ struct ObjectWaiterRecord {
 impl ObjectWaiterRecord {
     const fn empty() -> Self {
         Self {
+            sequence: 0,
             objects: [WaitObject::FREE; WAITER_MAX_EVENTS],
             event_leases: [nt_kernel_exec::EventLeaseId::NULL; WAITER_MAX_EVENTS],
             result_indices: [0; WAITER_MAX_EVENTS],
@@ -2612,6 +2614,7 @@ impl ObjectWaiterRecord {
 
     #[allow(clippy::too_many_arguments)]
     fn new(
+        sequence: u64,
         objects: &[WaitObject],
         event_leases: &[nt_kernel_exec::EventLeaseId],
         result_indices: &[u8],
@@ -2628,6 +2631,7 @@ impl ObjectWaiterRecord {
         reply: nt_syscall_abi::ParkedSyscallReply,
     ) -> Self {
         let mut record = Self::empty();
+        record.sequence = sequence;
         for (index, object) in objects.iter().copied().enumerate() {
             record.objects[index] = object;
             record.event_leases[index] = event_leases[index];
@@ -2771,6 +2775,15 @@ impl ObjectWaiterTable {
             .min()
     }
 
+    fn next_after_sequence(&self, sequence: u64) -> Option<(usize, ObjectWaiterRecord)> {
+        self.entries
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_live() && entry.sequence > sequence)
+            .min_by_key(|(_, entry)| entry.sequence)
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -2787,6 +2800,13 @@ impl ObjectWaiterTable {
 }
 
 static mut OBJECT_WAITERS: ObjectWaiterTable = ObjectWaiterTable::new();
+static DISPATCHER_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_dispatcher_wait_sequence() -> u64 {
+    let sequence = DISPATCHER_WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(sequence, 0, "dispatcher wait sequence exhausted");
+    sequence
+}
 /// Serialized service-loop work buffers, kept off the bounded rootserver stack.
 static mut PARK_WAIT_SET_WORK: [WaitObject; WAITER_MAX_EVENTS] =
     [WaitObject::FREE; WAITER_MAX_EVENTS];
@@ -18216,6 +18236,10 @@ fn object_waiter_pending_wake(slot: usize) -> Option<(ObjectWaiterRecord, u64, W
     unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).pending_wake(slot) }
 }
 
+fn object_waiter_next_after_sequence(sequence: u64) -> Option<(usize, ObjectWaiterRecord)> {
+    unsafe { (&*core::ptr::addr_of!(OBJECT_WAITERS)).next_after_sequence(sequence) }
+}
+
 fn io_completion_waiter_table_reset() -> bool {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(IO_COMPLETION_WAITERS))
@@ -19667,6 +19691,7 @@ unsafe fn wait_park_multi(
     // Commit: record the waiter's object set + its syscall resume context, install the fresh object as
     // the active recv reply cap.
     if !object_waiter_park(ObjectWaiterRecord::new(
+        next_dispatcher_wait_sequence(),
         objects,
         &event_leases[..objects.len()],
         result_indices,
@@ -19727,15 +19752,43 @@ unsafe fn wait_wake_dispatcher_pulse(
 
 /// Complete one false-to-true Event transition across native and hosted-GUI wait owners.
 unsafe fn wait_wake_event_set(index: usize, handler: &mut ExecNtHandler) -> u64 {
-    let woken = wait_wake_dispatcher_set(handler);
-    if let Some(id) = handler.event_id_for_index(index) {
-        crate::service_sec_image::gui_message_wait_select_level(handler, id);
+    let Some(id) = handler.event_id_for_index(index) else {
+        return wait_wake_dispatcher_set(handler);
+    };
+    let native_sequence = object_waiter_oldest_event_consumer_sequence(handler, index);
+    let gui_sequence =
+        crate::service_sec_image::gui_message_wait_oldest_unselected_sequence(id);
+    let oldest = nt_kernel_exec::oldest_dispatcher_wait_source(&[
+        (nt_kernel_exec::DispatcherWaitSource::Native, native_sequence),
+        (nt_kernel_exec::DispatcherWaitSource::Gui, gui_sequence),
+    ]);
+    if oldest == Some(nt_kernel_exec::DispatcherWaitSource::Gui) {
+        let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
+        wait_wake_dispatcher_set(handler)
+    } else {
+        let woken = wait_wake_dispatcher_set(handler);
+        let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
+        woken
     }
-    woken
 }
 
 /// Complete one pulse selection before the transient Event state can reach a late waiter.
 unsafe fn wait_wake_event_pulse(index: usize, handler: &mut ExecNtHandler) -> u64 {
+    if let Some(id) = handler.event_id_for_index(index) {
+        let native_sequence = object_waiter_oldest_event_consumer_sequence(handler, index);
+        let gui_sequence =
+            crate::service_sec_image::gui_message_wait_oldest_unselected_sequence(id);
+        let oldest = nt_kernel_exec::oldest_dispatcher_wait_source(&[
+            (nt_kernel_exec::DispatcherWaitSource::Native, native_sequence),
+            (nt_kernel_exec::DispatcherWaitSource::Gui, gui_sequence),
+        ]);
+        if oldest == Some(nt_kernel_exec::DispatcherWaitSource::Gui) {
+            let selected = crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
+            if selected {
+                let _ = handler.events.reset_existing(index as u64);
+            }
+        }
+    }
     let result = wait_wake_dispatcher_pulse(index, handler);
     if !result.pulse_event_consumed {
         if let Some(id) = handler.event_id_for_index(index) {
@@ -19745,56 +19798,71 @@ unsafe fn wait_wake_event_pulse(index: usize, handler: &mut ExecNtHandler) -> u6
     result.woken
 }
 
+fn object_waiter_ready_selection(
+    handler: &ExecNtHandler,
+    record: ObjectWaiterRecord,
+) -> Option<(usize, u64)> {
+    let count = record.count as usize;
+    if count == 0 || count > WAITER_MAX_EVENTS {
+        return None;
+    }
+    if record.wait_all {
+        let ready = record.objects[..count].iter().copied().all(|object| {
+            WaitObject::from_raw(object.raw()).is_some()
+                && handler.wait_object_ready_for(object, record.tid)
+        });
+        return ready.then_some((0, 0));
+    }
+    record.objects[..count]
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, object)| {
+            WaitObject::from_raw(object.raw()).is_some()
+                && handler.wait_object_ready_for(*object, record.tid)
+        })
+        .map(|(slot, _)| (slot, record.result_indices[slot] as u64))
+}
+
+fn object_waiter_oldest_event_consumer_sequence(
+    handler: &ExecNtHandler,
+    event_index: usize,
+) -> Option<u64> {
+    let target = WaitObject::dispatcher(event_index);
+    let mut sequence = 0;
+    while let Some((_, record)) = object_waiter_next_after_sequence(sequence) {
+        sequence = record.sequence;
+        let Some((selected_slot, _)) = object_waiter_ready_selection(handler, record) else {
+            continue;
+        };
+        let consumes_target = if record.wait_all {
+            record.objects[..record.count as usize]
+                .iter()
+                .any(|object| object.raw() == target.raw())
+        } else {
+            record.objects[selected_slot].raw() == target.raw()
+        };
+        if consumes_target {
+            return Some(record.sequence);
+        }
+    }
+    None
+}
+
 unsafe fn wait_wake_dispatcher(
     handler: &mut ExecNtHandler,
     pulse_event: Option<usize>,
 ) -> DispatcherWakeResult {
     object_waiter_clear_pending_wakes();
-    let waiter_count = object_waiter_len();
-    for i in 0..waiter_count {
-        let Some(record) = object_waiter_record(i) else {
+    let mut sequence = 0;
+    while let Some((i, record)) = object_waiter_next_after_sequence(sequence) {
+        sequence = record.sequence;
+        let count = record.count as usize;
+        let Some((selected_slot, mut wake_index)) =
+            object_waiter_ready_selection(handler, record)
+        else {
             continue;
         };
-        let count = record.count as usize;
-        // Does this waiter's condition hold, and if WaitAny, which index fired?
-        let mut wake = false;
-        let mut wake_index = 0u64;
-        let mut selected_slot = 0usize;
-        if record.wait_all {
-            // Check the whole set before consuming anything so an unsatisfied WaitAll never reserves
-            // an auto-reset event or semaphore token.
-            let mut all = true;
-            for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let object = record.objects[k];
-                if WaitObject::from_raw(object.raw()).is_none() {
-                    all = false;
-                    break;
-                };
-                if !handler.wait_object_ready_for(object, record.tid) {
-                    all = false;
-                    break;
-                }
-            }
-            wake = all;
-            wake_index = 0; // WaitAll returns WAIT_OBJECT_0
-        } else {
-            // WaitAny: the first (lowest-index) signalled event determines the return value.
-            for k in 0..count.min(WAITER_MAX_EVENTS) {
-                let object = record.objects[k];
-                if WaitObject::from_raw(object.raw()).is_none() {
-                    continue;
-                };
-                if handler.wait_object_ready_for(object, record.tid) {
-                    wake = true;
-                    selected_slot = k;
-                    wake_index = record.result_indices[k] as u64;
-                    break;
-                }
-            }
-        }
-        if !wake {
-            continue;
-        }
         let mutant_limit = if record.wait_all {
             record.objects[..count.min(WAITER_MAX_EVENTS)]
                 .iter()

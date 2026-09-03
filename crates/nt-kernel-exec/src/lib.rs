@@ -49,9 +49,10 @@ pub mod x86_io;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
 pub use dispatcher_wait::{
-    classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready, poll_dispatchers,
-    signal_dispatcher_for_wait, DispatcherConsumeResult, DispatcherObject, DispatcherSignalError,
-    DispatcherSignalObject, DispatcherWaitResult, DispatcherWaitTimeout,
+    classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready,
+    oldest_dispatcher_wait_source, poll_dispatchers, signal_dispatcher_for_wait,
+    DispatcherConsumeResult, DispatcherObject, DispatcherSignalError, DispatcherSignalObject,
+    DispatcherWaitResult, DispatcherWaitSource, DispatcherWaitTimeout,
 };
 pub use dpc::{DpcImportance, DpcQueue};
 pub use driver_thread::{
