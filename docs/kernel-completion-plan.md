@@ -23646,9 +23646,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The VSpace fault endpoint is deleted before the PML4 so the published PML4 identity remains a
     valid retry key, and DLL/page-table failures now accumulate instead of shadowing one another.
     `nt-address-space` is green (66 tests), `nt-memory-manager` is green (33 tests including stale
-    reclaim-snapshot rejection), and the freestanding executive remains at 213 warnings. Run the
-    serialized desktop acceptance next; retain explicit capability-failure injection as follow-up
-    coverage rather than reintroducing remove-before-delete helpers.
+    reclaim-snapshot rejection), and the freestanding executive remains at 213 warnings.
+
+    B3 deletion/reclaim desktop acceptance (2026-09-03, accepted): serialized
+    `./run.sh --desktop` completed the real E1000/SCM/winlogon/userinit/Explorer path, retired four
+    dynamic hosted processes through the new monotonic deletion record, painted all 786,432
+    framebuffer pixels with at least 32 colors, passed 293/293 gates, and exited on the guest
+    sentinel. Guest readiness reached the first periodic census at 96,830 ms; the remaining long
+    host-side preparation is the known full-tree ESP staging that the NTFS workstream removes.
+    Retain explicit capability-failure injection as follow-up coverage rather than reintroducing
+    remove-before-delete helpers. The next kernel boundary is the monotonic cross-table dispatcher
+    wait order, followed by typed provider object pointer/handle counts.
 
 ## NTFS System-Volume Workstream
 
