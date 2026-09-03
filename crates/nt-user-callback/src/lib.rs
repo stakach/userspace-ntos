@@ -1165,6 +1165,7 @@ impl ClientCallbackWindowState {
 /// the callback stack, which only works while frames are removed strictly top-first).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DispatchContext {
+    pub lane: nt_component_suspension::LaneHandle,
     pub dispatch_id: u64,
     pub ssn: u64,
     pub args: [u64; 4],
@@ -1182,6 +1183,7 @@ pub struct DispatchOutputStage {
 
 impl DispatchContext {
     pub const EMPTY: Self = Self {
+        lane: nt_component_suspension::LaneHandle::INVALID,
         dispatch_id: 0,
         ssn: 0,
         args: [0; 4],
@@ -1405,6 +1407,7 @@ impl ActiveCallbackFrame {
         self.outer_resume_ip = 0;
         self.redirected = false;
         self.callback_window = None;
+        self.dispatch_context.lane = nt_component_suspension::LaneHandle::INVALID;
         self.dispatch_context.dispatch_id = 0;
         self.dispatch_context.ssn = 0;
         self.dispatch_context.args.fill(0);
@@ -1593,14 +1596,20 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(index)
     }
 
-    /// Does this correlation name the physical top of the interleaved callback array?
+    /// Does this correlation name the innermost callback parked on its physical execution lane?
     ///
     /// A callback return can be logically valid for its own client thread while another thread's
-    /// callback frame sits above it. That is safe for purely model-level stack mutation, but a
-    /// userspace-hosted kernel component with one reply binding can only resume the global top.
-    pub fn is_global_top(&self, correlation: CallbackCorrelation) -> Result<bool, ValidationError> {
+    /// callback frame sits above it. Independent component lanes may resume out of global array
+    /// order, but callbacks sharing one physical lane remain strictly LIFO.
+    pub fn is_lane_top(&self, correlation: CallbackCorrelation) -> Result<bool, ValidationError> {
         let index = self.correlated_index(&correlation)?;
-        Ok(index + 1 == self.len)
+        let lane = self.frames[index].dispatch_context.lane;
+        if !lane.is_valid() {
+            return Err(ValidationError::State);
+        }
+        Ok(!self.frames[index + 1..self.len]
+            .iter()
+            .any(|frame| frame.dispatch_context.lane == lane))
     }
 
     pub fn push(
@@ -1706,6 +1715,9 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         context: DispatchContext,
     ) -> Result<(), ValidationError> {
         let index = self.correlated_index(&correlation)?;
+        if !context.lane.is_valid() {
+            return Err(ValidationError::State);
+        }
         if context.dispatch_id == 0 || context.dispatch_id != correlation.dispatch_id {
             return Err(ValidationError::Correlation);
         }
@@ -3324,6 +3336,10 @@ mod tests {
             .record_dispatch_context(
                 ca,
                 DispatchContext {
+                    lane: nt_component_suspension::LaneHandle {
+                        index: 0,
+                        generation: 1,
+                    },
                     dispatch_id: 10,
                     ssn: 0x1050,
                     args: [1, 2, 3, 4],
@@ -3339,6 +3355,10 @@ mod tests {
             .record_dispatch_context(
                 cb,
                 DispatchContext {
+                    lane: nt_component_suspension::LaneHandle {
+                        index: 1,
+                        generation: 1,
+                    },
                     dispatch_id: 20,
                     ssn: 0x1076,
                     args: [5, 6, 7, 8],
@@ -3349,8 +3369,8 @@ mod tests {
             .unwrap();
         stack.record_redirect(ca, [7; 20], 0xdead).unwrap();
         stack.record_redirect(cb, [9; 20], 0xbeef).unwrap();
-        assert_eq!(stack.is_global_top(ca), Ok(false));
-        assert_eq!(stack.is_global_top(cb), Ok(true));
+        assert_eq!(stack.is_lane_top(ca), Ok(true));
+        assert_eq!(stack.is_lane_top(cb), Ok(true));
         // A returns FIRST, from underneath B's frame.
         let popped_a = stack.pop(ca).unwrap();
         assert_eq!(popped_a.client_tcb(), 0xaaa0);
@@ -3398,6 +3418,62 @@ mod tests {
         assert_eq!(popped_b.client_token_user_sid_len(), 0x13);
         assert_eq!(popped_b.dispatch_context().caller_sp, 0x2000);
         assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn callback_return_readiness_is_lifo_per_execution_lane() {
+        let mut stack = ActiveCallbackStack::<2>::new();
+        let mut outer = CallbackHeader::idle(10, 2, 6, 4);
+        outer.state = CallbackState::Request as u32;
+        outer.callback_id = 1;
+        outer.api_index = USER32_CALLBACK_WINDOWPROC;
+        let mut inner = outer;
+        inner.dispatch_id = 20;
+        inner.callback_id = 2;
+        inner.client_tid = 21;
+        inner.client_badge = 13;
+        stack.push(outer, 0xAAA0).unwrap();
+        stack.push(inner, 0xBBB0).unwrap();
+
+        let lane = nt_component_suspension::LaneHandle {
+            index: 0,
+            generation: 7,
+        };
+        let outer_correlation = CallbackCorrelation::from_request(&outer);
+        let inner_correlation = CallbackCorrelation::from_request(&inner);
+        assert_eq!(
+            stack.record_dispatch_context(
+                outer_correlation,
+                DispatchContext {
+                    dispatch_id: 10,
+                    ..DispatchContext::EMPTY
+                },
+            ),
+            Err(ValidationError::State)
+        );
+        stack
+            .record_dispatch_context(
+                outer_correlation,
+                DispatchContext {
+                    lane,
+                    dispatch_id: 10,
+                    ..DispatchContext::EMPTY
+                },
+            )
+            .unwrap();
+        stack
+            .record_dispatch_context(
+                inner_correlation,
+                DispatchContext {
+                    lane,
+                    dispatch_id: 20,
+                    ..DispatchContext::EMPTY
+                },
+            )
+            .unwrap();
+
+        assert_eq!(stack.is_lane_top(outer_correlation), Ok(false));
+        assert_eq!(stack.is_lane_top(inner_correlation), Ok(true));
     }
 
     #[test]

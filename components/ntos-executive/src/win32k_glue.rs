@@ -60,6 +60,7 @@ static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)] // The routing cutover consumes the full retained resource description.
 struct Win32kPhysicalLane {
+    handle: nt_component_suspension::LaneHandle,
     binding: nt_component_suspension::LaneBinding,
     stack_base: u64,
     stack_frames: u64,
@@ -106,6 +107,10 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
         return false;
     }
     lanes.push(Win32kPhysicalLane {
+        handle: nt_component_suspension::LaneHandle {
+            index: 0,
+            generation: 1,
+        },
         binding,
         stack_base: win32k_subsystem::WIN32K_STACK_VADDR,
         stack_frames: 32,
@@ -115,13 +120,22 @@ pub(crate) unsafe fn register_primary_win32k_physical_lane(
     true
 }
 
+pub(crate) unsafe fn primary_win32k_physical_lane_handle(
+) -> Option<nt_component_suspension::LaneHandle> {
+    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        .as_ref()?
+        .first()
+        .map(|lane| lane.handle)
+}
+
 #[allow(dead_code)]
 pub(crate) unsafe fn win32k_physical_lane_binding(
-    index: usize,
+    handle: nt_component_suspension::LaneHandle,
 ) -> Option<nt_component_suspension::LaneBinding> {
     (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref()?
-        .get(index)
+        .iter()
+        .find(|lane| lane.handle == handle)
         .map(|lane| lane.binding)
 }
 
@@ -197,6 +211,10 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let resume = crate::spawn_hosts::resume_spawned_component_worker(&worker);
     if resume != 0 {
         lanes.push(Win32kPhysicalLane {
+            handle: nt_component_suspension::LaneHandle {
+                index: lanes.len() as u32,
+                generation: 1,
+            },
             binding: nt_component_suspension::LaneBinding {
                 executor_id: worker.tcb,
                 receive_endpoint: worker.endpoint,
@@ -224,6 +242,10 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     print_hex(worker.reply_cap as u32);
     print_str(if ready { b" ready=1\n" } else { b" ready=0\n" });
     lanes.push(Win32kPhysicalLane {
+        handle: nt_component_suspension::LaneHandle {
+            index: lanes.len() as u32,
+            generation: 1,
+        },
         binding: nt_component_suspension::LaneBinding {
             executor_id: worker.tcb,
             receive_endpoint: worker.endpoint,
@@ -1151,7 +1173,7 @@ pub(crate) unsafe fn user_callback_return_readiness(
         return UserCallbackReturnReadiness::Missing;
     }
     let correlation = nt_user_callback::CallbackCorrelation::from_request(frame.request());
-    match active.is_global_top(correlation) {
+    match active.is_lane_top(correlation) {
         Ok(true) => UserCallbackReturnReadiness::Ready,
         Ok(false) => UserCallbackReturnReadiness::Deferred,
         Err(_) => UserCallbackReturnReadiness::Missing,
@@ -3733,7 +3755,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         return None;
     }
     let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
-    if active.is_global_top(correlation) != Ok(true) {
+    if active.is_lane_top(correlation) != Ok(true) {
         return None;
     }
     let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
@@ -6411,6 +6433,9 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     let w_fault = WIN32K_FAULT_EP.load(Ordering::Relaxed);
     let host_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
     let debug_flags = WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.swap(0, Ordering::Relaxed);
+    let Some(lane) = primary_win32k_physical_lane_handle() else {
+        return (0xC000_0001u64, false);
+    };
     if w_fault == 0 || WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
         return (0xC000_0001u64, false);
     }
@@ -6475,6 +6500,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         UserCallbackDispatchContext {
+            lane,
             dispatch_id,
             ssn,
             args: completion_args,
@@ -6677,6 +6703,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
             Some(PendingProviderWaitDispatch {
                 request,
                 dispatch: UserCallbackDispatchContext {
+                    lane,
                     dispatch_id,
                     ssn,
                     args: completion_args,
@@ -6717,6 +6744,7 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
             Some(PendingLpcWaitDispatch {
                 request,
                 dispatch: UserCallbackDispatchContext {
+                    lane,
                     dispatch_id,
                     ssn,
                     args: completion_args,

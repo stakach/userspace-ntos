@@ -199,6 +199,11 @@ pub struct LaneHandle {
 }
 
 impl LaneHandle {
+    pub const INVALID: Self = Self {
+        index: 0,
+        generation: 0,
+    };
+
     pub const fn is_valid(self) -> bool {
         self.generation != 0
     }

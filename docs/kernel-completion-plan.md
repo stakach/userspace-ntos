@@ -24200,6 +24200,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     runs. All 19 `nt-component-suspension` tests pass and the freestanding executive is green at
     the established 221-warning baseline.
 
+    B3 callback lane-identity checkpoint (2026-09-03): every physical win32k catalog record now
+    owns a generation-bearing `LaneHandle`, and the dispatch context stored in an active callback
+    frame carries that exact handle. Invalid/absent lane contexts fail closed. Callback-return
+    readiness is no longer tied to the incidental global order of the interleaved frame array:
+    callbacks on distinct physical lanes may return independently, while callbacks sharing a lane
+    remain strict LIFO. Provider/LPC pending records retain the same identity through their embedded
+    dispatch context and every repark transition. All 59 `nt-user-callback` tests and 19
+    `nt-component-suspension` tests pass; the freestanding executive remains green at 221 warnings.
+    Next replace the singleton service-side suspension stack with the lane table and make that table
+    the sole allocator of the catalog handles before enabling secondary dispatch.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
