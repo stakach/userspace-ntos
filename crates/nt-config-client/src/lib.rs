@@ -107,6 +107,79 @@ pub enum SystemHiveMutation<'a> {
     },
 }
 
+/// Owned, strictly ordered input for one registry value mutation. Providers may fill this from a
+/// pointer-free shared window without publishing a partial value to Configuration Manager.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemHiveValueUpload {
+    expected_len: usize,
+    data: Vec<u8>,
+}
+
+impl SystemHiveValueUpload {
+    pub fn new(expected_len: usize) -> Result<Self, i32> {
+        if expected_len > 0x8000_0000 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(expected_len)
+            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(Self { expected_len, data })
+    }
+
+    pub fn expected_len(&self) -> usize {
+        self.expected_len
+    }
+
+    pub fn received_len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn append(&mut self, offset: usize, chunk: &[u8]) -> Result<(), i32> {
+        if chunk.is_empty()
+            || offset != self.data.len()
+            || offset
+                .checked_add(chunk.len())
+                .is_none_or(|end| end > self.expected_len)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.data.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    pub fn complete_data(&self) -> Result<&[u8], i32> {
+        (self.data.len() == self.expected_len)
+            .then_some(self.data.as_slice())
+            .ok_or(STATUS_INVALID_PARAMETER)
+    }
+}
+
+#[cfg(test)]
+mod value_upload_tests {
+    use super::*;
+
+    #[test]
+    fn upload_is_ordered_and_atomic() {
+        let mut upload = SystemHiveValueUpload::new(5).unwrap();
+        assert_eq!(upload.expected_len(), 5);
+        assert_eq!(upload.received_len(), 0);
+        assert_eq!(upload.complete_data(), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(upload.append(1, b"ab"), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(upload.append(0, b""), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(upload.append(0, b"ab"), Ok(()));
+        assert_eq!(upload.append(2, b"cde"), Ok(()));
+        assert_eq!(upload.complete_data(), Ok(b"abcde".as_slice()));
+        assert_eq!(upload.append(5, b"f"), Err(STATUS_INVALID_PARAMETER));
+
+        let empty = SystemHiveValueUpload::new(0).unwrap();
+        assert_eq!(empty.complete_data(), Ok([].as_slice()));
+        assert_eq!(
+            SystemHiveValueUpload::new(0x8000_0001).map(|_| ()),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+}
+
 /// One fully validated SYSTEM mutation whose CM-owned replay records must be made durable before
 /// publication. The token and lengths are opaque protocol identity; callers persist
 /// `durable_journal` and pass the complete value back to [`ConfigClient::publish_system_hive_mutation`].

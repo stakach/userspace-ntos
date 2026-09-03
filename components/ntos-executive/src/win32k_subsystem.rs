@@ -11928,6 +11928,11 @@ const WIN32K_REGISTRY_OP_CLOSE: u64 = 2;
 const WIN32K_REGISTRY_OP_QUERY_VALUE: u64 = 3;
 const WIN32K_REGISTRY_OP_QUERY_KEY: u64 = 4;
 const WIN32K_REGISTRY_OP_ENUMERATE_VALUE: u64 = 5;
+const WIN32K_REGISTRY_OP_BEGIN_SET_VALUE: u64 = 6;
+const WIN32K_REGISTRY_OP_APPEND_SET_VALUE: u64 = 7;
+const WIN32K_REGISTRY_OP_COMMIT_SET_VALUE: u64 = 8;
+const WIN32K_REGISTRY_OP_ABORT_SET_VALUE: u64 = 9;
+const WIN32K_REGISTRY_OP_DELETE_VALUE: u64 = 10;
 const _: () = assert!(
     WIN32K_REGISTRY_DATA_OFF + WIN32K_REGISTRY_VALUE_CAP as u64 <= WIN32K_REGISTRY_BYTES as u64
 );
@@ -11947,7 +11952,19 @@ struct Win32kRegHandle {
     target: Win32kRegHandleTarget,
 }
 
+struct Win32kRegSetTransfer {
+    token: u64,
+    handle: u64,
+    lease: nt_config_client::SystemHiveKeyLease,
+    physical_path: alloc::string::String,
+    name: alloc::string::String,
+    value_type: u32,
+    upload: nt_config_client::SystemHiveValueUpload,
+}
+
 static mut WIN32K_REG_HANDLES: Option<Vec<Win32kRegHandle>> = None;
+static mut WIN32K_REG_SET_TRANSFER: Option<Win32kRegSetTransfer> = None;
+static WIN32K_REG_SET_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct DisplayRegistrySpec<'a> {
     pub(crate) display_driver_leaf: &'a [u8],
@@ -12016,6 +12033,15 @@ fn take_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
     if let Some(entry) = handles.iter_mut().find(|entry| {
         entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
     }) {
+        unsafe {
+            let pending = &mut *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER);
+            if pending
+                .as_ref()
+                .is_some_and(|transfer| transfer.handle == handle)
+            {
+                *pending = None;
+            }
+        }
         entry.handle = 0;
         Some(core::mem::replace(
             &mut entry.target,
@@ -12136,6 +12162,47 @@ unsafe fn read_unicode_string_ascii_lower(ustr: u64) -> Option<Vec<u8>> {
     Some(out)
 }
 
+unsafe fn read_unicode_string_utf8(ustr: u64, trim_trailing_nuls: bool) -> Result<Vec<u8>, i32> {
+    if ustr == 0 {
+        return Err(STATUS_ACCESS_VIOLATION_I32);
+    }
+    let len = read_unaligned(ustr as *const u16) as usize;
+    if len > 32_767 || len & 1 != 0 {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let chars = len / 2;
+    let buf = read_unaligned((ustr + 8) as *const u64);
+    if chars != 0 && buf == 0 {
+        return Err(STATUS_ACCESS_VIOLATION_I32);
+    }
+    let mut units = Vec::new();
+    units
+        .try_reserve_exact(chars)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
+    for index in 0..chars {
+        units.push(read_unaligned((buf + index as u64 * 2) as *const u16));
+    }
+    if trim_trailing_nuls {
+        while units.last() == Some(&0) {
+            units.pop();
+        }
+    }
+    if units.contains(&0) {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let capacity = chars
+        .checked_mul(3)
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES_I32)?;
+    let mut value = alloc::string::String::new();
+    value
+        .try_reserve_exact(capacity)
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
+    for decoded in core::char::decode_utf16(units.into_iter()) {
+        value.push(decoded.map_err(|_| STATUS_INVALID_PARAMETER_I32)?);
+    }
+    Ok(value.into_bytes())
+}
+
 unsafe fn read_wide_cstr_ascii_lower(ptr: u64) -> Option<Vec<u8>> {
     if ptr == 0 {
         return None;
@@ -12181,6 +12248,31 @@ unsafe fn write_win32k_registry_ascii(len_off: u64, data_off: u64, value: &[u8])
     true
 }
 
+unsafe fn write_win32k_registry_bytes(
+    len_off: u64,
+    data_off: u64,
+    value: &[u8],
+) -> bool {
+    if value.len() > u32::MAX as usize
+        || data_off
+            .checked_add(value.len() as u64)
+            .is_none_or(|end| end > WIN32K_REGISTRY_BYTES as u64)
+    {
+        return false;
+    }
+    write_volatile(
+        (WIN32K_REGISTRY_VADDR + len_off) as *mut u32,
+        value.len() as u32,
+    );
+    for (index, byte) in value.iter().copied().enumerate() {
+        write_volatile(
+            (WIN32K_REGISTRY_VADDR + data_off + index as u64) as *mut u8,
+            byte,
+        );
+    }
+    true
+}
+
 unsafe fn read_win32k_registry_ascii(len_off: u64, data_off: u64) -> Option<Vec<u8>> {
     let len = read_volatile((WIN32K_REGISTRY_VADDR + len_off) as *const u32) as usize;
     if len > WIN32K_REGISTRY_PATH_MAX {
@@ -12194,6 +12286,24 @@ unsafe fn read_win32k_registry_ascii(len_off: u64, data_off: u64) -> Option<Vec<
             return None;
         }
         value.push(byte);
+    }
+    Some(value)
+}
+
+unsafe fn read_win32k_registry_bytes(len_off: u64, data_off: u64) -> Option<Vec<u8>> {
+    let len = read_volatile((WIN32K_REGISTRY_VADDR + len_off) as *const u32) as usize;
+    if data_off
+        .checked_add(len as u64)
+        .is_none_or(|end| end > WIN32K_REGISTRY_BYTES as u64)
+    {
+        return None;
+    }
+    let mut value = Vec::new();
+    value.try_reserve_exact(len).ok()?;
+    for index in 0..len {
+        value.push(read_volatile(
+            (WIN32K_REGISTRY_VADDR + data_off + index as u64) as *const u8,
+        ));
     }
     Some(value)
 }
@@ -12345,6 +12455,186 @@ fn lookup_win32k_reg_service_query_target(handle: u64) -> Option<Win32kRegServic
         })
 }
 
+fn clone_win32k_system_reg_target(
+    handle: u64,
+) -> Result<
+    (
+        nt_config_client::SystemHiveKeyLease,
+        alloc::string::String,
+    ),
+    i32,
+> {
+    let handles = win32k_reg_handles().ok_or(STATUS_INVALID_HANDLE_I32)?;
+    let entry = handles
+        .iter()
+        .find(|entry| {
+            entry.handle == handle && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
+        })
+        .ok_or(STATUS_INVALID_HANDLE_I32)?;
+    let Win32kRegHandleTarget::SystemHive {
+        lease,
+        physical_path,
+    } = &entry.target
+    else {
+        return Err(STATUS_NOT_SUPPORTED_I32);
+    };
+    let mut path = alloc::string::String::new();
+    path.try_reserve_exact(physical_path.len())
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
+    path.push_str(physical_path);
+    Ok((*lease, path))
+}
+
+fn win32k_system_reg_target_matches(
+    handle: u64,
+    lease: nt_config_client::SystemHiveKeyLease,
+) -> bool {
+    win32k_reg_handles().is_some_and(|handles| {
+        handles.iter().any(|entry| {
+            entry.handle == handle
+                && matches!(
+                    &entry.target,
+                    Win32kRegHandleTarget::SystemHive {
+                        lease: live_lease,
+                        ..
+                    } if *live_lease == lease
+                )
+        })
+    })
+}
+
+unsafe fn service_win32k_registry_begin_set(
+    handle: u64,
+    value_type: u64,
+    total_len: u64,
+) -> Result<u64, i32> {
+    if value_type > u32::MAX as u64 || total_len > 0x8000_0000 {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    if (&*core::ptr::addr_of!(WIN32K_REG_SET_TRANSFER)).is_some() {
+        return Err(0x8000_0011u32 as i32); // STATUS_DEVICE_BUSY
+    }
+    let name = read_win32k_registry_bytes(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF)
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    let name = alloc::string::String::from_utf8(name).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
+    let (lease, physical_path) = clone_win32k_system_reg_target(handle)?;
+    crate::config_manager_query_leased_system_hive_key_information(lease)?;
+    let total_len = usize::try_from(total_len).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
+    let upload = nt_config_client::SystemHiveValueUpload::new(total_len)?;
+    let token = WIN32K_REG_SET_NEXT_TOKEN
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+            (next != u64::MAX).then_some(next + 1)
+        })
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES_I32)?;
+    *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER) = Some(Win32kRegSetTransfer {
+        token,
+        handle,
+        lease,
+        physical_path,
+        name,
+        value_type: value_type as u32,
+        upload,
+    });
+    Ok(token)
+}
+
+unsafe fn service_win32k_registry_append_set(
+    handle: u64,
+    token: u64,
+    transfer_position: u64,
+    staged_data_len: usize,
+) -> Result<(), i32> {
+    let total_len = (transfer_position >> 32) as u32 as usize;
+    let offset = transfer_position as u32 as usize;
+    let transfer = (&mut *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER))
+        .as_mut()
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    if transfer.handle != handle
+        || transfer.token != token
+        || transfer.upload.expected_len() != total_len
+        || transfer.upload.received_len() != offset
+        || staged_data_len == 0
+        || staged_data_len > WIN32K_REGISTRY_VALUE_CAP
+        || offset
+            .checked_add(staged_data_len)
+            .is_none_or(|end| end > total_len)
+        || !win32k_system_reg_target_matches(handle, transfer.lease)
+    {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let data = core::slice::from_raw_parts(
+        (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8,
+        staged_data_len,
+    );
+    transfer.upload.append(offset, data)
+}
+
+unsafe fn service_win32k_registry_abort_set(
+    handle: u64,
+    token: u64,
+    total_len: u64,
+) -> Result<(), i32> {
+    let transfer = (&*core::ptr::addr_of!(WIN32K_REG_SET_TRANSFER))
+        .as_ref()
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    if transfer.handle != handle
+        || transfer.token != token
+        || transfer.upload.expected_len() as u64 != total_len
+    {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER) = None;
+    Ok(())
+}
+
+unsafe fn service_win32k_registry_commit_set(
+    handle: u64,
+    token: u64,
+    total_len: u64,
+) -> Result<(), i32> {
+    let transfer = (&*core::ptr::addr_of!(WIN32K_REG_SET_TRANSFER))
+        .as_ref()
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    if transfer.handle != handle
+        || transfer.token != token
+        || transfer.upload.expected_len() as u64 != total_len
+        || transfer.upload.complete_data().is_err()
+        || !win32k_system_reg_target_matches(handle, transfer.lease)
+    {
+        return Err(STATUS_INVALID_PARAMETER_I32);
+    }
+    let transfer = (&mut *core::ptr::addr_of_mut!(WIN32K_REG_SET_TRANSFER))
+        .take()
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    let data = transfer.upload.complete_data()?;
+    crate::persist_and_publish_system_hive_mutation(&[
+        nt_config_client::SystemHiveMutation::SetValue {
+            path: &transfer.physical_path,
+            name: &transfer.name,
+            value_type: transfer.value_type,
+            data,
+        },
+    ])
+    .map(|_| ())
+    .map_err(|status| status as i32)
+}
+
+unsafe fn service_win32k_registry_delete_value(handle: u64) -> Result<(), i32> {
+    let name = read_win32k_registry_bytes(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF)
+        .ok_or(STATUS_INVALID_PARAMETER_I32)?;
+    let name = alloc::string::String::from_utf8(name).map_err(|_| STATUS_INVALID_PARAMETER_I32)?;
+    let (lease, physical_path) = clone_win32k_system_reg_target(handle)?;
+    crate::config_manager_query_leased_system_hive_key_information(lease)?;
+    crate::persist_and_publish_system_hive_mutation(&[
+        nt_config_client::SystemHiveMutation::DeleteValue {
+            path: &physical_path,
+            name: &name,
+        },
+    ])
+    .map(|_| ())
+    .map_err(|status| status as i32)
+}
+
 unsafe fn service_win32k_registry_open(root: u64, path: &[u8]) -> Result<u64, i32> {
     let target = if !win32k_reg_path_is_absolute(path) {
         let absolute = system_hive_relative_path_from_handle(root, path)?;
@@ -12393,6 +12683,8 @@ pub(crate) unsafe fn service_registry_request(
     param1: u64,
     param2: u64,
 ) -> (i32, u64, u64) {
+    let staged_data_len =
+        read_volatile((WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *const u32) as usize;
     write_volatile(
         (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_TYPE) as *mut u32,
         0,
@@ -12555,6 +12847,34 @@ pub(crate) unsafe fn service_registry_request(
             }
             (0, bytes.len() as u64, minimum_length as u64)
         }
+        WIN32K_REGISTRY_OP_BEGIN_SET_VALUE => {
+            match service_win32k_registry_begin_set(arg, param1, param2) {
+                Ok(token) => (0, token, 0),
+                Err(status) => (status, 0, 0),
+            }
+        }
+        WIN32K_REGISTRY_OP_APPEND_SET_VALUE => {
+            match service_win32k_registry_append_set(arg, param1, param2, staged_data_len) {
+                Ok(()) => (0, 0, 0),
+                Err(status) => (status, 0, 0),
+            }
+        }
+        WIN32K_REGISTRY_OP_COMMIT_SET_VALUE => {
+            match service_win32k_registry_commit_set(arg, param1, param2) {
+                Ok(()) => (0, 0, 0),
+                Err(status) => (status, 0, 0),
+            }
+        }
+        WIN32K_REGISTRY_OP_ABORT_SET_VALUE => {
+            match service_win32k_registry_abort_set(arg, param1, param2) {
+                Ok(()) => (0, 0, 0),
+                Err(status) => (status, 0, 0),
+            }
+        }
+        WIN32K_REGISTRY_OP_DELETE_VALUE => match service_win32k_registry_delete_value(arg) {
+            Ok(()) => (0, 0, 0),
+            Err(status) => (status, 0, 0),
+        },
         _ => (STATUS_INVALID_PARAMETER_I32, 0, 0),
     }
 }
@@ -12584,6 +12904,119 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_
         write_unaligned(handle_out, hkey);
     }
     0
+}
+
+/// `NTSTATUS ZwSetValueKey(HANDLE, PUNICODE_STRING, ULONG, ULONG, PVOID, ULONG)`.
+/// The value name is captured before any mutation begins; value bytes then cross the pointer-free
+/// registry window in order and become visible only after CM has durably published one generation.
+extern "win64" fn s_zw_set_value_key(
+    hkey: u64,
+    value_name: u64,
+    _title_index: u64,
+    value_type: u64,
+    data: u64,
+    data_size: u64,
+) -> i32 {
+    if value_type > u32::MAX as u64 || data_size > 0x8000_0000 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    if data_size != 0 && data == 0 {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    unsafe {
+        let name = match read_unicode_string_utf8(value_name, true) {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
+        if !write_win32k_registry_bytes(
+            WIN32K_REGISTRY_VALUE_LEN,
+            WIN32K_REGISTRY_VALUE_OFF,
+            &name,
+        ) {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let (status, token, _) = win32k_registry_broker_call_with_params(
+            WIN32K_REGISTRY_OP_BEGIN_SET_VALUE,
+            hkey,
+            value_type,
+            data_size,
+        );
+        if status != 0 {
+            return status;
+        }
+        if token == 0 {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+
+        let mut offset = 0u64;
+        while offset < data_size {
+            let chunk_len = core::cmp::min(
+                data_size - offset,
+                WIN32K_REGISTRY_VALUE_CAP as u64,
+            ) as usize;
+            write_volatile(
+                (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *mut u32,
+                chunk_len as u32,
+            );
+            for index in 0..chunk_len {
+                write_volatile(
+                    (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF + index as u64) as *mut u8,
+                    read_volatile((data + offset + index as u64) as *const u8),
+                );
+            }
+            let transfer_position = (data_size << 32) | offset;
+            let (status, _, _) = win32k_registry_broker_call_with_params(
+                WIN32K_REGISTRY_OP_APPEND_SET_VALUE,
+                hkey,
+                token,
+                transfer_position,
+            );
+            if status != 0 {
+                let _ = win32k_registry_broker_call_with_params(
+                    WIN32K_REGISTRY_OP_ABORT_SET_VALUE,
+                    hkey,
+                    token,
+                    data_size,
+                );
+                return status;
+            }
+            offset += chunk_len as u64;
+        }
+        let (status, _, _) = win32k_registry_broker_call_with_params(
+            WIN32K_REGISTRY_OP_COMMIT_SET_VALUE,
+            hkey,
+            token,
+            data_size,
+        );
+        if status != 0 {
+            let _ = win32k_registry_broker_call_with_params(
+                WIN32K_REGISTRY_OP_ABORT_SET_VALUE,
+                hkey,
+                token,
+                data_size,
+            );
+        }
+        status
+    }
+}
+
+/// `NTSTATUS ZwDeleteValueKey(HANDLE, PUNICODE_STRING)` against the exact leased SYSTEM key.
+extern "win64" fn s_zw_delete_value_key(hkey: u64, value_name: u64) -> i32 {
+    unsafe {
+        let name = match read_unicode_string_utf8(value_name, false) {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
+        if !write_win32k_registry_bytes(
+            WIN32K_REGISTRY_VALUE_LEN,
+            WIN32K_REGISTRY_VALUE_OFF,
+            &name,
+        ) {
+            return STATUS_INVALID_PARAMETER_I32;
+        }
+        let (status, _, _) = win32k_registry_broker_call(WIN32K_REGISTRY_OP_DELETE_VALUE, hkey);
+        status
+    }
 }
 
 unsafe fn copy_registry_information(
@@ -13867,6 +14300,14 @@ fn register_trampolines() -> bool {
     reg.bind("NtOpenFile", s_zw_open_file_fail as usize as u64);
     reg.bind("ZwOpenKey", s_zw_open_key as usize as u64);
     reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
+    reg.bind(
+        "ZwSetValueKey",
+        s_zw_set_value_key as *const () as usize as u64,
+    );
+    reg.bind(
+        "ZwDeleteValueKey",
+        s_zw_delete_value_key as *const () as usize as u64,
+    );
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("ZwQueryKey", s_zw_query_key as usize as u64);

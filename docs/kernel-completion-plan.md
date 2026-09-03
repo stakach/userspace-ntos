@@ -24759,6 +24759,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     current global registry staging window must become request/lane-private before multi-lane
     registry dispatch can be enabled.
 
+    B3 durable kernel registry value mutation tranche 15 (2026-09-04, host and freestanding
+    green): win32k's `ZwSetValueKey` and `ZwDeleteValueKey` imports now mutate the exact physical
+    SYSTEM key retained by the provider's CM lease. Set captures and canonicalizes the counted
+    UTF-16 name, strips only trailing UTF-16 NULs, accepts a null data pointer only for a zero-byte
+    value, and streams exact bytes through the pointer-free registry window. The executive owns a
+    strictly ordered upload token, revalidates the opaque handle and lease on every chunk, and does
+    not expose partial data. Commit and delete both use
+    `persist_and_publish_system_hive_mutation`, so CM validates against the live generation, the
+    writable hive journal is appended and flushed before semantic publication, and every failure
+    aborts without a visible mutation. Closing the handle cancels its incomplete upload.
+
+    `SystemHiveValueUpload` is host-tested in `nt-config-client` for out-of-order, empty-chunk,
+    overflow, incomplete, complete, and zero-length behavior. All 22 `nt-config-client` tests and
+    all 46 `nt-compat-exports` tests pass; the freestanding executive release build succeeds at the
+    prior 254-warning baseline. Thirty-six audited code imports remain.
+
+    Review adjustment: this remains deliberately partial rather than claiming all NT registry
+    namespaces. Dynamic `HARDWARE\DEVICEMAP\VIDEO` is not a CM SYSTEM lease and rejects mutation;
+    CM currently bounds value names to 512 UTF-16 units and models the defined registry value-type
+    set rather than retaining every opaque ULONG. Lift those limits in the CM/hive owner, not in a
+    win32k side store. The one outstanding upload and shared staging window also remain serialized;
+    make them lane/request-owned before enabling multiple registry lanes. Implement `ZwCreateKey`
+    next with final-child-only creation, exact disposition, relative-root physical identity, and
+    the same durable transaction, then converge and delete the hosted-driver path-only mutation
+    machinery.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
