@@ -4308,7 +4308,7 @@ unsafe fn provider_wait_rendezvous(
         return 0xC000_000Du32 as i32;
     };
     trace_provider_wait_component(
-        b"admit",
+        b"submit",
         wait_id,
         (u64::from(owner.client_pi) << 32) | owner.client_tid,
         objects.len() as u64,

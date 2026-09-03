@@ -9,6 +9,23 @@ use crate::{
 
 pub const STATUS_WAIT_0: i32 = 0;
 pub const STATUS_TIMEOUT: i32 = 0x0000_0102;
+pub const STATUS_ALERTED: i32 = 0x0000_0101;
+pub const STATUS_USER_APC: i32 = 0x0000_00C0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderWaitInterrupt {
+    Alerted,
+    UserApc,
+}
+
+impl ProviderWaitInterrupt {
+    const fn status(self) -> i32 {
+        match self {
+            Self::Alerted => STATUS_ALERTED,
+            Self::UserApc => STATUS_USER_APC,
+        }
+    }
+}
 
 /// Executive operations required by the typed dispatcher-object provider-wait arbiter.
 ///
@@ -34,7 +51,6 @@ pub trait ProviderDispatcherWaitBackend {
 pub enum ProviderDispatcherWaitError<E> {
     InvalidRequest(ProviderWaitAbiError),
     OwnerMismatch,
-    UnsupportedAlertableWait,
     UnsupportedObjectType,
     InvalidAdmissionSequence,
     DuplicateWait,
@@ -63,6 +79,8 @@ struct ProviderDispatcherWaitRecord<L> {
     owner: ProviderWaitOwner,
     admission_sequence: u64,
     wait_type: ProviderWaitType,
+    wait_mode: crate::ProviderWaitMode,
+    alertable: bool,
     objects: Vec<ProviderWaitObject>,
     leases: Vec<L>,
     deadline: Deadline,
@@ -121,9 +139,6 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             .map_err(ProviderDispatcherWaitError::InvalidRequest)?;
         if request.owner != expected_owner {
             return Err(ProviderDispatcherWaitError::OwnerMismatch);
-        }
-        if request.alertable {
-            return Err(ProviderDispatcherWaitError::UnsupportedAlertableWait);
         }
         if request.objects.iter().any(|object| {
             !matches!(
@@ -197,6 +212,8 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             owner: request.owner,
             admission_sequence,
             wait_type: request.wait_type,
+            wait_mode: request.wait_mode,
+            alertable: request.alertable,
             objects,
             leases,
             deadline,
@@ -294,6 +311,32 @@ impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
             .iter()
             .position(|waiter| waiter.wait_id == wait_id)?;
         Some(self.remove(backend, slot, status, true))
+    }
+
+    /// Interrupt one exact alertable provider wait without weakening its dispatcher ownership.
+    ///
+    /// NT alerts may interrupt either wait mode. A user APC may terminate only an alertable
+    /// `UserMode` wait; kernel-mode waits remain parked while user APCs are pending. The caller
+    /// must supply the complete generation-owned dispatch tuple so a recycled wait ID cannot be
+    /// interrupted by an obsolete producer.
+    pub fn interrupt_alertable<B>(
+        &mut self,
+        backend: &mut B,
+        wait_id: u64,
+        owner: ProviderWaitOwner,
+        interrupt: ProviderWaitInterrupt,
+    ) -> Option<ProviderDispatcherWaitCompletion>
+    where
+        B: ProviderDispatcherWaitBackend<Lease = L>,
+    {
+        let slot = self.waiters.iter().position(|waiter| {
+            waiter.wait_id == wait_id
+                && waiter.owner == owner
+                && waiter.alertable
+                && (interrupt != ProviderWaitInterrupt::UserApc
+                    || waiter.wait_mode == crate::ProviderWaitMode::User)
+        })?;
+        Some(self.remove(backend, slot, interrupt.status(), false))
     }
 
     fn remove<B>(
@@ -661,12 +704,6 @@ mod tests {
             arbiter.admit(&mut backend, &base, owner(99), 5, now(0, 0)),
             Err(ProviderDispatcherWaitError::OwnerMismatch)
         );
-        let mut invalid = base;
-        invalid.header.alertable = 1;
-        assert_eq!(
-            arbiter.admit(&mut backend, &invalid, identity, 5, now(0, 0)),
-            Err(ProviderDispatcherWaitError::UnsupportedAlertableWait)
-        );
         let semaphore = ProviderWaitObject::new(ProviderWaitObjectType::Semaphore, 1, 1);
         let unsupported = request(
             identity,
@@ -711,6 +748,91 @@ mod tests {
             .unwrap();
         assert!(completion.cancelled);
         assert_eq!(arbiter.lease_count(), 0);
+        assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
+    fn alertable_kernel_wait_ignores_user_apc_but_accepts_alert() {
+        let identity = owner(16);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let mut wait = request(
+            identity,
+            25,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1)],
+        );
+        wait.header.alertable = 1;
+
+        assert_eq!(
+            arbiter.admit(&mut backend, &wait, identity, 16, now(0, 0)),
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 25 })
+        );
+        assert!(arbiter
+            .interrupt_alertable(
+                &mut backend,
+                25,
+                identity,
+                ProviderWaitInterrupt::UserApc,
+            )
+            .is_none());
+        assert_eq!(backend.lease_count(), 1);
+
+        let completion = arbiter
+            .interrupt_alertable(
+                &mut backend,
+                25,
+                identity,
+                ProviderWaitInterrupt::Alerted,
+            )
+            .unwrap();
+        assert_eq!(completion.status, STATUS_ALERTED);
+        assert!(!completion.cancelled);
+        assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
+    fn alertable_user_wait_accepts_only_exact_owner_user_apc() {
+        let identity = owner(17);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+        let mut wait = request(
+            identity,
+            26,
+            ProviderWaitType::Any,
+            ProviderWaitTimeoutKind::Infinite,
+            0,
+            &[event(1)],
+        );
+        wait.header.wait_mode = crate::ProviderWaitMode::User as u32;
+        wait.header.alertable = 1;
+
+        assert_eq!(
+            arbiter.admit(&mut backend, &wait, identity, 17, now(0, 0)),
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 26 })
+        );
+        assert!(arbiter
+            .interrupt_alertable(
+                &mut backend,
+                26,
+                owner(identity.dispatch_id + 1),
+                ProviderWaitInterrupt::UserApc,
+            )
+            .is_none());
+        let completion = arbiter
+            .interrupt_alertable(
+                &mut backend,
+                26,
+                identity,
+                ProviderWaitInterrupt::UserApc,
+            )
+            .unwrap();
+        assert_eq!(completion.status, STATUS_USER_APC);
+        assert!(!completion.cancelled);
         assert_eq!(backend.lease_count(), 0);
     }
 

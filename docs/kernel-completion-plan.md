@@ -24355,6 +24355,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `KeWaitForMultipleObjects` park and Timer wake, followed by DPC delivery and deferred-retirement
     acknowledgement.
 
+    B3 alertable provider-wait checkpoint (2026-09-03, host, freestanding, and raw-input runtime
+    green; nested desktop initialization under diagnosis): the raw-input gate revealed that the
+    typed arbiter still rejected every alertable request even though ReactOS correctly calls
+    `KeWaitForMultipleObjects(..., KernelMode, TRUE, NULL, ...)`. The obsolete rejection is removed.
+    Each parked record now retains its exact wait mode and alertable state, and a typed interruption
+    boundary enforces NT semantics: an alert may interrupt either alertable wait mode, while a user
+    APC may interrupt only an alertable `UserMode` wait. Exact wait ID and full generation-owned
+    dispatch ownership are required, and interruption releases every dispatcher lease. Two focused
+    regressions bring `nt-provider-wait` to 58 passing tests; the freestanding executive remains at
+    227 warnings.
+
+    The serialized run now proves the raw-input system lane parks on the real shutdown Event plus
+    `MasterTimer`, wakes from the executive Timer source, runs `ProcessTimers`, rearms the same
+    canonical Timer, and submits its next wait. This closes the prior tight invalid-parameter loop.
+    Concurrent initialization then exposes a later nested provider-wait failure: the outer
+    winlogon `NtUserCreateWindowStation` call receives `STATUS_INVALID_PARAMETER`, and the invalid
+    value is subsequently used as its station handle. Bounded executive admission telemetry now
+    records park, immediate readiness, timeout, and exact rejection class for both fresh and rearmed
+    waits. Resolve that ownership/continuation failure before Timer DPC and retirement work so the
+    genuine desktop baseline remains intact.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

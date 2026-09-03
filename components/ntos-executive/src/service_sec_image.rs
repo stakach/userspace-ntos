@@ -330,6 +330,7 @@ static PROVIDER_WAIT_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_DISPATCHER_LEASES_ACQUIRED: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_DISPATCHER_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_ADMISSION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_NESTED_DRAINS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_CRASH_PARKED_MASK: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RUNNABLE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -1375,6 +1376,43 @@ fn provider_wait_status_for_error<E>(error: nt_provider_wait::ProviderDispatcher
     }
 }
 
+fn provider_wait_error_detail(
+    error: nt_provider_wait::ProviderDispatcherWaitError<u32>,
+) -> u64 {
+    match error {
+        nt_provider_wait::ProviderDispatcherWaitError::InvalidRequest(error) => {
+            0x100 | error as u64
+        }
+        nt_provider_wait::ProviderDispatcherWaitError::OwnerMismatch => 2,
+        nt_provider_wait::ProviderDispatcherWaitError::UnsupportedObjectType => 3,
+        nt_provider_wait::ProviderDispatcherWaitError::InvalidAdmissionSequence => 4,
+        nt_provider_wait::ProviderDispatcherWaitError::DuplicateWait => 5,
+        nt_provider_wait::ProviderDispatcherWaitError::NoCapacity => 6,
+        nt_provider_wait::ProviderDispatcherWaitError::Backend(status) => {
+            0x1_0000_0000 | u64::from(status)
+        }
+    }
+}
+
+fn trace_provider_wait_admission(stage: &[u8], wait_id: u64, status: i32, detail: u64) {
+    let n = PROVIDER_WAIT_ADMISSION_TRACE_N.fetch_add(1, Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    print_str(b"[provider-wait-admit] #");
+    print_u64(n + 1);
+    print_str(b" stage=");
+    print_str(stage);
+    print_str(b" wait=");
+    print_u64(wait_id);
+    print_str(b" status=0x");
+    print_hex(status as u32);
+    print_str(b" detail=0x");
+    print_hex((detail >> 32) as u32);
+    print_hex(detail as u32);
+    print_str(b"\n");
+}
+
 fn provider_wait_expected_owner(
     pending: win32k_glue::PendingProviderWaitDispatch,
 ) -> Option<nt_provider_wait::ProviderWaitOwner> {
@@ -1828,12 +1866,24 @@ unsafe fn component_suspension_resume_top(
                         match admission {
                             Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
                                 PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+                                trace_provider_wait_admission(
+                                    b"repark",
+                                    next.request.header.wait_id,
+                                    0x0000_0103,
+                                    next.request.header.object_count as u64,
+                                );
                                 return Some(ComponentSuspensionRuntimeOutcome::Parked);
                             }
                             Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied {
                                 wait_id,
                                 status,
                             }) => {
+                                trace_provider_wait_admission(
+                                    b"ready-rearm",
+                                    wait_id,
+                                    status,
+                                    next.request.header.object_count as u64,
+                                );
                                 let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                                     .select(
                                         provider_wait_key(wait_id),
@@ -1843,6 +1893,12 @@ unsafe fn component_suspension_resume_top(
                             Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut {
                                 wait_id,
                             }) => {
+                                trace_provider_wait_admission(
+                                    b"timeout-rearm",
+                                    wait_id,
+                                    nt_provider_wait::STATUS_TIMEOUT,
+                                    next.request.header.object_count as u64,
+                                );
                                 let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                                     .select(
                                         provider_wait_key(wait_id),
@@ -1852,12 +1908,17 @@ unsafe fn component_suspension_resume_top(
                                     );
                             }
                             Err(error) => {
+                                let status = provider_wait_status_for_error(error);
+                                trace_provider_wait_admission(
+                                    b"reject-rearm",
+                                    next.request.header.wait_id,
+                                    status,
+                                    provider_wait_error_detail(error),
+                                );
                                 let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                                     .cancel(
                                         next_key,
-                                        ComponentSuspensionCompletion::provider(
-                                            provider_wait_status_for_error(error),
-                                        ),
+                                        ComponentSuspensionCompletion::provider(status),
                                     );
                             }
                         }
@@ -2005,8 +2066,20 @@ unsafe fn provider_wait_admit_current(
     ) {
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
             PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+            trace_provider_wait_admission(
+                b"park",
+                wait_id,
+                0x0000_0103,
+                pending.request.header.object_count as u64,
+            );
         }
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied { wait_id, status }) => {
+            trace_provider_wait_admission(
+                b"ready",
+                wait_id,
+                status,
+                pending.request.header.object_count as u64,
+            );
             if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .select(
                     provider_wait_key(wait_id),
@@ -2018,6 +2091,12 @@ unsafe fn provider_wait_admit_current(
             }
         }
         Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut { wait_id }) => {
+            trace_provider_wait_admission(
+                b"timeout",
+                wait_id,
+                nt_provider_wait::STATUS_TIMEOUT,
+                pending.request.header.object_count as u64,
+            );
             if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .select(
                     provider_wait_key(wait_id),
@@ -2029,10 +2108,17 @@ unsafe fn provider_wait_admit_current(
             }
         }
         Err(error) => {
+            let status = provider_wait_status_for_error(error);
+            trace_provider_wait_admission(
+                b"reject",
+                wait_id,
+                status,
+                provider_wait_error_detail(error),
+            );
             if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .cancel(
                     provider_wait_key(wait_id),
-                    ComponentSuspensionCompletion::provider(provider_wait_status_for_error(error)),
+                    ComponentSuspensionCompletion::provider(status),
                 )
                 .is_err()
             {
