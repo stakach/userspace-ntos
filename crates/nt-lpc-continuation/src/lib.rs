@@ -324,6 +324,118 @@ pub struct PendingRequestWait<C> {
     pub continuation: C,
 }
 
+/// Exact broker-side identity of a synchronous LPC request awaiting its reply.
+///
+/// Unlike [`RequestWaitRequest`], this identity deliberately contains no native output address.
+/// It is suitable for readiness polling when ownership of the suspended native continuation is
+/// held by another subsystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrokerRequestIdentity {
+    pub port_handle: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub message_id: u32,
+}
+
+impl BrokerRequestIdentity {
+    pub const fn is_valid(self) -> bool {
+        self.port_handle != 0
+            && self.client_process != 0
+            && self.client_thread != 0
+            && self.message_id != 0
+    }
+}
+
+/// One broker request identity plus the continuation key owned by its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingBrokerRequest<C> {
+    pub identity: BrokerRequestIdentity,
+    pub continuation: C,
+}
+
+/// Growable, generation-exact readiness table for synchronous broker requests.
+///
+/// This table owns only broker polling identity. It does not own a native reply buffer or the
+/// physical suspended continuation. Allocation happens in [`Self::reserve`], before the broker
+/// request is started; publishing and taking a request cannot allocate.
+pub struct BrokerRequestWaitTable<C> {
+    inner: GenerationTable<PendingBrokerRequest<C>>,
+}
+
+impl<C> Default for BrokerRequestWaitTable<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> BrokerRequestWaitTable<C> {
+    pub const fn new() -> Self {
+        Self::with_initial_reserve(DEFAULT_INITIAL_RESERVE)
+    }
+
+    pub const fn with_initial_reserve(initial_reserve: usize) -> Self {
+        Self {
+            inner: GenerationTable::with_initial_reserve(initial_reserve),
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), TableError> {
+        self.inner.reset()
+    }
+
+    pub fn reserve(&mut self) -> Result<Reservation, TableError> {
+        self.inner.reserve()
+    }
+
+    pub fn cancel(&mut self, reservation: Reservation) -> Result<(), TableError> {
+        self.inner.cancel(reservation)
+    }
+
+    pub fn publish(
+        &mut self,
+        reservation: Reservation,
+        value: PendingBrokerRequest<C>,
+    ) -> Result<usize, TableError> {
+        if !value.identity.is_valid()
+            || self.inner.occupied_slots().any(|slot| {
+                self.inner
+                    .get(slot)
+                    .is_some_and(|wait| wait.identity == value.identity)
+            })
+        {
+            return Err(TableError::InvalidRequest);
+        }
+        self.inner.publish(reservation, value)
+    }
+
+    pub fn get(&self, slot: usize) -> Option<&PendingBrokerRequest<C>> {
+        self.inner.get(slot)
+    }
+
+    pub fn next_occupied_after(
+        &self,
+        generation: u64,
+    ) -> Option<(usize, u64, &PendingBrokerRequest<C>)> {
+        self.inner.next_occupied_after(generation)
+    }
+
+    pub fn take(&mut self, slot: usize) -> Option<PendingBrokerRequest<C>> {
+        self.inner.take(slot)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.inner.slot_count()
+    }
+
+    pub fn allocation_capacity(&self) -> usize {
+        self.inner.allocation_capacity()
+    }
+}
+
 /// Growable, generation-exact ownership table for synchronous LPC request waiters.
 pub struct RequestWaitTable<C> {
     inner: GenerationTable<PendingRequestWait<C>>,
@@ -673,6 +785,101 @@ mod tests {
             },
             continuation: token,
         }
+    }
+
+    fn broker_request(message_id: u32, token: u64) -> PendingBrokerRequest<u64> {
+        PendingBrokerRequest {
+            identity: BrokerRequestIdentity {
+                port_handle: 0x9000,
+                client_process: 4,
+                client_thread: 8 + token,
+                message_id,
+            },
+            continuation: token,
+        }
+    }
+
+    #[test]
+    fn broker_request_rejects_invalid_identity_without_consuming_reservation() {
+        let mut table = BrokerRequestWaitTable::new();
+        let reservation = table.reserve().unwrap();
+        let mut invalid = broker_request(7, 1);
+        invalid.identity.client_process = 0;
+        assert_eq!(
+            table.publish(reservation, invalid),
+            Err(TableError::InvalidRequest)
+        );
+        table.cancel(reservation).unwrap();
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn broker_request_reservation_is_generation_exact() {
+        let mut table = BrokerRequestWaitTable::with_initial_reserve(1);
+        table.reset().unwrap();
+        let stale = table.reserve().unwrap();
+        table.cancel(stale).unwrap();
+        let current = table.reserve().unwrap();
+        assert_ne!(stale, current);
+        assert_eq!(
+            table.publish(stale, broker_request(7, 1)),
+            Err(TableError::StaleReservation)
+        );
+        assert_eq!(table.publish(current, broker_request(8, 2)), Ok(0));
+        assert_eq!(table.get(0).unwrap().continuation, 2);
+        assert_eq!(table.take(0).unwrap().identity.message_id, 8);
+    }
+
+    #[test]
+    fn broker_request_fifo_order_survives_slot_reuse() {
+        let mut table = BrokerRequestWaitTable::with_initial_reserve(2);
+        table.reset().unwrap();
+        for (message_id, token) in [(7, 1), (8, 2), (9, 3)] {
+            let reservation = table.reserve().unwrap();
+            table
+                .publish(reservation, broker_request(message_id, token))
+                .unwrap();
+        }
+        assert_eq!(table.take(0).unwrap().continuation, 1);
+        let reused = table.reserve().unwrap();
+        table.publish(reused, broker_request(10, 4)).unwrap();
+
+        let mut generation = 0;
+        let mut tokens = alloc::vec::Vec::new();
+        while let Some((_, current, wait)) = table.next_occupied_after(generation) {
+            generation = current;
+            tokens.push(wait.continuation);
+        }
+        assert_eq!(tokens, [2, 3, 4]);
+        assert_eq!(table.slot_count(), 3);
+        assert!(table.allocation_capacity() >= 3);
+    }
+
+    #[test]
+    fn broker_request_rejects_duplicate_exact_identity() {
+        let mut table = BrokerRequestWaitTable::new();
+        let first = table.reserve().unwrap();
+        let first_wait = broker_request(7, 1);
+        table.publish(first, first_wait).unwrap();
+
+        let duplicate = table.reserve().unwrap();
+        assert_eq!(
+            table.publish(
+                duplicate,
+                PendingBrokerRequest {
+                    identity: first_wait.identity,
+                    continuation: 99,
+                },
+            ),
+            Err(TableError::InvalidRequest)
+        );
+        table.cancel(duplicate).unwrap();
+
+        let distinct = table.reserve().unwrap();
+        let mut distinct_wait = first_wait;
+        distinct_wait.identity.message_id = 8;
+        distinct_wait.continuation = 2;
+        assert_eq!(table.publish(distinct, distinct_wait), Ok(1));
     }
 
     #[test]

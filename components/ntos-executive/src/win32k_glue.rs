@@ -57,6 +57,7 @@ static USER_CALLBACK_DEAD_CLIENT_UNWINDS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_DEAD_CLIENT_UNWIND_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
+static LPC_WAIT_LAST_PUMP_SUSPENDED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CANCEL_CHAINED: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_WM_PAINT_RETURNS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_LAST_REAL_WM_PAINT_HWND: AtomicU64 = AtomicU64::new(0);
@@ -386,9 +387,30 @@ pub(crate) struct PendingProviderWaitDispatch {
 
 static mut PROVIDER_WAIT_PENDING_DISPATCH: Option<PendingProviderWaitDispatch> = None;
 
+#[derive(Clone, Copy)]
+pub(crate) struct PendingLpcWaitDispatch {
+    pub request: win32k_subsystem::Win32kLpcWaitRequest,
+    pub dispatch: nt_user_callback::DispatchContext,
+    pub client: Win32kClientContext,
+    pub nested_user_callback: bool,
+    pub arg_snapshot_len: u32,
+    pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+}
+
+static mut LPC_WAIT_PENDING_DISPATCH: Option<PendingLpcWaitDispatch> = None;
+
 pub(crate) enum ProviderWaitPumpCompletion {
     Completed(CompletedWin32kDispatch),
     Reparked(PendingProviderWaitDispatch),
+    LpcReparked(PendingLpcWaitDispatch),
+    UserCallbackSuspended,
+    Failed(i32),
+}
+
+pub(crate) enum LpcWaitPumpCompletion {
+    Completed(CompletedWin32kDispatch),
+    ProviderReparked(PendingProviderWaitDispatch),
+    Reparked(PendingLpcWaitDispatch),
     UserCallbackSuspended,
     Failed(i32),
 }
@@ -1174,6 +1196,45 @@ pub(crate) unsafe fn take_pending_provider_wait_dispatch() -> Option<PendingProv
         core::ptr::addr_of_mut!(PROVIDER_WAIT_PENDING_DISPATCH),
         None,
     )
+}
+
+pub(crate) unsafe fn take_pending_lpc_wait_dispatch() -> Option<PendingLpcWaitDispatch> {
+    if LPC_WAIT_LAST_PUMP_SUSPENDED.swap(0, Ordering::AcqRel) == 0 {
+        return None;
+    }
+    core::ptr::replace(core::ptr::addr_of_mut!(LPC_WAIT_PENDING_DISPATCH), None)
+}
+
+unsafe fn capture_provider_wait_repark(
+    prior: PendingProviderWaitDispatch,
+) -> PendingProviderWaitDispatch {
+    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+        as *const nt_provider_wait::ProviderWaitSharedPage;
+    PendingProviderWaitDispatch {
+        request: core::ptr::read_volatile(core::ptr::addr_of!((*page).request)),
+        dispatch: prior.dispatch,
+        client: prior.client,
+        nested_user_callback: prior.nested_user_callback,
+        arg_snapshot_len: prior.arg_snapshot_len,
+        arg_snapshot: prior.arg_snapshot,
+    }
+}
+
+unsafe fn capture_lpc_wait_repark(
+    dispatch: nt_user_callback::DispatchContext,
+    client: Win32kClientContext,
+    nested_user_callback: bool,
+    arg_snapshot_len: u32,
+    arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
+) -> Option<PendingLpcWaitDispatch> {
+    Some(PendingLpcWaitDispatch {
+        request: win32k_subsystem::capture_lpc_wait_request()?,
+        dispatch,
+        client,
+        nested_user_callback,
+        arg_snapshot_len,
+        arg_snapshot,
+    })
 }
 
 pub(crate) fn real_wm_paint_callback_returns() -> u64 {
@@ -2572,7 +2633,11 @@ unsafe fn redirect_pending_user_callback(
 pub(crate) static WIN32K_RETIRED: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
-    if pr.completed || pr.callback_suspended || pr.provider_wait_suspended {
+    if pr.completed
+        || pr.callback_suspended
+        || pr.provider_wait_suspended
+        || pr.lpc_wait_suspended
+    {
         return;
     }
     if WIN32K_RETIRED.swap(1, Ordering::Relaxed) == 0 {
@@ -2648,6 +2713,7 @@ unsafe fn resume_suspended_user_callback_component(
             completed: false,
             callback_suspended: false,
             provider_wait_suspended: false,
+            lpc_wait_suspended: false,
             scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
@@ -2704,6 +2770,7 @@ unsafe fn resume_suspended_user_callback_component(
             completed: false,
             callback_suspended: false,
             provider_wait_suspended: false,
+            lpc_wait_suspended: false,
             scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
@@ -2852,8 +2919,17 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     retire_win32k_on_wall(&pump);
 
     if pump.provider_wait_suspended {
-        return take_pending_provider_wait_dispatch()
-            .map(ProviderWaitPumpCompletion::Reparked)
+        return ProviderWaitPumpCompletion::Reparked(capture_provider_wait_repark(pending));
+    }
+    if pump.lpc_wait_suspended {
+        return capture_lpc_wait_repark(
+            pending.dispatch,
+            pending.client,
+            pending.nested_user_callback,
+            pending.arg_snapshot_len,
+            pending.arg_snapshot,
+        )
+            .map(ProviderWaitPumpCompletion::LpcReparked)
             .unwrap_or(ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32));
     }
     if pump.callback_suspended {
@@ -2909,6 +2985,212 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         release_dispatch_output_stage(pending.dispatch);
     }
     ProviderWaitPumpCompletion::Completed(completed)
+}
+
+pub(crate) unsafe fn resume_suspended_lpc_wait_component(
+    pending: PendingLpcWaitDispatch,
+    message_id: u32,
+    status: i32,
+    reply: &[u8],
+) -> LpcWaitPumpCompletion {
+    if !pending.request.validate()
+        || pending.request.port_handle == 0
+        || pending.request.client_process != pending.client.pid
+        || pending.request.client_thread != pending.client.tid
+        || pending.dispatch.dispatch_id == 0
+        || reply.len() > nt_lpc_abi::PORT_MESSAGE_MAX_LEN
+        || (status == 0
+            && (reply.len() < nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
+                || nt_lpc_abi::port_message_total_length(reply[..4].try_into().unwrap())
+                    != Some(reply.len())
+                || u16::from_le_bytes(reply[4..6].try_into().unwrap())
+                    != nt_lpc_abi::msg_type::LPC_REPLY))
+    {
+        release_dispatch_output_stage(pending.dispatch);
+        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
+
+    let lpc = win32k_subsystem::WIN32K_LPC_VADDR;
+    core::ptr::write_volatile(
+        (lpc + win32k_subsystem::LPC_WAIT_MESSAGE_ID) as *mut u32,
+        message_id,
+    );
+    core::ptr::write_volatile(
+        (lpc + win32k_subsystem::LPC_SERVICE_MESSAGE) as *mut u8,
+        0,
+    );
+    if !reply.is_empty() {
+        core::ptr::copy_nonoverlapping(
+            reply.as_ptr(),
+            (lpc + win32k_subsystem::LPC_SERVICE_MESSAGE) as *mut u8,
+            reply.len(),
+        );
+    }
+    core::ptr::write_volatile(
+        (lpc + win32k_subsystem::LPC_SERVICE_MESSAGE_LEN) as *mut u32,
+        reply.len() as u32,
+    );
+    core::ptr::write_volatile(
+        (lpc + win32k_subsystem::LPC_SERVICE_STATUS) as *mut i32,
+        status,
+    );
+    // The generation is the commit marker. Publish it only after the complete bounded result is
+    // visible so the component cannot accept stale metadata or a partially copied LPC reply.
+    core::sync::atomic::compiler_fence(Ordering::Release);
+    core::ptr::write_volatile(
+        (lpc + win32k_subsystem::LPC_WAIT_RESULT_GENERATION) as *mut u64,
+        pending.request.generation,
+    );
+
+    let client = pending.client;
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    for (offset, value) in [
+        (win32k_subsystem::SH_REQ_PROCESS_ID, client.pid),
+        (win32k_subsystem::SH_REQ_CLIENT_PI, client.pi as u64),
+        (win32k_subsystem::SH_REQ_GENERATION, client.generation),
+        (win32k_subsystem::SH_REQ_CLIENT_TEB, client.teb),
+        (win32k_subsystem::SH_REQ_THREAD_ID, client.tid),
+        (win32k_subsystem::SH_REQ_EPROCESS, client.eprocess),
+        (win32k_subsystem::SH_REQ_ETHREAD, client.ethread),
+        (
+            win32k_subsystem::SH_REQ_PROCESS_ROLE,
+            callback_process_role_code(client.process_role) as u64,
+        ),
+    ] {
+        core::ptr::write_volatile((sh + offset) as *mut u64, value);
+    }
+    if !win32k_subsystem::restore_current_context_for_user_callback_resume(
+        client.pi,
+        client.pid,
+        client.tid,
+        client.teb,
+        client.eprocess,
+        client.ethread,
+        callback_process_role_code(client.process_role) as u64,
+    ) {
+        release_dispatch_output_stage(pending.dispatch);
+        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
+    let channel = crate::spawn_hosts::PumpChannel {
+        fault_ep: WIN32K_FAULT_EP.load(Ordering::Relaxed),
+        pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
+        code_va: win32k_subsystem::WIN32K_CODE_VA,
+        image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
+        root_image_rights: 3,
+        root_image_map_owner: crate::WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Relaxed) as u16,
+        shared_va: sh,
+        dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
+        demand_cap: 8192,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: WIN32K_TCB.load(Ordering::Relaxed),
+        reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
+        client_pi: client.pi as u64,
+        client_generation: client.generation,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Syscall,
+            client_attach: true,
+            usermode_callback: true,
+            provider_wait: true,
+            wide_arg_marshal: true,
+            assert_skip: true,
+            sparse_vspace: true,
+            io_port_faults: false,
+        },
+    };
+    let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+        pending.dispatch,
+    );
+    let pump = crate::spawn_hosts::component_pump_resume_lpc_wait(&channel);
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+        previous_dispatch,
+    );
+    retire_win32k_on_wall(&pump);
+
+    if pump.provider_wait_suspended {
+        let provider = PendingProviderWaitDispatch {
+            request: {
+                let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+                    as *const nt_provider_wait::ProviderWaitSharedPage;
+                core::ptr::read_volatile(core::ptr::addr_of!((*page).request))
+            },
+            dispatch: pending.dispatch,
+            client: pending.client,
+            nested_user_callback: pending.nested_user_callback,
+            arg_snapshot_len: pending.arg_snapshot_len,
+            arg_snapshot: pending.arg_snapshot,
+        };
+        return LpcWaitPumpCompletion::ProviderReparked(provider);
+    }
+    if pump.lpc_wait_suspended {
+        return capture_lpc_wait_repark(
+            pending.dispatch,
+            pending.client,
+            pending.nested_user_callback,
+            pending.arg_snapshot_len,
+            pending.arg_snapshot,
+        )
+            .map(LpcWaitPumpCompletion::Reparked)
+            .unwrap_or(LpcWaitPumpCompletion::Failed(0xC000_0001u32 as i32));
+    }
+    if pump.callback_suspended {
+        return LpcWaitPumpCompletion::UserCallbackSuspended;
+    }
+    if !pump.completed {
+        release_dispatch_output_stage(pending.dispatch);
+        return LpcWaitPumpCompletion::Failed(pump.status);
+    }
+    if pending.nested_user_callback
+        && !complete_nested_user_callback_dispatch(client, pending.dispatch.dispatch_id)
+    {
+        release_dispatch_output_stage(pending.dispatch);
+        return LpcWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
+    }
+    unregister_user_callback_client_for_dispatch(
+        pending.dispatch.dispatch_id,
+        client.pi,
+        client.tid,
+        client.badge,
+    );
+
+    let mut completed = CompletedWin32kDispatch::new(
+        pending.dispatch.ssn,
+        pending.dispatch.args,
+        pending.dispatch.caller_sp,
+        pump.result,
+    );
+    if matches!(
+        pending.dispatch.ssn,
+        nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+    ) {
+        if let Some(stage) = pending.dispatch.output_stage {
+            match published_win32k_output_length(stage) {
+                Some(len) => {
+                    completed.provider_output_len = len;
+                    if len != 0 {
+                        let _ = completed
+                            .capture_arg_snapshot_from(stage.provider_pointer, u64::from(len));
+                    }
+                }
+                None => completed.provider_output_len = u32::MAX,
+            }
+            let _ = release_win32k_message_stage(stage);
+        } else {
+            completed.provider_output_len = u32::MAX;
+        }
+    } else {
+        if pending.arg_snapshot_len != 0 {
+            let len = pending.arg_snapshot_len as usize;
+            let _ = completed.set_arg_snapshot(&pending.arg_snapshot[..len]);
+        }
+        release_dispatch_output_stage(pending.dispatch);
+    }
+    LpcWaitPumpCompletion::Completed(completed)
 }
 
 /// Cancel the callback that is PENDING (parked, not yet redirected into its client). A pending frame
@@ -6242,8 +6524,48 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
         );
         PROVIDER_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
     }
+    if pr.lpc_wait_suspended {
+        let Some(request) = win32k_subsystem::capture_lpc_wait_request() else {
+            return (0xC000_000Du32 as u64, false);
+        };
+        let mut arg_snapshot = [0u8; COMPLETED_ARG_SNAPSHOT_BYTES];
+        let arg_snapshot_len = match ssn {
+            nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN => {
+                nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES as usize
+            }
+            win32k_subsystem::SSN_NT_USER_INITIALIZE => {
+                (completion_args[2] as usize).min(COMPLETED_ARG_SNAPSHOT_BYTES)
+            }
+            _ => 0,
+        };
+        if arg_snapshot_len != 0 {
+            core::ptr::copy_nonoverlapping(
+                win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+                arg_snapshot.as_mut_ptr(),
+                arg_snapshot_len,
+            );
+        }
+        core::ptr::write(
+            core::ptr::addr_of_mut!(LPC_WAIT_PENDING_DISPATCH),
+            Some(PendingLpcWaitDispatch {
+                request,
+                dispatch: UserCallbackDispatchContext {
+                    dispatch_id,
+                    ssn,
+                    args: completion_args,
+                    caller_sp,
+                    output_stage,
+                },
+                client,
+                nested_user_callback,
+                arg_snapshot_len: arg_snapshot_len as u32,
+                arg_snapshot,
+            }),
+        );
+        LPC_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
+    }
     if nested_user_callback {
-        if pr.callback_suspended || pr.provider_wait_suspended {
+        if pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended {
             return (pr.result, false);
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {
@@ -6259,7 +6581,11 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
             return (pr.result, false);
         }
     }
-    if callback_capable && !pr.callback_suspended && !pr.provider_wait_suspended {
+    if callback_capable
+        && !pr.callback_suspended
+        && !pr.provider_wait_suspended
+        && !pr.lpc_wait_suspended
+    {
         unregister_user_callback_client_for_dispatch(
             dispatch_id,
             client.pi,

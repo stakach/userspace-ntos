@@ -1118,6 +1118,8 @@ pub const W32_PROVIDER_WAIT_LABEL: u64 = 0x779;
 /// Request tag returned on the retained component Call after the exact wait is selected, times out,
 /// or is cancelled. The correlated status lives in the dedicated provider-wait result frame.
 pub const W32_PROVIDER_WAIT_RESUME_LABEL: u64 = 0x77A;
+pub const W32_LPC_WAIT_LABEL: u64 = 0x77B;
+pub const W32_LPC_WAIT_RESUME_LABEL: u64 = 0x77C;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -1187,10 +1189,15 @@ static GDI_DRIVER_IMPORT_TRACE: AtomicU64 = AtomicU64::new(0);
 
 const LPC_SERVICE_PORT_HANDLE: u64 = 0x00;
 const LPC_SERVICE_OPERATION: u64 = 0x08;
-const LPC_SERVICE_STATUS: u64 = 0x0c;
-const LPC_SERVICE_MESSAGE_LEN: u64 = 0x10;
+pub(crate) const LPC_SERVICE_STATUS: u64 = 0x0c;
+pub(crate) const LPC_SERVICE_MESSAGE_LEN: u64 = 0x10;
 const LPC_SERVICE_RESULT: u64 = 0x18;
-const LPC_SERVICE_MESSAGE: u64 = 0x100;
+pub(crate) const LPC_WAIT_REQUEST_GENERATION: u64 = 0x20;
+pub(crate) const LPC_WAIT_RESULT_GENERATION: u64 = 0x28;
+pub(crate) const LPC_WAIT_CLIENT_PROCESS: u64 = 0x30;
+pub(crate) const LPC_WAIT_CLIENT_THREAD: u64 = 0x38;
+pub(crate) const LPC_WAIT_MESSAGE_ID: u64 = 0x40;
+pub(crate) const LPC_SERVICE_MESSAGE: u64 = 0x100;
 const LPC_SERVICE_QUERY_HANDLE: u32 = 1;
 const LPC_SERVICE_RETAIN_PORT: u32 = 2;
 const LPC_SERVICE_RELEASE_PORT: u32 = 3;
@@ -3820,6 +3827,7 @@ extern "win64" fn s_ke_wait_for_single_object(
 }
 
 static PROVIDER_WAIT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static LPC_WAIT_NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_provider_wait_id() -> Option<u64> {
     PROVIDER_WAIT_NEXT_ID
@@ -5293,17 +5301,177 @@ pub(crate) unsafe fn service_lpc_request() -> i32 {
     status
 }
 
-/// The synchronous kernel-client form requires suspending the current win32k continuation while a
-/// user-mode port server runs. It is deliberately bound to an explicit failure until that shared
-/// LPC continuation path owns the exchange; leaving the import unbound used to return synthetic
-/// success through the loader's catch-all stub.
+#[derive(Clone, Copy)]
+pub(crate) struct Win32kLpcWaitRequest {
+    pub generation: u64,
+    pub port_handle: u64,
+    pub client_process: u64,
+    pub client_thread: u64,
+    pub message_len: u32,
+    pub message: [u8; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
+}
+
+impl Win32kLpcWaitRequest {
+    pub(crate) fn validate(&self) -> bool {
+        let len = self.message_len as usize;
+        self.generation != 0
+            && self.port_handle != 0
+            && self.client_process != 0
+            && self.client_thread != 0
+            && len >= nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
+            && len <= self.message.len()
+            && nt_lpc_abi::port_message_total_length(self.message[..4].try_into().unwrap())
+                == Some(len)
+    }
+
+    pub(crate) fn message(&self) -> &[u8] {
+        &self.message[..self.message_len as usize]
+    }
+}
+
+pub(crate) unsafe fn capture_lpc_wait_request() -> Option<Win32kLpcWaitRequest> {
+    let sh = WIN32K_LPC_VADDR;
+    let message_len = read_volatile((sh + LPC_SERVICE_MESSAGE_LEN) as *const u32);
+    let mut request = Win32kLpcWaitRequest {
+        generation: read_volatile((sh + LPC_WAIT_REQUEST_GENERATION) as *const u64),
+        port_handle: read_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *const u64),
+        client_process: read_volatile((sh + LPC_WAIT_CLIENT_PROCESS) as *const u64),
+        client_thread: read_volatile((sh + LPC_WAIT_CLIENT_THREAD) as *const u64),
+        message_len,
+        message: [0; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
+    };
+    let len = message_len as usize;
+    if len > request.message.len() {
+        return None;
+    }
+    core::ptr::copy_nonoverlapping(
+        (sh + LPC_SERVICE_MESSAGE) as *const u8,
+        request.message.as_mut_ptr(),
+        len,
+    );
+    request.validate().then_some(request)
+}
+
+/// `LpcRequestWaitReplyPort` parks the physical win32k dispatch while the retained CSR port's
+/// user-mode server processes the request. Nested dispatches are serviced on the same component
+/// stack until the executive resumes this exact generation.
 extern "win64" fn s_lpc_request_wait_reply_port(
-    _port_object: u64,
-    _request: *const u8,
-    _reply: *mut u8,
+    port_object: u64,
+    request: *const u8,
+    reply: *mut u8,
 ) -> i32 {
-    print_str(b"[win32k-lpc] LpcRequestWaitReplyPort requires a parked kernel continuation\n");
-    STATUS_NOT_IMPLEMENTED_I32
+    if port_object == 0
+        || !unsafe { (&*core::ptr::addr_of!(WIN32K_LPC_PORT_REFERENCES)).contains(port_object) }
+    {
+        return STATUS_INVALID_HANDLE_I32;
+    }
+    if request.is_null() || reply.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    let header = unsafe { read_unaligned(request as *const u32) }.to_le_bytes();
+    let Some(total) = nt_lpc_abi::port_message_total_length(header) else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    let generation = LPC_WAIT_NEXT_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .filter(|generation| *generation != 0);
+    let Some(generation) = generation else {
+        return STATUS_INSUFFICIENT_RESOURCES_I32;
+    };
+    let sh = WIN32K_LPC_VADDR;
+    unsafe {
+        write_volatile((sh + LPC_SERVICE_PORT_HANDLE) as *mut u64, port_object);
+        write_volatile((sh + LPC_SERVICE_STATUS) as *mut i32, nt_user_callback::STATUS_PENDING);
+        write_volatile((sh + LPC_SERVICE_MESSAGE_LEN) as *mut u32, total as u32);
+        write_volatile((sh + LPC_SERVICE_RESULT) as *mut u64, 0);
+        write_volatile((sh + LPC_WAIT_REQUEST_GENERATION) as *mut u64, 0);
+        write_volatile((sh + LPC_WAIT_RESULT_GENERATION) as *mut u64, 0);
+        write_volatile(
+            (sh + LPC_WAIT_CLIENT_PROCESS) as *mut u64,
+            WIN32K_CURRENT_PROCESS_ID.load(Ordering::Relaxed),
+        );
+        write_volatile(
+            (sh + LPC_WAIT_CLIENT_THREAD) as *mut u64,
+            WIN32K_CURRENT_THREAD_ID.load(Ordering::Relaxed),
+        );
+        write_volatile((sh + LPC_WAIT_MESSAGE_ID) as *mut u32, 0);
+        core::ptr::copy_nonoverlapping(
+            request,
+            (sh + LPC_SERVICE_MESSAGE) as *mut u8,
+            total,
+        );
+        core::sync::atomic::compiler_fence(Ordering::Release);
+        write_volatile((sh + LPC_WAIT_REQUEST_GENERATION) as *mut u64, generation);
+
+        let callback_frame =
+            (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+        let owner_header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
+        let Some(wait_context) = callback_request_context_for_request(&owner_header) else {
+            return STATUS_INVALID_PARAMETER_I32;
+        };
+        let mut outgoing = W32_LPC_WAIT_LABEL << 12;
+        loop {
+            let (_label, tag, _, _, _) = crate::driver_launch::call_on(outgoing);
+            match tag {
+                W32_LPC_WAIT_RESUME_LABEL => {
+                    let result_generation =
+                        read_volatile((sh + LPC_WAIT_RESULT_GENERATION) as *const u64);
+                    core::sync::atomic::compiler_fence(Ordering::Acquire);
+                    if result_generation != generation
+                    {
+                        return 0xC000_0001u32 as i32;
+                    }
+                    let status = read_volatile((sh + LPC_SERVICE_STATUS) as *const i32);
+                    if status == 0 {
+                        let reply_len =
+                            read_volatile((sh + LPC_SERVICE_MESSAGE_LEN) as *const u32) as usize;
+                        if reply_len < nt_lpc_abi::PORT_MESSAGE_HEADER_LEN
+                            || reply_len > nt_lpc_abi::PORT_MESSAGE_MAX_LEN
+                            || nt_lpc_abi::port_message_total_length(
+                                read_volatile((sh + LPC_SERVICE_MESSAGE) as *const u32)
+                                    .to_le_bytes(),
+                            ) != Some(reply_len)
+                            || read_volatile((sh + LPC_SERVICE_MESSAGE + 4) as *const u16)
+                                != nt_lpc_abi::msg_type::LPC_REPLY
+                        {
+                            return STATUS_INVALID_PARAMETER_I32;
+                        }
+                        core::ptr::copy_nonoverlapping(
+                            (sh + LPC_SERVICE_MESSAGE) as *const u8,
+                            reply,
+                            reply_len,
+                        );
+                    }
+                    if !restore_user_callback_request_context(wait_context) {
+                        return STATUS_INVALID_PARAMETER_I32;
+                    }
+                    return status;
+                }
+                W32_DISPATCH_LABEL => {
+                    let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
+                        sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
+                        drv: 0,
+                    });
+                    if !restore_user_callback_request_context(wait_context) {
+                        return STATUS_INVALID_PARAMETER_I32;
+                    }
+                    write_volatile(
+                        core::ptr::addr_of_mut!((*(callback_frame
+                            as *mut nt_user_callback::CallbackFrame))
+                            .header),
+                        owner_header,
+                    );
+                    write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
+                    write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
+                    outgoing = W32_DISPATCH_LABEL << 12;
+                }
+                _ => return 0xC000_0001u32 as i32,
+            }
+        }
+    }
 }
 
 extern "win64" fn s_ps_get_process_winsta(process: u64) -> u64 {

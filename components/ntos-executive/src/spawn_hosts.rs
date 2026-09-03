@@ -1310,6 +1310,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
             && ch.caps.kind == ReqKind::Irp)
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
         || (label == crate::win32k_subsystem::W32_PROVIDER_WAIT_LABEL && ch.caps.provider_wait)
+        || (label == crate::win32k_subsystem::W32_LPC_WAIT_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_VIDEO_IOCTL_LABEL
@@ -1514,6 +1516,7 @@ struct PumpLoopOutcome {
     completed: bool,
     callback_suspended: bool,
     provider_wait_suspended: bool,
+    lpc_wait_suspended: bool,
     scheduler_yielded: bool,
     wall_ip: u64,
     wall_addr: u64,
@@ -1532,6 +1535,7 @@ impl PumpLoopOutcome {
             completed: false,
             callback_suspended: false,
             provider_wait_suspended: false,
+            lpc_wait_suspended: false,
             scheduler_yielded: false,
             wall_ip: 0,
             wall_addr: 0,
@@ -1779,6 +1783,8 @@ pub(crate) struct PumpResult {
     pub callback_suspended: bool,
     /// The component is blocked in its provider-wait rendezvous and its reply object remains bound.
     pub provider_wait_suspended: bool,
+    /// The component is blocked in an ordinary retained LPC request/reply rendezvous.
+    pub lpc_wait_suspended: bool,
     /// The component request is still live, but hosted scheduler work must run before its pump
     /// continues. The caller resumes with `RecvFirst` on this same reply object.
     pub scheduler_yielded: bool,
@@ -2079,11 +2085,16 @@ pub(crate) unsafe fn component_pump_resume_provider_wait(ch: &PumpChannel) -> Pu
     component_pump_inner(ch, PumpResume::ProviderWait)
 }
 
+pub(crate) unsafe fn component_pump_resume_lpc_wait(ch: &PumpChannel) -> PumpResult {
+    component_pump_inner(ch, PumpResume::LpcWait)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PumpResume {
     None,
     UserCallback,
     ProviderWait,
+    LpcWait,
 }
 
 #[inline(never)]
@@ -2127,7 +2138,9 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResu
     }
     pump_leave_depth(
         owns_depth,
-        outcome.callback_suspended || outcome.provider_wait_suspended,
+        outcome.callback_suspended
+            || outcome.provider_wait_suspended
+            || outcome.lpc_wait_suspended,
     );
     pump_suspend_walled_component(ch, outcome);
     pump_result_from_outcome(ch, outcome, reply_cap)
@@ -2139,6 +2152,7 @@ fn pump_request_tag(ch: &PumpChannel, resume: PumpResume) -> u64 {
         PumpResume::None => ch.dispatch_label,
         PumpResume::UserCallback => crate::win32k_subsystem::W32_USER_CALLBACK_RESUME_LABEL,
         PumpResume::ProviderWait => crate::win32k_subsystem::W32_PROVIDER_WAIT_RESUME_LABEL,
+        PumpResume::LpcWait => crate::win32k_subsystem::W32_LPC_WAIT_RESUME_LABEL,
     }
 }
 
@@ -2231,6 +2245,11 @@ unsafe fn component_pump_loop(
             // The executive validates and admits the copied shared-page request only after the
             // native caller's continuation storage is reserved. Keep this Call bound until then.
             outcome.provider_wait_suspended = true;
+            break;
+        } else if label == crate::win32k_subsystem::W32_LPC_WAIT_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            outcome.lpc_wait_suspended = true;
             break;
         } else if label == crate::win32k_subsystem::W32_GDI_LOAD_LABEL
             && ch.caps.kind == ReqKind::Syscall
@@ -3261,6 +3280,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
     if !outcome.completed
         && !outcome.callback_suspended
         && !outcome.provider_wait_suspended
+        && !outcome.lpc_wait_suspended
         && !outcome.scheduler_yielded
     {
         PUMP_WALL_SUSPENDS.fetch_add(1, Ordering::Relaxed);
@@ -3321,6 +3341,7 @@ unsafe fn pump_result_from_outcome(
         }
     } else if outcome.callback_suspended
         || outcome.provider_wait_suspended
+        || outcome.lpc_wait_suspended
         || outcome.scheduler_yielded
     {
         let status = nt_user_callback::STATUS_PENDING;
@@ -3336,6 +3357,7 @@ unsafe fn pump_result_from_outcome(
         completed: outcome.completed,
         callback_suspended: outcome.callback_suspended,
         provider_wait_suspended: outcome.provider_wait_suspended,
+        lpc_wait_suspended: outcome.lpc_wait_suspended,
         scheduler_yielded: outcome.scheduler_yielded,
         wall_ip: outcome.wall_ip,
         wall_addr: outcome.wall_addr,

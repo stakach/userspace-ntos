@@ -24049,6 +24049,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The freestanding executive check remains at the established 220-warning baseline. The remaining
     blocking frontier is the synchronous `LpcRequestWaitReplyPort` continuation itself.
 
+    B3 synchronous win32k LPC continuation checkpoint (2026-09-03, host and freestanding green;
+    desktop acceptance pending): win32k's `LpcRequestWaitReplyPort` now copies an ordinary native
+    request into a generation-correlated shared exchange and parks its retained component Call.
+    The executive owns one cross-kind LIFO continuation stack for provider Event waits and LPC
+    requests; broker readiness may select an exact buried frame, but only the common top-frame
+    drain may resume win32k. A dedicated broker-identity table owns no native reply state, reserves
+    before broker mutation, preserves immediate replies, polls by retained endpoint plus exact
+    client/message identity, and cancels the broker request during generation-exact thread/process
+    teardown. Same-dispatch re-entry may re-arm provider-to-LPC or LPC-to-provider without adding a
+    second physical continuation. The bounded reply payload is published before its result
+    generation commit marker and successful results require a structurally valid `LPC_REPLY`.
+    `nt-lpc-continuation` is green at 14 tests, `nt-component-suspension` remains green at 10, and
+    the freestanding executive check is green at 221 warnings. Next run the serialized desktop gate
+    and verify that CSRSS handles both real `UserCreateSystemThread` requests, the desktop/RIT
+    producers signal their win32k Events, and winlogon reaches its genuine window-station/desktop
+    path. Only after that acceptance should the unreachable host desktop-construction function and
+    its direct image-RVA constants be deleted.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

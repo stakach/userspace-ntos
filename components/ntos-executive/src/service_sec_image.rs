@@ -135,8 +135,60 @@ static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
-struct ProviderWaitNativeContinuation {
-    pending: win32k_glue::PendingProviderWaitDispatch,
+enum PendingComponentDispatch {
+    Provider(win32k_glue::PendingProviderWaitDispatch),
+    Lpc(win32k_glue::PendingLpcWaitDispatch),
+}
+
+impl PendingComponentDispatch {
+    fn client(self) -> win32k_glue::Win32kClientContext {
+        match self {
+            Self::Provider(pending) => pending.client,
+            Self::Lpc(pending) => pending.client,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ComponentSuspensionCompletion {
+    status: i32,
+    lpc_message_id: u32,
+    lpc_reply_len: u32,
+    lpc_reply: [u8; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
+}
+
+impl ComponentSuspensionCompletion {
+    const fn provider(status: i32) -> Self {
+        Self {
+            status,
+            lpc_message_id: 0,
+            lpc_reply_len: 0,
+            lpc_reply: [0; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
+        }
+    }
+
+    fn lpc(status: i32, message_id: u32, reply: &[u8]) -> Option<Self> {
+        if reply.len() > nt_lpc_abi::PORT_MESSAGE_MAX_LEN {
+            return None;
+        }
+        let mut completion = Self {
+            status,
+            lpc_message_id: message_id,
+            lpc_reply_len: reply.len() as u32,
+            lpc_reply: [0; nt_lpc_abi::PORT_MESSAGE_MAX_LEN],
+        };
+        completion.lpc_reply[..reply.len()].copy_from_slice(reply);
+        Some(completion)
+    }
+
+    fn lpc_reply(&self) -> &[u8] {
+        &self.lpc_reply[..self.lpc_reply_len as usize]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ComponentNativeContinuation {
+    pending: PendingComponentDispatch,
     reply_cap: u64,
     reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
@@ -145,15 +197,15 @@ struct ProviderWaitNativeContinuation {
     abandon_native_reply: bool,
 }
 
-const PROVIDER_WAIT_MAX_CONTINUATION_DEPTH: usize = 64;
+const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
 static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderEventWaitArbiter<
     nt_kernel_exec::EventLeaseId,
 > = nt_provider_wait::ProviderEventWaitArbiter::new();
-static mut PROVIDER_WAIT_CONTINUATIONS: nt_component_suspension::ComponentSuspensionStack<
-    ProviderWaitNativeContinuation,
-    i32,
+static mut COMPONENT_SUSPENSIONS: nt_component_suspension::ComponentSuspensionStack<
+    ComponentNativeContinuation,
+    ComponentSuspensionCompletion,
 > = nt_component_suspension::ComponentSuspensionStack::new(
-    PROVIDER_WAIT_MAX_CONTINUATION_DEPTH,
+    COMPONENT_SUSPENSION_MAX_DEPTH,
 );
 static PROVIDER_WAIT_DISPATCH_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_PARKED_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
@@ -208,7 +260,13 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
                 .load(Ordering::Relaxed),
             event_leases_acquired: PROVIDER_WAIT_EVENT_LEASES_ACQUIRED.load(Ordering::Relaxed),
             event_leases_released: PROVIDER_WAIT_EVENT_LEASES_RELEASED.load(Ordering::Relaxed),
-            active_continuations: (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).len(),
+            active_continuations: (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+                .frames()
+                .iter()
+                .filter(|frame| {
+                    matches!(frame.continuation.pending, PendingComponentDispatch::Provider(_))
+                })
+                .count(),
             active_waiters: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).len(),
             active_event_leases: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).lease_count(),
         }
@@ -379,6 +437,9 @@ static mut LPC_CONNECT_WAITS: nt_lpc_continuation::ConnectWaitTable<LpcConnectCo
     nt_lpc_continuation::ConnectWaitTable::new();
 static mut LPC_REQUEST_WAITS: nt_lpc_continuation::RequestWaitTable<LpcRequestContinuation> =
     nt_lpc_continuation::RequestWaitTable::new();
+static mut LPC_COMPONENT_WAITS: nt_lpc_continuation::BrokerRequestWaitTable<
+    nt_component_suspension::SuspensionKey,
+> = nt_lpc_continuation::BrokerRequestWaitTable::new();
 
 #[derive(Clone, Copy)]
 struct SyscallReplyContext {
@@ -646,6 +707,12 @@ unsafe fn reset_lpc_connect_waits() -> bool {
 
 unsafe fn reset_lpc_request_waits() -> bool {
     (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
+        .reset()
+        .is_ok()
+}
+
+unsafe fn reset_lpc_component_waits() -> bool {
+    (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
         .reset()
         .is_ok()
 }
@@ -1213,6 +1280,36 @@ fn provider_wait_expected_owner(
     owner.is_valid().then_some(owner)
 }
 
+fn lpc_wait_expected_owner(
+    pending: win32k_glue::PendingLpcWaitDispatch,
+) -> Option<nt_provider_wait::ProviderWaitOwner> {
+    if pending.request.client_process != pending.client.pid
+        || pending.request.client_thread != pending.client.tid
+    {
+        return None;
+    }
+    let identity = crate::current_win32k_provider_domain()?;
+    let owner = nt_provider_wait::ProviderWaitOwner {
+        provider_domain: identity.domain,
+        provider_generation: identity.generation,
+        client_pi: pending.client.pi,
+        client_generation: pending.client.generation,
+        client_tid: pending.client.tid,
+        client_badge: pending.client.badge,
+        dispatch_id: pending.dispatch.dispatch_id,
+    };
+    owner.is_valid().then_some(owner)
+}
+
+fn component_expected_owner(
+    pending: PendingComponentDispatch,
+) -> Option<nt_provider_wait::ProviderWaitOwner> {
+    match pending {
+        PendingComponentDispatch::Provider(pending) => provider_wait_expected_owner(pending),
+        PendingComponentDispatch::Lpc(pending) => lpc_wait_expected_owner(pending),
+    }
+}
+
 fn component_suspension_owner(
     owner: nt_provider_wait::ProviderWaitOwner,
 ) -> nt_component_suspension::SuspensionOwner {
@@ -1231,134 +1328,419 @@ fn provider_wait_key(wait_id: u64) -> nt_component_suspension::SuspensionKey {
     nt_component_suspension::SuspensionKey::provider_wait(wait_id)
 }
 
-enum ProviderWaitRuntimeOutcome {
+fn component_suspension_key(
+    pending: PendingComponentDispatch,
+) -> nt_component_suspension::SuspensionKey {
+    match pending {
+        PendingComponentDispatch::Provider(pending) => {
+            provider_wait_key(pending.request.header.wait_id)
+        }
+        PendingComponentDispatch::Lpc(pending) => {
+            nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation)
+        }
+    }
+}
+
+unsafe fn lpc_wait_begin_after_stack_admission(
+    pending: win32k_glue::PendingLpcWaitDispatch,
+    key: nt_component_suspension::SuspensionKey,
+    reservation: nt_lpc_continuation::Reservation,
+) -> bool {
+    let begin = lpc_client().map(|client| {
+        client.begin_retained_request_wait_reply(
+            pending.request.port_handle,
+            pending.request.message(),
+            pending.request.client_process,
+            pending.request.client_thread,
+        )
+    });
+    match begin {
+        Some(Ok(nt_lpc_client::BeginRequestWaitReply::Pending { message_id })) => {
+            let identity = nt_lpc_continuation::BrokerRequestIdentity {
+                port_handle: pending.request.port_handle,
+                client_process: pending.request.client_process,
+                client_thread: pending.request.client_thread,
+                message_id,
+            };
+            if (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
+                .publish(
+                    reservation,
+                    nt_lpc_continuation::PendingBrokerRequest {
+                        identity,
+                        continuation: key,
+                    },
+                )
+                .is_ok()
+            {
+                return true;
+            }
+            if let Some(client) = lpc_client() {
+                let _ = client.cancel_request(
+                    identity.port_handle,
+                    identity.client_process,
+                    identity.client_thread,
+                    identity.message_id,
+                );
+            }
+            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).cancel(
+                key,
+                ComponentSuspensionCompletion::provider(0xC000_009Au32 as i32),
+            );
+        }
+        Some(Ok(nt_lpc_client::BeginRequestWaitReply::Completed { message_id, reply })) => {
+            let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+            let completion = ComponentSuspensionCompletion::lpc(0, message_id, &reply)
+                .unwrap_or_else(|| {
+                    ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32)
+                });
+            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .select(key, completion);
+        }
+        Some(Err(status)) => {
+            let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).select(
+                key,
+                ComponentSuspensionCompletion::provider(status.raw()),
+            );
+        }
+        None => {
+            let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).select(
+                key,
+                ComponentSuspensionCompletion::provider(0xC000_0001u32 as i32),
+            );
+        }
+    }
+    false
+}
+
+unsafe fn lpc_component_wait_take(
+    key: nt_component_suspension::SuspensionKey,
+) -> Option<nt_lpc_continuation::PendingBrokerRequest<nt_component_suspension::SuspensionKey>> {
+    let mut generation = 0;
+    while let Some((slot, current_generation, wait)) =
+        (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
+            .next_occupied_after(generation)
+            .map(|(slot, generation, wait)| (slot, generation, *wait))
+    {
+        generation = current_generation;
+        if wait.continuation == key {
+            return (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).take(slot);
+        }
+    }
+    None
+}
+
+unsafe fn lpc_component_wait_select_ready() -> u64 {
+    let mut selected = 0;
+    let mut generation = 0;
+    while let Some((slot, current_generation, wait)) =
+        (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
+            .next_occupied_after(generation)
+            .map(|(slot, generation, wait)| (slot, generation, *wait))
+    {
+        generation = current_generation;
+        let completion = match lpc_client().map(|client| {
+            client.receive_reply(
+                wait.identity.port_handle,
+                wait.identity.client_process,
+                wait.identity.client_thread,
+                wait.identity.message_id,
+            )
+        }) {
+            Some(Ok(Some(reply))) => ComponentSuspensionCompletion::lpc(
+                0,
+                wait.identity.message_id,
+                &reply,
+            ),
+            Some(Ok(None)) => continue,
+            Some(Err(status)) => Some(ComponentSuspensionCompletion::provider(status.raw())),
+            None => Some(ComponentSuspensionCompletion::provider(
+                0xC000_0001u32 as i32,
+            )),
+        };
+        let Some(completion) = completion else {
+            panic!("LPC broker returned a reply larger than the ABI limit");
+        };
+        let completed = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
+            .take(slot)
+            .expect("selected LPC readiness entry disappeared");
+        if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .select(completed.continuation, completion)
+            .is_err()
+        {
+            panic!("LPC readiness selected an unowned component continuation");
+        }
+        selected += 1;
+    }
+    selected
+}
+
+enum ComponentPumpCompletion {
+    Completed(win32k_glue::CompletedWin32kDispatch),
+    Reparked(PendingComponentDispatch),
+    UserCallbackSuspended,
+    Failed(i32),
+}
+
+enum ComponentSuspensionRuntimeOutcome {
     Parked,
     Completed {
-        continuation: ProviderWaitNativeContinuation,
+        continuation: ComponentNativeContinuation,
         dispatch: win32k_glue::CompletedWin32kDispatch,
     },
-    UserCallbackSuspended(ProviderWaitNativeContinuation),
+    UserCallbackSuspended(ComponentNativeContinuation),
     Failed {
-        continuation: ProviderWaitNativeContinuation,
+        continuation: ComponentNativeContinuation,
         status: i32,
     },
 }
 
-unsafe fn provider_wait_resume_top(
+unsafe fn component_suspension_resume_top(
     nt_handler: &mut ExecNtHandler,
-) -> Option<ProviderWaitRuntimeOutcome> {
+) -> Option<ComponentSuspensionRuntimeOutcome> {
     loop {
-        let resume = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS)).top_resume()?;
-        let frame = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+        let resume = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).top_resume()?;
+        let frame = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .top()?
             .clone();
-        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
             .begin_resume(resume.key)
             .expect("provider wait top changed during synchronous resume");
-        PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
-        if !resume.cancelled {
-            PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
-        }
-        match win32k_glue::resume_suspended_provider_wait_component(
+        let provider_resume = matches!(
             frame.continuation.pending,
-            resume.key.id,
-            resume.completion,
-        ) {
-            win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
-                let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            PendingComponentDispatch::Provider(_)
+        );
+        if provider_resume {
+            PROVIDER_WAIT_RESUMES.fetch_add(1, Ordering::Relaxed);
+            if !resume.cancelled {
+                PROVIDER_WAIT_SUCCESSFUL_RESUMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let pump_completion = match frame.continuation.pending {
+            PendingComponentDispatch::Provider(pending) => {
+                match win32k_glue::resume_suspended_provider_wait_component(
+                    pending,
+                    resume.key.id,
+                    resume.completion.status,
+                ) {
+                    win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
+                        ComponentPumpCompletion::Completed(dispatch)
+                    }
+                    win32k_glue::ProviderWaitPumpCompletion::Reparked(pending) => {
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(
+                            pending,
+                        ))
+                    }
+                    win32k_glue::ProviderWaitPumpCompletion::LpcReparked(pending) => {
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
+                    }
+                    win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
+                        ComponentPumpCompletion::UserCallbackSuspended
+                    }
+                    win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
+                        ComponentPumpCompletion::Failed(status)
+                    }
+                }
+            }
+            PendingComponentDispatch::Lpc(pending) => {
+                match win32k_glue::resume_suspended_lpc_wait_component(
+                    pending,
+                    resume.completion.lpc_message_id,
+                    resume.completion.status,
+                    resume.completion.lpc_reply(),
+                ) {
+                    win32k_glue::LpcWaitPumpCompletion::Completed(dispatch) => {
+                        ComponentPumpCompletion::Completed(dispatch)
+                    }
+                    win32k_glue::LpcWaitPumpCompletion::ProviderReparked(pending) => {
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Provider(
+                            pending,
+                        ))
+                    }
+                    win32k_glue::LpcWaitPumpCompletion::Reparked(pending) => {
+                        ComponentPumpCompletion::Reparked(PendingComponentDispatch::Lpc(pending))
+                    }
+                    win32k_glue::LpcWaitPumpCompletion::UserCallbackSuspended => {
+                        ComponentPumpCompletion::UserCallbackSuspended
+                    }
+                    win32k_glue::LpcWaitPumpCompletion::Failed(status) => {
+                        ComponentPumpCompletion::Failed(status)
+                    }
+                }
+            }
+        };
+        match pump_completion {
+            ComponentPumpCompletion::Completed(dispatch) => {
+                let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .complete_dispatch(resume.key, frame.owner)
                     .ok()?;
-                PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Some(ProviderWaitRuntimeOutcome::Completed {
+                if provider_resume {
+                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(ComponentSuspensionRuntimeOutcome::Completed {
                     continuation: completed.continuation,
                     dispatch,
                 });
             }
-            win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
-                let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            ComponentPumpCompletion::UserCallbackSuspended => {
+                let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .complete_dispatch(resume.key, frame.owner)
                     .ok()?;
-                PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Some(ProviderWaitRuntimeOutcome::UserCallbackSuspended(
+                if provider_resume {
+                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(ComponentSuspensionRuntimeOutcome::UserCallbackSuspended(
                     completed.continuation,
                 ));
             }
-            win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
-                let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            ComponentPumpCompletion::Failed(status) => {
+                let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .complete_dispatch(resume.key, frame.owner)
                     .ok()?;
-                PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Some(ProviderWaitRuntimeOutcome::Failed {
+                if provider_resume {
+                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(ComponentSuspensionRuntimeOutcome::Failed {
                     continuation: completed.continuation,
                     status,
                 });
             }
-            win32k_glue::ProviderWaitPumpCompletion::Reparked(next) => {
-                PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
-                let Some(next_owner) = provider_wait_expected_owner(next) else {
+            ComponentPumpCompletion::Reparked(next) => {
+                if matches!(next, PendingComponentDispatch::Provider(_)) {
+                    PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
+                }
+                let Some(next_owner) = component_expected_owner(next) else {
                     let completed =
-                        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .abort_resume(resume.key, frame.owner, 0xC000_000Du32 as i32)
-                            .expect("invalid provider re-wait lost its active continuation");
+                        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .abort_resume(
+                                resume.key,
+                                frame.owner,
+                                ComponentSuspensionCompletion::provider(
+                                    0xC000_000Du32 as i32,
+                                ),
+                            )
+                            .expect("invalid component re-wait lost its active continuation");
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    return Some(ProviderWaitRuntimeOutcome::Failed {
+                    return Some(ComponentSuspensionRuntimeOutcome::Failed {
                         continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
                     });
                 };
-                let next_wait_id = next.request.header.wait_id;
+                let lpc_reservation = if matches!(next, PendingComponentDispatch::Lpc(_)) {
+                    match (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() {
+                        Ok(reservation) => Some(reservation),
+                        Err(_) => {
+                            let completed =
+                                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                                    .abort_resume(
+                                        resume.key,
+                                        frame.owner,
+                                        ComponentSuspensionCompletion::provider(
+                                            0xC000_009Au32 as i32,
+                                        ),
+                                    )
+                                    .expect(
+                                        "LPC readiness reservation failure lost its continuation",
+                                    );
+                            return Some(ComponentSuspensionRuntimeOutcome::Failed {
+                                continuation: completed.continuation,
+                                status: 0xC000_009Au32 as i32,
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                let next_key = component_suspension_key(next);
                 let sequence = next_dispatcher_wait_sequence();
                 let mut next_continuation = frame.continuation;
                 next_continuation.pending = next;
-                if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .rearm(
                         resume.key,
-                        provider_wait_key(next_wait_id),
+                        next_key,
                         sequence,
                         component_suspension_owner(next_owner),
                         next_continuation,
                     )
                     .is_err()
                 {
+                    if let Some(reservation) = lpc_reservation {
+                        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
+                            .cancel(reservation);
+                    }
                     let completed =
-                        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .abort_resume(resume.key, frame.owner, 0xC000_000Du32 as i32)
-                            .expect("rejected provider re-wait lost its active continuation");
+                        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                            .abort_resume(
+                                resume.key,
+                                frame.owner,
+                                ComponentSuspensionCompletion::provider(
+                                    0xC000_000Du32 as i32,
+                                ),
+                            )
+                            .expect("rejected component re-wait lost its active continuation");
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    return Some(ProviderWaitRuntimeOutcome::Failed {
+                    return Some(ComponentSuspensionRuntimeOutcome::Failed {
                         continuation: completed.continuation,
                         status: 0xC000_000Du32 as i32,
                     });
                 }
-                let admission = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
-                    nt_handler,
-                    &next.request,
-                    next_owner,
-                    sequence,
-                    nt_time_snapshot(),
-                );
-                match admission {
-                    Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
-                        PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
-                        return Some(ProviderWaitRuntimeOutcome::Parked);
-                    }
-                    Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied {
-                        wait_id,
-                        status,
-                    }) => {
-                        let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .select(provider_wait_key(wait_id), status);
-                    }
-                    Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
-                        let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .select(provider_wait_key(wait_id), nt_provider_wait::STATUS_TIMEOUT);
-                    }
-                    Err(error) => {
-                        let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                            .cancel(
-                                provider_wait_key(next_wait_id),
-                                provider_wait_status_for_error(error),
+                match next {
+                    PendingComponentDispatch::Provider(next) => {
+                        let admission =
+                            (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
+                                nt_handler,
+                                &next.request,
+                                next_owner,
+                                sequence,
+                                nt_time_snapshot(),
                             );
+                        match admission {
+                            Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
+                                PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+                                return Some(ComponentSuspensionRuntimeOutcome::Parked);
+                            }
+                            Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied {
+                                wait_id,
+                                status,
+                            }) => {
+                                let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                                    .select(
+                                        provider_wait_key(wait_id),
+                                        ComponentSuspensionCompletion::provider(status),
+                                    );
+                            }
+                            Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut {
+                                wait_id,
+                            }) => {
+                                let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                                    .select(
+                                        provider_wait_key(wait_id),
+                                        ComponentSuspensionCompletion::provider(
+                                            nt_provider_wait::STATUS_TIMEOUT,
+                                        ),
+                                    );
+                            }
+                            Err(error) => {
+                                let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                                    .cancel(
+                                        next_key,
+                                        ComponentSuspensionCompletion::provider(
+                                            provider_wait_status_for_error(error),
+                                        ),
+                                    );
+                            }
+                        }
+                    }
+                    PendingComponentDispatch::Lpc(next) => {
+                        if lpc_wait_begin_after_stack_admission(
+                            next,
+                            next_key,
+                            lpc_reservation.expect("LPC re-wait has readiness reservation"),
+                        ) {
+                            return Some(ComponentSuspensionRuntimeOutcome::Parked);
+                        }
                     }
                 }
             }
@@ -1386,8 +1768,11 @@ pub(crate) unsafe fn provider_wait_select_ready(nt_handler: &mut ExecNtHandler) 
     while let Some(completion) =
         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_ready(nt_handler)
     {
-        if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .select(provider_wait_key(completion.wait_id), completion.status)
+        if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .select(
+                provider_wait_key(completion.wait_id),
+                ComponentSuspensionCompletion::provider(completion.status),
+            )
             .is_err()
         {
             panic!("provider wait arbiter selected an unowned continuation");
@@ -1409,8 +1794,11 @@ pub(crate) unsafe fn provider_wait_select_due(
     while let Some(completion) =
         (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_due(nt_handler, now)
     {
-        if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .select(provider_wait_key(completion.wait_id), completion.status)
+        if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .select(
+                provider_wait_key(completion.wait_id),
+                ComponentSuspensionCompletion::provider(completion.status),
+            )
             .is_err()
         {
             panic!("provider wait timeout selected an unowned continuation");
@@ -1440,8 +1828,8 @@ unsafe fn provider_wait_admit_current(
     };
     let wait_id = pending.request.header.wait_id;
     let sequence = next_dispatcher_wait_sequence();
-    let continuation = ProviderWaitNativeContinuation {
-        pending,
+    let continuation = ComponentNativeContinuation {
+        pending: PendingComponentDispatch::Provider(pending),
         reply_cap: active_reply,
         reply,
         resume_ip,
@@ -1449,7 +1837,7 @@ unsafe fn provider_wait_admit_current(
         resume_flags,
         abandon_native_reply: false,
     };
-    if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
         .admit(
             provider_wait_key(wait_id),
             sequence,
@@ -1472,26 +1860,32 @@ unsafe fn provider_wait_admit_current(
             PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
         }
         Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied { wait_id, status }) => {
-            if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                .select(provider_wait_key(wait_id), status)
+            if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .select(
+                    provider_wait_key(wait_id),
+                    ComponentSuspensionCompletion::provider(status),
+                )
                 .is_err()
             {
                 panic!("provider wait immediate completion lost its continuation");
             }
         }
         Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
-            if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-                .select(provider_wait_key(wait_id), nt_provider_wait::STATUS_TIMEOUT)
+            if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .select(
+                    provider_wait_key(wait_id),
+                    ComponentSuspensionCompletion::provider(nt_provider_wait::STATUS_TIMEOUT),
+                )
                 .is_err()
             {
                 panic!("provider wait poll completion lost its continuation");
             }
         }
         Err(error) => {
-            if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .cancel(
                     provider_wait_key(wait_id),
-                    provider_wait_status_for_error(error),
+                    ComponentSuspensionCompletion::provider(provider_wait_status_for_error(error)),
                 )
                 .is_err()
             {
@@ -1504,34 +1898,89 @@ unsafe fn provider_wait_admit_current(
     true
 }
 
-unsafe fn provider_wait_drain_ready(
+unsafe fn lpc_wait_admit_current(
+    pending: win32k_glue::PendingLpcWaitDispatch,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+) -> bool {
+    let Ok(reservation) =
+        (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve()
+    else {
+        return false;
+    };
+    let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        return false;
+    };
+    if active_reply == 0 || fresh_reply == active_reply {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        return false;
+    }
+    let Some(owner) = lpc_wait_expected_owner(pending) else {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        return false;
+    };
+    let key = nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation);
+    let sequence = next_dispatcher_wait_sequence();
+    let continuation = ComponentNativeContinuation {
+        pending: PendingComponentDispatch::Lpc(pending),
+        reply_cap: active_reply,
+        reply,
+        resume_ip,
+        resume_sp,
+        resume_flags,
+        abandon_native_reply: false,
+    };
+    if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+        .admit(
+            key,
+            sequence,
+            component_suspension_owner(owner),
+            continuation,
+        )
+        .is_err()
+    {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        return false;
+    }
+    let _ = lpc_wait_begin_after_stack_admission(pending, key, reservation);
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
+    true
+}
+
+unsafe fn component_suspension_drain_ready(
     nt_handler: &mut ExecNtHandler,
     procs: &mut [ProcExec],
     pfilled: &mut [[u64; 512]],
 ) -> u64 {
     let mut drained = 0;
     loop {
-        let Some(outcome) = provider_wait_resume_top(nt_handler) else {
+        let Some(outcome) = component_suspension_resume_top(nt_handler) else {
             break;
         };
         match outcome {
-            ProviderWaitRuntimeOutcome::Parked => break,
-            ProviderWaitRuntimeOutcome::Completed {
+            ComponentSuspensionRuntimeOutcome::Parked => break,
+            ComponentSuspensionRuntimeOutcome::Completed {
                 continuation,
                 dispatch,
             } => {
                 if continuation.abandon_native_reply {
                     assert_eq!(continuation.reply_cap, 0);
                 } else {
-                    let pi = continuation.pending.client.pi as usize;
+                    let client = continuation.pending.client();
+                    let pi = client.pi as usize;
                     let copied = if let Some(process) = procs.get(pi) {
                         process.pml4 != 0
                             && process_completed_user_callback_outer_dispatch(
                                 nt_handler,
                                 pi,
                                 process.pml4,
-                                continuation.pending.client.badge,
-                                continuation.pending.client.tid,
+                                client.badge,
+                                client.tid,
                                 dispatch,
                                 &mut pfilled[pi],
                                 process.faults as usize,
@@ -1550,12 +1999,12 @@ unsafe fn provider_wait_drain_ready(
                 }
                 drained += 1;
             }
-            ProviderWaitRuntimeOutcome::UserCallbackSuspended(continuation) => {
+            ComponentSuspensionRuntimeOutcome::UserCallbackSuspended(continuation) => {
                 if continuation.abandon_native_reply {
                     assert_eq!(continuation.reply_cap, 0);
                     let _ = win32k_glue::cancel_suspended_user_callback();
                 } else {
-                    let client = continuation.pending.client;
+                    let client = continuation.pending.client();
                     if win32k_glue::begin_controlled_user_callback_redirect(
                         client,
                         continuation.resume_ip,
@@ -1575,7 +2024,7 @@ unsafe fn provider_wait_drain_ready(
                 }
                 drained += 1;
             }
-            ProviderWaitRuntimeOutcome::Failed {
+            ComponentSuspensionRuntimeOutcome::Failed {
                 continuation,
                 status,
             } => {
@@ -1596,11 +2045,11 @@ unsafe fn provider_wait_drain_ready(
     drained
 }
 
-unsafe fn provider_wait_prepare_abandoned_replies(
+unsafe fn component_suspension_prepare_abandoned_replies(
     scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
     loop {
-        let wait_id = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+        let wait_id = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
             .iter()
             .find(|frame| {
@@ -1610,7 +2059,7 @@ unsafe fn provider_wait_prepare_abandoned_replies(
         let Some(wait_key) = wait_id else {
             return true;
         };
-        let frame = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+        let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
             .get_mut(wait_key)
             .expect("provider wait teardown target disappeared");
         let cap = frame.continuation.reply_cap;
@@ -1632,56 +2081,76 @@ unsafe fn provider_wait_prepare_abandoned_replies(
     }
 }
 
-unsafe fn provider_wait_cancel_scope(
+unsafe fn component_suspension_cancel_scope(
     nt_handler: &mut ExecNtHandler,
     scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
     if !scope.is_valid() {
         return false;
     }
-    if !(&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).contains_scope(scope) {
+    if !(&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).contains_scope(scope) {
         return true;
     }
-    if !provider_wait_prepare_abandoned_replies(scope) {
+    if !component_suspension_prepare_abandoned_replies(scope) {
         return false;
     }
-    while let Some(wait_key) = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+    while let Some(wait_key) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
         .next_cancellable_in_scope(scope)
     {
-        let phase = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+        let phase = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .get(wait_key)
             .expect("provider wait cancellation target disappeared")
             .phase
             .clone();
-        let arbiter_completion =
-            (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).cancel(
-                nt_handler,
-                wait_key.id,
-                0xC000_0120u32 as i32,
-            );
+        let external_cancelled = match wait_key.kind {
+            nt_component_suspension::SuspensionKind::ProviderWait => {
+                (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
+                    .cancel(nt_handler, wait_key.id, 0xC000_0120u32 as i32)
+                    .is_some()
+            }
+            nt_component_suspension::SuspensionKind::LpcRequest => {
+                if let Some(wait) = lpc_component_wait_take(wait_key) {
+                    lpc_client().is_some_and(|client| {
+                        client
+                            .cancel_request(
+                                wait.identity.port_handle,
+                                wait.identity.client_process,
+                                wait.identity.client_thread,
+                                wait.identity.message_id,
+                            )
+                            .is_ok()
+                    })
+                } else {
+                    false
+                }
+            }
+        };
         if matches!(phase, nt_component_suspension::SuspensionPhase::Waiting)
-            && arbiter_completion.is_none()
+            && !external_cancelled
         {
-            panic!("waiting provider continuation has no dispatcher arbiter owner");
+            panic!("waiting component continuation has no readiness owner");
         }
-        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
-            .cancel(wait_key, 0xC000_0120u32 as i32)
-            .expect("provider wait teardown could not cancel its exact continuation");
+        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+            .cancel(
+                wait_key,
+                ComponentSuspensionCompletion::provider(0xC000_0120u32 as i32),
+            )
+            .expect("component teardown could not cancel its exact continuation");
         PROVIDER_WAIT_CANCELLATIONS.fetch_add(1, Ordering::Relaxed);
     }
 
     let Some(ctx) = nt_handler.loop_ctx else {
         return false;
     };
-    let _ = provider_wait_drain_ready(nt_handler, &mut *ctx.procs, &mut *ctx.pfilled);
-    !(&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).contains_scope(scope)
+    let _ = component_suspension_drain_ready(nt_handler, &mut *ctx.procs, &mut *ctx.pfilled);
+    !(&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).contains_scope(scope)
 }
 
 pub(crate) unsafe fn provider_wait_cancel_client_thread(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
 ) -> bool {
-    if (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).is_empty() {
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).is_empty() {
         return true;
     }
     let Some(provider) = crate::current_win32k_provider_domain() else {
@@ -1696,7 +2165,7 @@ pub(crate) unsafe fn provider_wait_cancel_client_thread(
     let Some(client_badge) = nt_handler.hosted_thread_badge_for_tid(tid) else {
         return false;
     };
-    provider_wait_cancel_scope(
+    component_suspension_cancel_scope(
         nt_handler,
         nt_component_suspension::SuspensionScope::Thread {
             domain: provider.domain,
@@ -1713,7 +2182,7 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     nt_handler: &mut ExecNtHandler,
     process_index: u8,
 ) -> bool {
-    if (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS)).is_empty() {
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).is_empty() {
         return true;
     }
     let Some(provider) = crate::current_win32k_provider_domain() else {
@@ -1723,7 +2192,7 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     else {
         return false;
     };
-    provider_wait_cancel_scope(
+    component_suspension_cancel_scope(
         nt_handler,
         nt_component_suspension::SuspensionScope::Process {
             domain: provider.domain,
@@ -1734,9 +2203,9 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     )
 }
 
-fn provider_wait_top_owns_dispatch(dispatch_id: u64) -> bool {
+fn component_suspension_top_owns_dispatch(dispatch_id: u64) -> bool {
     unsafe {
-        (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+        (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .top()
             .is_some_and(|frame| frame.owner.dispatch_id == dispatch_id)
     }
@@ -7163,6 +7632,9 @@ pub(crate) unsafe fn service_sec_image(
     if !reset_lpc_request_waits() {
         panic!("LPC request waiter table allocation failed");
     }
+    if !reset_lpc_component_waits() {
+        panic!("component LPC readiness table allocation failed");
+    }
     // Driver import catalogs are durable and may be consulted from later PnP or win32k loads.
     // Populate their expected boot footprint before entering the service loop.
     if !initialize_fsd_export_registry() {
@@ -10504,8 +10976,8 @@ pub(crate) unsafe fn service_sec_image(
             // onto the caller's bound `REPLY_MAIN`. Every reply takes the bound object now, so there
             // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
-            let mut provider_wait_park_request = false;
-            let mut provider_wait_admitted_dispatch_id = 0;
+            let mut component_suspension_park_request = false;
+            let mut component_suspension_admitted_dispatch_id = 0;
             let mut redirected_user_apc = false;
             let mut redirected_context_continue = false;
             let mut active_callback_bad_resume = false;
@@ -10689,6 +11161,10 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.pending_file_irp_drain.is_none(),
                     "previous syscall leaked a File IRP drain reservation"
                 );
+                // Poll component LPC completions only after `reply_recv` has returned another
+                // event. This guarantees the independent server syscall which published the LPC
+                // reply has already received its own native reply before win32k is resumed.
+                let _ = lpc_component_wait_select_ready();
                 nt_handler.dbgk_block_request = false;
                 nt_handler.pipe_endpoint_progress = false;
                 nt_handler.lpc_endpoint_progress = false;
@@ -15755,8 +16231,8 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
                 if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
-                    provider_wait_admitted_dispatch_id = pending.dispatch.dispatch_id;
-                    provider_wait_park_request = provider_wait_admit_current(
+                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
+                    component_suspension_park_request = provider_wait_admit_current(
                         &mut nt_handler,
                         pending,
                         parked_syscall_reply,
@@ -15765,17 +16241,31 @@ pub(crate) unsafe fn service_sec_image(
                         flags,
                     );
                     assert!(
-                        provider_wait_park_request,
+                        component_suspension_park_request,
                         "provider wait could not reserve its native continuation"
                     );
                     // Reuse the existing post-dispatch suppression gates. The provider wait owns
                     // the native reply now; this is not a user callback and is intercepted before
                     // the common reply tail.
                     redirected_user_callback = true;
+                } else if let Some(pending) = win32k_glue::take_pending_lpc_wait_dispatch() {
+                    component_suspension_admitted_dispatch_id = pending.dispatch.dispatch_id;
+                    component_suspension_park_request = lpc_wait_admit_current(
+                        pending,
+                        parked_syscall_reply,
+                        resume_ip,
+                        sp,
+                        flags,
+                    );
+                    assert!(
+                        component_suspension_park_request,
+                        "LPC wait could not reserve its native continuation"
+                    );
+                    redirected_user_callback = true;
                 }
                 let direct_provider_output_len = if ok
                     && !callback_suspended
-                    && !provider_wait_park_request
+                    && !component_suspension_park_request
                     && msg_returns_to_client
                     && message_output_stage.is_some()
                 {
@@ -15807,7 +16297,7 @@ pub(crate) unsafe fn service_sec_image(
                 // continuation returns; the completed-dispatch hook samples that final MSG.
                 if dialog_modal_dispatch
                     && !callback_suspended
-                    && !provider_wait_park_request
+                    && !component_suspension_park_request
                     && m0 != nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN
                 {
                     let staged_msg = msg_returns_to_client && message_output_stage.is_some();
@@ -15863,7 +16353,7 @@ pub(crate) unsafe fn service_sec_image(
                         st = resumed.0 as u32 as u64;
                         ok = resumed.1;
                     }
-                } else if !provider_wait_park_request && ok {
+                } else if !component_suspension_park_request && ok {
                     if let Some(resolved_resume_ip) =
                         win32k_glue::resolve_active_callback_syscall_resume_ip(
                             dispatch_client,
@@ -15956,7 +16446,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
-                if !callback_suspended && !provider_wait_park_request {
+                if !callback_suspended && !component_suspension_park_request {
                     if let Some(stage) = message_output_stage {
                         let _ = win32k_glue::release_win32k_message_stage(stage);
                     }
@@ -16421,13 +16911,15 @@ pub(crate) unsafe fn service_sec_image(
                 park_and_log!(pi, b"unhandled-syscall", m0, m0);
             }
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-            if provider_wait_park_request {
+            if component_suspension_park_request {
                 procs[pi].faults = faults;
                 procs[pi].first = first;
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
-                let _ = provider_wait_drain_ready(&mut nt_handler, procs, pfilled);
-                if provider_wait_top_owns_dispatch(provider_wait_admitted_dispatch_id) {
+                let _ = component_suspension_drain_ready(&mut nt_handler, procs, pfilled);
+                if component_suspension_top_owns_dispatch(
+                    component_suspension_admitted_dispatch_id,
+                ) {
                     mark_wait_parked!(pi, resume_ip);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
@@ -17175,7 +17667,7 @@ pub(crate) unsafe fn service_sec_image(
             // Event/timer processing may have selected an older provider continuation while this
             // syscall was in flight. The nested provider dispatch has returned to its retained
             // rendezvous by this point, so only now may the executive resume the LIFO top.
-            let _ = provider_wait_drain_ready(&mut nt_handler, procs, pfilled);
+            let _ = component_suspension_drain_ready(&mut nt_handler, procs, pfilled);
             // ★ PHASE 3 — ONE reply shape for every serviced client syscall: resume the caller
             // through the reply object the KERNEL bound to it at its recv (`decode_reply` →
             // `replies[idx].bound_tcb`), then recv the next event re-registering that same object.
