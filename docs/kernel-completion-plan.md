@@ -24311,6 +24311,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     221-warning baseline. The next B3 implementation is the component-private timer dispatcher
     boundary exposed by the serialized reply-barrier run.
 
+    B3 provider Timer ownership-model checkpoint (2026-09-03, host green; executive wiring next):
+    `nt-provider-wait` now owns component-local `KTIMER` storage separately from the executive's
+    canonical Timer namespace. Both sides use generation-fenced identities; raw provider addresses
+    never become object IDs. The executive table models notification and synchronization timers,
+    relative/absolute deadlines, periodic re-arm, set/cancel return values, exact wait leases, and
+    two-phase retirement deferred until every waiter releases its lease. Six focused regressions
+    bring the provider-wait suite to 55 passing tests. Next generalize the Event-only provider wait
+    backend to typed dispatcher leases, publish win32k's local Timer identities through the existing
+    scalar ownership channel, and include their deadlines in the one-shot executive timer source.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

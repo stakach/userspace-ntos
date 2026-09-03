@@ -32,7 +32,7 @@ pub enum ProviderEventBacking {
 }
 
 impl ProviderEventBacking {
-    fn is_valid(self, provider: ProviderDomainIdentity) -> bool {
+    pub(crate) fn is_valid(self, provider: ProviderDomainIdentity) -> bool {
         match self {
             Self::Static {
                 instance_generation,
