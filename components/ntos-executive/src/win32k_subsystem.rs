@@ -11911,8 +11911,9 @@ const RTL_QUERY_REGISTRY_DIRECT: u32 = 0x0000_0020;
 const RTL_QUERY_REGISTRY_TABLE_SIZE: u64 = 56;
 const REG_NONE: u32 = 0;
 const REG_DWORD: u32 = 4;
-const WIN32K_REG_HANDLE_BASE: u64 = 0xFFFF_FF00_5732_0000;
-const WIN32K_REG_HANDLE_INDEX_MASK: u64 = 0x0000_FFFF;
+const WIN32K_REG_HANDLE_BASE: u64 = 0xFFFF_5700_0000_0000;
+const WIN32K_REG_HANDLE_TOKEN_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
+static WIN32K_REG_HANDLE_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 const WIN32K_REGISTRY_PATH_MAX: usize = 384;
 const WIN32K_REGISTRY_KEY_LEN: u64 = 0;
 const WIN32K_REGISTRY_VALUE_LEN: u64 = 4;
@@ -11984,21 +11985,21 @@ fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Result<u64, Win3
     if matches!(&target, Win32kRegHandleTarget::Empty) {
         return Err(target);
     }
+    let Ok(token) = WIN32K_REG_HANDLE_NEXT_TOKEN.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |next| (next <= WIN32K_REG_HANDLE_TOKEN_MASK).then_some(next + 1),
+    ) else {
+        return Err(target);
+    };
+    let handle = WIN32K_REG_HANDLE_BASE | token;
     let handles = win32k_reg_handles_mut();
-    for (idx, entry) in handles.iter_mut().enumerate() {
+    for entry in handles.iter_mut() {
         if matches!(&entry.target, Win32kRegHandleTarget::Empty) {
-            if idx as u64 > WIN32K_REG_HANDLE_INDEX_MASK {
-                return Err(target);
-            }
-            let handle = WIN32K_REG_HANDLE_BASE | idx as u64;
             *entry = Win32kRegHandle { handle, target };
             return Ok(handle);
         }
     }
-    if handles.len() as u64 > WIN32K_REG_HANDLE_INDEX_MASK {
-        return Err(target);
-    }
-    let handle = WIN32K_REG_HANDLE_BASE | handles.len() as u64;
     if handles.try_reserve(1).is_err() {
         return Err(target);
     }
@@ -12007,7 +12008,7 @@ fn register_win32k_reg_handle(target: Win32kRegHandleTarget) -> Result<u64, Win3
 }
 
 fn is_win32k_reg_handle(handle: u64) -> bool {
-    handle & !WIN32K_REG_HANDLE_INDEX_MASK == WIN32K_REG_HANDLE_BASE
+    handle & !WIN32K_REG_HANDLE_TOKEN_MASK == WIN32K_REG_HANDLE_BASE
 }
 
 fn take_win32k_reg_handle(handle: u64) -> Option<Win32kRegHandleTarget> {
@@ -12561,7 +12562,7 @@ pub(crate) unsafe fn service_registry_request(
 /// `NTSTATUS ZwOpenKey(PHANDLE KeyHandle, ACCESS_MASK, POBJECT_ATTRIBUTES)`. OBJECT_ATTRIBUTES x64:
 /// ObjectName (PUNICODE_STRING) at +0x10. Resolve win32k's registry imports to live registry/device
 /// targets; optional keys not present in CM's mounted hive fail with CM's exact status.
-extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u64) -> i32 {
+extern "win64" fn s_zw_open_key(handle_out: *mut u64, _desired_access: u64, obj_attr: u64) -> i32 {
     if handle_out.is_null() {
         return STATUS_ACCESS_VIOLATION_I32;
     }

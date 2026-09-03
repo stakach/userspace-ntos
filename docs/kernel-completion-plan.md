@@ -24732,6 +24732,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     generation contract for mutable non-SYSTEM keys. Do not encode the current single-adapter value
     count in win32k; close that boundary when the video projection becomes a device-ID keyed catalog.
 
+    B3 kernel registry handle authority tranche 14 (2026-09-04, host and freestanding green):
+    win32k's private registry projection no longer exposes reusable vector indices as kernel
+    handles. A dedicated noncanonical tag now carries a monotonically allocated 40-bit opaque token;
+    closed storage slots may be reused internally, but a stale handle cannot resolve to the new
+    lease placed in that slot. Token exhaustion and allocation failure fail closed before the target
+    is published, and a failed publication releases the exact CM lease.
+
+    Review adjustment: the provider must preserve NT5's kernel previous-mode semantics. The
+    win32k `Zw*` imports are trusted kernel callers, so Object Manager references are not rejected
+    merely because the access originally requested on the handle lacks `KEY_SET_VALUE`; ReactOS
+    depends on this when its font-removal path opens with `KEY_READ` and then deletes a value. This
+    bypass must not leak into the native user-mode `Nt*` path, whose process-local handles continue
+    to enforce their mapped grants. The next registry tranche is the durable mutation boundary:
+    bind `ZwSetValueKey` and `ZwDeleteValueKey` to the retained CM lease/physical identity and route
+    each write through the existing generation-checked SYSTEM-hive transaction. `ZwCreateKey` must
+    create only the final child, return exact existing/new disposition, and fail missing
+    intermediates; volatile and non-SYSTEM mutable hives remain explicit partial coverage until CM
+    owns those namespaces.
+
+    The older hosted-driver registry broker remains uncovered debt against the already accepted
+    CM lease invariant: it stores reusable path-only handles and sends generic SYSTEM create/set
+    mutations that bypass durable mounted-hive publication. Converge hosted drivers and win32k on
+    CM leases and durable mutations with separate authenticated provider handle namespaces, then
+    delete the path-only SYSTEM write route. Component capture/chunk framing may be shared, but the
+    current global registry staging window must become request/lane-private before multi-lane
+    registry dispatch can be enabled.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
