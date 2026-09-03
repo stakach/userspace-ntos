@@ -3623,6 +3623,21 @@ pub(crate) unsafe fn component_main(
 
     post_driver_entry(status, drv);
 
+    component_dispatch_loop(shared_va, drv, status_off, dispatch_label, dispatch)
+}
+
+/// Enter the persistent request loop for an already initialized component image.
+///
+/// Secondary execution lanes use this entry after receiving their own TCB, stack, IPC buffer,
+/// endpoint, and reply object. They share the primary lane's VSpace and initialized driver object,
+/// so they must not repeat allocator setup, support-image initialization, or `DriverEntry`.
+pub(crate) unsafe fn component_dispatch_loop(
+    shared_va: u64,
+    drv: u64,
+    status_off: u64,
+    dispatch_label: u64,
+    dispatch: unsafe fn(&DispatchReq) -> (i32, u64),
+) -> ! {
     // ★ THE PERSISTENT DISPATCH LOOP — ONE syscall.
     //
     // `call_on` publishes this dispatch's completion (the status/info are already in the shared

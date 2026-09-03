@@ -141,6 +141,7 @@ static mut WIN32K_HOSTED_HEAP_ARENAS: Option<Vec<HostedHeapArena>> = None;
 static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatalog> = None;
 static mut WIN32K_STACK_EVENT_ACTIVATIONS: Option<Vec<ProviderStackEventActivation>> = None;
 static mut WIN32K_DRIVER_STACK_EVENT_ACTIVATION: Option<ProviderStackEventActivation> = None;
+static WIN32K_DRIVER_OBJECT: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_STACK_ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static PROVIDER_LOCAL_EVENT_INITIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 const PROVIDER_DRIVER_ENTRY_DISPATCH_ID: u64 = u64::MAX;
@@ -13407,12 +13408,37 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
     )
 }
 
+/// Secondary win32k execution-lane entry.
+///
+/// The primary lane has already initialized the shared allocator, provider state, driver image,
+/// and `DRIVER_OBJECT`. A secondary lane owns a different physical TCB stack and IPC channel in the
+/// same VSpace, so it enters only the persistent dispatch loop.
+#[no_mangle]
+#[link_section = ".text.win32k_dispatch_lane_entry"]
+pub unsafe extern "C" fn win32k_dispatch_lane_entry(_unused: u64) -> ! {
+    let drv = WIN32K_DRIVER_OBJECT.load(Ordering::Acquire);
+    if drv == 0 {
+        print_str(b"[win32k-host] ERROR: secondary lane started before DriverEntry completed\n");
+        park();
+    }
+    crate::spawn_hosts::component_dispatch_loop(
+        WIN32K_SHARED_VADDR,
+        drv,
+        SH_REQ_STATUS,
+        W32_DISPATCH_LABEL,
+        win32k_dispatch,
+    )
+}
+
 /// win32k `post_driver_entry` (runs between DriverEntry and the FIRST `send_done`, exactly as the old
 /// inline entry): emit the DriverEntry-returned diagnostic, record the pool high-water, then
 /// establish win32k's bootstrap process context and enter the per-dispatch process context
 /// ([`setup_dispatch_context`]). The first real CSRSS dispatch rekeys the bootstrap process and
 /// creates the permanent desktop thread with CSRSS's exact process generation active.
-unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
+unsafe fn win32k_post_driver_entry(status: i32, drv: u64) {
+    if status == 0 {
+        WIN32K_DRIVER_OBJECT.store(drv, Ordering::Release);
+    }
     let driver_activation =
         core::ptr::read(core::ptr::addr_of!(WIN32K_DRIVER_STACK_EVENT_ACTIVATION));
     core::ptr::write(

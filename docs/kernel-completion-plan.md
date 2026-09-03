@@ -24154,6 +24154,14 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     context before waking a selected lane. Do not copy provider-global shared-page metadata and do
     not permit two lane TCBs to run win32k concurrently.
 
+    B3 secondary-entry checkpoint (2026-09-03): the generic component harness now exposes its
+    persistent dispatch loop independently from the one-time `DriverEntry` preamble. The primary
+    win32k lane publishes its initialized driver object only after successful `DriverEntry`; the new
+    `win32k_dispatch_lane_entry` fails closed if that publication is absent and otherwise enters the
+    same SSN dispatch loop without repeating allocator, provider, support-image, or driver
+    initialization. The freestanding executive check remains green at 221 warnings. Next give this
+    entry real shared-VSpace worker resources and register those bindings with the lane table.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional
