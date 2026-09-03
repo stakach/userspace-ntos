@@ -2424,7 +2424,7 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Syscall
         {
             let (status, out1, out2) =
-                crate::win32k_subsystem::service_registry_request(msg.m0, msg.m1);
+                crate::win32k_subsystem::service_registry_request(msg.m0, msg.m1, msg.m2, msg.m3);
             pump_reply_recv4_into!(ch, *reply_cap, msg, 3, status as u32 as u64, out1, out2, 0);
             continue;
         } else if label == crate::win32k_subsystem::W32_EVENT_LABEL

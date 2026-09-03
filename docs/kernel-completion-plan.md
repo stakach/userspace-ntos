@@ -24713,6 +24713,25 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the user-mode syscall decoder, and do not expose the PnP property broker directly to win32k:
     both groups require their proper kernel I/O/IRP boundary first.
 
+    B3 read-only kernel registry tranche 13 (2026-09-04, host and freestanding green):
+    `ZwQueryKey` and `ZwEnumerateValueKey` now operate on the exact Configuration Manager lease
+    retained by each win32k kernel handle. The broker asks CM for generation-fenced key statistics
+    or the indexed value, shares the native syscall path's `KEY_*_INFORMATION` and
+    `KEY_VALUE_*_INFORMATION` layout policy, and copies one complete pointer-free result through the
+    bounded registry window. The component preserves required length, minimum-header behavior,
+    `STATUS_BUFFER_TOO_SMALL`, partial-prefix `STATUS_BUFFER_OVERFLOW`, invalid-handle, invalid-class,
+    and `STATUS_NO_MORE_ENTRIES` results. `ZwQueryValueKey` now supports all five native value
+    information classes instead of fabricating only `KeyValuePartialInformation`; this covers the
+    real ReactOS font-substitution enumeration/query sequence.
+
+    All 21 `nt-config-client` tests and all 46 `nt-compat-exports` tests pass, and the freestanding
+    executive release build succeeds. Thirty-eight audited code imports remain. This is deliberately
+    partial for the separately published dynamic `HARDWARE\\DEVICEMAP\\VIDEO` target: named value
+    queries remain real, while key statistics and indexed enumeration return
+    `STATUS_NOT_SUPPORTED` until Configuration Manager provides the same generic lease and
+    generation contract for mutable non-SYSTEM keys. Do not encode the current single-adapter value
+    count in win32k; close that boundary when the video projection becomes a device-ID keyed catalog.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

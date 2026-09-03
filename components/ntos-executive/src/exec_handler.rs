@@ -1940,7 +1940,7 @@ fn trace_winlogon_post_lsa_registry(
 }
 
 #[derive(Clone, Copy, Default)]
-struct RegistryKeyStats {
+pub(crate) struct RegistryKeyStats {
     subkeys: u32,
     max_subkey_name_bytes: u32,
     max_subkey_class_bytes: u32,
@@ -2263,7 +2263,9 @@ fn committed_mapping_effective_page_protection(info: nt_address_space::VmBasicIn
 }
 
 impl RegistryKeyStats {
-    fn from_leased_key(information: &nt_config_client::LeasedHiveKeyInformation) -> Self {
+    pub(crate) fn from_leased_key(
+        information: &nt_config_client::LeasedHiveKeyInformation,
+    ) -> Self {
         Self {
             subkeys: information.subkey_count,
             max_subkey_name_bytes: information.max_subkey_name_bytes,
@@ -2393,13 +2395,76 @@ fn put_u32_le(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+pub(crate) fn build_registry_value_query_info(
+    info_class: u64,
+    name: &str,
+    value_type: u32,
+    data: &[u8],
+) -> Result<(alloc::vec::Vec<u8>, usize), u32> {
+    let layout = key_value_info_layout(info_class, name, data.len())?;
+    if layout.name_len > u32::MAX as usize || layout.data_len > u32::MAX as usize {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let mut information = alloc::vec![0; layout.total_len];
+    match info_class {
+        0 => {
+            put_u32_le(&mut information, 0x04, value_type);
+            put_u32_le(&mut information, 0x08, layout.name_len as u32);
+            let mut offset = 0x0c;
+            for unit in name.encode_utf16() {
+                information[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+                offset += 2;
+            }
+        }
+        1 | 3 => {
+            let data_offset = layout.data_offset.unwrap_or(u32::MAX as usize);
+            if data_offset > u32::MAX as usize {
+                return Err(STATUS_INSUFFICIENT_RESOURCES);
+            }
+            put_u32_le(&mut information, 0x04, value_type);
+            put_u32_le(&mut information, 0x08, data_offset as u32);
+            put_u32_le(&mut information, 0x0c, layout.data_len as u32);
+            put_u32_le(&mut information, 0x10, layout.name_len as u32);
+            let mut offset = 0x14;
+            for unit in name.encode_utf16() {
+                information[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+                offset += 2;
+            }
+            if let Some(data_offset) = layout.data_offset {
+                information[data_offset..data_offset + data.len()].copy_from_slice(data);
+            }
+        }
+        2 => {
+            put_u32_le(&mut information, 0x04, value_type);
+            put_u32_le(&mut information, 0x08, layout.data_len as u32);
+            information[0x0c..0x0c + data.len()].copy_from_slice(data);
+        }
+        4 => {
+            put_u32_le(&mut information, 0x00, value_type);
+            put_u32_le(&mut information, 0x04, layout.data_len as u32);
+            information[0x08..0x08 + data.len()].copy_from_slice(data);
+        }
+        _ => return Err(STATUS_INVALID_PARAMETER),
+    }
+    Ok((information, layout.minimum_len))
+}
+
+pub(crate) fn registry_value_query_information_size(
+    info_class: u64,
+    name: &str,
+    data_len: usize,
+) -> Result<(usize, usize), u32> {
+    let layout = key_value_info_layout(info_class, name, data_len)?;
+    Ok((layout.total_len, layout.minimum_len))
+}
+
 fn registry_query_leaf_name(path: &str) -> &str {
     path.rsplit('\\')
         .find(|component| !component.is_empty())
         .unwrap_or(path)
 }
 
-fn build_registry_key_query_info(
+pub(crate) fn build_registry_key_query_info(
     info_class: u32,
     full_path: &str,
     stats: RegistryKeyStats,

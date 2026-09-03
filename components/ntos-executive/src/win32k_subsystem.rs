@@ -1908,6 +1908,7 @@ const STATUS_NO_TOKEN_I32: i32 = 0xC000_007Cu32 as i32;
 const STATUS_ACCESS_VIOLATION_I32: i32 = 0xC000_0005u32 as i32;
 const STATUS_INVALID_HANDLE_I32: i32 = 0xC000_0008u32 as i32;
 const STATUS_BUFFER_TOO_SMALL_I32: i32 = 0xC000_0023u32 as i32;
+const STATUS_NOT_SUPPORTED_I32: i32 = 0xC000_00BBu32 as i32;
 const STATUS_INVALID_INFO_CLASS_I32: i32 = 0xC000_0003u32 as i32;
 const STATUS_UNKNOWN_REVISION_I32: i32 = 0xC000_0058u32 as i32;
 const STATUS_REVISION_MISMATCH_I32: i32 = 0xC000_0059u32 as i32;
@@ -11924,6 +11925,8 @@ const WIN32K_REGISTRY_VALUE_CAP: usize = WIN32K_REGISTRY_BYTES - WIN32K_REGISTRY
 const WIN32K_REGISTRY_OP_OPEN: u64 = 1;
 const WIN32K_REGISTRY_OP_CLOSE: u64 = 2;
 const WIN32K_REGISTRY_OP_QUERY_VALUE: u64 = 3;
+const WIN32K_REGISTRY_OP_QUERY_KEY: u64 = 4;
+const WIN32K_REGISTRY_OP_ENUMERATE_VALUE: u64 = 5;
 const _: () = assert!(
     WIN32K_REGISTRY_DATA_OFF + WIN32K_REGISTRY_VALUE_CAP as u64 <= WIN32K_REGISTRY_BYTES as u64
 );
@@ -12200,6 +12203,32 @@ unsafe fn win32k_registry_broker_call(op: u64, arg: u64) -> (i32, u64, u64) {
     (status as u32 as i32, out1, out2)
 }
 
+unsafe fn win32k_registry_broker_call_with_param(
+    op: u64,
+    arg: u64,
+    param: u64,
+) -> (i32, u64, u64) {
+    let (_label, status, out1, out2, _) =
+        crate::driver_launch::call_on4((W32_REGISTRY_LABEL << 12) | 3, op, arg, param, 0);
+    (status as u32 as i32, out1, out2)
+}
+
+unsafe fn win32k_registry_broker_call_with_params(
+    op: u64,
+    arg: u64,
+    param1: u64,
+    param2: u64,
+) -> (i32, u64, u64) {
+    let (_label, status, out1, out2, _) = crate::driver_launch::call_on4(
+        (W32_REGISTRY_LABEL << 12) | 4,
+        op,
+        arg,
+        param1,
+        param2,
+    );
+    (status as u32 as i32, out1, out2)
+}
+
 unsafe fn win32k_event_broker_call(
     op: u64,
     arg1: u64,
@@ -12357,7 +12386,12 @@ unsafe fn service_win32k_registry_query(
 
 /// Service one pointer-free registry request from the win32k component. This is called only by the
 /// executive-side component pump, which owns the Configuration Manager transport and handle table.
-pub(crate) unsafe fn service_registry_request(op: u64, arg: u64) -> (i32, u64, u64) {
+pub(crate) unsafe fn service_registry_request(
+    op: u64,
+    arg: u64,
+    param1: u64,
+    param2: u64,
+) -> (i32, u64, u64) {
     write_volatile(
         (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_VALUE_TYPE) as *mut u32,
         0,
@@ -12427,6 +12461,99 @@ pub(crate) unsafe fn service_registry_request(op: u64, arg: u64) -> (i32, u64, u
                 Err(status) => (status, 0, 0),
             }
         }
+        WIN32K_REGISTRY_OP_QUERY_KEY => {
+            let Some(handles) = win32k_reg_handles() else {
+                return (STATUS_INVALID_HANDLE_I32, 0, 0);
+            };
+            let Some(entry) = handles.iter().find(|entry| {
+                entry.handle == arg && !matches!(&entry.target, Win32kRegHandleTarget::Empty)
+            }) else {
+                return (STATUS_INVALID_HANDLE_I32, 0, 0);
+            };
+            let Win32kRegHandleTarget::SystemHive {
+                lease,
+                physical_path,
+            } = &entry.target
+            else {
+                return (STATUS_NOT_SUPPORTED_I32, 0, 0);
+            };
+            let information = match crate::config_manager_query_leased_system_hive_key_information(
+                *lease,
+            ) {
+                Ok(information) => information,
+                Err(status) => return (status, 0, 0),
+            };
+            let info_class = match u32::try_from(param1) {
+                Ok(info_class) => info_class,
+                Err(_) => return (STATUS_INVALID_PARAMETER_I32, 0, 0),
+            };
+            let (bytes, minimum_length) =
+                match crate::exec_handler::build_registry_key_query_info(
+                    info_class,
+                    physical_path,
+                    crate::exec_handler::RegistryKeyStats::from_leased_key(&information),
+                    information.class_name.as_deref(),
+                ) {
+                    Ok(result) => result,
+                    Err(status) => return (status as i32, 0, 0),
+                };
+            if bytes.len() > WIN32K_REGISTRY_VALUE_CAP {
+                return (STATUS_BUFFER_TOO_SMALL_I32, bytes.len() as u64, minimum_length as u64);
+            }
+            write_volatile(
+                (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *mut u32,
+                bytes.len() as u32,
+            );
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                write_volatile(
+                    (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF + index as u64) as *mut u8,
+                    byte,
+                );
+            }
+            (0, bytes.len() as u64, minimum_length as u64)
+        }
+        WIN32K_REGISTRY_OP_ENUMERATE_VALUE => {
+            let lease = match lookup_win32k_reg_service_query_target(arg) {
+                Some(Win32kRegServiceQueryTarget::SystemHive(lease)) => lease,
+                Some(Win32kRegServiceQueryTarget::VideoDeviceMap) => {
+                    return (STATUS_NOT_SUPPORTED_I32, 0, 0);
+                }
+                None => return (STATUS_INVALID_HANDLE_I32, 0, 0),
+            };
+            let index = match u32::try_from(param1) {
+                Ok(index) => index,
+                Err(_) => return (STATUS_INVALID_PARAMETER_I32, 0, 0),
+            };
+            let value = match crate::config_manager_enumerate_leased_system_hive_value(lease, index)
+            {
+                Ok(value) => value,
+                Err(status) => return (status, 0, 0),
+            };
+            let (bytes, minimum_length) =
+                match crate::exec_handler::build_registry_value_query_info(
+                    param2,
+                    &value.name,
+                    value.value_type,
+                    &value.data,
+                ) {
+                    Ok(result) => result,
+                    Err(status) => return (status as i32, 0, 0),
+                };
+            if bytes.len() > WIN32K_REGISTRY_VALUE_CAP {
+                return (STATUS_BUFFER_TOO_SMALL_I32, bytes.len() as u64, minimum_length as u64);
+            }
+            write_volatile(
+                (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_LEN) as *mut u32,
+                bytes.len() as u32,
+            );
+            for (offset, byte) in bytes.iter().copied().enumerate() {
+                write_volatile(
+                    (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF + offset as u64) as *mut u8,
+                    byte,
+                );
+            }
+            (0, bytes.len() as u64, minimum_length as u64)
+        }
         _ => (STATUS_INVALID_PARAMETER_I32, 0, 0),
     }
 }
@@ -12458,45 +12585,77 @@ extern "win64" fn s_zw_open_key(handle_out: *mut u64, _access: u64, obj_attr: u6
     0
 }
 
-unsafe fn emit_kvpi_bytes(
-    kvi: u64,
+unsafe fn copy_registry_information(
+    bytes: &[u8],
+    minimum_length: usize,
+    information: u64,
     length: u64,
-    result_len: *mut u32,
-    value_type: u32,
-    data: &[u8],
+    result_length: *mut u32,
 ) -> i32 {
-    let need = 0xC + data.len() as u64;
-    if !result_len.is_null() {
-        write_unaligned(result_len, need as u32);
+    if result_length.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
     }
-    if kvi == 0 || length < need {
-        return STATUS_BUFFER_OVERFLOW;
+    let Ok(length) = usize::try_from(length) else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    let Ok(required) = u32::try_from(bytes.len()) else {
+        return STATUS_INSUFFICIENT_RESOURCES_I32;
+    };
+    write_unaligned(result_length, required);
+    if length < minimum_length {
+        return STATUS_BUFFER_TOO_SMALL_I32;
     }
-    write_unaligned(kvi as *mut u32, 0);
-    write_unaligned((kvi + 4) as *mut u32, value_type);
-    write_unaligned((kvi + 8) as *mut u32, data.len() as u32);
-    let dst = kvi + 0xC;
-    for (idx, &byte) in data.iter().enumerate() {
-        write_unaligned((dst + idx as u64) as *mut u8, byte);
+    let copy_len = length.min(bytes.len());
+    if copy_len != 0 {
+        if information == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), information as *mut u8, copy_len);
     }
-    0
+    if length < bytes.len() {
+        STATUS_BUFFER_OVERFLOW
+    } else {
+        0
+    }
 }
 
 unsafe fn query_win32k_registry_value(
     handle: u64,
     name: &[u8],
+    info_class: u64,
     kvi: u64,
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    if !write_win32k_registry_ascii(WIN32K_REGISTRY_VALUE_LEN, WIN32K_REGISTRY_VALUE_OFF, name) {
+    if result_len.is_null() {
+        return STATUS_ACCESS_VIOLATION_I32;
+    }
+    let Ok(name) = core::str::from_utf8(name) else {
+        return STATUS_INVALID_PARAMETER_I32;
+    };
+    if crate::exec_handler::registry_value_query_information_size(info_class, name, 0).is_err() {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    if !write_win32k_registry_ascii(
+        WIN32K_REGISTRY_VALUE_LEN,
+        WIN32K_REGISTRY_VALUE_OFF,
+        name.as_bytes(),
+    ) {
         return STATUS_INVALID_PARAMETER_I32;
     }
     let (status, value_type, data_len) =
         win32k_registry_broker_call(WIN32K_REGISTRY_OP_QUERY_VALUE, handle);
     if status != 0 {
-        if status == STATUS_BUFFER_TOO_SMALL_I32 && !result_len.is_null() {
-            write_unaligned(result_len, 12u64.saturating_add(data_len) as u32);
+        if status == STATUS_BUFFER_TOO_SMALL_I32 {
+            if let Ok((required, _)) = crate::exec_handler::registry_value_query_information_size(
+                info_class,
+                name,
+                data_len as usize,
+            ) {
+                if let Ok(required) = u32::try_from(required) {
+                    write_unaligned(result_len, required);
+                }
+            }
         }
         return status;
     }
@@ -12504,7 +12663,17 @@ unsafe fn query_win32k_registry_value(
         (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8,
         data_len as usize,
     );
-    emit_kvpi_bytes(kvi, length, result_len, value_type as u32, data)
+    let (information, minimum_length) =
+        match crate::exec_handler::build_registry_value_query_info(
+            info_class,
+            name,
+            value_type as u32,
+            data,
+        ) {
+            Ok(result) => result,
+            Err(status) => return status as i32,
+        };
+    copy_registry_information(&information, minimum_length, kvi, length, result_len)
 }
 
 /// `NTSTATUS ZwQueryValueKey(HANDLE, PUNICODE_STRING ValueName, KEY_VALUE_INFORMATION_CLASS, PVOID
@@ -12517,16 +12686,86 @@ extern "win64" fn s_zw_query_value_key(
     length: u64,
     result_len: *mut u32,
 ) -> i32 {
-    const KEY_VALUE_PARTIAL_INFORMATION: u64 = 2;
-    if info_class != KEY_VALUE_PARTIAL_INFORMATION || value_name == 0 {
+    if value_name == 0 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
     unsafe {
         let Some(name) = read_unicode_string_ascii_lower(value_name) else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        query_win32k_registry_value(hkey, &name, kvi, length, result_len)
+        query_win32k_registry_value(hkey, &name, info_class, kvi, length, result_len)
     }
+}
+
+/// `NTSTATUS ZwQueryKey(HANDLE, KEY_INFORMATION_CLASS, PVOID, ULONG, PULONG)`.
+extern "win64" fn s_zw_query_key(
+    hkey: u64,
+    info_class: u64,
+    information: u64,
+    length: u64,
+    result_length: *mut u32,
+) -> i32 {
+    let (status, required, minimum) = unsafe {
+        win32k_registry_broker_call_with_param(WIN32K_REGISTRY_OP_QUERY_KEY, hkey, info_class)
+    };
+    if status != 0 {
+        if !result_length.is_null() && required <= u32::MAX as u64 {
+            unsafe { write_unaligned(result_length, required as u32) };
+        }
+        return status;
+    }
+    if required > WIN32K_REGISTRY_VALUE_CAP as u64
+        || required > u32::MAX as u64
+        || minimum > required
+    {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8,
+            required as usize,
+        )
+    };
+    unsafe { copy_registry_information(bytes, minimum as usize, information, length, result_length) }
+}
+
+/// `NTSTATUS ZwEnumerateValueKey(HANDLE, ULONG, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG,
+/// PULONG)` over the exact CM-owned value order for the leased SYSTEM key.
+extern "win64" fn s_zw_enumerate_value_key(
+    hkey: u64,
+    index: u64,
+    info_class: u64,
+    information: u64,
+    length: u64,
+    result_length: *mut u32,
+) -> i32 {
+    let (status, required, minimum) = unsafe {
+        win32k_registry_broker_call_with_params(
+            WIN32K_REGISTRY_OP_ENUMERATE_VALUE,
+            hkey,
+            index,
+            info_class,
+        )
+    };
+    if status != 0 {
+        if !result_length.is_null() && required <= u32::MAX as u64 {
+            unsafe { write_unaligned(result_length, required as u32) };
+        }
+        return status;
+    }
+    if required > WIN32K_REGISTRY_VALUE_CAP as u64
+        || required > u32::MAX as u64
+        || minimum > required
+    {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (WIN32K_REGISTRY_VADDR + WIN32K_REGISTRY_DATA_OFF) as *const u8,
+            required as usize,
+        )
+    };
+    unsafe { copy_registry_information(bytes, minimum as usize, information, length, result_length) }
 }
 
 fn win32k_registry_value_owned(handle: u64, name: &[u8]) -> Result<Option<(u32, Vec<u8>)>, i32> {
@@ -13629,6 +13868,11 @@ fn register_trampolines() -> bool {
     reg.bind("NtOpenKey", s_zw_open_key as usize as u64);
     reg.bind("ZwQueryValueKey", s_zw_query_value_key as usize as u64);
     reg.bind("NtQueryValueKey", s_zw_query_value_key as usize as u64);
+    reg.bind("ZwQueryKey", s_zw_query_key as usize as u64);
+    reg.bind(
+        "ZwEnumerateValueKey",
+        s_zw_enumerate_value_key as usize as u64,
+    );
     reg.bind(
         "RtlQueryRegistryValues",
         s_rtl_query_registry_values as usize as u64,
