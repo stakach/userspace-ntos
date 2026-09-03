@@ -4655,6 +4655,7 @@ pub(crate) unsafe fn service_win32k_ps_request(
     const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+    const STATUS_NO_YIELD_PERFORMED: i32 = 0x4000_0024u32 as i32;
 
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
@@ -4732,6 +4733,16 @@ pub(crate) unsafe fn service_win32k_ps_request(
             .release_kernel_object_pointer(object)
             .map(|references| (0, u64::from(references), 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
+        crate::win32k_subsystem::W32_PS_OP_YIELD_EXECUTION => {
+            let Some(tid) = handler.pm.tid_for_kernel_thread_object(object) else {
+                return (STATUS_INVALID_HANDLE, 0, 0, 0);
+            };
+            if !handler.pm.has_yield_candidate(tid) {
+                return (STATUS_NO_YIELD_PERFORMED, 0, 0, 0);
+            }
+            sel4_rt::yield_now();
+            (0, 0, 0, 0)
+        }
         _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
     }
 }

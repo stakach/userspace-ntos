@@ -24590,6 +24590,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     need equivalent typed reference routes before the permissive unknown-object tail can be deleted
     from the general Ob trampolines; do not mistake Ps coverage for completion of that cleanup.
 
+    B3 resident-image and scheduler-yield tranche 6 (2026-09-04, host and freestanding green):
+    `MmPageEntireDriver` now resolves an arbitrary address only through the dynamically registered
+    win32k/display-provider image catalog, verifies the address is inside the exact checked image
+    extent, and returns that image's resident base. Unknown addresses return `NULL`; the component
+    never probes unregistered memory or assumes a fixed display-driver identity. This matches the
+    resident-image branch of the NT contract because every hosted kernel provider is eagerly mapped
+    and currently nonpageable.
+
+    `ZwYieldExecution` now crosses the generation-checked Ps broker into the canonical Process
+    Manager, determines whether another hosted thread is actually Ready or Running, and invokes the
+    seL4 scheduler only when yielding can make progress. With no eligible peer it returns
+    `STATUS_NO_YIELD_PERFORMED` instead of reporting fabricated success. All 46
+    `nt-compat-exports` tests pass and the freestanding executive release build succeeds. Forty-five
+    audited code imports remain. Next extend the typed external-reference contract to primary Token
+    projections and delete the permissive unknown-object reference tail only after Device, Section,
+    File, and remaining dispatcher kinds have explicit routes.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

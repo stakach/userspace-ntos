@@ -1160,6 +1160,7 @@ pub const W32_PS_OP_LOOKUP_PROCESS: u64 = 4;
 pub const W32_PS_OP_LOOKUP_THREAD: u64 = 5;
 pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
 pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
+pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -2812,6 +2813,13 @@ extern "win64" fn s_ke_set_priority_thread(thread: u64, priority: i32) -> i32 {
         reject_ps_broker("thread priority update", status);
     }
     previous as u32 as i32
+}
+
+extern "win64" fn s_zw_yield_execution() -> i32 {
+    let (status, _, _, _) = unsafe {
+        win32k_ps_broker_call(W32_PS_OP_YIELD_EXECUTION, s_current_thread(), 0)
+    };
+    status
 }
 
 /// `PACCESS_TOKEN PsReferencePrimaryToken(PEPROCESS Process)` — reference the selected process's
@@ -4650,17 +4658,27 @@ extern "win64" fn s_zw_query_default_locale(user_profile: u8, locale_id: *mut u3
 }
 
 unsafe fn registered_kernel_image_bytes(base: u64) -> Option<&'static [u8]> {
-    let length = if base == WIN32K_CODE_VA {
-        WIN32K_IMAGE_BYTES as usize
+    registered_kernel_image_containing(base)
+        .filter(|(registered_base, _)| *registered_base == base)
+        .map(|(_, image)| image)
+}
+
+unsafe fn registered_kernel_image_containing(address: u64) -> Option<(u64, &'static [u8])> {
+    let (base, length) = if (WIN32K_CODE_VA..WIN32K_CODE_VA + WIN32K_IMAGE_BYTES).contains(&address)
+    {
+        (WIN32K_CODE_VA, WIN32K_IMAGE_BYTES as usize)
     } else {
         let records = GDI_DRIVER_RECORDS_PTR.load(Ordering::Acquire);
         let count = GDI_DRIVER_RECORDS_LEN.load(Ordering::Acquire);
-        let mut found = 0usize;
+        let mut found = (0u64, 0usize);
         if records != 0 {
             for index in 0..count {
                 let record = read_volatile(gdi_driver_record_ptr(records, index));
-                if record.image == base {
-                    found = record.image_len as usize;
+                let Some(end) = record.image.checked_add(u64::from(record.image_len)) else {
+                    continue;
+                };
+                if (record.image..end).contains(&address) {
+                    found = (record.image, record.image_len as usize);
                     break;
                 }
             }
@@ -4670,7 +4688,18 @@ unsafe fn registered_kernel_image_bytes(base: u64) -> Option<&'static [u8]> {
     if length == 0 {
         None
     } else {
-        Some(core::slice::from_raw_parts(base as *const u8, length))
+        Some((
+            base,
+            core::slice::from_raw_parts(base as *const u8, length),
+        ))
+    }
+}
+
+extern "win64" fn s_mm_page_entire_driver(address_within_section: u64) -> u64 {
+    unsafe {
+        registered_kernel_image_containing(address_within_section)
+            .map(|(base, _)| base)
+            .unwrap_or(0)
     }
 }
 
@@ -12948,6 +12977,11 @@ fn register_trampolines() -> bool {
         "RtlImageDirectoryEntryToData",
         s_rtl_image_directory_entry_to_data as usize as u64,
     );
+    reg.bind(
+        "MmPageEntireDriver",
+        s_mm_page_entire_driver as usize as u64,
+    );
+    reg.bind("ZwYieldExecution", s_zw_yield_execution as usize as u64);
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",
