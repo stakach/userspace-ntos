@@ -379,9 +379,19 @@ pub(crate) struct PendingProviderWaitDispatch {
     pub request: nt_provider_wait::ProviderWaitRequest,
     pub dispatch: nt_user_callback::DispatchContext,
     pub client: Win32kClientContext,
+    pub nested_user_callback: bool,
+    pub arg_snapshot_len: u32,
+    pub arg_snapshot: [u8; COMPLETED_ARG_SNAPSHOT_BYTES],
 }
 
 static mut PROVIDER_WAIT_PENDING_DISPATCH: Option<PendingProviderWaitDispatch> = None;
+
+pub(crate) enum ProviderWaitPumpCompletion {
+    Completed(CompletedWin32kDispatch),
+    Reparked(PendingProviderWaitDispatch),
+    UserCallbackSuspended,
+    Failed(i32),
+}
 static WIN32K_NEXT_DISPATCH_DEBUG_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// Times the bridge invariant was re-asserted, and times it had actually been CLOBBERED (a foreign
 /// writer had replaced the bridged `PWND`) — the durable proof this is a live correctness fix.
@@ -2741,6 +2751,164 @@ unsafe fn resume_suspended_user_callback_component(
     let pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
     retire_win32k_on_wall(&pr);
     pr
+}
+
+pub(crate) unsafe fn resume_suspended_provider_wait_component(
+    pending: PendingProviderWaitDispatch,
+    wait_id: u64,
+    status: i32,
+) -> ProviderWaitPumpCompletion {
+    let Some(request) = pending.request.validate().ok() else {
+        release_dispatch_output_stage(pending.dispatch);
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    };
+    if request.wait_id != wait_id
+        || request.owner.client_pi != pending.client.pi
+        || request.owner.client_generation != pending.client.generation
+        || request.owner.client_tid != pending.client.tid
+        || request.owner.client_badge != pending.client.badge
+        || request.owner.dispatch_id != pending.dispatch.dispatch_id
+    {
+        release_dispatch_output_stage(pending.dispatch);
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
+
+    let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
+    let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
+        as *mut nt_provider_wait::ProviderWaitSharedPage;
+    core::ptr::write_volatile(
+        core::ptr::addr_of_mut!((*page).result),
+        nt_provider_wait::ProviderWaitResult::completed(wait_id, status),
+    );
+
+    let client = pending.client;
+    for (offset, value) in [
+        (win32k_subsystem::SH_REQ_PROCESS_ID, client.pid),
+        (win32k_subsystem::SH_REQ_CLIENT_PI, client.pi as u64),
+        (win32k_subsystem::SH_REQ_GENERATION, client.generation),
+        (win32k_subsystem::SH_REQ_CLIENT_TEB, client.teb),
+        (win32k_subsystem::SH_REQ_THREAD_ID, client.tid),
+        (win32k_subsystem::SH_REQ_EPROCESS, client.eprocess),
+        (win32k_subsystem::SH_REQ_ETHREAD, client.ethread),
+        (
+            win32k_subsystem::SH_REQ_PROCESS_ROLE,
+            callback_process_role_code(client.process_role) as u64,
+        ),
+    ] {
+        core::ptr::write_volatile((sh + offset) as *mut u64, value);
+    }
+    if !win32k_subsystem::restore_current_context_for_user_callback_resume(
+        client.pi,
+        client.pid,
+        client.tid,
+        client.teb,
+        client.eprocess,
+        client.ethread,
+        callback_process_role_code(client.process_role) as u64,
+    ) {
+        release_dispatch_output_stage(pending.dispatch);
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
+
+    let channel = crate::spawn_hosts::PumpChannel {
+        fault_ep: WIN32K_FAULT_EP.load(Ordering::Relaxed),
+        pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
+        code_va: win32k_subsystem::WIN32K_CODE_VA,
+        image_frames: win32k_subsystem::WIN32K_IMAGE_FRAMES,
+        exec_code_va: win32k_subsystem::WIN32K_CODE_VA,
+        root_image_rights: 3,
+        root_image_map_owner: crate::WIN32K_ROOT_IMAGE_MAP_OWNER.load(Ordering::Relaxed) as u16,
+        shared_va: sh,
+        dispatch_label: win32k_subsystem::W32_DISPATCH_LABEL,
+        demand_cap: 8192,
+        trace_faults: false,
+        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
+        tcb: WIN32K_TCB.load(Ordering::Relaxed),
+        reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
+        client_pi: client.pi as u64,
+        client_generation: client.generation,
+        caps: crate::spawn_hosts::HostCaps {
+            dispatch_server: true,
+            kind: crate::spawn_hosts::ReqKind::Syscall,
+            client_attach: true,
+            usermode_callback: true,
+            provider_wait: true,
+            wide_arg_marshal: true,
+            assert_skip: true,
+            sparse_vspace: true,
+            io_port_faults: false,
+        },
+    };
+    let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+        pending.dispatch,
+    );
+    let pump = crate::spawn_hosts::component_pump_resume_provider_wait(&channel);
+    core::ptr::write(
+        core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
+        previous_dispatch,
+    );
+    retire_win32k_on_wall(&pump);
+
+    if pump.provider_wait_suspended {
+        return take_pending_provider_wait_dispatch()
+            .map(ProviderWaitPumpCompletion::Reparked)
+            .unwrap_or(ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32));
+    }
+    if pump.callback_suspended {
+        return ProviderWaitPumpCompletion::UserCallbackSuspended;
+    }
+    if !pump.completed {
+        release_dispatch_output_stage(pending.dispatch);
+        return ProviderWaitPumpCompletion::Failed(pump.status);
+    }
+    if pending.nested_user_callback
+        && !complete_nested_user_callback_dispatch(client, pending.dispatch.dispatch_id)
+    {
+        release_dispatch_output_stage(pending.dispatch);
+        return ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
+    }
+    unregister_user_callback_client_for_dispatch(
+        pending.dispatch.dispatch_id,
+        client.pi,
+        client.tid,
+        client.badge,
+    );
+
+    let mut completed = CompletedWin32kDispatch::new(
+        pending.dispatch.ssn,
+        pending.dispatch.args,
+        pending.dispatch.caller_sp,
+        pump.result,
+    );
+    if matches!(
+        pending.dispatch.ssn,
+        nt_user_callback::NTUSER_GET_MESSAGE_SSN | nt_user_callback::NTUSER_PEEK_MESSAGE_SSN
+    ) {
+        if let Some(stage) = pending.dispatch.output_stage {
+            match published_win32k_output_length(stage) {
+                Some(len) => {
+                    completed.provider_output_len = len;
+                    if len != 0 {
+                        let _ = completed
+                            .capture_arg_snapshot_from(stage.provider_pointer, u64::from(len));
+                    }
+                }
+                None => completed.provider_output_len = u32::MAX,
+            }
+            let _ = release_win32k_message_stage(stage);
+        } else {
+            completed.provider_output_len = u32::MAX;
+        }
+    } else {
+        if pending.arg_snapshot_len != 0 {
+            let len = pending.arg_snapshot_len as usize;
+            let _ = completed.set_arg_snapshot(&pending.arg_snapshot[..len]);
+        }
+        release_dispatch_output_stage(pending.dispatch);
+    }
+    ProviderWaitPumpCompletion::Completed(completed)
 }
 
 /// Cancel the callback that is PENDING (parked, not yet redirected into its client). A pending frame
@@ -6038,6 +6206,23 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
         let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
             as *const nt_provider_wait::ProviderWaitSharedPage;
         let request = core::ptr::read_volatile(core::ptr::addr_of!((*page).request));
+        let mut arg_snapshot = [0u8; COMPLETED_ARG_SNAPSHOT_BYTES];
+        let arg_snapshot_len = match ssn {
+            nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN => {
+                nt_user_callback::DISPATCH_MESSAGE_OUTPUT_BYTES as usize
+            }
+            win32k_subsystem::SSN_NT_USER_INITIALIZE => {
+                (completion_args[2] as usize).min(COMPLETED_ARG_SNAPSHOT_BYTES)
+            }
+            _ => 0,
+        };
+        if arg_snapshot_len != 0 {
+            core::ptr::copy_nonoverlapping(
+                win32k_subsystem::WIN32K_ARG_VADDR as *const u8,
+                arg_snapshot.as_mut_ptr(),
+                arg_snapshot_len,
+            );
+        }
         core::ptr::write(
             core::ptr::addr_of_mut!(PROVIDER_WAIT_PENDING_DISPATCH),
             Some(PendingProviderWaitDispatch {
@@ -6050,12 +6235,15 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
                     output_stage,
                 },
                 client,
+                nested_user_callback,
+                arg_snapshot_len: arg_snapshot_len as u32,
+                arg_snapshot,
             }),
         );
         PROVIDER_WAIT_LAST_PUMP_SUSPENDED.store(1, Ordering::Release);
     }
     if nested_user_callback {
-        if pr.callback_suspended {
+        if pr.callback_suspended || pr.provider_wait_suspended {
             return (pr.result, false);
         }
         if !pr.completed || !complete_nested_user_callback_dispatch(client, dispatch_id) {

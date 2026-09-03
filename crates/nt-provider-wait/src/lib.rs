@@ -250,13 +250,15 @@ impl<C> ProviderWaitStack<C> {
     }
 
     /// Re-arm the same native dispatch if provider execution blocks again before returning to its
-    /// receive loop. The retained native continuation never changes owners.
+    /// receive loop. The caller supplies the refreshed provider-side state while retaining the
+    /// same native continuation owner.
     pub fn rearm(
         &mut self,
         completed_wait_id: u64,
         next_wait_id: u64,
         admission_sequence: u64,
         owner: ProviderWaitOwner,
+        continuation: C,
     ) -> Result<(), ProviderWaitError> {
         if next_wait_id == 0 || admission_sequence == 0 || !owner.is_valid() {
             return Err(ProviderWaitError::InvalidIdentity);
@@ -278,6 +280,7 @@ impl<C> ProviderWaitStack<C> {
         frame.wait_id = next_wait_id;
         frame.admission_sequence = admission_sequence;
         frame.phase = ProviderWaitPhase::Waiting;
+        frame.continuation = continuation;
         Ok(())
     }
 
@@ -377,12 +380,12 @@ mod tests {
         stack.admit(201, 10, identity, 0xfeed).unwrap();
         stack.select(201, STATUS_WAIT_0).unwrap();
         stack.begin_resume(201).unwrap();
-        stack.rearm(201, 202, 11, identity).unwrap();
+        stack.rearm(201, 202, 11, identity, 0xbeef).unwrap();
         let frame = stack.top().unwrap();
         assert_eq!(frame.wait_id, 202);
         assert_eq!(frame.admission_sequence, 11);
         assert_eq!(frame.phase, ProviderWaitPhase::Waiting);
-        assert_eq!(frame.continuation, 0xfeed);
+        assert_eq!(frame.continuation, 0xbeef);
     }
 
     #[test]

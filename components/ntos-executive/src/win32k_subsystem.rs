@@ -3773,23 +3773,22 @@ extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
 extern "win64" fn s_ke_wait_for_single_object(
     event: u64,
     _wait_reason: u64,
-    _wait_mode: u64,
-    _alertable: u64,
-    _timeout: u64,
+    wait_mode: u64,
+    alertable: u64,
+    timeout: u64,
 ) -> i32 {
-    if event != 0 {
-        unsafe {
-            if nt_kernel_exec::kevent::kevent_read_state(event as *const u8)
-                && matches!(
-                    nt_kernel_exec::kevent::kevent_kind(event as *const u8),
-                    nt_kernel_exec::kevent::EventKind::Synchronization
-                )
-            {
-                nt_kernel_exec::kevent::kevent_reset(event as *mut u8);
-            }
-        }
+    let Some(object) = (unsafe { provider_wait_object_for_event(event) }) else {
+        return 0xC000_000Du32 as i32;
+    };
+    unsafe {
+        provider_wait_rendezvous(
+            core::slice::from_ref(&object),
+            nt_provider_wait::ProviderWaitType::Any,
+            wait_mode,
+            alertable,
+            timeout,
+        )
     }
-    0 // STATUS_WAIT_0
 }
 
 static PROVIDER_WAIT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -3932,6 +3931,12 @@ unsafe fn provider_wait_rendezvous(
                 if !restore_user_callback_request_context(wait_context) {
                     return 0xC000_000Du32 as i32;
                 }
+                write_volatile(
+                    core::ptr::addr_of_mut!((*(callback_frame
+                        as *mut nt_user_callback::CallbackFrame))
+                        .header),
+                    owner_header,
+                );
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
                 write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
                 outgoing = W32_DISPATCH_LABEL << 12;
@@ -3941,7 +3946,6 @@ unsafe fn provider_wait_rendezvous(
     }
 }
 
-#[allow(dead_code)]
 extern "win64" fn s_ke_wait_for_multiple_objects(
     count: u32,
     object_array: u64,
@@ -11970,6 +11974,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "KeWaitForSingleObject",
         s_ke_wait_for_single_object as usize as u64,
+    );
+    reg.bind(
+        "KeWaitForMultipleObjects",
+        s_ke_wait_for_multiple_objects as usize as u64,
     );
     reg.bind(
         "KeEnterCriticalRegion",

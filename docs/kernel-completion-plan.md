@@ -23904,13 +23904,27 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     no request is admitted until the executive can first reserve the native continuation and rotate
     `REPLY_MAIN` transactionally.
 
-    Next compose arbiter completion with the existing LIFO continuation stack and the component
-    pump's non-reply suspension mechanism. `KeWaitForSingleObject` and
-    `KeWaitForMultipleObjects` must cut over atomically to the dedicated shared-page request/resume
-    transport; delete the old immediate-success single-wait body in that same step. Provider waits
-    must participate in the same native/GUI/provider signal arbitration and timer deadline minimum,
-    and process/thread/provider teardown must cancel and release every exact wait before identity
-    reuse. Do not add an immediate-result fallback if admission or resume validation fails.
+    Provider Event-wait continuation cutover (2026-09-03, host/freestanding green; serialized
+    desktop gate pending): `KeWaitForSingleObject` and `KeWaitForMultipleObjects` now both enter the
+    canonical request/resume transport, and the old local-state immediate-success implementation is
+    deleted. Every accepted request first reserves a LIFO continuation containing the copied
+    request, exact provider/client/dispatch identity, native syscall reply object, trap context,
+    provider output lease, and bounded argument snapshot; only then does it acquire Event leases and
+    rotate `REPLY_MAIN`. Immediate, poll, delayed, and rejected admissions all complete through the
+    same retained continuation instead of a side reply path. Re-waits refresh provider-side state
+    while retaining the original native continuation, and nested dispatches restore the outer
+    shared owner header before provider execution continues.
+
+    Provider consumers now join the existing global native/GUI dispatcher admission sequence for
+    set and pulse, and their absolute/relative deadlines participate in the common timer minimum and
+    due-work drain. Completion resumes only the LIFO top, snapshots authoritative MSG/USERCONNECT
+    output before releasing its provider lease, performs the established client copyout and GUI
+    bookkeeping, then replies through the exact parked native reply object. A callback raised after
+    wait completion transfers that reply into the normal controlled callback redirect. Focused
+    validation remains green (`nt-provider-wait` 39/39 and `nt-kernel-exec` 241/241); the
+    freestanding executive check succeeds. Next run the serialized desktop gate, repair only
+    measured transport/lifecycle failures, then add exact process/thread/provider teardown
+    cancellation before declaring this wait boundary accepted. Do not add a fallback.
 
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic

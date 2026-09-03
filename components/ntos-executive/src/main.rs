@@ -3439,6 +3439,7 @@ const DELAY_TIMER_SOURCE_KEYED_RELEASE: u64 = 8;
 const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
 const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
 const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
+const DELAY_TIMER_SOURCE_PROVIDER_WAIT: u64 = 12;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -7376,7 +7377,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to eleven wake paths; one of them owns
 /// the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 11;
+pub(crate) const SUBDRAIN_N: usize = 12;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -17779,6 +17780,7 @@ unsafe fn delay_timer_next_deadline(
     let io_completion_deadline =
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline(now) };
     let user_timer_deadline = handler.user_timer_next_deadline(now);
+    let provider_wait_deadline = crate::service_sec_image::provider_wait_next_deadline(now);
     let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     let acpi_pci_route_recovery_deadline =
@@ -17792,6 +17794,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(keyed_release_deadline)
         .chain(io_completion_deadline)
         .chain(user_timer_deadline)
+        .chain(provider_wait_deadline)
         .chain(hosted_kernel_timer_deadline)
         .chain(hosted_driver_deadline)
         .chain(acpi_pci_route_recovery_deadline)
@@ -17810,6 +17813,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_IO_COMPLETION
     } else if user_timer_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_USER_TIMER
+    } else if provider_wait_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_PROVIDER_WAIT
     } else if hosted_kernel_timer_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER
     } else if hosted_driver_deadline == Some(deadline) {
@@ -18031,6 +18036,13 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(
             10,
             driver_launch::hosted_acpi_pci_route_recovery_wake_due(now_100ns)
+        )
+        + subdrain!(
+            11,
+            crate::service_sec_image::provider_wait_select_due(
+                handler,
+                nt_time_snapshot_at(now_100ns),
+            )
         )
         + watchdog_tick
 }
@@ -19758,18 +19770,35 @@ unsafe fn wait_wake_event_set(index: usize, handler: &mut ExecNtHandler) -> u64 
     let native_sequence = object_waiter_oldest_event_consumer_sequence(handler, index);
     let gui_sequence =
         crate::service_sec_image::gui_message_wait_oldest_unselected_sequence(id);
+    let provider_sequence =
+        crate::service_sec_image::provider_wait_oldest_event_consumer_sequence(handler, id);
     let oldest = nt_kernel_exec::oldest_dispatcher_wait_source(&[
         (nt_kernel_exec::DispatcherWaitSource::Native, native_sequence),
         (nt_kernel_exec::DispatcherWaitSource::Gui, gui_sequence),
+        (
+            nt_kernel_exec::DispatcherWaitSource::Provider,
+            provider_sequence,
+        ),
     ]);
-    if oldest == Some(nt_kernel_exec::DispatcherWaitSource::Gui) {
-        let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
-        wait_wake_dispatcher_set(handler)
-    } else {
-        let woken = wait_wake_dispatcher_set(handler);
-        let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
-        woken
+    let mut woken = 0;
+    match oldest {
+        Some(nt_kernel_exec::DispatcherWaitSource::Gui) => {
+            let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
+            woken += wait_wake_dispatcher_set(handler);
+            woken += crate::service_sec_image::provider_wait_select_ready(handler);
+        }
+        Some(nt_kernel_exec::DispatcherWaitSource::Provider) => {
+            woken += crate::service_sec_image::provider_wait_select_ready(handler);
+            woken += wait_wake_dispatcher_set(handler);
+            let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
+        }
+        _ => {
+            woken += wait_wake_dispatcher_set(handler);
+            let _ = crate::service_sec_image::gui_message_wait_select_level(handler, id);
+            woken += crate::service_sec_image::provider_wait_select_ready(handler);
+        }
     }
+    woken
 }
 
 /// Complete one pulse selection before the transient Event state can reach a late waiter.
@@ -19778,15 +19807,27 @@ unsafe fn wait_wake_event_pulse(index: usize, handler: &mut ExecNtHandler) -> u6
         let native_sequence = object_waiter_oldest_event_consumer_sequence(handler, index);
         let gui_sequence =
             crate::service_sec_image::gui_message_wait_oldest_unselected_sequence(id);
+        let provider_sequence =
+            crate::service_sec_image::provider_wait_oldest_event_consumer_sequence(handler, id);
         let oldest = nt_kernel_exec::oldest_dispatcher_wait_source(&[
             (nt_kernel_exec::DispatcherWaitSource::Native, native_sequence),
             (nt_kernel_exec::DispatcherWaitSource::Gui, gui_sequence),
+            (
+                nt_kernel_exec::DispatcherWaitSource::Provider,
+                provider_sequence,
+            ),
         ]);
-        if oldest == Some(nt_kernel_exec::DispatcherWaitSource::Gui) {
-            let selected = crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
-            if selected {
-                let _ = handler.events.reset_existing(index as u64);
+        match oldest {
+            Some(nt_kernel_exec::DispatcherWaitSource::Gui) => {
+                let selected = crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
+                if selected {
+                    let _ = handler.events.reset_existing(index as u64);
+                }
             }
+            Some(nt_kernel_exec::DispatcherWaitSource::Provider) => {
+                let _ = crate::service_sec_image::provider_wait_select_ready(handler);
+            }
+            _ => {}
         }
     }
     let result = wait_wake_dispatcher_pulse(index, handler);
@@ -19795,7 +19836,9 @@ unsafe fn wait_wake_event_pulse(index: usize, handler: &mut ExecNtHandler) -> u6
             crate::service_sec_image::gui_message_wait_select_pulse(handler, id);
         }
     }
-    result.woken
+    result
+        .woken
+        .saturating_add(crate::service_sec_image::provider_wait_select_ready(handler))
 }
 
 fn object_waiter_ready_selection(

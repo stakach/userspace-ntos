@@ -133,6 +133,24 @@ static mut SERVICE_GENERIC_SECTIONS_WORK: GenericSectionTable = GenericSectionTa
 static mut SERVICE_DELAY_QUEUE_WORK: nt_delay_execution::Queue = nt_delay_execution::Queue::new();
 static SERVICE_DELAY_DRAIN_HANDLER: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_DRAIN_QUEUE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct ProviderWaitNativeContinuation {
+    pending: win32k_glue::PendingProviderWaitDispatch,
+    reply_cap: u64,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+}
+
+const PROVIDER_WAIT_MAX_CONTINUATION_DEPTH: usize = 64;
+static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderEventWaitArbiter<
+    nt_kernel_exec::EventLeaseId,
+> = nt_provider_wait::ProviderEventWaitArbiter::new();
+static mut PROVIDER_WAIT_CONTINUATIONS: nt_provider_wait::ProviderWaitStack<
+    ProviderWaitNativeContinuation,
+> = nt_provider_wait::ProviderWaitStack::new(PROVIDER_WAIT_MAX_CONTINUATION_DEPTH);
 static SERVICE_DELAY_NESTED_DRAINS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_CRASH_PARKED_MASK: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RUNNABLE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -905,9 +923,7 @@ unsafe fn gui_message_wait_reassign_selected(event: nt_kernel_exec::EventObjectI
     let Some(index) = waiters
         .iter()
         .enumerate()
-        .filter(|(_, waiter)| {
-            waiter.used && waiter.queue_event == event && !waiter.event_selected
-        })
+        .filter(|(_, waiter)| waiter.used && waiter.queue_event == event && !waiter.event_selected)
         .min_by_key(|(_, waiter)| waiter.sequence)
         .map(|(index, _)| index)
     else {
@@ -923,9 +939,7 @@ pub(crate) unsafe fn gui_message_wait_oldest_unselected_sequence(
 ) -> Option<u64> {
     (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS))
         .iter()
-        .filter(|waiter| {
-            waiter.used && waiter.queue_event == event && !waiter.event_selected
-        })
+        .filter(|waiter| waiter.used && waiter.queue_event == event && !waiter.event_selected)
         .map(|waiter| waiter.sequence)
         .min()
 }
@@ -1044,9 +1058,7 @@ unsafe fn gui_message_wait_select_level_inner(
     let Some(index) = waiters
         .iter()
         .enumerate()
-        .filter(|(_, waiter)| {
-            waiter.used && waiter.queue_event == event && !waiter.event_selected
-        })
+        .filter(|(_, waiter)| waiter.used && waiter.queue_event == event && !waiter.event_selected)
         .min_by_key(|(_, waiter)| waiter.sequence)
         .map(|(index, _)| index)
     else {
@@ -1081,9 +1093,7 @@ pub(crate) unsafe fn gui_message_wait_select_pulse(
     let Some(index) = waiters
         .iter()
         .enumerate()
-        .filter(|(_, waiter)| {
-            waiter.used && waiter.queue_event == event && !waiter.event_selected
-        })
+        .filter(|(_, waiter)| waiter.used && waiter.queue_event == event && !waiter.event_selected)
         .min_by_key(|(_, waiter)| waiter.sequence)
         .map(|(index, _)| index)
     else {
@@ -1097,10 +1107,7 @@ pub(crate) unsafe fn gui_message_wait_select_pulse(
     true
 }
 
-unsafe fn gui_message_wait_select_published(
-    nt_handler: &mut ExecNtHandler,
-    slot: usize,
-) -> bool {
+unsafe fn gui_message_wait_select_published(nt_handler: &mut ExecNtHandler, slot: usize) -> bool {
     let Some(waiter) = gui_message_waiter_record(slot) else {
         return false;
     };
@@ -1121,6 +1128,361 @@ unsafe fn steal_main_reply() -> Option<u64> {
     wait_reply_pool_mark_used(index);
     REPLY_MAIN_SLOT.store(cap, Ordering::Relaxed);
     Some(stolen)
+}
+
+fn provider_wait_status_for_error<E>(error: nt_provider_wait::ProviderEventWaitError<E>) -> i32 {
+    match error {
+        nt_provider_wait::ProviderEventWaitError::NoCapacity => 0xC000_009Au32 as i32,
+        _ => 0xC000_000Du32 as i32,
+    }
+}
+
+fn provider_wait_expected_owner(
+    pending: win32k_glue::PendingProviderWaitDispatch,
+) -> Option<nt_provider_wait::ProviderWaitOwner> {
+    let identity = crate::current_win32k_provider_domain()?;
+    let owner = nt_provider_wait::ProviderWaitOwner {
+        provider_domain: identity.domain,
+        provider_generation: identity.generation,
+        client_pi: pending.client.pi,
+        client_generation: pending.client.generation,
+        client_tid: pending.client.tid,
+        client_badge: pending.client.badge,
+        dispatch_id: pending.dispatch.dispatch_id,
+    };
+    owner.is_valid().then_some(owner)
+}
+
+enum ProviderWaitRuntimeOutcome {
+    Parked,
+    Completed {
+        continuation: ProviderWaitNativeContinuation,
+        dispatch: win32k_glue::CompletedWin32kDispatch,
+    },
+    UserCallbackSuspended(ProviderWaitNativeContinuation),
+    Failed {
+        continuation: ProviderWaitNativeContinuation,
+        status: i32,
+    },
+}
+
+unsafe fn provider_wait_resume_top(
+    nt_handler: &mut ExecNtHandler,
+) -> Option<ProviderWaitRuntimeOutcome> {
+    loop {
+        let resume = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS)).top_resume()?;
+        let frame = (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+            .top()?
+            .clone();
+        if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            .begin_resume(resume.wait_id)
+            .is_err()
+        {
+            return Some(ProviderWaitRuntimeOutcome::Failed {
+                continuation: frame.continuation,
+                status: 0xC000_0001u32 as i32,
+            });
+        }
+        match win32k_glue::resume_suspended_provider_wait_component(
+            frame.continuation.pending,
+            resume.wait_id,
+            resume.status,
+        ) {
+            win32k_glue::ProviderWaitPumpCompletion::Completed(dispatch) => {
+                let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                    .complete_dispatch(resume.wait_id, frame.owner)
+                    .ok()?;
+                return Some(ProviderWaitRuntimeOutcome::Completed {
+                    continuation: completed.continuation,
+                    dispatch,
+                });
+            }
+            win32k_glue::ProviderWaitPumpCompletion::UserCallbackSuspended => {
+                let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                    .complete_dispatch(resume.wait_id, frame.owner)
+                    .ok()?;
+                return Some(ProviderWaitRuntimeOutcome::UserCallbackSuspended(
+                    completed.continuation,
+                ));
+            }
+            win32k_glue::ProviderWaitPumpCompletion::Failed(status) => {
+                let completed = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                    .complete_dispatch(resume.wait_id, frame.owner)
+                    .ok()?;
+                return Some(ProviderWaitRuntimeOutcome::Failed {
+                    continuation: completed.continuation,
+                    status,
+                });
+            }
+            win32k_glue::ProviderWaitPumpCompletion::Reparked(next) => {
+                let Some(next_owner) = provider_wait_expected_owner(next) else {
+                    return Some(ProviderWaitRuntimeOutcome::Failed {
+                        continuation: frame.continuation,
+                        status: 0xC000_000Du32 as i32,
+                    });
+                };
+                let next_wait_id = next.request.header.wait_id;
+                let sequence = next_dispatcher_wait_sequence();
+                let mut next_continuation = frame.continuation;
+                next_continuation.pending = next;
+                if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                    .rearm(
+                        resume.wait_id,
+                        next_wait_id,
+                        sequence,
+                        next_owner,
+                        next_continuation,
+                    )
+                    .is_err()
+                {
+                    return Some(ProviderWaitRuntimeOutcome::Failed {
+                        continuation: frame.continuation,
+                        status: 0xC000_000Du32 as i32,
+                    });
+                }
+                let admission = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
+                    nt_handler,
+                    &next.request,
+                    next_owner,
+                    sequence,
+                    nt_time_snapshot(),
+                );
+                match admission {
+                    Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
+                        return Some(ProviderWaitRuntimeOutcome::Parked);
+                    }
+                    Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied {
+                        wait_id,
+                        status,
+                    }) => {
+                        let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                            .select(wait_id, status);
+                    }
+                    Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
+                        let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                            .select(wait_id, nt_provider_wait::STATUS_TIMEOUT);
+                    }
+                    Err(error) => {
+                        let _ = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                            .cancel(next_wait_id, provider_wait_status_for_error(error));
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn provider_wait_oldest_event_consumer_sequence(
+    nt_handler: &ExecNtHandler,
+    id: nt_kernel_exec::EventObjectId,
+) -> Option<u64> {
+    let object = nt_provider_wait::ProviderWaitObject::new(
+        nt_provider_wait::ProviderWaitObjectType::Event,
+        id.0.slot().checked_add(1)?,
+        u64::from(id.0.generation().0),
+    );
+    unsafe {
+        (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER))
+            .oldest_event_consumer_sequence(nt_handler, object)
+    }
+}
+
+pub(crate) unsafe fn provider_wait_select_ready(nt_handler: &mut ExecNtHandler) -> u64 {
+    let mut selected = 0;
+    while let Some(completion) =
+        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_ready(nt_handler)
+    {
+        if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            .select(completion.wait_id, completion.status)
+            .is_err()
+        {
+            panic!("provider wait arbiter selected an unowned continuation");
+        }
+        selected += 1;
+    }
+    selected
+}
+
+pub(crate) fn provider_wait_next_deadline(now: nt_delay_execution::TimeSnapshot) -> Option<u64> {
+    unsafe { (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).next_deadline(now) }
+}
+
+pub(crate) unsafe fn provider_wait_select_due(
+    nt_handler: &mut ExecNtHandler,
+    now: nt_delay_execution::TimeSnapshot,
+) -> u64 {
+    let mut selected = 0;
+    while let Some(completion) =
+        (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).pop_due(nt_handler, now)
+    {
+        if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+            .select(completion.wait_id, completion.status)
+            .is_err()
+        {
+            panic!("provider wait timeout selected an unowned continuation");
+        }
+        selected += 1;
+    }
+    selected
+}
+
+unsafe fn provider_wait_admit_current(
+    nt_handler: &mut ExecNtHandler,
+    pending: win32k_glue::PendingProviderWaitDispatch,
+    reply: nt_syscall_abi::ParkedSyscallReply,
+    resume_ip: u64,
+    resume_sp: u64,
+    resume_flags: u64,
+) -> bool {
+    let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+    let Some((fresh_index, fresh_reply)) = wait_reply_pool_find_free() else {
+        return false;
+    };
+    if active_reply == 0 || fresh_reply == active_reply {
+        return false;
+    }
+    let Some(owner) = provider_wait_expected_owner(pending) else {
+        return false;
+    };
+    let wait_id = pending.request.header.wait_id;
+    let sequence = next_dispatcher_wait_sequence();
+    let continuation = ProviderWaitNativeContinuation {
+        pending,
+        reply_cap: active_reply,
+        reply,
+        resume_ip,
+        resume_sp,
+        resume_flags,
+    };
+    if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+        .admit(wait_id, sequence, owner, continuation)
+        .is_err()
+    {
+        return false;
+    }
+    match (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
+        nt_handler,
+        &pending.request,
+        owner,
+        sequence,
+        nt_time_snapshot(),
+    ) {
+        Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {}
+        Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied { wait_id, status }) => {
+            if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                .select(wait_id, status)
+                .is_err()
+            {
+                panic!("provider wait immediate completion lost its continuation");
+            }
+        }
+        Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
+            if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                .select(wait_id, nt_provider_wait::STATUS_TIMEOUT)
+                .is_err()
+            {
+                panic!("provider wait poll completion lost its continuation");
+            }
+        }
+        Err(error) => {
+            if (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_CONTINUATIONS))
+                .cancel(wait_id, provider_wait_status_for_error(error))
+                .is_err()
+            {
+                panic!("provider wait rejection lost its continuation");
+            }
+        }
+    }
+    wait_reply_pool_mark_used(fresh_index);
+    REPLY_MAIN_SLOT.store(fresh_reply, Ordering::Relaxed);
+    true
+}
+
+unsafe fn provider_wait_drain_ready(
+    nt_handler: &mut ExecNtHandler,
+    procs: &mut [ProcExec],
+    pfilled: &mut [[u64; 512]],
+) -> u64 {
+    let mut drained = 0;
+    loop {
+        let Some(outcome) = provider_wait_resume_top(nt_handler) else {
+            break;
+        };
+        match outcome {
+            ProviderWaitRuntimeOutcome::Parked => break,
+            ProviderWaitRuntimeOutcome::Completed {
+                continuation,
+                dispatch,
+            } => {
+                let pi = continuation.pending.client.pi as usize;
+                let copied = if let Some(process) = procs.get(pi) {
+                    process.pml4 != 0
+                        && process_completed_user_callback_outer_dispatch(
+                            nt_handler,
+                            pi,
+                            process.pml4,
+                            continuation.pending.client.badge,
+                            continuation.pending.client.tid,
+                            dispatch,
+                            &mut pfilled[pi],
+                            process.faults as usize,
+                            process.scratch_base,
+                        )
+                } else {
+                    false
+                };
+                let status = if copied {
+                    dispatch.status
+                } else {
+                    0xC000_0001u32 as u64
+                };
+                reply_parked_syscall(continuation.reply_cap, continuation.reply, status);
+                release_reply_pool_cap(continuation.reply_cap);
+                drained += 1;
+            }
+            ProviderWaitRuntimeOutcome::UserCallbackSuspended(continuation) => {
+                let client = continuation.pending.client;
+                if win32k_glue::begin_controlled_user_callback_redirect(
+                    client,
+                    continuation.resume_ip,
+                    continuation.resume_sp,
+                    continuation.resume_flags,
+                ) {
+                    client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0);
+                } else {
+                    let cancelled = win32k_glue::cancel_suspended_user_callback();
+                    reply_parked_syscall(
+                        continuation.reply_cap,
+                        continuation.reply,
+                        cancelled.0 as u32 as u64,
+                    );
+                }
+                release_reply_pool_cap(continuation.reply_cap);
+                drained += 1;
+            }
+            ProviderWaitRuntimeOutcome::Failed {
+                continuation,
+                status,
+            } => {
+                reply_parked_syscall(
+                    continuation.reply_cap,
+                    continuation.reply,
+                    status as u32 as u64,
+                );
+                release_reply_pool_cap(continuation.reply_cap);
+                drained += 1;
+            }
+        }
+    }
+    drained
+}
+
+fn provider_wait_top_owns_dispatch(dispatch_id: u64) -> bool {
+    unsafe {
+        (&*core::ptr::addr_of!(PROVIDER_WAIT_CONTINUATIONS))
+            .top()
+            .is_some_and(|frame| frame.owner.dispatch_id == dispatch_id)
+    }
 }
 
 fn trace_deferred_user_callback_return_refusal(reason: &[u8]) {
@@ -1489,8 +1851,7 @@ unsafe fn drain_deferred_user_callback_returns(
             print_str(b"\n");
         } else if outer_dispatch_completed {
             pfilled[current_pi] = *current_filled_pages;
-            let (_, _, safe) =
-                drain_selected_gui_event_signals(nt_handler, pfilled, procs);
+            let (_, _, safe) = drain_selected_gui_event_signals(nt_handler, pfilled, procs);
             if !safe {
                 print_str(b"[gui-msg-wait] deferred callback drain aborted unsafe redrive\n");
             }
@@ -1694,11 +2055,8 @@ unsafe fn trace_progress_stall_deferral(
             let _ = defer_quiesce_for_pending_hosted_ipc(nt_handler, b"progress-stall");
         }
         StallDeferralSnapshot::ExplorerChrome { .. } => {
-            let _ = defer_quiesce_for_interactive_shell_chrome(
-                nt_handler,
-                crash_parked,
-                wait_parked,
-            );
+            let _ =
+                defer_quiesce_for_interactive_shell_chrome(nt_handler, crash_parked, wait_parked);
         }
     }
 }
@@ -2873,22 +3231,20 @@ pub(crate) unsafe fn service_win32k_event_request(
             .provider_retain_event_pointer(arg1)
             .map(|count| (0, count as u64, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_SET => {
-            match handler.provider_set_event(arg1) {
-                Ok((previous, _id, index, _kind)) => {
-                    if !previous {
-                        let _ = crate::wait_wake_event_set(index, handler);
-                        let current = handler
-                            .provider_read_event(arg1)
-                            .expect("newly signalled provider Event lost its canonical identity");
-                        (0, u64::from(previous), u64::from(current), 0)
-                    } else {
-                        (0, 1, 1, 0)
-                    }
+        crate::win32k_subsystem::W32_EVENT_OP_SET => match handler.provider_set_event(arg1) {
+            Ok((previous, _id, index, _kind)) => {
+                if !previous {
+                    let _ = crate::wait_wake_event_set(index, handler);
+                    let current = handler
+                        .provider_read_event(arg1)
+                        .expect("newly signalled provider Event lost its canonical identity");
+                    (0, u64::from(previous), u64::from(current), 0)
+                } else {
+                    (0, 1, 1, 0)
                 }
-                Err(status) => (status as i32, 0, 0, 0),
             }
-        }
+            Err(status) => (status as i32, 0, 0, 0),
+        },
         crate::win32k_subsystem::W32_EVENT_OP_RESET => handler
             .provider_reset_event(arg1)
             .map(|previous| (0, u64::from(previous), 0, 0))
@@ -2897,22 +3253,20 @@ pub(crate) unsafe fn service_win32k_event_request(
             .provider_clear_event(arg1)
             .map(|()| (0, 0, 0, 0))
             .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_EVENT_OP_PULSE => {
-            match handler.provider_pulse_event(arg1) {
-                Ok((previous, _id, index, _kind)) => {
-                    if previous {
-                        handler
-                            .provider_reset_event(arg1)
-                            .expect("provider pulse lost its canonical Event identity");
-                        (0, 1, 0, 0)
-                    } else {
-                        let _ = crate::wait_wake_event_pulse(index, handler);
-                        (0, 0, 0, 0)
-                    }
+        crate::win32k_subsystem::W32_EVENT_OP_PULSE => match handler.provider_pulse_event(arg1) {
+            Ok((previous, _id, index, _kind)) => {
+                if previous {
+                    handler
+                        .provider_reset_event(arg1)
+                        .expect("provider pulse lost its canonical Event identity");
+                    (0, 1, 0, 0)
+                } else {
+                    let _ = crate::wait_wake_event_pulse(index, handler);
+                    (0, 0, 0, 0)
                 }
-                Err(status) => (status as i32, 0, 0, 0),
             }
-        }
+            Err(status) => (status as i32, 0, 0, 0),
+        },
         crate::win32k_subsystem::W32_EVENT_OP_READ => handler
             .provider_read_event(arg1)
             .map(|signaled| (0, u64::from(signaled), 0, 0))
@@ -6961,19 +7315,11 @@ pub(crate) unsafe fn service_sec_image(
                 last_progress_t = now;
                 let _ = stall_deferrals.observe_progress(ep);
             } else if now.wrapping_sub(last_progress_t) >= STALL_BUDGET_100NS {
-                let deferral = progress_stall_deferral_snapshot(
-                    &nt_handler,
-                    crash_parked,
-                    wait_parked,
-                );
+                let deferral =
+                    progress_stall_deferral_snapshot(&nt_handler, crash_parked, wait_parked);
                 if deferral.is_some() && stall_deferrals.grant(ep, deferral.unwrap()) {
                     let snapshot = deferral.unwrap();
-                    trace_progress_stall_deferral(
-                        snapshot,
-                        &nt_handler,
-                        crash_parked,
-                        wait_parked,
-                    );
+                    trace_progress_stall_deferral(snapshot, &nt_handler, crash_parked, wait_parked);
                     last_progress_t = now;
                 } else {
                     dump_lsa_readiness_quiesce(
@@ -9819,7 +10165,9 @@ pub(crate) unsafe fn service_sec_image(
                                     procs,
                                 );
                                 if !safe {
-                                    print_str(b"[gui-msg-wait] callback drain aborted unsafe redrive\n");
+                                    print_str(
+                                        b"[gui-msg-wait] callback drain aborted unsafe redrive\n",
+                                    );
                                 }
                             }
                             drain_deferred_user_callback_returns(
@@ -9899,6 +10247,8 @@ pub(crate) unsafe fn service_sec_image(
             // onto the caller's bound `REPLY_MAIN`. Every reply takes the bound object now, so there
             // is nothing left to steer. See the reply tail at the bottom of the syscall arm.)
             let mut redirected_user_callback = false;
+            let mut provider_wait_park_request = false;
+            let mut provider_wait_admitted_dispatch_id = 0;
             let mut redirected_user_apc = false;
             let mut redirected_context_continue = false;
             let mut active_callback_bad_resume = false;
@@ -10410,7 +10760,8 @@ pub(crate) unsafe fn service_sec_image(
                         print_u64(
                             nt_handler
                                 .thread_runtime
-                                .has_process(process_index as usize) as u64,
+                                .has_process(process_index as usize)
+                                as u64,
                         );
                         print_str(b"\n");
                         if drop_reply {
@@ -15146,8 +15497,28 @@ pub(crate) unsafe fn service_sec_image(
                     r
                 };
                 let callback_suspended = win32k_glue::take_user_callback_pump_suspended();
+                if let Some(pending) = win32k_glue::take_pending_provider_wait_dispatch() {
+                    provider_wait_admitted_dispatch_id = pending.dispatch.dispatch_id;
+                    provider_wait_park_request = provider_wait_admit_current(
+                        &mut nt_handler,
+                        pending,
+                        parked_syscall_reply,
+                        resume_ip,
+                        sp,
+                        flags,
+                    );
+                    assert!(
+                        provider_wait_park_request,
+                        "provider wait could not reserve its native continuation"
+                    );
+                    // Reuse the existing post-dispatch suppression gates. The provider wait owns
+                    // the native reply now; this is not a user callback and is intercepted before
+                    // the common reply tail.
+                    redirected_user_callback = true;
+                }
                 let direct_provider_output_len = if ok
                     && !callback_suspended
+                    && !provider_wait_park_request
                     && msg_returns_to_client
                     && message_output_stage.is_some()
                 {
@@ -15179,6 +15550,7 @@ pub(crate) unsafe fn service_sec_image(
                 // continuation returns; the completed-dispatch hook samples that final MSG.
                 if dialog_modal_dispatch
                     && !callback_suspended
+                    && !provider_wait_park_request
                     && m0 != nt_user_callback::NTUSER_DISPATCH_MESSAGE_SSN
                 {
                     let staged_msg = msg_returns_to_client && message_output_stage.is_some();
@@ -15234,7 +15606,7 @@ pub(crate) unsafe fn service_sec_image(
                         st = resumed.0 as u32 as u64;
                         ok = resumed.1;
                     }
-                } else if ok {
+                } else if !provider_wait_park_request && ok {
                     if let Some(resolved_resume_ip) =
                         win32k_glue::resolve_active_callback_syscall_resume_ip(
                             dispatch_client,
@@ -15327,7 +15699,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_str(b"\n");
                     }
                 }
-                if !callback_suspended {
+                if !callback_suspended && !provider_wait_park_request {
                     if let Some(stage) = message_output_stage {
                         let _ = win32k_glue::release_win32k_message_stage(stage);
                     }
@@ -15792,6 +16164,25 @@ pub(crate) unsafe fn service_sec_image(
                 park_and_log!(pi, b"unhandled-syscall", m0, m0);
             }
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+            if provider_wait_park_request {
+                procs[pi].faults = faults;
+                procs[pi].first = first;
+                procs[pi].ntfaults = ntfaults;
+                pfilled[pi] = *filled_pages;
+                let _ = provider_wait_drain_ready(&mut nt_handler, procs, pfilled);
+                if provider_wait_top_owns_dispatch(provider_wait_admitted_dispatch_id) {
+                    mark_wait_parked!(pi, resume_ip);
+                }
+                let _ = finalize_service_loop_state(&mut nt_handler);
+                let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+                badge = received.0;
+                mi = received.1;
+                m0 = received.2;
+                m1 = received.3;
+                m2 = received.4;
+                m3 = received.5;
+                continue;
+            }
             if active_callback_bad_resume && reply_main != 0 {
                 if drop_current_syscall_reply() {
                     crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
@@ -16524,6 +16915,10 @@ pub(crate) unsafe fn service_sec_image(
                 // block) — fall through to the ordinary reply: post-and-continue, never a hang.
                 print_str(b"[dbgk] reporter block unavailable -> post-and-continue\n");
             }
+            // Event/timer processing may have selected an older provider continuation while this
+            // syscall was in flight. The nested provider dispatch has returned to its retained
+            // rendezvous by this point, so only now may the executive resume the LIFO top.
+            let _ = provider_wait_drain_ready(&mut nt_handler, procs, pfilled);
             // ★ PHASE 3 — ONE reply shape for every serviced client syscall: resume the caller
             // through the reply object the KERNEL bound to it at its recv (`decode_reply` →
             // `replies[idx].bound_tcb`), then recv the next event re-registering that same object.
@@ -22364,8 +22759,7 @@ unsafe fn gui_message_wait_park(
     {
         return false;
     }
-    let Ok((queue_event, queue_event_lease)) =
-        nt_handler.acquire_gui_event_wait(queue_event_body)
+    let Ok((queue_event, queue_event_lease)) = nt_handler.acquire_gui_event_wait(queue_event_body)
     else {
         return false;
     };
@@ -22693,10 +23087,7 @@ unsafe fn gui_message_wait_redrive_event(
     nt_handler.current_sp = saved_sp;
     nt_handler.current_flags = saved_flags;
     nt_handler.loop_ctx = saved_ctx;
-    GuiEventRedriveResult {
-        woken,
-        disposition,
-    }
+    GuiEventRedriveResult { woken, disposition }
 }
 
 unsafe fn drain_selected_gui_event_signals(
