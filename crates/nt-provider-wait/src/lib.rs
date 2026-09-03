@@ -12,9 +12,11 @@ use alloc::vec::Vec;
 
 mod abi;
 mod domain;
+mod local_event;
 
 pub use abi::*;
 pub use domain::*;
+pub use local_event::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderWaitOwner {

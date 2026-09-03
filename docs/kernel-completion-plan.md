@@ -23715,8 +23715,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     wait/signal lease exists, retire every pool Event before allocation reuse, and retire stack
     Events with their dispatch activation. Set/reset/clear/pulse/read must update the executive's
     authoritative dispatcher state and only mirror the returned state into the local `KEVENT`.
-    Implement this storage-scoped catalog next; a raw address or session-lifetime local-event row is
-    not an acceptable shortcut.
+    A raw address or session-lifetime local-event row is not an acceptable shortcut.
+
+    Storage-scoped provider Event catalog checkpoint (2026-09-03, host and freestanding green):
+    `nt-provider-wait` now owns the component-private catalog for embedded `KEVENT`s. It mints
+    generation-protected local identities for provider-instance statics, pool allocation
+    generations, and stack dispatch activations; the provider virtual address remains local and
+    only a typed canonical Event identity may be bound for cross-boundary operations. Wait and
+    signal leases fence deletion, all Events in one backing allocation/activation enter retirement
+    atomically, and exact executive acknowledgement is required before an address can be reused.
+    Publication failure has an exact rollback path. All 19 crate tests pass and the freestanding
+    executive remains at 213 warnings. Next expose generation identity from the shared provider
+    pool, then instantiate this catalog in win32k and broker local Event publication/retirement.
 
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
