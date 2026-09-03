@@ -23815,8 +23815,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     forbid moving realloc of an allocation containing an Event, and restore canonical Event
     publication/set/reset/clear/pulse/read before the next desktop gate.
 
-    Provider-local Event activation checkpoint (2026-09-03, host/freestanding green; wait cutover
-    next): win32k now instantiates one component-private local Event catalog from the dynamically
+    Provider-local Event activation checkpoint (2026-09-03, host/freestanding green; runtime
+    correction in progress): win32k now instantiates one component-private local Event catalog from the dynamically
     registered provider domain before DriverEntry. `KeInitializeEvent` classifies storage only as
     the innermost live allocation generation, the current nested dispatch/DriverEntry stack
     activation, or provider-image static data; an unknown address fails closed. Publication mints a
@@ -23831,11 +23831,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     body. Dispatch activations are a generation-owned LIFO stack, so nested callback dispatches
     cannot retire an outer stack Event; activation unwind retires all of its stack Events before the
     frame may be reused. The catalog exposes non-mutating retirement validation so batch frees can
-    retain their all-or-nothing preflight. `nt-provider-wait` passes all 29 tests and the
-    freestanding executive check is green. The old immediate-success
-    `KeWaitForSingleObject` body is now the remaining local Event fallback: next bind single and
-    multiple waits to the dedicated provider-wait frame and detached continuation stack, then
-    delete that body before serialized desktop acceptance.
+    retain their all-or-nothing preflight. Publication rollback now retires and acknowledges any
+    executive Event before removing its unpublished component row; retirement cannot acknowledge
+    the component row until the executive ACK succeeds. Provider-pool batch release and zero-size
+    heap realloc also fail-stop after their mutation boundary instead of returning through a
+    partially committed teardown. DriverEntry retains its exact stack activation token and stack
+    generations cannot wrap. Provider-wait object fields are range-checked before `ObjectId`
+    packing, and duplicate detection includes the typed object namespace. `nt-provider-wait`
+    passes all 31 tests and the freestanding executive remains at the 213-warning baseline.
+
+    Two serialized activation runs reached real win32k SSN `0x10FA`, then failed closed while
+    `PROCESSINFO.InputIdleEvent` was initialized for the second time at body
+    `0x000001000a061d70`; evidence is in
+    `.tmp/run-desktop-provider-local-events-20260903.log` and
+    `.tmp/run-desktop-provider-local-events-v2-20260903.log`. This is not desktop acceptance. The
+    next run must use the new broker-publication diagnostics to resolve that exact two-phase
+    reinitialization failure before provider waits are wired.
+
+    Once activation is accepted, build the next provider-wait slice as a host-tested Event-only
+    executive arbiter. It must copy the shared request at admission, require the exact provider and
+    client owner tuple, acquire and release canonical `ProviderWait` Event leases transactionally,
+    use the executive's global dispatcher admission sequence, implement WaitAny/WaitAll plus exact
+    deadlines, and compose with the existing LIFO continuation stack. Unsupported object types,
+    UserMode, and alertable semantics fail before mutation. Add checked Event wire-identity
+    conversion instead of masked `ObjectId::new` construction. Only after that core is green may
+    `KeWaitForSingleObject` and `KeWaitForMultipleObjects` cut over atomically to the shared-page
+    request/resume transport; delete the old immediate-success single-wait body in that same step.
 
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic

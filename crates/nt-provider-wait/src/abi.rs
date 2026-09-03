@@ -5,6 +5,9 @@ pub const PROVIDER_WAIT_ABI_VERSION: u16 = 1;
 pub const PROVIDER_WAIT_SHARED_MAGIC: u32 = u32::from_le_bytes(*b"PWS1");
 pub const PROVIDER_WAIT_MAX_OBJECTS: usize = 64;
 pub const PROVIDER_WAIT_OBJECT_FLAG_NONE: u32 = 0;
+/// Canonical object IDs are transported as a one-based form of `nt_types::ObjectId::slot()`.
+pub const PROVIDER_WAIT_MAX_OBJECT_ID: u64 = 1u64 << 40;
+pub const PROVIDER_WAIT_MAX_OBJECT_GENERATION: u64 = (1u64 << 24) - 1;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,12 +411,15 @@ impl ProviderWaitRequest {
             if object.typed().is_none()
                 || object.flags != PROVIDER_WAIT_OBJECT_FLAG_NONE
                 || object.object_id == 0
+                || object.object_id > PROVIDER_WAIT_MAX_OBJECT_ID
                 || object.object_generation == 0
+                || object.object_generation > PROVIDER_WAIT_MAX_OBJECT_GENERATION
             {
                 return Err(ProviderWaitAbiError::InvalidObject);
             }
             if objects[..index].iter().any(|candidate| {
-                candidate.object_id == object.object_id
+                candidate.object_type == object.object_type
+                    && candidate.object_id == object.object_id
                     && candidate.object_generation == object.object_generation
             }) {
                 return Err(ProviderWaitAbiError::DuplicateObject);
@@ -520,6 +526,30 @@ mod tests {
             request.begin(metadata(), &[invalid]),
             Err(ProviderWaitAbiError::InvalidObject)
         );
+    }
+
+    #[test]
+    fn equal_ids_in_distinct_object_type_namespaces_are_not_duplicates() {
+        let mut request = ProviderWaitRequest::empty();
+        let objects = [
+            ProviderWaitObject::new(ProviderWaitObjectType::Event, 4, 2),
+            ProviderWaitObject::new(ProviderWaitObjectType::Semaphore, 4, 2),
+        ];
+        request.begin(metadata(), &objects).unwrap();
+        assert_eq!(request.validate().unwrap().objects, objects);
+    }
+
+    #[test]
+    fn object_identity_fields_must_fit_the_canonical_packing() {
+        let mut request = ProviderWaitRequest::empty();
+        let object = ProviderWaitObject::new(ProviderWaitObjectType::Event, 4, 2);
+        request.begin(metadata(), &[object]).unwrap();
+        request.objects[0].object_id = PROVIDER_WAIT_MAX_OBJECT_ID + 1;
+        assert_eq!(request.validate(), Err(ProviderWaitAbiError::InvalidObject));
+
+        request.begin(metadata(), &[object]).unwrap();
+        request.objects[0].object_generation = PROVIDER_WAIT_MAX_OBJECT_GENERATION + 1;
+        assert_eq!(request.validate(), Err(ProviderWaitAbiError::InvalidObject));
     }
 
     #[test]
