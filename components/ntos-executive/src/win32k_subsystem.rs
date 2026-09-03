@@ -1112,6 +1112,12 @@ pub const W32_REGISTRY_LABEL: u64 = 0x777;
 /// Pointer-free Event object ownership requests. The component passes only scalar process handles,
 /// generation-protected ids, and provider-body projections; the executive owns canonical identity.
 pub const W32_EVENT_LABEL: u64 = 0x778;
+/// Provider dispatcher wait request. Root may answer immediately or retain the component Call while
+/// its native client continuation is parked.
+pub const W32_PROVIDER_WAIT_LABEL: u64 = 0x779;
+/// Request tag returned on the retained component Call after the exact wait is selected, times out,
+/// or is cancelled. The correlated status lives in the dedicated provider-wait result frame.
+pub const W32_PROVIDER_WAIT_RESUME_LABEL: u64 = 0x77A;
 
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
@@ -3784,6 +3790,197 @@ extern "win64" fn s_ke_wait_for_single_object(
         }
     }
     0 // STATUS_WAIT_0
+}
+
+static PROVIDER_WAIT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_provider_wait_id() -> Option<u64> {
+    PROVIDER_WAIT_NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .filter(|id| *id != 0)
+}
+
+unsafe fn provider_wait_object_for_event(event: u64) -> Option<nt_provider_wait::ProviderWaitObject> {
+    let canonical = if let Some(id) = (&*core::ptr::addr_of!(WIN32K_EVENT_PROJECTIONS)).identity(event)
+    {
+        nt_provider_wait::ProviderWaitObject::new(
+            nt_provider_wait::ProviderWaitObjectType::Event,
+            id.0.slot().checked_add(1)?,
+            u64::from(id.0.generation().0),
+        )
+    } else {
+        provider_local_events()?.resolve_body(event).ok()?.canonical?
+    };
+    (canonical.typed() == Some(nt_provider_wait::ProviderWaitObjectType::Event))
+        .then_some(canonical)
+}
+
+unsafe fn current_provider_wait_owner() -> Option<nt_provider_wait::ProviderWaitOwner> {
+    let provider = registered_provider_wait_domain()?;
+    let callback_frame =
+        (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+    let header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
+    let client_generation = read_volatile((WIN32K_SHARED_VADDR + SH_REQ_GENERATION) as *const u64);
+    let owner = nt_provider_wait::ProviderWaitOwner {
+        provider_domain: provider.domain,
+        provider_generation: provider.generation,
+        client_pi: header.client_pi,
+        client_generation,
+        client_tid: header.client_tid,
+        client_badge: header.client_badge,
+        dispatch_id: header.dispatch_id,
+    };
+    owner.is_valid().then_some(owner)
+}
+
+unsafe fn provider_wait_timeout(
+    timeout: u64,
+) -> Option<(nt_provider_wait::ProviderWaitTimeoutKind, i64)> {
+    if timeout == 0 {
+        return Some((nt_provider_wait::ProviderWaitTimeoutKind::Infinite, 0));
+    }
+    let interval = read_unaligned(timeout as *const i64);
+    let kind = if interval == 0 {
+        nt_provider_wait::ProviderWaitTimeoutKind::Poll
+    } else if interval < 0 {
+        nt_provider_wait::ProviderWaitTimeoutKind::Relative
+    } else {
+        nt_provider_wait::ProviderWaitTimeoutKind::Absolute
+    };
+    Some((kind, interval))
+}
+
+unsafe fn provider_wait_rendezvous(
+    objects: &[nt_provider_wait::ProviderWaitObject],
+    wait_type: nt_provider_wait::ProviderWaitType,
+    wait_mode: u64,
+    alertable: u64,
+    timeout: u64,
+) -> i32 {
+    let Some(owner) = current_provider_wait_owner() else {
+        return 0xC000_000Du32 as i32;
+    };
+    let Some(wait_id) = next_provider_wait_id() else {
+        return 0xC000_009Au32 as i32;
+    };
+    let Some((timeout_kind, timeout_100ns)) = provider_wait_timeout(timeout) else {
+        return 0xC000_000Du32 as i32;
+    };
+    let wait_mode = match wait_mode {
+        0 => nt_provider_wait::ProviderWaitMode::Kernel,
+        1 => nt_provider_wait::ProviderWaitMode::User,
+        _ => return 0xC000_000Du32 as i32,
+    };
+    let alertable = match alertable {
+        0 => false,
+        1 => true,
+        _ => return 0xC000_000Du32 as i32,
+    };
+    let page = WIN32K_PROVIDER_WAIT_VADDR as *mut nt_provider_wait::ProviderWaitSharedPage;
+    let mut request = nt_provider_wait::ProviderWaitRequest::empty();
+    if request
+        .begin(
+            nt_provider_wait::ProviderWaitRequestMetadata {
+                wait_id,
+                owner,
+                wait_type,
+                wait_mode,
+                alertable,
+                timeout_kind,
+                timeout_100ns,
+            },
+            objects,
+        )
+        .is_err()
+    {
+        return 0xC000_000Du32 as i32;
+    }
+    write_volatile(core::ptr::addr_of_mut!((*page).request), request);
+    write_volatile(
+        core::ptr::addr_of_mut!((*page).result),
+        nt_provider_wait::ProviderWaitResult::EMPTY,
+    );
+
+    let callback_frame =
+        (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+    let owner_header = read_volatile(core::ptr::addr_of!((*callback_frame).header));
+    let Some(wait_context) = callback_request_context_for_request(&owner_header) else {
+        return 0xC000_000Du32 as i32;
+    };
+    let mut outgoing = W32_PROVIDER_WAIT_LABEL << 12;
+    loop {
+        let (_label, tag, _, _, _) = crate::driver_launch::call_on(outgoing);
+        match tag {
+            W32_PROVIDER_WAIT_RESUME_LABEL => {
+                let result = read_volatile(core::ptr::addr_of!((*page).result));
+                let Some(status) = result.validate(wait_id) else {
+                    return 0xC000_0001u32 as i32;
+                };
+                if !restore_user_callback_request_context(wait_context) {
+                    return 0xC000_000Du32 as i32;
+                }
+                return status;
+            }
+            W32_DISPATCH_LABEL => {
+                let (status, info) = win32k_dispatch(&crate::spawn_hosts::DispatchReq {
+                    sel: read_volatile((WIN32K_SHARED_VADDR + SH_REQ_SSN) as *const u64),
+                    drv: 0,
+                });
+                if !restore_user_callback_request_context(wait_context) {
+                    return 0xC000_000Du32 as i32;
+                }
+                write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut u64, info);
+                write_volatile((WIN32K_SHARED_VADDR + SH_REQ_STATUS) as *mut i32, status);
+                outgoing = W32_DISPATCH_LABEL << 12;
+            }
+            _ => return 0xC000_0001u32 as i32,
+        }
+    }
+}
+
+#[allow(dead_code)]
+extern "win64" fn s_ke_wait_for_multiple_objects(
+    count: u32,
+    object_array: u64,
+    wait_type: u64,
+    _wait_reason: u64,
+    wait_mode: u64,
+    alertable: u64,
+    timeout: u64,
+    _wait_blocks: u64,
+) -> i32 {
+    if count == 0 || count as usize > nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS || object_array == 0
+    {
+        return 0xC000_000Du32 as i32;
+    }
+    let wait_type = match wait_type {
+        0 => nt_provider_wait::ProviderWaitType::All,
+        1 => nt_provider_wait::ProviderWaitType::Any,
+        _ => return 0xC000_000Du32 as i32,
+    };
+    let mut objects = [
+        nt_provider_wait::ProviderWaitObject::EMPTY;
+        nt_provider_wait::PROVIDER_WAIT_MAX_OBJECTS
+    ];
+    for index in 0..count as usize {
+        let event = unsafe { read_unaligned((object_array + index as u64 * 8) as *const u64) };
+        let Some(object) = (unsafe { provider_wait_object_for_event(event) }) else {
+            return 0xC000_000Du32 as i32;
+        };
+        objects[index] = object;
+    }
+    unsafe {
+        provider_wait_rendezvous(
+            &objects[..count as usize],
+            wait_type,
+            wait_mode,
+            alertable,
+            timeout,
+        )
+    }
 }
 
 extern "win64" fn s_eng_get_tick_count() -> u32 {

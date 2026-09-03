@@ -23880,6 +23880,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     class, and reaches readiness and consumption only through the executive-owned `EventStore`.
     The freestanding executive remains at the 213-warning baseline.
 
+    Provider-wait resume ABI checkpoint (2026-09-03, host/freestanding green; not activated): the
+    dedicated shared page now carries a versioned result record correlated by exact `wait_id`, so a
+    resume cannot consume a status left by an inner wait that reused the page. The component-side
+    rendezvous builder captures the current dynamic provider/client/dispatch owner, resolves both
+    projected and embedded Events to canonical typed identities, preserves infinite/poll/relative/
+    absolute timeout forms, and validates KernelMode/alertable inputs through the common ABI. Its
+    receive loop can service nested win32k dispatches while an outer wait is retained, restoring the
+    outer thread context after each nested completion. The multiple-object entry captures at most
+    the architectural 64 object pointers before publication. The result-correlation test brings
+    `nt-provider-wait` to 39 passing tests; the freestanding executive remains at 213 warnings.
+    These routines remain deliberately unbound until pump suspension and executive continuation
+    admission land in one atomic cutover; the live single-object import still has its old body.
+
     Next compose arbiter completion with the existing LIFO continuation stack and the component
     pump's non-reply suspension mechanism. `KeWaitForSingleObject` and
     `KeWaitForMultipleObjects` must cut over atomically to the dedicated shared-page request/resume

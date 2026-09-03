@@ -3,6 +3,7 @@ use crate::ProviderWaitOwner;
 pub const PROVIDER_WAIT_ABI_MAGIC: u32 = u32::from_le_bytes(*b"PWT1");
 pub const PROVIDER_WAIT_ABI_VERSION: u16 = 1;
 pub const PROVIDER_WAIT_SHARED_MAGIC: u32 = u32::from_le_bytes(*b"PWS1");
+pub const PROVIDER_WAIT_RESULT_MAGIC: u32 = u32::from_le_bytes(*b"PWR1");
 pub const PROVIDER_WAIT_MAX_OBJECTS: usize = 64;
 pub const PROVIDER_WAIT_OBJECT_FLAG_NONE: u32 = 0;
 /// Canonical object IDs are transported as a one-based form of `nt_types::ObjectId::slot()`.
@@ -271,6 +272,7 @@ impl ProviderWaitSharedControl {
 pub struct ProviderWaitSharedPage {
     pub control: ProviderWaitSharedControl,
     pub request: ProviderWaitRequest,
+    pub result: ProviderWaitResult,
 }
 
 impl ProviderWaitSharedPage {
@@ -278,12 +280,60 @@ impl ProviderWaitSharedPage {
         Self {
             control: ProviderWaitSharedControl::EMPTY,
             request: ProviderWaitRequest::empty(),
+            result: ProviderWaitResult::EMPTY,
         }
     }
 }
 
 const _: () = assert!(core::mem::size_of::<ProviderWaitSharedPage>() <= 0x1000);
 const _: () = assert!(core::mem::align_of::<ProviderWaitSharedPage>() == 8);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderWaitResult {
+    pub magic: u32,
+    pub version: u16,
+    pub result_size: u16,
+    pub wait_id: u64,
+    pub status: i32,
+    pub reserved: u32,
+}
+
+impl ProviderWaitResult {
+    pub const EMPTY: Self = Self {
+        magic: 0,
+        version: 0,
+        result_size: 0,
+        wait_id: 0,
+        status: 0,
+        reserved: 0,
+    };
+
+    pub const fn completed(wait_id: u64, status: i32) -> Self {
+        Self {
+            magic: PROVIDER_WAIT_RESULT_MAGIC,
+            version: PROVIDER_WAIT_ABI_VERSION,
+            result_size: core::mem::size_of::<Self>() as u16,
+            wait_id,
+            status,
+            reserved: 0,
+        }
+    }
+
+    pub const fn validate(self, expected_wait_id: u64) -> Option<i32> {
+        if self.magic == PROVIDER_WAIT_RESULT_MAGIC
+            && self.version == PROVIDER_WAIT_ABI_VERSION
+            && self.result_size as usize == core::mem::size_of::<Self>()
+            && self.wait_id != 0
+            && self.wait_id == expected_wait_id
+            && self.reserved == 0
+        {
+            Some(self.status)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderWaitRequestMetadata {
@@ -611,5 +661,20 @@ mod tests {
         page.control = ProviderWaitSharedControl::published(identity);
         page.control.page_size -= 1;
         assert_eq!(page.control.identity(), None);
+    }
+
+    #[test]
+    fn shared_result_is_correlated_to_the_exact_wait() {
+        let result = ProviderWaitResult::completed(17, 0x102);
+        assert_eq!(result.validate(17), Some(0x102));
+        assert_eq!(result.validate(18), None);
+
+        let mut stale = result;
+        stale.version += 1;
+        assert_eq!(stale.validate(17), None);
+        stale = result;
+        stale.reserved = 1;
+        assert_eq!(stale.validate(17), None);
+        assert_eq!(ProviderWaitResult::EMPTY.validate(17), None);
     }
 }
