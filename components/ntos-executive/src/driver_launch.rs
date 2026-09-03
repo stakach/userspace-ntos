@@ -33569,7 +33569,27 @@ unsafe fn call_on5(
     arg3: u64,
     arg4: u64,
 ) -> (u64, u64, u64, u64, u64) {
-    core::ptr::write_volatile((crate::IPCBUF_VADDR + 8 + 4 * 8) as *mut u64, arg4);
+    let rsp: u64;
+    core::arch::asm!(
+        "mov {}, rsp",
+        out(reg) rsp,
+        options(nostack, nomem, preserves_flags)
+    );
+    let win32k_lanes = nt_component_suspension::LaneAddressLayout {
+        base: crate::win32k_subsystem::WIN32K_LANE_ARENA_VADDR,
+        stride: crate::win32k_subsystem::WIN32K_LANE_STRIDE,
+        stack_bytes: crate::win32k_subsystem::WIN32K_LANE_STACK_FRAMES * 0x1000,
+        ipc_buffer_offset: crate::win32k_subsystem::WIN32K_LANE_IPCBUF_OFFSET,
+        capacity: crate::win32k_subsystem::WIN32K_LANE_CAPACITY,
+    };
+    let ipc_buffer_va = win32k_lanes
+        .ipc_buffer_for_stack_pointer(rsp)
+        .or_else(|| {
+            hosted_worker_component_base_from_rsp(rsp)
+                .and_then(|base| base.checked_add(FSD_WORKER_IPCBUF_OFFSET))
+        })
+        .unwrap_or(crate::IPCBUF_VADDR);
+    core::ptr::write_volatile((ipc_buffer_va + 8 + 4 * 8) as *mut u64, arg4);
     call_on4(msginfo, arg0, arg1, arg2, arg3)
 }
 

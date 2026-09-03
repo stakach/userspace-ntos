@@ -24178,6 +24178,16 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     into the tested lane table, make the unique IPC-buffer VA visible to five-word component calls,
     and route unrelated native threads to the idle lane before rerunning desktop.
 
+    B3 lane IPC-buffer checkpoint (2026-09-03): the old five-word component `Call` helper no longer
+    writes MR4 through the singleton `IPCBUF_VADDR`. A host-tested `LaneAddressLayout` validates the
+    bounded arena and resolves the exact IPC page only when the current stack pointer lies inside an
+    owned lane stack. The component helper now selects secondary win32k and hosted-driver worker IPC
+    pages by physical stack identity, retaining the fixed address only for primary component/root
+    contexts. This also closes the equivalent latent bug for existing FSD worker threads. All 17
+    `nt-component-suspension` tests pass and the freestanding build remains green at 221 warnings.
+    Next replace the singleton continuation owner with `ComponentSuspensionLanes` and adopt lane 0
+    plus the ready worker into it; no worker dispatch is allowed before that state cutover.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

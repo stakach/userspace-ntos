@@ -211,6 +211,41 @@ pub struct LaneBinding {
     pub reply_object: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaneAddressLayout {
+    pub base: u64,
+    pub stride: u64,
+    pub stack_bytes: u64,
+    pub ipc_buffer_offset: u64,
+    pub capacity: usize,
+}
+
+impl LaneAddressLayout {
+    pub const fn is_valid(self) -> bool {
+        self.base != 0
+            && self.stride != 0
+            && self.stack_bytes != 0
+            && self.stack_bytes <= self.ipc_buffer_offset
+            && self.ipc_buffer_offset <= self.stride.saturating_sub(0x1000)
+            && self.capacity != 0
+    }
+
+    pub fn ipc_buffer_for_stack_pointer(self, stack_pointer: u64) -> Option<u64> {
+        if !self.is_valid() || stack_pointer < self.base {
+            return None;
+        }
+        let relative = stack_pointer - self.base;
+        let lane = relative / self.stride;
+        let lane_offset = relative % self.stride;
+        if lane >= self.capacity as u64 || lane_offset >= self.stack_bytes {
+            return None;
+        }
+        self.base
+            .checked_add(lane.checked_mul(self.stride)?)?
+            .checked_add(self.ipc_buffer_offset)
+    }
+}
+
 impl LaneBinding {
     pub const fn is_valid(self) -> bool {
         self.executor_id != 0 && self.receive_endpoint != 0 && self.reply_object != 0
@@ -1340,5 +1375,28 @@ mod tests {
         );
         lanes.cancel(provider, 0xC000_0120).unwrap();
         assert!(lanes.next_resumable().unwrap().suspension.cancelled);
+    }
+
+    #[test]
+    fn lane_address_layout_resolves_only_owned_stack_ranges() {
+        let layout = LaneAddressLayout {
+            base: 0x1000_0000,
+            stride: 0x40_000,
+            stack_bytes: 0x20_000,
+            ipc_buffer_offset: 0x20_000,
+            capacity: 3,
+        };
+        assert!(layout.is_valid());
+        assert_eq!(
+            layout.ipc_buffer_for_stack_pointer(0x1000_0000),
+            Some(0x1002_0000)
+        );
+        assert_eq!(
+            layout.ipc_buffer_for_stack_pointer(0x1004_1234),
+            Some(0x1006_0000)
+        );
+        assert_eq!(layout.ipc_buffer_for_stack_pointer(0x1002_0000), None);
+        assert_eq!(layout.ipc_buffer_for_stack_pointer(0x100c_0000), None);
+        assert_eq!(layout.ipc_buffer_for_stack_pointer(0x0fff_ffff), None);
     }
 }
