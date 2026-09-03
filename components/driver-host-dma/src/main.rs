@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use nt_cm_resources::{InterruptDescriptor, MemoryDescriptor};
 use nt_dma_manager::{DmaManager, DmaOwner};
 use nt_kernel_exec::{CompleteResult, EventKind, FakeClock, KernelExecRuntime};
-use nt_mdl::MdlRegistry;
+use nt_mdl::{MdlKey, MdlRegistry};
 use nt_pnp_abi::{DeviceState, IRP_MJ_PNP, IRP_MN_REMOVE_DEVICE, IRP_MN_START_DEVICE};
 use nt_pnp_manager::{PnpManager, ResourceAssignment};
 use nt_power_manager::PowerManager;
@@ -153,6 +153,11 @@ unsafe fn dma() -> &'static mut DmaManager {
 }
 unsafe fn mdl() -> &'static mut MdlRegistry {
     (*core::ptr::addr_of_mut!(MDL)).as_mut().unwrap()
+}
+
+fn mdl_key(component_va: u64) -> MdlKey {
+    MdlKey::new(DRIVER_HOST_ID, DRIVER_HOST_COOKIE, component_va)
+        .expect("driver-host DMA MDL identity")
 }
 
 fn owner() -> ResourceOwner {
@@ -575,7 +580,6 @@ extern "win64" fn ntos_dma_put_adapter(_adapter: u64) {
 }
 
 /// `IoAllocateMdl(VirtualAddress, Length, ...)` → a driver-visible MDL projection.
-/// Stashes the canonical MDL id in the (unused) `Next` field.
 extern "win64" fn ntos_io_allocate_mdl(
     va: u64,
     length: u32,
@@ -586,8 +590,14 @@ extern "win64" fn ntos_io_allocate_mdl(
     // SAFETY: single-threaded service access.
     unsafe {
         let m = alloc_bytes(nt_mdl::MDL_SIZE);
-        let id = mdl().allocate(va, length);
-        core::ptr::write_unaligned((m + nt_mdl::MDL_OFF_NEXT) as *mut u64, id);
+        mdl()
+            .register(mdl_key(m), va, length)
+            .expect("register driver-host DMA MDL");
+        core::ptr::write_unaligned((m + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
+        core::ptr::write_unaligned(
+            (m + nt_mdl::MDL_OFF_SIZE) as *mut i16,
+            nt_mdl::MDL_SIZE as i16,
+        );
         core::ptr::write_unaligned((m + nt_mdl::MDL_OFF_START_VA) as *mut u64, va & !0xFFF);
         core::ptr::write_unaligned((m + nt_mdl::MDL_OFF_BYTE_COUNT) as *mut u32, length);
         core::ptr::write_unaligned(
@@ -602,8 +612,9 @@ extern "win64" fn ntos_io_allocate_mdl(
 extern "win64" fn ntos_mm_build_mdl_for_nonpaged_pool(m: u64) {
     // SAFETY: `m` is an MDL projection we allocated.
     unsafe {
-        let id = core::ptr::read_unaligned((m + nt_mdl::MDL_OFF_NEXT) as *const u64);
-        let _ = mdl().build_for_nonpaged(id);
+        mdl()
+            .build_for_nonpaged_key(mdl_key(m))
+            .expect("build driver-host DMA MDL");
         let flags = core::ptr::read_unaligned((m + nt_mdl::MDL_OFF_FLAGS) as *const i16);
         core::ptr::write_unaligned(
             (m + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
@@ -645,8 +656,9 @@ extern "win64" fn ntos_mm_map_locked_pages(
 extern "win64" fn ntos_io_free_mdl(m: u64) {
     // SAFETY: `m` is an MDL projection we allocated.
     unsafe {
-        let id = core::ptr::read_unaligned((m + nt_mdl::MDL_OFF_NEXT) as *const u64);
-        let _ = mdl().free(id);
+        mdl()
+            .free_key(mdl_key(m))
+            .expect("free driver-host DMA MDL");
     }
 }
 
@@ -819,9 +831,18 @@ unsafe fn run_dma_command() {
 /// Build a driver-visible MDL projection over `[va, va+len)`, nonpaged + mapped.
 unsafe fn build_output_mdl(va: u64, len: u32) -> u64 {
     let m = alloc_bytes(nt_mdl::MDL_SIZE);
-    let id = mdl().allocate(va, len);
-    let _ = mdl().build_for_nonpaged(id);
-    core::ptr::write_unaligned((m + nt_mdl::MDL_OFF_NEXT) as *mut u64, id);
+    let key = mdl_key(m);
+    mdl()
+        .register(key, va, len)
+        .expect("register driver-host output MDL");
+    mdl()
+        .build_for_nonpaged_key(key)
+        .expect("build driver-host output MDL");
+    core::ptr::write_unaligned((m + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
+    core::ptr::write_unaligned(
+        (m + nt_mdl::MDL_OFF_SIZE) as *mut i16,
+        nt_mdl::MDL_SIZE as i16,
+    );
     core::ptr::write_unaligned(
         (m + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
         nt_mdl::MDL_SOURCE_IS_NONPAGED_POOL,

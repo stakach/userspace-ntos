@@ -92,6 +92,7 @@ use nt_io_manager::{
     WDM_X64_IO_STACK_LOCATION_SIZE, WDM_X64_IO_TYPE_DEVICE, WDM_X64_IO_TYPE_DRIVER,
     WDM_X64_IO_TYPE_FILE, WDM_X64_IRP_SIZE,
 };
+use nt_mdl::{MdlKey, MdlRegistry};
 use nt_kernel_exec::{
     classify_dispatcher_wait_timeout, init_ksemaphore, kevent, ksemaphore_read_state,
     ksemaphore_release, ksemaphore_try_wait, rtl_bitmap, DispatcherWaitTimeout, EventKind,
@@ -106,7 +107,6 @@ use nt_kernel_exec::{
     InterruptMode as KernelInterruptMode, InterruptRundownState, InterruptScan,
     InterruptScanProgress, HOSTED_DRIVER_THREAD_HANDLE_BASE, SEMAPHORE_OBJECT,
 };
-use nt_mdl::MdlRegistry;
 use nt_resource_manager::{
     HalError, MemoryResourceDelegation, PortResourceDelegation, ResourceManager, ResourceOwner,
 };
@@ -689,6 +689,7 @@ pub const FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL: u64 = 0x788;
 pub const FSD_SERVICE_QUEUE_DPC_LABEL: u64 = 0x789;
 pub const FSD_SERVICE_FLUSH_DPCS_LABEL: u64 = 0x78A;
 pub const FSD_SERVICE_DMA_ADAPTER_LABEL: u64 = 0x78B;
+pub const FSD_SERVICE_MDL_LABEL: u64 = 0x78C;
 pub const FSD_DISPATCH_UNLOAD: u64 = u64::MAX - 0x771;
 pub const FSD_DISPATCH_ADD_DEVICE: u64 = u64::MAX - 0x772;
 pub const FSD_DISPATCH_VIDEO_FIND_ADAPTER: u64 = u64::MAX - 0x775;
@@ -730,11 +731,17 @@ pub(crate) fn is_fsd_component_service_label(label: u64) -> bool {
             | FSD_SERVICE_QUEUE_DPC_LABEL
             | FSD_SERVICE_FLUSH_DPCS_LABEL
             | FSD_SERVICE_DMA_ADAPTER_LABEL
+            | FSD_SERVICE_MDL_LABEL
     )
 }
 
 const HOSTED_INTERRUPT_OP_CONNECT: u64 = 1;
 const HOSTED_INTERRUPT_OP_DISCONNECT: u64 = 2;
+const HOSTED_MDL_OP_REGISTER: u64 = 1;
+const HOSTED_MDL_OP_BUILD_NONPAGED: u64 = 2;
+const HOSTED_MDL_OP_UPDATE: u64 = 3;
+const HOSTED_MDL_OP_UNLOCK: u64 = 4;
+const HOSTED_MDL_OP_FREE: u64 = 5;
 const HOSTED_KINTERRUPT_MAGIC: u64 = 0x4B49_4E54_5250_5431;
 const HOSTED_KINTERRUPT_SIZE: u64 = 0x50;
 const HOSTED_KINTERRUPT_VECTOR: u64 = 0x00;
@@ -3562,6 +3569,31 @@ unsafe fn release_hosted_instance_pool_allocation_if_live(inst: DriverInstance, 
         Some(false) => hosted_instance_pool_free_unlocked(inst, p),
         None => false,
     }
+}
+
+unsafe fn free_hosted_instance_pool_allocation_exact(inst: DriverInstance, p: u64) -> bool {
+    if p == 0 {
+        return false;
+    }
+    let Some(_guard) = hosted_instance_pool_lock(inst.exec_pool_va) else {
+        return false;
+    };
+    match hosted_instance_pool_allocation_is_free_unlocked(inst, p) {
+        Some(false) => hosted_instance_pool_free_unlocked(inst, p),
+        Some(true) | None => false,
+    }
+}
+
+unsafe fn hosted_instance_pool_allocation_exec_if_live(
+    inst: DriverInstance,
+    component_va: u64,
+    bytes: u64,
+) -> Option<u64> {
+    let _guard = hosted_instance_pool_lock(inst.exec_pool_va)?;
+    if hosted_instance_pool_allocation_is_free_unlocked(inst, component_va) != Some(false) {
+        return None;
+    }
+    hosted_pool_allocation_exec_va(inst.exec_pool_va, component_va, bytes)
 }
 
 unsafe fn print_active_irp_graph_for_deadman(inst: &DriverInstance) {
@@ -8670,8 +8702,53 @@ extern "win64" fn s_po_set_power_state(device: u64, power_type: u32, state: u32)
     }
 }
 
-/// `PMDL IoAllocateMdl(PVOID, ULONG, BOOLEAN, BOOLEAN, PIRP)` — project a single-buffer MDL
-/// while recording the canonical MDL id in the driver-visible `Next` field.
+/// `PMDL IoAllocateMdl(PVOID, ULONG, BOOLEAN, BOOLEAN, PIRP)` — allocate and initialize a
+/// single-buffer MDL. `Next` remains the public chain link defined by the NT ABI.
+unsafe fn hosted_mdl_service(op: u64, mdl: u64, virtual_address: u64, length: u64) -> i32 {
+    if let Some((_, identity, _, _, grant)) = hosted_irq_lane_context() {
+        let mut arguments = [0; nt_hosted_runtime::HOSTED_IRQ_ARENA_ARGUMENT_CAP];
+        arguments[..4].copy_from_slice(&[op, mdl, virtual_address, length]);
+        let result = hosted_irq_lane_service(nt_hosted_runtime::HostedIrqServiceCommand {
+            kind: nt_hosted_runtime::HostedIrqServiceKind::Mdl,
+            service_id: FSD_SERVICE_MDL_LABEL,
+            target_domain_id: identity.domain_id,
+            target_domain_cookie: identity.domain_cookie,
+            authority_cookie: 0,
+            grant,
+            argument_count: 4,
+            arguments,
+        });
+        if result.faulted || result.value_count != 0 {
+            hosted_irq_lane_protocol_fault(mdl);
+        }
+        return result.status;
+    }
+    let (_, status, _, _, _) = call_on4(
+        (FSD_SERVICE_MDL_LABEL << 12) | 4,
+        op,
+        mdl,
+        virtual_address,
+        length,
+    );
+    status as u32 as i32
+}
+
+unsafe fn require_hosted_mdl_service(op: u64, mdl: u64, virtual_address: u64, length: u64) {
+    let status = hosted_mdl_service(op, mdl, virtual_address, length);
+    if status != STATUS_SUCCESS {
+        if hosted_irq_lane_context().is_some() {
+            hosted_irq_lane_protocol_fault(mdl);
+        }
+        s_ke_bug_check_ex(
+            0xC4,
+            0x4D44_4C53,
+            mdl,
+            status as u32 as u64,
+            s_ps_get_current_thread_id(),
+        );
+    }
+}
+
 extern "win64" fn s_io_allocate_mdl(
     virtual_address: u64,
     length: u32,
@@ -8687,8 +8764,7 @@ extern "win64" fn s_io_allocate_mdl(
         if mdl == 0 {
             return 0;
         }
-        let id = hosted_mdl_registry_mut().allocate(virtual_address, length);
-        write_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, id);
+        write_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *mut u64, 0);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_SIZE) as *mut i16,
             nt_mdl::MDL_SIZE as i16,
@@ -8702,6 +8778,16 @@ extern "win64" fn s_io_allocate_mdl(
             (mdl + nt_mdl::MDL_OFF_BYTE_OFFSET) as *mut u32,
             (virtual_address & 0xFFF) as u32,
         );
+        if hosted_mdl_service(
+            HOSTED_MDL_OP_REGISTER,
+            mdl,
+            virtual_address,
+            length as u64,
+        ) != STATUS_SUCCESS
+        {
+            pool_free(mdl);
+            return 0;
+        }
         mdl
     }
 }
@@ -8712,9 +8798,7 @@ extern "win64" fn s_io_free_mdl(mdl: u64) {
         if mdl == 0 {
             return;
         }
-        let id = read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64);
-        let _ = hosted_mdl_registry_mut().free(id);
-        pool_free(mdl);
+        require_hosted_mdl_service(HOSTED_MDL_OP_FREE, mdl, 0, 0);
     }
 }
 
@@ -8761,6 +8845,7 @@ extern "win64" fn s_io_build_partial_mdl(
             (target_mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
             va,
         );
+        require_hosted_mdl_service(HOSTED_MDL_OP_UPDATE, target_mdl, va, len as u64);
     }
 }
 
@@ -8770,8 +8855,6 @@ extern "win64" fn s_mm_build_mdl_for_nonpaged_pool(mdl: u64) {
         if mdl == 0 {
             return;
         }
-        let id = read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64);
-        let _ = hosted_mdl_registry_mut().build_for_nonpaged(id);
         let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
@@ -8783,6 +8866,7 @@ extern "win64" fn s_mm_build_mdl_for_nonpaged_pool(mdl: u64) {
             (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
             start + offset as u64,
         );
+        require_hosted_mdl_service(HOSTED_MDL_OP_BUILD_NONPAGED, mdl, 0, 0);
     }
 }
 
@@ -8792,8 +8876,6 @@ extern "win64" fn s_mm_probe_and_lock_pages(mdl: u64, _access_mode: u8, _operati
         if mdl == 0 {
             return;
         }
-        let id = read_unaligned((mdl + nt_mdl::MDL_OFF_NEXT) as *const u64);
-        let _ = hosted_mdl_registry_mut().build_for_nonpaged(id);
         let flags = read_unaligned((mdl + nt_mdl::MDL_OFF_FLAGS) as *const i16);
         write_unaligned(
             (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
@@ -8805,6 +8887,7 @@ extern "win64" fn s_mm_probe_and_lock_pages(mdl: u64, _access_mode: u8, _operati
             (mdl + nt_mdl::MDL_OFF_MAPPED_SYSTEM_VA) as *mut u64,
             start + offset as u64,
         );
+        require_hosted_mdl_service(HOSTED_MDL_OP_BUILD_NONPAGED, mdl, 0, 0);
     }
 }
 
@@ -8819,6 +8902,7 @@ extern "win64" fn s_mm_unlock_pages(mdl: u64) {
             (mdl + nt_mdl::MDL_OFF_FLAGS) as *mut i16,
             flags & !nt_mdl::MDL_PAGES_LOCKED,
         );
+        require_hosted_mdl_service(HOSTED_MDL_OP_UNLOCK, mdl, 0, 0);
     }
 }
 
@@ -20269,6 +20353,44 @@ unsafe fn provider_receive_buffer_exec_va(
     None
 }
 
+fn hosted_mdl_key(domain: HostedDomainIdentity, component_va: u64) -> Option<MdlKey> {
+    MdlKey::new(domain.domain_id.raw(), domain.cookie, component_va)
+}
+
+fn hosted_provider_mdl_key(
+    owner: HostedProviderObjectOwner,
+    component_va: u64,
+) -> Option<MdlKey> {
+    MdlKey::new(
+        owner.provider_domain_id,
+        owner.provider_domain_cookie,
+        component_va,
+    )
+}
+
+fn hosted_dependent_mdl_key(
+    owner: HostedProviderObjectOwner,
+    component_va: u64,
+) -> Option<MdlKey> {
+    MdlKey::new(
+        owner.dependent_domain_id,
+        owner.dependent_domain_cookie,
+        component_va,
+    )
+}
+
+unsafe fn register_hosted_projected_mdl(
+    key: MdlKey,
+    data_component_va: u64,
+    bytes: u64,
+) -> Result<(), nt_status::NtStatus> {
+    let length = u32::try_from(bytes).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)?;
+    hosted_mdl_registry_mut()
+        .register(key, data_component_va, length)
+        .and_then(|_| hosted_mdl_registry_mut().build_for_nonpaged_key(key))
+        .map_err(hosted_mdl_status)
+}
+
 unsafe fn release_hosted_provider_ndis_buffer_shadow_record(
     record: &mut HostedProviderNdisBufferShadow,
 ) -> bool {
@@ -20281,14 +20403,42 @@ unsafe fn release_hosted_provider_ndis_buffer_shadow_record(
     {
         return false;
     }
+    let provider_key = record
+        .provider_component_owned_by_bridge
+        .then(|| hosted_provider_mdl_key(record.owner, record.provider_component_va))
+        .flatten();
+    let dependent_key = record
+        .dependent_component_owned_by_bridge
+        .then(|| hosted_dependent_mdl_key(record.owner, record.dependent_component_va))
+        .flatten();
+    if record.provider_component_owned_by_bridge && provider_key.is_none()
+        || record.dependent_component_owned_by_bridge && dependent_key.is_none()
+    {
+        return false;
+    }
+    for key in [provider_key, dependent_key].into_iter().flatten() {
+        match hosted_mdl_registry_mut().can_free_key(key) {
+            Ok(()) => {}
+            Err(nt_mdl::MdlError::StaleId)
+                if record.construction_state != HostedProviderConstructionState::Published => {}
+            Err(_) => return false,
+        }
+    }
     let mut complete = true;
     macro_rules! release_owned {
-        ($owned:ident, $instance:ident, $component_va:ident) => {
+        ($owned:ident, $instance:ident, $component_va:ident, $key:expr) => {
             if record.$owned {
                 if instance(record.$instance).is_some_and(|inst| {
                     release_hosted_instance_pool_allocation_if_live(inst, record.$component_va)
                 }) {
                     record.$owned = false;
+                    if let Some(key) = $key {
+                        if hosted_mdl_registry_mut().id_for(key).is_some()
+                            && hosted_mdl_registry_mut().free_key(key).is_err()
+                        {
+                            complete = false;
+                        }
+                    }
                 } else {
                     complete = false;
                 }
@@ -20298,22 +20448,26 @@ unsafe fn release_hosted_provider_ndis_buffer_shadow_record(
     release_owned!(
         provider_component_owned_by_bridge,
         provider_instance,
-        provider_component_va
+        provider_component_va,
+        provider_key
     );
     release_owned!(
         provider_data_component_owned_by_bridge,
         provider_instance,
-        provider_data_component_va
+        provider_data_component_va,
+        None
     );
     release_owned!(
         dependent_component_owned_by_bridge,
         dependent_instance,
-        dependent_component_va
+        dependent_component_va,
+        dependent_key
     );
     release_owned!(
         dependent_data_component_owned_by_bridge,
         dependent_instance,
-        dependent_data_component_va
+        dependent_data_component_va,
+        None
     );
     complete
 }
@@ -20343,6 +20497,64 @@ unsafe fn release_hosted_provider_ndis_buffer_shadow_by_dependent_exact(
         }
     }
     false
+}
+
+unsafe fn release_hosted_provider_ndis_buffer_shadow_by_component_mdl(
+    caller_instance: usize,
+    caller_domain: HostedDomainIdentity,
+    mdl: u64,
+) -> Result<Option<bool>, nt_status::NtStatus> {
+    if mdl == 0 {
+        return Err(nt_status::NtStatus::INVALID_PARAMETER);
+    }
+    let records = hosted_provider_ndis_buffer_shadows_mut();
+    let mut matched = None;
+    for (index, record) in records.iter().enumerate() {
+        if !record.present {
+            continue;
+        }
+        let is_dependent = record.dependent_instance == caller_instance
+            && record.dependent_component_va == mdl
+            && record
+                .owner
+                .dependent_matches(caller_domain.domain_id.raw(), caller_domain.cookie);
+        let is_provider = record.provider_instance == caller_instance
+            && record.provider_component_va == mdl
+            && record
+                .owner
+                .provider_matches(caller_domain.domain_id.raw(), caller_domain.cookie);
+        if !is_dependent && !is_provider {
+            continue;
+        }
+        if matched.replace(index).is_some() {
+            return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
+        }
+    }
+    let Some(index) = matched else {
+        return Ok(None);
+    };
+    let record = &mut records[index];
+    if record.construction_state != HostedProviderConstructionState::Published
+        || !hosted_provider_object_owner_is_current(
+            record.owner,
+            record.provider_instance,
+            record.dependent_instance,
+        )
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    let caller_allocation_released = if record.dependent_instance == caller_instance
+        && record.dependent_component_va == mdl
+    {
+        record.dependent_component_owned_by_bridge
+    } else {
+        record.provider_component_owned_by_bridge
+    };
+    if !release_hosted_provider_ndis_buffer_shadow_record(record) {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
+    *record = HostedProviderNdisBufferShadow::empty();
+    Ok(Some(caller_allocation_released))
 }
 
 unsafe fn reserve_hosted_provider_ndis_packet_construction(
@@ -20847,6 +21059,20 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_dependent_from_provider(
         copy_bytes(dependent_data_exec, provider_data_exec, bytes);
     }
     write_ndis_mdl(dependent_mdl_exec, dependent_data_component_va, bytes, 0);
+    let Some(dependent_key) = hosted_dependent_mdl_key(owner, dependent_component_va) else {
+        return Err(retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+            construction_index,
+            STATUS_INVALID_PARAMETER,
+        ));
+    };
+    if let Err(status) =
+        register_hosted_projected_mdl(dependent_key, dependent_data_component_va, bytes)
+    {
+        return Err(retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+            construction_index,
+            status.raw(),
+        ));
+    }
     finish_hosted_provider_ndis_buffer_construction(construction_index, owner)
         .map(|shadow| (shadow, true))
         .ok_or_else(|| {
@@ -20997,6 +21223,20 @@ unsafe fn ensure_hosted_provider_ndis_buffer_shadow_for_provider_from_dependent(
         copy_bytes(provider_data_exec, dependent_data_exec, bytes);
     }
     write_ndis_mdl(provider_mdl_exec, provider_data_component_va, bytes, 0);
+    let Some(provider_key) = hosted_provider_mdl_key(owner, provider_component_va) else {
+        return Err(retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+            construction_index,
+            STATUS_INVALID_PARAMETER,
+        ));
+    };
+    if let Err(status) =
+        register_hosted_projected_mdl(provider_key, provider_data_component_va, bytes)
+    {
+        return Err(retain_or_clear_failed_hosted_provider_ndis_buffer_construction(
+            construction_index,
+            status.raw(),
+        ));
+    }
     finish_hosted_provider_ndis_buffer_construction(construction_index, owner)
         .map(|shadow| (shadow, true))
         .ok_or_else(|| {
@@ -22685,6 +22925,34 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         state.ndis_buffer_out_bytes,
         0,
     );
+    let Some(dependent_key) = hosted_dependent_mdl_key(owner, dependent_buffer) else {
+        hosted_instance_pool_free(dependent_inst, dependent_buffer);
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
+        write_provider_ndis_status(state, STATUS_INVALID_PARAMETER);
+        write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
+        return;
+    };
+    if let Err(status) = register_hosted_projected_mdl(
+        dependent_key,
+        state.ndis_buffer_out_dependent_data_component_va,
+        state.ndis_buffer_out_bytes,
+    ) {
+        hosted_instance_pool_free(dependent_inst, dependent_buffer);
+        if state.ndis_buffer_out_provider_data_owned_by_bridge {
+            hosted_instance_pool_free(
+                provider_inst,
+                state.ndis_buffer_out_provider_data_component_va,
+            );
+        }
+        write_provider_ndis_status(state, status.raw());
+        write_unaligned(state.ndis_buffer_out_dependent_exec_va as *mut u64, 0);
+        return;
+    }
     if !register_hosted_provider_ndis_buffer_shadow(HostedProviderNdisBufferShadow {
         present: true,
         construction_state: HostedProviderConstructionState::Published,
@@ -22702,6 +22970,7 @@ unsafe fn complete_provider_ndis_buffer_allocation(
         dependent_component_owned_by_bridge: true,
         dependent_data_component_owned_by_bridge: false,
     }) {
+        let _ = hosted_mdl_registry_mut().free_key(dependent_key);
         hosted_instance_pool_free(dependent_inst, dependent_buffer);
         if state.ndis_buffer_out_provider_data_owned_by_bridge {
             hosted_instance_pool_free(
@@ -51943,6 +52212,13 @@ fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
             shadow_failures += clear_hosted_provider_ndis_work_item_shadows_for_instance(i, domain);
             shadow_failures +=
                 clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(i, domain);
+            if shadow_failures == 0
+                && hosted_mdl_registry_mut()
+                    .revoke_domain(domain.domain_id.raw(), domain.cookie)
+                    .is_err()
+            {
+                shadow_failures += 1;
+            }
             if shadow_failures == 0 {
                 route_failures = clear_hosted_provider_dispatch_routes_for_instance(i, domain);
             }
@@ -52597,6 +52873,199 @@ pub(crate) fn service_hosted_driver_dma_adapter(
         STATUS_SUCCESS,
         adapter.adapter_id,
         adapter.num_map_registers as u64,
+    )
+}
+
+fn hosted_mdl_status(error: nt_mdl::MdlError) -> nt_status::NtStatus {
+    match error {
+        nt_mdl::MdlError::AlreadyExists => nt_status::NtStatus::OBJECT_NAME_COLLISION,
+        nt_mdl::MdlError::ActiveMappings => nt_status::NtStatus::DEVICE_BUSY,
+        nt_mdl::MdlError::InvalidKey
+        | nt_mdl::MdlError::StaleId
+        | nt_mdl::MdlError::OutOfRange => nt_status::NtStatus::INVALID_PARAMETER,
+    }
+}
+
+unsafe fn service_hosted_driver_mdl_for_instance(
+    instance_index: usize,
+    caller_domain: HostedDomainIdentity,
+    operation: u64,
+    mdl: u64,
+    virtual_address: u64,
+    length: u64,
+) -> i32 {
+    let Some(inst) = instance(instance_index) else {
+        return STATUS_ACCESS_DENIED;
+    };
+    if instance_domain_identity(inst) != Some(caller_domain) {
+        return STATUS_ACCESS_DENIED;
+    }
+    let Some(key) = hosted_mdl_key(caller_domain, mdl) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    match operation {
+        HOSTED_MDL_OP_REGISTER => {
+            let Ok(length) = u32::try_from(length) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if virtual_address == 0 || length == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let Some(mdl_exec) = hosted_instance_pool_allocation_exec_if_live(
+                inst,
+                mdl,
+                nt_mdl::MDL_SIZE as u64,
+            ) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_SIZE) as *const i16)
+                != nt_mdl::MDL_SIZE as i16
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64)
+                    != virtual_address & !0xfff
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32)
+                    != (virtual_address & 0xfff) as u32
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            match hosted_mdl_registry_mut().register(key, virtual_address, length) {
+                Ok(_) => STATUS_SUCCESS,
+                Err(error) => hosted_mdl_status(error).raw(),
+            }
+        }
+        HOSTED_MDL_OP_BUILD_NONPAGED => {
+            if hosted_instance_pool_allocation_exec_if_live(
+                inst,
+                mdl,
+                nt_mdl::MDL_SIZE as u64,
+            )
+            .is_none()
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            match hosted_mdl_registry_mut().build_for_nonpaged_key(key) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(error) => hosted_mdl_status(error).raw(),
+            }
+        }
+        HOSTED_MDL_OP_UPDATE => {
+            let Ok(length) = u32::try_from(length) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if virtual_address == 0 || length == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let Some(mdl_exec) = hosted_instance_pool_allocation_exec_if_live(
+                inst,
+                mdl,
+                nt_mdl::MDL_SIZE as u64,
+            ) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if read_unaligned((mdl_exec + nt_mdl::MDL_OFF_START_VA) as *const u64)
+                != virtual_address & !0xfff
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_COUNT) as *const u32) != length
+                || read_unaligned((mdl_exec + nt_mdl::MDL_OFF_BYTE_OFFSET) as *const u32)
+                    != (virtual_address & 0xfff) as u32
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            match hosted_mdl_registry_mut().update_key(key, virtual_address, length) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(error) => hosted_mdl_status(error).raw(),
+            }
+        }
+        HOSTED_MDL_OP_UNLOCK => {
+            match hosted_mdl_registry_mut().unlock_key(key) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(error) => hosted_mdl_status(error).raw(),
+            }
+        }
+        HOSTED_MDL_OP_FREE => {
+            match release_hosted_provider_ndis_buffer_shadow_by_component_mdl(
+                instance_index,
+                caller_domain,
+                mdl,
+            ) {
+                Ok(Some(true)) => return STATUS_SUCCESS,
+                Ok(Some(false)) | Ok(None) => {}
+                Err(status) => return status.raw(),
+            }
+            if let Err(error) = hosted_mdl_registry_mut().can_free_key(key) {
+                return hosted_mdl_status(error).raw();
+            }
+            if hosted_instance_pool_allocation_exec_if_live(
+                inst,
+                mdl,
+                nt_mdl::MDL_SIZE as u64,
+            )
+            .is_none()
+                || !free_hosted_instance_pool_allocation_exact(inst, mdl)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+            match hosted_mdl_registry_mut().free_key(key) {
+                Ok(()) => STATUS_SUCCESS,
+                Err(error) => hosted_mdl_status(error).raw(),
+            }
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}
+
+pub(crate) fn service_hosted_driver_mdl(
+    ch: &crate::spawn_hosts::PumpChannel,
+    operation: u64,
+    mdl: u64,
+    virtual_address: u64,
+    length: u64,
+    caller_badge: u64,
+    active_reply_cap: u64,
+) -> i32 {
+    let Some((instance_index, inst)) = instance_for_pump_channel(ch, active_reply_cap) else {
+        return STATUS_ACCESS_DENIED;
+    };
+    if caller_badge != 0 && hosted_driver_runtime_by_badge(instance_index, caller_badge).is_none() {
+        return STATUS_ACCESS_DENIED;
+    }
+    let Some(caller_domain) = instance_domain_identity(inst) else {
+        return STATUS_ACCESS_DENIED;
+    };
+    unsafe {
+        service_hosted_driver_mdl_for_instance(
+            instance_index,
+            caller_domain,
+            operation,
+            mdl,
+            virtual_address,
+            length,
+        )
+    }
+}
+
+pub(crate) unsafe fn service_hosted_irq_lane_mdl(
+    instance_index: usize,
+    caller_domain_id: u64,
+    caller_domain_cookie: u64,
+    operation: u64,
+    mdl: u64,
+    virtual_address: u64,
+    length: u64,
+) -> i32 {
+    if caller_domain_id == 0 || caller_domain_cookie == 0 {
+        return STATUS_ACCESS_DENIED;
+    }
+    let caller_domain = HostedDomainIdentity {
+        domain_id: nt_io_manager::HostedDomainId(caller_domain_id),
+        cookie: caller_domain_cookie,
+    };
+    service_hosted_driver_mdl_for_instance(
+        instance_index,
+        caller_domain,
+        operation,
+        mdl,
+        virtual_address,
+        length,
     )
 }
 

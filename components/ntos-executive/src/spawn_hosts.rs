@@ -2317,6 +2317,20 @@ unsafe fn component_pump_loop(
                 0
             );
             continue;
+        } else if label == crate::driver_launch::FSD_SERVICE_MDL_LABEL
+            && ch.caps.kind == ReqKind::Irp
+        {
+            let status = crate::driver_launch::service_hosted_driver_mdl(
+                ch,
+                msg.m0,
+                msg.m1,
+                msg.m2,
+                msg.m3,
+                msg.badge,
+                *reply_cap,
+            );
+            pump_reply_recv_into!(ch, *reply_cap, msg, 1, status as u32 as u64);
+            continue;
         } else if label
             == crate::driver_launch::FSD_SERVICE_HAL_ACPI_INTERRUPT_MODEL_LABEL
             && ch.caps.kind == ReqKind::Irp

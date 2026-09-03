@@ -23519,6 +23519,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     authenticated owner plus MDL address. Address reuse, stale generations, and duplicate frees
     must fail without freeing a new allocation. Delete the local-only lifetime path in the cutover.
 
+    B3 generation-owned MDL lifetime checkpoint (2026-09-03, host and freestanding green;
+    serialized desktop acceptance pending): `nt-mdl` now keys driver-visible records by exact
+    `(domain_id, domain_cookie, component_va)` identity while leaving the public `MDL.Next` field
+    exclusively available for NT buffer chains. Hosted `IoAllocateMdl`, build/update/unlock, and
+    `IoFreeMdl` operations cross an authenticated root service; elevated-IRQL calls use the typed
+    IRQ arena under the current lane grant. Root validates the live pool allocation and public MDL
+    fields, owns the physical pool free, retires paired provider/dependent NDIS shadows exactly
+    once, rejects stale generations and duplicate frees, and revokes the remaining keyed records
+    during domain teardown only when no mappings remain. There is no component-local free fallback.
+    Focused validation passes all 7 `nt-mdl` tests and all 107 `nt-hosted-runtime` tests; both the
+    standalone DMA host and executive freestanding checks pass. Run the serialized desktop next and
+    require real E1000 receive, terminal PnP START, zero pool double frees, Explorer framebuffer,
+    all gates, and sentinel exit before accepting this checkpoint.
+
     B3 lane IRQL mirror checkpoint (2026-09-02, freestanding green): the arena control remains the
     authoritative lane-local IRQL, while the generic lane executor now mirrors each active
     ISR/DPC/provider dispatch into `SH_HOSTED_CURRENT_IRQL` and restores the previous value on

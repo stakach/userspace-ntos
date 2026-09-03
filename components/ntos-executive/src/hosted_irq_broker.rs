@@ -998,6 +998,41 @@ impl HostedIrqRootSession {
         result
     }
 
+    unsafe fn mdl_service(
+        &mut self,
+        lane_index: usize,
+        command: nt_hosted_runtime::HostedIrqServiceCommand,
+    ) -> nt_hosted_runtime::HostedIrqArenaResult {
+        let Ok(lane) = self.lane(lane_index) else {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if command.service_id != FSD_SERVICE_MDL_LABEL
+            || command.target_domain_id != lane.identity.domain_id
+            || command.target_domain_cookie != lane.identity.domain_cookie
+            || command.argument_count != 4
+            || command.arguments[0] == 0
+            || command.arguments[1] == 0
+        {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let root_dpc_grant = self
+            .dpc_grant
+            .is_some_and(|(identity, grant)| identity == lane.identity && grant == command.grant);
+        if !root_dpc_grant && !lane_has_service_grant(lane, command.grant) {
+            return fatal_service_result(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let status = service_hosted_irq_lane_mdl(
+            lane.projection_instance,
+            lane.identity.domain_id,
+            lane.identity.domain_cookie,
+            command.arguments[0],
+            command.arguments[1],
+            command.arguments[2],
+            command.arguments[3],
+        );
+        service_result(status, None)
+    }
+
     unsafe fn execute_service(
         &mut self,
         lane_index: usize,
@@ -1011,6 +1046,9 @@ impl HostedIrqRootSession {
             }
             nt_hosted_runtime::HostedIrqServiceKind::QueueDpc => {
                 self.queue_dpc_service(lane_index, command)
+            }
+            nt_hosted_runtime::HostedIrqServiceKind::Mdl => {
+                self.mdl_service(lane_index, command)
             }
             nt_hosted_runtime::HostedIrqServiceKind::ProviderImport => {
                 self.provider_import_service(lane_index, service, command)

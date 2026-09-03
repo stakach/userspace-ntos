@@ -139,6 +139,7 @@ pub enum HostedIrqServiceKind {
     QueueDpc = 3,
     AcquireActualLock = 4,
     ReleaseActualLock = 5,
+    Mdl = 6,
 }
 
 impl HostedIrqServiceKind {
@@ -149,6 +150,7 @@ impl HostedIrqServiceKind {
             3 => Some(Self::QueueDpc),
             4 => Some(Self::AcquireActualLock),
             5 => Some(Self::ReleaseActualLock),
+            6 => Some(Self::Mdl),
             _ => None,
         }
     }
@@ -471,6 +473,12 @@ impl HostedIrqServiceCommand {
                 }
                 HostedIrqServiceKind::QueueDpc => {
                     self.authority_cookie == 0 && self.argument_count == 4 && self.arguments[0] != 0
+                }
+                HostedIrqServiceKind::Mdl => {
+                    self.authority_cookie == 0
+                        && self.argument_count == 4
+                        && self.arguments[0] != 0
+                        && self.arguments[1] != 0
                 }
                 HostedIrqServiceKind::ProviderImport
                 | HostedIrqServiceKind::ProviderCallbackRequest => {
@@ -2318,7 +2326,11 @@ mod tests {
             HostedIrqServiceKind::from_raw(5),
             Some(HostedIrqServiceKind::ReleaseActualLock)
         );
-        assert_eq!(HostedIrqServiceKind::from_raw(6), None);
+        assert_eq!(
+            HostedIrqServiceKind::from_raw(6),
+            Some(HostedIrqServiceKind::Mdl)
+        );
+        assert_eq!(HostedIrqServiceKind::from_raw(7), None);
         assert!(HostedIrqServiceKind::ProviderCallbackRequest.may_request_nested_dispatch());
         assert!(!HostedIrqServiceKind::ProviderImport.may_request_nested_dispatch());
 
@@ -2348,6 +2360,16 @@ mod tests {
         queue_dpc.arguments[0] = 43;
         queue_dpc.argument_count = 3;
         assert!(!queue_dpc.valid());
+
+        let mut mdl = service();
+        mdl.kind = HostedIrqServiceKind::Mdl;
+        mdl.authority_cookie = 0;
+        mdl.argument_count = 4;
+        mdl.arguments[0] = 5;
+        mdl.arguments[1] = 0x20_0100;
+        assert!(mdl.valid());
+        mdl.arguments[1] = 0;
+        assert!(!mdl.valid());
 
         let mut provider = service();
         assert!(provider.valid());
