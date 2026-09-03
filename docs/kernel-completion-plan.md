@@ -24080,6 +24080,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     win32k resumes. The freestanding executive check remains green at 221 warnings; the next
     serialized run must prove both system-thread requests and their provider Event completions.
 
+    B3 retained connection-port receive correction (2026-09-03, host and freestanding green;
+    desktop rerun pending): the receive redrive woke CSRSS, but its first real
+    `UserpCreateSystemThreads` request was returned as `STATUS_INVALID_PARAMETER`. This was not a
+    malformed native frame: CSRSS deliberately passes its named `CsrApiPort` handle to win32k, and
+    win32k retains that server connection-port object rather than a client communication port. The
+    isolated broker therefore publishes connection ID zero for the kernel-originated request while
+    retaining exact client process, client thread, and message identity for reply matching. The LPC
+    client decoder no longer rejects this broker-authored connection-port provenance. A focused
+    regression now sends an ordinary type-zero request through a retained named port, observes the
+    normalized `LPC_REQUEST` on the real server receive path, replies through the listen handle, and
+    collects the exact reply from the retained endpoint. All seven `nt-lpc-client` and 23
+    `nt-lpc-server` tests pass; the freestanding executive check remains green at 221 warnings. The
+    next serialized run must show CSRSS dispatching both system-thread requests rather than
+    rejecting the first receive.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional

@@ -587,10 +587,7 @@ impl<B: Backend> LpcClient<B> {
             let metadata: LpcDataMessageMetadata =
                 bytemuck::try_pod_read_unaligned(&out[message_len..returned])
                     .map_err(|_| NtStatus::INVALID_PARAMETER)?;
-            if metadata.abi_size as usize != metadata_size
-                || metadata.connection_id == 0 && msg_type != msg_type::LPC_ERROR_EVENT
-                || metadata.port_context != r.detail0
-            {
+            if metadata.abi_size as usize != metadata_size || metadata.port_context != r.detail0 {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
             (

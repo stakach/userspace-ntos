@@ -1504,6 +1504,57 @@ mod tests {
     }
 
     #[test]
+    fn retained_connection_port_routes_ordinary_kernel_request() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+            .unwrap();
+        let retained = client.retain_port_object(listen).unwrap();
+        let request = port_message(0, b"create-system-thread");
+        let result = client
+            .begin_retained_request_wait_reply(retained, &request, 0x220, 0x224)
+            .unwrap();
+        let message_id = result.message_id();
+        assert!(matches!(
+            result,
+            nt_lpc_client::BeginRequestWaitReply::Pending { .. }
+        ));
+
+        let received = client.reply_wait_receive(listen).unwrap();
+        assert_eq!(received.connection_id, 0);
+        assert_eq!(received.client_process, 0x220);
+        assert_eq!(received.client_thread, 0x224);
+        assert_eq!(received.msg_type, msg_type::LPC_REQUEST);
+        assert_eq!(received.port_context, 0);
+        assert_eq!(
+            &received.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
+            b"create-system-thread"
+        );
+
+        let mut reply = received.connection_info;
+        reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
+        assert_eq!(
+            client.reply_wait_receive_with_reply(listen, &reply),
+            Err(NtStatus::PENDING)
+        );
+        assert_eq!(
+            client
+                .receive_reply(retained, 0x220, 0x224, message_id)
+                .unwrap(),
+            Some(reply)
+        );
+
+        client.release_port_object(retained).unwrap();
+        client.close_port(listen).unwrap();
+        assert_eq!(server.port_count(), 0);
+    }
+
+    #[test]
     fn retained_port_object_routes_process_exception_connection_port() {
         let mut server = Server::new();
         server.set_accept_policy(AcceptPolicy::Manual);
