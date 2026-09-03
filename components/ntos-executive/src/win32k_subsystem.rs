@@ -4451,6 +4451,47 @@ extern "win64" fn s_rtl_get_exp_winver(_base: u64) -> u32 {
     0x0501 // MAKEWORD(1, 5): Windows XP/Server 2003-compatible subsystem version.
 }
 
+extern "win64" fn s_rtl_get_version(version_information: u64) -> i32 {
+    if version_information == 0 {
+        return 0xC000_000Du32 as i32;
+    }
+    let version = nt_compat_exports::rtl::NT_VERSION;
+    unsafe {
+        let size = read_unaligned(version_information as *const u32);
+        write_unaligned((version_information + 0x04) as *mut u32, version.major);
+        write_unaligned((version_information + 0x08) as *mut u32, version.minor);
+        write_unaligned((version_information + 0x0c) as *mut u32, version.build);
+        write_unaligned((version_information + 0x10) as *mut u32, version.platform_id);
+        write_unaligned((version_information + 0x14) as *mut u16, 0);
+        if size == 0x11c {
+            write_unaligned((version_information + 0x114) as *mut u16, 0);
+            write_unaligned((version_information + 0x116) as *mut u16, 0);
+            write_unaligned((version_information + 0x118) as *mut u16, 0);
+            write_volatile((version_information + 0x11a) as *mut u8, 1);
+            write_volatile((version_information + 0x11b) as *mut u8, 0);
+        }
+    }
+    0
+}
+
+extern "win64" fn s_rtl_are_all_accesses_granted(granted: u32, desired: u32) -> u8 {
+    nt_compat_exports::rtl::are_all_accesses_granted(granted, desired) as u8
+}
+
+extern "win64" fn s_ex_system_time_to_local_time(system_time: u64, local_time: u64) {
+    if system_time == 0 || local_time == 0 {
+        return;
+    }
+    unsafe {
+        let system = read_unaligned(system_time as *const i64);
+        let bias = SYSTEM_TIME_ZONE_BIAS_100NS.load(Ordering::Relaxed) as i64;
+        write_unaligned(
+            local_time as *mut i64,
+            nt_kernel_exec::rtl_time::system_time_to_local_time(system, bias),
+        );
+    }
+}
+
 /// Allocate + initialize a DESKTOP body from the win32k pool. The DESKTOPINFO is created later from
 /// the desktop's own section-backed heap, matching ReactOS `UserInitializeDesktop`.
 unsafe fn alloc_desktop_body() -> u64 {
@@ -12659,6 +12700,15 @@ fn register_trampolines() -> bool {
     reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
     reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
     reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
+    reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);
+    reg.bind(
+        "RtlAreAllAccessesGranted",
+        s_rtl_are_all_accesses_granted as usize as u64,
+    );
+    reg.bind(
+        "ExSystemTimeToLocalTime",
+        s_ex_system_time_to_local_time as usize as u64,
+    );
     // RTL atom table (nt_kernel_exec::rtl_atom)
     reg.bind(
         "RtlCreateAtomTable",

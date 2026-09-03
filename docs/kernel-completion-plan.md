@@ -24519,6 +24519,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     failures, and keep the complete registry gate enabled. Restore the serialized desktop baseline
     only by reaching zero missing imports; do not weaken the gate or restore the zero trampoline.
 
+    B3 pure kernel-helper tranche 1 (2026-09-04, host and freestanding green): three of the 63
+    audited imports are now real. `RtlAreAllAccessesGranted` uses the exact desired-mask subset
+    predicate; `RtlGetVersion` marshals both native base and extended `RTL_OSVERSIONINFO` layouts
+    from one host-tested NT 5.2 compatibility tuple; and `ExSystemTimeToLocalTime` applies the live
+    registry-derived timezone bias through `nt-kernel-exec` instead of assuming UTC. Their former
+    `StubSuccess` metadata is removed. All 44 `nt-compat-exports` tests pass and the freestanding
+    executive release build succeeds with 231 warnings. Sixty audited code imports remain before
+    registry readiness and desktop boot can resume.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

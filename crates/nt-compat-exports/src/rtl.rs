@@ -9,6 +9,27 @@
 
 use alloc::vec::Vec;
 
+/// Kernel version exported to NT 5.2 drivers and user-mode compatibility code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NtVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub build: u32,
+    pub platform_id: u32,
+}
+
+pub const NT_VERSION: NtVersion = NtVersion {
+    major: 5,
+    minor: 2,
+    build: 3790,
+    platform_id: 2,
+};
+
+/// `RtlAreAllAccessesGranted`: every desired access bit must be present in the granted mask.
+pub const fn are_all_accesses_granted(granted: u32, desired: u32) -> bool {
+    desired & !granted == 0
+}
+
 /// A counted UTF-16 string (Windows `UNICODE_STRING`), byte lengths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnicodeString {
@@ -408,6 +429,18 @@ mod tests {
             0
         );
         assert_eq!(compare_utf16_case_insensitive_n(&u("a"), &u("z"), 0), 0);
+    }
+
+    #[test]
+    fn kernel_version_and_access_mask_contracts_match_nt52() {
+        assert_eq!(NT_VERSION.major, 5);
+        assert_eq!(NT_VERSION.minor, 2);
+        assert_eq!(NT_VERSION.build, 3790);
+        assert_eq!(NT_VERSION.platform_id, 2);
+
+        assert!(are_all_accesses_granted(0, 0));
+        assert!(are_all_accesses_granted(0x001f_0003, 0x0002));
+        assert!(!are_all_accesses_granted(0x0001, 0x0003));
     }
 
     #[test]
