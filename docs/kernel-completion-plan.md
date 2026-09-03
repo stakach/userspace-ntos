@@ -23665,6 +23665,17 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     rendezvous loop; the crate is not yet wired into the pump and therefore does not close the
     provider-wait item.
 
+    Provider-wait ABI checkpoint (2026-09-03, host green): `nt-provider-wait` now defines a fixed,
+    page-bounded `repr(C)` request for both single-object and 64-object waits. The wire format carries
+    canonical typed object ID/generation pairs rather than provider virtual addresses, exact
+    provider/client/dispatch ownership, WaitAny/WaitAll, processor mode, alertability, and distinct
+    infinite/poll/relative/absolute timeout forms. Validation rejects invalid identities, malformed
+    sizes and discriminants, duplicate objects, inconsistent timeout values, and dirty inactive
+    descriptor slots so a reused shared page cannot leak stale wait authority. All 11 focused tests
+    pass. Next map a dedicated provider-wait page, publish canonical object identities from win32k,
+    bind both wait imports, and add the component rendezvous loop plus resume label; pump suspension
+    and executive waiter admission remain a following slice.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences
