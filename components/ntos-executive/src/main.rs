@@ -16398,17 +16398,6 @@ pub(crate) unsafe fn config_manager_abort_set_value_transfer(
     client.abort_set_value_transfer(token, total_len)
 }
 
-pub(crate) unsafe fn config_manager_query_value(
-    key_path: &str,
-    name: &str,
-    out: &mut [u8],
-) -> Result<(u32, usize), i32> {
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    client.query_value(key_path, name, out)
-}
-
 pub(crate) unsafe fn config_manager_query_value_owned(
     key_path: &str,
     name: &str,

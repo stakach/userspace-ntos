@@ -24806,6 +24806,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hosted-driver registry broker on these lease/durability rules and delete its path-only handles
     and recursive generic SYSTEM mutations.
 
+    B3 hosted-driver SYSTEM registry convergence tranche 17 (2026-09-04, host and freestanding
+    green): hosted-driver kernel registry handles now retain the exact Configuration Manager key
+    lease and resolved physical SYSTEM-hive path. Their externally visible identity is a
+    monotonically allocated tagged token rather than a reusable slot number, so closing a handle
+    releases its lease and a stale value cannot alias a later open. Query and enumeration use the
+    retained lease; nonvolatile final-child creation validates the immediate parent, commits one
+    durable `CreateKey`, then acquires a fresh lease and reports the exact existing/new
+    disposition. Small and streamed `ZwSetValueKey` writes and `ZwDeleteValueKey` route through
+    `persist_and_publish_system_hive_mutation`; streamed writes have independent ordered upload
+    tokens, revalidate their handle and lease at every boundary, and are discarded on abort or
+    close. The old path-only SYSTEM slot, bounded query wrapper, recursive generic SYSTEM create,
+    and nondurable generic SYSTEM set routes have been removed.
+
+    Generic non-SYSTEM handles are a separate typed target and cannot enter a SYSTEM mutation.
+    Their existing owner may still serve reads and explicitly supported writes, but value deletion
+    fails with `STATUS_NOT_SUPPORTED` until Configuration Manager provides an equivalent lease and
+    persistence contract. The component boundary remains partial: it currently narrows counted
+    Unicode names to ASCII, does not preserve requested access, title index, optional class, or
+    security descriptor, and rejects volatile SYSTEM keys because CM has no volatile namespace.
+    Resolve those contracts in CM and the hosted-driver capture ABI; do not add another registry
+    overlay or path-only SYSTEM fallback. All 22 `nt-config-client` tests and all 46
+    `nt-compat-exports` tests pass, and the freestanding executive release build succeeds at the
+    unchanged 254-warning baseline. The audited win32k import count remains thirty-five because
+    this tranche closes a hosted-driver provider boundary rather than another win32k import.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
