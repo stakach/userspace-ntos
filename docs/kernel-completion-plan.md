@@ -24695,6 +24695,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     class owner when a real win32k caller requires another class; do not add a generic zero-filled
     response or duplicate the native-service encoding policy in the component.
 
+    B3 native global-atom tranche 12 (2026-09-04, host and freestanding green): win32k's
+    `NtAddAtom` import now reaches the executive-owned native global atom table through a dedicated
+    authenticated broker instead of creating component-private state. The component preserves
+    MAKEINTATOM values, bounds named input to the NT 255-character contract, stages exactly the
+    caller-supplied UTF-16 byte length, and publishes the output atom only after success. The
+    executive accepts the request only from the current hosted process generation and uses the same
+    case-insensitive table and reference counts as user-mode `NtAddAtom`/`NtFindAtom`. Trusted
+    kernel initialization is deliberately independent of user job `GLOBALATOMS` restrictions;
+    those restrictions continue to govern user-mode callers and their private job table.
+
+    All 243 `nt-kernel-exec` tests and all 46 `nt-compat-exports` tests pass, and the freestanding
+    executive release build succeeds. Forty audited code imports remain. The component pump now
+    admits the atom label across timer interleaving under the ordinary syscall-channel capability;
+    there is no alternate success path or local atom fallback. Continue with imports that have a
+    real existing owner. Do not route kernel-mode `ZwCreateFile`/section/registry pointers through
+    the user-mode syscall decoder, and do not expose the PnP property broker directly to win32k:
+    both groups require their proper kernel I/O/IRP boundary first.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

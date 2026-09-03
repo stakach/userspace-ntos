@@ -251,7 +251,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ProbeForRead", Partial, "validates the NT user range/alignment; structured exception delivery remains"),
     // --- Nt ---
     e("NtQuerySystemInformation", Partial, "returns live NT5 SystemBasicInformation and CPUID-derived SystemProcessorInformation with shared size policy"),
-    e("NtAddAtom", Partial, "global atom add routed to the Rtl atom table"),
+    e("NtAddAtom", Implemented, "authenticated bounded broker into the executive-owned native global atom table"),
     // --- Po ---
     e("PoRequestShutdownEvent", StubSuccess, "records a shutdown-event request; never signalled on the host"),
     // --- vDbg ---

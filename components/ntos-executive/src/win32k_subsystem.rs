@@ -1161,6 +1161,11 @@ pub const W32_PS_OP_LOOKUP_THREAD: u64 = 5;
 pub const W32_PS_OP_RETAIN_POINTER: u64 = 6;
 pub const W32_PS_OP_RELEASE_POINTER: u64 = 7;
 pub const W32_PS_OP_YIELD_EXECUTION: u64 = 8;
+/// Bounded global-atom requests. The executive owns the one native atom table; win32k stages only
+/// explicit-length UTF-16 input and receives the resulting 16-bit atom.
+pub const W32_ATOM_LABEL: u64 = 0x77E;
+pub const W32_ATOM_OP_ADD_NAME: u64 = 1;
+pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
 pub const W32_EVENT_OP_REFERENCE: u64 = 2;
 pub const W32_EVENT_OP_CLOSE: u64 = 3;
@@ -2828,6 +2833,12 @@ unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, 
     let (_label, status, out1, out2, out3) =
         crate::driver_launch::call_on4((W32_PS_LABEL << 12) | 3, op, object, value, 0);
     (status as u32 as i32, out1, out2, out3)
+}
+
+unsafe fn win32k_atom_broker_call(operation: u64, value: u64) -> (i32, u64) {
+    let (_label, status, atom, _, _) =
+        crate::driver_launch::call_on4((W32_ATOM_LABEL << 12) | 2, operation, value, 0, 0);
+    (status as u32 as i32, atom)
 }
 
 #[cold]
@@ -4890,6 +4901,31 @@ extern "win64" fn s_query_system_information(
         }
     }
     0
+}
+
+/// `NTSTATUS NtAddAtom(PWSTR AtomName, ULONG Length, PRTL_ATOM Atom)`.
+extern "win64" fn s_nt_add_atom(name: u64, byte_length: u32, atom_out: *mut u16) -> i32 {
+    let byte_length = byte_length as usize;
+    if byte_length > nt_kernel_exec::rtl_atom::NAME_CAP * 2 || byte_length & 1 != 0 {
+        return STATUS_INVALID_PARAMETER_I32;
+    }
+    let (operation, value) = if name <= 0xFFFF {
+        (W32_ATOM_OP_ADD_INTEGER, name)
+    } else {
+        if name == 0 {
+            return STATUS_ACCESS_VIOLATION_I32;
+        }
+        unsafe {
+            let payload = WIN32K_JOB_ATOM_VADDR + WIN32K_JOB_ATOM_PAYLOAD_OFF;
+            core::ptr::copy_nonoverlapping(name as *const u8, payload as *mut u8, byte_length);
+        }
+        (W32_ATOM_OP_ADD_NAME, byte_length as u64)
+    };
+    let (status, atom) = unsafe { win32k_atom_broker_call(operation, value) };
+    if status == 0 && !atom_out.is_null() {
+        unsafe { write_unaligned(atom_out, atom as u16) };
+    }
+    status
 }
 
 unsafe fn registered_kernel_image_bytes(base: u64) -> Option<&'static [u8]> {
@@ -13271,6 +13307,7 @@ fn register_trampolines() -> bool {
         "NtQuerySystemInformation",
         s_query_system_information as usize as u64,
     );
+    reg.bind("NtAddAtom", s_nt_add_atom as usize as u64);
     reg.bind("RtlImageNtHeader", s_rtl_image_nt_header as usize as u64);
     reg.bind(
         "RtlImageDirectoryEntryToData",

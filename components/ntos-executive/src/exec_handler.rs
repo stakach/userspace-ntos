@@ -26997,6 +26997,19 @@ impl ExecNtHandler {
         Ok((restrictions & nt_win32k_job::JOB_OBJECT_UILIMIT_GLOBALATOMS != 0).then_some(job))
     }
 
+    /// Add an atom on behalf of trusted kernel code. Job UI restrictions apply to user-mode global
+    /// atom callers, not to win32k's initialization of kernel-owned property names.
+    pub(crate) fn add_kernel_global_atom(
+        &mut self,
+        integer: Option<u16>,
+        name: &[u16],
+    ) -> Result<u16, u32> {
+        match integer {
+            Some(atom) => self.global_atoms.add_integer(atom),
+            None => self.global_atoms.add_name(name),
+        }
+    }
+
     fn dispatch_win32_job_atom(
         &mut self,
         job: nt_process::job::JobId,

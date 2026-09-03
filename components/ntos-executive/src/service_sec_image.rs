@@ -4747,6 +4747,60 @@ pub(crate) unsafe fn service_win32k_ps_request(
     }
 }
 
+/// Service a bounded win32k global-atom request against the executive-lifetime native atom table.
+pub(crate) unsafe fn service_win32k_atom_request(
+    client_pi: u64,
+    client_generation: u64,
+    operation: u64,
+    value: u64,
+) -> (i32, u64) {
+    const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+    const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
+
+    let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if handler_ptr.is_null() {
+        return (STATUS_DEVICE_NOT_READY, 0);
+    }
+    let handler = &mut *handler_ptr;
+    let Ok(pi) = usize::try_from(client_pi) else {
+        return (STATUS_DEVICE_NOT_READY, 0);
+    };
+    if client_generation == 0
+        || handler.pm_pid_for_pi(pi).is_none()
+        || handler.hosted_process_generation(pi) != Some(client_generation)
+    {
+        return (STATUS_DEVICE_NOT_READY, 0);
+    }
+
+    let result = match operation {
+        crate::win32k_subsystem::W32_ATOM_OP_ADD_INTEGER => {
+            if value > u16::MAX as u64 {
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            handler.add_kernel_global_atom(Some(value as u16), &[])
+        }
+        crate::win32k_subsystem::W32_ATOM_OP_ADD_NAME => {
+            let Ok(byte_length) = usize::try_from(value) else {
+                return (STATUS_INVALID_PARAMETER, 0);
+            };
+            if byte_length > nt_kernel_exec::rtl_atom::NAME_CAP * 2 || byte_length & 1 != 0 {
+                return (STATUS_INVALID_PARAMETER, 0);
+            }
+            let name = core::slice::from_raw_parts(
+                (crate::win32k_subsystem::WIN32K_JOB_ATOM_VADDR
+                    + crate::win32k_subsystem::WIN32K_JOB_ATOM_PAYLOAD_OFF)
+                    as *const u16,
+                byte_length / 2,
+            );
+            handler.add_kernel_global_atom(None, name)
+        }
+        _ => return (STATUS_INVALID_PARAMETER, 0),
+    };
+    result
+        .map(|atom| (0, u64::from(atom)))
+        .unwrap_or_else(|status| (status as i32, 0))
+}
+
 unsafe fn delay_timer_rearm_after_park(
     queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
