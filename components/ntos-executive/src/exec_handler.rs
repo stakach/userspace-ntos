@@ -110,28 +110,22 @@ pub(crate) struct ProviderLocalEventTransfer {
     state: Option<(nt_kernel_exec::EventKind, bool)>,
 }
 
-impl nt_provider_wait::ProviderEventWaitBackend for ExecNtHandler {
-    type Lease = nt_kernel_exec::EventLeaseId;
+#[derive(Clone, Copy)]
+pub(crate) enum ProviderDispatcherLease {
+    Event(nt_kernel_exec::EventLeaseId),
+    Timer(nt_provider_wait::ProviderTimerLeaseId),
+}
+
+impl nt_provider_wait::ProviderDispatcherWaitBackend for ExecNtHandler {
+    type Lease = ProviderDispatcherLease;
     type Error = u32;
 
-    fn acquire_event_wait(
+    fn acquire_dispatcher_wait(
         &mut self,
         owner: nt_provider_wait::ProviderWaitOwner,
         object: nt_provider_wait::ProviderWaitObject,
     ) -> Result<Self::Lease, Self::Error> {
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        if object.typed() != Some(nt_provider_wait::ProviderWaitObjectType::Event) {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let id = nt_kernel_exec::EventObjectId::from_wire_parts(
-            object.object_id,
-            object.object_generation,
-        )
-        .ok_or(STATUS_INVALID_PARAMETER)?;
-        let snapshot = self
-            .event_objects
-            .snapshot(id)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?;
         let provider = nt_provider_wait::ProviderDomainIdentity {
             domain: owner.provider_domain,
             generation: owner.provider_generation,
@@ -144,63 +138,111 @@ impl nt_provider_wait::ProviderEventWaitBackend for ExecNtHandler {
             .unwrap_or(0);
         if !crate::win32k_provider_domain_is_current(provider)
             || current_client_generation != owner.client_generation
-            || !snapshot.authorizes_provider_wait(
-                nt_kernel_exec::EventObjectOwner::provider(provider.domain, provider.generation),
-                nt_kernel_exec::EventObjectOwner::new(
-                    client_pid as u64,
-                    owner.client_generation,
-                ),
-            )
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let lease = self
-            .event_objects
-            .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
-            .map_err(|_| STATUS_INVALID_PARAMETER)?;
-        crate::service_sec_image::provider_wait_record_event_lease_acquired();
+        let lease = match object.typed() {
+            Some(nt_provider_wait::ProviderWaitObjectType::Event) => {
+                let id = nt_kernel_exec::EventObjectId::from_wire_parts(
+                    object.object_id,
+                    object.object_generation,
+                )
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+                let snapshot = self
+                    .event_objects
+                    .snapshot(id)
+                    .map_err(|_| STATUS_INVALID_PARAMETER)?;
+                if !snapshot.authorizes_provider_wait(
+                    nt_kernel_exec::EventObjectOwner::provider(
+                        provider.domain,
+                        provider.generation,
+                    ),
+                    nt_kernel_exec::EventObjectOwner::new(
+                        client_pid as u64,
+                        owner.client_generation,
+                    ),
+                ) {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                ProviderDispatcherLease::Event(
+                    self.event_objects
+                        .acquire_wait(id, nt_kernel_exec::EventLeaseKind::ProviderWait)
+                        .map_err(|_| STATUS_INVALID_PARAMETER)?,
+                )
+            }
+            Some(nt_provider_wait::ProviderWaitObjectType::Timer) => {
+                ProviderDispatcherLease::Timer(
+                    self.provider_timers
+                        .acquire_wait(owner, object)
+                        .map_err(|_| STATUS_INVALID_PARAMETER)?,
+                )
+            }
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        };
+        crate::service_sec_image::provider_wait_record_dispatcher_lease_acquired();
         Ok(lease)
     }
 
-    fn event_is_ready(&self, lease: Self::Lease) -> bool {
-        let id = self
-            .event_objects
-            .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
-            .expect("provider Event wait lost its canonical lease");
-        let snapshot = self
-            .event_objects
-            .snapshot(id)
-            .expect("provider Event wait lease resolved a stale object");
-        self.events.read_state(snapshot.native_identity)
-    }
-
-    fn consume_ready_event(&mut self, lease: Self::Lease) {
-        let id = self
-            .event_objects
-            .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
-            .expect("provider Event wait lost its canonical lease");
-        let snapshot = self
-            .event_objects
-            .snapshot(id)
-            .expect("provider Event wait lease resolved a stale object");
-        assert!(
-            self.events.consume_existing(snapshot.native_identity),
-            "provider Event wait selected an unsignalled object"
-        );
-    }
-
-    fn release_event_wait(&mut self, lease: Self::Lease) {
-        match self
-            .event_objects
-            .release_wait(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
-        {
-            Ok(Some(retired)) => {
-                crate::service_sec_image::provider_wait_record_event_lease_released();
-                self.finalize_retired_event_object(retired)
+    fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
+        match lease {
+            ProviderDispatcherLease::Event(lease) => {
+                let id = self
+                    .event_objects
+                    .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
+                    .expect("provider Event wait lost its canonical lease");
+                let snapshot = self
+                    .event_objects
+                    .snapshot(id)
+                    .expect("provider Event wait lease resolved a stale object");
+                self.events.read_state(snapshot.native_identity)
             }
-            Ok(None) => crate::service_sec_image::provider_wait_record_event_lease_released(),
-            Err(_) => panic!("provider Event wait lost its exact lease during release"),
+            ProviderDispatcherLease::Timer(lease) => self
+                .provider_timers
+                .is_ready(lease)
+                .expect("provider Timer wait lost its canonical lease"),
         }
+    }
+
+    fn consume_ready_dispatcher(&mut self, lease: Self::Lease) {
+        match lease {
+            ProviderDispatcherLease::Event(lease) => {
+                let id = self
+                    .event_objects
+                    .event_for_lease(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
+                    .expect("provider Event wait lost its canonical lease");
+                let snapshot = self
+                    .event_objects
+                    .snapshot(id)
+                    .expect("provider Event wait lease resolved a stale object");
+                assert!(
+                    self.events.consume_existing(snapshot.native_identity),
+                    "provider Event wait selected an unsignalled object"
+                );
+            }
+            ProviderDispatcherLease::Timer(lease) => self
+                .provider_timers
+                .consume_ready(lease)
+                .expect("provider Timer wait selected an unsignalled object"),
+        }
+    }
+
+    fn release_dispatcher_wait(&mut self, lease: Self::Lease) {
+        match lease {
+            ProviderDispatcherLease::Event(lease) => match self
+                .event_objects
+                .release_wait(lease, nt_kernel_exec::EventLeaseKind::ProviderWait)
+            {
+                Ok(Some(retired)) => self.finalize_retired_event_object(retired),
+                Ok(None) => {}
+                Err(_) => panic!("provider Event wait lost its exact lease during release"),
+            },
+            ProviderDispatcherLease::Timer(lease) => {
+                self.provider_timers
+                    .release_wait(lease)
+                    .expect("provider Timer wait lost its exact lease during release");
+            }
+        }
+        crate::service_sec_image::provider_wait_record_dispatcher_lease_released();
     }
 }
 
@@ -4018,6 +4060,8 @@ impl ExecNtHandler {
         let time_configuration = SystemTimeConfiguration::default();
         let time_zone_information = time_configuration.information;
         let real_time_is_universal = time_configuration.real_time_is_universal;
+        let provider_timer_domain = crate::current_win32k_provider_domain()
+            .expect("executive construction requires the registered win32k provider domain");
         let BootstrapProcessManagerSeed {
             pm,
             pids: bootstrap_pids,
@@ -4059,6 +4103,11 @@ impl ExecNtHandler {
         write_field!(
             event_objects,
             nt_kernel_exec::EventObjectRegistry::with_capacity(192, 192)
+        );
+        write_field!(
+            provider_timers,
+            nt_provider_wait::ProviderTimerTable::new(provider_timer_domain)
+                .expect("registered win32k provider domain must be valid")
         );
         write_field!(user_timers, nt_user_timer::TimerTable::with_capacity(32));
         write_field!(user_timer_rearm_requested, false);
@@ -26251,6 +26300,126 @@ impl ExecNtHandler {
                 local_identity,
             )
             .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_publish_local_timer(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+        timer_type: u32,
+    ) -> Result<nt_provider_wait::ProviderWaitObject, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) || timer_type > 1 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let kind = if timer_type == 0 {
+            nt_provider_wait::ProviderTimerKind::Notification
+        } else {
+            nt_provider_wait::ProviderTimerKind::Synchronization
+        };
+        self.provider_timers
+            .publish(local_identity, kind)
+            .map(nt_provider_wait::ProviderTimerId::wait_object)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_set_local_timer(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+        due_time_100ns: i64,
+        period_ms: u32,
+    ) -> Result<bool, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_timers
+            .set_local(
+                local_identity,
+                due_time_100ns,
+                period_ms,
+                crate::nt_time_snapshot(),
+            )
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_cancel_local_timer(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<bool, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_timers
+            .cancel_local(local_identity)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_read_local_timer(
+        &self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<bool, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let id = self
+            .provider_timers
+            .id_for_local(local_identity)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        self.provider_timers
+            .read_state(id)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_retire_local_timer(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        local_identity: u64,
+    ) -> Result<Option<nt_provider_wait::ProviderTimerRetirement>, u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_timers
+            .request_retire_local(local_identity)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_ack_local_timer_retirement(
+        &mut self,
+        provider: nt_provider_wait::ProviderDomainIdentity,
+        retirement: nt_provider_wait::ProviderTimerRetirement,
+    ) -> Result<(), u32> {
+        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+        if !crate::win32k_provider_domain_is_current(provider) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        self.provider_timers
+            .ack_retirement(retirement)
+            .map_err(|_| STATUS_INVALID_PARAMETER)
+    }
+
+    pub(crate) fn provider_timer_next_deadline(
+        &self,
+        now: nt_delay_execution::TimeSnapshot,
+    ) -> Option<u64> {
+        self.provider_timers.next_deadline(now)
+    }
+
+    pub(crate) fn provider_timer_expire_due(
+        &mut self,
+        now: nt_delay_execution::TimeSnapshot,
+    ) -> u64 {
+        let mut expired = 0u64;
+        while self.provider_timers.expire_next_due(now).is_some() {
+            expired = expired.saturating_add(1);
+        }
+        expired
     }
 
     fn provider_event_identity(

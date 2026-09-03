@@ -199,9 +199,9 @@ struct ComponentNativeContinuation {
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
 const COMPONENT_EXECUTION_LANE_CAPACITY: usize = win32k_subsystem::WIN32K_LANE_CAPACITY + 1;
-static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderEventWaitArbiter<
-    nt_kernel_exec::EventLeaseId,
-> = nt_provider_wait::ProviderEventWaitArbiter::new();
+static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderDispatcherWaitArbiter<
+    crate::exec_handler::ProviderDispatcherLease,
+> = nt_provider_wait::ProviderDispatcherWaitArbiter::new();
 static mut COMPONENT_SUSPENSIONS: nt_component_suspension::ComponentSuspensionLanes<
     ComponentNativeContinuation,
     ComponentSuspensionCompletion,
@@ -328,8 +328,8 @@ static PROVIDER_WAIT_REARMS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_DISPATCH_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_CANCELLATIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_WAIT_EVENT_LEASES_ACQUIRED: AtomicU64 = AtomicU64::new(0);
-static PROVIDER_WAIT_EVENT_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_DISPATCHER_LEASES_ACQUIRED: AtomicU64 = AtomicU64::new(0);
+static PROVIDER_WAIT_DISPATCHER_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
 static SERVICE_DELAY_NESTED_DRAINS: AtomicU64 = AtomicU64::new(0);
 static SERVICE_CRASH_PARKED_MASK: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RUNNABLE_DEFER_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -344,19 +344,19 @@ pub(crate) struct ProviderWaitRuntimeStats {
     pub dispatch_completions: u64,
     pub cancellations: u64,
     pub native_replies_abandoned: u64,
-    pub event_leases_acquired: u64,
-    pub event_leases_released: u64,
+    pub dispatcher_leases_acquired: u64,
+    pub dispatcher_leases_released: u64,
     pub active_continuations: usize,
     pub active_waiters: usize,
-    pub active_event_leases: usize,
+    pub active_dispatcher_leases: usize,
 }
 
-pub(crate) fn provider_wait_record_event_lease_acquired() {
-    PROVIDER_WAIT_EVENT_LEASES_ACQUIRED.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn provider_wait_record_dispatcher_lease_acquired() {
+    PROVIDER_WAIT_DISPATCHER_LEASES_ACQUIRED.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn provider_wait_record_event_lease_released() {
-    PROVIDER_WAIT_EVENT_LEASES_RELEASED.fetch_add(1, Ordering::Relaxed);
+pub(crate) fn provider_wait_record_dispatcher_lease_released() {
+    PROVIDER_WAIT_DISPATCHER_LEASES_RELEASED.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
@@ -371,8 +371,8 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
             cancellations: PROVIDER_WAIT_CANCELLATIONS.load(Ordering::Relaxed),
             native_replies_abandoned: PROVIDER_WAIT_NATIVE_REPLIES_ABANDONED
                 .load(Ordering::Relaxed),
-            event_leases_acquired: PROVIDER_WAIT_EVENT_LEASES_ACQUIRED.load(Ordering::Relaxed),
-            event_leases_released: PROVIDER_WAIT_EVENT_LEASES_RELEASED.load(Ordering::Relaxed),
+            dispatcher_leases_acquired: PROVIDER_WAIT_DISPATCHER_LEASES_ACQUIRED.load(Ordering::Relaxed),
+            dispatcher_leases_released: PROVIDER_WAIT_DISPATCHER_LEASES_RELEASED.load(Ordering::Relaxed),
             active_continuations: (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                 .frames()
                 .filter(|(_, frame)| {
@@ -383,7 +383,7 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
                 })
                 .count(),
             active_waiters: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).len(),
-            active_event_leases: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).lease_count(),
+            active_dispatcher_leases: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).lease_count(),
         }
     }
 }
@@ -1368,9 +1368,9 @@ unsafe fn steal_main_reply() -> Option<u64> {
     Some(stolen)
 }
 
-fn provider_wait_status_for_error<E>(error: nt_provider_wait::ProviderEventWaitError<E>) -> i32 {
+fn provider_wait_status_for_error<E>(error: nt_provider_wait::ProviderDispatcherWaitError<E>) -> i32 {
     match error {
-        nt_provider_wait::ProviderEventWaitError::NoCapacity => 0xC000_009Au32 as i32,
+        nt_provider_wait::ProviderDispatcherWaitError::NoCapacity => 0xC000_009Au32 as i32,
         _ => 0xC000_000Du32 as i32,
     }
 }
@@ -1826,11 +1826,11 @@ unsafe fn component_suspension_resume_top(
                                 nt_time_snapshot(),
                             );
                         match admission {
-                            Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
+                            Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
                                 PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
                                 return Some(ComponentSuspensionRuntimeOutcome::Parked);
                             }
-                            Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied {
+                            Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied {
                                 wait_id,
                                 status,
                             }) => {
@@ -1840,7 +1840,7 @@ unsafe fn component_suspension_resume_top(
                                         ComponentSuspensionCompletion::provider(status),
                                     );
                             }
-                            Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut {
+                            Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut {
                                 wait_id,
                             }) => {
                                 let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
@@ -1938,6 +1938,17 @@ pub(crate) unsafe fn provider_wait_select_due(
     selected
 }
 
+pub(crate) unsafe fn provider_timer_wake_due(
+    nt_handler: &mut ExecNtHandler,
+    now: nt_delay_execution::TimeSnapshot,
+) -> u64 {
+    let expired = nt_handler.provider_timer_expire_due(now);
+    if expired == 0 {
+        return 0;
+    }
+    expired.saturating_add(provider_wait_select_ready(nt_handler))
+}
+
 unsafe fn provider_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
@@ -1992,10 +2003,10 @@ unsafe fn provider_wait_admit_current(
         sequence,
         nt_time_snapshot(),
     ) {
-        Ok(nt_provider_wait::ProviderEventWaitAdmission::Parked { .. }) => {
+        Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Parked { .. }) => {
             PROVIDER_WAIT_PARKED_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(nt_provider_wait::ProviderEventWaitAdmission::Satisfied { wait_id, status }) => {
+        Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::Satisfied { wait_id, status }) => {
             if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .select(
                     provider_wait_key(wait_id),
@@ -2006,7 +2017,7 @@ unsafe fn provider_wait_admit_current(
                 panic!("provider wait immediate completion lost its continuation");
             }
         }
-        Ok(nt_provider_wait::ProviderEventWaitAdmission::TimedOut { wait_id }) => {
+        Ok(nt_provider_wait::ProviderDispatcherWaitAdmission::TimedOut { wait_id }) => {
             if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                 .select(
                     provider_wait_key(wait_id),
@@ -4057,6 +4068,12 @@ pub(crate) unsafe fn service_win32k_event_request(
             | crate::win32k_subsystem::W32_EVENT_OP_CLEAR_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_PULSE_LOCAL
             | crate::win32k_subsystem::W32_EVENT_OP_READ_LOCAL
+            | crate::win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL
+            | crate::win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL
+            | crate::win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT
+            | crate::win32k_subsystem::W32_TIMER_OP_SET_LOCAL
+            | crate::win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL
+            | crate::win32k_subsystem::W32_TIMER_OP_READ_LOCAL
     );
     let pi = if provider_scoped {
         0
@@ -4262,6 +4279,86 @@ pub(crate) unsafe fn service_win32k_event_request(
             };
             handler
                 .provider_read_local_event(provider, arg1)
+                .map(|signaled| (0, u64::from(signaled), 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_TIMER_OP_PUBLISH_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_publish_local_timer(provider, arg1, arg2 as u32)
+                .map(|object| (0, object.object_id, object.object_generation, arg2))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_TIMER_OP_RETIRE_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_retire_local_timer(provider, arg1)
+                .map(|retirement| match retirement {
+                    Some(retirement) => {
+                        let object = retirement.id.wait_object();
+                        (0, object.object_id, object.object_generation, 0)
+                    }
+                    None => (0x0000_0103, 0, 0, 0),
+                })
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_TIMER_OP_ACK_LOCAL_RETIREMENT => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            let object = nt_provider_wait::ProviderWaitObject::new(
+                nt_provider_wait::ProviderWaitObjectType::Timer,
+                arg2,
+                arg3,
+            );
+            let Some(id) = nt_provider_wait::ProviderTimerId::from_wait_object(object) else {
+                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+            };
+            handler
+                .provider_ack_local_timer_retirement(
+                    provider,
+                    nt_provider_wait::ProviderTimerRetirement {
+                        id,
+                        local_identity: arg1,
+                    },
+                )
+                .map(|()| (0, 0, 0, 0))
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_TIMER_OP_SET_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_set_local_timer(provider, arg1, arg2 as i64, arg3 as u32)
+                .map(|active| {
+                    let _ = rearm_registered_delay_timer();
+                    (0, u64::from(active), 0, 0)
+                })
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_TIMER_OP_CANCEL_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_cancel_local_timer(provider, arg1)
+                .map(|active| {
+                    let _ = rearm_registered_delay_timer();
+                    (0, u64::from(active), 0, 0)
+                })
+                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
+        }
+        crate::win32k_subsystem::W32_TIMER_OP_READ_LOCAL => {
+            let Some(provider) = crate::current_win32k_provider_domain() else {
+                return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+            };
+            handler
+                .provider_read_local_timer(provider, arg1)
                 .map(|signaled| (0, u64::from(signaled), 0, 0))
                 .unwrap_or_else(|status| (status as i32, 0, 0, 0))
         }

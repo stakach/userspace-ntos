@@ -10,28 +10,28 @@ use crate::{
 pub const STATUS_WAIT_0: i32 = 0;
 pub const STATUS_TIMEOUT: i32 = 0x0000_0102;
 
-/// Executive operations required by the Event-only provider-wait arbiter.
+/// Executive operations required by the typed dispatcher-object provider-wait arbiter.
 ///
 /// A successful acquisition creates an exact canonical `ProviderWait` lease. The remaining
 /// operations are infallible until release: losing a previously acquired lease is a kernel
 /// invariant failure, not a recoverable wait result.
-pub trait ProviderEventWaitBackend {
+pub trait ProviderDispatcherWaitBackend {
     type Lease: Copy;
     type Error;
 
-    fn acquire_event_wait(
+    fn acquire_dispatcher_wait(
         &mut self,
         owner: ProviderWaitOwner,
         object: ProviderWaitObject,
     ) -> Result<Self::Lease, Self::Error>;
 
-    fn event_is_ready(&self, lease: Self::Lease) -> bool;
-    fn consume_ready_event(&mut self, lease: Self::Lease);
-    fn release_event_wait(&mut self, lease: Self::Lease);
+    fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool;
+    fn consume_ready_dispatcher(&mut self, lease: Self::Lease);
+    fn release_dispatcher_wait(&mut self, lease: Self::Lease);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderEventWaitError<E> {
+pub enum ProviderDispatcherWaitError<E> {
     InvalidRequest(ProviderWaitAbiError),
     OwnerMismatch,
     UnsupportedAlertableWait,
@@ -43,14 +43,14 @@ pub enum ProviderEventWaitError<E> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderEventWaitAdmission {
+pub enum ProviderDispatcherWaitAdmission {
     Satisfied { wait_id: u64, status: i32 },
     TimedOut { wait_id: u64 },
     Parked { wait_id: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProviderEventWaitCompletion {
+pub struct ProviderDispatcherWaitCompletion {
     pub wait_id: u64,
     pub owner: ProviderWaitOwner,
     pub admission_sequence: u64,
@@ -58,7 +58,7 @@ pub struct ProviderEventWaitCompletion {
     pub cancelled: bool,
 }
 
-struct ProviderEventWaitRecord<L> {
+struct ProviderDispatcherWaitRecord<L> {
     wait_id: u64,
     owner: ProviderWaitOwner,
     admission_sequence: u64,
@@ -68,16 +68,16 @@ struct ProviderEventWaitRecord<L> {
     deadline: Deadline,
 }
 
-/// Event-only dispatcher arbiter for calls made by isolated kernel providers.
+/// Dispatcher-object arbiter for calls made by isolated kernel providers.
 ///
 /// The shared request is copied before validation, provider and client ownership are checked as one
 /// tuple, and every canonical lease is acquired before a waiter becomes visible. Selection uses the
 /// executive-supplied global admission sequence rather than backing-vector position.
-pub struct ProviderEventWaitArbiter<L> {
-    waiters: Vec<ProviderEventWaitRecord<L>>,
+pub struct ProviderDispatcherWaitArbiter<L> {
+    waiters: Vec<ProviderDispatcherWaitRecord<L>>,
 }
 
-impl<L: Copy> ProviderEventWaitArbiter<L> {
+impl<L: Copy> ProviderDispatcherWaitArbiter<L> {
     pub const fn new() -> Self {
         Self {
             waiters: Vec::new(),
@@ -110,30 +110,31 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         expected_owner: ProviderWaitOwner,
         admission_sequence: u64,
         now: TimeSnapshot,
-    ) -> Result<ProviderEventWaitAdmission, ProviderEventWaitError<B::Error>>
+    ) -> Result<ProviderDispatcherWaitAdmission, ProviderDispatcherWaitError<B::Error>>
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         // Never retain a borrow into a page the provider can overwrite on a nested dispatch.
         let captured = *shared_request;
         let request = captured
             .validate()
-            .map_err(ProviderEventWaitError::InvalidRequest)?;
+            .map_err(ProviderDispatcherWaitError::InvalidRequest)?;
         if request.owner != expected_owner {
-            return Err(ProviderEventWaitError::OwnerMismatch);
+            return Err(ProviderDispatcherWaitError::OwnerMismatch);
         }
         if request.alertable {
-            return Err(ProviderEventWaitError::UnsupportedAlertableWait);
+            return Err(ProviderDispatcherWaitError::UnsupportedAlertableWait);
         }
-        if request
-            .objects
-            .iter()
-            .any(|object| object.typed() != Some(ProviderWaitObjectType::Event))
-        {
-            return Err(ProviderEventWaitError::UnsupportedObjectType);
+        if request.objects.iter().any(|object| {
+            !matches!(
+                object.typed(),
+                Some(ProviderWaitObjectType::Event | ProviderWaitObjectType::Timer)
+            )
+        }) {
+            return Err(ProviderDispatcherWaitError::UnsupportedObjectType);
         }
         if admission_sequence == 0 {
-            return Err(ProviderEventWaitError::InvalidAdmissionSequence);
+            return Err(ProviderDispatcherWaitError::InvalidAdmissionSequence);
         }
         if self.waiters.iter().any(|waiter| {
             waiter.wait_id == request.wait_id
@@ -141,30 +142,30 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
                     && waiter.owner.provider_generation == request.owner.provider_generation
                     && waiter.owner.dispatch_id == request.owner.dispatch_id)
         }) {
-            return Err(ProviderEventWaitError::DuplicateWait);
+            return Err(ProviderDispatcherWaitError::DuplicateWait);
         }
 
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(request.objects.len())
-            .map_err(|_| ProviderEventWaitError::NoCapacity)?;
+            .map_err(|_| ProviderDispatcherWaitError::NoCapacity)?;
         objects.extend_from_slice(request.objects);
         let mut leases = Vec::new();
         leases
             .try_reserve_exact(objects.len())
-            .map_err(|_| ProviderEventWaitError::NoCapacity)?;
+            .map_err(|_| ProviderDispatcherWaitError::NoCapacity)?;
         if self.waiters.len() == self.waiters.capacity() {
             self.waiters
                 .try_reserve(1)
-                .map_err(|_| ProviderEventWaitError::NoCapacity)?;
+                .map_err(|_| ProviderDispatcherWaitError::NoCapacity)?;
         }
 
         for object in objects.iter().copied() {
-            match backend.acquire_event_wait(request.owner, object) {
+            match backend.acquire_dispatcher_wait(request.owner, object) {
                 Ok(lease) => leases.push(lease),
                 Err(error) => {
                     Self::release_leases(backend, &leases);
-                    return Err(ProviderEventWaitError::Backend(error));
+                    return Err(ProviderDispatcherWaitError::Backend(error));
                 }
             }
         }
@@ -172,7 +173,7 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         if let Some(index) = Self::ready_selection(backend, request.wait_type, &leases) {
             Self::consume_selection(backend, request.wait_type, &leases, index);
             Self::release_leases(backend, &leases);
-            return Ok(ProviderEventWaitAdmission::Satisfied {
+            return Ok(ProviderDispatcherWaitAdmission::Satisfied {
                 wait_id: request.wait_id,
                 status: STATUS_WAIT_0 + index as i32,
             });
@@ -186,12 +187,12 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         };
         if request.timeout_kind == ProviderWaitTimeoutKind::Poll || deadline.is_due(now) {
             Self::release_leases(backend, &leases);
-            return Ok(ProviderEventWaitAdmission::TimedOut {
+            return Ok(ProviderDispatcherWaitAdmission::TimedOut {
                 wait_id: request.wait_id,
             });
         }
 
-        self.waiters.push(ProviderEventWaitRecord {
+        self.waiters.push(ProviderDispatcherWaitRecord {
             wait_id: request.wait_id,
             owner: request.owner,
             admission_sequence,
@@ -200,7 +201,7 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
             leases,
             deadline,
         });
-        Ok(ProviderEventWaitAdmission::Parked {
+        Ok(ProviderDispatcherWaitAdmission::Parked {
             wait_id: request.wait_id,
         })
     }
@@ -211,7 +212,7 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         object: ProviderWaitObject,
     ) -> Option<u64>
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         self.waiters
             .iter()
@@ -226,9 +227,9 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
             .min()
     }
 
-    pub fn pop_ready<B>(&mut self, backend: &mut B) -> Option<ProviderEventWaitCompletion>
+    pub fn pop_ready<B>(&mut self, backend: &mut B) -> Option<ProviderDispatcherWaitCompletion>
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         let (slot, selected) = self
             .waiters
@@ -243,7 +244,7 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         let waiter = self.waiters.remove(slot);
         Self::consume_selection(backend, waiter.wait_type, &waiter.leases, selected);
         Self::release_leases(backend, &waiter.leases);
-        Some(ProviderEventWaitCompletion {
+        Some(ProviderDispatcherWaitCompletion {
             wait_id: waiter.wait_id,
             owner: waiter.owner,
             admission_sequence: waiter.admission_sequence,
@@ -263,9 +264,9 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         &mut self,
         backend: &mut B,
         now: TimeSnapshot,
-    ) -> Option<ProviderEventWaitCompletion>
+    ) -> Option<ProviderDispatcherWaitCompletion>
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         let slot = self
             .waiters
@@ -284,9 +285,9 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         backend: &mut B,
         wait_id: u64,
         status: i32,
-    ) -> Option<ProviderEventWaitCompletion>
+    ) -> Option<ProviderDispatcherWaitCompletion>
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         let slot = self
             .waiters
@@ -301,13 +302,13 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         slot: usize,
         status: i32,
         cancelled: bool,
-    ) -> ProviderEventWaitCompletion
+    ) -> ProviderDispatcherWaitCompletion
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         let waiter = self.waiters.remove(slot);
         Self::release_leases(backend, &waiter.leases);
-        ProviderEventWaitCompletion {
+        ProviderDispatcherWaitCompletion {
             wait_id: waiter.wait_id,
             owner: waiter.owner,
             admission_sequence: waiter.admission_sequence,
@@ -318,18 +319,18 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
 
     fn ready_selection<B>(backend: &B, wait_type: ProviderWaitType, leases: &[L]) -> Option<usize>
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         match wait_type {
             ProviderWaitType::All => leases
                 .iter()
                 .copied()
-                .all(|lease| backend.event_is_ready(lease))
+                .all(|lease| backend.dispatcher_is_ready(lease))
                 .then_some(0),
             ProviderWaitType::Any => leases
                 .iter()
                 .copied()
-                .position(|lease| backend.event_is_ready(lease)),
+                .position(|lease| backend.dispatcher_is_ready(lease)),
         }
     }
 
@@ -339,29 +340,29 @@ impl<L: Copy> ProviderEventWaitArbiter<L> {
         leases: &[L],
         index: usize,
     ) where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         match wait_type {
             ProviderWaitType::All => {
                 for lease in leases.iter().copied() {
-                    backend.consume_ready_event(lease);
+                    backend.consume_ready_dispatcher(lease);
                 }
             }
-            ProviderWaitType::Any => backend.consume_ready_event(leases[index]),
+            ProviderWaitType::Any => backend.consume_ready_dispatcher(leases[index]),
         }
     }
 
     fn release_leases<B>(backend: &mut B, leases: &[L])
     where
-        B: ProviderEventWaitBackend<Lease = L>,
+        B: ProviderDispatcherWaitBackend<Lease = L>,
     {
         for lease in leases.iter().copied().rev() {
-            backend.release_event_wait(lease);
+            backend.release_dispatcher_wait(lease);
         }
     }
 }
 
-impl<L: Copy> Default for ProviderEventWaitArbiter<L> {
+impl<L: Copy> Default for ProviderDispatcherWaitArbiter<L> {
     fn default() -> Self {
         Self::new()
     }
@@ -419,11 +420,11 @@ mod tests {
         }
     }
 
-    impl ProviderEventWaitBackend for Backend {
+    impl ProviderDispatcherWaitBackend for Backend {
         type Lease = u64;
         type Error = &'static str;
 
-        fn acquire_event_wait(
+        fn acquire_dispatcher_wait(
             &mut self,
             owner: ProviderWaitOwner,
             object: ProviderWaitObject,
@@ -442,11 +443,11 @@ mod tests {
             Ok(self.next_lease)
         }
 
-        fn event_is_ready(&self, lease: Self::Lease) -> bool {
+        fn dispatcher_is_ready(&self, lease: Self::Lease) -> bool {
             self.events[&self.leases[&lease]].signaled
         }
 
-        fn consume_ready_event(&mut self, lease: Self::Lease) {
+        fn consume_ready_dispatcher(&mut self, lease: Self::Lease) {
             let key = self.leases[&lease];
             let event = self.events.get_mut(&key).unwrap();
             assert!(event.signaled);
@@ -455,7 +456,7 @@ mod tests {
             }
         }
 
-        fn release_event_wait(&mut self, lease: Self::Lease) {
+        fn release_dispatcher_wait(&mut self, lease: Self::Lease) {
             let key = self.leases.remove(&lease).unwrap();
             self.events.get_mut(&key).unwrap().leases -= 1;
         }
@@ -475,6 +476,10 @@ mod tests {
 
     fn event(slot: u64) -> ProviderWaitObject {
         ProviderWaitObject::new(ProviderWaitObjectType::Event, slot, 1)
+    }
+
+    fn timer(slot: u64) -> ProviderWaitObject {
+        ProviderWaitObject::new(ProviderWaitObjectType::Timer, slot, 1)
     }
 
     fn request(
@@ -517,7 +522,7 @@ mod tests {
         let mut backend = Backend::default();
         backend.insert(identity, event(1), false, false);
         backend.insert(identity, event(2), false, true);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         let result = arbiter.admit(
             &mut backend,
             &request(
@@ -534,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            Ok(ProviderEventWaitAdmission::Satisfied {
+            Ok(ProviderDispatcherWaitAdmission::Satisfied {
                 wait_id: 10,
                 status: 1
             })
@@ -544,12 +549,44 @@ mod tests {
     }
 
     #[test]
+    fn wait_any_accepts_mixed_event_and_timer_leases() {
+        let identity = owner(15);
+        let mut backend = Backend::default();
+        backend.insert(identity, event(1), false, false);
+        backend.insert(identity, timer(2), true, true);
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
+
+        assert_eq!(
+            arbiter.admit(
+                &mut backend,
+                &request(
+                    identity,
+                    24,
+                    ProviderWaitType::Any,
+                    ProviderWaitTimeoutKind::Infinite,
+                    0,
+                    &[event(1), timer(2)],
+                ),
+                identity,
+                15,
+                now(0, 0),
+            ),
+            Ok(ProviderDispatcherWaitAdmission::Satisfied {
+                wait_id: 24,
+                status: 1,
+            })
+        );
+        assert!(backend.events[&(2, 1)].signaled);
+        assert_eq!(backend.lease_count(), 0);
+    }
+
+    #[test]
     fn wait_all_is_atomic_and_notification_state_remains_set() {
         let identity = owner(2);
         let mut backend = Backend::default();
         backend.insert(identity, event(1), false, true);
         backend.insert(identity, event(2), true, false);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         let admission = arbiter.admit(
             &mut backend,
             &request(
@@ -566,7 +603,7 @@ mod tests {
         );
         assert_eq!(
             admission,
-            Ok(ProviderEventWaitAdmission::Parked { wait_id: 11 })
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 11 })
         );
         assert!(backend.events[&(1, 1)].signaled);
         backend.set(event(2));
@@ -586,7 +623,7 @@ mod tests {
         backend.insert(identity, event(1), false, false);
         backend.insert(identity, event(2), false, false);
         backend.fail_object = Some((2, 1));
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         let result = arbiter.admit(
             &mut backend,
             &request(
@@ -601,7 +638,7 @@ mod tests {
             4,
             now(0, 0),
         );
-        assert_eq!(result, Err(ProviderEventWaitError::Backend("injected")));
+        assert_eq!(result, Err(ProviderDispatcherWaitError::Backend("injected")));
         assert_eq!(backend.lease_count(), 0);
         assert!(arbiter.is_empty());
     }
@@ -611,7 +648,7 @@ mod tests {
         let identity = owner(4);
         let mut backend = Backend::default();
         backend.insert(identity, event(1), false, false);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         let base = request(
             identity,
             13,
@@ -622,13 +659,13 @@ mod tests {
         );
         assert_eq!(
             arbiter.admit(&mut backend, &base, owner(99), 5, now(0, 0)),
-            Err(ProviderEventWaitError::OwnerMismatch)
+            Err(ProviderDispatcherWaitError::OwnerMismatch)
         );
         let mut invalid = base;
         invalid.header.alertable = 1;
         assert_eq!(
             arbiter.admit(&mut backend, &invalid, identity, 5, now(0, 0)),
-            Err(ProviderEventWaitError::UnsupportedAlertableWait)
+            Err(ProviderDispatcherWaitError::UnsupportedAlertableWait)
         );
         let semaphore = ProviderWaitObject::new(ProviderWaitObjectType::Semaphore, 1, 1);
         let unsupported = request(
@@ -641,7 +678,7 @@ mod tests {
         );
         assert_eq!(
             arbiter.admit(&mut backend, &unsupported, identity, 5, now(0, 0)),
-            Err(ProviderEventWaitError::UnsupportedObjectType)
+            Err(ProviderDispatcherWaitError::UnsupportedObjectType)
         );
         assert_eq!(backend.lease_count(), 0);
     }
@@ -651,7 +688,7 @@ mod tests {
         let identity = owner(14);
         let mut backend = Backend::default();
         backend.insert(identity, event(1), false, false);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         let mut user_wait = request(
             identity,
             23,
@@ -664,7 +701,7 @@ mod tests {
 
         assert_eq!(
             arbiter.admit(&mut backend, &user_wait, identity, 14, now(0, 0)),
-            Ok(ProviderEventWaitAdmission::Parked { wait_id: 23 })
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 23 })
         );
         assert_eq!(arbiter.lease_count(), 1);
         assert_eq!(backend.lease_count(), 1);
@@ -682,7 +719,7 @@ mod tests {
         let identity = owner(5);
         let mut backend = Backend::default();
         backend.insert(identity, event(1), false, false);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         for (wait_id, kind, timeout) in [
             (14, ProviderWaitTimeoutKind::Poll, 0),
             (15, ProviderWaitTimeoutKind::Absolute, 100),
@@ -703,7 +740,7 @@ mod tests {
             );
             assert_eq!(
                 admission,
-                Ok(ProviderEventWaitAdmission::TimedOut { wait_id })
+                Ok(ProviderDispatcherWaitAdmission::TimedOut { wait_id })
             );
         }
         assert_eq!(backend.lease_count(), 0);
@@ -714,7 +751,7 @@ mod tests {
         let identity = owner(6);
         let mut backend = Backend::default();
         backend.insert(identity, event(1), false, false);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         let timed = request(
             identity,
             16,
@@ -725,7 +762,7 @@ mod tests {
         );
         assert_eq!(
             arbiter.admit(&mut backend, &timed, identity, 8, now(10, 100)),
-            Ok(ProviderEventWaitAdmission::Parked { wait_id: 16 })
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 16 })
         );
         assert_eq!(arbiter.next_deadline(now(10, 100)), Some(35));
         assert!(arbiter.pop_due(&mut backend, now(34, 124)).is_none());
@@ -743,7 +780,7 @@ mod tests {
         );
         assert_eq!(
             arbiter.admit(&mut backend, &infinite, identity, 9, now(0, 0)),
-            Ok(ProviderEventWaitAdmission::Parked { wait_id: 17 })
+            Ok(ProviderDispatcherWaitAdmission::Parked { wait_id: 17 })
         );
         let cancelled = arbiter
             .cancel(&mut backend, 17, 0xC000_0120u32 as i32)
@@ -758,7 +795,7 @@ mod tests {
         let second = owner(8);
         let mut backend = Backend::default();
         backend.insert(first, event(1), false, false);
-        let mut arbiter = ProviderEventWaitArbiter::new();
+        let mut arbiter = ProviderDispatcherWaitArbiter::new();
         for (identity, wait_id, sequence) in [(first, 18, 20), (second, 19, 10)] {
             let wait = request(
                 identity,
@@ -770,7 +807,7 @@ mod tests {
             );
             assert_eq!(
                 arbiter.admit(&mut backend, &wait, identity, sequence, now(0, 0)),
-                Ok(ProviderEventWaitAdmission::Parked { wait_id })
+                Ok(ProviderDispatcherWaitAdmission::Parked { wait_id })
             );
         }
         backend.set(event(1));

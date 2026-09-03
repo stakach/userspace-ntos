@@ -316,6 +316,19 @@ impl ProviderLocalTimerCatalog {
         Ok(record.snapshot(slot))
     }
 
+    pub fn snapshot_for_body(
+        &self,
+        body: u64,
+    ) -> Result<ProviderLocalTimerSnapshot, ProviderTimerError> {
+        let (slot, record) = self
+            .records
+            .iter()
+            .enumerate()
+            .find(|(_, record)| record.live && record.body == body)
+            .ok_or(ProviderTimerError::NotFound)?;
+        Ok(record.snapshot(slot))
+    }
+
     pub fn rollback_unpublished(
         &mut self,
         id: ProviderLocalTimerId,

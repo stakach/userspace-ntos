@@ -24321,6 +24321,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     backend to typed dispatcher leases, publish win32k's local Timer identities through the existing
     scalar ownership channel, and include their deadlines in the one-shot executive timer source.
 
+    B3 provider Timer dispatcher-integration checkpoint (2026-09-03, host and freestanding green;
+    serialized desktop gate next): the Event-only provider-wait arbiter is now a typed dispatcher
+    arbiter. Event and Timer objects acquire distinct generation-fenced executive leases behind one
+    admission, readiness, consumption, and release contract; WaitAny over a mixed Event/Timer set is
+    host-tested. Win32k now owns component-private `KTIMER` storage, publishes only opaque local
+    identities to the executive, and binds real `KeInitializeTimer[Ex]`, `KeSetTimer`,
+    `KeCancelTimer`, `KeReadStateTimer`, and `PoRequestShutdownEvent` imports. The executive owns
+    timer state and deadlines, feeds the earliest provider Timer into the existing one-shot timer
+    source, expires due timers, and selects matching parked provider waits. The provider-wait suite
+    passes 56 tests and the freestanding executive remains at 227 warnings. Next prove in the
+    serialized desktop run that the raw-input system lane blocks on the genuine shutdown
+    Event/`MasterTimer` set and wakes to process timers without the prior tight input-read loop.
+    After that gate, complete Timer DPC delivery and propagate final deferred-retirement completion
+    back to the component before permitting timer-backed storage to be freed; neither capability is
+    represented by a fallback in the current boundary.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

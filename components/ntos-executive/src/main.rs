@@ -3440,6 +3440,7 @@ const DELAY_TIMER_SOURCE_HOSTED_DRIVER: u64 = 9;
 const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
 const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
 const DELAY_TIMER_SOURCE_PROVIDER_WAIT: u64 = 12;
+const DELAY_TIMER_SOURCE_PROVIDER_TIMER: u64 = 13;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -5981,7 +5982,7 @@ unsafe fn winlogon_profile_copied_spec(passed: &mut u64) {
     );
 }
 
-/// Prove that a real provider-side dispatcher wait owns its native continuation and every Event
+/// Prove that a real provider-side dispatcher wait owns its native continuation and every object
 /// lease. Active indefinite waits are legitimate at desktop quiescence, so balance acquisitions
 /// against releases plus the arbiter's exact live lease count rather than requiring an empty table.
 fn provider_wait_transport_spec(passed: &mut u64) {
@@ -6003,11 +6004,11 @@ fn provider_wait_transport_spec(passed: &mut u64) {
     print_str(b" waiters/leases=");
     print_u64(stats.active_waiters as u64);
     print_str(b"/");
-    print_u64(stats.active_event_leases as u64);
+    print_u64(stats.active_dispatcher_leases as u64);
     print_str(b" lease-acquire/release=");
-    print_u64(stats.event_leases_acquired);
+    print_u64(stats.dispatcher_leases_acquired);
     print_str(b"/");
-    print_u64(stats.event_leases_released);
+    print_u64(stats.dispatcher_leases_released);
     print_str(b" cancel/abandon=");
     print_u64(stats.cancellations);
     print_str(b"/");
@@ -6024,11 +6025,11 @@ fn provider_wait_transport_spec(passed: &mut u64) {
                     .dispatch_completions
                     .saturating_add(stats.active_continuations as u64)
             && stats.active_waiters <= stats.active_continuations
-            && stats.active_event_leases >= stats.active_waiters
-            && stats.event_leases_acquired
+            && stats.active_dispatcher_leases >= stats.active_waiters
+            && stats.dispatcher_leases_acquired
                 == stats
-                    .event_leases_released
-                    .saturating_add(stats.active_event_leases as u64),
+                    .dispatcher_leases_released
+                    .saturating_add(stats.active_dispatcher_leases as u64),
         passed,
     );
 }
@@ -17796,6 +17797,7 @@ unsafe fn delay_timer_next_deadline(
         unsafe { (&*core::ptr::addr_of!(IO_COMPLETION_WAITERS)).next_deadline(now) };
     let user_timer_deadline = handler.user_timer_next_deadline(now);
     let provider_wait_deadline = crate::service_sec_image::provider_wait_next_deadline(now);
+    let provider_timer_deadline = handler.provider_timer_next_deadline(now);
     let hosted_kernel_timer_deadline = driver_launch::hosted_driver_timer_next_deadline();
     let hosted_driver_deadline = driver_launch::hosted_driver_wait_next_deadline();
     let acpi_pci_route_recovery_deadline =
@@ -17810,6 +17812,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(io_completion_deadline)
         .chain(user_timer_deadline)
         .chain(provider_wait_deadline)
+        .chain(provider_timer_deadline)
         .chain(hosted_kernel_timer_deadline)
         .chain(hosted_driver_deadline)
         .chain(acpi_pci_route_recovery_deadline)
@@ -17830,6 +17833,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_USER_TIMER
     } else if provider_wait_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_PROVIDER_WAIT
+    } else if provider_timer_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_PROVIDER_TIMER
     } else if hosted_kernel_timer_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_HOSTED_KERNEL_TIMER
     } else if hosted_driver_deadline == Some(deadline) {
@@ -18059,6 +18064,10 @@ unsafe fn delay_timer_drain_due_work(
                 nt_time_snapshot_at(now_100ns),
             )
         )
+        + subdrain!(12, crate::service_sec_image::provider_timer_wake_due(
+            handler,
+            nt_time_snapshot_at(now_100ns),
+        ))
         + watchdog_tick
 }
 
@@ -24310,6 +24319,9 @@ struct ExecNtHandler {
     /// pointers, native/GUI waits, and queued provider signals hold independent leases here; the
     /// `EventStore` namespace index remains the canonical dispatcher identity.
     event_objects: nt_kernel_exec::EventObjectRegistry,
+    /// Canonical dispatcher state for provider-owned kernel Timers. Component addresses never
+    /// enter this table; provider-local identities resolve to generation-fenced Timer IDs.
+    provider_timers: nt_provider_wait::ProviderTimerTable,
     /// Native waitable timers, keyed by `obj_ns` timer entries. Dispatcher signal state is stored in
     /// `events`; this table holds due-time, period, and optional APC metadata.
     user_timers: nt_user_timer::TimerTable,
