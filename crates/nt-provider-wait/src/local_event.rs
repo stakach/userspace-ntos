@@ -19,6 +19,7 @@ pub enum ProviderEventBacking {
     },
     Allocation {
         arena_id: u64,
+        arena_generation: u64,
         allocation_id: u64,
         allocation_generation: u64,
     },
@@ -36,9 +37,15 @@ impl ProviderEventBacking {
             } => instance_generation == provider.generation,
             Self::Allocation {
                 arena_id,
+                arena_generation,
                 allocation_id,
                 allocation_generation,
-            } => arena_id != 0 && allocation_id != 0 && allocation_generation != 0,
+            } => {
+                arena_id != 0
+                    && arena_generation != 0
+                    && allocation_id != 0
+                    && allocation_generation != 0
+            }
             Self::Stack {
                 dispatch_id,
                 activation_generation,
@@ -48,7 +55,8 @@ impl ProviderEventBacking {
 
     pub const fn from_allocation(allocation: ProviderAllocationSnapshot) -> Self {
         Self::Allocation {
-            arena_id: allocation.identity.arena_id,
+            arena_id: allocation.identity.arena.id,
+            arena_generation: allocation.identity.arena.generation,
             allocation_id: allocation.identity.allocation_id,
             allocation_generation: allocation.identity.generation,
         }
@@ -580,6 +588,7 @@ mod tests {
         ProviderEventStorage {
             backing: ProviderEventBacking::Allocation {
                 arena_id: 1,
+                arena_generation: 1,
                 allocation_id,
                 allocation_generation: generation,
             },
@@ -817,7 +826,11 @@ mod tests {
     #[test]
     fn allocation_event_initialization_rejects_a_stale_allocation_generation() {
         let mut allocations = ProviderAllocationCatalog::new();
-        let first_allocation = allocations.register(1, 0x9000, 0x100).unwrap();
+        let arena = crate::ProviderArenaIdentity {
+            id: 1,
+            generation: 1,
+        };
+        let first_allocation = allocations.register(arena, 0x9000, 0x100).unwrap();
         let mut events = ProviderLocalEventCatalog::new(provider()).unwrap();
         let first = events
             .initialize_in_allocation(
@@ -833,7 +846,7 @@ mod tests {
         let retirement = events.begin_retire_event(first).unwrap();
         events.ack_retirement(retirement).unwrap();
         allocations.retire(first_allocation.identity).unwrap();
-        let second_allocation = allocations.register(1, 0x9000, 0x100).unwrap();
+        let second_allocation = allocations.register(arena, 0x9000, 0x100).unwrap();
 
         assert_eq!(
             events.initialize_in_allocation(

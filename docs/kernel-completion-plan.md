@@ -23764,8 +23764,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Nested provider-allocation identity checkpoint (2026-09-03, host green):
     `nt-provider-wait` now owns a component-private generation catalog for reclaimable allocations.
-    Arena identity scopes allocation identity, address reuse advances the generation, stale exact
-    identities fail closed, and allocation ranges may overlap only through strict cross-arena
+    An explicit `(arena id, arena generation)` scopes each allocation identity, address reuse
+    advances the allocation generation, stale exact identities fail closed, and allocation ranges
+    may overlap only through strict cross-arena
     containment. Lookup selects the smallest live containing allocation, so an Event in a desktop
     heap allocation is never attributed to the enclosing session-heap section view. Parent
     retirement is fenced until nested live allocations retire. Event initialization can no longer

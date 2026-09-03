@@ -1,15 +1,27 @@
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderArenaIdentity {
+    pub id: u64,
+    pub generation: u64,
+}
+
+impl ProviderArenaIdentity {
+    pub const fn is_valid(self) -> bool {
+        self.id != 0 && self.generation != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderAllocationIdentity {
-    pub arena_id: u64,
+    pub arena: ProviderArenaIdentity,
     pub allocation_id: u64,
     pub generation: u64,
 }
 
 impl ProviderAllocationIdentity {
     pub const fn is_valid(self) -> bool {
-        self.arena_id != 0 && self.allocation_id != 0 && self.generation != 0
+        self.arena.is_valid() && self.allocation_id != 0 && self.generation != 0
     }
 }
 
@@ -45,7 +57,7 @@ pub enum ProviderAllocationError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderAllocationRecord {
-    arena_id: u64,
+    arena: ProviderArenaIdentity,
     generation: u64,
     live: bool,
     base: u64,
@@ -54,7 +66,10 @@ struct ProviderAllocationRecord {
 
 impl ProviderAllocationRecord {
     const EMPTY: Self = Self {
-        arena_id: 0,
+        arena: ProviderArenaIdentity {
+            id: 0,
+            generation: 0,
+        },
         generation: 0,
         live: false,
         base: 0,
@@ -68,7 +83,7 @@ impl ProviderAllocationRecord {
             .ok_or(ProviderAllocationError::IdentityExhausted)?;
         Ok(ProviderAllocationSnapshot {
             identity: ProviderAllocationIdentity {
-                arena_id: self.arena_id,
+                arena: self.arena,
                 allocation_id,
                 generation: self.generation,
             },
@@ -101,11 +116,11 @@ impl ProviderAllocationCatalog {
 
     pub fn register(
         &mut self,
-        arena_id: u64,
+        arena: ProviderArenaIdentity,
         base: u64,
         capacity: u64,
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
-        if arena_id == 0 {
+        if !arena.is_valid() {
             return Err(ProviderAllocationError::InvalidArena);
         }
         let end = base
@@ -116,7 +131,7 @@ impl ProviderAllocationCatalog {
             if !record.live || base >= record.end() || record.base >= end {
                 return false;
             }
-            if record.arena_id == arena_id {
+            if record.arena == arena {
                 return true;
             }
             let new_contains_existing = base < record.base && end >= record.end();
@@ -126,26 +141,27 @@ impl ProviderAllocationCatalog {
             return Err(ProviderAllocationError::AddressInUse);
         }
 
-        let slot =
-            if let Some(slot) = self.records.iter().position(|record| {
-                !record.live && record.arena_id == arena_id && record.base == base
-            }) {
-                slot
-            } else if let Some(slot) = self.records.iter().position(|record| !record.live) {
-                slot
-            } else {
-                self.records
-                    .try_reserve(1)
-                    .map_err(|_| ProviderAllocationError::NoCapacity)?;
-                self.records.push(ProviderAllocationRecord::EMPTY);
-                self.records.len() - 1
-            };
+        let slot = if let Some(slot) = self
+            .records
+            .iter()
+            .position(|record| !record.live && record.arena == arena && record.base == base)
+        {
+            slot
+        } else if let Some(slot) = self.records.iter().position(|record| !record.live) {
+            slot
+        } else {
+            self.records
+                .try_reserve(1)
+                .map_err(|_| ProviderAllocationError::NoCapacity)?;
+            self.records.push(ProviderAllocationRecord::EMPTY);
+            self.records.len() - 1
+        };
         let generation = self.records[slot]
             .generation
             .checked_add(1)
             .ok_or(ProviderAllocationError::IdentityExhausted)?;
         self.records[slot] = ProviderAllocationRecord {
-            arena_id,
+            arena,
             generation,
             live: true,
             base,
@@ -164,14 +180,14 @@ impl ProviderAllocationCatalog {
 
     pub fn exact(
         &self,
-        arena_id: u64,
+        arena: ProviderArenaIdentity,
         base: u64,
     ) -> Result<ProviderAllocationSnapshot, ProviderAllocationError> {
         let (slot, record) = self
             .records
             .iter()
             .enumerate()
-            .find(|(_, record)| record.live && record.arena_id == arena_id && record.base == base)
+            .find(|(_, record)| record.live && record.arena == arena && record.base == base)
             .ok_or(ProviderAllocationError::NotFound)?;
         record.snapshot(slot)
     }
@@ -237,7 +253,7 @@ impl ProviderAllocationCatalog {
             .get(slot)
             .filter(|record| {
                 record.live
-                    && record.arena_id == identity.arena_id
+                    && record.arena == identity.arena
                     && record.generation == identity.generation
             })
             .map(|_| slot)
@@ -255,12 +271,16 @@ impl Default for ProviderAllocationCatalog {
 mod tests {
     use super::*;
 
+    fn arena(id: u64) -> ProviderArenaIdentity {
+        ProviderArenaIdentity { id, generation: 1 }
+    }
+
     #[test]
     fn address_reuse_advances_generation_and_rejects_stale_identity() {
         let mut catalog = ProviderAllocationCatalog::new();
-        let first = catalog.register(1, 0x1000, 0x100).unwrap();
+        let first = catalog.register(arena(1), 0x1000, 0x100).unwrap();
         catalog.retire(first.identity).unwrap();
-        let second = catalog.register(1, 0x1000, 0x80).unwrap();
+        let second = catalog.register(arena(1), 0x1000, 0x80).unwrap();
         assert_eq!(second.identity.allocation_id, first.identity.allocation_id);
         assert!(second.identity.generation > first.identity.generation);
         assert_eq!(
@@ -272,7 +292,7 @@ mod tests {
             Err(ProviderAllocationError::StaleIdentity)
         );
         let wrong_arena = ProviderAllocationIdentity {
-            arena_id: 2,
+            arena: arena(2),
             ..second.identity
         };
         assert_eq!(
@@ -280,14 +300,14 @@ mod tests {
             Err(ProviderAllocationError::StaleIdentity)
         );
         assert_eq!(catalog.snapshot(second.identity).unwrap(), second);
-        assert_eq!(catalog.exact(1, 0x1000).unwrap(), second);
+        assert_eq!(catalog.exact(arena(1), 0x1000).unwrap(), second);
     }
 
     #[test]
     fn innermost_nested_arena_owns_contained_storage() {
         let mut catalog = ProviderAllocationCatalog::new();
-        let outer = catalog.register(1, 0x1000, 0x2000).unwrap();
-        let inner = catalog.register(2, 0x1800, 0x400).unwrap();
+        let outer = catalog.register(arena(1), 0x1000, 0x2000).unwrap();
+        let inner = catalog.register(arena(2), 0x1800, 0x400).unwrap();
         assert_eq!(catalog.containing(0x1900, 0x18).unwrap(), inner);
         assert_eq!(catalog.containing(0x1400, 0x18).unwrap(), outer);
     }
@@ -295,7 +315,7 @@ mod tests {
     #[test]
     fn containment_is_end_exclusive_and_overflow_checked() {
         let mut catalog = ProviderAllocationCatalog::new();
-        let allocation = catalog.register(1, 0x2000, 0x100).unwrap();
+        let allocation = catalog.register(arena(1), 0x2000, 0x100).unwrap();
         assert_eq!(catalog.containing(0x20e8, 0x18).unwrap(), allocation);
         assert_eq!(
             catalog.containing(0x20e9, 0x18),
@@ -310,8 +330,8 @@ mod tests {
     #[test]
     fn a_range_crossing_the_innermost_boundary_does_not_fall_back_to_its_parent() {
         let mut catalog = ProviderAllocationCatalog::new();
-        catalog.register(1, 0x1000, 0x2000).unwrap();
-        catalog.register(2, 0x1800, 0x400).unwrap();
+        catalog.register(arena(1), 0x1000, 0x2000).unwrap();
+        catalog.register(arena(2), 0x1800, 0x400).unwrap();
         assert_eq!(
             catalog.containing(0x1bf8, 0x10),
             Err(ProviderAllocationError::InvalidRange)
@@ -321,17 +341,17 @@ mod tests {
     #[test]
     fn same_arena_overlap_and_non_hierarchical_cross_arena_overlap_fail_closed() {
         let mut catalog = ProviderAllocationCatalog::new();
-        catalog.register(1, 0x3000, 0x200).unwrap();
+        catalog.register(arena(1), 0x3000, 0x200).unwrap();
         assert_eq!(
-            catalog.register(1, 0x3100, 0x200),
+            catalog.register(arena(1), 0x3100, 0x200),
             Err(ProviderAllocationError::AddressInUse)
         );
         assert_eq!(
-            catalog.register(2, 0x3000, 0x200),
+            catalog.register(arena(2), 0x3000, 0x200),
             Err(ProviderAllocationError::AddressInUse)
         );
         assert_eq!(
-            catalog.register(2, 0x2f80, 0x100),
+            catalog.register(arena(2), 0x2f80, 0x100),
             Err(ProviderAllocationError::AddressInUse)
         );
     }
@@ -339,8 +359,8 @@ mod tests {
     #[test]
     fn outer_retirement_waits_for_nested_allocations() {
         let mut catalog = ProviderAllocationCatalog::new();
-        let outer = catalog.register(1, 0x4000, 0x1000).unwrap();
-        let inner = catalog.register(2, 0x4800, 0x100).unwrap();
+        let outer = catalog.register(arena(1), 0x4000, 0x1000).unwrap();
+        let inner = catalog.register(arena(2), 0x4800, 0x100).unwrap();
         assert_eq!(
             catalog.retire(outer.identity),
             Err(ProviderAllocationError::ContainsLiveAllocations)
@@ -352,10 +372,10 @@ mod tests {
     #[test]
     fn moved_reallocation_has_a_distinct_identity() {
         let mut catalog = ProviderAllocationCatalog::new();
-        let old = catalog.register(1, 0x5000, 0x80).unwrap();
-        let moved = catalog.register(1, 0x6000, 0x100).unwrap();
+        let old = catalog.register(arena(1), 0x5000, 0x80).unwrap();
+        let moved = catalog.register(arena(1), 0x6000, 0x100).unwrap();
         catalog.retire(old.identity).unwrap();
         assert_ne!(old.identity, moved.identity);
-        assert_eq!(catalog.exact(1, 0x6000).unwrap(), moved);
+        assert_eq!(catalog.exact(arena(1), 0x6000).unwrap(), moved);
     }
 }
