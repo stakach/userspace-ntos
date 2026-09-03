@@ -23815,6 +23815,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     forbid moving realloc of an allocation containing an Event, and restore canonical Event
     publication/set/reset/clear/pulse/read before the next desktop gate.
 
+    Provider-local Event activation checkpoint (2026-09-03, host/freestanding green; wait cutover
+    next): win32k now instantiates one component-private local Event catalog from the dynamically
+    registered provider domain before DriverEntry. `KeInitializeEvent` classifies storage only as
+    the innermost live allocation generation, the current nested dispatch/DriverEntry stack
+    activation, or provider-image static data; an unknown address fails closed. Publication mints a
+    real canonical executive Event, and set/reset/clear/pulse/read now cross the provider-scoped
+    broker under an exact signal lease before mirroring returned state into the local `KEVENT`.
+    Legal reinitialization performs the complete begin-retire/canonical-ack/local-ack handshake and
+    receives a fresh local generation.
+
+    Shared provider-pool, FTYP, root session-heap, and nested USER/desktop-heap free paths now
+    preflight and retire every Event owned by the exact allocation before allocator metadata can
+    change. A moving heap realloc containing any live Event fails without copying the dispatcher
+    body. Dispatch activations are a generation-owned LIFO stack, so nested callback dispatches
+    cannot retire an outer stack Event; activation unwind retires all of its stack Events before the
+    frame may be reused. The catalog exposes non-mutating retirement validation so batch frees can
+    retain their all-or-nothing preflight. `nt-provider-wait` passes all 29 tests and the
+    freestanding executive check is green. The old immediate-success
+    `KeWaitForSingleObject` body is now the remaining local Event fallback: next bind single and
+    multiple waits to the dedicated provider-wait frame and detached continuation stack, then
+    delete that body before serialized desktop acceptance.
+
     B3 monotonic Ps deletion checkpoint (2026-09-03, host and freestanding green):
     `nt-user-host` now owns an exact `(pi, pid, generation)` deletion record with monotonic
     `AwaitingReferences -> ReclaimingVm -> DeletingProcessObject -> ReleasingExecutiveReferences

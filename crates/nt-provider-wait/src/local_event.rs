@@ -419,6 +419,52 @@ impl ProviderLocalEventCatalog {
         Ok(self.records[slot].snapshot(slot))
     }
 
+    /// Resolve live component storage without requiring canonical publication. Lifecycle code uses
+    /// this to distinguish first initialization from legal reinitialization and rollback.
+    pub fn snapshot_for_body(
+        &self,
+        body: u64,
+    ) -> Result<ProviderLocalEventSnapshot, ProviderLocalEventError> {
+        let (slot, record) = self
+            .records
+            .iter()
+            .enumerate()
+            .find(|(_, record)| record.live && record.body == body)
+            .ok_or(ProviderLocalEventError::NotFound)?;
+        Ok(record.snapshot(slot))
+    }
+
+    /// Return the number of live Events whose lifetime is owned by this exact backing identity.
+    pub fn backing_event_count(&self, backing: ProviderEventBacking) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.live && record.storage.backing == backing)
+            .count()
+    }
+
+    /// Validate that every Event owned by a backing can enter retirement without mutating it.
+    pub fn validate_backing_retirement(
+        &self,
+        backing: ProviderEventBacking,
+    ) -> Result<usize, ProviderLocalEventError> {
+        if !backing.is_valid(self.provider) {
+            return Err(ProviderLocalEventError::InvalidStorage);
+        }
+        let mut count = 0usize;
+        for record in &self.records {
+            if record.live && record.storage.backing == backing {
+                if record.has_leases() {
+                    return Err(ProviderLocalEventError::ActiveLeases);
+                }
+                if record.canonical.is_none() {
+                    return Err(ProviderLocalEventError::NotPublished);
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn resolve_body(
         &self,
         body: u64,
@@ -499,23 +545,9 @@ impl ProviderLocalEventCatalog {
         &mut self,
         backing: ProviderEventBacking,
     ) -> Result<Vec<ProviderLocalEventRetirement>, ProviderLocalEventError> {
-        if !backing.is_valid(self.provider) {
-            return Err(ProviderLocalEventError::InvalidStorage);
-        }
-        let count = self
-            .records
-            .iter()
-            .filter(|record| record.live && record.storage.backing == backing)
-            .count();
+        let count = self.validate_backing_retirement(backing)?;
         if count == 0 {
             return Err(ProviderLocalEventError::NotFound);
-        }
-        if self
-            .records
-            .iter()
-            .any(|record| record.live && record.storage.backing == backing && record.has_leases())
-        {
-            return Err(ProviderLocalEventError::ActiveLeases);
         }
         let mut retirements = Vec::new();
         retirements
@@ -784,6 +816,27 @@ mod tests {
             catalog.snapshot(second),
             Err(ProviderLocalEventError::StaleIdentity)
         );
+    }
+
+    #[test]
+    fn lifecycle_queries_include_unpublished_and_delete_pending_events() {
+        let mut catalog = ProviderLocalEventCatalog::new(provider()).unwrap();
+        let storage = allocation(31, 2, 0x40);
+        let id = catalog
+            .initialize(0x9040, storage, ProviderEventKind::Synchronization, false)
+            .unwrap();
+        assert_eq!(catalog.snapshot_for_body(0x9040).unwrap().id, id);
+        assert_eq!(catalog.backing_event_count(storage.backing), 1);
+        catalog.bind_canonical(id, canonical(14, 3)).unwrap();
+        let retirement = catalog.begin_retire_event(id).unwrap();
+        assert!(catalog.snapshot_for_body(0x9040).unwrap().delete_pending);
+        assert_eq!(catalog.backing_event_count(storage.backing), 1);
+        catalog.ack_retirement(retirement).unwrap();
+        assert_eq!(
+            catalog.snapshot_for_body(0x9040),
+            Err(ProviderLocalEventError::NotFound)
+        );
+        assert_eq!(catalog.backing_event_count(storage.backing), 0);
     }
 
     #[test]

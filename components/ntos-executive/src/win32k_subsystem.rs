@@ -138,6 +138,11 @@ static PROVIDER_ARENA_NEXT_HOSTED_HEAP_ID: AtomicU64 =
     AtomicU64::new(PROVIDER_ARENA_FIRST_HOSTED_HEAP_ID);
 static mut WIN32K_PROVIDER_ALLOCATIONS: Option<nt_provider_wait::ProviderAllocationCatalog> = None;
 static mut WIN32K_HOSTED_HEAP_ARENAS: Option<Vec<HostedHeapArena>> = None;
+static mut WIN32K_LOCAL_EVENTS: Option<nt_provider_wait::ProviderLocalEventCatalog> = None;
+static mut WIN32K_STACK_EVENT_ACTIVATIONS: Option<Vec<ProviderStackEventActivation>> = None;
+static PROVIDER_STACK_ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+const PROVIDER_DRIVER_ENTRY_DISPATCH_ID: u64 = u64::MAX;
+const WIN32K_STACK_BYTES: u64 = 32 * 0x1000;
 
 #[derive(Clone, Copy)]
 struct HostedHeapArena {
@@ -145,6 +150,34 @@ struct HostedHeapArena {
     bytes: u64,
     identity: nt_provider_wait::ProviderArenaIdentity,
     backing: nt_provider_wait::ProviderAllocationIdentity,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ProviderStackEventActivation {
+    dispatch_id: u64,
+    generation: u64,
+}
+
+impl ProviderStackEventActivation {
+    const fn backing(self) -> nt_provider_wait::ProviderEventBacking {
+        nt_provider_wait::ProviderEventBacking::Stack {
+            dispatch_id: self.dispatch_id,
+            activation_generation: self.generation,
+        }
+    }
+}
+
+struct ProviderStackEventActivationGuard {
+    activation: ProviderStackEventActivation,
+}
+
+impl Drop for ProviderStackEventActivationGuard {
+    fn drop(&mut self) {
+        if !unsafe { finish_provider_stack_event_activation(self.activation) } {
+            print_str(b"[win32k-event] stack activation retirement failed\n");
+            park();
+        }
+    }
 }
 const _: () = assert!(WIN32K_HEAP_VADDR + WIN32K_HEAP_FRAMES * 0x1000 <= WIN32K_POOL_VADDR);
 const _: () = assert!(WIN32K_POOL_VADDR + WIN32K_POOL_FRAMES * 0x1000 <= WIN32K_STACK_VADDR);
@@ -456,6 +489,61 @@ unsafe fn initialize_provider_allocation_tracking() -> bool {
     true
 }
 
+unsafe fn initialize_provider_local_event_tracking() -> bool {
+    let Some(provider) = registered_provider_wait_domain() else {
+        return false;
+    };
+    if (&*core::ptr::addr_of!(WIN32K_LOCAL_EVENTS)).is_some()
+        || (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS)).is_some()
+    {
+        return false;
+    }
+    let Ok(events) = nt_provider_wait::ProviderLocalEventCatalog::new(provider) else {
+        return false;
+    };
+    *core::ptr::addr_of_mut!(WIN32K_LOCAL_EVENTS) = Some(events);
+    *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS) = Some(Vec::new());
+    PROVIDER_STACK_ACTIVATION_GENERATION.store(1, Ordering::Relaxed);
+    true
+}
+
+unsafe fn provider_local_events_mut(
+) -> Option<&'static mut nt_provider_wait::ProviderLocalEventCatalog> {
+    (&mut *core::ptr::addr_of_mut!(WIN32K_LOCAL_EVENTS)).as_mut()
+}
+
+unsafe fn provider_local_events(
+) -> Option<&'static nt_provider_wait::ProviderLocalEventCatalog> {
+    (&*core::ptr::addr_of!(WIN32K_LOCAL_EVENTS)).as_ref()
+}
+
+unsafe fn active_provider_stack_event_activation() -> Option<ProviderStackEventActivation> {
+    (&*core::ptr::addr_of!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_ref()?
+        .last()
+        .copied()
+}
+
+unsafe fn begin_provider_stack_event_activation(
+    dispatch_id: u64,
+) -> Option<ProviderStackEventActivationGuard> {
+    if dispatch_id == 0 {
+        return None;
+    }
+    let generation = PROVIDER_STACK_ACTIVATION_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if generation == 0 || generation == u64::MAX {
+        return None;
+    }
+    let activation = ProviderStackEventActivation {
+        dispatch_id,
+        generation,
+    };
+    let stack = (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS)).as_mut()?;
+    stack.try_reserve(1).ok()?;
+    stack.push(activation);
+    Some(ProviderStackEventActivationGuard { activation })
+}
+
 unsafe fn provider_allocations_mut(
 ) -> Option<&'static mut nt_provider_wait::ProviderAllocationCatalog> {
     (&mut *core::ptr::addr_of_mut!(WIN32K_PROVIDER_ALLOCATIONS)).as_mut()
@@ -491,6 +579,28 @@ unsafe fn retire_provider_allocation(
 ) -> bool {
     provider_allocations_mut()
         .is_some_and(|allocations| allocations.retire(allocation.identity).is_ok())
+}
+
+unsafe fn provider_allocation_event_backing(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> nt_provider_wait::ProviderEventBacking {
+    nt_provider_wait::ProviderEventBacking::from_allocation(allocation)
+}
+
+unsafe fn validate_provider_allocation_event_retirement(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
+    provider_local_events().is_some_and(|events| {
+        events
+            .validate_backing_retirement(provider_allocation_event_backing(allocation))
+            .is_ok()
+    })
+}
+
+unsafe fn retire_provider_allocation_events(
+    allocation: nt_provider_wait::ProviderAllocationSnapshot,
+) -> bool {
+    retire_provider_local_events_for_backing(provider_allocation_event_backing(allocation))
 }
 
 unsafe fn provider_heap_arena_identity(
@@ -1285,6 +1395,18 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
         };
         tracked_allocations.push(allocation);
     }
+    if tracked_allocations
+        .iter()
+        .copied()
+        .any(|allocation| !validate_provider_allocation_event_retirement(allocation))
+    {
+        return false;
+    }
+    for allocation in tracked_allocations.iter().copied() {
+        if !retire_provider_allocation_events(allocation) {
+            return false;
+        }
+    }
     {
         let Some(_guard) = provider_pool_lock() else {
             return false;
@@ -1505,6 +1627,8 @@ unsafe fn reclaiming_pool_free(p: u64) -> bool {
         return false;
     };
     if reclaiming_pool_capacity(p) != Some(allocation.capacity)
+        || !validate_provider_allocation_event_retirement(allocation)
+        || !retire_provider_allocation_events(allocation)
         || !reclaiming_pool_free_raw(p)
     {
         return false;
@@ -3124,17 +3248,262 @@ extern "win64" fn s_zw_close(handle: u64) -> i32 {
     s_ob_close_handle(handle, 0)
 }
 
+unsafe fn retire_provider_local_event(
+    retirement: nt_provider_wait::ProviderLocalEventRetirement,
+) -> bool {
+    let (status, object_id, object_generation, _) = win32k_event_broker_call(
+        W32_EVENT_OP_RETIRE_LOCAL,
+        retirement.id.raw(),
+        0,
+        0,
+    );
+    if status != 0
+        || object_id != retirement.canonical.object_id
+        || object_generation != retirement.canonical.object_generation
+    {
+        return false;
+    }
+    let (status, _, _, _) = win32k_event_broker_call(
+        W32_EVENT_OP_ACK_LOCAL_RETIREMENT,
+        retirement.id.raw(),
+        object_id,
+        object_generation,
+    );
+    status == 0
+        && provider_local_events_mut()
+            .is_some_and(|events| events.ack_retirement(retirement).is_ok())
+}
+
+unsafe fn retire_provider_local_events_for_backing(
+    backing: nt_provider_wait::ProviderEventBacking,
+) -> bool {
+    let Some(events) = provider_local_events() else {
+        return false;
+    };
+    if events.backing_event_count(backing) == 0 {
+        return true;
+    }
+    let retirements = match provider_local_events_mut()
+        .expect("local Event catalog disappeared")
+        .begin_retire_backing(backing)
+    {
+        Ok(retirements) => retirements,
+        Err(_) => return false,
+    };
+    for retirement in retirements {
+        if !retire_provider_local_event(retirement) {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn finish_provider_stack_event_activation(
+    activation: ProviderStackEventActivation,
+) -> bool {
+    if active_provider_stack_event_activation() != Some(activation) {
+        return false;
+    }
+    if !retire_provider_local_events_for_backing(activation.backing()) {
+        return false;
+    }
+    (&mut *core::ptr::addr_of_mut!(WIN32K_STACK_EVENT_ACTIVATIONS))
+        .as_mut()
+        .and_then(Vec::pop)
+        == Some(activation)
+}
+
+unsafe fn retire_existing_provider_local_event(body: u64) -> bool {
+    let existing = match provider_local_events()
+        .expect("local Event catalog is not initialized")
+        .snapshot_for_body(body)
+    {
+        Ok(existing) => existing,
+        Err(nt_provider_wait::ProviderLocalEventError::NotFound) => return true,
+        Err(_) => return false,
+    };
+    if existing.canonical.is_none() {
+        return provider_local_events_mut()
+            .is_some_and(|events| events.rollback_unpublished(existing.id).is_ok());
+    }
+    let retirement = match provider_local_events_mut()
+        .expect("local Event catalog disappeared")
+        .begin_retire_event(existing.id)
+    {
+        Ok(retirement) => retirement,
+        Err(_) => return false,
+    };
+    retire_provider_local_event(retirement)
+}
+
+unsafe fn initialize_provider_local_event(
+    event: u64,
+    kind: nt_provider_wait::ProviderEventKind,
+    initial_state: bool,
+) -> bool {
+    if !retire_existing_provider_local_event(event) {
+        return false;
+    }
+    let event_bytes = nt_kernel_exec::kevent::kevent_layout::SIZE_OF as u64;
+    let id = if let Some(allocations) =
+        (&*core::ptr::addr_of!(WIN32K_PROVIDER_ALLOCATIONS)).as_ref()
+    {
+        if allocations.containing(event, event_bytes).is_ok() {
+            provider_local_events_mut().and_then(|events| {
+                events
+                    .initialize_allocation(allocations, event, event_bytes, kind, initial_state)
+                    .ok()
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| {
+        let end = event.checked_add(event_bytes)?;
+        if event >= WIN32K_STACK_VADDR && end <= WIN32K_STACK_VADDR + WIN32K_STACK_BYTES {
+            let activation = active_provider_stack_event_activation()?;
+            return provider_local_events_mut()?.initialize_stack(
+                event,
+                activation.dispatch_id,
+                activation.generation,
+                event - WIN32K_STACK_VADDR,
+                kind,
+                initial_state,
+            ).ok();
+        }
+        None
+    })
+    .or_else(|| {
+        let end = event.checked_add(event_bytes)?;
+        if event >= WIN32K_CODE_VA && end <= WIN32K_CODE_VA + WIN32K_IMAGE_BYTES {
+            return provider_local_events_mut()?.initialize_static(
+                event,
+                event - WIN32K_CODE_VA,
+                kind,
+                initial_state,
+            ).ok();
+        }
+        None
+    });
+    let Some(id) = id else {
+        return false;
+    };
+    let event_type = u64::from(matches!(
+        kind,
+        nt_provider_wait::ProviderEventKind::Synchronization
+    ));
+    let (status, object_id, object_generation, metadata) = win32k_event_broker_call(
+        W32_EVENT_OP_PUBLISH_LOCAL,
+        id.raw(),
+        event_type,
+        u64::from(initial_state),
+    );
+    let expected_metadata = event_type | (u64::from(initial_state) << 1);
+    if status != 0 || object_id == 0 || object_generation == 0 || metadata != expected_metadata {
+        let _ = provider_local_events_mut()
+            .expect("local Event catalog disappeared")
+            .rollback_unpublished(id);
+        return false;
+    }
+    let canonical = nt_provider_wait::ProviderWaitObject::new(
+        nt_provider_wait::ProviderWaitObjectType::Event,
+        object_id,
+        object_generation,
+    );
+    if provider_local_events_mut()
+        .expect("local Event catalog disappeared")
+        .bind_canonical(id, canonical)
+        .is_err()
+    {
+        let (retire_status, retired_id, retired_generation, _) =
+            win32k_event_broker_call(W32_EVENT_OP_RETIRE_LOCAL, id.raw(), 0, 0);
+        if retire_status == 0
+            && retired_id == object_id
+            && retired_generation == object_generation
+        {
+            let _ = win32k_event_broker_call(
+                W32_EVENT_OP_ACK_LOCAL_RETIREMENT,
+                id.raw(),
+                retired_id,
+                retired_generation,
+            );
+        }
+        let _ = provider_local_events_mut()
+            .expect("local Event catalog disappeared")
+            .rollback_unpublished(id);
+        return false;
+    }
+    let kernel_kind = match kind {
+        nt_provider_wait::ProviderEventKind::Notification => {
+            nt_kernel_exec::kevent::EventKind::Notification
+        }
+        nt_provider_wait::ProviderEventKind::Synchronization => {
+            nt_kernel_exec::kevent::EventKind::Synchronization
+        }
+    };
+    nt_kernel_exec::kevent::init_kevent(event as *mut u8, kernel_kind, initial_state);
+    true
+}
+
+unsafe fn provider_local_event_snapshot_or_park(
+    event: u64,
+) -> nt_provider_wait::ProviderLocalEventSnapshot {
+    match provider_local_events().and_then(|events| events.resolve_body(event).ok()) {
+        Some(snapshot) => snapshot,
+        None => {
+            print_str(b"[win32k-event] unowned local Event body=0x");
+            print_hex((event >> 32) as u32);
+            print_hex(event as u32);
+            print_str(b"\n");
+            park();
+        }
+    }
+}
+
+unsafe fn provider_local_event_call(event: u64, op: u64) -> (u64, u64) {
+    let snapshot = provider_local_event_snapshot_or_park(event);
+    if provider_local_events_mut()
+        .expect("local Event catalog disappeared")
+        .acquire_lease(
+            snapshot.id,
+            nt_provider_wait::ProviderLocalEventLeaseKind::Signal,
+        )
+        .is_err()
+    {
+        park();
+    }
+    let (status, out1, out2, _) = win32k_event_broker_call(op, snapshot.id.raw(), 0, 0);
+    let released = provider_local_events_mut()
+        .expect("local Event catalog disappeared")
+        .release_lease(
+            snapshot.id,
+            nt_provider_wait::ProviderLocalEventLeaseKind::Signal,
+        )
+        .is_ok();
+    if status != 0 || !released {
+        print_str(b"[win32k-event] canonical local Event operation failed\n");
+        park();
+    }
+    (out1, out2)
+}
+
 extern "win64" fn s_ke_initialize_event(event: u64, event_type: u64, initial_state: u64) {
     if event == 0 {
         return;
     }
     let kind = if event_type == 1 {
-        nt_kernel_exec::kevent::EventKind::Synchronization
+        nt_provider_wait::ProviderEventKind::Synchronization
     } else {
-        nt_kernel_exec::kevent::EventKind::Notification
+        nt_provider_wait::ProviderEventKind::Notification
     };
-    unsafe {
-        nt_kernel_exec::kevent::init_kevent(event as *mut u8, kind, initial_state != 0);
+    if !unsafe { initialize_provider_local_event(event, kind, initial_state != 0) } {
+        print_str(b"[win32k-event] KeInitializeEvent storage classification failed body=0x");
+        print_hex((event >> 32) as u32);
+        print_hex(event as u32);
+        print_str(b"\n");
+        park();
     }
 }
 
@@ -3152,7 +3521,9 @@ extern "win64" fn s_ke_set_event(event: u64, _increment: u64, _wait: u64) -> i32
     }
     assert_eq!(_wait, 0, "KeSetEvent(Wait=TRUE) requires atomic signal-and-wait");
     if !provider_event_projection_contains(event) {
-        return unsafe { nt_kernel_exec::kevent::kevent_set(event as *mut u8) as i32 };
+        let (previous, current) = unsafe { provider_local_event_call(event, W32_EVENT_OP_SET_LOCAL) };
+        unsafe { mirror_projected_event_state(event, current != 0) };
+        return previous as i32;
     }
     let (status, previous, current, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_SET, event, _increment, _wait) };
@@ -3166,7 +3537,9 @@ extern "win64" fn s_ke_reset_event(event: u64) -> i32 {
         return 0;
     }
     if !provider_event_projection_contains(event) {
-        return unsafe { nt_kernel_exec::kevent::kevent_reset(event as *mut u8) as i32 };
+        let (previous, _) = unsafe { provider_local_event_call(event, W32_EVENT_OP_RESET_LOCAL) };
+        unsafe { mirror_projected_event_state(event, false) };
+        return previous as i32;
     }
     let (status, previous, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_RESET, event, 0, 0) };
@@ -3180,7 +3553,10 @@ extern "win64" fn s_ke_clear_event(event: u64) {
         return;
     }
     if !provider_event_projection_contains(event) {
-        unsafe { nt_kernel_exec::kevent::kevent_clear(event as *mut u8) };
+        unsafe {
+            provider_local_event_call(event, W32_EVENT_OP_CLEAR_LOCAL);
+            mirror_projected_event_state(event, false);
+        }
         return;
     }
     let (status, _, _, _) = unsafe { win32k_event_broker_call(W32_EVENT_OP_CLEAR, event, 0, 0) };
@@ -3197,7 +3573,9 @@ extern "win64" fn s_ke_pulse_event(event: u64, _increment: u64, _wait: u64) -> i
         "KePulseEvent(Wait=TRUE) requires atomic signal-and-wait"
     );
     if !provider_event_projection_contains(event) {
-        return unsafe { nt_kernel_exec::kevent::kevent_pulse(event as *mut u8) as i32 };
+        let (previous, _) = unsafe { provider_local_event_call(event, W32_EVENT_OP_PULSE_LOCAL) };
+        unsafe { mirror_projected_event_state(event, false) };
+        return previous as i32;
     }
     let (status, previous, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_PULSE, event, _increment, _wait) };
@@ -3211,7 +3589,9 @@ extern "win64" fn s_ke_read_state_event(event: u64) -> i32 {
         return 0;
     }
     if !provider_event_projection_contains(event) {
-        return unsafe { nt_kernel_exec::kevent::kevent_read_state(event as *const u8) as i32 };
+        let (signaled, _) = unsafe { provider_local_event_call(event, W32_EVENT_OP_READ_LOCAL) };
+        unsafe { mirror_projected_event_state(event, signaled != 0) };
+        return signaled as i32;
     }
     let (status, signaled, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_READ, event, 0, 0) };
@@ -4779,16 +5159,12 @@ unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     let Some(arena) = provider_heap_arena_identity(arena_base) else {
         return false;
     };
-    let Some(allocations) = provider_allocations_mut() else {
-        return false;
-    };
-    let Ok(allocation) = allocations.exact(arena, p) else {
+    let Some(allocation) = validate_provider_allocation_retirement(arena, p, 1) else {
         return false;
     };
     if heap_block_capacity_in(arena_base, arena_bytes, p) != Some(allocation.capacity)
-        || allocations
-            .validate_retirement(allocation.identity)
-            .is_err()
+        || !validate_provider_allocation_event_retirement(allocation)
+        || !retire_provider_allocation_events(allocation)
     {
         return false;
     }
@@ -4796,7 +5172,7 @@ unsafe fn heap_free_in(arena_base: u64, arena_bytes: u64, p: u64) -> bool {
     if !heap_free_in_raw(arena_base, arena_bytes, p) {
         return false;
     }
-    if allocations.retire(allocation.identity).is_err() {
+    if !retire_provider_allocation(allocation) {
         return false;
     }
     nested_arena.is_none_or(|identity| retire_hosted_heap_arena(identity, allocation.identity))
@@ -4831,6 +5207,19 @@ unsafe fn heap_realloc_in(
         return p;
     }
     if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
+        return 0;
+    }
+    let Some(arena) = provider_heap_arena_identity(arena_base) else {
+        return 0;
+    };
+    let Some(allocation) = provider_allocations_mut()
+        .and_then(|allocations| allocations.exact(arena, p).ok())
+    else {
+        return 0;
+    };
+    if provider_local_events().is_none_or(|events| {
+        events.backing_event_count(provider_allocation_event_backing(allocation)) != 0
+    }) {
         return 0;
     }
     let newp = heap_alloc_in(
@@ -12240,6 +12629,17 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
         print_str(b"[win32k-host] ERROR: provider allocation tracking initialization failed\n");
         park();
     }
+    if !initialize_provider_local_event_tracking() {
+        print_str(b"[win32k-host] ERROR: provider local Event tracking initialization failed\n");
+        park();
+    }
+    let Some(driver_activation) =
+        begin_provider_stack_event_activation(PROVIDER_DRIVER_ENTRY_DISPATCH_ID)
+    else {
+        print_str(b"[win32k-host] ERROR: DriverEntry stack activation failed\n");
+        park();
+    };
+    core::mem::forget(driver_activation);
     // NOW RUNS ON THE SHARED HARNESS (Phase B, Step 4b). The DriverEntry preamble (build DRIVER_OBJECT
     // + RegistryPath from win32k's OWN pool, mark V_ENTERED, call DriverEntry, record verdict/status),
     // the `post_driver_entry` hook, and the persistent send_done→recv_req→dispatch→writeback loop are
@@ -12302,6 +12702,14 @@ pub unsafe extern "C" fn win32k_subsystem_entry(heap_frames: u64) -> ! {
 /// ([`setup_dispatch_context`]). The first real CSRSS dispatch rekeys the bootstrap process and
 /// creates the permanent desktop thread with CSRSS's exact process generation active.
 unsafe fn win32k_post_driver_entry(status: i32, _drv: u64) {
+    let driver_activation = ProviderStackEventActivation {
+        dispatch_id: PROVIDER_DRIVER_ENTRY_DISPATCH_ID,
+        generation: 1,
+    };
+    if !finish_provider_stack_event_activation(driver_activation) {
+        print_str(b"[win32k-event] DriverEntry stack Event retirement failed\n");
+        park();
+    }
     let v = read_volatile((WIN32K_SHARED_VADDR + SH_VERDICT) as *const u32);
     let pool_used = provider_pool_census().arena_high_water;
     write_volatile((WIN32K_SHARED_VADDR + SH_POOL_USED) as *mut u64, pool_used);
@@ -12600,6 +13008,13 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
 /// `(low32, full_result)` — win32k uses pointer-width syscall returns, with the low 32 bits kept as
 /// status-compatible data for legacy harness readers.
 unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
+    let callback_frame =
+        (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
+    let dispatch_id = read_volatile(core::ptr::addr_of!((*callback_frame).header.dispatch_id));
+    let Some(_stack_event_activation) = begin_provider_stack_event_activation(dispatch_id) else {
+        let status = 0xC000_009Au32;
+        return (status as i32, status as u64);
+    };
     if read_volatile((WIN32K_SHARED_VADDR + SH_EVENT_RECLAIM_PENDING) as *const u64) != 0
         && !drain_retired_event_provider_bodies()
     {
