@@ -2288,9 +2288,7 @@ unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResu
     }
     pump_leave_depth(
         owns_depth,
-        outcome.callback_suspended
-            || outcome.provider_wait_suspended
-            || outcome.lpc_wait_suspended,
+        outcome.callback_suspended || outcome.provider_wait_suspended || outcome.lpc_wait_suspended,
     );
     pump_suspend_walled_component(ch, outcome);
     pump_result_from_outcome(ch, outcome, reply_cap)
@@ -2851,8 +2849,9 @@ unsafe fn component_pump_loop(
 unsafe fn pump_service_user_callback(
     ch: &PumpChannel,
 ) -> Option<crate::win32k_glue::UserCallbackDisposition> {
-    let _ = ch;
-    crate::win32k_glue::service_user_callback()
+    let lane =
+        crate::win32k_glue::win32k_physical_lane_for_channel(ch.tcb, ch.fault_ep, ch.reply_cap)?;
+    crate::win32k_glue::service_user_callback(lane)
 }
 
 #[inline(never)]

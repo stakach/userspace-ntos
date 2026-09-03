@@ -24211,6 +24211,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Next replace the singleton service-side suspension stack with the lane table and make that table
     the sole allocator of the catalog handles before enabling secondary dispatch.
 
+    B3 lane-owner cutover checkpoint (2026-09-03, host and freestanding green; desktop run pending):
+    the service-side singleton `ComponentSuspensionStack` has been deleted. One
+    `ComponentSuspensionLanes` table now allocates the primary and worker catalog handles and owns
+    every provider wait, retained LPC request, and external callback token. The central win32k
+    dispatch funnel reacquires the exact lane for same-thread callback recursion and selects an idle
+    lane for unrelated work; callback, provider, and LPC resumes resolve TCB/endpoint/Reply solely
+    from the generation-checked physical catalog. Resume paths restore the dispatch identity,
+    client identity, first four arguments, caller stack pointer, nested marker, and bounded argument
+    snapshot before handing the retained Call back to win32k. Deferred `NtCallbackReturn` selection
+    now scans for any lane-ready frame instead of consulting the deleted global-top policy. The 19
+    scheduler tests and 59 callback tests pass, and the freestanding executive remains green at 221
+    warnings. Next run the serialized desktop gate, fix the first real lane transition failure, then
+    make stack-Event activation ownership lane-local before expanding the worker pool.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

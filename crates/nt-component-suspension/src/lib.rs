@@ -872,6 +872,44 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         Ok(())
     }
 
+    /// Retire the top external continuation while retaining the lane's running token. The caller
+    /// must immediately finish, repark, or admit the component work that the callback resumed.
+    pub fn retire_external_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        token: u64,
+    ) -> Result<(), LaneError> {
+        self.validate_running(handle, reply_object)?;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.last().copied() != Some(token) {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.external_tokens.pop();
+        Ok(())
+    }
+
+    pub fn replace_external_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        completed_token: u64,
+        next_token: u64,
+    ) -> Result<(), LaneError> {
+        if next_token == 0 {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_running(handle, reply_object)?;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.last().copied() != Some(completed_token) {
+            return Err(LaneError::InvalidPhase);
+        }
+        *lane.external_tokens.last_mut().unwrap() = next_token;
+        lane.phase = LanePhase::Suspended;
+        self.running = None;
+        Ok(())
+    }
+
     pub fn admit_running(
         &mut self,
         handle: LaneHandle,
@@ -1133,6 +1171,36 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         } else {
             LanePhase::Suspended
         };
+        self.running = None;
+        Ok(completed)
+    }
+
+    pub fn complete_running_and_suspend_external(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        token: u64,
+    ) -> Result<CompletedSuspension<C, R>, LaneError> {
+        if token == 0 {
+            return Err(LaneError::InvalidIdentity);
+        }
+        self.validate_running(handle, reply_object)?;
+        let max_depth = self.max_depth_per_lane;
+        let lane = self.lane_mut(handle)?;
+        if lane.external_tokens.len() >= max_depth {
+            return Err(LaneError::Suspension(SuspensionError::Overflow));
+        }
+        lane.external_tokens
+            .try_reserve(1)
+            .map_err(|_| LaneError::NoCapacity)?;
+        let completed = lane
+            .suspensions
+            .complete_dispatch(key, owner)
+            .map_err(LaneError::Suspension)?;
+        lane.external_tokens.push(token);
+        lane.phase = LanePhase::Suspended;
         self.running = None;
         Ok(completed)
     }
@@ -1531,20 +1599,42 @@ mod tests {
             .unwrap();
         assert_eq!(
             lanes
-                .complete_running(lane, binding(1).reply_object, outer, owner(1))
+                .complete_running_and_suspend_external(
+                    lane,
+                    binding(1).reply_object,
+                    outer,
+                    owner(1),
+                    0xBEEF,
+                )
                 .unwrap()
                 .continuation,
             10
         );
         assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
-        assert_eq!(lanes.external_top(lane), Ok(Some(0xCA11_BACC)));
+        assert_eq!(lanes.external_top(lane), Ok(Some(0xBEEF)));
         assert_eq!(lanes.next_idle(), None);
 
+        lanes
+            .resume_external(lane, binding(1).reply_object, 0xBEEF)
+            .unwrap();
+        lanes
+            .replace_external_running(lane, binding(1).reply_object, 0xBEEF, 0xF00D)
+            .unwrap();
+        lanes
+            .resume_external(lane, binding(1).reply_object, 0xF00D)
+            .unwrap();
+        lanes
+            .complete_external(lane, binding(1).reply_object, 0xF00D)
+            .unwrap();
+        assert_eq!(lanes.external_top(lane), Ok(Some(0xCA11_BACC)));
         lanes
             .resume_external(lane, binding(1).reply_object, 0xCA11_BACC)
             .unwrap();
         lanes
-            .complete_external(lane, binding(1).reply_object, 0xCA11_BACC)
+            .retire_external_running(lane, binding(1).reply_object, 0xCA11_BACC)
+            .unwrap();
+        lanes
+            .finish_dispatch(lane, binding(1).reply_object)
             .unwrap();
         assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
     }

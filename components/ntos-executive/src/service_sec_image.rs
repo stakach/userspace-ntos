@@ -198,15 +198,124 @@ struct ComponentNativeContinuation {
 }
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
+const COMPONENT_EXECUTION_LANE_CAPACITY: usize = win32k_subsystem::WIN32K_LANE_CAPACITY + 1;
 static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderEventWaitArbiter<
     nt_kernel_exec::EventLeaseId,
 > = nt_provider_wait::ProviderEventWaitArbiter::new();
-static mut COMPONENT_SUSPENSIONS: nt_component_suspension::ComponentSuspensionStack<
+static mut COMPONENT_SUSPENSIONS: nt_component_suspension::ComponentSuspensionLanes<
     ComponentNativeContinuation,
     ComponentSuspensionCompletion,
-> = nt_component_suspension::ComponentSuspensionStack::new(
+> = nt_component_suspension::ComponentSuspensionLanes::new(
+    COMPONENT_EXECUTION_LANE_CAPACITY,
     COMPONENT_SUSPENSION_MAX_DEPTH,
 );
+
+pub(crate) unsafe fn register_component_execution_lane(
+    binding: nt_component_suspension::LaneBinding,
+) -> Option<nt_component_suspension::LaneHandle> {
+    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+        .allocate(binding)
+        .ok()
+}
+
+fn component_execution_lane_reply(
+    lanes: &nt_component_suspension::ComponentSuspensionLanes<
+        ComponentNativeContinuation,
+        ComponentSuspensionCompletion,
+    >,
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<u64> {
+    lanes.binding(lane).ok().map(|binding| binding.reply_object)
+}
+
+pub(crate) unsafe fn acquire_idle_component_execution_lane(
+) -> Option<nt_component_suspension::LaneHandle> {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let (lane, binding) = lanes.next_idle()?;
+    lanes.begin_dispatch(lane, binding.reply_object).ok()?;
+    Some(lane)
+}
+
+pub(crate) unsafe fn resume_external_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.resume_external(lane, reply_object, token).is_ok()
+}
+
+pub(crate) unsafe fn finish_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.finish_dispatch(lane, reply_object).is_ok()
+}
+
+pub(crate) unsafe fn suspend_component_execution_lane_for_callback(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.suspend_running(lane, reply_object, token).is_ok()
+}
+
+pub(crate) unsafe fn repark_external_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.repark_external(lane, reply_object, token).is_ok()
+}
+
+pub(crate) unsafe fn complete_external_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.complete_external(lane, reply_object, token).is_ok()
+}
+
+pub(crate) unsafe fn replace_external_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+    completed_token: u64,
+    next_token: u64,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes
+        .replace_external_running(lane, reply_object, completed_token, next_token)
+        .is_ok()
+}
+
+pub(crate) unsafe fn retire_external_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes
+        .retire_external_running(lane, reply_object, token)
+        .is_ok()
+}
 static PROVIDER_WAIT_DISPATCH_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_PARKED_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 static PROVIDER_WAIT_RESUMES: AtomicU64 = AtomicU64::new(0);
@@ -262,9 +371,11 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
             event_leases_released: PROVIDER_WAIT_EVENT_LEASES_RELEASED.load(Ordering::Relaxed),
             active_continuations: (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
                 .frames()
-                .iter()
-                .filter(|frame| {
-                    matches!(frame.continuation.pending, PendingComponentDispatch::Provider(_))
+                .filter(|(_, frame)| {
+                    matches!(
+                        frame.continuation.pending,
+                        PendingComponentDispatch::Provider(_)
+                    )
                 })
                 .count(),
             active_waiters: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).len(),
@@ -660,10 +771,6 @@ impl DeferredCallbackReturn {
         reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
         reply_cap: 0,
     };
-
-    const fn matches_identity(self, pi: u32, badge: u64, tid: u64) -> bool {
-        self.used && self.pi == pi && self.badge == badge && self.tid == tid
-    }
 }
 
 static mut DEFERRED_CALLBACK_RETURNS: [DeferredCallbackReturn; DEFERRED_CALLBACK_RETURN_N] =
@@ -1395,18 +1502,13 @@ unsafe fn lpc_wait_begin_after_stack_admission(
         Some(Ok(nt_lpc_client::BeginRequestWaitReply::Completed { message_id, reply })) => {
             let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
             let completion = ComponentSuspensionCompletion::lpc(0, message_id, &reply)
-                .unwrap_or_else(|| {
-                    ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32)
-                });
-            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                .select(key, completion);
+                .unwrap_or_else(|| ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32));
+            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).select(key, completion);
         }
         Some(Err(status)) => {
             let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
-            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).select(
-                key,
-                ComponentSuspensionCompletion::provider(status.raw()),
-            );
+            let _ = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .select(key, ComponentSuspensionCompletion::provider(status.raw()));
         }
         None => {
             let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
@@ -1423,10 +1525,9 @@ unsafe fn lpc_component_wait_take(
     key: nt_component_suspension::SuspensionKey,
 ) -> Option<nt_lpc_continuation::PendingBrokerRequest<nt_component_suspension::SuspensionKey>> {
     let mut generation = 0;
-    while let Some((slot, current_generation, wait)) =
-        (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
-            .next_occupied_after(generation)
-            .map(|(slot, generation, wait)| (slot, generation, *wait))
+    while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
+        .next_occupied_after(generation)
+        .map(|(slot, generation, wait)| (slot, generation, *wait))
     {
         generation = current_generation;
         if wait.continuation == key {
@@ -1439,10 +1540,9 @@ unsafe fn lpc_component_wait_take(
 unsafe fn lpc_component_wait_select_ready() -> u64 {
     let mut selected = 0;
     let mut generation = 0;
-    while let Some((slot, current_generation, wait)) =
-        (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
-            .next_occupied_after(generation)
-            .map(|(slot, generation, wait)| (slot, generation, *wait))
+    while let Some((slot, current_generation, wait)) = (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
+        .next_occupied_after(generation)
+        .map(|(slot, generation, wait)| (slot, generation, *wait))
     {
         generation = current_generation;
         let completion = match lpc_client().map(|client| {
@@ -1453,11 +1553,9 @@ unsafe fn lpc_component_wait_select_ready() -> u64 {
                 wait.identity.message_id,
             )
         }) {
-            Some(Ok(Some(reply))) => ComponentSuspensionCompletion::lpc(
-                0,
-                wait.identity.message_id,
-                &reply,
-            ),
+            Some(Ok(Some(reply))) => {
+                ComponentSuspensionCompletion::lpc(0, wait.identity.message_id, &reply)
+            }
             Some(Ok(None)) => continue,
             Some(Err(status)) => Some(ComponentSuspensionCompletion::provider(status.raw())),
             None => Some(ComponentSuspensionCompletion::provider(
@@ -1505,12 +1603,17 @@ unsafe fn component_suspension_resume_top(
     nt_handler: &mut ExecNtHandler,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
     loop {
-        let resume = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).top_resume()?;
+        let lane_resume =
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).next_resumable()?;
+        let lane = lane_resume.lane;
+        let reply_object = lane_resume.binding.reply_object;
+        let resume = lane_resume.suspension;
         let frame = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-            .top()?
+            .frame(lane, resume.key)
+            .ok()??
             .clone();
         (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .begin_resume(resume.key)
+            .begin_resume(lane, reply_object, resume.key)
             .expect("provider wait top changed during synchronous resume");
         let provider_resume = matches!(
             frame.continuation.pending,
@@ -1578,7 +1681,7 @@ unsafe fn component_suspension_resume_top(
         match pump_completion {
             ComponentPumpCompletion::Completed(dispatch) => {
                 let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .complete_dispatch(resume.key, frame.owner)
+                    .complete_running(lane, reply_object, resume.key, frame.owner)
                     .ok()?;
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -1589,8 +1692,16 @@ unsafe fn component_suspension_resume_top(
                 });
             }
             ComponentPumpCompletion::UserCallbackSuspended => {
+                let token =
+                    win32k_glue::pending_user_callback_token(lane, frame.owner.dispatch_id)?;
                 let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .complete_dispatch(resume.key, frame.owner)
+                    .complete_running_and_suspend_external(
+                        lane,
+                        reply_object,
+                        resume.key,
+                        frame.owner,
+                        token,
+                    )
                     .ok()?;
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -1601,7 +1712,7 @@ unsafe fn component_suspension_resume_top(
             }
             ComponentPumpCompletion::Failed(status) => {
                 let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .complete_dispatch(resume.key, frame.owner)
+                    .complete_running(lane, reply_object, resume.key, frame.owner)
                     .ok()?;
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
@@ -1616,16 +1727,15 @@ unsafe fn component_suspension_resume_top(
                     PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
                 }
                 let Some(next_owner) = component_expected_owner(next) else {
-                    let completed =
-                        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                            .abort_resume(
-                                resume.key,
-                                frame.owner,
-                                ComponentSuspensionCompletion::provider(
-                                    0xC000_000Du32 as i32,
-                                ),
-                            )
-                            .expect("invalid component re-wait lost its active continuation");
+                    let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                        .abort_running(
+                            lane,
+                            reply_object,
+                            resume.key,
+                            frame.owner,
+                            ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32),
+                        )
+                        .expect("invalid component re-wait lost its active continuation");
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ComponentSuspensionRuntimeOutcome::Failed {
                         continuation: completed.continuation,
@@ -1636,18 +1746,15 @@ unsafe fn component_suspension_resume_top(
                     match (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() {
                         Ok(reservation) => Some(reservation),
                         Err(_) => {
-                            let completed =
-                                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                                    .abort_resume(
-                                        resume.key,
-                                        frame.owner,
-                                        ComponentSuspensionCompletion::provider(
-                                            0xC000_009Au32 as i32,
-                                        ),
-                                    )
-                                    .expect(
-                                        "LPC readiness reservation failure lost its continuation",
-                                    );
+                            let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                                .abort_running(
+                                    lane,
+                                    reply_object,
+                                    resume.key,
+                                    frame.owner,
+                                    ComponentSuspensionCompletion::provider(0xC000_009Au32 as i32),
+                                )
+                                .expect("LPC readiness reservation failure lost its continuation");
                             return Some(ComponentSuspensionRuntimeOutcome::Failed {
                                 continuation: completed.continuation,
                                 status: 0xC000_009Au32 as i32,
@@ -1662,7 +1769,9 @@ unsafe fn component_suspension_resume_top(
                 let mut next_continuation = frame.continuation;
                 next_continuation.pending = next;
                 if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .rearm(
+                    .rearm_running(
+                        lane,
+                        reply_object,
                         resume.key,
                         next_key,
                         sequence,
@@ -1675,16 +1784,15 @@ unsafe fn component_suspension_resume_top(
                         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
                             .cancel(reservation);
                     }
-                    let completed =
-                        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                            .abort_resume(
-                                resume.key,
-                                frame.owner,
-                                ComponentSuspensionCompletion::provider(
-                                    0xC000_000Du32 as i32,
-                                ),
-                            )
-                            .expect("rejected component re-wait lost its active continuation");
+                    let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                        .abort_running(
+                            lane,
+                            reply_object,
+                            resume.key,
+                            frame.owner,
+                            ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32),
+                        )
+                        .expect("rejected component re-wait lost its active continuation");
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ComponentSuspensionRuntimeOutcome::Failed {
                         continuation: completed.continuation,
@@ -1693,8 +1801,8 @@ unsafe fn component_suspension_resume_top(
                 }
                 match next {
                     PendingComponentDispatch::Provider(next) => {
-                        let admission =
-                            (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER)).admit(
+                        let admission = (&mut *core::ptr::addr_of_mut!(PROVIDER_WAIT_ARBITER))
+                            .admit(
                                 nt_handler,
                                 &next.request,
                                 next_owner,
@@ -1843,8 +1951,14 @@ unsafe fn provider_wait_admit_current(
         resume_flags,
         abandon_native_reply: false,
     };
+    let lane = pending.dispatch.lane;
+    let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
+        return false;
+    };
     if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .admit(
+        .admit_running(
+            lane,
+            binding.reply_object,
             provider_wait_key(wait_id),
             sequence,
             component_suspension_owner(owner),
@@ -1912,9 +2026,7 @@ unsafe fn lpc_wait_admit_current(
     resume_sp: u64,
     resume_flags: u64,
 ) -> bool {
-    let Ok(reservation) =
-        (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve()
-    else {
+    let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
         return false;
     };
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -1941,8 +2053,15 @@ unsafe fn lpc_wait_admit_current(
         resume_flags,
         abandon_native_reply: false,
     };
+    let lane = pending.dispatch.lane;
+    let Ok(binding) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).binding(lane) else {
+        let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).cancel(reservation);
+        return false;
+    };
     if (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-        .admit(
+        .admit_running(
+            lane,
+            binding.reply_object,
             key,
             sequence,
             component_suspension_owner(owner),
@@ -2064,18 +2183,19 @@ unsafe fn component_suspension_prepare_abandoned_replies(
     scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
     loop {
-        let wait_id = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()
-            .iter()
-            .find(|frame| {
+            .find(|(_, frame)| {
                 scope.matches(frame.owner) && !frame.continuation.abandon_native_reply
             })
-            .map(|frame| frame.key);
-        let Some(wait_key) = wait_id else {
+            .map(|(lane, frame)| (lane, frame.key));
+        let Some((lane, wait_key)) = target else {
             return true;
         };
         let frame = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .get_mut(wait_key)
+            .frame_mut(lane, wait_key)
+            .ok()
+            .flatten()
             .expect("provider wait teardown target disappeared");
         let cap = frame.continuation.reply_cap;
         if cap != 0 {
@@ -2109,11 +2229,13 @@ unsafe fn component_suspension_cancel_scope(
     if !component_suspension_prepare_abandoned_replies(scope) {
         return false;
     }
-    while let Some(wait_key) = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-        .next_cancellable_in_scope(scope)
+    while let Some((lane, wait_key)) =
+        (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).next_cancellable_in_scope(scope)
     {
         let phase = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-            .get(wait_key)
+            .frame(lane, wait_key)
+            .ok()
+            .flatten()
             .expect("provider wait cancellation target disappeared")
             .phase
             .clone();
@@ -2140,8 +2262,7 @@ unsafe fn component_suspension_cancel_scope(
                 }
             }
         };
-        if matches!(phase, nt_component_suspension::SuspensionPhase::Waiting)
-            && !external_cancelled
+        if matches!(phase, nt_component_suspension::SuspensionPhase::Waiting) && !external_cancelled
         {
             panic!("waiting component continuation has no readiness owner");
         }
@@ -2165,7 +2286,7 @@ pub(crate) unsafe fn provider_wait_cancel_client_thread(
     nt_handler: &mut ExecNtHandler,
     tid: u64,
 ) -> bool {
-    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).is_empty() {
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).total_suspensions() == 0 {
         return true;
     }
     let Some(provider) = crate::current_win32k_provider_domain() else {
@@ -2197,7 +2318,7 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     nt_handler: &mut ExecNtHandler,
     process_index: u8,
 ) -> bool {
-    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).is_empty() {
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).total_suspensions() == 0 {
         return true;
     }
     let Some(provider) = crate::current_win32k_provider_domain() else {
@@ -2221,8 +2342,8 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
 fn component_suspension_top_owns_dispatch(dispatch_id: u64) -> bool {
     unsafe {
         (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
-            .top()
-            .is_some_and(|frame| frame.owner.dispatch_id == dispatch_id)
+            .frames()
+            .any(|(_, frame)| frame.owner.dispatch_id == dispatch_id)
     }
 }
 
@@ -2308,17 +2429,14 @@ unsafe fn defer_user_callback_return(
     true
 }
 
-unsafe fn take_deferred_user_callback_return_for_top() -> Option<DeferredCallbackReturn> {
-    let (pi, badge, tid) = win32k_glue::active_user_callback_global_top_identity()?;
-    if win32k_glue::user_callback_return_readiness(pi, badge, tid)
-        != win32k_glue::UserCallbackReturnReadiness::Ready
-    {
-        return None;
-    }
+unsafe fn take_ready_deferred_user_callback_return() -> Option<DeferredCallbackReturn> {
     let table = &mut *core::ptr::addr_of_mut!(DEFERRED_CALLBACK_RETURNS);
     for index in 0..DEFERRED_CALLBACK_RETURN_N {
-        if table[index].matches_identity(pi, badge, tid) {
-            let item = table[index];
+        let item = table[index];
+        if item.used
+            && win32k_glue::user_callback_return_readiness(item.pi, item.badge, item.tid)
+                == win32k_glue::UserCallbackReturnReadiness::Ready
+        {
             table[index] = DeferredCallbackReturn::EMPTY;
             return Some(item);
         }
@@ -2518,7 +2636,7 @@ unsafe fn drain_deferred_user_callback_returns(
     pfilled: &mut [[u64; 512]],
     current_filled_pages: &mut [u64; 512],
 ) {
-    while let Some(deferred) = take_deferred_user_callback_return_for_top() {
+    while let Some(deferred) = take_ready_deferred_user_callback_return() {
         let completion = win32k_glue::complete_controlled_user_callback(
             deferred.pi,
             deferred.badge,
@@ -16933,9 +17051,8 @@ pub(crate) unsafe fn service_sec_image(
                 procs[pi].ntfaults = ntfaults;
                 pfilled[pi] = *filled_pages;
                 let _ = component_suspension_drain_ready(&mut nt_handler, procs, pfilled);
-                if component_suspension_top_owns_dispatch(
-                    component_suspension_admitted_dispatch_id,
-                ) {
+                if component_suspension_top_owns_dispatch(component_suspension_admitted_dispatch_id)
+                {
                     mark_wait_parked!(pi, resume_ip);
                 }
                 let _ = finalize_service_loop_state(&mut nt_handler);
