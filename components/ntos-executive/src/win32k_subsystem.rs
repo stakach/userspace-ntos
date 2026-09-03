@@ -4827,6 +4827,71 @@ extern "win64" fn s_zw_query_default_locale(user_profile: u8, locale_id: *mut u3
     0
 }
 
+/// Kernel-callable `Nt/ZwQuerySystemInformation` surface used by win32k. The fixed NT5 layouts and
+/// size policy are shared with the native syscall path; this binding deliberately admits only the
+/// two classes consumed by the graphics subsystem.
+extern "win64" fn s_query_system_information(
+    class: u32,
+    buffer: u64,
+    buffer_length: u32,
+    return_length: *mut u32,
+) -> i32 {
+    use nt_syscall::system_information::{
+        query_plan, SystemInformationKind, SYSTEM_BASIC_INFORMATION_CLASS,
+        SYSTEM_PROCESSOR_INFORMATION_CLASS,
+    };
+
+    const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005u32 as i32;
+    const STATUS_DATATYPE_MISALIGNMENT: i32 = 0x8000_0002u32 as i32;
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003u32 as i32;
+
+    if !return_length.is_null() {
+        if return_length as u64 & 3 != 0 {
+            return STATUS_DATATYPE_MISALIGNMENT;
+        }
+        unsafe { write_unaligned(return_length, 0) };
+    }
+    if !matches!(
+        class,
+        SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_PROCESSOR_INFORMATION_CLASS
+    ) {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    let plan = match query_plan(class, buffer_length as usize) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if !return_length.is_null() {
+                unsafe { write_unaligned(return_length, error.return_length) };
+            }
+            return error.status as i32;
+        }
+    };
+    if buffer == 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    if buffer & 3 != 0 {
+        return STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if !return_length.is_null() {
+        unsafe { write_unaligned(return_length, plan.return_length) };
+    }
+
+    unsafe {
+        match plan.kind {
+            SystemInformationKind::Basic => {
+                let output = crate::exec_handler::native_basic_system_information().encode();
+                core::ptr::copy_nonoverlapping(output.as_ptr(), buffer as *mut u8, plan.copy_length);
+            }
+            SystemInformationKind::Processor => {
+                let output = crate::exec_handler::native_processor_information().encode();
+                core::ptr::copy_nonoverlapping(output.as_ptr(), buffer as *mut u8, plan.copy_length);
+            }
+            _ => return STATUS_INVALID_INFO_CLASS,
+        }
+    }
+    0
+}
+
 unsafe fn registered_kernel_image_bytes(base: u64) -> Option<&'static [u8]> {
     registered_kernel_image_containing(base)
         .filter(|(registered_base, _)| *registered_base == base)
@@ -13197,6 +13262,14 @@ fn register_trampolines() -> bool {
     reg.bind(
         "ZwQueryDefaultLocale",
         s_zw_query_default_locale as usize as u64,
+    );
+    reg.bind(
+        "ZwQuerySystemInformation",
+        s_query_system_information as usize as u64,
+    );
+    reg.bind(
+        "NtQuerySystemInformation",
+        s_query_system_information as usize as u64,
     );
     reg.bind("RtlImageNtHeader", s_rtl_image_nt_header as usize as u64);
     reg.bind(

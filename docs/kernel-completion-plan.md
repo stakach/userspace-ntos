@@ -24681,6 +24681,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     publish projections for attachment-stack participants before multi-adapter or filter-stack
     support is complete.
 
+    B3 live system-information tranche 11 (2026-09-04, host and freestanding green): win32k's
+    `NtQuerySystemInformation` and `ZwQuerySystemInformation` imports now share the same checked NT5
+    layout and size policy as the native syscall path. `SystemBasicInformation` reports the
+    executive's published physical-page bounds and processor count, and
+    `SystemProcessorInformation` derives family, revision, and feature flags from CPUID while
+    reflecting rust-micro's actual FXSAVE-only context support. The kernel-callable binding
+    preserves exact length, alignment, optional `ReturnLength`, and error behavior for those two
+    classes; every other class returns `STATUS_INVALID_INFO_CLASS` instead of canned data.
+
+    All 80 `nt-syscall` tests and all 46 `nt-compat-exports` tests pass, and the freestanding
+    executive release build succeeds. Forty-one audited code imports remain. Extend the shared
+    class owner when a real win32k caller requires another class; do not add a generic zero-filled
+    response or duplicate the native-service encoding policy in the component.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

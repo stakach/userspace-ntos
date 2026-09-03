@@ -2977,7 +2977,8 @@ fn is_dynamic_hive_selector(sel: u32) -> bool {
     HIVE_SEL_DYNAMIC.iter().any(|candidate| *candidate == sel)
 }
 
-fn native_basic_system_information() -> nt_syscall::system_information::SystemBasicInformation {
+pub(crate) fn native_basic_system_information(
+) -> nt_syscall::system_information::SystemBasicInformation {
     let processors = SYSTEM_PROCESSOR_COUNT.load(Ordering::Relaxed) as u8;
     let affinity = if processors >= 64 {
         u64::MAX

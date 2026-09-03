@@ -161,7 +161,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ZwCreateDirectoryObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
     e("ZwOpenDirectoryObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
     e("ZwQueryDirectoryObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
-    e("ZwQuerySystemInformation", StubSuccess, "system-information classes win32k needs return canned values; TODO Phase 2"),
+    e("ZwQuerySystemInformation", Partial, "returns live NT5 SystemBasicInformation and CPUID-derived SystemProcessorInformation with shared size policy"),
     e("ZwQueryKey", Partial, "registry ops routed to nt-config-manager"),
     e("ZwQueryObject", Partial, "handle/directory-object ops routed to nt-object-manager"),
     e("ZwQueryDirectoryFile", StubSuccess, "file ops routed to nt-fs where mounted; else success with empty result (Phase 2 wiring)"),
@@ -250,7 +250,7 @@ pub const WIN32K_NTOSKRNL: &[ExportDescriptor] = &[
     e("ProbeForWrite", Partial, "validates the NT user range/alignment and touches every spanned page; structured exception delivery remains"),
     e("ProbeForRead", Partial, "validates the NT user range/alignment; structured exception delivery remains"),
     // --- Nt ---
-    e("NtQuerySystemInformation", StubSuccess, "system-information classes return canned values"),
+    e("NtQuerySystemInformation", Partial, "returns live NT5 SystemBasicInformation and CPUID-derived SystemProcessorInformation with shared size policy"),
     e("NtAddAtom", Partial, "global atom add routed to the Rtl atom table"),
     // --- Po ---
     e("PoRequestShutdownEvent", StubSuccess, "records a shutdown-event request; never signalled on the host"),
