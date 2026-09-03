@@ -1219,9 +1219,9 @@ impl PortCore {
         Ok(())
     }
 
-    /// Queue a typed synchronous request from a kernel-retained connection or communication port.
-    /// Unlike an LPC client request this preserves the caller-supplied message type (for example
-    /// `LPC_ERROR_EVENT`). Raw user communication handles are deliberately not accepted here.
+    /// Queue a synchronous request through a kernel-retained connection or communication port.
+    /// Message-type normalization is owned by the protocol adapter. Raw user communication handles
+    /// are deliberately not accepted here.
     pub fn send_kernel_request_message(
         &mut self,
         endpoint_handle: u64,
@@ -1305,6 +1305,82 @@ impl PortCore {
         self.kernel_communication_endpoints[endpoint_index]
             .outstanding_requests
             .push(identity);
+        Ok(())
+    }
+
+    /// Queue a datagram through a kernel-retained connection or communication port. Unlike a
+    /// synchronous request, this carries no reply identity and therefore owns no outstanding-request
+    /// entry on the retained reference.
+    pub fn send_retained_message(
+        &mut self,
+        endpoint_handle: u64,
+        bytes: &[u8],
+        attrs: MessageAttrs,
+        client: ClientId,
+    ) -> Result<(), NtStatus> {
+        if let Some(endpoint_index) = self
+            .kernel_endpoints
+            .iter()
+            .position(|endpoint| endpoint.handle == endpoint_handle)
+        {
+            let port = self
+                .ports
+                .iter()
+                .find(|port| port.object_id == self.kernel_endpoints[endpoint_index].port_object_id)
+                .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+            if bytes.len() > port.limits.max_message as usize {
+                return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+            }
+            let stored = self.allocate_stored_message(
+                port.pool_account,
+                0,
+                bytes,
+                attrs,
+                MessageProvenance {
+                    connection_id: 0,
+                    client,
+                },
+                0,
+                None,
+            )?;
+            self.kernel_endpoints[endpoint_index]
+                .server_inbox
+                .push(stored);
+            return Ok(());
+        }
+
+        let endpoint = self
+            .kernel_communication_endpoints
+            .iter()
+            .find(|endpoint| endpoint.handle == endpoint_handle)
+            .ok_or(NtStatus::INVALID_PORT_HANDLE)?;
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| {
+                connection.id == endpoint.connection_id
+                    && connection.state == ConnState::Connected
+                    && connection.client_kernel_refs != 0
+                    && connection.server_open
+            })
+            .ok_or(NtStatus::PORT_DISCONNECTED)?;
+        let connection = &self.connections[connection_index];
+        if bytes.len() > connection.limits.max_message as usize {
+            return Err(NtStatus::PORT_MESSAGE_TOO_LONG);
+        }
+        let stored = self.allocate_stored_message(
+            connection.pool_account,
+            0,
+            bytes,
+            attrs,
+            MessageProvenance {
+                connection_id: connection.id,
+                client,
+            },
+            connection.port_context,
+            None,
+        )?;
+        self.connections[connection_index].server_inbox.push(stored);
         Ok(())
     }
 

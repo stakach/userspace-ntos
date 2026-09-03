@@ -17,7 +17,7 @@
 #![no_std]
 
 /// ABI version. Bump on any incompatible wire change.
-pub const LPC_ABI_VERSION: u32 = 9;
+pub const LPC_ABI_VERSION: u32 = 10;
 
 /// The reserved SURT opcode range for the LPC protocol (fresh block after
 /// object 0x2000 / config 0x2100).
@@ -65,6 +65,12 @@ pub mod opcode {
     // by a user handle. This is used for process exception-port ownership.
     pub const LPC_OP_RETAIN_PORT_OBJECT: u16 = 0x2212;
     pub const LPC_OP_RELEASE_PORT_OBJECT: u16 = 0x2213;
+
+    // Ordinary LPC traffic through a kernel-retained port-object reference. These remain distinct
+    // from the typed hard-error plane above so a type-zero CSR request cannot acquire kernel-only
+    // message semantics.
+    pub const LPC_OP_RETAINED_REQUEST_WAIT_REPLY: u16 = 0x2214;
+    pub const LPC_OP_RETAINED_REQUEST_PORT: u16 = 0x2215;
 }
 
 /// True if `op` is an LPC opcode.
@@ -816,6 +822,6 @@ mod tests {
 
     #[test]
     fn version_is_current() {
-        assert_eq!(LPC_ABI_VERSION, 9);
+        assert_eq!(LPC_ABI_VERSION, 10);
     }
 }

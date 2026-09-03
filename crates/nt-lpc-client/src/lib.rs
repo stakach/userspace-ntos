@@ -94,6 +94,22 @@ pub struct RequestQueryResult {
     pub effective_only: bool,
 }
 
+/// Result of beginning one synchronous LPC request. An immediate broker reply remains owned by
+/// this result; callers must never park and then try to receive it a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BeginRequestWaitReply {
+    Pending { message_id: u32 },
+    Completed { message_id: u32, reply: Vec<u8> },
+}
+
+impl BeginRequestWaitReply {
+    pub fn message_id(&self) -> u32 {
+        match self {
+            Self::Pending { message_id } | Self::Completed { message_id, .. } => *message_id,
+        }
+    }
+}
+
 /// The LPC client.
 pub struct LpcClient<B> {
     backend: B,
@@ -615,13 +631,15 @@ impl<B: Backend> LpcClient<B> {
         client_process: u64,
         client_thread: u64,
     ) -> Result<Vec<u8>, NtStatus> {
-        self.begin_request_wait_reply_with_client_id(
+        match self.begin_request_wait_reply_with_client_id(
             port_handle,
             message,
             client_process,
             client_thread,
-        )
-        .map(|_| Vec::new())
+        )? {
+            BeginRequestWaitReply::Pending { .. } => Ok(Vec::new()),
+            BeginRequestWaitReply::Completed { reply, .. } => Ok(reply),
+        }
     }
 
     /// Queue one synchronous request and return the broker-authored message id that owns its
@@ -632,7 +650,7 @@ impl<B: Backend> LpcClient<B> {
         message: &[u8],
         client_process: u64,
         client_thread: u64,
-    ) -> Result<u32, NtStatus> {
+    ) -> Result<BeginRequestWaitReply, NtStatus> {
         let header = size_of::<LpcMessageRequest>();
         let request = LpcMessageRequest {
             abi_size: header as u16,
@@ -649,13 +667,7 @@ impl<B: Backend> LpcClient<B> {
         let reply = self
             .backend
             .call(opcode::LPC_OP_REQUEST_WAIT_REPLY, buf.as_slice(), &mut out);
-        if reply.status != NtStatus::PENDING.raw() && reply.status != NtStatus::SUCCESS.raw() {
-            return Err(NtStatus(reply.status));
-        }
-        u32::try_from(reply.detail0)
-            .ok()
-            .filter(|message_id| *message_id != 0)
-            .ok_or(NtStatus::UNSUCCESSFUL)
+        decode_begin_request_reply(reply, &out)
     }
 
     /// Queue one typed synchronous request from a kernel-retained connection port. The broker
@@ -667,7 +679,7 @@ impl<B: Backend> LpcClient<B> {
         message: &[u8],
         client_process: u64,
         client_thread: u64,
-    ) -> Result<u32, NtStatus> {
+    ) -> Result<BeginRequestWaitReply, NtStatus> {
         let header = size_of::<LpcMessageRequest>();
         let request = LpcMessageRequest {
             abi_size: header as u16,
@@ -686,13 +698,67 @@ impl<B: Backend> LpcClient<B> {
             buf.as_slice(),
             &mut out,
         );
-        if reply.status != NtStatus::PENDING.raw() && reply.status != NtStatus::SUCCESS.raw() {
-            return Err(NtStatus(reply.status));
-        }
-        u32::try_from(reply.detail0)
-            .ok()
-            .filter(|message_id| *message_id != 0)
-            .ok_or(NtStatus::UNSUCCESSFUL)
+        decode_begin_request_reply(reply, &out)
+    }
+
+    /// Queue one ordinary synchronous request through an exact kernel-retained port object.
+    pub fn begin_retained_request_wait_reply(
+        &mut self,
+        endpoint_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<BeginRequestWaitReply, NtStatus> {
+        self.begin_request_wait_reply_on(
+            opcode::LPC_OP_RETAINED_REQUEST_WAIT_REPLY,
+            endpoint_handle,
+            message,
+            client_process,
+            client_thread,
+        )
+    }
+
+    /// Send a datagram through an exact kernel-retained port object.
+    pub fn retained_request_port(
+        &mut self,
+        endpoint_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<(), NtStatus> {
+        self.send_message(
+            opcode::LPC_OP_RETAINED_REQUEST_PORT,
+            endpoint_handle,
+            message,
+            client_process,
+            client_thread,
+        )
+        .map(|_| ())
+    }
+
+    fn begin_request_wait_reply_on(
+        &mut self,
+        opcode: u16,
+        port_handle: u64,
+        message: &[u8],
+        client_process: u64,
+        client_thread: u64,
+    ) -> Result<BeginRequestWaitReply, NtStatus> {
+        let header = size_of::<LpcMessageRequest>();
+        let request = LpcMessageRequest {
+            abi_size: header as u16,
+            _reserved: 0,
+            _reserved2: 0,
+            port_handle,
+            msg_offset: header as u32,
+            msg_len_bytes: u32_len(message.len())?,
+            client_process,
+            client_thread,
+        };
+        let buf = pack_bytes::<LPC_MESSAGE_BUF_LEN, _>(&request, message)?;
+        let mut out = [0u8; 512];
+        let reply = self.backend.call(opcode, buf.as_slice(), &mut out);
+        decode_begin_request_reply(reply, &out)
     }
 
     /// Poll one exact synchronous request reply without consuming other traffic on the client
@@ -803,6 +869,32 @@ pub const LPC_CONNECTION_REQUEST: u16 = msg_type::LPC_CONNECTION_REQUEST;
 
 const LPC_CONTROL_BUF_LEN: usize = 1024;
 const LPC_MESSAGE_BUF_LEN: usize = 1024;
+
+fn decode_begin_request_reply(
+    reply: LpcReply,
+    out: &[u8],
+) -> Result<BeginRequestWaitReply, NtStatus> {
+    if reply.status != NtStatus::PENDING.raw() && reply.status != NtStatus::SUCCESS.raw() {
+        return Err(NtStatus(reply.status));
+    }
+    let message_id = u32::try_from(reply.detail0)
+        .ok()
+        .filter(|message_id| *message_id != 0)
+        .ok_or(NtStatus::UNSUCCESSFUL)?;
+    if reply.status == NtStatus::PENDING.raw() {
+        return (reply.information == 0)
+            .then_some(BeginRequestWaitReply::Pending { message_id })
+            .ok_or(NtStatus::UNSUCCESSFUL);
+    }
+    let len = usize::try_from(reply.information)
+        .ok()
+        .filter(|len| *len <= out.len())
+        .ok_or(NtStatus::UNSUCCESSFUL)?;
+    Ok(BeginRequestWaitReply::Completed {
+        message_id,
+        reply: out[..len].to_vec(),
+    })
+}
 
 struct StackBuf<const N: usize> {
     bytes: [u8; N],
@@ -930,8 +1022,88 @@ mod tests {
         }
     }
 
+    struct ImmediateBackend {
+        reply: LpcReply,
+        bytes: Vec<u8>,
+    }
+
+    impl Backend for ImmediateBackend {
+        fn call(&mut self, _opcode: u16, _in_buf: &[u8], out_buf: &mut [u8]) -> LpcReply {
+            let len = self.bytes.len().min(out_buf.len());
+            out_buf[..len].copy_from_slice(&self.bytes[..len]);
+            self.reply
+        }
+    }
+
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn begin_request_distinguishes_pending_from_owned_immediate_reply() {
+        let mut pending = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: NtStatus::PENDING.raw(),
+                detail0: 41,
+                ..Default::default()
+            },
+            bytes: Vec::new(),
+        });
+        assert_eq!(
+            pending
+                .begin_retained_request_wait_reply(7, &[0; 40], 11, 13)
+                .unwrap(),
+            BeginRequestWaitReply::Pending { message_id: 41 }
+        );
+
+        let expected = vec![1, 2, 3, 4, 5];
+        let mut completed = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: NtStatus::SUCCESS.raw(),
+                information: expected.len() as u32,
+                detail0: 42,
+                ..Default::default()
+            },
+            bytes: expected.clone(),
+        });
+        assert_eq!(
+            completed
+                .begin_retained_request_wait_reply(7, &[0; 40], 11, 13)
+                .unwrap(),
+            BeginRequestWaitReply::Completed {
+                message_id: 42,
+                reply: expected,
+            }
+        );
+    }
+
+    #[test]
+    fn begin_request_rejects_malformed_completion_metadata() {
+        let mut zero_identity = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: NtStatus::PENDING.raw(),
+                ..Default::default()
+            },
+            bytes: Vec::new(),
+        });
+        assert_eq!(
+            zero_identity.begin_retained_request_wait_reply(7, &[0; 40], 11, 13),
+            Err(NtStatus::UNSUCCESSFUL)
+        );
+
+        let mut pending_with_bytes = LpcClient::new(ImmediateBackend {
+            reply: LpcReply {
+                status: NtStatus::PENDING.raw(),
+                information: 1,
+                detail0: 42,
+                ..Default::default()
+            },
+            bytes: vec![1],
+        });
+        assert_eq!(
+            pending_with_bytes.begin_retained_request_wait_reply(7, &[0; 40], 11, 13),
+            Err(NtStatus::UNSUCCESSFUL)
+        );
     }
 
     #[test]

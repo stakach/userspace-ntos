@@ -31620,27 +31620,39 @@ impl ExecNtHandler {
             crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
             return STATUS_UNSUCCESSFUL;
         };
-        let message_id = match lpc.begin_request_wait_reply_with_client_id(
+        let begin = match lpc.begin_request_wait_reply_with_client_id(
             port_handle,
             &message,
             client_process,
             client_thread,
         ) {
-            Ok(message_id) => message_id,
+            Ok(begin) => begin,
             Err(status) => {
                 crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
                 return status.raw() as u32;
             }
         };
+        let request = nt_lpc_continuation::RequestWaitRequest {
+            port_handle,
+            reply_message,
+            client_process,
+            client_thread,
+            message_id: begin.message_id(),
+        };
+        if let nt_lpc_client::BeginRequestWaitReply::Completed { reply, .. } = begin {
+            crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+            self.lpc_endpoint_progress = true;
+            return self.lpc_publish_request_reply(
+                self.pi,
+                self.current_user_memory,
+                request,
+                LpcRequestCompletion::PortMessage,
+                &reply,
+            );
+        }
         self.lpc_request_park = Some(PendingLpcRequestPark {
             reservation,
-            request: nt_lpc_continuation::RequestWaitRequest {
-                port_handle,
-                reply_message,
-                client_process,
-                client_thread,
-                message_id,
-            },
+            request,
             memory: self.current_user_memory,
             completion: LpcRequestCompletion::PortMessage,
         });
@@ -31667,27 +31679,39 @@ impl ExecNtHandler {
             crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
             return STATUS_UNSUCCESSFUL;
         };
-        let message_id = match lpc.begin_kernel_request_wait_reply(
+        let begin = match lpc.begin_kernel_request_wait_reply(
             port_handle,
             message,
             client_process,
             client_thread,
         ) {
-            Ok(message_id) => message_id,
+            Ok(begin) => begin,
             Err(status) => {
                 crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
                 return status.raw() as u32;
             }
         };
+        let request = nt_lpc_continuation::RequestWaitRequest {
+            port_handle,
+            reply_message: response,
+            client_process,
+            client_thread,
+            message_id: begin.message_id(),
+        };
+        if let nt_lpc_client::BeginRequestWaitReply::Completed { reply, .. } = begin {
+            crate::service_sec_image::lpc_request_wait_cancel_reservation(reservation);
+            self.lpc_endpoint_progress = true;
+            return self.lpc_publish_request_reply(
+                self.pi,
+                self.current_user_memory,
+                request,
+                LpcRequestCompletion::HardErrorResponse,
+                &reply,
+            );
+        }
         self.lpc_request_park = Some(PendingLpcRequestPark {
             reservation,
-            request: nt_lpc_continuation::RequestWaitRequest {
-                port_handle,
-                reply_message: response,
-                client_process,
-                client_thread,
-                message_id,
-            },
+            request,
             memory: self.current_user_memory,
             completion: LpcRequestCompletion::HardErrorResponse,
         });

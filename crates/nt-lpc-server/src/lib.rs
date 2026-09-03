@@ -159,6 +159,10 @@ impl Server {
             opcode::LPC_OP_KERNEL_REQUEST_WAIT_REPLY => {
                 self.op_kernel_request_wait_reply(in_buf, out_buf)
             }
+            opcode::LPC_OP_RETAINED_REQUEST_WAIT_REPLY => {
+                self.op_retained_request_wait_reply(in_buf, out_buf)
+            }
+            opcode::LPC_OP_RETAINED_REQUEST_PORT => self.op_retained_request_port(in_buf),
             _ => Err(NtStatus::NOT_IMPLEMENTED),
         }
     }
@@ -423,6 +427,67 @@ impl Server {
             }
             None => Ok(reply(NtStatus::PENDING, 0, identity.message_id as u64, 0)),
         }
+    }
+
+    fn op_retained_request_wait_reply(
+        &mut self,
+        buf: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<LpcReply, NtStatus> {
+        let req: LpcMessageRequest = read_req(buf)?;
+        let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
+        let identity = MessageIdentity {
+            client: ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+            message_id: self.allocate_message_id(),
+        };
+        let msg = message_with_request_identity(msg, identity)?;
+        self.core.send_kernel_request_message(
+            req.port_handle,
+            &msg,
+            MessageAttrs::default(),
+            identity,
+        )?;
+        match self.core.receive_reply_message(req.port_handle, identity)? {
+            Some(message) => {
+                let n = message.bytes.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&message.bytes[..n]);
+                Ok(reply(
+                    NtStatus::SUCCESS,
+                    n as u32,
+                    identity.message_id as u64,
+                    msg_type_of(&message.bytes) as u64,
+                ))
+            }
+            None => Ok(reply(NtStatus::PENDING, 0, identity.message_id as u64, 0)),
+        }
+    }
+
+    fn op_retained_request_port(&mut self, buf: &[u8]) -> Result<LpcReply, NtStatus> {
+        let req: LpcMessageRequest = read_req(buf)?;
+        let msg = read_blob(buf, req.msg_offset, req.msg_len_bytes)?;
+        let msg_type = msg_type_of(msg);
+        let msg = if msg_type == 0 {
+            message_with_type(msg, nt_lpc_abi::msg_type::LPC_DATAGRAM)?
+        } else if (nt_lpc_abi::msg_type::LPC_DATAGRAM..=nt_lpc_abi::msg_type::LPC_CLIENT_DIED)
+            .contains(&msg_type)
+        {
+            validated_port_message(msg)?
+        } else {
+            return Err(NtStatus::INVALID_PARAMETER);
+        };
+        self.core.send_retained_message(
+            req.port_handle,
+            &msg,
+            MessageAttrs::default(),
+            ClientId {
+                process: req.client_process,
+                thread: req.client_thread,
+            },
+        )?;
+        Ok(ok())
     }
 
     fn op_receive_reply(&mut self, buf: &[u8], out_buf: &mut [u8]) -> Result<LpcReply, NtStatus> {
@@ -1347,7 +1412,8 @@ mod tests {
             let request_message = port_message(0, b"request");
             let queued_message_id = c
                 .begin_request_wait_reply_with_client_id(client, &request_message, 0x120, 0x124)
-                .unwrap();
+                .unwrap()
+                .message_id();
             let request = c.reply_wait_receive(listen).unwrap();
             assert_eq!(request.connection_id, connection);
             assert_eq!(request.client_process, 0x120);
@@ -1408,7 +1474,8 @@ mod tests {
         let request = port_message(msg_type::LPC_ERROR_EVENT, b"hard-error");
         let message_id = client
             .begin_kernel_request_wait_reply(retained, &request, 0x220, 0x224)
-            .unwrap();
+            .unwrap()
+            .message_id();
 
         let received = client.reply_wait_receive(listen).unwrap();
         assert_eq!(received.connection_id, 0);
@@ -1451,7 +1518,8 @@ mod tests {
         let request = port_message(msg_type::LPC_ERROR_EVENT, b"process-hard-error");
         let message_id = client
             .begin_kernel_request_wait_reply(retained, &request, 0x330, 0x334)
-            .unwrap();
+            .unwrap()
+            .message_id();
         let received = client.reply_wait_receive(listen).unwrap();
         assert_eq!(received.connection_id, 0);
         assert_eq!(received.client_process, 0x330);
@@ -1501,7 +1569,8 @@ mod tests {
         let request = port_message(msg_type::LPC_ERROR_EVENT, b"process-hard-error");
         let message_id = client
             .begin_kernel_request_wait_reply(retained, &request, 0x330, 0x334)
-            .unwrap();
+            .unwrap()
+            .message_id();
         let received = client.reply_wait_receive(listen).unwrap();
         assert_eq!(received.connection_id, pending.connection_id);
         assert_eq!(received.client_process, 0x330);
@@ -1534,6 +1603,141 @@ mod tests {
         client.close_port(server_port).unwrap();
         client.close_port(listen).unwrap();
         assert_eq!(server.port_count(), 0);
+    }
+
+    #[test]
+    fn retained_communication_port_routes_ordinary_request_after_user_close() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+            .unwrap();
+        let pending = client
+            .connect_port_with_client_id(&utf16("\\Windows\\ApiPort"), 0, &[], 0x440, 0x444)
+            .unwrap();
+        client.reply_wait_receive(listen).unwrap();
+        let server_port = client
+            .accept_connect(pending.connection_id, true, 0x9911)
+            .unwrap();
+        let client_port = client
+            .complete_connect(pending.connection_id)
+            .unwrap()
+            .handle;
+        let retained = client.retain_port_object(client_port).unwrap();
+        client.close_port(client_port).unwrap();
+
+        let request = port_message(0, b"create-system-thread");
+        let result = client
+            .begin_retained_request_wait_reply(retained, &request, 0x440, 0x444)
+            .unwrap();
+        let message_id = result.message_id();
+        assert!(matches!(
+            result,
+            nt_lpc_client::BeginRequestWaitReply::Pending { .. }
+        ));
+        let received = client.reply_wait_receive(listen).unwrap();
+        assert_eq!(received.connection_id, pending.connection_id);
+        assert_eq!(received.client_process, 0x440);
+        assert_eq!(received.client_thread, 0x444);
+        assert_eq!(received.msg_type, msg_type::LPC_REQUEST);
+        assert_eq!(received.port_context, 0x9911);
+        assert_eq!(
+            &received.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
+            b"create-system-thread"
+        );
+
+        let mut reply = received.connection_info;
+        reply[4..6].copy_from_slice(&msg_type::LPC_REPLY.to_le_bytes());
+        assert_eq!(
+            client.reply_wait_receive_with_reply(listen, &reply),
+            Err(NtStatus::PENDING)
+        );
+        assert_eq!(
+            client.receive_reply(retained, 0x440, 0x445, message_id),
+            Err(NtStatus::REPLY_MESSAGE_MISMATCH)
+        );
+        assert_eq!(
+            client
+                .receive_reply(retained, 0x440, 0x444, message_id)
+                .unwrap(),
+            Some(reply)
+        );
+
+        client.release_port_object(retained).unwrap();
+        client.close_port(server_port).unwrap();
+        client.close_port(listen).unwrap();
+        assert_eq!(server.port_count(), 0);
+    }
+
+    #[test]
+    fn retained_communication_port_routes_datagram_after_user_close() {
+        let mut server = Server::new();
+        server.set_accept_policy(AcceptPolicy::Manual);
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+            .unwrap();
+        let pending = client
+            .connect_port_with_client_id(&utf16("\\Windows\\ApiPort"), 0, &[], 0x550, 0x554)
+            .unwrap();
+        client.reply_wait_receive(listen).unwrap();
+        let server_port = client
+            .accept_connect(pending.connection_id, true, 0)
+            .unwrap();
+        let client_port = client
+            .complete_connect(pending.connection_id)
+            .unwrap()
+            .handle;
+        let retained = client.retain_port_object(client_port).unwrap();
+        client.close_port(client_port).unwrap();
+
+        client
+            .retained_request_port(retained, &port_message(0, b"notify"), 0x550, 0x554)
+            .unwrap();
+        let received = client.reply_wait_receive(listen).unwrap();
+        assert_eq!(received.msg_type, msg_type::LPC_DATAGRAM);
+        assert_eq!(received.client_process, 0x550);
+        assert_eq!(received.client_thread, 0x554);
+        assert_eq!(
+            &received.connection_info[nt_lpc_abi::PORT_MESSAGE_HEADER_LEN..],
+            b"notify"
+        );
+
+        client.release_port_object(retained).unwrap();
+        client.close_port(server_port).unwrap();
+        client.close_port(listen).unwrap();
+        assert_eq!(server.port_count(), 0);
+    }
+
+    #[test]
+    fn hard_error_request_opcode_still_rejects_an_ordinary_request() {
+        let mut server = Server::new();
+        let mut client = LpcClient::new(Direct {
+            server: &mut server,
+            out: [0; 512],
+        });
+        let listen = client
+            .create_port(&utf16("\\Windows\\ApiPort"), 0, 0x148, 0)
+            .unwrap();
+        let retained = client.retain_port_object(listen).unwrap();
+        assert_eq!(
+            client.begin_kernel_request_wait_reply(
+                retained,
+                &port_message(0, b"not-a-hard-error"),
+                0x660,
+                0x664,
+            ),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        client.release_port_object(retained).unwrap();
+        client.close_port(listen).unwrap();
     }
 
     #[test]

@@ -24025,6 +24025,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     no-op port references and the unreachable host desktop-construction machinery only after a
     serialized real-CSRSS desktop acceptance run.
 
+    B3 retained LPC request-plane checkpoint (2026-09-03, host and freestanding green): LPC ABI
+    version 10 gives ordinary synchronous requests and datagrams distinct retained-port opcodes;
+    the existing `LPC_ERROR_EVENT` operation remains type-restricted. The shared port core routes
+    both connection-port and communication-port kernel references after the originating user handle
+    closes, while exact client/message identity prevents a wrong waiter from consuming a reply.
+    `nt-lpc-client` now returns typed Pending versus Completed begin results and owns immediate reply
+    bytes instead of discarding them; native user and hard-error callers copy an immediate result
+    out without parking. Focused validation is green for `nt-lpc-abi` (8), `nt-lpc-client` (7),
+    `nt-port-core` (20), and `nt-lpc-server` (22) tests, including stale release, wrong identity,
+    retained datagram, and hard-error separation. Next make win32k's port-object reference acquire
+    and release these retained endpoints, then connect the synchronous import to the common
+    cross-kind continuation stack and generation-correlated shared reply frame.
+
 ## NTFS System-Volume Workstream
 
 The target boot disk is one GPT image with two independently owned volumes plus the conventional
