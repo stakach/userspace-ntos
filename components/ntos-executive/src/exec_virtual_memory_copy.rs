@@ -101,11 +101,16 @@ impl ExecNtHandler {
             let after = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER);
             *before = process_committed_mapping_snapshot(pi as u64).ok_or(STATUS_INVALID_HANDLE)?;
             *after = *before;
-            after.protect(page, PAGE_SIZE, plan.protection)?;
+            let change = after.clear_guard(page)?;
+            debug_assert_eq!(change.new_protection, plan.protection);
             let mut new = old;
             new.protect = plan.protection;
-            let old_rights = committed_mapping_effective_page_protection(old);
-            let new_rights = committed_mapping_effective_page_protection(new);
+            let owned = csrss_frame_get_exact_record(pi as u64, page)
+                .is_some_and(|record| record.owns_frame);
+            let old_rights =
+                nt_address_space::resident_backing_protection(old.type_, old.protect, owned);
+            let new_rights =
+                nt_address_space::resident_backing_protection(new.type_, new.protect, owned);
             if old.type_ == nt_address_space::MEM_IMAGE {
                 vm_reprotect_resident_image_page(
                     pi,

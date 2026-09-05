@@ -53,6 +53,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   probes with transactional transition protection (tranche 25, host tests and executive build).
 - [x] Apply protection changes to cold private and section-backed ranges without materialization,
   with one atomic transition update and shared resident rollback (tranche 26, host/build validation).
+- [x] Normalize writable image protection requests to write-copy before admission/publication,
+  preserving map-time shared policy and exact guard clearing (tranche 27, host/build validation).
+- [ ] Track private COW ownership through query/OldProtect and commitment lifetime, including
+  read-only reprotection, eviction, restoration, and unmap. Carry explicit section/VAD CopyOnWrite
+  policy before extending request normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
   backing admission and ordinary guards are implemented; current-thread stack-guard expansion,
@@ -25158,6 +25163,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     expansion/overflow and ordinary CPU guard exception delivery, followed by live SEH-reader
     accessibility and lifetime checks. The 33-import barrier and live desktop acceptance remain
     unchanged; no boot gate is bypassed.
+
+    B3 image-protection normalization tranche 27 (2026-09-06, host and executive build green):
+    `VmCommittedRangeTable::protect` now normalizes image READWRITE/EXECUTE_READWRITE requests to
+    WRITECOPY/EXECUTE_WRITECOPY before metadata publication, new COW commitment admission, secured
+    lease checks, and physical/transition reprotection. First-page OldProtect, modifiers, allocation
+    protection, and unchanged neighboring ranges retain their existing contracts. Initial PE mapping
+    policy is not normalized: legitimately shared-writable image sections remain shared at map time.
+    This follows NT5 `mm/protect.c` and Wine's image-protection tests, rather than copying incomplete
+    ReactOS section-protection behavior.
+
+    A dedicated one-page `clear_guard` metadata transaction consumes only the guard bit without
+    reinterpreting the existing policy as a new image request or adding COW commitment. Guard
+    clearing and native protection changes now share ownership-aware resident-rights projection:
+    shared WC backing remains read-only, while already-private WC backing retains writable physical
+    rights. The obsolete view-only executive projection helper has been removed. Writable secured
+    leases accept WC policy, and secure-memory acquisition uses the shared mapping-type-aware
+    access planner across every covered region instead of private-only permission checks. This
+    changes metadata admission, not the still-separate full faulting/probing contract of MmSecure.
+
+    Validation: all 107 `nt-address-space` and 40 `nt-memory-manager` tests pass, including ten new
+    image-policy regressions covering normalization, map-time policy, nonimage isolation, new COW
+    admission, atomic rejection, exact guard clearing, secure-memory admission, and private/shared
+    physical-rights projection. The freestanding executive build passes with the existing 256
+    warnings. Logs: `.tmp/test-image-protect-20260906.log` and
+    `.tmp/build-image-protect-20260906.log`. Independent review of the final secure-admission
+    integration found no remaining bounded regression. No QEMU boot was attempted.
+
+    Review adjustment: request normalization is closed, not the complete image-protection contract.
+    Next carry per-page private COW ownership into query/OldProtect and commitment lifetime: native
+    image queries expose private writable policy after COW, and private backing must retain its
+    charge when reprotected read-only until release/unmap. The current view-only charge calculation
+    and query metadata cannot express those lifetimes. Nonimage CopyOnWrite VAD behavior also needs
+    explicit section policy; NT5 obtains it from the section's CopyOnWrite flag, not from the initial
+    view protection, so do not infer it from a WC mapping. Keep stack-guard expansion/overflow,
+    ordinary CPU guard delivery, and live mixed-residency/COW/remap-failure acceptance open. The
+    unchanged 33-import win32k barrier still prevents live MM/SEH and desktop acceptance; do not
+    bypass it or treat host/build validation as rendered desktop proof.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -2258,16 +2258,6 @@ unsafe fn allocate_automatic_vad_in_slice_avoiding_fixed_authorities(
     Err(nt_address_space::STATUS_NO_MEMORY)
 }
 
-fn committed_mapping_effective_page_protection(info: nt_address_space::VmBasicInformation) -> u32 {
-    if info.type_ == nt_address_space::MEM_MAPPED {
-        nt_address_space::mapped_view_fault_plan(info.protect, false).map_protection
-    } else if info.type_ == nt_address_space::MEM_IMAGE {
-        nt_address_space::image_view_fault_plan(info.protect, false).map_protection
-    } else {
-        info.protect
-    }
-}
-
 impl RegistryKeyStats {
     pub(crate) fn from_leased_key(
         information: &nt_config_client::LeasedHiveKeyInformation,
@@ -19275,39 +19265,25 @@ impl ExecNtHandler {
         let pid = self
             .pm_pid_for_pi(target_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let first = self.query_memory_basic_information(target_pi, address)?;
-        if first.state != nt_address_space::MEM_COMMIT
-            || !nt_address_space::protection_permits(
-                first.protect,
-                match access {
-                    nt_address_space::SecuredVirtualMemoryAccess::ReadOnly => {
-                        nt_address_space::FaultAccess::Read
-                    }
-                    nt_address_space::SecuredVirtualMemoryAccess::ReadWrite => {
-                        nt_address_space::FaultAccess::Write
-                    }
-                },
-            )
-        {
-            return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
-        }
-        let allocation_base = first.allocation_base;
+        let fault_access = match access {
+            nt_address_space::SecuredVirtualMemoryAccess::ReadOnly => {
+                nt_address_space::FaultAccess::Read
+            }
+            nt_address_space::SecuredVirtualMemoryAccess::ReadWrite => {
+                nt_address_space::FaultAccess::Write
+            }
+        };
+        let mut information = self.query_memory_basic_information(target_pi, address)?;
+        let allocation_base = information.allocation_base;
         let mut cursor = address;
         while cursor < end {
-            let information = self.query_memory_basic_information(target_pi, cursor)?;
-            if information.state != nt_address_space::MEM_COMMIT
-                || information.allocation_base != allocation_base
-                || !nt_address_space::protection_permits(
-                    information.protect,
-                    match access {
-                        nt_address_space::SecuredVirtualMemoryAccess::ReadOnly => {
-                            nt_address_space::FaultAccess::Read
-                        }
-                        nt_address_space::SecuredVirtualMemoryAccess::ReadWrite => {
-                            nt_address_space::FaultAccess::Write
-                        }
-                    },
+            if information.allocation_base != allocation_base
+                || nt_address_space::vm_access_page_plan(
+                    cursor & !(nt_address_space::PAGE_SIZE - 1),
+                    information,
+                    fault_access,
                 )
+                .is_err()
             {
                 return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
             }
@@ -19317,6 +19293,9 @@ impl ExecNtHandler {
                 .filter(|region_end| *region_end > cursor)
                 .ok_or(nt_address_space::STATUS_ACCESS_VIOLATION)?;
             cursor = region_end.min(end);
+            if cursor < end {
+                information = self.query_memory_basic_information(target_pi, cursor)?;
+            }
         }
         self.secured_virtual_memory
             .secure(u64::from(pid), address, size, access)

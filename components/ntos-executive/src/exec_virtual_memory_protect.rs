@@ -14,19 +14,7 @@ impl ProtectionTarget {
         let record = csrss_frame_get_exact_record(self.pi as u64, page);
         let owned = record.is_some_and(|record| record.owns_frame);
         let effective = |protection| {
-            if owned {
-                nt_address_space::private_backing_protection(protection)
-            } else {
-                match self.mapping_type {
-                    nt_address_space::MEM_IMAGE => {
-                        nt_address_space::image_view_fault_plan(protection, false).map_protection
-                    }
-                    nt_address_space::MEM_MAPPED => {
-                        nt_address_space::mapped_view_fault_plan(protection, false).map_protection
-                    }
-                    _ => protection,
-                }
-            }
+            nt_address_space::resident_backing_protection(self.mapping_type, protection, owned)
         };
         if self.mapping_type == nt_address_space::MEM_IMAGE {
             vm_reprotect_resident_image_page(
@@ -158,6 +146,7 @@ impl ExecNtHandler {
                 Ok(plan) => plan,
                 Err(status) => return status,
             };
+            let new_protection = plan.new_protection;
             if !self.secured_virtual_memory.permits_protection(
                 u64::from(target_pid),
                 plan.base,

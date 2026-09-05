@@ -118,7 +118,7 @@ impl SecuredVirtualMemoryTable {
                     protection_allows_fault_access(protection, FaultAccess::Read)
                 }
                 SecuredVirtualMemoryAccess::ReadWrite => {
-                    protection_allows_fault_access(protection, FaultAccess::Write)
+                    mapped_protection_allows_fault_access(protection, FaultAccess::Write)
                 }
             }
         })
@@ -1201,6 +1201,29 @@ pub fn private_backing_protection(protection: u32) -> u32 {
     }
 }
 
+/// Image protection requests make writable shared pages copy-on-write. Initial PE mapping
+/// protection is deliberately separate: shared-writable image sections remain valid at map time.
+pub fn image_protection_request(protection: u32) -> u32 {
+    let modifiers = protection & !0xff;
+    match protection & 0xff {
+        PAGE_READWRITE => PAGE_WRITECOPY | modifiers,
+        PAGE_EXECUTE_READWRITE => PAGE_EXECUTE_WRITECOPY | modifiers,
+        _ => protection,
+    }
+}
+
+/// Project view protection onto existing backing without forgetting that a COW page is private.
+pub fn resident_backing_protection(mapping_type: u32, protection: u32, owns_frame: bool) -> u32 {
+    if owns_frame {
+        return private_backing_protection(protection);
+    }
+    match mapping_type {
+        MEM_IMAGE => image_view_fault_plan(protection, false).map_protection,
+        MEM_MAPPED => mapped_view_fault_plan(protection, false).map_protection,
+        _ => protection,
+    }
+}
+
 pub fn image_view_fault_plan(protection: u32, write_fault: bool) -> VmImageViewFaultPlan {
     let base = protection & 0xff;
     let modifiers = protection & !0xff;
@@ -1556,6 +1579,38 @@ impl<const N: usize> VmCommittedRangeTable<N> {
             return Err(STATUS_INVALID_PARAMETER_4);
         }
 
+        let new_protection = if first.type_ == MEM_IMAGE {
+            image_protection_request(new_protection)
+        } else {
+            new_protection
+        };
+        self.set_protection(base, end, first, new_protection)
+    }
+
+    /// Consume one guard without reinterpreting the existing protection as a new image request.
+    pub fn clear_guard(&mut self, address: u64) -> Result<VmCommittedProtectPlan, u32> {
+        let base = address & !(PAGE_SIZE - 1);
+        let end = base.checked_add(PAGE_SIZE).ok_or(STATUS_ACCESS_VIOLATION)?;
+        let first = self
+            .ranges
+            .iter()
+            .flatten()
+            .copied()
+            .find(|range| range.contains(base))
+            .ok_or(STATUS_NOT_COMMITTED)?;
+        if first.protect & PAGE_GUARD == 0 {
+            return Err(STATUS_ACCESS_VIOLATION);
+        }
+        self.set_protection(base, end, first, first.protect & !PAGE_GUARD)
+    }
+
+    fn set_protection(
+        &mut self,
+        base: u64,
+        end: u64,
+        first: VmCommittedRange,
+        new_protection: u32,
+    ) -> Result<VmCommittedProtectPlan, u32> {
         let mut cursor = base;
         while cursor < end {
             let range = self
@@ -2865,3 +2920,6 @@ impl AddressSpace {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod image_protection_tests;
