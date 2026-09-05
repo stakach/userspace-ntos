@@ -91,6 +91,11 @@ pub const EXCEPTION_EXIT_UNWIND: u32 = 0x0000_0004;
 pub const EXCEPTION_TARGET_UNWIND: u32 = 0x0000_0020;
 /// `EXCEPTION_COLLIDED_UNWIND`.
 pub const EXCEPTION_COLLIDED_UNWIND: u32 = 0x0000_0040;
+/// Any unwind phase, including exit, target, and collided unwind.
+pub const EXCEPTION_UNWIND: u32 = EXCEPTION_UNWINDING
+    | EXCEPTION_EXIT_UNWIND
+    | EXCEPTION_TARGET_UNWIND
+    | EXCEPTION_COLLIDED_UNWIND;
 
 /// `STATUS_NONCONTINUABLE_EXCEPTION`.
 pub const STATUS_NONCONTINUABLE_EXCEPTION: u32 = 0xC000_0025;
@@ -1083,6 +1088,91 @@ pub enum CHandlerAction {
     ContinueExecution,
 }
 
+impl CHandlerAction {
+    /// C filters use the sign of their result, not an EXCEPTION_DISPOSITION value.
+    pub fn from_filter_result(verdict: i32, target_rva: u32, scope_index: usize) -> Self {
+        match verdict.cmp(&0) {
+            core::cmp::Ordering::Less => Self::ContinueExecution,
+            core::cmp::Ordering::Equal => Self::ContinueSearch,
+            core::cmp::Ordering::Greater => Self::ExecuteHandler {
+                target_rva,
+                scope_index,
+            },
+        }
+    }
+}
+
+/// The next operation of a resumable C language-handler walk. The caller publishes the updated
+/// scope index before invoking any filter/finally or transferring control.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CScopeAction {
+    ContinueSearch,
+    Filter {
+        handler_rva: u32,
+        target_rva: u32,
+        scope_index: u32,
+    },
+    Finally {
+        handler_rva: u32,
+    },
+    ExecuteHandler {
+        target_rva: u32,
+        scope_index: u32,
+    },
+}
+
+/// Select one C scope operation without allocating or invoking foreign code. `scope_index` is
+/// advanced before a selected operation is returned, so a collided unwind can resume from it.
+/// Image-relative PCs remain 64-bit so an address outside the image cannot alias a 32-bit scope.
+/// The adapter must validate the table extent before supplying its record reader.
+pub fn next_c_scope(
+    pc_rva: u64,
+    target_rva: u64,
+    flags: u32,
+    scope_count: u32,
+    scope_index: &mut u32,
+    mut read_scope: impl FnMut(u32) -> ScopeRecord,
+) -> CScopeAction {
+    while *scope_index < scope_count {
+        let index = *scope_index;
+        *scope_index += 1;
+        let scope = read_scope(index);
+        if pc_rva < u64::from(scope.begin) || pc_rva >= u64::from(scope.end) {
+            continue;
+        }
+        if flags & EXCEPTION_UNWIND != 0 {
+            if flags & EXCEPTION_TARGET_UNWIND != 0
+                && target_rva >= u64::from(scope.begin)
+                && target_rva < u64::from(scope.end)
+            {
+                return CScopeAction::ContinueSearch;
+            }
+            if scope.target == 0 {
+                return CScopeAction::Finally {
+                    handler_rva: scope.handler,
+                };
+            }
+            if target_rva == u64::from(scope.target) {
+                return CScopeAction::ContinueSearch;
+            }
+        } else if scope.target != 0 {
+            return if scope.handler == SCOPE_HANDLER_EXECUTE {
+                CScopeAction::ExecuteHandler {
+                    target_rva: scope.target,
+                    scope_index: index,
+                }
+            } else {
+                CScopeAction::Filter {
+                    handler_rva: scope.handler,
+                    target_rva: scope.target,
+                    scope_index: index,
+                }
+            };
+        }
+    }
+    CScopeAction::ContinueSearch
+}
+
 /// `__C_specific_handler`'s scope-table walk — the *search-pass* decision. For each scope record
 /// whose `[begin,end)` covers `pc_rva`, decide via the filter: a `HandlerAddress == 1` sentinel is
 /// EXECUTE unconditionally; a `target == 0` record is a `__finally` (skipped in the search pass);
@@ -1097,31 +1187,39 @@ pub fn c_specific_handler_search(
     scopes: &[ScopeRecord],
     mut run_filter: impl FnMut(u32) -> i32,
 ) -> CHandlerAction {
-    for (i, s) in scopes.iter().enumerate() {
-        if pc_rva < s.begin || pc_rva >= s.end {
-            continue;
-        }
-        if s.target == 0 {
-            // A __finally record — no filter; it runs during the UNWIND pass, not the search.
-            continue;
-        }
-        let verdict = if s.handler == SCOPE_HANDLER_EXECUTE {
-            EXCEPTION_EXECUTE_HANDLER
-        } else {
-            run_filter(s.handler)
-        };
-        match verdict {
-            EXCEPTION_EXECUTE_HANDLER => {
-                return CHandlerAction::ExecuteHandler {
-                    target_rva: s.target,
-                    scope_index: i,
+    let count = u32::try_from(scopes.len()).expect("NT scope count fits ULONG");
+    let mut index = 0;
+    loop {
+        match next_c_scope(u64::from(pc_rva), 0, 0, count, &mut index, |i| {
+            scopes[i as usize]
+        }) {
+            CScopeAction::Filter {
+                handler_rva,
+                target_rva,
+                scope_index,
+            } => {
+                let result = CHandlerAction::from_filter_result(
+                    run_filter(handler_rva),
+                    target_rva,
+                    scope_index as usize,
+                );
+                if result != CHandlerAction::ContinueSearch {
+                    return result;
                 }
             }
-            EXCEPTION_CONTINUE_EXECUTION => return CHandlerAction::ContinueExecution,
-            _ => continue, // EXCEPTION_CONTINUE_SEARCH → try the next scope
+            CScopeAction::ExecuteHandler {
+                target_rva,
+                scope_index,
+            } => {
+                return CHandlerAction::ExecuteHandler {
+                    target_rva,
+                    scope_index: scope_index as usize,
+                };
+            }
+            CScopeAction::ContinueSearch => return CHandlerAction::ContinueSearch,
+            CScopeAction::Finally { .. } => unreachable!("search does not select finalizers"),
         }
     }
-    CHandlerAction::ContinueSearch
 }
 
 /// `__C_specific_handler`'s *unwind-pass* work: the `__finally` blocks (and any target-terminated
@@ -1130,10 +1228,17 @@ pub fn c_specific_handler_search(
 /// runs if its `[begin,end)` covers the fault PC and it is being unwound out of.
 pub fn c_specific_handler_unwind(pc_rva: u32, scopes: &[ScopeRecord]) -> Vec<u32> {
     let mut finallies = Vec::new();
-    for s in scopes {
-        if pc_rva >= s.begin && pc_rva < s.end && s.target == 0 {
-            finallies.push(s.handler); // the __finally routine RVA
-        }
+    let count = u32::try_from(scopes.len()).expect("NT scope count fits ULONG");
+    let mut index = 0;
+    while let CScopeAction::Finally { handler_rva } = next_c_scope(
+        u64::from(pc_rva),
+        0,
+        EXCEPTION_UNWINDING,
+        count,
+        &mut index,
+        |i| scopes[i as usize],
+    ) {
+        finallies.push(handler_rva);
     }
     finallies
 }
@@ -1230,6 +1335,7 @@ mod tests {
     use std::vec;
 
     mod chain;
+    mod scope;
 
     // ---- A concrete host ImageReader over a byte blob at a fixed base + a .pdata table ----------
 

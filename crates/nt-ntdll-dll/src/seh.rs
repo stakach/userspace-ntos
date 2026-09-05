@@ -902,21 +902,29 @@ pub unsafe fn c_specific_handler(
     if dispatcher_context.is_null() {
         return ex::Disposition::ContinueSearch.as_raw();
     }
-    // SAFETY: the dispatcher passed a valid DISPATCHER_CONTEXT.
-    let disp = unsafe { &mut *(dispatcher_context as *mut DispatcherContext) };
-    let image_base = disp.image_base;
-    let control_pc = disp.control_pc;
-    let scope_table = disp.handler_data as *const u8; // SCOPE_TABLE VA
+    // Read only required fields: foreign records may leave padding/unused fields uninitialized.
+    // Do not hold an exclusive reference across filters or finalizers.
+    let disp_ptr = dispatcher_context as *mut DispatcherContext;
+    // SAFETY: the dispatcher passed a valid DISPATCHER_CONTEXT with these input fields initialized.
+    let (image_base, control_pc, target_ip, scope_table) = unsafe {
+        (
+            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).image_base)),
+            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).control_pc)),
+            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).target_ip)),
+            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).handler_data)) as *const u8,
+        )
+    };
     if scope_table.is_null() {
         return ex::Disposition::ContinueSearch.as_raw();
     }
     // SCOPE_TABLE: Count @0, then Count × { Begin, End, Handler, Target } (4 u32s each).
     // SAFETY: scope_table is a mapped read-only .xdata region.
-    let count = unsafe { core::ptr::read_unaligned(scope_table as *const u32) } as usize;
+    let count = unsafe { core::ptr::read_unaligned(scope_table as *const u32) };
     if count == 0 || count > 4096 {
         return ex::Disposition::ContinueSearch.as_raw();
     }
-    let pc_rva = (control_pc.wrapping_sub(image_base)) as u32;
+    let pc_rva = control_pc.wrapping_sub(image_base);
+    let target_rva = target_ip.wrapping_sub(image_base);
 
     // Read the exception flags (record+4) to distinguish the search pass from the unwind pass.
     let flags = if exception_record.is_null() {
@@ -925,13 +933,11 @@ pub unsafe fn c_specific_handler(
         // SAFETY: record+4 = ExceptionFlags.
         unsafe { core::ptr::read_unaligned((exception_record as *const u8).add(4) as *const u32) }
     };
-    let unwinding = flags & ex::EXCEPTION_UNWINDING != 0;
-
     // Read a scope record.
     // SAFETY: bounded by `count`, within the mapped SCOPE_TABLE.
-    let read_scope = |i: usize| -> ScopeRecord {
+    let read_scope = |i: u32| -> ScopeRecord {
         unsafe {
-            let p = scope_table.add(4 + i * 16);
+            let p = scope_table.add(4 + i as usize * 16);
             ScopeRecord {
                 begin: core::ptr::read_unaligned(p as *const u32),
                 end: core::ptr::read_unaligned(p.add(4) as *const u32),
@@ -941,69 +947,60 @@ pub unsafe fn c_specific_handler(
         }
     };
 
-    if unwinding {
-        // UNWIND pass: run each covered __finally (target == 0).
-        for i in 0..count {
-            let s = read_scope(i);
-            if pc_rva >= s.begin && pc_rva < s.end {
-                // If unwinding to a target within this scope's __except, stop.
-                if s.target != 0
-                    && (flags & ex::EXCEPTION_TARGET_UNWIND != 0)
-                    && disp.target_ip == image_base + s.target as u64
-                {
-                    return ex::Disposition::ContinueSearch.as_raw();
+    loop {
+        // Publish the cursor before any filter/finally can initiate a collided unwind. Reload it
+        // after callbacks rather than overwriting a cursor the dispatcher may have advanced.
+        // SAFETY: the supplied dispatcher record remains live throughout this invocation.
+        let mut index = unsafe {
+            core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).scope_index))
+        };
+        let selected = ex::next_c_scope(pc_rva, target_rva, flags, count, &mut index, read_scope);
+        // SAFETY: the cursor is a writable ULONG in the caller's dispatcher record.
+        unsafe {
+            core::ptr::write_unaligned(core::ptr::addr_of_mut!((*disp_ptr).scope_index), index)
+        };
+        let action = match selected {
+            ex::CScopeAction::ContinueSearch => return ex::Disposition::ContinueSearch.as_raw(),
+            ex::CScopeAction::Finally { handler_rva } => {
+                let fin = image_base + u64::from(handler_rva);
+                // SAFETY: the selected loaded-image routine uses the native __finally ABI.
+                unsafe {
+                    let f: unsafe extern "C" fn(u8, u64) = core::mem::transmute(fin);
+                    f(1, establisher_frame);
                 }
-                if s.target == 0 {
-                    // A __finally: call it with (AbnormalTermination=TRUE, EstablisherFrame).
-                    let fin = image_base + s.handler as u64;
-                    // SAFETY: `fin` is a __finally routine in a loaded image; SEH __finally ABI is
-                    // fn(BOOLEAN AbnormalTermination, PVOID EstablisherFrame).
-                    unsafe {
-                        let f: unsafe extern "C" fn(u8, u64) = core::mem::transmute(fin);
-                        f(1, establisher_frame);
-                    }
+                continue;
+            }
+            ex::CScopeAction::ExecuteHandler { target_rva, scope_index } => {
+                ex::CHandlerAction::ExecuteHandler {
+                    target_rva,
+                    scope_index: scope_index as usize,
                 }
             }
-        }
-        return ex::Disposition::ContinueSearch.as_raw();
-    }
-
-    // SEARCH pass: find the first __except whose filter says EXECUTE.
-    for i in 0..count {
-        let s = read_scope(i);
-        if pc_rva < s.begin || pc_rva >= s.end {
-            continue;
-        }
-        if s.target == 0 {
-            continue; // a __finally — no filter in the search pass
-        }
-        let verdict = if s.handler == ex::SCOPE_HANDLER_EXECUTE {
-            ex::EXCEPTION_EXECUTE_HANDLER
-        } else {
-            // Call the filter: int filter(EXCEPTION_POINTERS*, EstablisherFrame). We build a small
-            // EXCEPTION_POINTERS { ExceptionRecord, ContextRecord } on the stack.
-            let filt = image_base + s.handler as u64;
-            #[repr(C)]
-            struct ExceptionPointers {
-                record: *mut c_void,
-                context: *mut u8,
-            }
-            let ptrs = ExceptionPointers {
-                record: exception_record,
-                context: _context_record,
-            };
-            // SAFETY: `filt` is a filter routine in a loaded image; the SEH filter ABI.
-            unsafe {
-                let f: unsafe extern "C" fn(*const c_void, u64) -> i32 = core::mem::transmute(filt);
-                f(&ptrs as *const _ as *const c_void, establisher_frame)
+            ex::CScopeAction::Filter { handler_rva, target_rva, scope_index } => {
+                #[repr(C)]
+                struct ExceptionPointers {
+                    record: *mut c_void,
+                    context: *mut u8,
+                }
+                let ptrs = ExceptionPointers {
+                    record: exception_record,
+                    context: _context_record,
+                };
+                let filt = image_base + u64::from(handler_rva);
+                // SAFETY: the selected loaded-image filter uses the native EXCEPTION_POINTERS ABI.
+                let verdict = unsafe {
+                    let f: unsafe extern "C" fn(*const c_void, u64) -> i32 = core::mem::transmute(filt);
+                    f(&ptrs as *const _ as *const c_void, establisher_frame)
+                };
+                ex::CHandlerAction::from_filter_result(verdict, target_rva, scope_index as usize)
             }
         };
-        if verdict == ex::EXCEPTION_CONTINUE_EXECUTION {
+        if action == ex::CHandlerAction::ContinueExecution {
             return ex::Disposition::ContinueExecution.as_raw();
         }
-        if verdict == ex::EXCEPTION_EXECUTE_HANDLER {
+        if let ex::CHandlerAction::ExecuteHandler { target_rva, .. } = action {
             // Unwind to the __except body — does not return.
-            let target_ip = image_base + s.target as u64;
+            let target_ip = image_base + u64::from(target_rva);
             // SAFETY: RtlUnwindEx transfers control; the ExceptionCode goes to RAX as the return.
             let code = if exception_record.is_null() {
                 0
@@ -1016,8 +1013,8 @@ pub unsafe fn c_specific_handler(
                     target_ip,
                     exception_record,
                     code,
-                    disp.context_record,
-                    disp.history_table,
+                    core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).context_record)),
+                    core::ptr::read_unaligned(core::ptr::addr_of!((*disp_ptr).history_table)),
                 );
             }
             // Not reached.
@@ -1025,7 +1022,6 @@ pub unsafe fn c_specific_handler(
         }
         // CONTINUE_SEARCH → next scope.
     }
-    ex::Disposition::ContinueSearch.as_raw()
 }
 
 // =================================================================================================

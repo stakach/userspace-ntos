@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-03
+Last updated: 2026-09-06
 
 ## Objective
 
@@ -38,7 +38,22 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Current serialized frontier (2026-08-16): the real desktop/icon path is past shell launch and paint
+Latest checkpoint (2026-09-06): B3 provider exception work is active. The complete win32k import
+gate still has 33 unresolved code imports and blocks desktop acceptance. The older desktop proofs
+below are historical baselines, not acceptance of the current provider cutover.
+
+- [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
+- [x] Extract and harden the shared AMD64 unwind interpreter (tranche 20).
+- [x] Correct chained handlers, machine frames, and fixed-frame register restores (tranche 21).
+- [x] Share resumable C scope selection with ntdll's live handler adapter (tranche 22).
+- [ ] Validate live image/stack/scope-table readers, including dynamic unwind tables, and close the
+  remaining epilogue decoding/arithmetic gaps.
+- [ ] Replace the live target/collided/exit unwind loop with checked current/caller context state and
+  a genuine handler-invocation boundary. Exercise cursor publication through real foreign callbacks.
+- [ ] Wire provider context capture/restore and exception delivery, then bind the raising/unwind
+  imports. Re-run desktop acceptance only after the complete import gate is satisfied.
+
+Earlier accepted desktop frontier (2026-08-16): the real desktop/icon path is past shell launch and paint
 scaffolding again on the Rust ntdll, with Dbgk debugger-control proofing now covering live context
 edits, trap-flag single-step, and seL4-backed hardware breakpoints. The executive no longer contains
 live `[w32-slip]` or `[cb-inject]` post-quiesce callback probes; any run that still emits those tags
@@ -24934,6 +24949,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     resumable, including target-inside-scope suppression and signed filter results. Bounded live
     readers and epilogue decoding/arithmetic remain prerequisites as well; the shared interpreter
     extraction is not proof that the full dispatcher is ready.
+
+    B3 resumable C language-handler tranche 22 (2026-09-06, host and ntdll PE green):
+    shared `next_c_scope` now selects filters, finalizers, and unconditional except targets without
+    allocating or calling foreign code. It advances the native ULONG scope cursor before yielding
+    an operation, honors target-inside-scope and matched except-target termination, recognizes all
+    unwind-phase flags, and preserves 64-bit image-relative PCs. C filter results are classified by
+    sign, including integer extremes, rather than requiring exact -1/+1 values.
+
+    ntdll's `__C_specific_handler` adapter uses this same policy and removes its two independent
+    scope loops. It publishes `DispatcherContext.ScopeIndex` before callbacks and reloads it after
+    callbacks, so a resumed cursor does not repeat completed finalizers. Only required foreign
+    dispatcher fields are read; no whole-record copy consumes uninitialized fields and no exclusive
+    Rust reference spans a foreign handler call. Context/history pointers are reloaded at transfer.
+    The existing pure convenience APIs delegate their scope decisions to the same cursor core.
+
+    All 75 shared-unwind tests (eight new cursor/filter regressions) and all 656 ntdll tests pass.
+    The serialized ntdll DLL build and PE/native ABI/staged-consumer import verification pass. No
+    provider exports were enabled and the unresolved win32k count remains 33.
+
+    Review adjustment: scope-cursor policy and adapter wiring are complete, not end-to-end collided
+    unwind. The live reader still needs actual scope-table extent/access validation instead of the
+    existing count-only bound; the raw stack reader and dynamic function-table metadata need their
+    own checked accessibility contracts. Follow with epilogue correctness and current/caller unwind
+    state, then the registered handler-invocation/restore boundary. A future live acceptance test
+    must observe ScopeIndex from an actual foreign callback, mutate/resume it, and prove no repeated
+    finalizer. The import gate and one-hour external boot deadline remain unchanged.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
