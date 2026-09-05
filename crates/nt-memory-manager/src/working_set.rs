@@ -330,6 +330,13 @@ pub struct PagefilePublishPlan {
     page: PagefilePage,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagefileProtectionPlan {
+    generation: u64,
+    next_generation: u64,
+    page: PagefilePage,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PagefileStoreStats {
     pub pages: usize,
@@ -411,6 +418,47 @@ impl PagefileStore {
     pub fn page(&self, owner: WorkingSetOwnerId, page: u64) -> Option<PagefilePage> {
         let index = self.index_for(owner, page)?;
         Some(self.records[index])
+    }
+
+    /// Reserve the fallible generation change before altering resident or VAD protection.
+    pub fn prepare_protection(
+        &self,
+        owner: WorkingSetOwnerId,
+        page: u64,
+        protection: u32,
+    ) -> Result<Option<PagefileProtectionPlan>, u32> {
+        if page & (WORKING_SET_PAGE_SIZE - 1) != 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let Some(mut record) = self.page(owner, page) else {
+            return Ok(None);
+        };
+        if record.protection == protection {
+            return Ok(None);
+        }
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        record.protection = protection;
+        Ok(Some(PagefileProtectionPlan {
+            generation: self.generation,
+            next_generation,
+            page: record,
+        }))
+    }
+
+    pub fn commit_protection(&mut self, plan: PagefileProtectionPlan) -> Result<(), u32> {
+        if self.generation != plan.generation {
+            self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let index = self
+            .index_for(plan.page.owner, plan.page.page)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        self.records[index] = plan.page;
+        self.generation = plan.next_generation;
+        Ok(())
     }
 
     pub fn take(
@@ -632,6 +680,111 @@ mod tests {
         store.commit_publish(new).unwrap();
         assert_eq!(store.commit_publish(old), Err(STATUS_INVALID_PARAMETER));
         assert!(store.page(7, 0x20_000).is_none());
+    }
+
+    #[test]
+    fn pagefile_protection_change_is_prepared_without_mutating_backing() {
+        let mut store = PagefileStore::new();
+        let original = PagefilePage {
+            owner: 7,
+            page: 0x1000,
+            protection: 0x104,
+            backing: 0xabcd,
+        };
+        let publish = store.prepare_publish(original).unwrap();
+        store.commit_publish(publish).unwrap();
+        let change = store.prepare_protection(7, 0x1000, 0x04).unwrap().unwrap();
+        assert_eq!(store.page(7, 0x1000), Some(original));
+        store.commit_protection(change).unwrap();
+        let updated = store.take(7, 0x1000).unwrap().unwrap();
+        assert_eq!(
+            updated,
+            PagefilePage {
+                protection: 0x04,
+                ..original
+            }
+        );
+        store.restore(updated).unwrap();
+        assert_eq!(store.page(7, 0x1000), Some(updated));
+        assert_eq!(store.stats().publications, 1);
+    }
+
+    #[test]
+    fn stale_protection_plan_cannot_change_replaced_transition_backing() {
+        let mut store = PagefileStore::new();
+        let original = PagefilePage {
+            owner: 7,
+            page: 0x1000,
+            protection: 0x104,
+            backing: 1,
+        };
+        let publish = store.prepare_publish(original).unwrap();
+        store.commit_publish(publish).unwrap();
+        let change = store.prepare_protection(7, 0x1000, 0x04).unwrap().unwrap();
+        store.take(7, 0x1000).unwrap();
+        let replacement = PagefilePage {
+            backing: 2,
+            ..original
+        };
+        store.restore(replacement).unwrap();
+        assert_eq!(
+            store.commit_protection(change),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(store.page(7, 0x1000), Some(replacement));
+    }
+
+    #[test]
+    fn protection_updates_isolate_owners_and_invalidate_older_publication_plans() {
+        let mut store = PagefileStore::new();
+        for owner in [7, 8] {
+            let publish = store
+                .prepare_publish(PagefilePage {
+                    owner,
+                    page: 0x1000,
+                    protection: 0x104,
+                    backing: owner,
+                })
+                .unwrap();
+            store.commit_publish(publish).unwrap();
+        }
+        let publish = store
+            .prepare_publish(PagefilePage {
+                owner: 7,
+                page: 0x2000,
+                protection: 0x04,
+                backing: 9,
+            })
+            .unwrap();
+        let change = store.prepare_protection(7, 0x1000, 0x04).unwrap().unwrap();
+        store.commit_protection(change).unwrap();
+        assert_eq!(store.page(8, 0x1000).unwrap().protection, 0x104);
+        assert_eq!(store.commit_publish(publish), Err(STATUS_INVALID_PARAMETER));
+        assert_eq!(store.prepare_protection(7, 0x2000, 0x04), Ok(None));
+        assert_eq!(store.prepare_protection(7, 0x1000, 0x04), Ok(None));
+        assert_eq!(
+            store.prepare_protection(7, 0x1001, 0x04),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn protection_generation_exhaustion_fails_before_any_mutation() {
+        let mut store = PagefileStore::new();
+        let original = PagefilePage {
+            owner: 7,
+            page: 0x1000,
+            protection: 0x104,
+            backing: 1,
+        };
+        let publish = store.prepare_publish(original).unwrap();
+        store.commit_publish(publish).unwrap();
+        store.generation = u64::MAX;
+        assert_eq!(
+            store.prepare_protection(7, 0x1000, 0x04),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(store.page(7, 0x1000), Some(original));
     }
 
     #[test]

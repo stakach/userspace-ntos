@@ -1,8 +1,75 @@
 //! Bounded, fault-aware virtual-memory copy ordering, independent of physical page ownership.
 
-use crate::{PAGE_SIZE, STATUS_ACCESS_VIOLATION, STATUS_SUCCESS};
+use crate::{
+    vm_access_page_plan, FaultAccess, VmBasicInformation, VmResidencyPagePlan, PAGE_GUARD,
+    PAGE_SIZE, STATUS_ACCESS_VIOLATION, STATUS_SUCCESS,
+};
 
 pub const STATUS_PARTIAL_COPY: u32 = 0x8000_000D;
+pub const STATUS_GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyPagePlan {
+    Resident(VmResidencyPagePlan),
+    ConsumeGuard(VmResidencyPagePlan),
+}
+
+/// Guard consumption is a protection transition, not residency admission. The caller must publish
+/// it before raising the guard exception, and must not consume another process's guard.
+pub fn copy_page_plan(
+    page: u64,
+    mut info: VmBasicInformation,
+    access: FaultAccess,
+    attached: bool,
+) -> Result<CopyPagePlan, u32> {
+    let guarded = info.protect & PAGE_GUARD != 0;
+    info.protect &= !PAGE_GUARD;
+    let plan = vm_access_page_plan(page, info, access)?;
+    if !guarded {
+        return Ok(CopyPagePlan::Resident(plan));
+    }
+    if attached {
+        return Err(STATUS_ACCESS_VIOLATION);
+    }
+    Ok(CopyPagePlan::ConsumeGuard(plan))
+}
+
+pub trait WriteProbeMemory {
+    fn read_byte(&mut self, address: u64) -> Result<u8, u32>;
+    fn write_byte(&mut self, address: u64, value: u8) -> Result<(), u32>;
+}
+
+/// The native SIZE_T output probe captures the complete value before its self-write. This differs
+/// from probing a range page by page when an unaligned count straddles a guard page.
+pub fn probe_write_u64(memory: &mut impl WriteProbeMemory, address: u64) -> Result<(), u32> {
+    address.checked_add(8).ok_or(STATUS_ACCESS_VIOLATION)?;
+    let mut value = [0; 8];
+    for (offset, byte) in value.iter_mut().enumerate() {
+        *byte = memory.read_byte(address + offset as u64)?;
+    }
+    for (offset, byte) in value.into_iter().enumerate() {
+        memory.write_byte(address + offset as u64, byte)?;
+    }
+    Ok(())
+}
+
+/// Native write probing reads before self-writing each touched page. A readable guard therefore
+/// faults before write permission is tested; a write-only metadata check has different semantics.
+pub fn probe_write_range(
+    memory: &mut impl WriteProbeMemory,
+    address: u64,
+    length: u64,
+) -> Result<(), u32> {
+    let end = address.checked_add(length).ok_or(STATUS_ACCESS_VIOLATION)?;
+    let mut current = address;
+    while current < end {
+        let value = memory.read_byte(current)?;
+        memory.write_byte(current, value)?;
+        let step = (PAGE_SIZE - current % PAGE_SIZE).min(end - current);
+        current += step;
+    }
+    Ok(())
+}
 
 /// Each transfer is contained in one source and one destination page. Implementations must
 /// validate access and make backing resident before touching bytes. An unsuccessful write must
@@ -64,6 +131,10 @@ pub fn copy_virtual_memory(
     }
     result
 }
+
+#[cfg(test)]
+#[path = "copy_guard_tests.rs"]
+mod guard_tests;
 
 #[cfg(test)]
 mod tests {

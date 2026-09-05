@@ -49,10 +49,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Decode and execute canonical return epilogues transactionally (tranche 23).
 - [x] Route native VM copies through access-checked private/mapped/image residency and preserve
   writable image backing across eviction (tranche 24, host tests and executive build).
+- [x] Implement ordinary native-copy guard consumption, remote-guard isolation, and ordered output
+  probes with transactional transition protection (tranche 25, host tests and executive build).
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
-  backing admission is implemented; local guard consumption and live cold-page/COW/trim acceptance
-  remain. Then validate live image/stack/scope-table readers and dynamic unwind metadata lifetimes.
+  backing admission and ordinary guards are implemented; current-thread stack-guard expansion,
+  CPU guard exception delivery, and live cold-page/COW/trim acceptance remain. Repair general
+  cold-page protection changes, then validate live SEH readers and dynamic metadata lifetimes.
 - [ ] Replace the live target/collided/exit unwind loop with checked current/caller context state and
   a genuine handler-invocation boundary. Exercise cursor publication through real foreign callbacks.
 - [ ] Wire provider context capture/restore and exception delivery, then bind the raising/unwind
@@ -25058,6 +25061,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lifetime outside this exact-copy path also require cleanup; do not duplicate those mechanisms.
     Loader/dynamic-table lifetime checks, tail-jump identity, and real exception-handler invocation
     remain open. The 33-import win32k barrier is unchanged; no QEMU/desktop acceptance is claimed.
+
+    B3 ordinary-copy guard tranche 25 (2026-09-06, host and executive build green):
+    `nt-address-space::copy::copy_page_plan` separates residency admission from consuming a local
+    guard. Underlying access permission is checked first; attached remote access fails without
+    changing the guard. Local ordinary guard access clears only the current protection's guard
+    attribute and returns `STATUS_GUARD_PAGE_VIOLATION`, without copying bytes or materializing the
+    guarded page. Source-copy faults retain the existing partial-copy translation; first destination
+    probe faults retain their exception status and zero transferred bytes.
+
+    The old write-only output admission loop is replaced by host-tested read/self-write probing.
+    A local READONLY|GUARD output probe therefore reports the guard violation before a retry finds
+    the write access violation. Range probes touch each page in order. The optional count probe
+    captures the entire eight-byte value before any self-write, including an unaligned value that
+    straddles pages. It still runs before handle validation and for zero-length copies; a failed
+    initial count probe does not publish a replacement count. These ordering rules follow
+    `references/nt5/base/ntos/mm/acceschk.c`, `mm/readwrt.c`, `ex/probe.c`, and `inc/ex.h`.
+
+    Executive guard publication snapshots the owning private VAD or committed mapping table,
+    prepares the one-page protection change, remaps only existing backing, and publishes metadata
+    after successful reprotection. Mapped/image reprotection retains the read-side dirty/COW
+    boundary. Paged-out frames use the new generation-checked `PagefileStore` protection transaction:
+    preparation is fallible before mutation; publication retains frame identity and uses current
+    metadata with the owned-frame COW protection policy, so restore cannot reinstall the consumed
+    guard or obsolete permissions from an earlier trim. No stack-growing CPU wrapper or raw PE
+    read is used to implement an ordinary guard exception.
+
+    Validation: 89 `nt-address-space` tests and 37 `nt-memory-manager` tests pass. Added coverage
+    includes local/remote source and destination guards, read-before-write precedence, complete
+    count capture, unchanged output on a later destination guard, partial source prefixes, all
+    backing types, NOACCESS/READONLY/WRITECOPY guard edges, and transition identity, generation
+    exhaustion, stale plans, and cross-owner isolation. The freestanding executive build passes
+    with the existing 256 warnings. Logs: `.tmp/test-vm-guard-20260906.log` and
+    `.tmp/build-vm-guard-20260906.log`.
+
+    Review adjustment: ordinary guard consumption is not complete stack-guard support. A guard in
+    the current thread's stack still needs native expansion/overflow handling and retry; another
+    thread's stack must remain an ordinary guard exception. The older CPU private-guard wrapper
+    still retries ordinary guards rather than delivering their exception, and mapped/image CPU
+    guard handling also needs that common exception boundary. Replace that wrapper when unifying
+    stack growth and guard delivery. General NtProtectVirtualMemory cold private pages currently
+    lack resident backing to reprotect, while cold committed mappings can leave stale transition
+    protection; extend the protection transaction to those paths rather than adding exceptions to
+    restore. Live MM selftests currently require the service loop after the win32k import barrier,
+    so no existing pre-barrier lane can validate this slice. Keep cold-page/COW/trim, stack growth,
+    and desktop acceptance open; do not bypass the remaining 33 imports or switch live SEH readers
+    before their full accessibility and lifetime contract is ready.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

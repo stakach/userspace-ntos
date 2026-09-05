@@ -42,10 +42,10 @@ pub use runtime_section::{
     SECTION_ATTR_SEC_RESERVE,
 };
 pub use working_set::{
-    PagefilePage, PagefilePublishPlan, PagefileStore, PagefileStoreStats, WorkingSetAdjustmentPlan,
-    WorkingSetLimits, WorkingSetOwnerId, WorkingSetPage, WorkingSetTable, WorkingSetTableStats,
-    DEFAULT_WORKING_SET_MAXIMUM_PAGES, DEFAULT_WORKING_SET_MINIMUM_PAGES, FLUID_WORKING_SET_PAGES,
-    STATUS_BAD_WORKING_SET_LIMIT, WORKING_SET_PAGE_SIZE,
+    PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileStore, PagefileStoreStats,
+    WorkingSetAdjustmentPlan, WorkingSetLimits, WorkingSetOwnerId, WorkingSetPage, WorkingSetTable,
+    WorkingSetTableStats, DEFAULT_WORKING_SET_MAXIMUM_PAGES, DEFAULT_WORKING_SET_MINIMUM_PAGES,
+    FLUID_WORKING_SET_PAGES, STATUS_BAD_WORKING_SET_LIMIT, WORKING_SET_PAGE_SIZE,
 };
 
 // NTSTATUS

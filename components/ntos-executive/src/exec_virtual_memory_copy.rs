@@ -1,13 +1,35 @@
 //! Native virtual-memory copies through the same backing owners as user page faults.
 
 use super::*;
-use nt_address_space::copy::{copy_virtual_memory, VirtualMemoryCopy};
+use nt_address_space::copy::{
+    copy_page_plan, copy_virtual_memory, probe_write_range, probe_write_u64, CopyPagePlan,
+    VirtualMemoryCopy, WriteProbeMemory, STATUS_GUARD_PAGE_VIOLATION,
+};
 use nt_address_space::{FaultAccess, PAGE_SIZE};
 
 struct ProcessMemoryCopy<'a> {
     handler: &'a mut ExecNtHandler,
     source_pi: usize,
     destination_pi: usize,
+}
+
+struct ProcessWriteProbe<'a> {
+    handler: &'a mut ExecNtHandler,
+    pi: usize,
+}
+
+impl WriteProbeMemory for ProcessWriteProbe<'_> {
+    fn read_byte(&mut self, address: u64) -> Result<u8, u32> {
+        let mut byte = [0];
+        unsafe {
+            self.handler.copy_read_page(self.pi, address, &mut byte)?;
+        }
+        Ok(byte[0])
+    }
+
+    fn write_byte(&mut self, address: u64, value: u8) -> Result<(), u32> {
+        unsafe { self.handler.copy_write_page(self.pi, address, &[value]) }
+    }
 }
 
 impl VirtualMemoryCopy for ProcessMemoryCopy<'_> {
@@ -39,14 +61,91 @@ impl ExecNtHandler {
     ) -> Result<(), u32> {
         let page = address & !(PAGE_SIZE - 1);
         let info = self.query_memory_basic_information(pi, page)?;
-        let plan = nt_address_space::vm_access_page_plan(page, info, access).map_err(|status| {
+        let plan = copy_page_plan(page, info, access, pi != self.pi).map_err(|status| {
             if status == nt_address_space::STATUS_NOT_COMMITTED {
                 STATUS_ACCESS_VIOLATION
             } else {
                 status
             }
         })?;
-        self.ensure_residency_page(pi, plan)
+        match plan {
+            CopyPagePlan::Resident(plan) => self.ensure_residency_page(pi, plan),
+            CopyPagePlan::ConsumeGuard(plan) => {
+                self.consume_copy_guard(pi, info, plan)?;
+                Err(STATUS_GUARD_PAGE_VIOLATION)
+            }
+        }
+    }
+
+    unsafe fn consume_copy_guard(
+        &mut self,
+        pi: usize,
+        old: nt_address_space::VmBasicInformation,
+        plan: nt_address_space::VmResidencyPagePlan,
+    ) -> Result<(), u32> {
+        let ctx = self.loop_ctx.ok_or(STATUS_INVALID_HANDLE)?;
+        let target = (&*ctx.procs)
+            .get(pi)
+            .copied()
+            .filter(|target| target.pml4 != 0 && target.scratch_base != 0)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let page = plan.page;
+        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
+        // Transition records own private frames, including already-promoted write-copy pages.
+        // Use current metadata rather than retaining protection from an earlier trim.
+        let transition_protection = match plan.source {
+            nt_address_space::VmResidencySource::Private => plan.protection,
+            nt_address_space::VmResidencySource::Mapped => {
+                nt_address_space::mapped_view_fault_plan(plan.protection, true).map_protection
+            }
+            nt_address_space::VmResidencySource::Image => {
+                nt_address_space::image_view_fault_plan(plan.protection, true).map_protection
+            }
+        };
+        let transition = pagefile.prepare_protection(pi as u64, page, transition_protection)?;
+
+        if process_committed_mapping_basic_information(pi as u64, page).is_some() {
+            let before = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_BEFORE);
+            let after = &mut *core::ptr::addr_of_mut!(COMMITTED_MAP_AFTER);
+            *before = process_committed_mapping_snapshot(pi as u64).ok_or(STATUS_INVALID_HANDLE)?;
+            *after = *before;
+            after.protect(page, PAGE_SIZE, plan.protection)?;
+            let mut new = old;
+            new.protect = plan.protection;
+            let old_rights = committed_mapping_effective_page_protection(old);
+            let new_rights = committed_mapping_effective_page_protection(new);
+            if old.type_ == nt_address_space::MEM_IMAGE {
+                vm_reprotect_resident_image_page(
+                    pi,
+                    page,
+                    old_rights,
+                    new_rights,
+                    target.pml4,
+                    target.scratch_base,
+                )?;
+            } else if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+                vm_reprotect_private_page(pi, page, old_rights, new_rights, target.pml4)?;
+            }
+            assert!(
+                process_committed_mapping_replace(pi as u64, *after),
+                "guard consumption retains its committed mapping owner"
+            );
+        } else {
+            let map = process_vm_region_map_mut(pi).ok_or(STATUS_INVALID_HANDLE)?;
+            let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+            *after = *map;
+            after.protect(page, PAGE_SIZE, plan.protection)?;
+            if csrss_frame_get_exact(pi as u64, page).0 != 0 {
+                vm_reprotect_private_page(pi, page, old.protect, plan.protection, target.pml4)?;
+            }
+            *map = *after;
+        }
+        if let Some(transition) = transition {
+            pagefile
+                .commit_protection(transition)
+                .expect("serialized guard consumption retains its prepared transition generation");
+        }
+        Ok(())
     }
 
     unsafe fn probe_copy_output(
@@ -55,16 +154,24 @@ impl ExecNtHandler {
         address: u64,
         length: u64,
     ) -> Result<(), u32> {
-        let end = address
+        address
             .checked_add(length)
             .filter(|end| *end <= USER_ADDRESS_LIMIT)
             .ok_or(STATUS_ACCESS_VIOLATION)?;
-        let mut current = address;
-        while current < end {
-            self.prepare_copy_page(pi, current, FaultAccess::Write)?;
-            current = ((current & !(PAGE_SIZE - 1)) + PAGE_SIZE).min(end);
-        }
-        Ok(())
+        probe_write_range(
+            &mut ProcessWriteProbe { handler: self, pi },
+            address,
+            length,
+        )
+    }
+
+    unsafe fn probe_copy_count(&mut self, address: u64) -> Result<(), u32> {
+        address
+            .checked_add(8)
+            .filter(|end| *end <= USER_ADDRESS_LIMIT)
+            .ok_or(STATUS_ACCESS_VIOLATION)?;
+        let pi = self.pi;
+        probe_write_u64(&mut ProcessWriteProbe { handler: self, pi }, address)
     }
 
     unsafe fn copy_read_page(
@@ -185,7 +292,7 @@ impl ExecNtHandler {
             return STATUS_ACCESS_VIOLATION;
         }
         if count_ptr != 0 {
-            if let Err(status) = self.probe_copy_output(self.pi, count_ptr, 8) {
+            if let Err(status) = self.probe_copy_count(count_ptr) {
                 return status;
             }
         }
