@@ -334,7 +334,10 @@ pub struct PagefilePublishPlan {
 pub struct PagefileProtectionPlan {
     generation: u64,
     next_generation: u64,
-    page: PagefilePage,
+    owner: WorkingSetOwnerId,
+    base: u64,
+    end: u64,
+    protection: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -427,24 +430,43 @@ impl PagefileStore {
         page: u64,
         protection: u32,
     ) -> Result<Option<PagefileProtectionPlan>, u32> {
-        if page & (WORKING_SET_PAGE_SIZE - 1) != 0 {
+        self.prepare_protection_range(owner, page, WORKING_SET_PAGE_SIZE, protection)
+    }
+
+    /// Prepare one uniform range change without allocating or changing backing residency.
+    pub fn prepare_protection_range(
+        &self,
+        owner: WorkingSetOwnerId,
+        base: u64,
+        size: u64,
+        protection: u32,
+    ) -> Result<Option<PagefileProtectionPlan>, u32> {
+        if base & (WORKING_SET_PAGE_SIZE - 1) != 0
+            || size == 0
+            || size & (WORKING_SET_PAGE_SIZE - 1) != 0
+        {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let Some(mut record) = self.page(owner, page) else {
-            return Ok(None);
-        };
-        if record.protection == protection {
+        let end = base.checked_add(size).ok_or(STATUS_INVALID_PARAMETER)?;
+        if !self.records.iter().any(|record| {
+            record.owner == owner
+                && record.page >= base
+                && record.page < end
+                && record.protection != protection
+        }) {
             return Ok(None);
         }
         let next_generation = self
             .generation
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        record.protection = protection;
         Ok(Some(PagefileProtectionPlan {
             generation: self.generation,
             next_generation,
-            page: record,
+            owner,
+            base,
+            end,
+            protection,
         }))
     }
 
@@ -453,10 +475,11 @@ impl PagefileStore {
             self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let index = self
-            .index_for(plan.page.owner, plan.page.page)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        self.records[index] = plan.page;
+        for record in &mut self.records {
+            if record.owner == plan.owner && record.page >= plan.base && record.page < plan.end {
+                record.protection = plan.protection;
+            }
+        }
         self.generation = plan.next_generation;
         Ok(())
     }
@@ -785,6 +808,124 @@ mod tests {
             Err(STATUS_INSUFFICIENT_RESOURCES)
         );
         assert_eq!(store.page(7, 0x1000), Some(original));
+    }
+
+    #[test]
+    fn protection_range_updates_one_owner_once_and_preserves_sparse_backing() {
+        let mut store = PagefileStore::new();
+        for (owner, page, protection, backing) in [
+            (7, 0x1000, 0x104, 1),
+            (7, 0x3000, 0x40, 2),
+            (7, 0x4000, 0x04, 3),
+            (8, 0x1000, 0x04, 4),
+        ] {
+            let publish = store
+                .prepare_publish(PagefilePage {
+                    owner,
+                    page,
+                    protection,
+                    backing,
+                })
+                .unwrap();
+            store.commit_publish(publish).unwrap();
+        }
+        let original = store.records.clone();
+        let generation = store.generation;
+        let plan = store
+            .prepare_protection_range(7, 0x1000, 0x3000, 0x02)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.records, original);
+        store.commit_protection(plan).unwrap();
+        assert_eq!(store.generation, generation + 1);
+        for record in original {
+            let expected = if record.owner == 7 && record.page < 0x4000 {
+                PagefilePage {
+                    protection: 0x02,
+                    ..record
+                }
+            } else {
+                record
+            };
+            assert_eq!(store.page(record.owner, record.page), Some(expected));
+        }
+        assert!(!store.contains(7, 0x2000));
+        assert_eq!(store.stats().pages, 4);
+        assert_eq!(store.stats().restores, 0);
+        assert_eq!(store.stats().takes, 0);
+    }
+
+    #[test]
+    fn rejected_or_stale_range_plan_changes_no_transition() {
+        let mut store = PagefileStore::new();
+        for page in [0x1000, 0x2000] {
+            let publish = store
+                .prepare_publish(PagefilePage {
+                    owner: 7,
+                    page,
+                    protection: 0x104,
+                    backing: page,
+                })
+                .unwrap();
+            store.commit_publish(publish).unwrap();
+        }
+        let before = store.records.clone();
+        let abandoned = store
+            .prepare_protection_range(7, 0x1000, 0x2000, 0x01)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.records, before);
+        let newer = store.prepare_protection(7, 0x1000, 0x04).unwrap().unwrap();
+        store.commit_protection(newer).unwrap();
+        let updated = store.records.clone();
+        assert_eq!(
+            store.commit_protection(abandoned),
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        assert_eq!(store.records, updated);
+    }
+
+    #[test]
+    fn protection_range_validation_and_noops_do_not_reserve_generations() {
+        let mut store = PagefileStore::new();
+        let publish = store
+            .prepare_publish(PagefilePage {
+                owner: 7,
+                page: 0x1000,
+                protection: 0x104,
+                backing: 1,
+            })
+            .unwrap();
+        store.commit_publish(publish).unwrap();
+        for (base, size) in [
+            (0x1001, 0x1000),
+            (0x1000, 0),
+            (0x1000, 1),
+            (u64::MAX & !0xfff, 0x1000),
+        ] {
+            assert_eq!(
+                store.prepare_protection_range(7, base, size, 0x04),
+                Err(STATUS_INVALID_PARAMETER)
+            );
+        }
+        store.generation = u64::MAX;
+        assert_eq!(
+            store.prepare_protection_range(7, 0x1000, 0x3000, 0x104),
+            Ok(None)
+        );
+        assert_eq!(
+            store.prepare_protection_range(8, 0x1000, 0x3000, 0x04),
+            Ok(None)
+        );
+        assert_eq!(
+            store.prepare_protection_range(7, 0x2000, 0x3000, 0x04),
+            Ok(None)
+        );
+        assert_eq!(
+            store.prepare_protection_range(7, 0x1000, 0x3000, 0x04),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(store.page(7, 0x1000).unwrap().protection, 0x104);
     }
 
     #[test]

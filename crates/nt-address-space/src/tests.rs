@@ -2061,6 +2061,33 @@ fn residency_page_plan_uses_each_backing_owners_read_fault_policy() {
 }
 
 #[test]
+fn private_backing_protection_preserves_owned_data_and_modifiers() {
+    for modifiers in [0, PAGE_GUARD, PAGE_NOCACHE, PAGE_GUARD | PAGE_WRITECOMBINE] {
+        assert_eq!(
+            private_backing_protection(PAGE_WRITECOPY | modifiers),
+            PAGE_READWRITE | modifiers
+        );
+        assert_eq!(
+            private_backing_protection(PAGE_EXECUTE_WRITECOPY | modifiers),
+            PAGE_EXECUTE_READWRITE | modifiers
+        );
+        for base in [
+            PAGE_NOACCESS,
+            PAGE_READONLY,
+            PAGE_READWRITE,
+            PAGE_EXECUTE,
+            PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE,
+        ] {
+            assert_eq!(
+                private_backing_protection(base | modifiers),
+                base | modifiers
+            );
+        }
+    }
+}
+
+#[test]
 fn writable_image_residency_keeps_private_backing_for_later_eviction() {
     for protect in [PAGE_READWRITE, PAGE_EXECUTE_READWRITE] {
         for write in [false, true] {

@@ -93,15 +93,7 @@ impl ExecNtHandler {
         let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
         // Transition records own private frames, including already-promoted write-copy pages.
         // Use current metadata rather than retaining protection from an earlier trim.
-        let transition_protection = match plan.source {
-            nt_address_space::VmResidencySource::Private => plan.protection,
-            nt_address_space::VmResidencySource::Mapped => {
-                nt_address_space::mapped_view_fault_plan(plan.protection, true).map_protection
-            }
-            nt_address_space::VmResidencySource::Image => {
-                nt_address_space::image_view_fault_plan(plan.protection, true).map_protection
-            }
-        };
+        let transition_protection = nt_address_space::private_backing_protection(plan.protection);
         let transition = pagefile.prepare_protection(pi as u64, page, transition_protection)?;
 
         if process_committed_mapping_basic_information(pi as u64, page).is_some() {

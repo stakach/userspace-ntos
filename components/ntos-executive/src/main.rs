@@ -13618,7 +13618,11 @@ unsafe fn vm_reprotect_private_page(
     if page_map_r(frame, page, vm_page_rights(new_protection), pml4) == 0 {
         Ok(())
     } else {
-        let _ = page_map_r(frame, page, vm_page_rights(old_protection), pml4);
+        assert_eq!(
+            page_map_r(frame, page, vm_page_rights(old_protection), pml4),
+            0,
+            "failed to restore private page protection"
+        );
         Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
@@ -13755,8 +13759,15 @@ unsafe fn vm_reprotect_shared_image_mapping(
         }
         Ok(())
     } else {
-        let _ = page_map_r(map_cap, page, old_rights, pml4);
-        let _ = shared_image_mapping_put(pi as u64, page, map_cap);
+        assert_eq!(
+            page_map_r(map_cap, page, old_rights, pml4),
+            0,
+            "failed to restore shared image protection"
+        );
+        assert!(
+            shared_image_mapping_put(pi as u64, page, map_cap),
+            "failed to restore shared image mapping identity"
+        );
         Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
@@ -13788,7 +13799,11 @@ unsafe fn vm_promote_image_cow_page(
         old_protection: u32,
         pml4: u64,
     ) {
-        let _ = page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4);
+        assert_eq!(
+            page_map_r(old_map_cap, page, vm_page_rights(old_protection), pml4),
+            0,
+            "failed to restore pre-COW image protection"
+        );
         match old_mapping {
             OldImageMapping::Exact {
                 alias,
@@ -13797,20 +13812,30 @@ unsafe fn vm_promote_image_cow_page(
                 owns_frame,
             } => {
                 if alias != 0 && alias_cap != 0 {
-                    let _ = page_map_r(alias_cap, alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+                    assert_eq!(
+                        page_map_r(alias_cap, alias, RW_NX, CAP_INIT_THREAD_VSPACE),
+                        0,
+                        "failed to restore pre-COW image alias"
+                    );
                 }
-                let _ = csrss_frame_put_at_cap_source_owned(
-                    pi as u64,
-                    page,
-                    old_map_cap,
-                    alias,
-                    alias_cap,
-                    source_cap,
-                    owns_frame,
+                assert!(
+                    csrss_frame_put_at_cap_source_owned(
+                        pi as u64,
+                        page,
+                        old_map_cap,
+                        alias,
+                        alias_cap,
+                        source_cap,
+                        owns_frame,
+                    ),
+                    "failed to restore pre-COW image identity"
                 );
             }
             OldImageMapping::Shared => {
-                let _ = shared_image_mapping_put(pi as u64, page, old_map_cap);
+                assert!(
+                    shared_image_mapping_put(pi as u64, page, old_map_cap),
+                    "failed to restore pre-COW shared image identity"
+                );
             }
         }
     }
@@ -13994,18 +14019,29 @@ unsafe fn vm_promote_mapped_cow_page(
         pml4: u64,
     ) {
         if let Some((old_frame, old_alias_cap, old_source_cap, old_owns_frame)) = old_mapping {
-            let _ = page_map_r(old_frame, page, vm_page_rights(old_protection), pml4);
+            assert_eq!(
+                page_map_r(old_frame, page, vm_page_rights(old_protection), pml4),
+                0,
+                "failed to restore pre-COW section protection"
+            );
             if retained_alias != 0 && old_alias_cap != 0 {
-                let _ = page_map_r(old_alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
+                assert_eq!(
+                    page_map_r(old_alias_cap, retained_alias, RW_NX, CAP_INIT_THREAD_VSPACE),
+                    0,
+                    "failed to restore pre-COW section alias"
+                );
             }
-            let _ = csrss_frame_put_at_cap_source_owned(
-                pi as u64,
-                page,
-                old_frame,
-                retained_alias,
-                old_alias_cap,
-                old_source_cap,
-                old_owns_frame,
+            assert!(
+                csrss_frame_put_at_cap_source_owned(
+                    pi as u64,
+                    page,
+                    old_frame,
+                    retained_alias,
+                    old_alias_cap,
+                    old_source_cap,
+                    old_owns_frame,
+                ),
+                "failed to restore pre-COW section identity"
             );
         }
     }

@@ -51,11 +51,13 @@ below are historical baselines, not acceptance of the current provider cutover.
   writable image backing across eviction (tranche 24, host tests and executive build).
 - [x] Implement ordinary native-copy guard consumption, remote-guard isolation, and ordered output
   probes with transactional transition protection (tranche 25, host tests and executive build).
+- [x] Apply protection changes to cold private and section-backed ranges without materialization,
+  with one atomic transition update and shared resident rollback (tranche 26, host/build validation).
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
   backing admission and ordinary guards are implemented; current-thread stack-guard expansion,
-  CPU guard exception delivery, and live cold-page/COW/trim acceptance remain. Repair general
-  cold-page protection changes, then validate live SEH readers and dynamic metadata lifetimes.
+  CPU guard exception delivery, and live cold-page/protection/COW/trim acceptance remain.
+  Then validate live SEH readers and dynamic metadata lifetimes.
 - [ ] Replace the live target/collided/exit unwind loop with checked current/caller context state and
   a genuine handler-invocation boundary. Exercise cursor publication through real foreign callbacks.
 - [ ] Wire provider context capture/restore and exception delivery, then bind the raising/unwind
@@ -25107,6 +25109,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     so no existing pre-barrier lane can validate this slice. Keep cold-page/COW/trim, stack growth,
     and desktop acceptance open; do not bypass the remaining 33 imports or switch live SEH readers
     before their full accessibility and lifetime contract is ready.
+
+    B3 cold-page protection tranche 26 (2026-09-06, host and executive build green):
+    `NtProtectVirtualMemory` now leaves committed cold private pages nonresident instead of trying
+    to reprotect a nonexistent frame. Cold section/image overrides and privately owned transition
+    pages follow the same range publication path. The existing single-allocation, whole-commitment,
+    secured-range, and commitment-charge checks remain before side effects; old protection still
+    comes from the first addressed page.
+
+    `PagefileProtectionPlan` is now an allocation-free owner/range/protection transaction rather
+    than a single-record replacement. Preparation validates the entire aligned range and reserves
+    one generation change; publication scans only existing matching transition records, preserving
+    their frame identity and residency. All pages update together, unchanged/sparse ranges need no
+    allocation or generation, and stale or exhausted generations cannot partially mutate a range.
+    The ordinary-guard path retains its one-page wrapper over this same mechanism.
+
+    The new `exec_virtual_memory_protect.rs` owns the native handler and resident adapter. It replaces
+    both old private/committed forward-and-rollback loops with the host-tested
+    `nt-address-space::protection::apply_protection_range`. Cold backing is skipped; a failed remap
+    restores the completed prefix from the stable old-protection snapshot before returning failure.
+    Only after resident changes succeed are mapping metadata and the prepared transition update
+    published. Failed restoration is an explicit invariant failure, not an ignored error followed by
+    continued execution with uncertain rights. Low-level private/shared image and COW restoration
+    paths now check restoration of mappings, aliases, and registry identity as well.
+
+    Shared `private_backing_protection` converts WRITECOPY to READWRITE and executable WRITECOPY to
+    executable READWRITE while retaining guard/cache modifiers for frames that already own private
+    data. Protection changes, trim publication, and ordinary-guard transitions use this one rule;
+    resident ownership is re-evaluated during rollback, so an image page promoted during a rejected
+    change retains its private bytes instead of reverting to original shared backing. This follows
+    NT5 `mm/protect.c` transition/private-COW semantics rather than ReactOS's incomplete section
+    protection path.
+
+    Validation: all 97 `nt-address-space` and 40 `nt-memory-manager` tests pass. New regressions
+    cover sparse/mixed residency, first-page and prefix failure, rollback failure reporting,
+    per-page old protections, unchanged and invalid ranges, multi-page transition updates, owner
+    isolation, backing preservation, stale/generation-exhausted plans, and private-COW modifiers.
+    The freestanding executive build passes with the existing 256 warnings. Logs:
+    `.tmp/test-vm-protect-20260906.log` and `.tmp/build-vm-protect-20260906.log`.
+
+    Review adjustment: cold-page protection implementation is closed, but live mixed-residency
+    protection, trim/protect/restore COW isolation, and backend remap-failure injection remain open.
+    Host tests prove the orchestration contract, not the physical remap adapters. A separate image
+    protection gap was confirmed: NT5 normalizes requested shared image READWRITE/EXECUTE_READWRITE
+    to WRITECOPY/EXECUTE_WRITECOPY before private-page conversion and commitment accounting. Audit
+    and implement that policy through image/VAD metadata with tests; do not infer a complete section
+    protection implementation from this cold-page fix. Continue current-thread stack-guard
+    expansion/overflow and ordinary CPU guard exception delivery, followed by live SEH-reader
+    accessibility and lifetime checks. The 33-import barrier and live desktop acceptance remain
+    unchanged; no boot gate is bypassed.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

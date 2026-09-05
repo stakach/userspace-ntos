@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod copy;
+pub mod protection;
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -1187,6 +1188,17 @@ pub fn private_guard_page_fault_plan(protection: u32, access: FaultAccess) -> Op
     }
     let unguarded = protection & !PAGE_GUARD;
     protection_allows_fault_access(unguarded, access).then_some(unguarded)
+}
+
+/// Owned frames have already crossed the copy-on-write boundary. Preserve their private data
+/// while changing protection; a write-copy request must not turn them back into shared backing.
+pub fn private_backing_protection(protection: u32) -> u32 {
+    let modifiers = protection & !0xff;
+    match protection & 0xff {
+        PAGE_WRITECOPY => PAGE_READWRITE | modifiers,
+        PAGE_EXECUTE_WRITECOPY => PAGE_EXECUTE_READWRITE | modifiers,
+        _ => protection,
+    }
 }
 
 pub fn image_view_fault_plan(protection: u32, write_fault: bool) -> VmImageViewFaultPlan {
