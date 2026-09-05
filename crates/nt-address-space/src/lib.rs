@@ -121,6 +121,43 @@ impl SecuredVirtualMemoryTable {
         })
     }
 
+    /// Recommit can change protection just like `NtProtectVirtualMemory`. `MEM_RESET` only
+    /// discards contents and leaves access intact; its ignored protection must not reject a lease.
+    pub fn permits_allocation(
+        &self,
+        owner: u64,
+        plan: VmAllocatePlan,
+        allocation_type: u32,
+        protection: u32,
+    ) -> bool {
+        allocation_type == MEM_RESET
+            || self.permits_protection(owner, plan.base, plan.size, protection)
+    }
+
+    /// NT checks the whole VAD for a release, including a partial release which splits or rebases
+    /// it. Decommit preserves the allocation identity and checks only the affected pages.
+    pub fn permits_free<const N: usize>(
+        &self,
+        owner: u64,
+        before: &VmRegionMap<N>,
+        plan: VmFreePlan,
+    ) -> bool {
+        let (base, size) = match plan.free_type {
+            MEM_RELEASE => {
+                let Some(extent) = before.extent_at(plan.base) else {
+                    return false;
+                };
+                let Some(end) = before.allocation_end(extent.allocation_base) else {
+                    return false;
+                };
+                (extent.allocation_base, end - extent.allocation_base)
+            }
+            MEM_DECOMMIT => (plan.base, plan.size),
+            _ => return false,
+        };
+        !self.conflicts_with_delete(owner, base, size)
+    }
+
     pub fn retire_owner(&mut self, owner: u64) -> usize {
         let before = self.ranges.len();
         self.ranges.retain(|range| range.owner != owner);
@@ -137,6 +174,9 @@ impl SecuredVirtualMemoryTable {
 }
 
 fn ranges_overlap(left_base: u64, left_size: u64, right_base: u64, right_size: u64) -> bool {
+    if left_size == 0 || right_size == 0 {
+        return false;
+    }
     let Some(left_end) = left_base.checked_add(left_size) else {
         return true;
     };

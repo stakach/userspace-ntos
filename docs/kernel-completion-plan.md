@@ -24853,6 +24853,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unwind boundary) as real kernel-to-provider structured exception delivery; do not turn failed
     probes into ordinary return values or component-local traps.
 
+    B3 secured-memory lifetime correction tranche 19 (2026-09-06, host and freestanding green):
+    review found that tranche 18 made native protect/free/unmap require an EPROCESS projection
+    which is only published after win32k dispatch. MM leases now use the Process Manager's
+    canonical, non-reused ClientId from process creation onward. This supersedes tranche 18's
+    EPROCESS lease key and removes the provider-publication dependency from native VM operations.
+    Lease retirement runs at the exact process-deletion VM phase, including retries with no
+    remaining VSpace caps, before the Process object or hosted slot can be retired.
+
+    The same review closed the `NtAllocateVirtualMemory(MEM_COMMIT)` protection bypass: recommit
+    checks the normalized pages against every overlapping lease before MM charging or mapping.
+    `MEM_RESET` preserves access and ignores the supplied protection for lease admission. Release
+    checks the entire original allocation even for a partial release; decommit checks only its
+    normalized pages, matching NT5 `MiCheckSecuredVad` callers. Image unmap uses the registered PE
+    extent and no longer invents a one-page range when metadata is absent. Empty ranges do not
+    overlap; overflowing ranges still fail closed. All 70 `nt-address-space` tests pass, including
+    recommit/reset and release/decommit regression coverage, and the serialized freestanding build
+    succeeds at the unchanged 256-warning baseline.
+
+    Review adjustment: validate the native lifecycle as well as provider calls for every remaining
+    import. Thirty-three imports remain; desktop acceptance stays blocked by the complete import
+    gate. Continue with shared x64 exception machinery, preserving the provider's active stack and
+    checking unwind metadata and stack bounds before enabling exception-raising imports.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

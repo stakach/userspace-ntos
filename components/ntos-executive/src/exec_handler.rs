@@ -18769,6 +18769,14 @@ impl ExecNtHandler {
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
         }
+        if !self.secured_virtual_memory.permits_allocation(
+            u64::from(target_pid),
+            plan,
+            allocation_type,
+            protection,
+        ) {
+            return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
+        }
 
         let commit_delta = after
             .private_committed_bytes()
@@ -19024,12 +19032,8 @@ impl ExecNtHandler {
                 Ok(plan) => plan,
                 Err(status) => return status,
             };
-            let secure_owner = match self.pm.process_kernel_object(target_pid) {
-                Some(owner) => owner,
-                None => return nt_process::STATUS_INVALID_HANDLE,
-            };
             if !self.secured_virtual_memory.permits_protection(
-                secure_owner,
+                u64::from(target_pid),
                 plan.base,
                 plan.size,
                 new_protection,
@@ -19156,12 +19160,8 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
-        let secure_owner = match self.pm.process_kernel_object(target_pid) {
-            Some(owner) => owner,
-            None => return nt_process::STATUS_INVALID_HANDLE,
-        };
         if !self.secured_virtual_memory.permits_protection(
-            secure_owner,
+            u64::from(target_pid),
             plan.base,
             plan.size,
             new_protection,
@@ -19553,10 +19553,6 @@ impl ExecNtHandler {
         let pid = self
             .pm_pid_for_pi(target_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let owner = self
-            .pm
-            .process_kernel_object(pid)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let first = self.query_memory_basic_information(target_pi, address)?;
         if first.state != nt_address_space::MEM_COMMIT
             || !nt_address_space::protection_permits(
@@ -19601,7 +19597,7 @@ impl ExecNtHandler {
             cursor = region_end.min(end);
         }
         self.secured_virtual_memory
-            .secure(owner, address, size, access)
+            .secure(u64::from(pid), address, size, access)
     }
 
     pub(crate) fn service_win32k_unsecure_virtual_memory(
@@ -19612,12 +19608,8 @@ impl ExecNtHandler {
         let pid = self
             .pm_pid_for_pi(target_pi)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let owner = self
-            .pm
-            .process_kernel_object(pid)
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         self.secured_virtual_memory
-            .unsecure(owner, handle)
+            .unsecure(u64::from(pid), handle)
             .map(|_| ())
     }
 
@@ -20010,15 +20002,7 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
-        let secure_owner = match self.pm.process_kernel_object(target_pid) {
-            Some(owner) => owner,
-            None => return nt_process::STATUS_INVALID_HANDLE,
-        };
-        if self.secured_virtual_memory.conflicts_with_delete(
-            secure_owner,
-            plan.base,
-            plan.size,
-        ) {
+        if !self.secured_virtual_memory.permits_free(u64::from(target_pid), before, plan) {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
         }
         let released_commit = before
@@ -22565,6 +22549,9 @@ impl ExecNtHandler {
                         .expect("preflighted process deletion must enter VM reclaim exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::ReclaimingVm => {
+                    // ClientIds are never reused. Retire MM leases even when there are no VSpace
+                    // caps left to reclaim, before advancing to canonical Process deletion.
+                    self.secured_virtual_memory.retire_owner(u64::from(pid));
                     if self.process_vspaces.get(pi).copied().unwrap_or(0) != 0
                         || self
                             .process_vspace_caps
@@ -40252,11 +40239,8 @@ impl ExecNtHandler {
                     if let Some((_section_index, view)) =
                         generic_sections.view_for_page(target_pi, base)
                     {
-                        let Some(secure_owner) = self.pm.process_kernel_object(target_pid) else {
-                            return nt_process::STATUS_INVALID_HANDLE;
-                        };
                         if self.secured_virtual_memory.conflicts_with_delete(
-                            secure_owner,
+                            u64::from(target_pid),
                             view.base,
                             view.size,
                         ) {
@@ -40323,30 +40307,16 @@ impl ExecNtHandler {
                 if let Some(ctx) = self.loop_ctx {
                     let reg = &mut *ctx.reg;
                     if let Some((slot, _)) = reg.dll_for_page(target_pi, base) {
-                        let (image_base, image_size) = reg
-                            .get(slot)
-                            .map(|dll| (dll.base, dll.image_size))
-                            .unwrap_or((base, 0x1000));
+                        let Some(dll) = reg.get(slot) else {
+                            return STATUS_NOT_MAPPED_VIEW;
+                        };
+                        let (image_base, image_size) = (dll.base, dll.image_size);
                         let allocation =
                             process_committed_image_allocation(target_pi as u64, image_base);
-                        let (unmap_base, unmap_size) = allocation.map_or(
-                            (image_base, image_size),
-                            |allocation| {
-                                (
-                                    allocation.allocation_base,
-                                    allocation
-                                        .allocation_end
-                                        .saturating_sub(allocation.allocation_base),
-                                )
-                            },
-                        );
-                        let Some(secure_owner) = self.pm.process_kernel_object(target_pid) else {
-                            return nt_process::STATUS_INVALID_HANDLE;
-                        };
                         if self.secured_virtual_memory.conflicts_with_delete(
-                            secure_owner,
-                            unmap_base,
-                            unmap_size,
+                            u64::from(target_pid),
+                            image_base,
+                            image_size,
                         ) {
                             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
                         }

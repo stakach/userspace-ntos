@@ -46,6 +46,96 @@ fn secured_virtual_memory_handles_do_not_alias_and_owner_retirement_is_exact() {
 }
 
 #[test]
+fn secured_recommit_preserves_access_and_reset_ignores_protection() {
+    let mut map = VmRegionMap::<8>::new(0x10000, 0x10_0000);
+    let allocation = map
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    let mut secured = SecuredVirtualMemoryTable::new();
+    let handle = secured
+        .secure(
+            4,
+            allocation.base + 0x1800,
+            8,
+            SecuredVirtualMemoryAccess::ReadWrite,
+        )
+        .unwrap();
+
+    for protection in [PAGE_READONLY, PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD] {
+        let mut after = map;
+        let plan = after
+            .allocate(Some(allocation.base + 0x1001), 1, MEM_COMMIT, protection)
+            .unwrap();
+        assert_eq!(plan.size, PAGE_SIZE);
+        assert!(!secured.permits_allocation(4, plan, MEM_COMMIT, protection));
+        assert!(secured.permits_allocation(8, plan, MEM_COMMIT, protection));
+        assert_eq!(map.extent_at(plan.base).unwrap().protection, PAGE_READWRITE);
+    }
+
+    let reset = map
+        .allocate(
+            Some(allocation.base),
+            allocation.size,
+            MEM_RESET,
+            PAGE_NOACCESS,
+        )
+        .unwrap();
+    assert!(secured.permits_allocation(4, reset, MEM_RESET, PAGE_NOACCESS));
+    assert_eq!(
+        map.extent_at(allocation.base).unwrap().protection,
+        PAGE_READWRITE
+    );
+    let plan = map
+        .allocate(
+            Some(allocation.base + 0x1000),
+            PAGE_SIZE,
+            MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .unwrap();
+    assert!(secured.permits_allocation(4, plan, MEM_COMMIT, PAGE_READWRITE));
+    secured.unsecure(4, handle).unwrap();
+    assert!(secured.permits_allocation(4, plan, MEM_COMMIT, PAGE_NOACCESS));
+}
+
+#[test]
+fn secured_release_checks_whole_allocation_but_decommit_only_checks_its_pages() {
+    let mut before = VmRegionMap::<8>::new(0x10000, 0x10_0000);
+    let allocation = before
+        .allocate(None, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        .unwrap();
+    let mut secured = SecuredVirtualMemoryTable::new();
+    secured
+        .secure(
+            4,
+            allocation.base + 0x2000,
+            8,
+            SecuredVirtualMemoryAccess::ReadOnly,
+        )
+        .unwrap();
+
+    for offset in [0, 0x1000, 0x2000] {
+        let mut after = before;
+        let plan = after
+            .free(allocation.base + offset, PAGE_SIZE, MEM_RELEASE)
+            .unwrap();
+        assert!(!secured.permits_free(4, &before, plan));
+        assert!(secured.permits_free(8, &before, plan));
+        let mut after = before;
+        let plan = after
+            .free(allocation.base + offset, PAGE_SIZE, MEM_DECOMMIT)
+            .unwrap();
+        assert_eq!(secured.permits_free(4, &before, plan), offset != 0x2000);
+    }
+    assert!(!secured.conflicts_with_delete(4, allocation.base + 0x2004, 0));
+    assert!(secured.permits_protection(4, allocation.base + 0x2004, 0, PAGE_NOACCESS));
+    secured.retire_owner(4);
+    let mut after = before;
+    let plan = after.free(allocation.base, 0, MEM_RELEASE).unwrap();
+    assert!(secured.permits_free(4, &before, plan));
+}
+
+#[test]
 fn page_table_ownership_is_transactional_and_process_scoped() {
     let mut owner = VmPageTableOwnership::new();
     let p1a = owner.prepare_insert(1, 0x1000_0000).unwrap().unwrap();
