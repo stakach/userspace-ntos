@@ -6,7 +6,8 @@
 //! one frame (restoring the caller's registers into the `CONTEXT`), and — if the function has a
 //! language handler — calls it to decide `ContinueSearch` vs `ExecuteHandler`.
 //!
-//! This module is the **pure, host-testable core**: it operates over an [`ImageReader`] abstraction
+//! This crate is the **pure, host-testable core** used by ntdll and reusable by hosted providers:
+//! it operates over an [`ImageReader`] abstraction
 //! (read a `u8`/`u16`/`u32` at an RVA in a module, and enumerate a module's `.pdata`) so the exact
 //! same code runs against hand-crafted `UNWIND_INFO` byte blobs in host tests and against live
 //! mapped images on target. The C-ABI export wrappers + the live `ImageReader` over the loader's
@@ -16,6 +17,10 @@
 //! against `references/reactos/sdk/lib/rtl/amd64/unwind.c` (`RtlVirtualUnwind`,
 //! `RtlLookupFunctionEntry`, `RtlpUnwindOpSlots`) and `references/reactos/sdk/lib/rtl/` for
 //! `__C_specific_handler`'s `SCOPE_TABLE` walk.
+
+#![no_std]
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -288,14 +293,14 @@ pub trait ImageReader {
     /// Read a `u16` at `image_base + rva` (little-endian).
     fn read_u16(&self, image_base: u64, rva: u32) -> Option<u16> {
         let lo = self.read_u8(image_base, rva)? as u16;
-        let hi = self.read_u8(image_base, rva + 1)? as u16;
+        let hi = self.read_u8(image_base, rva.checked_add(1)?)? as u16;
         Some(lo | (hi << 8))
     }
 
     /// Read a `u32` at `image_base + rva` (little-endian).
     fn read_u32(&self, image_base: u64, rva: u32) -> Option<u32> {
         let lo = self.read_u16(image_base, rva)? as u32;
-        let hi = self.read_u16(image_base, rva + 2)? as u32;
+        let hi = self.read_u16(image_base, rva.checked_add(2)?)? as u32;
         Some(lo | (hi << 16))
     }
 }
@@ -326,10 +331,21 @@ pub enum FrameWalkError {
     UnwindData,
 }
 
-struct BoundedStack<'a> {
+/// Restrict stack reads to one active thread or provider lane before consulting the backing reader.
+pub struct BoundedStack<'a> {
     inner: &'a dyn StackReader,
     low: u64,
     high: u64,
+}
+
+impl<'a> BoundedStack<'a> {
+    /// Restrict aligned word reads to the half-open interval `[low, high)`.
+    pub fn new(inner: &'a dyn StackReader, low: u64, high: u64) -> Result<Self, FrameWalkError> {
+        if low >= high {
+            return Err(FrameWalkError::InvalidStackBounds);
+        }
+        Ok(Self { inner, low, high })
+    }
 }
 
 impl StackReader for BoundedStack<'_> {
@@ -357,17 +373,10 @@ pub fn walk_frame_chain(
     image: &dyn ImageReader,
     stack: &dyn StackReader,
 ) -> Result<usize, FrameWalkError> {
-    if stack_low >= stack_high {
-        return Err(FrameWalkError::InvalidStackBounds);
-    }
+    let bounded = BoundedStack::new(stack, stack_low, stack_high)?;
     let total = frames_to_skip
         .checked_add(callers.len())
         .ok_or(FrameWalkError::CountOverflow)?;
-    let bounded = BoundedStack {
-        inner: stack,
-        low: stack_low,
-        high: stack_high,
-    };
     let mut control_pc = context.rip;
 
     for index in 0..total {
@@ -473,10 +482,7 @@ impl FunctionTable {
     /// Find the `RUNTIME_FUNCTION` covering an absolute control PC (binary search). Returns `None`
     /// for a leaf (no covering `.pdata` entry).
     pub fn lookup(&self, control_pc: u64) -> Option<RuntimeFunction> {
-        if control_pc < self.image_base {
-            return None;
-        }
-        let rva = (control_pc - self.image_base) as u32;
+        let rva = u32::try_from(control_pc.checked_sub(self.image_base)?).ok()?;
         let idx = self.functions.partition_point(|f| f.begin <= rva);
         if idx == 0 {
             return None;
@@ -526,9 +532,35 @@ pub type HandlerType = u8;
 /// all-zero [`UnwindResult`] if this function has no such handler. On a hard read failure returns
 /// `None` (a corrupt / unmapped unwind table — the caller treats it as unhandleable).
 ///
+/// On failure the caller's context is unchanged, including any registers restored before a later
+/// unreadable stack slot or malformed unwind operation was found.
+///
 /// `image_base` + `func` come from [`ImageReader::lookup_function`]; `control_pc` is the absolute PC
 /// in this frame; `img` reads the `.xdata`; `stack` reads saved values off the frame.
 pub fn virtual_unwind(
+    handler_type: HandlerType,
+    image_base: u64,
+    control_pc: u64,
+    func: RuntimeFunction,
+    ctx: &mut Context,
+    img: &dyn ImageReader,
+    stack: &dyn StackReader,
+) -> Option<UnwindResult> {
+    let mut next = *ctx;
+    let result = virtual_unwind_inner(
+        handler_type,
+        image_base,
+        control_pc,
+        func,
+        &mut next,
+        img,
+        stack,
+    )?;
+    *ctx = next;
+    Some(result)
+}
+
+fn virtual_unwind_inner(
     handler_type: HandlerType,
     image_base: u64,
     control_pc: u64,
@@ -550,8 +582,8 @@ pub fn virtual_unwind(
     while func.is_chained_ptr() {
         let parent_rva = func.unwind_info & !1;
         let begin = img.read_u32(image_base, parent_rva)?;
-        let end = img.read_u32(image_base, parent_rva + 4)?;
-        let uw = img.read_u32(image_base, parent_rva + 8)?;
+        let end = img.read_u32(image_base, parent_rva.checked_add(4)?)?;
+        let uw = img.read_u32(image_base, parent_rva.checked_add(8)?)?;
         func = RuntimeFunction {
             begin,
             end,
@@ -581,6 +613,36 @@ pub fn virtual_unwind(
     )
 }
 
+fn read_unwind_header(
+    img: &dyn ImageReader,
+    image_base: u64,
+    rva: u32,
+) -> Option<UnwindInfoHeader> {
+    let header = UnwindInfoHeader::parse(&[
+        img.read_u8(image_base, rva)?,
+        img.read_u8(image_base, rva.checked_add(1)?)?,
+        img.read_u8(image_base, rva.checked_add(2)?)?,
+        img.read_u8(image_base, rva.checked_add(3)?)?,
+    ]);
+    if !matches!(header.version, 1 | 2)
+        || header.flags & !7 != 0
+        || header.is_chained() && header.has_handler()
+    {
+        return None;
+    }
+    // Code operands and any declared tail must remain representable as image RVAs.
+    let tail_bytes = if header.is_chained() {
+        12
+    } else if header.has_handler() {
+        4
+    } else {
+        0
+    };
+    rva.checked_add(header.tail_offset() as u32)?
+        .checked_add(tail_bytes)?;
+    Some(header)
+}
+
 /// The inner recursive worker (recursion depth `depth` bounds `CHAININFO`). `unwind_rva` is the RVA
 /// of this level's `UNWIND_INFO`; `prologue_offset` is how far into *this* function's prologue the PC
 /// is (chained levels use 0 — the shared prologue is fully executed by the time we chain to it).
@@ -600,12 +662,7 @@ fn unwind_one(
     if depth > 32 {
         return None; // pathological CHAININFO chain
     }
-    let hdr = UnwindInfoHeader::parse(&[
-        img.read_u8(image_base, unwind_rva)?,
-        img.read_u8(image_base, unwind_rva + 1)?,
-        img.read_u8(image_base, unwind_rva + 2)?,
-        img.read_u8(image_base, unwind_rva + 3)?,
-    ]);
+    let hdr = read_unwind_header(img, image_base, unwind_rva)?;
 
     // GetEstablisherFrame (ref RtlVirtualUnwind): the frame the handler's data offsets are relative
     // to. If there is no frame register it is the incoming RSP. Otherwise, if the PC is past the
@@ -644,6 +701,10 @@ fn unwind_one(
         let op = op_byte & 0x0F;
         let op_info = (op_byte >> 4) & 0x0F;
         let slots = op_slots(op, op_info)?;
+
+        if i + slots > count {
+            return None;
+        }
 
         if (code_off as u32) <= prologue_offset {
             if apply_code(
@@ -684,17 +745,17 @@ fn unwind_one(
         let ret_addr_slot = ctx.rsp();
         let ret = stack.read_u64(ret_addr_slot)?;
         ctx.rip = ret;
-        ctx.set_rsp(ret_addr_slot.wrapping_add(8));
+        ctx.set_rsp(ret_addr_slot.checked_add(8)?);
     }
 
-    Some(collect_handler(
+    collect_handler(
         handler_type,
         image_base,
         &hdr,
         unwind_rva,
         establisher_frame,
         img,
-    ))
+    )
 }
 
 /// Recognize and execute the remaining instructions of a canonical AMD64 epilogue. The scan uses a
@@ -812,12 +873,7 @@ fn apply_chained_codes(
     if depth > 32 {
         return None;
     }
-    let hdr = UnwindInfoHeader::parse(&[
-        img.read_u8(image_base, unwind_rva)?,
-        img.read_u8(image_base, unwind_rva + 1)?,
-        img.read_u8(image_base, unwind_rva + 2)?,
-        img.read_u8(image_base, unwind_rva + 3)?,
-    ]);
+    let hdr = read_unwind_header(img, image_base, unwind_rva)?;
     let count = hdr.count_of_codes as usize;
     let mut i = 0usize;
     while i < count {
@@ -825,6 +881,9 @@ fn apply_chained_codes(
         let op = op_byte & 0x0F;
         let op_info = (op_byte >> 4) & 0x0F;
         let slots = op_slots(op, op_info)?;
+        if i + slots > count {
+            return None;
+        }
         // Chained prologue: every code has executed → apply unconditionally.
         apply_code(
             op,
@@ -861,10 +920,10 @@ fn compute_establisher_frame(
         return Some(ctx.rsp());
     }
     let fp_value =
-        ctx.gpr[hdr.frame_register as usize].wrapping_sub((hdr.frame_offset as u64) * 16);
+        || ctx.gpr[hdr.frame_register as usize].checked_sub((hdr.frame_offset as u64) * 16);
     // Past the prologue (or a chained level, prologue_offset == u32::MAX) → the FP is established.
     if prologue_offset >= hdr.size_of_prolog as u32 {
-        return Some(fp_value);
+        return fp_value();
     }
     // Still inside the prologue: the FP is the frame register only if the SET_FPREG code has run.
     let count = hdr.count_of_codes as usize;
@@ -875,9 +934,12 @@ fn compute_establisher_frame(
         let op = op_byte & 0x0F;
         let op_info = (op_byte >> 4) & 0x0F;
         if op == uwop::SET_FPREG && (off as u32) <= prologue_offset {
-            return Some(fp_value);
+            return fp_value();
         }
         i += op_slots(op, op_info)?;
+        if i > count {
+            return None;
+        }
     }
     Some(ctx.rsp())
 }
@@ -891,7 +953,7 @@ fn collect_handler(
     unwind_rva: u32,
     establisher_frame: u64,
     img: &dyn ImageReader,
-) -> UnwindResult {
+) -> Option<UnwindResult> {
     let mut res = UnwindResult {
         image_base,
         establisher_frame,
@@ -901,14 +963,11 @@ fn collect_handler(
     // for the unwind pass). handler_type == 0 → don't return a handler.
     if handler_type != 0 && hdr.has_handler() && (hdr.flags & handler_type) != 0 {
         let tail = unwind_rva + hdr.tail_offset() as u32;
-        if let Some(hrva) = img.read_u32(image_base, tail) {
-            res.handler_rva = hrva;
-            // The language-specific handler data (e.g. the SCOPE_TABLE) immediately follows the
-            // handler RVA.
-            res.handler_data_rva = tail + 4;
-        }
+        res.handler_rva = img.read_u32(image_base, tail)?;
+        // The language-specific handler data immediately follows the handler RVA.
+        res.handler_data_rva = tail + 4;
     }
-    res
+    Some(res)
 }
 
 /// How many 2-byte slots an unwind code consumes (including its own slot). Some depend on `OpInfo`.
@@ -919,8 +978,10 @@ fn op_slots(op: u8, op_info: u8) -> Option<usize> {
         uwop::ALLOC_LARGE => {
             if op_info == 0 {
                 2
-            } else {
+            } else if op_info == 1 {
                 3
+            } else {
+                return None;
             }
         }
         uwop::ALLOC_SMALL => 1,
@@ -931,7 +992,7 @@ fn op_slots(op: u8, op_info: u8) -> Option<usize> {
         7 => 3, // UWOP_SPARE_CODE — 3 slots
         uwop::SAVE_XMM128 => 2,
         uwop::SAVE_XMM128_FAR => 3,
-        uwop::PUSH_MACHFRAME => 1,
+        uwop::PUSH_MACHFRAME if op_info <= 1 => 1,
         _ => return None, // unknown op → corrupt xdata
     })
 }
@@ -961,7 +1022,7 @@ fn apply_code(
             // A `push reg` was executed: the register's saved value sits at [RSP]; pop it, RSP += 8.
             let v = stack.read_u64(ctx.rsp())?;
             ctx.gpr[op_info as usize] = v;
-            ctx.set_rsp(ctx.rsp().wrapping_add(8));
+            ctx.set_rsp(ctx.rsp().checked_add(8)?);
         }
         uwop::ALLOC_LARGE => {
             let size = if op_info == 0 {
@@ -969,41 +1030,41 @@ fn apply_code(
             } else {
                 img.read_u32(image_base, slot(1))? as u64
             };
-            ctx.set_rsp(ctx.rsp().wrapping_add(size));
+            ctx.set_rsp(ctx.rsp().checked_add(size)?);
         }
         uwop::ALLOC_SMALL => {
             let size = (op_info as u64) * 8 + 8;
-            ctx.set_rsp(ctx.rsp().wrapping_add(size));
+            ctx.set_rsp(ctx.rsp().checked_add(size)?);
         }
         uwop::SET_FPREG => {
             // Undo the frame-pointer establishment: RSP = FrameReg - FrameOffset*16 (ref:
             // `Rsp = GetReg(FrameRegister) - FrameOffset*16`). The frame register is in the header,
             // NOT this code's OpInfo (which is 0/unused for SET_FPREG).
-            ctx.set_rsp(ctx.gpr[frame_register as usize].wrapping_sub((frame_offset as u64) * 16));
+            ctx.set_rsp(ctx.gpr[frame_register as usize].checked_sub((frame_offset as u64) * 16)?);
         }
         uwop::SAVE_NONVOL => {
             // reg = *((u64*)Rsp + FrameOffset); the stored u16 is a count of 8-byte slots.
             let off = (img.read_u16(image_base, slot(1))? as u64) * 8;
-            let v = stack.read_u64(ctx.rsp().wrapping_add(off))?;
+            let v = stack.read_u64(ctx.rsp().checked_add(off)?)?;
             ctx.gpr[op_info as usize] = v;
         }
         uwop::SAVE_NONVOL_FAR => {
             // reg = *(u64*)(Rsp + u32) — raw byte offset.
             let off = img.read_u32(image_base, slot(1))? as u64;
-            let v = stack.read_u64(ctx.rsp().wrapping_add(off))?;
+            let v = stack.read_u64(ctx.rsp().checked_add(off)?)?;
             ctx.gpr[op_info as usize] = v;
         }
         uwop::SAVE_XMM128 => {
             // xmm[OpInfo] = *((M128A*)Rsp + FrameOffset); stored u16 is a count of 16-byte slots.
             let off = (img.read_u16(image_base, slot(1))? as u64) * 16;
-            let lo = stack.read_u64(ctx.rsp().wrapping_add(off))?;
-            let hi = stack.read_u64(ctx.rsp().wrapping_add(off + 8))?;
+            let lo = stack.read_u64(ctx.rsp().checked_add(off)?)?;
+            let hi = stack.read_u64(ctx.rsp().checked_add(off + 8)?)?;
             ctx.xmm[op_info as usize] = [lo, hi];
         }
         uwop::SAVE_XMM128_FAR => {
             let off = img.read_u32(image_base, slot(1))? as u64;
-            let lo = stack.read_u64(ctx.rsp().wrapping_add(off))?;
-            let hi = stack.read_u64(ctx.rsp().wrapping_add(off + 8))?;
+            let lo = stack.read_u64(ctx.rsp().checked_add(off)?)?;
+            let hi = stack.read_u64(ctx.rsp().checked_add(off + 8)?)?;
             ctx.xmm[op_info as usize] = [lo, hi];
         }
         6 | 7 => {
@@ -1011,9 +1072,9 @@ fn apply_code(
         }
         uwop::PUSH_MACHFRAME => {
             // A trap/interrupt machine frame (ref: `Rsp += OpInfo*8; Rip=[Rsp+0]; Rsp=[Rsp+0x18]`).
-            ctx.set_rsp(ctx.rsp().wrapping_add((op_info as u64) * 8));
+            ctx.set_rsp(ctx.rsp().checked_add((op_info as u64) * 8)?);
             let rip = stack.read_u64(ctx.rsp())?;
-            let new_rsp = stack.read_u64(ctx.rsp().wrapping_add(0x18))?;
+            let new_rsp = stack.read_u64(ctx.rsp().checked_add(0x18)?)?;
             ctx.rip = rip;
             ctx.set_rsp(new_rsp);
             return Some(true); // machine frame terminates the unwind
@@ -1575,6 +1636,139 @@ mod tests {
         assert_eq!(ctx.rip, 0x1400_2222); // return address popped into RIP
         assert_eq!(ctx.rsp(), 0x9010); // RSP: 0x9000 +8 (pop RBX) +8 (pop retaddr)
         assert_eq!(r.handler_rva, 0); // no handler requested / present
+    }
+
+    #[test]
+    fn bounded_stack_rejects_reads_before_consulting_backing_storage() {
+        struct RecordingStack(core::cell::Cell<usize>);
+        impl StackReader for RecordingStack {
+            fn read_u64(&self, addr: u64) -> Option<u64> {
+                self.0.set(self.0.get() + 1);
+                Some(addr)
+            }
+        }
+        let raw = RecordingStack(core::cell::Cell::new(0));
+        assert!(BoundedStack::new(&raw, 0x9000, 0x9000).is_err());
+        assert!(BoundedStack::new(&raw, 0x9008, 0x9000).is_err());
+        let stack = BoundedStack::new(&raw, 0x9000, 0x9010).unwrap();
+        for address in [0x8ff8, 0x9001, 0x900c, 0x9010, u64::MAX - 7] {
+            assert_eq!(stack.read_u64(address), None);
+        }
+        assert_eq!(raw.0.get(), 0);
+        assert_eq!(stack.read_u64(0x9000), Some(0x9000));
+        assert_eq!(stack.read_u64(0x9008), Some(0x9008));
+        assert_eq!(raw.0.get(), 2);
+    }
+
+    #[test]
+    fn function_lookup_and_image_reads_do_not_alias_wrapped_rvas() {
+        let mut img = img_with_unwind(&[], 1, 0, 0, 0);
+        assert!(img.lookup_function(img.base + 0x1_0000_1050).is_none());
+        img.write(u32::MAX, &[0xaa]);
+        img.write(0, &[0xbb, 0xcc, 0xdd]);
+        assert_eq!(img.read_u16(img.base, u32::MAX), None);
+        img.write(u32::MAX - 1, &[0x11]);
+        assert_eq!(img.read_u32(img.base, u32::MAX - 1), None);
+    }
+
+    #[test]
+    fn unwind_failure_preserves_all_registers_after_partial_restore() {
+        let img = img_with_unwind(&[1, 0x30], 1, 8, 1, 0);
+        let mut raw = MockStack::new();
+        raw.put(0x9000, 0xdead_beef);
+        raw.put(0x9008, 0x1400_2222);
+        let stack = BoundedStack::new(&raw, 0x9000, 0x9008).unwrap();
+        let pc = img.base + 0x1050;
+        let (base, func) = img.lookup_function(pc).unwrap();
+        let mut ctx = Context {
+            gpr: [0x1111; 16],
+            rip: pc,
+            xmm: [[0x2222; 2]; 16],
+        };
+        ctx.set_rsp(0x9000);
+        let before = ctx;
+        assert_eq!(
+            virtual_unwind(0, base, pc, func, &mut ctx, &img, &stack),
+            None
+        );
+        assert_eq!(ctx, before);
+    }
+
+    #[test]
+    fn unwind_rejects_invalid_headers_and_operand_encodings() {
+        for (header, codes, count) in [
+            (0, vec![], 0), // unknown version
+            (3, vec![], 0),
+            (0x41, vec![], 0),                 // unknown flags
+            (0x29, vec![], 0),                 // CHAININFO with EHANDLER
+            (1, vec![1, 0x21, 0, 0, 0, 0], 3), // invalid ALLOC_LARGE OpInfo
+            (1, vec![1, 0x2a], 1),             // invalid PUSH_MACHFRAME OpInfo
+            (1, vec![1, 0x01, 0, 0], 1),       // operand outside CountOfCodes
+            (1, vec![1, 0x11, 0, 0, 0, 0], 2),
+        ] {
+            let img = img_with_unwind(&codes, header, 8, count, 0);
+            let mut stack = MockStack::new();
+            stack.put(0x9000, 0x1400_2222);
+            let pc = img.base + 0x1050;
+            let (base, func) = img.lookup_function(pc).unwrap();
+            let mut ctx = Context::default();
+            ctx.set_rsp(0x9000);
+            let before = ctx;
+            assert_eq!(
+                virtual_unwind(0, base, pc, func, &mut ctx, &img, &stack),
+                None
+            );
+            assert_eq!(ctx, before);
+        }
+    }
+
+    #[test]
+    fn unwind_rejects_unreadable_requested_handler_without_publishing_context() {
+        let img = img_with_unwind(&[], 0x09, 0, 0, 0);
+        let mut stack = MockStack::new();
+        stack.put(0x9000, 0x1400_2222);
+        let pc = img.base + 0x1050;
+        let (base, func) = img.lookup_function(pc).unwrap();
+        let mut ctx = Context::default();
+        ctx.set_rsp(0x9000);
+        let before = ctx;
+        assert_eq!(
+            virtual_unwind(1, base, pc, func, &mut ctx, &img, &stack),
+            None
+        );
+        assert_eq!(ctx, before);
+        assert!(virtual_unwind(0, base, pc, func, &mut ctx, &img, &stack).is_some());
+    }
+
+    #[test]
+    fn unwind_rejects_stack_arithmetic_overflow() {
+        let img = img_with_unwind(&[1, 0x12], 1, 8, 1, 0); // undo 16-byte allocation
+        let mut stack = MockStack::new();
+        stack.put(8, 0x1400_2222); // would be readable after wrapping
+        let pc = img.base + 0x1050;
+        let (base, func) = img.lookup_function(pc).unwrap();
+        let mut ctx = Context::default();
+        ctx.set_rsp(u64::MAX - 7);
+        let before = ctx;
+        assert_eq!(
+            virtual_unwind(0, base, pc, func, &mut ctx, &img, &stack),
+            None
+        );
+        assert_eq!(ctx, before);
+    }
+
+    #[test]
+    fn unwind_before_frame_register_is_established_uses_incoming_rsp() {
+        let img = img_with_unwind(&[5, 3], 1, 8, 1, 0x25);
+        let mut stack = MockStack::new();
+        stack.put(0x9000, 0x1400_2222);
+        let pc = img.base + 0x1000;
+        let (base, func) = img.lookup_function(pc).unwrap();
+        let mut ctx = Context::default(); // incoming RBP is not yet a frame pointer
+        ctx.set_rsp(0x9000);
+        let result = virtual_unwind(0, base, pc, func, &mut ctx, &img, &stack).unwrap();
+        assert_eq!(result.establisher_frame, 0x9000);
+        assert_eq!(ctx.rsp(), 0x9008);
     }
 
     #[test]

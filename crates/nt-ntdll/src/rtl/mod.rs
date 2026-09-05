@@ -28,7 +28,7 @@ pub mod dos8dot3;
 pub mod dynamic_function_table;
 pub mod encode;
 pub mod environment;
-pub mod exception;
+pub use nt_unwind as exception;
 pub mod fls;
 pub mod generic_table;
 pub mod guid;

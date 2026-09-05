@@ -24876,6 +24876,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     gate. Continue with shared x64 exception machinery, preserving the provider's active stack and
     checking unwind metadata and stack bounds before enabling exception-raising imports.
 
+    B3 shared AMD64 unwind foundation tranche 20 (2026-09-06, host and ntdll PE green):
+    the pure x64 interpreter, frame walker, and C exception policy now live in the `no_std`
+    `nt-unwind` crate. ntdll re-exports that crate at its existing `rtl::exception` namespace;
+    the old implementation file is removed, not duplicated. This lets hosted providers reuse the
+    interpreter without linking the rest of ntdll or moving user-mode loader policy into the
+    executive. Provider export wrappers are not bound by this foundation checkpoint.
+
+    `virtual_unwind` publishes its register context only after the entire frame succeeds. Invalid
+    versions/flags, invalid allocation or machine-frame operands, operands outside the declared
+    code slots, missing requested handler metadata, and unwind-code stack arithmetic overflow now
+    fail without partially restoring the caller. Image reads and function lookup reject wrapped
+    RVAs, including the prior greater-than-4-GiB function-table alias. The bounded stack adapter is
+    public and rejects out-of-range, unaligned, and overflowing word reads before consulting the
+    backing reader. Partial prologues do not interpret an unestablished frame register as a live
+    frame pointer.
+
+    All 54 shared-unwind tests and all 656 remaining ntdll tests pass (the original 47 unwind tests
+    moved with the implementation; seven regression tests were added). The serialized ntdll DLL
+    build passes PE loading, 1,376 exports, native ABI checks, 2,824 relocation fixups, and zero
+    missing ntdll imports across the staged ReactOS consumers. No desktop acceptance is claimed.
+
+    Review adjustment: complete chained-handler/machine-frame propagation and audit the live
+    target-frame and collided-unwind paths before sharing the live dispatcher. Then add exact
+    active-provider stack/image readers, Microsoft-x64 ABI context capture/restore, and genuine
+    language-handler dispatch before binding `ExRaiseAccessViolation`, `ExRaiseStatus`, and
+    `RtlUnwindEx`. The live ntdll raw stack reader and provider fault/probe integration are not made
+    safe merely by extracting the pure interpreter. Thirty-three audited win32k code imports
+    remain, and the complete import gate stays in force.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

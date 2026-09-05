@@ -1,0 +1,11 @@
+[package]
+name = "nt-unwind"
+description = "Shared no_std AMD64 NT unwind, frame-walk, and C exception policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

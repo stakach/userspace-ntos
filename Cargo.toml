@@ -98,6 +98,7 @@ members = [
     "crates/nt-ntdll-layout",
     "crates/nt-printf",
     "crates/nt-ntdll",
+    "crates/nt-unwind",
     "tools/driver-import-report",
     "tools/ntdll-dll-verify",
 ]
@@ -119,6 +120,7 @@ repository = "https://github.com/stakach/userspace-ntos"
 authors = ["Stephen von Takach <steve@place.technology>"]
 
 [workspace.dependencies]
+nt-unwind = { path = "crates/nt-unwind" }
 bitflags = { version = "2", default-features = false }
 nt-status = { path = "crates/nt-status" }
 nt-types = { path = "crates/nt-types" }
