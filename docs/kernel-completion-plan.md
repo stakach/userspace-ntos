@@ -46,8 +46,10 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Extract and harden the shared AMD64 unwind interpreter (tranche 20).
 - [x] Correct chained handlers, machine frames, and fixed-frame register restores (tranche 21).
 - [x] Share resumable C scope selection with ntdll's live handler adapter (tranche 22).
-- [ ] Validate live image/stack/scope-table readers, including dynamic unwind tables, and close the
-  remaining epilogue decoding/arithmetic gaps.
+- [x] Decode and execute canonical return epilogues transactionally (tranche 23).
+- [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
+- [ ] Complete fault-aware exact virtual-memory copy for nonresident pages before using it for SEH
+  readers. Then validate live image/stack/scope-table readers and dynamic unwind metadata lifetimes.
 - [ ] Replace the live target/collided/exit unwind loop with checked current/caller context state and
   a genuine handler-invocation boundary. Exercise cursor publication through real foreign callbacks.
 - [ ] Wire provider context capture/restore and exception delivery, then bind the raising/unwind
@@ -24975,6 +24977,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     state, then the registered handler-invocation/restore boundary. A future live acceptance test
     must observe ScopeIndex from an actual foreign callback, mutate/resume it, and prove no repeated
     finalizer. The import gate and one-hour external boot deadline remain unchanged.
+
+    B3 canonical return-epilogue tranche 23 (2026-09-06, host and ntdll PE green):
+    `nt-unwind/src/epilogue.rs` replaces the old end-of-function-only interpreter. Recognition
+    decodes the complete return sequence without stack reads; only a recognized sequence executes
+    against a private context. Ordinary body code selects metadata interpretation, while truncated
+    or unreadable instructions, failed stack reads, and arithmetic overflow remain unwind failures.
+    In particular, a failed epilogue return can no longer retry prologue metadata and invent a
+    different caller context.
+
+    Supported return forms are RET, RET imm16, and REP RET, including returns before trailing code
+    or padding, entry at remaining POP instructions, and REX-prefixed register pops. ADD immediates
+    and declared-frame-register LEA displacements are sign-extended; instruction reads are bounded
+    by the covering function and stack arithmetic is checked. POP RSP follows the processor's
+    assignment order. Recognition includes a return at the prologue boundary and zero-code metadata,
+    following the NT5-era contract rather than Wine's newer Windows-version special case.
+
+    The 13 new regressions in `nt-unwind/src/tests/epilogue.rs` bring the shared suite to 88 passing
+    tests; all 656 ntdll tests pass. The serialized ntdll DLL build and PE/native ABI/staged-consumer
+    import verification pass. The old interpreter is deleted. Tail jumps and return sequences that
+    cross chained function-range boundaries remain open, and replay requires stable instruction
+    bytes for one unwind operation. Thirty-three win32k imports remain; no desktop acceptance or
+    complete provider exception delivery is claimed.
+
+    Reader audit / review adjustment: the existing `NtReadVirtualMemory` exact-copy wrapper is not
+    yet a complete guarded SEH reader. The executive's `nt_copy_virtual_memory` copies resident
+    frames through `client_copyin_process_mapped`; valid demand-paged image metadata can therefore
+    fail solely because it has not faulted in. Complete read-copy residency through the ordinary
+    private/mapped/image MM backing owners before replacing raw SEH reads with this service. A
+    query-then-raw-read sequence is not fault containment and must not be introduced as a substitute.
+
+    Loaded-image extent/lifetime lookup also needs loader synchronization: the current SEH module
+    scan's process-lifetime comment is invalid now that unload exists. Use validated image extents
+    without holding loader locks across language callbacks. Dynamic function-table code ranges do
+    not bound their separately allocated xdata; keep metadata accessibility and registration
+    lifetime distinct from control-PC ownership. No live reader was switched to a resident-only
+    syscall or an invented dynamic-image extent in this tranche. Continue with these MM/reader
+    prerequisites and tail-jump identity before enabling the provider exception imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

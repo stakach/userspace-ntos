@@ -25,6 +25,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
+mod epilogue;
+
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions
 // =================================================================================================
@@ -594,9 +596,16 @@ fn virtual_unwind_inner(
         img,
     )?;
 
-    if prologue_offset > hdr.size_of_prolog as u32
-        && hdr.count_of_codes != 0
-        && try_unwind_epilogue(image_base, control_rva, covering_func.end, ctx, img, stack)
+    if prologue_offset >= hdr.size_of_prolog as u32
+        && epilogue::unwind_return(
+            image_base,
+            control_rva,
+            covering_func.end,
+            hdr.frame_register,
+            ctx,
+            img,
+            stack,
+        )?
     {
         return Some(UnwindResult {
             image_base,
@@ -755,108 +764,6 @@ fn unwind_codes(
     }
 
     Some(false)
-}
-
-/// Recognize and execute the remaining instructions of a canonical AMD64 epilogue. The scan uses a
-/// local context and commits it only after reaching the function's final `ret`, so ordinary body
-/// instructions fall back to unwind-code interpretation without partially changing the context.
-fn try_unwind_epilogue(
-    image_base: u64,
-    control_rva: u32,
-    function_end_rva: u32,
-    ctx: &mut Context,
-    img: &dyn ImageReader,
-    stack: &dyn StackReader,
-) -> bool {
-    let Some(end_rva) = function_end_rva.checked_sub(1) else {
-        return false;
-    };
-    if control_rva > end_rva {
-        return false;
-    }
-
-    let read_u8 = |rva| img.read_u8(image_base, rva);
-    let read_u32 = |rva| img.read_u32(image_base, rva);
-    let mut local = *ctx;
-    let mut cursor = control_rva;
-
-    if let Some(instr) = read_u32(cursor) {
-        // 48 83 c4 ib / 48 81 c4 id: add rsp, immediate.
-        if instr & 0x00ff_fdff == 0x00c4_8148 {
-            if instr & 0x0000_ff00 == 0x0000_8300 {
-                local.set_rsp(local.rsp().wrapping_add((instr >> 24) as u64));
-                cursor = match cursor.checked_add(4) {
-                    Some(next) => next,
-                    None => return false,
-                };
-            } else {
-                let Some(imm) = read_u32(cursor.wrapping_add(3)) else {
-                    return false;
-                };
-                local.set_rsp(local.rsp().wrapping_add(imm as u64));
-                cursor = match cursor.checked_add(7) {
-                    Some(next) => next,
-                    None => return false,
-                };
-            }
-        // 48/49 8d 60..a7 [disp]: lea rsp, [nonvolatile + displacement].
-        } else if instr & 0x0038_fffe == 0x0020_8d48 {
-            let reg = (((instr >> 16) & 7) + ((instr & 1) * 8)) as usize;
-            let mode = (instr >> 22) & 3;
-            let (displacement, length) = match mode {
-                0 => (0i64, 3u32),
-                1 => (((instr >> 24) as u8 as i8) as i64, 4),
-                2 => {
-                    let Some(raw) = read_u32(cursor.wrapping_add(3)) else {
-                        return false;
-                    };
-                    (raw as i32 as i64, 7)
-                }
-                _ => return false,
-            };
-            local.set_rsp(local.gpr[reg].wrapping_add_signed(displacement));
-            cursor = match cursor.checked_add(length) {
-                Some(next) => next,
-                None => return false,
-            };
-        }
-    }
-
-    while cursor < end_rva {
-        let Some(opcode) = read_u8(cursor) else {
-            return false;
-        };
-        let (reg, length) = if opcode & 0xf8 == 0x58 {
-            ((opcode & 7) as usize, 1u32)
-        } else if (opcode == 0x41 || opcode == 0x49)
-            && read_u8(cursor.wrapping_add(1)).is_some_and(|next| next & 0xf8 == 0x58)
-        {
-            let next = read_u8(cursor.wrapping_add(1)).unwrap_or(0);
-            (((next & 7) + 8) as usize, 2)
-        } else {
-            return false;
-        };
-        let Some(value) = stack.read_u64(local.rsp()) else {
-            return false;
-        };
-        local.gpr[reg] = value;
-        local.set_rsp(local.rsp().wrapping_add(8));
-        cursor = match cursor.checked_add(length) {
-            Some(next) => next,
-            None => return false,
-        };
-    }
-
-    if cursor != end_rva || read_u8(cursor) != Some(0xc3) {
-        return false;
-    }
-    let Some(return_address) = stack.read_u64(local.rsp()) else {
-        return false;
-    };
-    local.rip = return_address;
-    local.set_rsp(local.rsp().wrapping_add(8));
-    *ctx = local;
-    true
 }
 
 /// `GetEstablisherFrame` (ref `unwind.c:431`).
@@ -1335,6 +1242,7 @@ mod tests {
     use std::vec;
 
     mod chain;
+    mod epilogue;
     mod scope;
 
     // ---- A concrete host ImageReader over a byte blob at a fixed base + a .pdata table ----------
@@ -1360,6 +1268,12 @@ mod tests {
             }
         }
         fn set_pdata(&mut self, funcs: Vec<RuntimeFunction>) {
+            // Default to ordinary function-body code. Epilogue tests replace these bytes explicitly.
+            for func in &funcs {
+                for rva in func.begin..func.end {
+                    self.bytes.entry(rva).or_insert(0x90);
+                }
+            }
             self.pdata = FunctionTable::add(self.base, funcs);
         }
     }
