@@ -575,42 +575,100 @@ fn virtual_unwind_inner(
         return None;
     }
 
-    // Resolve a chained-pointer RUNTIME_FUNCTION (low bit of UnwindInfoAddress set → the RVA points
-    // at the parent RUNTIME_FUNCTION, not an UNWIND_INFO). Follow the chain to the real xdata.
-    let mut func = func;
-    let mut guard = 0;
-    while func.is_chained_ptr() {
-        let parent_rva = func.unwind_info & !1;
-        let begin = img.read_u32(image_base, parent_rva)?;
-        let end = img.read_u32(image_base, parent_rva.checked_add(4)?)?;
-        let uw = img.read_u32(image_base, parent_rva.checked_add(8)?)?;
-        func = RuntimeFunction {
-            begin,
-            end,
-            unwind_info: uw,
-        };
-        guard += 1;
-        if guard > 32 {
-            return None; // pathological chain
-        }
-    }
-
-    // The image-relative offset of the control PC within the function's prologue. If the PC is at the
-    // function's very first byte (== begin) this is 0 → the prologue has not executed at all.
-    let prologue_offset = (control_pc.wrapping_sub(image_base) as u32).wrapping_sub(func.begin);
-
-    unwind_one(
-        handler_type,
+    // Both link encodings share one budget, including links reached through CHAININFO tails.
+    let mut links_left = 32;
+    let mut func = resolve_function(func, image_base, img, &mut links_left)?;
+    let mut hdr = read_unwind_header(img, image_base, func.unwind_info)?;
+    let mut prologue_offset = control_rva.wrapping_sub(func.begin);
+    let establisher_frame = compute_establisher_frame(
+        &hdr,
         image_base,
         func.unwind_info,
         prologue_offset,
         ctx,
         img,
-        stack,
-        0,
-        control_rva,
-        covering_func.end,
-    )
+    )?;
+
+    if prologue_offset > hdr.size_of_prolog as u32
+        && hdr.count_of_codes != 0
+        && try_unwind_epilogue(image_base, control_rva, covering_func.end, ctx, img, stack)
+    {
+        return Some(UnwindResult {
+            image_base,
+            establisher_frame,
+            ..Default::default()
+        });
+    }
+
+    loop {
+        let machine_frame = unwind_codes(
+            image_base,
+            func.unwind_info,
+            &hdr,
+            prologue_offset,
+            establisher_frame,
+            ctx,
+            img,
+            stack,
+        )?;
+        if hdr.is_chained() {
+            links_left = links_left.checked_sub(1)?;
+            let tail = func.unwind_info + hdr.tail_offset() as u32;
+            func = resolve_function(
+                read_runtime_function(img, image_base, tail)?,
+                image_base,
+                img,
+                &mut links_left,
+            )?;
+            hdr = read_unwind_header(img, image_base, func.unwind_info)?;
+            prologue_offset = control_rva.wrapping_sub(func.begin);
+            continue;
+        }
+
+        if !machine_frame {
+            let rsp = ctx.rsp();
+            ctx.rip = stack.read_u64(rsp)?;
+            ctx.set_rsp(rsp.checked_add(8)?);
+        }
+        return collect_handler(
+            if prologue_offset >= hdr.size_of_prolog as u32 {
+                handler_type
+            } else {
+                0
+            },
+            image_base,
+            &hdr,
+            func.unwind_info,
+            establisher_frame,
+            img,
+        );
+    }
+}
+
+fn read_runtime_function(
+    img: &dyn ImageReader,
+    image_base: u64,
+    rva: u32,
+) -> Option<RuntimeFunction> {
+    let func = RuntimeFunction {
+        begin: img.read_u32(image_base, rva)?,
+        end: img.read_u32(image_base, rva.checked_add(4)?)?,
+        unwind_info: img.read_u32(image_base, rva.checked_add(8)?)?,
+    };
+    (func.begin < func.end).then_some(func)
+}
+
+fn resolve_function(
+    mut func: RuntimeFunction,
+    image_base: u64,
+    img: &dyn ImageReader,
+    links_left: &mut u8,
+) -> Option<RuntimeFunction> {
+    while func.is_chained_ptr() {
+        *links_left = links_left.checked_sub(1)?;
+        func = read_runtime_function(img, image_base, func.unwind_info & !1)?;
+    }
+    Some(func)
 }
 
 fn read_unwind_header(
@@ -643,58 +701,21 @@ fn read_unwind_header(
     Some(header)
 }
 
-/// The inner recursive worker (recursion depth `depth` bounds `CHAININFO`). `unwind_rva` is the RVA
-/// of this level's `UNWIND_INFO`; `prologue_offset` is how far into *this* function's prologue the PC
-/// is (chained levels use 0 — the shared prologue is fully executed by the time we chain to it).
+/// Apply one code array without popping a return address. Every chained level uses the original
+/// establisher frame for SAVE offsets. Returns whether a terminal machine frame supplied RIP/RSP.
 #[allow(clippy::too_many_arguments)]
-fn unwind_one(
-    handler_type: HandlerType,
+fn unwind_codes(
     image_base: u64,
     unwind_rva: u32,
+    hdr: &UnwindInfoHeader,
     prologue_offset: u32,
+    establisher_frame: u64,
     ctx: &mut Context,
     img: &dyn ImageReader,
     stack: &dyn StackReader,
-    depth: u32,
-    control_rva: u32,
-    function_end_rva: u32,
-) -> Option<UnwindResult> {
-    if depth > 32 {
-        return None; // pathological CHAININFO chain
-    }
-    let hdr = read_unwind_header(img, image_base, unwind_rva)?;
-
-    // GetEstablisherFrame (ref RtlVirtualUnwind): the frame the handler's data offsets are relative
-    // to. If there is no frame register it is the incoming RSP. Otherwise, if the PC is past the
-    // prologue (or we are on a chained level, prologue_offset == u32::MAX), it is
-    // FrameReg - FrameOffset*16. If still inside the prologue, it is that only once the SET_FPREG
-    // code (with CodeOffset <= prologue_offset) has executed; else the incoming RSP. Computed BEFORE
-    // any register restores so the frame-register value is the live one.
-    let establisher_frame =
-        compute_establisher_frame(&hdr, image_base, unwind_rva, prologue_offset, ctx, img)?;
-
-    // A PC in an AMD64 epilogue must execute the remaining epilogue instructions, not reverse the
-    // entire prologue again. ReactOS recognizes the ABI's optional stack adjustment, nonvolatile
-    // pops, and final `ret` sequence.
-    if prologue_offset > hdr.size_of_prolog as u32
-        && hdr.count_of_codes != 0
-        && try_unwind_epilogue(image_base, control_rva, function_end_rva, ctx, img, stack)
-    {
-        return Some(UnwindResult {
-            image_base,
-            establisher_frame,
-            ..Default::default()
-        });
-    }
-
-    // Walk the unwind codes. Each slot is (CodeOffset, op_byte) little-endian pairs; a code may
-    // consume additional slots for its operand. We only APPLY a code if its CodeOffset has already
-    // been executed by the PC (CodeOffset <= prologue_offset) — codes for prologue instructions that
-    // have not run yet are skipped (their register was not saved yet). Per the reference, ALL
-    // SAVE_*/PUSH ops read relative to the CURRENT unwinding RSP (not the frame base).
+) -> Option<bool> {
     let count = hdr.count_of_codes as usize;
     let mut i = 0usize;
-    let mut machframe = false;
     while i < count {
         let code_off = img.read_u8(image_base, unwind_rva + 4 + (i as u32) * 2)?;
         let op_byte = img.read_u8(image_base, unwind_rva + 4 + (i as u32) * 2 + 1)?;
@@ -702,7 +723,9 @@ fn unwind_one(
         let op_info = (op_byte >> 4) & 0x0F;
         let slots = op_slots(op, op_info)?;
 
-        if i + slots > count {
+        if i + slots > count
+            || (op == uwop::PUSH_MACHFRAME && (hdr.is_chained() || i + slots != count))
+        {
             return None;
         }
 
@@ -715,47 +738,18 @@ fn unwind_one(
                 i,
                 hdr.frame_register,
                 hdr.frame_offset,
+                establisher_frame,
                 ctx,
                 img,
                 stack,
-            )? && op == uwop::PUSH_MACHFRAME
-            {
-                machframe = true;
+            )? {
+                return Some(true);
             }
         }
         i += slots;
     }
 
-    // Handle CHAININFO: the chained RUNTIME_FUNCTION sits at the (padded) tail; reload UnwindInfo
-    // from its UnwindData and apply IT in full (all its prologue codes have executed by here). The
-    // language handler + establisher frame come from THIS (last-applied) level in the reference; we
-    // apply the chained codes then fall through to collect this level's handler.
-    if hdr.is_chained() {
-        let tail = unwind_rva + hdr.tail_offset() as u32;
-        // tail: RUNTIME_FUNCTION { begin:u32, end:u32, unwind_info:u32 }
-        let chained_uw = img.read_u32(image_base, tail + 8)?;
-        // Apply the chained prologue in full WITHOUT its own return-address pop (that belongs to the
-        // outermost frame). We recurse with a "codes only" flag by using prologue_offset u32::MAX and
-        // a sentinel that suppresses the ret pop — handled by unwind_codes_only below.
-        apply_chained_codes(image_base, chained_uw & !1, ctx, img, stack, depth + 1)?;
-    }
-
-    // A machine-frame op already set RIP+RSP from the trap frame → do NOT pop a return address.
-    if !machframe {
-        let ret_addr_slot = ctx.rsp();
-        let ret = stack.read_u64(ret_addr_slot)?;
-        ctx.rip = ret;
-        ctx.set_rsp(ret_addr_slot.checked_add(8)?);
-    }
-
-    collect_handler(
-        handler_type,
-        image_base,
-        &hdr,
-        unwind_rva,
-        establisher_frame,
-        img,
-    )
+    Some(false)
 }
 
 /// Recognize and execute the remaining instructions of a canonical AMD64 epilogue. The scan uses a
@@ -860,53 +854,6 @@ fn try_unwind_epilogue(
     true
 }
 
-/// Apply ONLY the unwind codes of a chained `UNWIND_INFO` (no return-address pop, no handler
-/// collection) — the shared-prologue register/stack restores. Recurses for nested CHAININFO.
-fn apply_chained_codes(
-    image_base: u64,
-    unwind_rva: u32,
-    ctx: &mut Context,
-    img: &dyn ImageReader,
-    stack: &dyn StackReader,
-    depth: u32,
-) -> Option<()> {
-    if depth > 32 {
-        return None;
-    }
-    let hdr = read_unwind_header(img, image_base, unwind_rva)?;
-    let count = hdr.count_of_codes as usize;
-    let mut i = 0usize;
-    while i < count {
-        let op_byte = img.read_u8(image_base, unwind_rva + 4 + (i as u32) * 2 + 1)?;
-        let op = op_byte & 0x0F;
-        let op_info = (op_byte >> 4) & 0x0F;
-        let slots = op_slots(op, op_info)?;
-        if i + slots > count {
-            return None;
-        }
-        // Chained prologue: every code has executed → apply unconditionally.
-        apply_code(
-            op,
-            op_info,
-            image_base,
-            unwind_rva,
-            i,
-            hdr.frame_register,
-            hdr.frame_offset,
-            ctx,
-            img,
-            stack,
-        )?;
-        i += slots;
-    }
-    if hdr.is_chained() {
-        let tail = unwind_rva + hdr.tail_offset() as u32;
-        let chained_uw = img.read_u32(image_base, tail + 8)?;
-        apply_chained_codes(image_base, chained_uw & !1, ctx, img, stack, depth + 1)?;
-    }
-    Some(())
-}
-
 /// `GetEstablisherFrame` (ref `unwind.c:431`).
 fn compute_establisher_frame(
     hdr: &UnwindInfoHeader,
@@ -921,8 +868,8 @@ fn compute_establisher_frame(
     }
     let fp_value =
         || ctx.gpr[hdr.frame_register as usize].checked_sub((hdr.frame_offset as u64) * 16);
-    // Past the prologue (or a chained level, prologue_offset == u32::MAX) → the FP is established.
-    if prologue_offset >= hdr.size_of_prolog as u32 {
+    // A chained secondary region inherits an established FP, including inside its own prologue.
+    if prologue_offset >= hdr.size_of_prolog as u32 || hdr.is_chained() {
         return fp_value();
     }
     // Still inside the prologue: the FP is the frame register only if the SET_FPREG code has run.
@@ -998,8 +945,8 @@ fn op_slots(op: u8, op_info: u8) -> Option<usize> {
 }
 
 /// Apply one unwind code to `ctx` (undo the corresponding prologue instruction), faithful to
-/// `RtlVirtualUnwind`'s op table. Per the reference, ALL `SAVE_*` offsets are relative to the CURRENT
-/// unwinding RSP (`Context->Rsp`), and register indices are ABI numbers (into [`Context::gpr`]).
+/// `RtlVirtualUnwind`'s op table. SAVE offsets are relative to the original establisher frame;
+/// PUSH/ALLOC update the current RSP. Register indices are ABI numbers (into [`Context::gpr`]).
 /// `frame_offset` is the header's `FrameOffset` (for `SET_FPREG`). Returns `true` if the op was
 /// `UWOP_PUSH_MACHFRAME` (which terminates the unwind — the caller must not pop a return address).
 /// `idx` is the code's slot index (its operand slots follow at `idx+1`, `idx+2`).
@@ -1012,6 +959,7 @@ fn apply_code(
     idx: usize,
     frame_register: u8,
     frame_offset: u8,
+    establisher_frame: u64,
     ctx: &mut Context,
     img: &dyn ImageReader,
     stack: &dyn StackReader,
@@ -1043,28 +991,28 @@ fn apply_code(
             ctx.set_rsp(ctx.gpr[frame_register as usize].checked_sub((frame_offset as u64) * 16)?);
         }
         uwop::SAVE_NONVOL => {
-            // reg = *((u64*)Rsp + FrameOffset); the stored u16 is a count of 8-byte slots.
+            // The stored u16 is a count of 8-byte slots from the established frame base.
             let off = (img.read_u16(image_base, slot(1))? as u64) * 8;
-            let v = stack.read_u64(ctx.rsp().checked_add(off)?)?;
+            let v = stack.read_u64(establisher_frame.checked_add(off)?)?;
             ctx.gpr[op_info as usize] = v;
         }
         uwop::SAVE_NONVOL_FAR => {
-            // reg = *(u64*)(Rsp + u32) — raw byte offset.
+            // The stored u32 is a raw byte offset from the established frame base.
             let off = img.read_u32(image_base, slot(1))? as u64;
-            let v = stack.read_u64(ctx.rsp().checked_add(off)?)?;
+            let v = stack.read_u64(establisher_frame.checked_add(off)?)?;
             ctx.gpr[op_info as usize] = v;
         }
         uwop::SAVE_XMM128 => {
-            // xmm[OpInfo] = *((M128A*)Rsp + FrameOffset); stored u16 is a count of 16-byte slots.
+            // The stored u16 is a count of 16-byte slots from the established frame base.
             let off = (img.read_u16(image_base, slot(1))? as u64) * 16;
-            let lo = stack.read_u64(ctx.rsp().checked_add(off)?)?;
-            let hi = stack.read_u64(ctx.rsp().checked_add(off + 8)?)?;
+            let lo = stack.read_u64(establisher_frame.checked_add(off)?)?;
+            let hi = stack.read_u64(establisher_frame.checked_add(off + 8)?)?;
             ctx.xmm[op_info as usize] = [lo, hi];
         }
         uwop::SAVE_XMM128_FAR => {
             let off = img.read_u32(image_base, slot(1))? as u64;
-            let lo = stack.read_u64(ctx.rsp().checked_add(off)?)?;
-            let hi = stack.read_u64(ctx.rsp().checked_add(off + 8)?)?;
+            let lo = stack.read_u64(establisher_frame.checked_add(off)?)?;
+            let hi = stack.read_u64(establisher_frame.checked_add(off + 8)?)?;
             ctx.xmm[op_info as usize] = [lo, hi];
         }
         6 | 7 => {
@@ -1280,6 +1228,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::vec;
+
+    mod chain;
 
     // ---- A concrete host ImageReader over a byte blob at a fixed base + a .pdata table ----------
 

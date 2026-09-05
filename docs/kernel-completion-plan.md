@@ -24905,6 +24905,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     safe merely by extracting the pure interpreter. Thirty-three audited win32k code imports
     remain, and the complete import gate stays in force.
 
+    B3 chained AMD64 unwind correction tranche 21 (2026-09-06, host and ntdll PE green):
+    one iterative interpreter now handles ordinary, embedded CHAININFO, and indirect
+    RUNTIME_FUNCTION links. The recursive codes-only walker is removed. Handler and handler-data
+    RVAs come from the final primary record, with code and handler admission based on that record's
+    prologue offset. Fragmented primary functions need not cover the original PC. All link forms
+    share a bounded 32-edge traversal, and malformed records or exhausted/cyclic chains preserve
+    the caller's complete context.
+
+    CHAININFO inherits an established frame pointer even inside the secondary prologue. SAVE
+    integer/XMM offsets now use the original establisher frame, including dynamic stack allocation
+    and earlier secondary stack adjustments. This corrects the former evolving-RSP behavior using
+    NT5 and Wine rather than copying ReactOS's limitation. A terminal primary machine frame keeps
+    its restored RIP/RSP without a second return-address pop; nonterminal or chained machine-frame
+    placements fail rather than silently skipping the operation.
+
+    The focused chain tests live in `crates/nt-unwind/src/tests/chain.rs`. All 67 shared-unwind tests
+    (13 new regressions) and all 656 ntdll tests pass. The serialized ntdll DLL build and PE/native
+    ABI/staged-consumer import verification pass. Thirty-three win32k imports remain; no desktop
+    acceptance or provider exception delivery is claimed.
+
+    Review adjustment: before provider binding, replace the live unwind loop's single mutable
+    context with explicit current/caller contexts; run target handlers with TARGET_UNWIND and
+    restore the actual target context, not the original capture with an invented target RSP.
+    Collided unwind must adopt dispatcher state and resume a persisted scope cursor through a real
+    handler-invocation boundary. Invalid dispositions, unreachable targets, and exit unwind must
+    not fall through to successful continuation. First make the C language-handler scope walk
+    resumable, including target-inside-scope suppression and signed filter results. Bounded live
+    readers and epilogue decoding/arithmetic remain prerequisites as well; the shared interpreter
+    extraction is not proof that the full dispatcher is ready.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every
