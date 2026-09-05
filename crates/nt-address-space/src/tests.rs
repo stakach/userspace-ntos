@@ -2033,6 +2033,7 @@ fn residency_page_plan_uses_each_backing_owners_read_fault_policy() {
         Ok(VmResidencyPagePlan {
             page: 0x5000,
             source: VmResidencySource::Private,
+            access: FaultAccess::Lock,
             protection: PAGE_READWRITE,
             map_protection: PAGE_READWRITE,
         })
@@ -2042,6 +2043,7 @@ fn residency_page_plan_uses_each_backing_owners_read_fault_policy() {
         Ok(VmResidencyPagePlan {
             page: 0x5000,
             source: VmResidencySource::Mapped,
+            access: FaultAccess::Lock,
             protection: PAGE_EXECUTE_READWRITE,
             map_protection: PAGE_EXECUTE_READ,
         })
@@ -2051,10 +2053,86 @@ fn residency_page_plan_uses_each_backing_owners_read_fault_policy() {
         Ok(VmResidencyPagePlan {
             page: 0x5000,
             source: VmResidencySource::Image,
+            access: FaultAccess::Lock,
             protection: PAGE_EXECUTE_WRITECOPY,
             map_protection: PAGE_EXECUTE_READ,
         })
     );
+}
+
+#[test]
+fn writable_image_residency_keeps_private_backing_for_later_eviction() {
+    for protect in [PAGE_READWRITE, PAGE_EXECUTE_READWRITE] {
+        for write in [false, true] {
+            assert!(image_view_fault_plan(protect, write).requires_private_backing());
+        }
+    }
+    for protect in [PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY] {
+        assert!(!image_view_fault_plan(protect, false).requires_private_backing());
+        assert!(image_view_fault_plan(protect, true).requires_private_backing());
+    }
+    for protect in [PAGE_READONLY, PAGE_EXECUTE, PAGE_EXECUTE_READ] {
+        assert!(!image_view_fault_plan(protect, false).requires_private_backing());
+    }
+}
+
+#[test]
+fn access_page_plan_preserves_write_intent_for_each_backing_owner() {
+    for type_ in [MEM_PRIVATE, MEM_MAPPED, MEM_IMAGE] {
+        for protect in [
+            PAGE_READONLY,
+            PAGE_READWRITE,
+            PAGE_EXECUTE_READWRITE,
+            PAGE_WRITECOPY,
+            PAGE_EXECUTE_WRITECOPY,
+            PAGE_NOACCESS,
+            PAGE_EXECUTE,
+            PAGE_READWRITE | PAGE_GUARD,
+        ] {
+            let info = VmBasicInformation {
+                base_address: 0x8000,
+                allocation_base: 0x8000,
+                allocation_protect: protect,
+                region_size: PAGE_SIZE,
+                state: MEM_COMMIT,
+                protect,
+                type_,
+            };
+            for access in [FaultAccess::Read, FaultAccess::Write, FaultAccess::Lock] {
+                let expected = match type_ {
+                    MEM_PRIVATE => {
+                        if protection_permits(protect, access) {
+                            Ok(())
+                        } else {
+                            Err(STATUS_ACCESS_VIOLATION)
+                        }
+                    }
+                    MEM_MAPPED => mapped_view_fault_access_status(protect, access),
+                    MEM_IMAGE => image_view_fault_access_status(protect, access),
+                    _ => unreachable!(),
+                };
+                let result = vm_access_page_plan(0x8000, info, access);
+                assert_eq!(result.map(|_| ()), expected);
+                if let Ok(plan) = result {
+                    assert_eq!(plan.access, access);
+                    assert_eq!(plan.protection, protect);
+                    let expected_map = match type_ {
+                        MEM_PRIVATE => protect,
+                        MEM_MAPPED => {
+                            mapped_view_fault_plan(protect, access == FaultAccess::Write)
+                                .map_protection
+                        }
+                        MEM_IMAGE => {
+                            image_view_fault_plan(protect, access == FaultAccess::Write)
+                                .map_protection
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(plan.map_protection, expected_map);
+                }
+            }
+        }
+    }
 }
 
 #[test]

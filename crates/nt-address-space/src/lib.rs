@@ -16,6 +16,8 @@
 
 extern crate alloc;
 
+pub mod copy;
+
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -774,6 +776,7 @@ pub enum VmResidencySource {
 /// One page in a normalized virtual-memory residency operation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VmResidencyPagePlan {
+    pub access: FaultAccess,
     pub page: u64,
     pub source: VmResidencySource,
     pub protection: u32,
@@ -1008,6 +1011,15 @@ pub fn vm_residency_page_plan(
     page: u64,
     info: VmBasicInformation,
 ) -> Result<VmResidencyPagePlan, u32> {
+    vm_access_page_plan(page, info, FaultAccess::Lock)
+}
+
+/// Validate access before materializing a page, including COW and dirty-write admission.
+pub fn vm_access_page_plan(
+    page: u64,
+    info: VmBasicInformation,
+    access: FaultAccess,
+) -> Result<VmResidencyPagePlan, u32> {
     let info_end = info
         .base_address
         .checked_add(info.region_size)
@@ -1026,29 +1038,30 @@ pub fn vm_residency_page_plan(
 
     let (source, map_protection) = match info.type_ {
         MEM_PRIVATE => {
-            if !protection_allows_fault_access(info.protect, FaultAccess::Lock) {
+            if !protection_allows_fault_access(info.protect, access) {
                 return Err(STATUS_ACCESS_VIOLATION);
             }
             (VmResidencySource::Private, info.protect)
         }
         MEM_MAPPED => {
-            mapped_view_fault_access_status(info.protect, FaultAccess::Lock)?;
+            mapped_view_fault_access_status(info.protect, access)?;
             (
                 VmResidencySource::Mapped,
-                mapped_view_fault_plan(info.protect, false).map_protection,
+                mapped_view_fault_plan(info.protect, access == FaultAccess::Write).map_protection,
             )
         }
         MEM_IMAGE => {
-            image_view_fault_access_status(info.protect, FaultAccess::Lock)?;
+            image_view_fault_access_status(info.protect, access)?;
             (
                 VmResidencySource::Image,
-                image_view_fault_plan(info.protect, false).map_protection,
+                image_view_fault_plan(info.protect, access == FaultAccess::Write).map_protection,
             )
         }
         _ => return Err(STATUS_ACCESS_VIOLATION),
     };
 
     Ok(VmResidencyPagePlan {
+        access,
         page,
         source,
         protection: info.protect,
@@ -1096,6 +1109,14 @@ pub struct VmMappedViewFaultPlan {
 pub struct VmImageViewFaultPlan {
     pub map_protection: u32,
     pub copy_on_write: bool,
+}
+
+impl VmImageViewFaultPlan {
+    /// Writable image mappings must survive eviction as private data, even when the page was
+    /// initially materialized by a read. Later user writes need not fault on a writable mapping.
+    pub fn requires_private_backing(self) -> bool {
+        protection_permits(self.map_protection, FaultAccess::Write)
+    }
 }
 
 pub fn mapped_view_fault_plan(protection: u32, write_fault: bool) -> VmMappedViewFaultPlan {

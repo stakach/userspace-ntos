@@ -7,6 +7,9 @@
 use crate::*;
 use nt_io_abi::major;
 
+#[path = "exec_virtual_memory_copy.rs"]
+mod virtual_memory_copy;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -19247,7 +19250,7 @@ impl ExecNtHandler {
         let target = procs
             .get(target_pi)
             .copied()
-            .filter(|target| target.pml4 != 0)
+            .filter(|target| target.pml4 != 0 && target.scratch_base != 0)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         match plan.source {
             nt_address_space::VmResidencySource::Private => {
@@ -19274,7 +19277,11 @@ impl ExecNtHandler {
                     plan.page,
                     target.pml4,
                     target.scratch_base,
-                    nt_address_space::FaultAccess::Lock,
+                    if plan.access == nt_address_space::FaultAccess::Read {
+                        nt_address_space::FaultAccess::Lock
+                    } else {
+                        plan.access
+                    },
                 )? {
                     true => Ok(()),
                     false => Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES),
@@ -19317,7 +19324,7 @@ impl ExecNtHandler {
                     target.pml4,
                     target.scratch_base,
                     hosted_active_image_mirror_for_pi(target_pi),
-                    nt_address_space::FaultAccess::Lock,
+                    plan.access,
                     false,
                     filled_pages,
                     faults,
@@ -19684,186 +19691,6 @@ impl ExecNtHandler {
             }
         }
         0
-    }
-
-    unsafe fn nt_copy_virtual_memory(&mut self, args: &[u64], read: bool) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_PARTIAL_COPY: u32 = 0x8000_000D;
-        const PROCESS_VM_READ: u32 = 0x0010;
-        const PROCESS_VM_WRITE: u32 = 0x0020;
-
-        let remote = args[1];
-        let local = args[2];
-        let length = args[3];
-        let count_ptr = args[4];
-        let valid_range = |base: u64| {
-            base.checked_add(length)
-                .is_some_and(|end| end <= USER_ADDRESS_LIMIT)
-        };
-        if !valid_range(remote) || !valid_range(local) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        if count_ptr != 0 {
-            if !self.probe_user_output(count_ptr, 8) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-        }
-        if length == 0 {
-            if count_ptr != 0 {
-                let _ = self.xas_write_u64(count_ptr, 0);
-            }
-            return 0;
-        }
-
-        let required_access = if read {
-            PROCESS_VM_READ
-        } else {
-            PROCESS_VM_WRITE
-        };
-        let (target_pid, target_pi) =
-            match self.resolve_process_for_access(args[0], required_access) {
-                Ok(target) => target,
-                Err(status) => {
-                    if count_ptr != 0 {
-                        let _ = self.xas_write_u64(count_ptr, 0);
-                    }
-                    return status;
-                }
-            };
-        if self.pm.process(target_pid).is_some_and(|process| {
-            matches!(
-                process.state,
-                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
-            )
-        }) {
-            if count_ptr != 0 {
-                let _ = self.xas_write_u64(count_ptr, 0);
-            }
-            return nt_process::STATUS_PROCESS_IS_TERMINATING;
-        }
-
-        let ctx = match self.loop_ctx {
-            Some(ctx) => ctx,
-            None => {
-                if count_ptr != 0 {
-                    let _ = self.xas_write_u64(count_ptr, 0);
-                }
-                return STATUS_PARTIAL_COPY;
-            }
-        };
-        let procs = &mut *ctx.procs;
-        let target = procs[target_pi];
-        if target.pml4 == 0 || target.scratch_base == 0 {
-            if count_ptr != 0 {
-                let _ = self.xas_write_u64(count_ptr, 0);
-            }
-            return nt_process::STATUS_INVALID_HANDLE;
-        }
-        let (target_filled, target_faults) = if target_pi == self.pi {
-            (&*ctx.filled_pages, *ctx.faults as usize)
-        } else {
-            (&(*ctx.pfilled)[target_pi], procs[target_pi].faults as usize)
-        };
-        let target_vm = match process_vm_region_map(target_pi) {
-            Some(map) => *map,
-            None => {
-                if count_ptr != 0 {
-                    let _ = self.xas_write_u64(count_ptr, 0);
-                }
-                return nt_process::STATUS_INVALID_HANDLE;
-            }
-        };
-
-        let mut transferred = 0u64;
-        let mut buffer = [0u8; 256];
-        while transferred < length {
-            let remote_address = remote + transferred;
-            let local_address = local + transferred;
-            let remote_page = 0x1000 - (remote_address as usize & 0xfff);
-            let local_page = 0x1000 - (local_address as usize & 0xfff);
-            let chunk = (length - transferred)
-                .min(buffer.len() as u64)
-                .min(remote_page as u64)
-                .min(local_page as u64) as usize;
-            let private_extent = target_vm.extent_at(remote_address);
-            let protection_allows = private_extent.is_none()
-                || if read {
-                    target_vm.permits_read(remote_address)
-                } else {
-                    target_vm.permits_write(remote_address)
-                };
-            let mut local_copied = false;
-            let mut remote_copied = false;
-            let copied = if !protection_allows {
-                false
-            } else if read {
-                remote_copied = client_copyin_process_mapped(
-                    target_pi as u64,
-                    remote_address,
-                    &mut buffer[..chunk],
-                    target_filled,
-                    target_faults,
-                    target.scratch_base,
-                    target_pi == self.pi,
-                );
-                local_copied =
-                    remote_copied && self.xas_try_write_buf(local_address, &buffer[..chunk]);
-                local_copied
-            } else {
-                local_copied = self.xas_read(local_address, &mut buffer[..chunk]);
-                remote_copied = local_copied
-                    && if target_pi == self.pi {
-                        self.xas_try_write_buf(remote_address, &buffer[..chunk])
-                    } else {
-                        client_copyout_mapped(
-                            target_pi as u64,
-                            remote_address,
-                            &buffer[..chunk],
-                            target_filled,
-                            target_faults,
-                            target.scratch_base,
-                        )
-                    };
-                remote_copied
-            };
-            if !copied {
-                if self.current_process_is_winlogon() && target_pi != self.pi {
-                    let (frame, _) =
-                        csrss_frame_get_exact(target_pi as u64, remote_address & !0xfff);
-                    print_str(b"[remote-vm] write failed target_pi=");
-                    print_u64(target_pi as u64);
-                    print_str(b" remote=0x");
-                    print_hex((remote_address >> 32) as u32);
-                    print_hex(remote_address as u32);
-                    print_str(b" local=0x");
-                    print_hex((local_address >> 32) as u32);
-                    print_hex(local_address as u32);
-                    print_str(b" chunk=0x");
-                    print_hex(chunk as u32);
-                    print_str(b" local_ok=");
-                    print_u64(local_copied as u64);
-                    print_str(b" remote_ok=");
-                    print_u64(remote_copied as u64);
-                    print_str(b" protection_ok=");
-                    print_u64(protection_allows as u64);
-                    print_str(b" frame=0x");
-                    print_hex(frame as u32);
-                    print_str(b" vad=");
-                    print_u64(private_extent.is_some() as u64);
-                    print_str(b"\n");
-                }
-                break;
-            }
-            transferred += chunk as u64;
-        }
-        if count_ptr != 0 {
-            let _ = self.xas_write_u64(count_ptr, transferred);
-        }
-        if transferred == length {
-            0
-        } else {
-            STATUS_PARTIAL_COPY
-        }
     }
 
     unsafe fn nt_flush_virtual_memory(&mut self, args: &[u64]) -> u32 {

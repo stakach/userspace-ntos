@@ -47,9 +47,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Correct chained handlers, machine frames, and fixed-frame register restores (tranche 21).
 - [x] Share resumable C scope selection with ntdll's live handler adapter (tranche 22).
 - [x] Decode and execute canonical return epilogues transactionally (tranche 23).
+- [x] Route native VM copies through access-checked private/mapped/image residency and preserve
+  writable image backing across eviction (tranche 24, host tests and executive build).
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
-- [ ] Complete fault-aware exact virtual-memory copy for nonresident pages before using it for SEH
-  readers. Then validate live image/stack/scope-table readers and dynamic unwind metadata lifetimes.
+- [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
+  backing admission is implemented; local guard consumption and live cold-page/COW/trim acceptance
+  remain. Then validate live image/stack/scope-table readers and dynamic unwind metadata lifetimes.
 - [ ] Replace the live target/collided/exit unwind loop with checked current/caller context state and
   a genuine handler-invocation boundary. Exercise cursor publication through real foreign callbacks.
 - [ ] Wire provider context capture/restore and exception delivery, then bind the raising/unwind
@@ -25014,6 +25017,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lifetime distinct from control-PC ownership. No live reader was switched to a resident-only
     syscall or an invented dynamic-image extent in this tranche. Continue with these MM/reader
     prerequisites and tail-jump identity before enabling the provider exception imports.
+
+    B3 fault-aware virtual-memory copy tranche 24 (2026-09-06, host and executive build green):
+    `nt-address-space::copy` now owns the bounded copy ordering: stage source bytes, probe the whole
+    destination before its first write, copy page-contained chunks, and report only completed
+    destination bytes. Source/destination copy faults return `STATUS_PARTIAL_COPY`; an initial
+    destination probe failure keeps its status and writes no copy bytes. Empty and overflowing
+    requests do not touch memory. The native wrapper retains VM_READ/VM_WRITE handle checks,
+    count-output probing before handle validation, zero-size behavior, process-exit rejection, and
+    best-effort count publication without overriding copy status.
+
+    The new focused `exec_virtual_memory_copy.rs` adapter replaces the old resident-only loop in
+    `exec_handler.rs`, including its Winlogon-specific diagnostic branch. Both source and destination
+    pages use queried protection plus `vm_access_page_plan` before ordinary private, section, or
+    image backing admission. Writes retain COW/dirty intent; mapped read readiness uses the
+    existing idempotent lock-read path after read permission validation. Exact copy helpers fetch
+    mapping counters after residency changes, never use the raw-PE reader or legacy demand-fill
+    copyout, and disable active-image mirrors. KUSER uses its explicit read-only alias. The final
+    byte-count store revalidates residency because an earlier probe does not pin its page.
+
+    Review found and corrected a related image eviction bug: cold writable image mappings were
+    registered as discardable backing, including ordinary READWRITE mappings initially faulted by
+    a read. `VmImageViewFaultPlan::requires_private_backing` now preserves all actually writable
+    mappings. Resident pages promote before use, cold writable pages register owned frames, and
+    owned image pages are excluded from the legacy filled-page scratch list. Clean write-copy
+    reads retain their existing read-only/shareable behavior.
+
+    Validation: all 78 `nt-address-space` tests pass, including copy ordering, source staging across
+    destination paging, page-boundary clipping, partial counts, probe failures, access policy for
+    all three backing owners, and writable-image retention policy. All 33 `nt-memory-manager`
+    tests also pass. The freestanding executive build passes with the existing 256 warnings.
+    Logs: `.tmp/test-vm-copy-20260906.log`, `.tmp/test-vm-copy-mm-20260906.log`, and
+    `.tmp/build-vm-copy-20260906.log`.
+
+    Review adjustment: this is implementation/host validation, not live MM or desktop acceptance.
+    Guarded ranges currently fail closed; remote guards must remain untouched, while same-process
+    guards still need their native consume-and-raise behavior. Add live cold private/section/image
+    copy tests on both sides, cross-process COW isolation, and dirty-image trim/restore proof before
+    switching SEH readers. Existing registered-frame protection inference and main-image mirror
+    lifetime outside this exact-copy path also require cleanup; do not duplicate those mechanisms.
+    Loader/dynamic-table lifetime checks, tail-jump identity, and real exception-handler invocation
+    remain open. The 33-import win32k barrier is unchanged; no QEMU/desktop acceptance is claimed.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -3968,7 +3968,7 @@ pub(crate) unsafe fn service_image_page_residency(
         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
     let shared_mapping_registered = shared_image_mapping_contains(pi as u64, page);
 
-    if fault_plan.copy_on_write
+    if fault_plan.requires_private_backing()
         && (csrss_frame_get_exact_record(pi as u64, page).is_some() || shared_mapping_registered)
     {
         let read_protection =
@@ -4122,7 +4122,7 @@ pub(crate) unsafe fn service_image_page_residency(
             private_alias,
             private_source_cap,
             private_source_cap,
-            false,
+            fault_plan.requires_private_backing(),
         ) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
@@ -4132,7 +4132,11 @@ pub(crate) unsafe fn service_image_page_residency(
         }
         let filled_index = (*faults as usize).saturating_sub(1);
         if filled_index < filled_pages.len() {
-            filled_pages[filled_index] = page;
+            filled_pages[filled_index] = if fault_plan.requires_private_backing() {
+                0
+            } else {
+                page
+            };
         }
     }
     note_boot_progress(BootProgress::PageMappingPublished);
