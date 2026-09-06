@@ -1,6 +1,15 @@
 //! Admission for the executive's serialized thread-to-mechanism binding table.
 //! This checks routing identity, not ownership transfer or Ps thread activation.
 
+/// Captured holds, not lookups through a possibly reused current TID or badge mapping.
+/// The native adapter validates slot bounds and ownership before admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadRuntimeReservations {
+    pub badge: u64,
+    pub pool_slot: usize,
+    pub window_slot: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadBinding<R> {
     pub pi: usize,
@@ -9,6 +18,25 @@ pub struct ThreadBinding<R> {
     pub role: R,
     /// One denotes a reserved identity with no TCB; larger values identify real TCB caps.
     pub tcb: u64,
+    /// None for runtimes that do not own worker pool/window reservations.
+    pub reservations: Option<ThreadRuntimeReservations>,
+}
+
+impl<R> ThreadBinding<R> {
+    /// Ownership queries include unbuilt, constructing, live and cleanup-pending rows.
+    pub fn holds_pool_slot(&self, pi: usize, slot: usize) -> bool {
+        self.pi == pi
+            && self
+                .reservations
+                .is_some_and(|holds| holds.pool_slot == slot)
+    }
+
+    pub fn holds_window_slot(&self, pi: usize, slot: usize) -> bool {
+        self.pi == pi
+            && self
+                .reservations
+                .is_some_and(|holds| holds.window_slot == Some(slot))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +54,7 @@ pub enum ThreadBindingError {
     RoleConflict,
     TcbConflict,
     DuplicateOwner,
+    ReservationConflict,
 }
 
 /// Plan without mutation or allocation. The caller must commit against the unchanged, exclusively
@@ -35,7 +64,12 @@ pub fn admit_thread_binding<R: Copy + Eq>(
     requested: ThreadBinding<R>,
     live: impl IntoIterator<Item = (usize, ThreadBinding<R>)>,
 ) -> Result<ThreadBindingAdmission, ThreadBindingError> {
-    if requested.tid == 0 || requested.tcb == 0 {
+    if requested.tid == 0
+        || requested.tcb == 0
+        || requested
+            .reservations
+            .is_some_and(|holds| holds.badge != requested.badge)
+    {
         return Err(ThreadBindingError::InvalidIdentity);
     }
     let mut existing = None;
@@ -47,6 +81,7 @@ pub fn admit_thread_binding<R: Copy + Eq>(
             if owner.pi != requested.pi
                 || owner.badge != requested.badge
                 || owner.role != requested.role
+                || owner.reservations != requested.reservations
             {
                 return Err(ThreadBindingError::IdentityConflict);
             }
@@ -66,6 +101,15 @@ pub fn admit_thread_binding<R: Copy + Eq>(
             }
             if requested.tcb > 1 && owner.tcb == requested.tcb {
                 return Err(ThreadBindingError::TcbConflict);
+            }
+            if let Some(holds) = requested.reservations {
+                if owner.holds_pool_slot(requested.pi, holds.pool_slot)
+                    || holds
+                        .window_slot
+                        .is_some_and(|slot| owner.holds_window_slot(requested.pi, slot))
+                {
+                    return Err(ThreadBindingError::ReservationConflict);
+                }
             }
         }
     }

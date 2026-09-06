@@ -9428,14 +9428,6 @@ impl ExecNtHandler {
         self.thread_mechanisms.pool_tid_for_slot(pi, slot)
     }
 
-    pub(crate) fn pm_pool_slot_for_tid(&self, tid: u64) -> Option<(usize, usize)> {
-        if tid == 0 || tid > u32::MAX as u64 {
-            return None;
-        }
-        self.thread_mechanisms
-            .pool_slot_for_tid(tid as nt_process::ThreadId)
-    }
-
     pub(crate) fn observe_win32k_stock_object(&mut self, object_id: u32, handle: u32) -> bool {
         self.win32k_session.observe_stock_object(object_id, handle)
     }
@@ -9578,12 +9570,13 @@ impl ExecNtHandler {
     }
 
     fn claim_pool_usage_slot_excluding(&mut self, pi: usize, skip_mask: u64) -> Option<usize> {
-        let used = self.pool_used.get_mut(pi)?;
+        let used = *self.pool_used.get(pi)?;
         let slot = (0..PM_RUNTIME_THREAD_SLOTS).find(|slot| {
             let bit = 1u64 << slot;
-            *used & bit == 0 && skip_mask & bit == 0
+            used & bit == 0 && skip_mask & bit == 0
+                && !self.thread_runtime.holds_pool_slot(pi, *slot)
         })?;
-        *used |= 1u64 << slot;
+        self.pool_used[pi] |= 1u64 << slot;
         Some(slot)
     }
 
@@ -9595,10 +9588,7 @@ impl ExecNtHandler {
         let Some(bit) = Self::pool_slot_bit(slot) else {
             return false;
         };
-        if self.pm_pool_tid_for_slot(pi, slot)
-            .and_then(|tid| self.thread_runtime.get_by_tid(tid as u64))
-            .is_some_and(|runtime| runtime.publication.is_busy())
-        {
+        if self.thread_runtime.holds_pool_slot(pi, slot) {
             return false;
         }
         let Some(used) = self.pool_used.get_mut(pi) else {
@@ -9679,7 +9669,9 @@ impl ExecNtHandler {
     }
 
     fn clear_temporary_process_slot(&mut self, pi: usize) {
-        if pi >= MAX_PI || self.process_mechanisms.pid_for_pi(pi).is_some() {
+        if pi >= MAX_PI || self.process_mechanisms.pid_for_pi(pi).is_some()
+            || self.thread_runtime.has_process(pi)
+        {
             return;
         }
         self.temporary_process_slots[pi] = 0;
@@ -9718,6 +9710,9 @@ impl ExecNtHandler {
         if self.process_mechanisms.pid_for_pi(pi).is_some() {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
+        if self.thread_runtime.holds_pool_slot(pi, slot) {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
         self.register_hosted_pool_thread_identity(pi, slot, tid)?;
         self.release_pool_usage_slot(pi, slot);
         Ok(())
@@ -9728,6 +9723,7 @@ impl ExecNtHandler {
             || slot >= PM_RUNTIME_THREAD_SLOTS
             || self.temporary_pid_for_pi(pi).is_none()
             || self.process_mechanisms.pid_for_pi(pi).is_some()
+            || self.thread_runtime.holds_pool_slot(pi, slot)
         {
             return;
         }
@@ -9762,7 +9758,15 @@ impl ExecNtHandler {
         badge: u64,
         role: HostedThreadRole,
     ) -> Result<PreparedHostedThreadRuntime, u32> {
-        self.thread_runtime.prepare_spawn(pi, tid, badge, role)
+        let reservations = self.capture_hosted_thread_reservations(pi, tid, badge, role)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        if reservations.window_slot.is_some_and(|slot| {
+            Self::tp_worker_slot_bit(slot)
+                .is_none_or(|bit| self.tp_worker_window_used[pi] & bit == 0)
+        }) {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        self.thread_runtime.prepare_spawn(pi, tid, badge, role, reservations)
     }
 
     pub(crate) fn cancel_hosted_thread_runtime_publication(
@@ -9794,7 +9798,38 @@ impl ExecNtHandler {
         badge: u64,
         role: HostedThreadRole,
     ) -> bool {
-        self.thread_runtime.reserve(pi, tid, badge, role).is_some()
+        let Some(reservations) = self.capture_hosted_thread_reservations(pi, tid, badge, role) else {
+            return false;
+        };
+        self.thread_runtime.reserve(pi, tid, badge, role, reservations).is_some()
+    }
+
+    fn capture_hosted_thread_reservations(
+        &self,
+        pi: usize,
+        tid: u64,
+        badge: u64,
+        role: HostedThreadRole,
+    ) -> Option<nt_user_host::thread_binding::ThreadRuntimeReservations> {
+        let mechanism = self.hosted_thread_mechanism_for_tid(tid)?;
+        let nt_user_host::ThreadMechanismKind::Pool { slot } = mechanism.kind else {
+            return None;
+        };
+        if mechanism.pi != pi || self.pool_used.get(pi)? & Self::pool_slot_bit(slot)? == 0 {
+            return None;
+        }
+        let window_slot = role.worker_window_slot();
+        if let Some(window) = window_slot {
+            Self::tp_worker_slot_bit(window)?;
+            if badge != tp_worker_badge(pi, window) {
+                return None;
+            }
+        }
+        Some(nt_user_host::thread_binding::ThreadRuntimeReservations {
+            badge,
+            pool_slot: slot,
+            window_slot,
+        })
     }
 
     pub(crate) fn register_main_thread_spawn(
@@ -10742,7 +10777,8 @@ impl ExecNtHandler {
     pub(crate) fn first_free_hosted_tp_worker_slot(&self, pi: usize) -> Option<usize> {
         let used = *self.tp_worker_window_used.get(pi)?;
         (0..TP_WORKER_SLOT_COUNT)
-            .find(|&slot| Self::tp_worker_slot_bit(slot).is_some_and(|bit| used & bit == 0))
+            .find(|&slot| Self::tp_worker_slot_bit(slot).is_some_and(|bit| used & bit == 0)
+                && !self.thread_runtime.holds_window_slot(pi, slot))
     }
 
     pub(crate) fn reserve_hosted_tp_worker_slot(
@@ -10773,7 +10809,9 @@ impl ExecNtHandler {
         let Some(bit) = Self::tp_worker_slot_bit(slot) else {
             return false;
         };
-        if self.tp_worker_window_used[pi] & bit != 0 {
+        if self.tp_worker_window_used[pi] & bit != 0
+            || self.thread_runtime.holds_window_slot(pi, slot)
+        {
             return false;
         }
         let badge = tp_worker_badge(pi, slot);
@@ -10805,10 +10843,7 @@ impl ExecNtHandler {
         if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
             return;
         }
-        if self.thread_runtime
-            .get_by_badge(tp_worker_badge(pi, slot))
-            .is_some_and(|runtime| runtime.publication.is_busy())
-        {
+        if self.thread_runtime.holds_window_slot(pi, slot) {
             return;
         }
         if let Some(bit) = Self::tp_worker_slot_bit(slot) {
@@ -10817,10 +10852,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn clear_hosted_tp_worker_windows(&mut self, pi: usize) {
-        if (0..self.thread_runtime.record_count()).any(|index| {
-            self.thread_runtime.get_by_index(index)
-                .is_some_and(|runtime| runtime.pi == pi && runtime.publication.is_busy())
-        }) {
+        if (0..TP_WORKER_SLOT_COUNT).any(|slot| self.thread_runtime.holds_window_slot(pi, slot)) {
             return;
         }
         if pi < MAX_PI {

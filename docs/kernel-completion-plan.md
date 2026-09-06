@@ -130,6 +130,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain a host pending-runtime payload and exact reservations before fallible cleanup-journal
   preparation; reuse the same attempt on retry. Preflight native suspend/resume runtime admission
   before changing Ps counts (tranche 59, host/build; native pending-owner activation still open).
+- [x] Capture pool/window holds in native runtime bindings before construction, reject conflicting
+  reservations, and guard allocation/release/temporary identity clearing using retained ownership
+  instead of current routing lookups (tranche 60, host/build; native pending-owner activation still open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next integrate the retained pending owner into
   native runtime/pool/window tables with process-generation validation, then wire registered-resume
@@ -26697,6 +26700,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Do not replace unchecked registered-resume cleanup with a partially guarded adapter. Early
     construction/main-process cleanup and handler-owned handoffs remain open. The complete win32k
     import gate still has 33 unresolved code imports.
+
+    B3 captured runtime-reservation guards tranche 60 (2026-09-07, host/build green):
+    `ThreadBinding` now includes the shared `ThreadRuntimeReservations` inventory. Non-pooled
+    main/external runtimes explicitly own no worker reservations; every native worker reservation
+    captures its validated pool slot and optional role-derived window slot before construction.
+    Preparing construction revalidates the pool/window bits and exact captured binding. The exclusive
+    publication ticket includes those holds, so replay/promotion cannot discard or change them.
+    Admission rejects another TID claiming either the pool or window in the same process, even with
+    a different role, badge or TCB. Process-local slot reuse in a different process remains valid.
+
+    Native pool/window allocation and release now query captured holds in all retained rows,
+    including unbuilt reservations, rather than following current PM slot-to-TID or badge mappings
+    and checking only publication-busy rows. Temporary pool registration/clearing checks ownership
+    before modifying mechanism identity. Temporary process clearing refuses retained runtimes
+    before clearing PID, VSpace or commitment. Bulk window clearing preserves holds when process
+    termination leaves a live worker or a TCB cleanup failure. Successful thread termination uses
+    the removed runtime's captured reservations rather than reconstructing the pool/window from
+    mutable mechanism/role lookups. The old mapping-based reservation-release checks and their
+    unused native TID-to-pool reverse-lookup wrappers are removed.
+
+    Validation: ten new host regressions cover exact reservation replay/promotion, changed/discarded
+    holds, captured-badge mismatch, independent pool/window collisions, process scoping, full-scan
+    conflicts, ownership queries independent of construction/TCB state, owner removal and
+    publication-ticket rejection/retry after changing only captured holds. The serialized nine-crate
+    suite passes 999 tests, including 106 `nt-user-host` unit/integration tests;
+    log: `.tmp/test-thread-reservations-20260907.log`. The executive build passes and stages
+    rootserver/hive; log: `.tmp/build-thread-reservations-20260907.log`. Two read-only agents audited
+    admission and every existing native reserve/release caller; root alone ran builds/tests. Native
+    caller ordering has build/review validation, not live failure-injection proof.
+
+    Review adjustment: captured reservation guards are now native, but pending cleanup is not.
+    Retain the pending owner in the already-allocated runtime row and split ownership-inclusive
+    lookup from execution admission before activation. Capture PID/process-generation provenance
+    before construction; temporary debugger process slots currently have no published mechanism
+    generation and need a real monotonic lifetime identity, not zero or a fabricated constant.
+    Complete caller-cancellation separation, external-alias journals and fault/copy/mirror/VM/pageout
+    exclusions before replacing unchecked registered-resume cleanup. Normal termination also still
+    contains unchecked resource releases; this slice fixes reservation identity, not retry-safe
+    physical cleanup. Early construction/main-process cleanup and handler-owned handoffs remain open.
+    The complete win32k import gate still has 33 unresolved code imports; no desktop proof is claimed.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -19347,23 +19347,18 @@ unsafe fn terminate_hosted_thread_mechanism(
     print_u64(delete);
     print_str(b"\n");
     if suspend == 0 && delete == 0 {
-        let pool_slot = handler.pm_pool_slot_for_tid(tid);
-        let role = handler.hosted_thread_role(tid);
-        let worker_slot = role
-            .and_then(|role| role.worker_window_slot())
-            .and_then(|slot| pool_slot.map(|(pi, _)| (pi, slot)));
         let runtime = handler.release_hosted_thread_runtime(tid);
-        if let Some((pi, slot)) = pool_slot {
-            let _ = handler.release_pool_usage_slot(pi, slot);
-        }
         if let Some(runtime) = runtime {
             handler.release_hosted_thread_user_stack_vad(runtime);
             release_hosted_thread_resources(runtime.resources);
             handler.release_hosted_thread_commitment(runtime.resources);
             release_hosted_thread_mechanism_cnodes(runtime);
-        }
-        if let Some((pi, slot)) = worker_slot {
-            handler.clear_hosted_tp_worker_window_slot(pi, slot);
+            if let Some(holds) = runtime.reservations {
+                let _ = handler.release_pool_usage_slot(runtime.pi, holds.pool_slot);
+                if let Some(slot) = holds.window_slot {
+                    handler.clear_hosted_tp_worker_window_slot(runtime.pi, slot);
+                }
+            }
         }
         PM_TERMINATE_THREAD_TCB_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         true
@@ -25371,10 +25366,6 @@ impl ExecThreadMechanisms {
         unsafe { (&*self.table).get_by_tid(tid) }
     }
 
-    fn pool_slot_for_tid(&self, tid: u32) -> Option<(usize, usize)> {
-        // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
-        unsafe { (&*self.table).pool_slot_for_tid(tid) }
-    }
 }
 
 /// Exclusive pointer to the serialized executive's fixed directory-open table.
@@ -25786,6 +25777,7 @@ pub(crate) struct HostedThreadRuntime {
     lpc_server_port: u64,
     lpc_client_process: u32,
     publication: nt_user_host::thread_publication::ThreadPublicationSlot,
+    reservations: Option<nt_user_host::thread_binding::ThreadRuntimeReservations>,
 }
 
 pub(crate) struct PreparedHostedThreadRuntime {
@@ -25811,6 +25803,7 @@ impl HostedThreadRuntime {
             lpc_server_port: 0,
             lpc_client_process: 0,
             publication: nt_user_host::thread_publication::ThreadPublicationSlot::empty(),
+            reservations: None,
         }
     }
 
@@ -25825,6 +25818,7 @@ impl HostedThreadRuntime {
             tcb: self.tcb,
             badge: self.badge,
             role: self.role,
+            reservations: self.reservations,
         }
     }
 
@@ -25889,7 +25883,7 @@ impl HostedThreadRuntimeTable {
         if tcb <= 1 {
             return None;
         }
-        self.store(pi, tid, tcb, badge, role)
+        self.store(pi, tid, tcb, badge, role, None)
     }
 
     fn register_main(
@@ -25913,7 +25907,7 @@ impl HostedThreadRuntimeTable {
         ) {
             return None;
         }
-        let runtime = self.store(pi, tid, tcb, badge, HostedThreadRole::Main)?;
+        let runtime = self.store(pi, tid, tcb, badge, HostedThreadRole::Main, None)?;
         let entry = self
             .entries
             .iter_mut()
@@ -25931,11 +25925,12 @@ impl HostedThreadRuntimeTable {
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
+        reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Result<PreparedHostedThreadRuntime, u32> {
         use nt_user_host::thread_binding::{
             admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
         };
-        let key = ThreadBinding { pi, tid, badge, role, tcb: 1 };
+        let key = ThreadBinding { pi, tid, badge, role, tcb: 1, reservations: Some(reservations) };
         let admission = admit_thread_binding(
             key,
             self.entries
@@ -25989,8 +25984,9 @@ impl HostedThreadRuntimeTable {
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
+        reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Option<HostedThreadRuntime> {
-        self.store(pi, tid, 1, badge, role)
+        self.store(pi, tid, 1, badge, role, Some(reservations))
     }
 
     fn store(
@@ -26000,12 +25996,13 @@ impl HostedThreadRuntimeTable {
         tcb: u64,
         badge: u64,
         role: HostedThreadRole,
+        reservations: Option<nt_user_host::thread_binding::ThreadRuntimeReservations>,
     ) -> Option<HostedThreadRuntime> {
         use nt_user_host::thread_binding::{
             admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
         };
         let admission = admit_thread_binding(
-            ThreadBinding { pi, tid, tcb, badge, role },
+            ThreadBinding { pi, tid, tcb, badge, role, reservations },
             self.entries
                 .iter()
                 .enumerate()
@@ -26045,6 +26042,7 @@ impl HostedThreadRuntimeTable {
             lpc_server_port: 0,
             lpc_client_process: 0,
             publication: nt_user_host::thread_publication::ThreadPublicationSlot::empty(),
+            reservations,
         };
         if let Some(empty) = self.entries.iter_mut().find(|entry| !entry.is_live()) {
             *empty = runtime;
@@ -26128,6 +26126,14 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .any(|entry| entry.is_live() && entry.pi == pi)
+    }
+
+    fn holds_pool_slot(&self, pi: usize, slot: usize) -> bool {
+        self.entries.iter().any(|entry| entry.is_live() && entry.binding().holds_pool_slot(pi, slot))
+    }
+
+    fn holds_window_slot(&self, pi: usize, slot: usize) -> bool {
+        self.entries.iter().any(|entry| entry.is_live() && entry.binding().holds_window_slot(pi, slot))
     }
 
     fn get_by_role(&self, pi: usize, role: HostedThreadRole) -> Option<HostedThreadRuntime> {
@@ -26224,8 +26230,9 @@ impl HostedThreadRuntimes {
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
+        reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Result<PreparedHostedThreadRuntime, u32> {
-        unsafe { (&mut *self.table).prepare_spawn(pi, tid, badge, role) }
+        unsafe { (&mut *self.table).prepare_spawn(pi, tid, badge, role, reservations) }
     }
 
     fn cancel_spawn(&mut self, prepared: PreparedHostedThreadRuntime) {
@@ -26242,9 +26249,10 @@ impl HostedThreadRuntimes {
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
+        reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).reserve(pi, tid, badge, role) }
+        unsafe { (&mut *self.table).reserve(pi, tid, badge, role, reservations) }
     }
 
     fn set_lpc_server_context(&mut self, badge: u64, port: u64, process: u32) -> bool {
@@ -26300,6 +26308,14 @@ impl HostedThreadRuntimes {
     fn has_process(&self, pi: usize) -> bool {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).has_process(pi) }
+    }
+
+    fn holds_pool_slot(&self, pi: usize, slot: usize) -> bool {
+        unsafe { (&*self.table).holds_pool_slot(pi, slot) }
+    }
+
+    fn holds_window_slot(&self, pi: usize, slot: usize) -> bool {
+        unsafe { (&*self.table).holds_window_slot(pi, slot) }
     }
 
     fn tcb_for_role(&self, pi: usize, role: HostedThreadRole) -> Option<u64> {

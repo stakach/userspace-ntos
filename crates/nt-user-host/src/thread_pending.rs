@@ -1,17 +1,9 @@
 //! Retained runtime ownership before fallible rollback-journal construction.
+use crate::thread_binding::ThreadRuntimeReservations;
 use crate::thread_rollback::{
     new_rollback_id, ThreadRollback, ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity,
     ThreadRollbackIo, ThreadRollbackResource, ThreadRollbackStage,
 };
-
-/// Captured holds, not lookups through a possibly reused current TID or badge mapping. The native
-/// adapter must validate their ownership and bounds against its tables before retaining a runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ThreadRuntimeReservations {
-    pub badge: u64,
-    pub pool_slot: usize,
-    pub window_slot: Option<usize>,
-}
 
 /// Non-cloneable pending owner. Admission allocates no journal, and every preparation/cleanup
 /// failure retains the runtime payload and exact reservation identity. Keep it in durable storage
