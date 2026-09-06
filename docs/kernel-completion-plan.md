@@ -74,6 +74,8 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Share native VM range capture and ordered output publication for allocate/free/protect/lock/
   unlock, preserving per-service late-fault contracts and batching scalar memory access
   (tranche 34, host/build validation).
+- [x] Correct VM flush and ordinary basic-query output protocols, with full typed IOSB capture,
+  full-length query probes, and tested late-fault status boundaries (tranche 35, host/build validation).
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25528,6 +25530,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Historical general reads, shared-writable control areas, nonimage COW policy, stack guards,
     provider unwind/exception delivery, and live MM/desktop acceptance remain open. The complete
     win32k import gate still has 33 unresolved imports and blocks live acceptance.
+
+    B3 VM flush/query-output tranche 35 (2026-09-06, host/build green):
+    Extended the host-tested native-output module with `VmFlushOutput` and `VmBasicQueryOutput`.
+    Flush probes BaseAddress, RegionSize, and the complete 16-byte IO_STATUS_BLOCK before either
+    input is captured. Typed outputs are allowed to be unaligned. Cross-page reads finish before
+    any scalar self-write, and initial faults retain their exact status. Removed the blanket
+    eight-byte-alignment rejection and the historical readable/XAS parameter capture. The native
+    range check now follows NT5's highest-address subtraction without the prior extra byte.
+
+    Extracted flush into `exec_virtual_memory_flush.rs`. Writeback uses the target's validated
+    paging context while final outputs stay in the caller's process. Final publication is size,
+    aligned base, then complete IOSB, stopping at its first fault and retaining the operation
+    status. IOSB encoding initializes all 16 bytes, including the upper status-union bytes.
+    Planner failures now publish aligned base/original size and a deterministic error IOSB instead
+    of silently skipping the post-operation output boundary. No failed writeback is converted to
+    success and no completed VM effect is rolled back because a result store faults.
+
+    Ordinary MemoryBasicInformation queries validate class/minimum length before output probes,
+    probe the entire caller-specified buffer at pointer alignment, then probe optional unaligned
+    SIZE_T ReturnLength, before validating the query address and process handle. The information
+    store reports its exact error and skips ReturnLength on failure. Once the full information
+    result is written, a late ReturnLength fault preserves success, following NT5's Found boundary.
+    The output size remains exactly 48 bytes regardless of caller buffer capacity. Replaced the
+    boolean probes/copies in this path without adding alternative memory access mechanisms.
+
+    Reference review used NT5 `mm/flushsec.c` (112, 205), `inc/ex.h` (1789, 1889, 1956),
+    `mm/queryvm.c` (226, 510, 672), and `ex/probe.c` (91). Validation: 157 `nt-address-space` and
+    50 `nt-memory-manager` tests pass (207 total). Twelve new tests cover complete probe order,
+    unaligned and aliased outputs, cross-page IOSB/ReturnLength faults, oversized query buffers,
+    size/alignment/range precedence, initialized IOSB bytes, exact fixed output width, and every
+    final store failure boundary. The executive build passes with the existing 256 warnings.
+    Logs: `.tmp/test-vm-flush-query-outputs-20260906.log` and
+    `.tmp/build-vm-flush-query-outputs-20260906.log`. Builds/tests were serialized; no QEMU boot ran.
+
+    Review adjustment: these output protocols are closed for the implemented ordinary paths,
+    not the entire VM query or flush service. Track the NT5 highest-VAD/shared-user-data query
+    branch separately: it precedes handle lookup and has distinct final-fault behavior. Unsupported
+    query classes also remain unimplemented. Next address writeback durability/progress: dirty
+    pages are currently cleared before the final filesystem flush succeeds, partial errors lose
+    written progress and may omit writable-fs dirty bookkeeping, and IOSB Information uses planned
+    size rather than actual I/O progress. Non-data-view status and terminating-process publication
+    also need NT-contract review. Then resume remaining handle/completion output audits. General
+    checked reads, shared-writable control areas, stack guards, provider unwind/exception delivery,
+    and live MM/desktop acceptance remain open; the 33-import win32k gate is unchanged.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -13,9 +13,16 @@ struct ProcessMemoryCopy<'a> {
     destination_pi: usize,
 }
 
-struct ProcessWriteProbe<'a> {
+pub(super) struct ProcessWriteProbe<'a> {
     handler: &'a mut ExecNtHandler,
     pi: usize,
+}
+
+impl<'a> ProcessWriteProbe<'a> {
+    pub(super) fn current(handler: &'a mut ExecNtHandler) -> Self {
+        let pi = handler.pi;
+        Self { handler, pi }
+    }
 }
 
 impl WriteProbeMemory for ProcessWriteProbe<'_> {

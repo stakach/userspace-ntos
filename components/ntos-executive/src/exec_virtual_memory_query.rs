@@ -1,6 +1,8 @@
 //! Native memory queries project private backing without changing fault-handler view policy.
 
 use super::*;
+use super::virtual_memory_copy::ProcessWriteProbe;
+use nt_address_space::native_output::VmBasicQueryOutput;
 
 pub(super) unsafe fn native_page_protection(
     pi: usize,
@@ -41,9 +43,7 @@ impl ExecNtHandler {
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
-        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
         let process_handle = args.first().copied().unwrap_or(0);
@@ -53,29 +53,20 @@ impl ExecNtHandler {
         let length = args.get(4).copied().unwrap_or(0);
         let return_length = args.get(5).copied().unwrap_or(0);
 
-        if base > HIGHEST_USER_ADDRESS {
-            return STATUS_INVALID_PARAMETER;
-        }
         if info_class != 0 {
             return STATUS_INVALID_INFO_CLASS;
         }
-        if length < nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE as u64 {
-            return STATUS_INFO_LENGTH_MISMATCH;
+        let output = VmBasicQueryOutput {
+            information: buffer,
+            length,
+            return_length,
+        };
+        let SyscallUserMemory::CurrentProcess = memory;
+        if let Err(status) = output.probe(&mut ProcessWriteProbe::current(self), USER_ADDRESS_LIMIT) {
+            return status;
         }
-        if buffer == 0
-            || !self.user_memory_probe_output(
-                memory,
-                buffer,
-                nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE,
-            )
-            || return_length != 0
-                && !self.user_memory_probe_output(
-                    memory,
-                    return_length,
-                    core::mem::size_of::<u64>(),
-                )
-        {
-            return STATUS_ACCESS_VIOLATION;
+        if base > HIGHEST_USER_ADDRESS {
+            return STATUS_INVALID_PARAMETER;
         }
 
         let (target_pid, target_pi) = match self
@@ -97,15 +88,7 @@ impl ExecNtHandler {
             Ok(info) => info,
             Err(status) => return status,
         };
-        if !self.user_memory_write(memory, buffer, &info.encode_x64()) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        if return_length != 0 {
-            let returned = nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE as u64;
-            if !self.user_memory_write(memory, return_length, &returned.to_le_bytes()) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-        }
-        0
+        output.publish(&mut ProcessWriteProbe::current(self), &info.encode_x64())
+            .map_or_else(|status| status, |_| 0)
     }
 }

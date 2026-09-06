@@ -16,6 +16,9 @@ mod virtual_memory_protect;
 #[path = "exec_virtual_memory_query.rs"]
 mod virtual_memory_query;
 
+#[path = "exec_virtual_memory_flush.rs"]
+mod virtual_memory_flush;
+
 #[path = "exec_virtual_memory_commit.rs"]
 mod virtual_memory_commit;
 
@@ -19303,80 +19306,6 @@ impl ExecNtHandler {
         self.secured_virtual_memory
             .unsecure(u64::from(pid), handle)
             .map(|_| ())
-    }
-
-    unsafe fn nt_flush_virtual_memory(&mut self, args: &[u64]) -> u32 {
-        const PROCESS_VM_OPERATION: u32 = 0x0008;
-        const STATUS_INVALID_PARAMETER_2: u32 = 0xC000_00F0;
-        let base_ptr = args.get(1).copied().unwrap_or(0);
-        let size_ptr = args.get(2).copied().unwrap_or(0);
-        let iosb = args.get(3).copied().unwrap_or(0);
-        if base_ptr & 7 != 0 || size_ptr & 7 != 0 || iosb & 7 != 0 {
-            return STATUS_DATATYPE_MISALIGNMENT;
-        }
-        if !self.probe_user_output(base_ptr, 8)
-            || !self.probe_user_output(size_ptr, 8)
-            || !self.probe_user_output(iosb, 16)
-        {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let mut word = [0u8; 8];
-        if !self.xas_read(base_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let base = u64::from_le_bytes(word);
-        if !self.xas_read(size_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let size = u64::from_le_bytes(word);
-        if base > HIGHEST_USER_ADDRESS
-            || size > HIGHEST_USER_ADDRESS.saturating_add(1).saturating_sub(base)
-        {
-            return STATUS_INVALID_PARAMETER_2;
-        }
-
-        let (target_pid, target_pi) =
-            match self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION) {
-                Ok(target) => target,
-                Err(status) => return status,
-            };
-        if self.pm.process(target_pid).is_some_and(|process| {
-            matches!(
-                process.state,
-                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
-            )
-        }) {
-            return nt_process::STATUS_PROCESS_IS_TERMINATING;
-        }
-        let Some(ctx) = self.loop_ctx else {
-            return STATUS_INVALID_HANDLE;
-        };
-        let generic_sections = &mut *ctx.generic_sections;
-        let plan = match generic_sections.plan_flush(target_pi, base, size) {
-            Ok(plan) => plan,
-            Err(status) => return status,
-        };
-        let (status, information) = match service_generic_section_writeback_plan(
-            generic_sections,
-            plan,
-            ctx.scratch_base,
-        ) {
-            Ok(written) => {
-                if written != 0 {
-                    self.writable_fs_dirty = true;
-                }
-                (0, plan.size)
-            }
-            Err(status) => (status, 0),
-        };
-
-        if !self.xas_try_write_buf(base_ptr, &plan.base.to_le_bytes())
-            || !self.xas_try_write_buf(size_ptr, &plan.size.to_le_bytes())
-            || !self.write_current_iosb(iosb, status, information)
-        {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        status
     }
 
     unsafe fn nt_free_virtual_memory(&mut self, args: &[u64]) -> u32 {

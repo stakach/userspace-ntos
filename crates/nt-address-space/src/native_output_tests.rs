@@ -9,6 +9,15 @@ const RANGE: VmRangeOutput = VmRangeOutput {
 };
 const OLD: u64 = 0x3001;
 const LIMIT: u64 = 0x4000;
+const FLUSH: VmFlushOutput = VmFlushOutput {
+    range: RANGE,
+    iosb: OLD,
+};
+const QUERY: VmBasicQueryOutput = VmBasicQueryOutput {
+    information: 0x800,
+    length: crate::MEMORY_BASIC_INFORMATION_X64_SIZE as u64,
+    return_length: OLD,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Access {
@@ -39,6 +48,16 @@ impl Memory {
         memory.seed(RANGE.base_pointer, &0x1234u64.to_le_bytes());
         memory.seed(RANGE.size_pointer, &0x5678u64.to_le_bytes());
         memory.seed(OLD, &0x20u32.to_le_bytes());
+        memory
+    }
+
+    fn with_outputs() -> Self {
+        let mut memory = Self::initialized();
+        memory.seed(OLD, &[0x7f; 16]);
+        memory.seed(
+            QUERY.information,
+            &[0x5a; crate::MEMORY_BASIC_INFORMATION_X64_SIZE],
+        );
         memory
     }
 }
@@ -217,4 +236,229 @@ fn protection_stores_size_base_old_and_stops_at_each_late_fault() {
             [RANGE.size_pointer, RANGE.base_pointer, OLD][..failed_store.unwrap_or(3)]
         );
     }
+}
+
+#[test]
+fn flush_probes_full_unaligned_iosb_before_capturing_range() {
+    let mut memory = Memory::with_outputs();
+    let original = memory.bytes.clone();
+    assert_eq!(FLUSH.capture(&mut memory, LIMIT), Ok((0x1234, 0x5678)));
+    let mut expected = Vec::new();
+    for (address, length) in [(RANGE.base_pointer, 8), (RANGE.size_pointer, 8), (OLD, 16)] {
+        expected.extend((0..length).map(|offset| Access::Read(address + offset)));
+        expected.extend((0..length).map(|offset| Access::ProbeWrite(address + offset)));
+    }
+    for address in [RANGE.base_pointer, RANGE.size_pointer] {
+        expected.extend((0..8).map(|offset| Access::Read(address + offset)));
+    }
+    assert_eq!(memory.accesses, expected);
+    assert_eq!(memory.bytes, original);
+}
+
+#[test]
+fn flush_cross_page_iosb_read_fault_prevents_its_self_write_and_capture() {
+    let mut memory = Memory::with_outputs();
+    let output = VmFlushOutput {
+        iosb: 0x3ff8,
+        ..FLUSH
+    };
+    memory.seed(output.iosb, &[0x77; 16]);
+    memory.fail_read = Some(0x4000);
+    assert_eq!(
+        output.capture(&mut memory, 0x5000),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(memory.accesses.len(), 32 + 9);
+    assert!(memory.accesses[32..]
+        .iter()
+        .all(|access| matches!(access, Access::Read(_))));
+    assert_eq!(memory.accesses.last(), Some(&Access::Read(0x4000)));
+}
+
+#[test]
+fn flush_probe_failures_stop_before_later_outputs_or_input_capture() {
+    for address in [RANGE.base_pointer, RANGE.size_pointer, OLD] {
+        let mut memory = Memory::with_outputs();
+        memory.fail_read = Some(address);
+        assert_eq!(
+            FLUSH.capture(&mut memory, LIMIT),
+            Err(STATUS_GUARD_PAGE_VIOLATION)
+        );
+        assert_eq!(memory.accesses.last(), Some(&Access::Read(address)));
+        assert_eq!(memory.stores, 0);
+    }
+}
+
+#[test]
+fn flush_stops_at_each_late_store_fault_and_retains_operation_status() {
+    for status in [0, 0xC000_0185] {
+        for failed_store in [None, Some(1), Some(2), Some(3)] {
+            let mut memory = Memory::with_outputs();
+            memory.fail_store = failed_store;
+            assert_eq!(
+                FLUSH.publish(&mut memory, 0x8000, 0x9000, status, 0x1200),
+                status
+            );
+            let addresses: Vec<_> = memory
+                .accesses
+                .iter()
+                .filter_map(|access| match access {
+                    Access::Store(address, _) => Some(*address),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                addresses,
+                [RANGE.size_pointer, RANGE.base_pointer, OLD][..failed_store.unwrap_or(3)]
+            );
+        }
+    }
+}
+
+#[test]
+fn flush_publishes_the_complete_initialized_iosb() {
+    let mut memory = Memory::with_outputs();
+    assert_eq!(
+        FLUSH.publish(&mut memory, 0x8000, 0x9000, 0xC000_0185, 0x123456789),
+        0xC000_0185
+    );
+    assert_eq!(read_u64(&mut memory, OLD), Ok(0xC000_0185));
+    assert_eq!(read_u64(&mut memory, OLD + 8), Ok(0x123456789));
+}
+
+#[test]
+fn flush_aliased_iosb_is_published_after_range_fields() {
+    let mut memory = Memory::with_outputs();
+    let output = VmFlushOutput {
+        iosb: RANGE.base_pointer,
+        ..FLUSH
+    };
+    assert_eq!(output.publish(&mut memory, 0x8000, 0x9000, 0, 0x42), 0);
+    assert_eq!(read_u64(&mut memory, RANGE.base_pointer), Ok(0));
+    assert_eq!(read_u64(&mut memory, RANGE.base_pointer + 8), Ok(0x42));
+}
+
+#[test]
+fn query_minimum_length_and_alignment_precede_range_probing() {
+    let mut memory = Memory::with_outputs();
+    let output = VmBasicQueryOutput {
+        information: u64::MAX,
+        length: 47,
+        ..QUERY
+    };
+    assert_eq!(output.probe(&mut memory, LIMIT), Err(0xC000_0004));
+    let output = VmBasicQueryOutput {
+        length: 48,
+        ..output
+    };
+    assert_eq!(output.probe(&mut memory, LIMIT), Err(0x8000_0002));
+    let output = VmBasicQueryOutput {
+        information: u64::MAX - 7,
+        ..output
+    };
+    assert_eq!(
+        output.probe(&mut memory, LIMIT),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert!(memory.accesses.is_empty());
+}
+
+#[test]
+fn query_probes_caller_length_beyond_the_fixed_information_structure() {
+    let mut memory = Memory::with_outputs();
+    memory.fail_read = Some(0x1000);
+    let output = VmBasicQueryOutput {
+        length: 0x801,
+        ..QUERY
+    };
+    assert_eq!(
+        output.probe(&mut memory, LIMIT),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(
+        memory.accesses,
+        vec![
+            Access::Read(0x800),
+            Access::ProbeWrite(0x800),
+            Access::Read(0x1000)
+        ]
+    );
+}
+
+#[test]
+fn query_probes_information_before_unaligned_pointer_sized_return_length() {
+    let mut memory = Memory::with_outputs();
+    assert_eq!(QUERY.probe(&mut memory, LIMIT), Ok(()));
+    let mut expected = vec![
+        Access::Read(QUERY.information),
+        Access::ProbeWrite(QUERY.information),
+    ];
+    expected.extend((0..8).map(|offset| Access::Read(OLD + offset)));
+    expected.extend((0..8).map(|offset| Access::ProbeWrite(OLD + offset)));
+    assert_eq!(memory.accesses, expected);
+}
+
+#[test]
+fn query_cross_page_length_read_fault_precedes_its_self_write() {
+    let mut memory = Memory::with_outputs();
+    let output = VmBasicQueryOutput {
+        return_length: 0x2ffc,
+        ..QUERY
+    };
+    memory.seed(output.return_length, &[0x77; 8]);
+    memory.fail_read = Some(0x3000);
+    assert_eq!(
+        output.probe(&mut memory, LIMIT),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(memory.accesses.len(), 2 + 5);
+    assert!(memory.accesses[2..]
+        .iter()
+        .all(|access| matches!(access, Access::Read(_))));
+    assert_eq!(memory.accesses.last(), Some(&Access::Read(0x3000)));
+    assert_eq!(memory.stores, 0);
+}
+
+#[test]
+fn query_information_copy_fault_skips_return_length_but_length_fault_retains_success() {
+    for failed_store in [Some(1), Some(2), None] {
+        let mut memory = Memory::with_outputs();
+        memory.fail_store = failed_store;
+        let bytes = [0x33; crate::MEMORY_BASIC_INFORMATION_X64_SIZE];
+        assert_eq!(
+            QUERY.publish(&mut memory, &bytes),
+            if failed_store == Some(1) {
+                Err(STATUS_GUARD_PAGE_VIOLATION)
+            } else {
+                Ok(())
+            }
+        );
+        assert_eq!(memory.stores, if failed_store == Some(1) { 1 } else { 2 });
+        if failed_store != Some(1) {
+            assert_eq!(
+                read_u64(&mut memory, QUERY.information),
+                Ok(0x3333333333333333)
+            );
+        }
+        if failed_store.is_none() {
+            assert_eq!(read_u64(&mut memory, OLD), Ok(48));
+        }
+    }
+}
+
+#[test]
+fn query_writes_only_the_fixed_structure_and_omits_absent_return_length() {
+    let mut memory = Memory::with_outputs();
+    let output = VmBasicQueryOutput {
+        length: 64,
+        return_length: 0,
+        ..QUERY
+    };
+    let bytes = [0x33; crate::MEMORY_BASIC_INFORMATION_X64_SIZE];
+    assert_eq!(output.publish(&mut memory, &bytes), Ok(()));
+    assert_eq!(
+        memory.accesses,
+        vec![Access::Store(QUERY.information, bytes.to_vec())]
+    );
+    assert!(!memory.bytes.contains_key(&(QUERY.information + 48)));
 }
