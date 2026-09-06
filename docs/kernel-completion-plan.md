@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-06
+Last updated: 2026-09-07
 
 ## Objective
 
@@ -38,7 +38,7 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest checkpoint (2026-09-06): B3 provider exception work is active. The complete win32k import
+Latest checkpoint (2026-09-07): B3 provider exception work is active. The complete win32k import
 gate still has 33 unresolved code imports and blocks desktop acceptance. The older desktop proofs
 below are historical baselines, not acceptance of the current provider cutover.
 
@@ -106,8 +106,14 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Stage final process VM retirement through checked leaves, page tables, and VSpace release;
   retain DLL/VAD/transition ownership until commit and recheck quiescence on retries
   (tranche 51, host/build; executive adapter wired).
-- [ ] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof; validate retained cleanup with live failures.
+- [x] Add a host-tested unpublished-thread rollback owner with unique attempt identity, retained
+  capability progress, ordered teardown, and once-only target commit (tranche 52, host/build;
+  not runtime wired).
+- [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
+  emptiness as a complete execution-quiescence proof. Next wire the registered-resume failure path
+  with retained runtime/pool/window ownership, once-only caller cancellation, reconciled physical-frame
+  ownership, and persistent refault/native-copy exclusion. Then cover unregistered/early spawn
+  failures and handler-owned handoffs; validate retained cleanup with live failures.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
   cleanup is incomplete; retain private COW backing and exact failed capabilities.
 - [ ] Bind parsed-image caches, every SEC_IMAGE section reference, mapped view, and process image
@@ -26306,6 +26312,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     completion/accounting at cutover, including fully resident reads and late output faults. Direct FAT
     partial-failure accounting, noncached alignment, live refault/persistence, and the unchanged
     33-import win32k blocker remain open.
+
+    B3 unpublished-thread rollback ownership tranche 52 (2026-09-07, host/build green):
+    `nt-user-host::thread_rollback` now owns checked cleanup for a registered hosted thread whose
+    Ps activation and handle publication never committed. Preparation validates ownership without
+    backend effects, rejects conflicting cap classes or TCB overlap, and coalesces duplicate references
+    to the same cap. The non-cloneable owner retains exact pending capabilities through repeated
+    failures. Cleanup acknowledges suspension and TCB deletion, establishes persistent memory-access
+    exclusion, retires aliases and mechanism caps, and only then recycles physical-frame owners.
+    Target commitment and pool/window reservations are released once at the final allocation-free
+    commit. Completed retries perform no backend operations; failed steps preserve their real status.
+
+    Every prepared owner receives an opaque, checked monotonic attempt ID in addition to process
+    index/PID/generation and TID. Pooled ETHREAD TIDs can recur without advancing process generation,
+    so the process identity alone cannot reject a stale cleanup attempt. Counter exhaustion refuses
+    preparation rather than wrapping. Backend admission must match the exact published attempt and
+    its retained reservations. Caller output pointers are deliberately absent: cancellation of the
+    original bound handle and failure outputs belongs once in the original syscall context, not in
+    a later maintenance retry. Failed activation does not require synthetic ETHREAD termination.
+
+    Capability release clears mirrored runtime/registry references only after acknowledged success.
+    Memory exclusion must survive every retry through commit, including other-thread access,
+    refaults and native copies. Its external-alias journal must be disjoint from the listed resources;
+    it cannot recycle slots that later stages still own. Physical-frame cleanup must also checked-unmap
+    the owner's own mapping and preflight free-list capacity. These are explicit adapter obligations,
+    not claims that the current executive already enforces them.
+
+    Validation: 14 new host tests cover repeated failure at every fallible stage, exact cap retention,
+    stale identity and same-TID attempt replacement at every retry stage, attempt exhaustion, missing
+    reservations, duplicate/conflicting ownership, TCB-slot reuse, completed retries, empty-resource
+    teardown, and mechanism failure before frame recycling. The serialized nine-crate regression
+    suite passes 897 tests, including 33 `nt-user-host` unit/integration tests. Logs:
+    `.tmp/test-thread-rollback-focused-20260907.log` and `.tmp/test-thread-rollback-20260907.log`.
+    The executive build passes at the existing 262-warning baseline and stages rootserver/hive;
+    build log: `.tmp/build-thread-rollback-20260907.log`.
+    Two research agents reviewed the ownership contract and ordering; root alone ran tests/builds.
+    Native seL4 failure injection and desktop acceptance remain unclaimed.
+
+    Review adjustment: close the host policy only. The four registered resume-failure callers still
+    use the old abort path, which drops runtime ownership before unchecked physical cleanup and
+    releases pool/window reservations immediately. Native adoption must transfer ownership atomically
+    into a retained runtime attempt, split immediate caller cancellation from target commit, exclude
+    rollback entries from resume lookup, and add a serialized retry sweep. Resource inventories require
+    physical rather than numeric deduplication: stack registry entries and resource arrays share an
+    owner cap, while TEB registry target caps and separate resource owner caps can name the same frame.
+    Do not recycle both as physical owners. Preserve external registry aliases and owner-map progress
+    under checked journals. Unregistered-spawn failure, earlier construction failure, whole-process
+    unpublished cleanup, and pre-park driver/PnP/LPC handoffs remain separately open. No unsafe native
+    cleanup path was replaced in this host-only slice; remove each old path when its adapter is enabled.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
