@@ -1,7 +1,20 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_record_id(counter: &AtomicU64) -> Result<u64, ClientFrameInsertError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| ClientFrameInsertError::IdentityExhausted)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientFrameRecord {
+    // Independent of working-set age and cap values, which may recur after row/cap-slot reuse.
+    record_id: u64,
     pub pi: u64,
     pub page: u64,
     pub frame: u64,
@@ -12,12 +25,17 @@ pub struct ClientFrameRecord {
     pub age: u64,
     pub frame_unmapped: bool,
     pub alias_unmapped: bool,
+    reclaim_started: bool,
 }
 
 impl ClientFrameRecord {
     /// Reclamation is terminal for access, even while some capabilities remain live.
     pub const fn is_resident(self) -> bool {
-        self.frame != 0 && !self.frame_unmapped && !self.alias_unmapped
+        self.frame != 0 && !self.reclaim_started && !self.frame_unmapped && !self.alias_unmapped
+    }
+
+    pub const fn is_reclaiming(self) -> bool {
+        self.reclaim_started
     }
 
     pub fn mapped_alias(self) -> Option<u64> {
@@ -41,8 +59,13 @@ pub enum ClientFrameInsert {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientFrameInsertError {
+    InvalidRecord,
     ConflictingFrame,
     ConflictingOwnership,
+    ConflictingAlias,
+    ConflictingSource,
+    Reclaiming,
+    IdentityExhausted,
     AllocationFailed,
 }
 
@@ -55,6 +78,11 @@ pub struct ClientFrameRegistryStats {
     pub allocation_failures: u64,
     pub frame_conflicts: u64,
     pub ownership_conflicts: u64,
+    pub alias_conflicts: u64,
+    pub source_conflicts: u64,
+    pub invalid_records: u64,
+    pub reclaim_refusals: u64,
+    pub identity_exhaustions: u64,
 }
 
 pub struct ClientFrameRegistry {
@@ -65,6 +93,11 @@ pub struct ClientFrameRegistry {
     allocation_failures: u64,
     frame_conflicts: u64,
     ownership_conflicts: u64,
+    alias_conflicts: u64,
+    source_conflicts: u64,
+    invalid_records: u64,
+    reclaim_refusals: u64,
+    identity_exhaustions: u64,
 }
 
 impl ClientFrameRegistry {
@@ -77,6 +110,11 @@ impl ClientFrameRegistry {
             allocation_failures: 0,
             frame_conflicts: 0,
             ownership_conflicts: 0,
+            alias_conflicts: 0,
+            source_conflicts: 0,
+            invalid_records: 0,
+            reclaim_refusals: 0,
+            identity_exhaustions: 0,
         }
     }
 
@@ -106,7 +144,6 @@ impl ClientFrameRegistry {
         owns_frame: bool,
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
         let age = self.next_age;
-        self.next_age = self.next_age.saturating_add(1);
         self.insert_at_age(
             pi, page, frame, alias, alias_cap, source_cap, owns_frame, age,
         )
@@ -124,9 +161,16 @@ impl ClientFrameRegistry {
         owns_frame: bool,
         age: u64,
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
-        self.next_age = self.next_age.max(age.saturating_add(1));
+        if frame == 0 || (alias != 0 && alias_cap == 0) {
+            self.invalid_records = self.invalid_records.saturating_add(1);
+            return Err(ClientFrameInsertError::InvalidRecord);
+        }
         if let Some(index) = self.index_for(pi, page) {
             let record = &mut self.records[index];
+            if record.is_reclaiming() {
+                self.reclaim_refusals = self.reclaim_refusals.saturating_add(1);
+                return Err(ClientFrameInsertError::Reclaiming);
+            }
             if record.frame != frame {
                 self.frame_conflicts = self.frame_conflicts.saturating_add(1);
                 return Err(ClientFrameInsertError::ConflictingFrame);
@@ -135,16 +179,30 @@ impl ClientFrameRegistry {
                 self.ownership_conflicts = self.ownership_conflicts.saturating_add(1);
                 return Err(ClientFrameInsertError::ConflictingOwnership);
             }
-            if record.alias == 0 && alias != 0 {
-                record.alias = alias;
+            // An omitted pair preserves existing ownership. A dormant copy (0, cap) may acquire
+            // a mapped address only when the caller explicitly supplies that same capability.
+            if (alias_cap != 0 && record.alias_cap != 0 && alias_cap != record.alias_cap)
+                || (alias != 0 && record.alias != 0 && alias != record.alias)
+            {
+                self.alias_conflicts = self.alias_conflicts.saturating_add(1);
+                return Err(ClientFrameInsertError::ConflictingAlias);
             }
+            if source_cap != 0 && record.source_cap != 0 && source_cap != record.source_cap {
+                self.source_conflicts = self.source_conflicts.saturating_add(1);
+                return Err(ClientFrameInsertError::ConflictingSource);
+            }
+            // Every conflict is checked before any metadata, including working-set age, changes.
             if record.alias_cap == 0 && alias_cap != 0 {
                 record.alias_cap = alias_cap;
+            }
+            if record.alias == 0 && alias != 0 {
+                record.alias = alias;
             }
             if record.source_cap == 0 && source_cap != 0 {
                 record.source_cap = source_cap;
             }
             record.age = age;
+            self.next_age = self.next_age.max(age.saturating_add(1));
             return Ok(ClientFrameInsert::Updated);
         }
 
@@ -153,11 +211,16 @@ impl ClientFrameRegistry {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             return Err(ClientFrameInsertError::AllocationFailed);
         }
+        let record_id = allocate_record_id(&NEXT_RECORD_ID).map_err(|error| {
+            self.identity_exhaustions = self.identity_exhaustions.saturating_add(1);
+            error
+        })?;
         let grew = self.records.capacity() != old_capacity;
         if grew {
             self.growths = self.growths.saturating_add(1);
         }
         self.records.push(ClientFrameRecord {
+            record_id,
             pi,
             page,
             frame,
@@ -168,7 +231,9 @@ impl ClientFrameRegistry {
             age,
             frame_unmapped: false,
             alias_unmapped: false,
+            reclaim_started: false,
         });
+        self.next_age = self.next_age.max(age.saturating_add(1));
         self.high_water = self.high_water.max(self.records.len());
         Ok(ClientFrameInsert::Inserted { grew })
     }
@@ -186,6 +251,9 @@ impl ClientFrameRegistry {
         let Some(index) = self.index_for(pi, page) else {
             return false;
         };
+        if self.records[index].is_reclaiming() {
+            return false;
+        }
         self.records[index].age = self.next_age;
         self.next_age = self.next_age.saturating_add(1);
         true
@@ -205,6 +273,7 @@ impl ClientFrameRegistry {
             return None;
         }
         record.frame_unmapped = true;
+        record.reclaim_started = true;
         Some(*record)
     }
 
@@ -217,6 +286,7 @@ impl ClientFrameRegistry {
             return None;
         }
         record.alias_unmapped = true;
+        record.reclaim_started = true;
         Some(*record)
     }
 
@@ -229,6 +299,7 @@ impl ClientFrameRegistry {
             return None;
         }
         let frame = record.frame;
+        record.reclaim_started = true;
         record.frame = 0;
         if record.alias_cap == frame {
             record.alias_cap = 0;
@@ -249,6 +320,7 @@ impl ClientFrameRegistry {
             return None;
         }
         let alias = record.alias_cap;
+        record.reclaim_started = true;
         record.alias_cap = 0;
         record.alias_unmapped = false;
         if record.source_cap == alias {
@@ -265,7 +337,19 @@ impl ClientFrameRegistry {
         if record.source_cap == 0 {
             return None;
         }
+        record.reclaim_started = true;
         record.source_cap = 0;
+        Some(*record)
+    }
+
+    /// Close registration and resident access before the first destructive backend operation.
+    /// A failed unmap/delete retains this terminal state and its exact capabilities for retry.
+    pub fn begin_reclaim_exact(
+        &mut self,
+        expected: ClientFrameRecord,
+    ) -> Option<ClientFrameRecord> {
+        let record = self.exact_mut(expected)?;
+        record.reclaim_started = true;
         Some(*record)
     }
 
@@ -317,6 +401,11 @@ impl ClientFrameRegistry {
             allocation_failures: self.allocation_failures,
             frame_conflicts: self.frame_conflicts,
             ownership_conflicts: self.ownership_conflicts,
+            alias_conflicts: self.alias_conflicts,
+            source_conflicts: self.source_conflicts,
+            invalid_records: self.invalid_records,
+            reclaim_refusals: self.reclaim_refusals,
+            identity_exhaustions: self.identity_exhaustions,
         }
     }
 }
@@ -326,6 +415,10 @@ impl Default for ClientFrameRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "client_frame_lifetime_tests.rs"]
+mod lifetime_tests;
 
 #[cfg(test)]
 mod tests {

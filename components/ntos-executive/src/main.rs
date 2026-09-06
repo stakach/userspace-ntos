@@ -5851,6 +5851,10 @@ fn vm_pool_headroom_spec(passed: &mut u64) {
             && frame_registry.allocation_failures == 0
             && frame_registry.frame_conflicts == 0
             && frame_registry.ownership_conflicts == 0
+            && frame_registry.alias_conflicts == 0
+            && frame_registry.source_conflicts == 0
+            && frame_registry.invalid_records == 0
+            && frame_registry.identity_exhaustions == 0
             && free_frame_store_failures == 0
             && page_locks.allocation_failures == 0
             && VM_LOCK_RECLAIM_REFUSALS.load(Ordering::Relaxed) == 0
@@ -8687,6 +8691,9 @@ unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
     if record.owns_frame && !(&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).reserve(1) {
         return false;
     }
+    record = registry
+        .begin_reclaim_exact(record)
+        .expect("serialized frame reclaim must retain its exact owner before unmapping");
 
     if record.frame != 0 && !record.frame_unmapped {
         if page_unmap_r(record.frame) != 0 {
@@ -9170,6 +9177,16 @@ fn print_frame_registry_census(tag: &[u8]) {
     print_u64(registry.frame_conflicts);
     print_str(b"/");
     print_u64(registry.ownership_conflicts);
+    print_str(b" alias/source/invalid/id-exhausted/reclaim-refused=");
+    print_u64(registry.alias_conflicts);
+    print_str(b"/");
+    print_u64(registry.source_conflicts);
+    print_str(b"/");
+    print_u64(registry.invalid_records);
+    print_str(b"/");
+    print_u64(registry.identity_exhaustions);
+    print_str(b"/");
+    print_u64(registry.reclaim_refusals);
     print_str(b" owned/borrowed=");
     print_u64(census.owned);
     print_str(b"/");
@@ -10283,6 +10300,16 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(frame_registry.frame_conflicts);
     print_str(b"/");
     print_u64(frame_registry.ownership_conflicts);
+    print_str(b" alias/source/invalid/id-exhausted/reclaim-refused=");
+    print_u64(frame_registry.alias_conflicts);
+    print_str(b"/");
+    print_u64(frame_registry.source_conflicts);
+    print_str(b"/");
+    print_u64(frame_registry.invalid_records);
+    print_str(b"/");
+    print_u64(frame_registry.identity_exhaustions);
+    print_str(b"/");
+    print_u64(frame_registry.reclaim_refusals);
     print_str(b" driver-exports=");
     print_u64(fsd_exports.bindings as u64);
     print_str(b"/");

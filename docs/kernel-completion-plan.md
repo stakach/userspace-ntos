@@ -118,6 +118,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Prepare exclusive runtime publication before worker construction, commit successful spawns
   once into the reserved row, and remove destructive post-construction registration rejection
   (tranche 55, host/build; all five worker construction paths wired).
+- [x] Reject conflicting frame-registry alias/source publication, retain terminal reclamation state,
+  and give exact cleanup snapshots a non-reusable record identity (tranche 56, host/build;
+  native registry admission and reclamation entry wired).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next wire the registered-resume failure path
   with retained runtime/pool/window ownership, once-only caller cancellation, reconciled physical-frame
@@ -26502,6 +26505,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retention, and pending-cleanup execution/control/memory exclusions remain open. A failed
     constructor's zero result does not yet prove successful physical cleanup. Handler-owned handoffs
     also remain open. The win32k import barrier is unchanged at 33 unresolved code imports.
+
+    B3 frame-registry lifetime tranche 56 (2026-09-07, host/build green):
+    Resume-rollback integration review exposed an unstable registry boundary: repeat registration
+    silently accepted conflicting nonzero alias/source capabilities, could combine an old address
+    with a different incoming capability, and could enrich rows after reclamation had begun.
+    `ClientFrameRegistry` now checks the full request before changing any ownership or working-set
+    age. Zero-frame/address-without-cap records and conflicting nonzero aliases or sources are
+    refused. Exact replay and omitted metadata preserve existing ownership. A dormant `(0, cap)`
+    alias remains valid because worker TEB construction uses unmapped copies; adding a mapped
+    address requires the same explicitly supplied capability. There is no independent alias-address
+    update or silent replacement of a retained capability.
+
+    Registry rows now carry a private, globally unique, checked non-wrapping identity independent
+    of working-set age. Exact snapshot operations cannot affect a replacement row, even if process,
+    address, cap slots and caller-supplied age are all identical, or a registry is recreated.
+    Reclamation has a sticky terminal state: native `csrss_frame_reclaim_exact` publishes it after
+    free-list preallocation and before its first unmap. Failed unmaps retain the row and its exact
+    caps; retries accept only the current snapshot. Registration and age touches are refused while
+    reclaiming, and the resident/alias/source accessors remain unavailable even after alias-only
+    cleanup clears its transient unmap bit. All destructive exact mark/clear operations also enter
+    that terminal state. The old independent fill-and-ignore insertion behavior is removed.
+    Native registry diagnostics expose the new conflict/refusal counters, and schema/identity
+    failures participate in the existing registry integrity check.
+
+    Validation: 14 new lifetime tests plus the eight existing registry tests pass. Coverage includes
+    atomic conflict refusal, sparse replay, dormant aliases, age preservation, first-operation
+    reclamation failure, retry identity, alias/source-first teardown, same-tuple reuse, cross-registry
+    stale snapshots and identity exhaustion. The serialized nine-crate suite passes 943 tests,
+    including 231 `nt-memory-manager` tests. Logs: `.tmp/test-frame-lifetime-focused-20260907.log`
+    and `.tmp/test-frame-lifetime-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-frame-lifetime-20260907.log`.
+    Two agents audited native ownership and exclusion boundaries; root alone ran builds/tests.
+    No live failure injection or desktop proof is claimed.
+
+    Review adjustment: this closes registry admission/snapshot lifetime, not retained native
+    resume rollback. Worker TEB registry rows still describe target aliases as physical owners;
+    reconcile them with runtime-owned frames before enabling cleanup. Capture registry-only live
+    mirrors/source caps and attached/copy aliases into retained journals before exact transfer.
+    Raw frame lookups, direct mirrors, existing attachments and VM/pageout operations still bypass
+    the resident accessors, so this tranche is not a complete memory exclusion boundary. Pending
+    runtime/control/pool/window ownership and once-only caller cancellation must precede physical
+    cleanup. Exclusions must cover native copy and its mirror retry, fault/section/image admission,
+    nonsection win32k attachments, lock/secure admission, VM mutations and working-set victim/pageout
+    selection. Keep whole-process retirement blocked by retained runtimes. Partial-constructor and
+    main-process failure ownership remain open, as do handler-owned handoffs. The current complete
+    win32k import gate is still blocked by 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
