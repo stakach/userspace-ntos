@@ -2,6 +2,13 @@ use super::*;
 use crate::*;
 use alloc::{vec, vec::Vec};
 
+fn file_identity(file_id: u64) -> SectionFileIdentity {
+    SectionFileIdentity {
+        mount: SectionMountIds::new().allocate().unwrap(),
+        file_id,
+    }
+}
+
 const IO_ERROR: u32 = 0xC000_0185;
 
 #[derive(Default)]
@@ -48,7 +55,7 @@ fn fixture() -> (GenericSectionTable, GenericSectionFlushPlan) {
             0x2100,
             PAGE_READWRITE,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(7),
+            GenericSectionBacking::overlay(7, file_identity(7), 0x2100),
         )
         .unwrap();
     assert!(table.map_view(3, section, 0x10000, 0x3000, 0));
@@ -89,7 +96,7 @@ fn aliases_follow_section_offsets_across_processes_and_views() {
 }
 
 #[test]
-fn aliases_exclude_dead_views_and_distinct_sections_of_the_same_file() {
+fn aliases_exclude_dead_views_but_include_sibling_sections_of_the_same_file() {
     let (mut table, plan) = fixture();
     let other = table
         .create(
@@ -107,10 +114,16 @@ fn aliases_exclude_dead_views_and_distinct_sections_of_the_same_file() {
     let ticket = table.prepare_writeback(plan).unwrap()[0];
     assert_eq!(
         table.writeback_aliases(ticket).unwrap(),
-        vec![SectionPageAlias {
-            pi: 3,
-            page: 0x10000
-        }]
+        vec![
+            SectionPageAlias {
+                pi: 3,
+                page: 0x10000
+            },
+            SectionPageAlias {
+                pi: 8,
+                page: 0x20000
+            }
+        ]
     );
 }
 
@@ -127,8 +140,8 @@ fn alias_planning_rejects_stale_or_inconsistent_tickets() {
     table.mark_page_dirty(plan.view.section_index, 0);
     assert_eq!(table.writeback_aliases(ticket), Err(STATUS_NOT_MAPPED_VIEW));
     let ticket = table.prepare_writeback(plan).unwrap()[0];
-    table.set_page_frame(plan.view.section_index, 0, 900);
-    assert_eq!(table.writeback_aliases(ticket), Err(STATUS_NOT_MAPPED_VIEW));
+    assert!(!table.set_page_frame(plan.view.section_index, 0, 900));
+    assert!(table.writeback_aliases(ticket).is_ok());
 }
 
 #[test]
@@ -321,9 +334,9 @@ fn later_dirty_mark_invalidates_an_old_completion_ticket() {
 fn replacement_and_reset_cannot_revive_stale_tickets() {
     let (mut table, plan) = fixture();
     let ticket = table.prepare_writeback(plan).unwrap()[0];
-    assert!(table.set_page_frame(plan.view.section_index, ticket.page_index, 999));
+    assert!(!table.set_page_frame(plan.view.section_index, ticket.page_index, 999));
     assert!(table.set_page_frame(plan.view.section_index, ticket.page_index, ticket.frame));
-    assert!(!table.complete_writeback_page(ticket));
+    assert!(table.complete_writeback_page(ticket));
     table.clear_section(plan.view.section_index);
     while let Some(retirement) = table.next_retirement() {
         assert!(table.complete_retirement(retirement));
@@ -336,7 +349,7 @@ fn replacement_and_reset_cannot_revive_stale_tickets() {
             0x2100,
             PAGE_READWRITE,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(7),
+            GenericSectionBacking::overlay(7, file_identity(7), 0x2100),
         )
         .unwrap();
     assert_eq!(section, plan.view.section_index);

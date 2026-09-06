@@ -105,8 +105,18 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
     scratch_base: u64,
     context: Option<ExecLoopCtx>,
 ) -> WritebackResult {
+    if table.section(plan.view.section_index) != Some(plan.section) {
+        return WritebackResult::failure(nt_memory_manager::STATUS_NOT_MAPPED_VIEW);
+    }
     if !generic_section_writes_back(plan.section) {
         return WritebackResult::default();
+    }
+    let Some(info) = crate::writable_fs::standard_information(plan.section.backing.overlay_file_id)
+    else {
+        return WritebackResult::failure(nt_fs::STATUS_INVALID_HANDLE);
+    };
+    if let Err(status) = table.refresh_file_extent(plan.view.section_index, info.end_of_file) {
+        return WritebackResult::failure(status);
     }
     let result = table.writeback(
         plan,

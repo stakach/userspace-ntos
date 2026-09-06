@@ -11,6 +11,7 @@ pub enum SectionRetirementResource {
 pub struct SectionRetirement {
     section_index: usize,
     generation: u64,
+    control_area: u64,
     page_epoch: u64,
     pub resource: SectionRetirementResource,
 }
@@ -70,13 +71,17 @@ impl GenericSectionTable {
             .iter()
             .enumerate()
             .find(|(_, section)| !section.live && section.backing.is_live())?;
-        let page = self
-            .pages
-            .iter()
-            .find(|page| page.live && page.section_index == section_index);
+        let page = if self.control_area_live(section.control_area) {
+            None
+        } else {
+            self.pages
+                .iter()
+                .find(|page| page.live && page.control_area == section.control_area)
+        };
         Some(SectionRetirement {
             section_index,
             generation: section.generation,
+            control_area: section.control_area,
             page_epoch: page.map_or(0, |page| page.dirty_epoch),
             resource: page.map_or(
                 SectionRetirementResource::Backing(section.backing),
@@ -94,7 +99,7 @@ impl GenericSectionTable {
             SectionRetirementResource::Frame(frame) => {
                 let Some(page) = self.pages.iter_mut().find(|page| {
                     page.live
-                        && page.section_index == ticket.section_index
+                        && page.control_area == ticket.control_area
                         && page.frame == frame
                         && page.dirty_epoch == ticket.page_epoch
                 }) else {
@@ -104,6 +109,7 @@ impl GenericSectionTable {
             }
             SectionRetirementResource::Backing(_) => {
                 self.sections[ticket.section_index] = GenericSection::empty();
+                self.retire_control_area_if_unreferenced(ticket.control_area);
             }
         }
         true

@@ -1,8 +1,18 @@
 use alloc::vec::Vec;
 
+#[path = "section_control_area.rs"]
+mod control_area;
+use control_area::ControlArea;
+pub use control_area::{SectionFileIdentity, SectionMountId, SectionMountIds};
+
+#[path = "section_pages.rs"]
+mod pages;
+
 #[path = "section_retirement.rs"]
 mod retirement;
-pub use retirement::{PendingSectionFrames, SectionRetirement, SectionRetirementIo, SectionRetirementResource};
+pub use retirement::{
+    PendingSectionFrames, SectionRetirement, SectionRetirementIo, SectionRetirementResource,
+};
 
 use crate::{PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
 
@@ -26,6 +36,8 @@ pub struct GenericSectionBacking {
     pub first_cluster: u32,
     pub file_size: u32,
     pub overlay_file_id: u64,
+    pub file: Option<SectionFileIdentity>,
+    pub file_extent: u64,
 }
 
 impl GenericSectionBacking {
@@ -35,6 +47,8 @@ impl GenericSectionBacking {
             first_cluster: 0,
             file_size: 0,
             overlay_file_id: 0,
+            file: None,
+            file_extent: 0,
         }
     }
 
@@ -44,24 +58,30 @@ impl GenericSectionBacking {
             first_cluster: 0,
             file_size: 0,
             overlay_file_id: 0,
+            file: None,
+            file_extent: 0,
         }
     }
 
-    pub const fn disk(first_cluster: u32, file_size: u32) -> Self {
+    pub const fn disk(first_cluster: u32, file_size: u32, file: SectionFileIdentity) -> Self {
         Self {
             kind: GENERIC_SECTION_BACKING_DISK,
             first_cluster,
             file_size,
             overlay_file_id: 0,
+            file: Some(file),
+            file_extent: file_size as u64,
         }
     }
 
-    pub const fn overlay(file_id: u64) -> Self {
+    pub const fn overlay(file_id: u64, file: SectionFileIdentity, file_extent: u64) -> Self {
         Self {
             kind: GENERIC_SECTION_BACKING_OVERLAY,
             first_cluster: 0,
             file_size: 0,
             overlay_file_id: file_id,
+            file: Some(file),
+            file_extent,
         }
     }
 
@@ -74,6 +94,7 @@ impl GenericSectionBacking {
 pub struct GenericSection {
     pub live: bool,
     pub generation: u64,
+    control_area: u64,
     pub owner_pi: usize,
     pub handle: u64,
     pub size: u64,
@@ -87,6 +108,7 @@ impl GenericSection {
         Self {
             live: false,
             generation: 0,
+            control_area: 0,
             owner_pi: 0,
             handle: 0,
             size: 0,
@@ -160,7 +182,7 @@ impl GenericSectionView {
 #[derive(Clone, Copy)]
 struct GenericSectionPage {
     live: bool,
-    section_index: usize,
+    control_area: u64,
     page_index: u64,
     frame: u64,
     dirty: bool,
@@ -171,7 +193,7 @@ impl GenericSectionPage {
     const fn empty() -> Self {
         Self {
             live: false,
-            section_index: usize::MAX,
+            control_area: 0,
             page_index: 0,
             frame: 0,
             dirty: false,
@@ -201,6 +223,7 @@ pub struct GenericSectionTableStats {
 
 pub struct GenericSectionTable {
     sections: Vec<GenericSection>,
+    control_areas: Vec<ControlArea>,
     views: Vec<GenericSectionView>,
     pages: Vec<GenericSectionPage>,
     dirty_epoch: u64,
@@ -217,6 +240,7 @@ impl GenericSectionTable {
     pub const fn new() -> Self {
         Self {
             sections: Vec::new(),
+            control_areas: Vec::new(),
             views: Vec::new(),
             pages: Vec::new(),
             dirty_epoch: 0,
@@ -244,12 +268,16 @@ impl GenericSectionTable {
         view_reserve: usize,
         page_reserve: usize,
     ) -> bool {
-        if self.sections.iter().any(|section| section.backing.is_live())
+        if self
+            .sections
+            .iter()
+            .any(|section| section.backing.is_live())
             || self.pages.iter().any(|page| page.live)
         {
             return false;
         }
         self.sections.clear();
+        self.control_areas.clear();
         self.views.clear();
         self.pages.clear();
         self.section_growths = 0;
@@ -324,6 +352,14 @@ impl GenericSectionTable {
         if size == 0 || !backing.is_live() {
             return None;
         }
+        match backing.kind {
+            GENERIC_SECTION_BACKING_ANON if backing.file.is_none() => {}
+            GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY
+                if backing.file.is_some()
+                    && size <= backing.file_extent
+                    && backing.file_extent <= crate::data_section::MAX_DATA_SECTION_SIZE => {}
+            _ => return None,
+        }
         if handle != 0 {
             if self.index_for_handle(owner_pi, handle).is_some() {
                 return None;
@@ -331,9 +367,16 @@ impl GenericSectionTable {
         }
         let generation = self.section_generation.checked_add(1)?;
         self.section_generation = generation;
+        self.validate_backing_extent(backing).ok()?;
+        let existing = self.matching_control_area(backing);
+        if existing.is_none() {
+            self.control_areas.try_reserve(1).ok()?;
+        }
+        let area_id = existing.map_or(generation, |index| self.control_areas[index].id);
         let section = GenericSection {
             live: true,
             generation,
+            control_area: area_id,
             owner_pi,
             handle,
             size,
@@ -341,12 +384,36 @@ impl GenericSectionTable {
             allocation_attributes,
             backing,
         };
-        if let Some(index) = self.sections.iter().position(|entry| !entry.backing.is_live()) {
+        let index = if let Some(index) = self
+            .sections
+            .iter()
+            .position(|entry| !entry.backing.is_live())
+        {
             self.sections[index] = section;
-            Some(index)
+            index
         } else {
-            self.append_section(section)
+            self.append_section(section)?
+        };
+        if let Some(area) = existing {
+            self.control_areas[area].extent = backing.file_extent;
+        } else {
+            let area = ControlArea {
+                id: area_id,
+                file: backing.file,
+                kind: backing.kind,
+                extent: if backing.file.is_some() {
+                    backing.file_extent
+                } else {
+                    size
+                },
+            };
+            if let Some(slot) = self.control_areas.iter_mut().find(|area| area.id == 0) {
+                *slot = area;
+            } else {
+                self.control_areas.push(area);
+            }
         }
+        Some(index)
     }
 
     pub fn bind_handle(&mut self, index: usize, handle: u64) -> bool {
@@ -528,259 +595,6 @@ impl GenericSectionTable {
         })
     }
 
-    pub fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
-        self.section(section_index)?;
-        self.pages
-            .iter()
-            .find(|page| {
-                page.live && page.section_index == section_index && page.page_index == page_index
-            })
-            .map(|page| page.frame)
-            .filter(|frame| *frame != 0)
-    }
-
-    pub fn set_page_frame(&mut self, section_index: usize, page_index: u64, frame: u64) -> bool {
-        if frame == 0 || self.section(section_index).is_none() {
-            return false;
-        }
-        let Some(epoch) = self.dirty_epoch.checked_add(1) else {
-            return false;
-        };
-        self.dirty_epoch = epoch;
-        if let Some(page) = self.pages.iter_mut().find(|page| {
-            page.live && page.section_index == section_index && page.page_index == page_index
-        }) {
-            page.frame = frame;
-            page.dirty_epoch = epoch;
-            return true;
-        }
-        let page = GenericSectionPage {
-            live: true,
-            section_index,
-            page_index,
-            frame,
-            dirty: false,
-            dirty_epoch: epoch,
-        };
-        if let Some(index) = self.pages.iter().position(|entry| !entry.live) {
-            self.pages[index] = page;
-            true
-        } else {
-            self.append_page(page)
-        }
-    }
-
-    pub fn mark_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
-        if self.section(section_index).is_none() { return false; }
-        let Some(epoch) = self.dirty_epoch.checked_add(1) else {
-            return false;
-        };
-        self.dirty_epoch = epoch;
-        if let Some(page) = self.pages.iter_mut().find(|page| {
-            page.live && page.section_index == section_index && page.page_index == page_index
-        }) {
-            page.dirty = true;
-            page.dirty_epoch = epoch;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Retire only the version that was copied and checkpointed. Later marks or replacement
-    /// frames remain dirty, including reuse of a page slot after an earlier batch was captured.
-    pub fn complete_writeback_page(
-        &mut self,
-        ticket: crate::writeback::SectionWritebackPage,
-    ) -> bool {
-        if self.section(ticket.section_index).is_none() { return false; }
-        if let Some(page) = self.pages.iter_mut().find(|page| {
-            page.live
-                && page.dirty
-                && page.section_index == ticket.section_index
-                && page.page_index == ticket.page_index
-                && page.frame == ticket.frame
-                && page.dirty_epoch == ticket.dirty_epoch
-        }) {
-            page.dirty = false;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn prepare_writeback(
-        &self,
-        plan: GenericSectionFlushPlan,
-    ) -> Result<Vec<crate::writeback::SectionWritebackPage>, u32> {
-        if self.section(plan.view.section_index) != Some(plan.section)
-            || !self.views.contains(&plan.view)
-        {
-            return Err(STATUS_NOT_MAPPED_VIEW);
-        }
-        let displacement = plan
-            .base
-            .checked_sub(plan.view.base)
-            .ok_or(STATUS_INVALID_PARAMETER_2)?;
-        if plan.size == 0
-            || displacement
-                .checked_add(plan.size)
-                .is_none_or(|end| end > plan.view.size)
-            || plan.view.section_offset.checked_add(displacement) != Some(plan.section_offset)
-        {
-            return Err(STATUS_INVALID_PARAMETER_2);
-        }
-        let end = plan
-            .section_offset
-            .checked_add(plan.size)
-            .ok_or(STATUS_INVALID_PARAMETER_2)?;
-        let mut pages = Vec::new();
-        for page in &self.pages {
-            if !page.live || !page.dirty || page.section_index != plan.view.section_index {
-                continue;
-            }
-            let offset = page
-                .page_index
-                .checked_mul(0x1000)
-                .ok_or(STATUS_INVALID_PARAMETER_2)?;
-            if offset < plan.section_offset || offset >= end {
-                continue;
-            }
-            let length = plan.section.size.saturating_sub(offset).min(0x1000) as usize;
-            if length != 0 {
-                pages.try_reserve(1).map_err(|_| 0xC000_009Au32)?; // STATUS_INSUFFICIENT_RESOURCES
-                pages.push(crate::writeback::SectionWritebackPage {
-                    section_index: page.section_index,
-                    page_index: page.page_index,
-                    frame: page.frame,
-                    file_offset: offset,
-                    length,
-                    dirty_epoch: page.dirty_epoch,
-                });
-            }
-        }
-        pages.sort_unstable_by_key(|page| page.page_index);
-        Ok(pages)
-    }
-
-    pub fn writeback(
-        &mut self,
-        plan: GenericSectionFlushPlan,
-        io: &mut impl crate::writeback::SectionWritebackIo,
-    ) -> crate::writeback::WritebackResult {
-        let pages = match self.prepare_writeback(plan) {
-            Ok(pages) => pages,
-            Err(status) => return crate::writeback::WritebackResult::failure(status),
-        };
-        // Rearm the entire batch before the first copy. Faults after this point must dirty-admit
-        // through the memory owner; no writable alias may outlive successful ticket retirement.
-        for page in &pages {
-            let aliases = match self.writeback_aliases(*page) {
-                Ok(aliases) => aliases,
-                Err(status) => return crate::writeback::WritebackResult::failure(status),
-            };
-            for alias in aliases {
-                if let Err(status) = io.rearm_alias(alias) {
-                    return crate::writeback::WritebackResult::failure(status);
-                }
-            }
-        }
-        let result = crate::writeback::writeback_pages(&pages, io);
-        if result.status == 0 {
-            for page in pages {
-                let _ = self.complete_writeback_page(page);
-            }
-        }
-        result
-    }
-
-    pub fn writeback_aliases(
-        &self,
-        ticket: crate::writeback::SectionWritebackPage,
-    ) -> Result<Vec<crate::writeback::SectionPageAlias>, u32> {
-        if self.section(ticket.section_index).is_none() || !self.pages.iter().any(|page| {
-            page.live
-                && page.dirty
-                && page.section_index == ticket.section_index
-                && page.page_index == ticket.page_index
-                && page.frame == ticket.frame
-                && page.dirty_epoch == ticket.dirty_epoch
-        }) || ticket.page_index.checked_mul(0x1000) != Some(ticket.file_offset)
-        {
-            return Err(STATUS_NOT_MAPPED_VIEW);
-        }
-        let mut aliases = Vec::new();
-        for view in &self.views {
-            if !view.live || view.section_index != ticket.section_index {
-                continue;
-            }
-            if view.base & 0xfff != 0
-                || view.section_offset & 0xfff != 0
-                || view.base.checked_add(view.size).is_none()
-                || view.section_offset.checked_add(view.size).is_none()
-            {
-                return Err(STATUS_INVALID_PARAMETER_2);
-            }
-            let Some(displacement) = ticket.file_offset.checked_sub(view.section_offset) else {
-                continue;
-            };
-            if displacement >= view.size {
-                continue;
-            }
-            let page = view
-                .base
-                .checked_add(displacement)
-                .ok_or(STATUS_INVALID_PARAMETER_2)?;
-            aliases.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
-            aliases.push(crate::writeback::SectionPageAlias { pi: view.pi, page });
-        }
-        Ok(aliases)
-    }
-
-    pub fn next_dirty_page_for_view(
-        &self,
-        view: GenericSectionView,
-        section: GenericSection,
-    ) -> Option<(u64, u64, u64, usize)> {
-        self.next_dirty_page_in_range(view.section_index, section, view.section_offset, view.size)
-    }
-
-    pub fn next_dirty_page_for_flush(
-        &self,
-        plan: GenericSectionFlushPlan,
-    ) -> Option<(u64, u64, u64, usize)> {
-        self.next_dirty_page_in_range(
-            plan.view.section_index,
-            plan.section,
-            plan.section_offset,
-            plan.size,
-        )
-    }
-
-    fn next_dirty_page_in_range(
-        &self,
-        section_index: usize,
-        section: GenericSection,
-        range_start: u64,
-        range_size: u64,
-    ) -> Option<(u64, u64, u64, usize)> {
-        let range_end = range_start.saturating_add(range_size);
-        for page in &self.pages {
-            if !page.live || !page.dirty || page.section_index != section_index {
-                continue;
-            }
-            let page_offset = page.page_index.saturating_mul(0x1000);
-            if page_offset < range_start || page_offset >= range_end {
-                continue;
-            }
-            let len = section.size.saturating_sub(page_offset).min(0x1000) as usize;
-            if len != 0 {
-                return Some((page.page_index, page.frame, page_offset, len));
-            }
-        }
-        None
-    }
-
     pub fn stats(&self) -> GenericSectionTableStats {
         GenericSectionTableStats {
             live_sections: self.sections.iter().filter(|section| section.live).count(),
@@ -811,6 +625,13 @@ impl Default for GenericSectionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_identity(file_id: u64) -> SectionFileIdentity {
+        SectionFileIdentity {
+            mount: SectionMountIds::new().allocate().unwrap(),
+            file_id,
+        }
+    }
 
     fn create_section(table: &mut GenericSectionTable, owner_pi: usize, handle: u64) -> usize {
         table
@@ -916,7 +737,7 @@ mod tests {
                 0x8000,
                 crate::PAGE_READWRITE,
                 SECTION_ATTR_SEC_COMMIT,
-                GenericSectionBacking::overlay(7),
+                GenericSectionBacking::overlay(7, file_identity(7), 0x8000),
             )
             .unwrap();
         assert!(table.map_view(3, section, 0x1_0000, 0x4000, 0x2000));
@@ -939,7 +760,7 @@ mod tests {
                 0x8000,
                 crate::PAGE_READWRITE,
                 SECTION_ATTR_SEC_COMMIT,
-                GenericSectionBacking::disk(4, 0x8000),
+                GenericSectionBacking::disk(4, 0x8000, file_identity(4)),
             )
             .unwrap();
         assert!(table.map_view(4, section, 0x2_0000, 0x5000, 0x1000));
@@ -961,7 +782,7 @@ mod tests {
                 0x4000,
                 crate::PAGE_READWRITE,
                 SECTION_ATTR_SEC_COMMIT,
-                GenericSectionBacking::overlay(7),
+                GenericSectionBacking::overlay(7, file_identity(7), 0x8000),
             )
             .unwrap();
         let anonymous = create_section(&mut table, 2, 0x44);
@@ -993,7 +814,7 @@ mod tests {
                 0x4000,
                 crate::PAGE_READWRITE,
                 SECTION_ATTR_SEC_COMMIT,
-                GenericSectionBacking::overlay(7),
+                GenericSectionBacking::overlay(7, file_identity(7), 0x8000),
             )
             .unwrap();
         assert!(table.map_view(6, section, 0x5_0000, 0x4000, 0));

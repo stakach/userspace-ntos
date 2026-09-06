@@ -25806,6 +25806,64 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and integrated persistence tests remain open. No QEMU or desktop acceptance is claimed; the
     33-import win32k gate is unchanged.
 
+    B3 shared data-control-area tranche 41 (2026-09-06, host/build green):
+    Independently created data sections now share canonical frames and dirty state by a mounted-file
+    identity, not a pathname, executable identity, reusable open slot, or first section index. One
+    checked monotonic mount-ID allocator serves both executive FAT and writable-volume publications;
+    mount IDs never wrap or reset. FAT keys use the opened file's stable directory metadata ID;
+    writable keys use the stable node file ID, including hardlink/reopen aliases. Both mount owners
+    reject replacement while retained handles can still refer to them. Allocation happens at
+    executive publication, not inside mount parsing that also runs in the read-only storage host.
+
+    A generation-bound control area owns page frames, dirty epochs, and backing extent. Sections
+    retain independent size, protection, handles/views, and FILE_OBJECT references; anonymous
+    sections remain distinct. Closing an early section releases its own file reference but never
+    the shared frames while siblings remain. The last section/view retires all source frames before
+    releasing backing ownership. Dead-only areas cannot accept new joins, including during failed
+    frame release. Reused section/control records and reused physical frame values cannot revive old
+    retirement or dirty tickets. Canonical frame publication is idempotent for the same frame and
+    refuses replacement by a different owner. Missing file keys and invalid backing extents are
+    refused at publication. Page/alias/writeback logic moved out of `runtime_section.rs` into focused
+    `section_pages.rs`, alongside the new `section_control_area` policy module.
+
+    Dirty tickets name the shared area generation, page/frame epoch, and exact backing extent.
+    A sibling write invalidates an earlier ticket, and completion does not depend on the continued
+    existence of whichever section requested the flush. Flush ranges still belong to the caller's
+    view, but each selected page writes the full actual file prefix, not a shorter sibling's section
+    limit. Rearming enumerates every live sibling view across processes; private COW records remain
+    excluded by the executive alias mechanism. Page-in and writeback always use the active section's
+    retained FILE_OBJECT rather than retaining an unowned first-open slot in the control area.
+
+    Review found and fixed two unsafe extent transitions. Creation checks the observed EOF before
+    any extension, so external truncation cannot be hidden by re-extending and joining stale pages.
+    It also checks the prospective extent before mutation. Shrink is refused, and growth into a
+    resident former partial-EOF page returns `STATUS_USER_MAPPED_FILE` until resident-file coherence
+    can replace its old zero tail with actual appended bytes. Nonresident-tail and page-aligned growth
+    can proceed; extent changes invalidate older dirty tickets. Page-in checks current extent before
+    returning a shared cached frame. Writeback validates the caller section generation before querying
+    its file or changing shared extent. Failed admission does not clear dirty ownership or claim a
+    successful flush. These are explicit safety boundaries, not a substitute for coherent ordinary I/O.
+
+    Validation: 112 `nt-memory-manager`, 157 `nt-address-space`, 135 `nt-fs`, and 10 `nt-ahci` tests
+    pass (414 total). Eighteen new tests cover mounted-file isolation, shared residency/dirty state,
+    shorter-sibling and final-partial-page flush lengths, cross-process alias rearm, first/last
+    section and view lifetime, canonical replacement refusal, failed retirement/checkpoint retry,
+    stale control/extent tickets, unsafe growth/truncation refusal, and a real MemFs hardlink pair
+    whose first FILE_OBJECT slot is reused for an unrelated file while its sibling remains usable.
+    Existing distinct-section alias expectations were replaced by shared-control-area expectations.
+    The executive build passes with the existing 256 warnings. Logs:
+    `.tmp/test-control-area-20260906.log` and `.tmp/build-control-area-20260906.log`.
+    Root serialized all builds/tests; two research agents reviewed identities and ownership, including
+    a second review of the extent-transition fixes. No QEMU or physical persistence test ran.
+
+    Review adjustment: shared data-control-area ownership and wiring are complete at the host/build
+    boundary. Next unify ordinary file reads/writes and EOF changes with resident mapped pages through
+    this same owner, including dirty-page merging, partial EOF tails, truncation, and rearm/invalidation.
+    That work must replace the current conservative refusal cases with genuine coherent operations.
+    Live cross-process refault/COW and persistence acceptance, full allocation-attribute validation,
+    non-data-view/termination flush semantics, and remaining native output contracts stay open.
+    The 33-import win32k gate still blocks desktop acceptance and is unchanged by this slice.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

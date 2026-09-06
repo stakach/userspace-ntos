@@ -23,7 +23,8 @@ pub struct SectionWritebackPage {
     pub frame: u64,
     pub file_offset: u64,
     pub length: usize,
-    pub(crate) section_index: usize,
+    pub(crate) control_area: u64,
+    pub(crate) file_extent: u64,
     pub(crate) dirty_epoch: u64,
 }
 

@@ -710,17 +710,25 @@ fn note_restored_snapshot(generation: u64, bytes: usize, nodes: usize) {
     print_str(b"\n");
 }
 
-unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) {
+static mut WRITABLE_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
+
+unsafe fn install_writable_fs(mut fs: nt_fs::FileSystem, restored: bool) -> Result<(), u32> {
+    if (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).is_some() {
+        return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let mount = crate::mounted_volume::allocate_mount_id()?;
     let timestamps_initialized = fs.initialize_timestamps(nt_system_time_100ns());
     selftest(&mut fs);
     let provisioned = provision_missing_installed_sources(&mut fs);
     let slot = &mut *core::ptr::addr_of_mut!(EXEC_WRITABLE_FS);
     *slot = Some(fs);
+    *core::ptr::addr_of_mut!(WRITABLE_MOUNT_ID) = Some(mount);
     mark_runtime_dirty();
     WRITABLE_FS_MOUNT_DIRTY.store(true, Ordering::Release);
     if timestamps_initialized || provisioned || !restored {
         mark_snapshot_dirty();
     }
+    Ok(())
 }
 
 unsafe fn checkpoint_volume_snapshot() -> Result<(u64, usize), u32> {
@@ -1042,7 +1050,10 @@ pub(crate) unsafe fn writable_fs() -> Option<&'static mut nt_fs::FileSystem> {
                 return None;
             }
         };
-        install_writable_fs(fs, restored);
+        if install_writable_fs(fs, restored).is_err() {
+            WRITABLE_FS_SNAPSHOT_MOUNT_BLOCKED.store(true, Ordering::Release);
+            return None;
+        }
     }
     let fs = slot.as_mut()?;
     fs.set_current_time_100ns(nt_system_time_100ns());
@@ -1123,7 +1134,7 @@ pub(crate) unsafe fn restore_boot_system_persistence(
             }
             let nodes = fs.node_count();
             note_restored_snapshot(generation, bytes, nodes);
-            install_writable_fs(fs, true);
+            install_writable_fs(fs, true).map_err(|_| BootSystemRestoreError::MountBlocked)?;
             Ok(BootSystemPersistence::Restored(RestoredBootSystem {
                 snapshot_generation: generation,
                 snapshot_bytes: bytes,
@@ -1828,6 +1839,13 @@ pub(crate) unsafe fn standard_information(file_id: u64) -> Option<nt_fs::Standar
 
 pub(crate) unsafe fn metadata(file_id: u64) -> Option<nt_fs::FileMetadata> {
     writable_fs()?.zw_query_metadata(file_id)
+}
+
+pub(crate) unsafe fn section_backing(file_id: u64) -> Result<nt_memory_manager::GenericSectionBacking, u32> {
+    let info = metadata(file_id).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    let mount = (*core::ptr::addr_of!(WRITABLE_MOUNT_ID)).ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+    Ok(nt_memory_manager::GenericSectionBacking::overlay(file_id,
+        nt_memory_manager::SectionFileIdentity { mount, file_id: info.file_id }, info.end_of_file))
 }
 
 pub(crate) unsafe fn opened_name(file_id: u64) -> Option<alloc::string::String> {

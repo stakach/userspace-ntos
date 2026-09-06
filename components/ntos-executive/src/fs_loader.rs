@@ -1016,7 +1016,23 @@ pub(crate) unsafe fn query_nt_path_metadata_into(
 
 /// The executive's own live FAT32 handle, mounted after the storage host parks (bound to the
 /// executive's AHCI BAR + DMA-frame mappings). `None` until mounted. Read-only.
-pub(crate) static mut EXEC_FS: Option<Fat32> = None;
+static mut EXEC_FS: Option<Fat32> = None;
+static mut EXEC_FS_MOUNT_ID: Option<nt_memory_manager::SectionMountId> = None;
+
+pub(crate) unsafe fn publish_exec_fs(fs: Fat32) -> Result<(), u32> {
+    let slot = &mut *core::ptr::addr_of_mut!(EXEC_FS);
+    if slot.is_some() { return Err(nt_fs::STATUS_INVALID_DEVICE_REQUEST); }
+    let id = crate::mounted_volume::allocate_mount_id()?;
+    *core::ptr::addr_of_mut!(EXEC_FS_MOUNT_ID) = Some(id);
+    *slot = Some(fs);
+    Ok(())
+}
+
+pub(crate) unsafe fn exec_fs_file_identity(file_id: u64) -> Option<nt_memory_manager::SectionFileIdentity> {
+    Some(nt_memory_manager::SectionFileIdentity {
+        mount: (*core::ptr::addr_of!(EXEC_FS_MOUNT_ID))?, file_id,
+    })
+}
 
 /// Copy of the executive's mounted FAT32 handle (Fat32 is Copy), or None if not yet mounted.
 /// Read via a raw pointer to avoid the static_mut_refs lint (single-threaded executive).

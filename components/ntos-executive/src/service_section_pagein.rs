@@ -85,14 +85,22 @@ pub(crate) unsafe fn service_prepare_data_section_file(
     maximum_size: u64,
     protection: u32,
     granted_access: u32,
-) -> Result<u64, u32> {
+) -> Result<(GenericSectionBacking, u64), u32> {
     prepare_data_section_file(
         maximum_size,
         protection,
         granted_access,
         &mut BackingIo(backing),
     )
-    .map(|extent| extent.section_size)
+    .map(|extent| {
+        (
+            GenericSectionBacking {
+                file_extent: extent.file_size,
+                ..backing
+            },
+            extent.section_size,
+        )
+    })
 }
 
 pub(super) unsafe fn service_generic_section_frame(
@@ -106,21 +114,21 @@ pub(super) unsafe fn service_generic_section_frame(
         .checked_mul(DATA_PAGE_SIZE as u64)
         .filter(|offset| *offset < section.size)
         .ok_or(nt_memory_manager::STATUS_INVALID_VIEW_SIZE)?;
+    let mut io = BackingIo(section.backing);
+    let file_size = if section.backing.kind != GENERIC_SECTION_BACKING_ANON {
+        let info = io.query_file()?;
+        generic_sections.refresh_file_extent(section_index, info.end_of_file)?;
+        Some(info.end_of_file)
+    } else {
+        None
+    };
     if let Some(frame) = generic_sections.page_frame(section_index, page_index) {
         return Ok(frame);
     }
     // Finish backing I/O before acquiring a physical frame. Failed reads never enter the cache.
     let mut bytes = [0u8; DATA_PAGE_SIZE];
-    if section.backing.kind != GENERIC_SECTION_BACKING_ANON {
-        let mut io = BackingIo(section.backing);
-        let info = io.query_file()?;
-        read_data_section_page(
-            page_index,
-            section.size,
-            info.end_of_file,
-            &mut bytes,
-            &mut io,
-        )?;
+    if let Some(file_size) = file_size {
+        read_data_section_page(page_index, section.size, file_size, &mut bytes, &mut io)?;
     }
     reserve_pagein_cleanup()?;
     let frame = vm_frame_acquire(scratch_base)?;

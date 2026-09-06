@@ -1,6 +1,13 @@
 use super::*;
 use alloc::vec;
 
+fn file_identity(file_id: u64) -> SectionFileIdentity {
+    SectionFileIdentity {
+        mount: SectionMountIds::new().allocate().unwrap(),
+        file_id,
+    }
+}
+
 #[derive(Default)]
 struct Release {
     frames: Vec<u64>,
@@ -55,7 +62,7 @@ fn section(table: &mut GenericSectionTable) -> usize {
             0x2000,
             crate::PAGE_READWRITE,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(7),
+            GenericSectionBacking::overlay(7, file_identity(7), 0x2000),
         )
         .unwrap()
 }
@@ -156,7 +163,7 @@ fn existing_handle_cannot_replace_owned_backing() {
             0x1000,
             crate::PAGE_READONLY,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(99)
+            GenericSectionBacking::overlay(99, file_identity(99), 0x2000)
         ),
         None
     );
@@ -175,7 +182,7 @@ fn section_generation_exhaustion_does_not_reuse_identity() {
             0x1000,
             crate::PAGE_READONLY,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(7)
+            GenericSectionBacking::overlay(7, file_identity(7), 0x2000)
         ),
         None
     );
@@ -206,7 +213,11 @@ fn delete_on_close_unlinks_name_but_preserves_retained_section_storage() {
             0x1000,
             crate::PAGE_READWRITE,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(file.handle),
+            GenericSectionBacking::overlay(
+                file.handle,
+                file_identity(fs.zw_query_metadata(file.handle).unwrap().file_id),
+                0x1000,
+            ),
         )
         .unwrap();
     assert_eq!(fs.zw_close(file.handle), 0);
@@ -220,7 +231,11 @@ fn delete_on_close_unlinks_name_but_preserves_retained_section_storage() {
     let ticket = table.next_retirement().unwrap();
     assert_eq!(
         ticket.resource,
-        SectionRetirementResource::Backing(GenericSectionBacking::overlay(file.handle))
+        SectionRetirementResource::Backing(GenericSectionBacking::overlay(
+            file.handle,
+            file_identity(fs.zw_query_metadata(file.handle).unwrap().file_id),
+            0x1000
+        ))
     );
     fs.zw_release_io_reference(file.handle).unwrap();
     assert!(table.complete_retirement(ticket));
@@ -251,7 +266,11 @@ fn retained_section_backing_survives_file_close_and_reopen_without_holding_share
             0x1000,
             crate::PAGE_READWRITE,
             SECTION_ATTR_SEC_COMMIT,
-            GenericSectionBacking::overlay(file.handle),
+            GenericSectionBacking::overlay(
+                file.handle,
+                file_identity(fs.zw_query_metadata(file.handle).unwrap().file_id),
+                0x1000,
+            ),
         )
         .unwrap();
     table.map_view(3, section, 0x10000, 0x1000, 0);
@@ -292,7 +311,11 @@ fn retained_section_backing_survives_file_close_and_reopen_without_holding_share
     let ticket = table.next_retirement().unwrap();
     assert_eq!(
         ticket.resource,
-        SectionRetirementResource::Backing(GenericSectionBacking::overlay(backing))
+        SectionRetirementResource::Backing(GenericSectionBacking::overlay(
+            backing,
+            file_identity(identity),
+            0x1000
+        ))
     );
     fs.zw_release_io_reference(backing).unwrap();
     assert!(table.complete_retirement(ticket));

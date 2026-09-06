@@ -44907,6 +44907,9 @@ impl ExecNtHandler {
                     let Some(access) = self.pm.handle_access(caller_pid, file_handle) else {
                         return nt_fs::STATUS_INVALID_HANDLE;
                     };
+                    if let Err(status) = nt_memory_manager::data_section::check_data_section_file_access(page_protection, access) {
+                        return status;
+                    }
                     let backing = match object {
                         nt_process::HandleObject::DiskFile { first_cluster, size, object_id } => {
                             let open = match self.readonly_file_opens.get(object_id) {
@@ -44919,18 +44922,28 @@ impl ExecNtHandler {
                             if open.metadata.is_directory {
                                 return STATUS_INVALID_FILE_FOR_SECTION;
                             }
-                            GenericSectionBacking::disk(first_cluster, size)
+                            let Some(identity) = exec_fs_file_identity(open.metadata.file_id) else {
+                                return nt_fs::STATUS_INVALID_HANDLE;
+                            };
+                            GenericSectionBacking::disk(first_cluster, size, identity)
                         }
-                        nt_process::HandleObject::OverlayFile(file_id) => GenericSectionBacking::overlay(file_id),
+                        nt_process::HandleObject::OverlayFile(file_id) => match crate::writable_fs::section_backing(file_id) {
+                            Ok(backing) => backing,
+                            Err(status) => return status,
+                        },
                         _ => return STATUS_INVALID_FILE_FOR_SECTION,
                     };
-                    let size = match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
-                        Ok(size) => size,
+                    if let Err(status) = (&*ctx.generic_sections).validate_file_creation(backing, maxsize) {
+                        return status;
+                    }
+                    let (backing, size) = match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
+                        Ok(result) => result,
                         Err(status) => return status,
                     };
                     (backing, size)
                 };
                 let generic_sections = &mut *ctx.generic_sections;
+                if let Err(status) = generic_sections.validate_backing_extent(backing) { return status; }
                 if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
                     if let Err(status) = crate::writable_fs::retain_io_reference(backing.overlay_file_id) {
                         return status;

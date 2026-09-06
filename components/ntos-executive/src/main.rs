@@ -42,6 +42,7 @@ pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod executive_va;
 mod fs_loader;
+mod mounted_volume;
 pub(crate) use fs_loader::*;
 mod hosted_bootstrap;
 pub(crate) use hosted_bootstrap::*;
@@ -12462,6 +12463,19 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     }
     proof |= MAPPED_SECTION_WRITEBACK_SEEDED;
 
+    let backing = match crate::writable_fs::section_backing(file_id).and_then(|backing| {
+        crate::service_sec_image::service_prepare_data_section_file(backing,
+            MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64, nt_address_space::PAGE_READWRITE,
+            nt_fs::FILE_READ_DATA | nt_fs::FILE_WRITE_DATA).map(|(backing, _)| backing)
+    }) {
+        Ok(backing) => backing,
+        Err(error) => {
+            cleanup(table, section_index, frame, file_id);
+            MAPPED_SECTION_WRITEBACK_STATUS.store(error as u64, Ordering::Relaxed);
+            return;
+        }
+    };
+
     if let Err(error) = crate::writable_fs::retain_io_reference(file_id) {
         cleanup(table, section_index, frame, file_id);
         MAPPED_SECTION_WRITEBACK_STATUS.store(error as u64, Ordering::Relaxed);
@@ -12474,7 +12488,7 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
         MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64,
         nt_address_space::PAGE_READWRITE,
         SECTION_ATTR_SEC_COMMIT,
-        GenericSectionBacking::overlay(file_id),
+        backing,
     ) else {
         crate::writable_fs::release_io_reference(file_id)
             .expect("failed test section creation retains its acquired file reference");
@@ -31294,8 +31308,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             let dma_exec = copy_cap(dma_frame);
             let _ = page_map(dma_exec, AHCI_DMA_VADDR, RW_NX, CAP_INIT_THREAD_VSPACE);
             let mut generic_loader_ok = false;
-            if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA) {
-                EXEC_FS = Some(fs);
+            if let Some(fs) = fat32_mount(AHCI_VADDR, AHCI_DMA_VADDR, AHCI_IOVA)
+                .and_then(|fs| publish_exec_fs(fs).ok().map(|()| fs)) {
                 if let Some((va, sz)) = load_file_to_pool(&fs, b"reactos\\system32\\version.dll") {
                     let bytes = core::slice::from_raw_parts(va as *const u8, sz as usize);
                     let mz = sz >= 2 && bytes[0] == b'M' && bytes[1] == b'Z';
