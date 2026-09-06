@@ -1521,13 +1521,14 @@ pub(crate) unsafe fn write(file_id: u64, byte_offset: Option<u64>, data: &[u8]) 
         return (nt_fs::STATUS_INVALID_HANDLE, 0);
     };
     let (status, written) = fs.zw_write_file(file_id, byte_offset, data);
-    if status == nt_fs::STATUS_SUCCESS {
+    if status == nt_fs::STATUS_SUCCESS || written != 0 {
         OVERLAY_WRITES.fetch_add(1, Ordering::Relaxed);
         OVERLAY_BYTES_WRITTEN.fetch_add(written as u64, Ordering::Relaxed);
         if written != 0 {
             mark_snapshot_dirty();
         }
-    } else {
+    }
+    if status != nt_fs::STATUS_SUCCESS {
         trace_io_refusal(b"write", file_id, byte_offset, data.len(), status);
     }
     (status, written)

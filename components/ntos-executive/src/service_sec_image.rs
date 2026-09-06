@@ -3693,105 +3693,11 @@ fn generic_section_mark_dirty_if_backed(
     }
 }
 
-unsafe fn service_generic_section_writeback_page(
-    file_id: u64,
-    frame: u64,
-    file_offset: u64,
-    len: usize,
-    scratch_base: u64,
-) -> Result<usize, u32> {
-    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
-    if len == 0 {
-        return Ok(0);
-    }
-    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x4000;
-    let (alias, copy_error) = copy_cap_r(frame);
-    if copy_error != 0 {
-        if alias != 0 {
-            let _ = cnode_delete_recycle_r(alias);
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let map_error = page_map_r(alias, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-    if map_error != 0 {
-        let _ = cnode_delete_recycle_r(alias);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let bytes = core::slice::from_raw_parts(scratch as *const u8, len);
-    let (status, written) = crate::writable_fs::write(file_id, Some(file_offset), bytes);
-    let _ = page_unmap_r(alias);
-    let _ = cnode_delete_recycle_r(alias);
-    if status != nt_fs::STATUS_SUCCESS {
-        return Err(status);
-    }
-    if written != len {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
-    Ok(written)
-}
-
-pub(crate) unsafe fn service_generic_section_writeback_view(
-    generic_sections: &mut GenericSectionTable,
-    view: GenericSectionView,
-    scratch_base: u64,
-) -> Result<u64, u32> {
-    let Some(section) = generic_sections.section(view.section_index) else {
-        return Err(nt_fs::STATUS_INVALID_HANDLE);
-    };
-    service_generic_section_writeback_plan(
-        generic_sections,
-        GenericSectionFlushPlan {
-            view,
-            section,
-            base: view.base,
-            size: view.size,
-            section_offset: view.section_offset,
-        },
-        scratch_base,
-    )
-}
-
-pub(crate) unsafe fn service_generic_section_writeback_plan(
-    generic_sections: &mut GenericSectionTable,
-    plan: GenericSectionFlushPlan,
-    scratch_base: u64,
-) -> Result<u64, u32> {
-    let section = plan.section;
-    if !generic_section_writes_back(section) {
-        return Ok(0);
-    }
-    let mut written_total = 0u64;
-    while let Some((page_index, frame, file_offset, len)) =
-        generic_sections.next_dirty_page_for_flush(plan)
-    {
-        match service_generic_section_writeback_page(
-            section.backing.overlay_file_id,
-            frame,
-            file_offset,
-            len,
-            scratch_base,
-        ) {
-            Ok(written) => {
-                let _ = generic_sections.clear_page_dirty(plan.view.section_index, page_index);
-                GENERIC_SECTION_WRITEBACKS.fetch_add(1, Ordering::Relaxed);
-                GENERIC_SECTION_WRITEBACK_BYTES.fetch_add(written as u64, Ordering::Relaxed);
-                written_total = written_total.saturating_add(written as u64);
-            }
-            Err(status) => {
-                GENERIC_SECTION_WRITEBACK_FAILS.fetch_add(1, Ordering::Relaxed);
-                return Err(status);
-            }
-        }
-    }
-    if written_total != 0 {
-        let flush_status = crate::writable_fs::flush(section.backing.overlay_file_id);
-        if flush_status != nt_fs::STATUS_SUCCESS {
-            GENERIC_SECTION_WRITEBACK_FAILS.fetch_add(1, Ordering::Relaxed);
-            return Err(flush_status);
-        }
-    }
-    Ok(written_total)
-}
+#[path = "service_section_writeback.rs"]
+mod section_writeback;
+pub(crate) use section_writeback::{
+    service_generic_section_writeback_plan, service_generic_section_writeback_view,
+};
 
 pub(crate) unsafe fn service_generic_section_fault(
     nt_handler: &mut ExecNtHandler,

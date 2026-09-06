@@ -45,6 +45,7 @@ pub use runtime_section::{
     SECTION_ATTR_SEC_BASED, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
     SECTION_ATTR_SEC_RESERVE,
 };
+pub mod writeback;
 pub use working_set::{
     PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileStore, PagefileStoreStats,
     WorkingSetAdjustmentPlan, WorkingSetLimits, WorkingSetOwnerId, WorkingSetPage, WorkingSetTable,

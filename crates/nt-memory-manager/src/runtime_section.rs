@@ -158,6 +158,7 @@ struct GenericSectionPage {
     page_index: u64,
     frame: u64,
     dirty: bool,
+    dirty_epoch: u64,
 }
 
 impl GenericSectionPage {
@@ -168,6 +169,7 @@ impl GenericSectionPage {
             page_index: 0,
             frame: 0,
             dirty: false,
+            dirty_epoch: 0,
         }
     }
 }
@@ -195,6 +197,7 @@ pub struct GenericSectionTable {
     sections: Vec<GenericSection>,
     views: Vec<GenericSectionView>,
     pages: Vec<GenericSectionPage>,
+    dirty_epoch: u64,
     section_growths: u64,
     section_allocation_failures: u64,
     view_growths: u64,
@@ -209,6 +212,7 @@ impl GenericSectionTable {
             sections: Vec::new(),
             views: Vec::new(),
             pages: Vec::new(),
+            dirty_epoch: 0,
             section_growths: 0,
             section_allocation_failures: 0,
             view_growths: 0,
@@ -529,10 +533,15 @@ impl GenericSectionTable {
         if frame == 0 {
             return false;
         }
+        let Some(epoch) = self.dirty_epoch.checked_add(1) else {
+            return false;
+        };
+        self.dirty_epoch = epoch;
         if let Some(page) = self.pages.iter_mut().find(|page| {
             page.live && page.section_index == section_index && page.page_index == page_index
         }) {
             page.frame = frame;
+            page.dirty_epoch = epoch;
             return true;
         }
         let page = GenericSectionPage {
@@ -541,6 +550,7 @@ impl GenericSectionTable {
             page_index,
             frame,
             dirty: false,
+            dirty_epoch: epoch,
         };
         if let Some(index) = self.pages.iter().position(|entry| !entry.live) {
             self.pages[index] = page;
@@ -551,25 +561,112 @@ impl GenericSectionTable {
     }
 
     pub fn mark_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
+        let Some(epoch) = self.dirty_epoch.checked_add(1) else {
+            return false;
+        };
+        self.dirty_epoch = epoch;
         if let Some(page) = self.pages.iter_mut().find(|page| {
             page.live && page.section_index == section_index && page.page_index == page_index
         }) {
             page.dirty = true;
+            page.dirty_epoch = epoch;
             true
         } else {
             false
         }
     }
 
-    pub fn clear_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
+    /// Retire only the version that was copied and checkpointed. Later marks or replacement
+    /// frames remain dirty, including reuse of a page slot after an earlier batch was captured.
+    pub fn complete_writeback_page(
+        &mut self,
+        ticket: crate::writeback::SectionWritebackPage,
+    ) -> bool {
         if let Some(page) = self.pages.iter_mut().find(|page| {
-            page.live && page.section_index == section_index && page.page_index == page_index
+            page.live
+                && page.dirty
+                && page.section_index == ticket.section_index
+                && page.page_index == ticket.page_index
+                && page.frame == ticket.frame
+                && page.dirty_epoch == ticket.dirty_epoch
         }) {
             page.dirty = false;
             true
         } else {
             false
         }
+    }
+
+    pub fn prepare_writeback(
+        &self,
+        plan: GenericSectionFlushPlan,
+    ) -> Result<Vec<crate::writeback::SectionWritebackPage>, u32> {
+        if self.section(plan.view.section_index) != Some(plan.section)
+            || !self.views.contains(&plan.view)
+        {
+            return Err(STATUS_NOT_MAPPED_VIEW);
+        }
+        let displacement = plan
+            .base
+            .checked_sub(plan.view.base)
+            .ok_or(STATUS_INVALID_PARAMETER_2)?;
+        if plan.size == 0
+            || displacement
+                .checked_add(plan.size)
+                .is_none_or(|end| end > plan.view.size)
+            || plan.view.section_offset.checked_add(displacement) != Some(plan.section_offset)
+        {
+            return Err(STATUS_INVALID_PARAMETER_2);
+        }
+        let end = plan
+            .section_offset
+            .checked_add(plan.size)
+            .ok_or(STATUS_INVALID_PARAMETER_2)?;
+        let mut pages = Vec::new();
+        for page in &self.pages {
+            if !page.live || !page.dirty || page.section_index != plan.view.section_index {
+                continue;
+            }
+            let offset = page
+                .page_index
+                .checked_mul(0x1000)
+                .ok_or(STATUS_INVALID_PARAMETER_2)?;
+            if offset < plan.section_offset || offset >= end {
+                continue;
+            }
+            let length = plan.section.size.saturating_sub(offset).min(0x1000) as usize;
+            if length != 0 {
+                pages.try_reserve(1).map_err(|_| 0xC000_009Au32)?; // STATUS_INSUFFICIENT_RESOURCES
+                pages.push(crate::writeback::SectionWritebackPage {
+                    section_index: page.section_index,
+                    page_index: page.page_index,
+                    frame: page.frame,
+                    file_offset: offset,
+                    length,
+                    dirty_epoch: page.dirty_epoch,
+                });
+            }
+        }
+        pages.sort_unstable_by_key(|page| page.page_index);
+        Ok(pages)
+    }
+
+    pub fn writeback(
+        &mut self,
+        plan: GenericSectionFlushPlan,
+        io: &mut impl crate::writeback::SectionWritebackIo,
+    ) -> crate::writeback::WritebackResult {
+        let pages = match self.prepare_writeback(plan) {
+            Ok(pages) => pages,
+            Err(status) => return crate::writeback::WritebackResult::failure(status),
+        };
+        let result = crate::writeback::writeback_pages(&pages, io);
+        if result.status == 0 {
+            for page in pages {
+                let _ = self.complete_writeback_page(page);
+            }
+        }
+        result
     }
 
     pub fn next_dirty_page_for_view(
@@ -839,11 +936,24 @@ mod tests {
             table.next_dirty_page_for_flush(plan),
             Some((1, 0x101, 0x1000, 0x1000))
         );
-        assert!(table.clear_page_dirty(section, 1));
+        let tickets = table.prepare_writeback(plan).unwrap();
+        assert_eq!(tickets.len(), 1);
+        assert!(table.complete_writeback_page(tickets[0]));
         assert_eq!(table.next_dirty_page_for_flush(plan), None);
         assert_eq!(
             table.next_dirty_page_for_view(plan.view, plan.section),
             Some((0, 0x100, 0, 0x1000))
         );
+    }
+
+    #[test]
+    fn dirty_epoch_exhaustion_cannot_reuse_a_completion_identity() {
+        let mut table = GenericSectionTable::new();
+        let section = create_section(&mut table, 2, 0x40);
+        assert!(table.set_page_frame(section, 0, 100));
+        table.dirty_epoch = u64::MAX;
+        assert!(!table.mark_page_dirty(section, 0));
+        assert!(!table.set_page_frame(section, 0, 101));
+        assert_eq!(table.page_frame(section, 0), Some(100));
     }
 }

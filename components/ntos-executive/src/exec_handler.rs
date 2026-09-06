@@ -39257,16 +39257,16 @@ impl ExecNtHandler {
                                 return status;
                             }
                         }
-                        let writeback = match service_generic_section_writeback_view(
+                        let writeback = service_generic_section_writeback_view(
                             generic_sections,
                             view,
                             ctx.scratch_base,
-                        ) {
-                            Ok(bytes) => bytes,
-                            Err(status) => return status,
-                        };
-                        if writeback != 0 {
+                        );
+                        if writeback.bytes_written != 0 {
                             self.writable_fs_dirty = true;
+                        }
+                        if writeback.status != 0 {
+                            return writeback.status;
                         }
                         let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
                             return nt_process::STATUS_INVALID_HANDLE;

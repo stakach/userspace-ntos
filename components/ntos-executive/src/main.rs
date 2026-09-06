@@ -12531,21 +12531,18 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     }
     proof |= MAPPED_SECTION_WRITEBACK_DIRTY;
 
-    match service_generic_section_writeback_view(table, view, scratch_base) {
-        Ok(written) => {
-            bytes_written = written;
-            if written == MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64 {
-                proof |= MAPPED_SECTION_WRITEBACK_WRITTEN;
-            }
-        }
-        Err(error) => {
-            status = error;
-            cleanup(table, section_index, frame, file_id);
-            MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
-            MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
-            MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
-            return;
-        }
+    let writeback = service_generic_section_writeback_view(table, view, scratch_base);
+    bytes_written = writeback.bytes_written;
+    if writeback.status != 0 {
+        status = writeback.status;
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
+        return;
+    }
+    if bytes_written == MAPPED_SECTION_WRITEBACK_PAYLOAD.len() as u64 {
+        proof |= MAPPED_SECTION_WRITEBACK_WRITTEN;
     }
     let (read_status, read_back) =
         crate::writable_fs::read(file_id, Some(0), MAPPED_SECTION_WRITEBACK_PAYLOAD.len());
@@ -19471,32 +19468,29 @@ unsafe fn reclaim_final_process_vm(
     if let Some(ctx) = handler.loop_ctx {
         let generic_sections = &mut *ctx.generic_sections;
         while let Some(view) = generic_sections.first_view_for_process(pi) {
-            match crate::service_sec_image::service_generic_section_writeback_view(
+            let writeback = crate::service_sec_image::service_generic_section_writeback_view(
                 generic_sections,
                 view,
                 ctx.scratch_base,
-            ) {
-                Ok(bytes) => {
-                    if bytes != 0 {
-                        handler.writable_fs_dirty = true;
-                    }
-                }
-                Err(status) => {
-                    stats.generic_writeback_failures =
-                        stats.generic_writeback_failures.saturating_add(1);
-                    print_str(b"[process-vm-reclaim] mapped-section writeback failed pi=");
-                    print_u64(pi as u64);
-                    print_str(b" base=0x");
-                    print_hex((view.base >> 32) as u32);
-                    print_hex(view.base as u32);
-                    print_str(b" size=0x");
-                    print_hex((view.size >> 32) as u32);
-                    print_hex(view.size as u32);
-                    print_str(b" status=0x");
-                    print_hex(status);
-                    print_str(b"\n");
-                    break;
-                }
+            );
+            if writeback.bytes_written != 0 {
+                handler.writable_fs_dirty = true;
+            }
+            if writeback.status != 0 {
+                stats.generic_writeback_failures =
+                    stats.generic_writeback_failures.saturating_add(1);
+                print_str(b"[process-vm-reclaim] mapped-section writeback failed pi=");
+                print_u64(pi as u64);
+                print_str(b" base=0x");
+                print_hex((view.base >> 32) as u32);
+                print_hex(view.base as u32);
+                print_str(b" size=0x");
+                print_hex((view.size >> 32) as u32);
+                print_hex(view.size as u32);
+                print_str(b" status=0x");
+                print_hex(writeback.status);
+                print_str(b"\n");
+                break;
             }
             let _ = generic_sections.unmap_view(pi, view.base);
             stats.generic_views = stats.generic_views.saturating_add(1);

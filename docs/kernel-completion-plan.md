@@ -76,6 +76,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   (tranche 34, host/build validation).
 - [x] Correct VM flush and ordinary basic-query output protocols, with full typed IOSB capture,
   full-length query probes, and tested late-fault status boundaries (tranche 35, host/build validation).
+- [x] Retain section dirty batches through snapshot-publication failure, preserve partial progress,
+  and finish the configured snapshot checkpoint before publishing flush results (tranche 36).
+- [ ] Add ordered block-device cache flush barriers to snapshot commits; rearm all shared section
+  aliases and dirty-admit win32k attachments/legacy kernel copybacks before claiming repeated-flush
+  or power-loss durability acceptance.
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25574,6 +25579,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     also need NT-contract review. Then resume remaining handle/completion output audits. General
     checked reads, shared-writable control areas, stack guards, provider unwind/exception delivery,
     and live MM/desktop acceptance remain open; the 33-import win32k gate is unchanged.
+
+    B3 section writeback-checkpoint tranche 36 (2026-09-06, host/build green):
+    Added a focused `nt-memory-manager::writeback` engine and versioned section dirty batches.
+    Worklists are fallibly allocated, range-validated, and ordered by file offset. They do not loop
+    over a dirty record repeatedly within one request. Every mark and frame registration gets a
+    table-wide checked epoch; completing an older ticket cannot clear a later mark, replaced frame,
+    or reused record, even across table reset. Epoch exhaustion refuses admission. Removed the
+    unconditional `clear_page_dirty` API and early per-page retirement from the executive.
+
+    Writeback returns operation status, accepted byte count, and completed page count independently.
+    Short successful writes fail without losing accepted bytes; real backend errors retain their
+    status and prefix progress. No page in the captured batch becomes clean after a failed page
+    write or checkpoint. A successful checkpoint retires only still-matching tickets. Even a clean
+    range invokes the backing checkpoint, since prior operations may have staged filesystem bytes.
+    Forged range/offset plans cannot select pages outside their validated view.
+
+    Extracted the executive adapter into `service_section_writeback.rs`. The cached file-handle
+    flush is followed by the real configured volume-snapshot checkpoint before dirty retirement or
+    syscall output publication. Transient snapshot allocations do not escape into section state.
+    Page data is exposed through a read-only temporary alias. `NtFlushVirtualMemory` now reports
+    actual accepted bytes instead of planned range size, including partial progress on failure.
+    Unmap, process reclaim, and the mapped-section selftest consume the same result; failed unmap/
+    teardown keeps its existing view/frame retry ownership. Writable-filesystem snapshot bookkeeping
+    records any nonzero backend progress even when that write's final status is an error.
+
+    Validation: 61 `nt-memory-manager`, 157 `nt-address-space`, and 126 `nt-fs` tests pass
+    (344 total). Eleven new tests cover checkpoint failure/retry, short and partial writes, invalid
+    backend progress, clean-range checkpoints, range confinement, redirtying, frame/record reuse,
+    and epoch exhaustion. The executive build passes with the existing 256 warnings. Logs:
+    `.tmp/test-section-writeback-20260906.log` and `.tmp/build-section-writeback-20260906.log`.
+    Builds/tests were serialized; no QEMU boot or physical durability test ran.
+
+    Review adjustment: this closes snapshot-publication ordering and progress/retry accounting,
+    not complete writeback durability. The snapshot block-device interface has no cache-flush
+    operation and AHCI currently issues writes without a device-cache barrier. Implement ordering
+    barriers around snapshot data and commit publication before claiming power-loss durability.
+    Successful writeback also still needs all writable aliases rearmed before copying: ordinary
+    shared views, win32k attachment mappings, and legacy kernel copyback paths. Dirty epochs detect
+    recorded writes, not CPU stores through an alias left writable. Win32k's already-attached-page
+    fast path must perform real dirty admission rather than loop on a read-only attachment fault.
+    Keep this as a required follow-on, not a heuristic or conservative-always-dirty replacement.
+    Non-data-view/termination flush semantics, the special system-range query branch, unsupported
+    query classes, and remaining handle/completion outputs remain open. The 33-import win32k gate
+    still blocks live MM/desktop acceptance.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

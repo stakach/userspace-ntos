@@ -52,25 +52,20 @@ impl ExecNtHandler {
                 );
             }
         };
-        let (status, information) = match service_generic_section_writeback_plan(
+        let writeback = service_generic_section_writeback_plan(
             generic_sections,
             plan,
             ctx.scratch_base,
-        ) {
-            Ok(written) => {
-                if written != 0 {
-                    self.writable_fs_dirty = true;
-                }
-                (0, plan.size)
-            }
-            Err(status) => (status, 0),
-        };
+        );
+        if writeback.bytes_written != 0 {
+            self.writable_fs_dirty = true;
+        }
         output.publish(
             &mut ProcessWriteProbe::current(self),
             plan.base,
             plan.size,
-            status,
-            information,
+            writeback.status,
+            writeback.bytes_written,
         )
     }
 }
