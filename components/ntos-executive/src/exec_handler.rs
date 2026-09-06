@@ -521,7 +521,8 @@ static LPC_CACHE_MISS_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static LPC_PORT_CREATE_TRACE_N: AtomicU64 = AtomicU64::new(0);
 static SETUP_PROVISION_TRACE_N: AtomicU64 = AtomicU64::new(0);
 // The hosted syscall lane is single-dispatch today; keep overlay copy chunks out of the bump heap.
-static mut OVERLAY_WRITE_SCRATCH: [u8; 64 * 1024] = [0; 64 * 1024];
+pub(crate) const LOCAL_FILE_TRANSFER_CAP: usize = 64 * 1024;
+static mut OVERLAY_WRITE_SCRATCH: [u8; LOCAL_FILE_TRANSFER_CAP] = [0; LOCAL_FILE_TRANSFER_CAP];
 static mut SETUP_UNATTEND_SCRATCH: [u8; 4096] = [0; 4096];
 static mut NT_QUERY_ATTR_FOLDED_SCRATCH: [u8; 1024] = [0; 1024];
 static mut NT_QUERY_ATTR_RELATIVE_SCRATCH: [u8; FILE_VOLUME_RELATIVE_CAP] =
@@ -43173,7 +43174,7 @@ impl ExecNtHandler {
                         });
                 // The writable overlay keeps its existing copy-loop staging bound. Hosted drivers
                 // stream arbitrary ULONG-sized requests through their per-instance transfer bank.
-                const OVERLAY_IO_CAP: usize = 64 * 1024;
+                const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
                 let overlay_file = self.overlay_file_id_for(fh);
                 let overlay_access = overlay_file.and_then(|_| self.hosted_file_access_for(fh));
                 let overlay_write_access = overlay_file.is_none()
@@ -43625,7 +43626,7 @@ impl ExecNtHandler {
                     || self.hosted_file_access_for(fh).is_some_and(|access| {
                         access & (0x0000_0001 | 0x8000_0000 | 0x1000_0000) != 0
                     });
-                const OVERLAY_IO_CAP: usize = 64 * 1024;
+                const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some()
                 {
                     0

@@ -10058,12 +10058,14 @@ impl ClientCopyinFrameRecord {
 
 static mut CLIENT_COPYIN_FRAMES: Option<Vec<ClientCopyinFrameRecord>> = None;
 // Fixed tail slots 1..=8 cover image admission, frame zeroing, section page-in/writeback,
-// section fixtures, and source/destination COW copies. Persistent aliases must start below them.
+// section fixtures, and source/destination COW copies. Prepared native I/O additionally needs
+// up to 17 intersected pages plus an old-EOF tail for the current 64 KiB transfer bound.
 const EXECUTIVE_SCRATCH_LAYOUT: nt_address_space::scratch::ScratchWindowLayout =
-    match nt_address_space::scratch::ScratchWindowLayout::new(
+    match nt_address_space::scratch::ScratchWindowLayout::with_prepared(
         DEMAND_SCRATCH_WINDOW,
         service_sec_image::SEC_IMAGE_FAULT_CAP as u64,
         8,
+        (exec_handler::LOCAL_FILE_TRANSFER_CAP as u64).div_ceil(0x1000) + 2,
     ) {
         Some(layout) => layout,
         None => panic!("executive scratch regions must be disjoint"),

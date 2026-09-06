@@ -7,10 +7,20 @@ pub struct ScratchWindowLayout {
     window_bytes: u64,
     demand_pages: u64,
     temporary_pages: u64,
+    prepared_pages: u64,
 }
 
 impl ScratchWindowLayout {
     pub const fn new(window_bytes: u64, demand_pages: u64, temporary_pages: u64) -> Option<Self> {
+        Self::with_prepared(window_bytes, demand_pages, temporary_pages, 0)
+    }
+
+    pub const fn with_prepared(
+        window_bytes: u64,
+        demand_pages: u64,
+        temporary_pages: u64,
+        prepared_pages: u64,
+    ) -> Option<Self> {
         if window_bytes == 0 || window_bytes % PAGE_SIZE != 0 {
             return None;
         }
@@ -18,15 +28,22 @@ impl ScratchWindowLayout {
         if demand_pages > pages || temporary_pages > pages - demand_pages {
             return None;
         }
+        if prepared_pages > pages - demand_pages - temporary_pages {
+            return None;
+        }
         Some(Self {
             window_bytes,
             demand_pages,
             temporary_pages,
+            prepared_pages,
         })
     }
 
     pub const fn alias_capacity(self) -> u64 {
-        self.window_bytes / PAGE_SIZE - self.demand_pages - self.temporary_pages
+        self.window_bytes / PAGE_SIZE
+            - self.demand_pages
+            - self.temporary_pages
+            - self.prepared_pages
     }
 
     fn window_end(self, base: u64) -> Option<u64> {
@@ -39,6 +56,15 @@ impl ScratchWindowLayout {
     /// Persistent aliases grow downward immediately below the reserved temporary region.
     pub fn alias_address(self, base: u64, index: u64) -> Option<u64> {
         if index >= self.alias_capacity() {
+            return None;
+        }
+        self.window_end(base)?
+            .checked_sub((self.temporary_pages + self.prepared_pages + index + 1) * PAGE_SIZE)
+    }
+
+    /// Prepared transaction slots sit below fixed temporaries and above persistent aliases.
+    pub fn prepared_address(self, base: u64, index: u64) -> Option<u64> {
+        if index >= self.prepared_pages {
             return None;
         }
         self.window_end(base)?
@@ -57,6 +83,35 @@ impl ScratchWindowLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_native_batch_is_disjoint_from_every_fixed_and_persistent_slot() {
+        let layout = ScratchWindowLayout::with_prepared(0x400_0000, 15_000, 8, 18).unwrap();
+        assert_eq!(layout.alias_capacity(), 1358);
+        assert_eq!(layout.prepared_address(0, 0), Some(0x400_0000 - 0x9000));
+        assert_eq!(layout.prepared_address(0, 17), Some(0x400_0000 - 0x1a000));
+        assert_eq!(layout.alias_address(0, 0), Some(0x400_0000 - 0x1b000));
+        assert_eq!(layout.prepared_address(0, 18), None);
+        for index in 0..18 {
+            let address = layout.prepared_address(0, index).unwrap();
+            for slot in 1..=8 {
+                assert_ne!(Some(address), layout.temporary_address(0, slot));
+            }
+            for slot in 0..layout.alias_capacity() {
+                assert_ne!(Some(address), layout.alias_address(0, slot));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_prepared_reservations_fail_closed() {
+        assert!(ScratchWindowLayout::with_prepared(0x400_0000, 15_000, 8, 1377).is_none());
+        assert!(ScratchWindowLayout::with_prepared(4096, 0, 0, u64::MAX).is_none());
+        let layout = ScratchWindowLayout::with_prepared(0x400_0000, 15_000, 8, 18).unwrap();
+        assert_eq!(layout.prepared_address(1, 0), None);
+        assert_eq!(layout.prepared_address(u64::MAX - 4095, 0), None);
+        assert_eq!(layout.prepared_address(0, u64::MAX), None);
+    }
 
     #[test]
     fn production_window_keeps_every_persistent_alias_disjoint_from_demand_and_temporary_pages() {

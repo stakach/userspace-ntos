@@ -1509,6 +1509,14 @@ pub(crate) unsafe fn read(
     (status, bytes)
 }
 
+/// Raw backing fragments, without logical position, access metadata, or read accounting.
+pub(crate) unsafe fn read_backing_into(file_id: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
+    let Some(fs) = writable_fs() else {
+        return (nt_fs::STATUS_INVALID_HANDLE, 0);
+    };
+    fs.read_backing_into(file_id, offset, output)
+}
+
 /// `NtReadFile` on a writable-volume file object into caller-owned staging.
 pub(crate) unsafe fn read_into(
     file_id: u64,

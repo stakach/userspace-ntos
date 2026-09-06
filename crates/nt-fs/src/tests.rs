@@ -1420,6 +1420,108 @@ fn read_file_into_uses_and_advances_file_position() {
 }
 
 #[test]
+fn backing_fragments_leave_logical_read_accounting_untouched() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let file = fs.zw_create_file(
+        r"\??\C:\Temp\fragments",
+        FILE_WRITE_DATA | FILE_READ_DATA,
+        0,
+        0,
+        FILE_CREATE,
+        0,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(
+        fs.zw_write_file(file.handle, Some(0), b"abcdef"),
+        (STATUS_SUCCESS, 6)
+    );
+    let directory = fs.zw_create_file(
+        r"\??\C:\Temp",
+        FILE_LIST_DIRECTORY,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    let notify = fs
+        .zw_notify_change_directory_file(
+            directory.handle,
+            FILE_NOTIFY_CHANGE_LAST_ACCESS,
+            false,
+            256,
+            99,
+        )
+        .unwrap();
+    let before = fs.export_volume_snapshot().unwrap();
+    fs.set_current_time_100ns(123_456);
+    let mut output = [0xcc; 4];
+    assert_eq!(
+        fs.read_backing_into(file.handle, 1, &mut output[..2]),
+        (STATUS_SUCCESS, 2)
+    );
+    assert_eq!(&output[..2], b"bc");
+    assert_eq!(
+        fs.read_backing_into(file.handle, 5, &mut output),
+        (STATUS_SUCCESS, 1)
+    );
+    assert_eq!(output, [b'f', b'c', 0xcc, 0xcc]);
+    assert_eq!(fs.current_offset(file.handle), Some(0));
+    assert_eq!(fs.export_volume_snapshot().unwrap(), before);
+    assert!(fs.directory_notify_completion(notify).is_none());
+
+    assert_eq!(
+        fs.zw_read_file_into(file.handle, None, &mut output),
+        (STATUS_SUCCESS, 4)
+    );
+    assert_eq!(&output, b"abcd");
+    assert_eq!(fs.current_offset(file.handle), Some(4));
+    assert_ne!(fs.export_volume_snapshot().unwrap(), before);
+    assert_eq!(fs.pop_directory_notify_completion().unwrap().id, notify);
+    assert_eq!(
+        fs.zw_read_file_into(file.handle, Some(1), &mut output),
+        (STATUS_SUCCESS, 4)
+    );
+    assert_eq!(&output, b"bcde");
+    assert_eq!(fs.current_offset(file.handle), Some(4));
+}
+
+#[test]
+fn backing_reads_preserve_output_on_invalid_objects_and_eof() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let file = fs.zw_create_file(r"\??\C:\Temp\empty", FILE_READ_DATA, 0, 0, FILE_CREATE, 0);
+    let directory = fs.zw_create_file(
+        r"\??\C:\Temp",
+        FILE_LIST_DIRECTORY,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(file.status, STATUS_SUCCESS);
+    assert_eq!(directory.status, STATUS_SUCCESS);
+    let mut output = [0xcc; 4];
+    assert_eq!(
+        fs.read_backing_into(file.handle, 0, &mut output),
+        (STATUS_END_OF_FILE, 0)
+    );
+    assert_eq!(
+        fs.read_backing_into(file.handle, u64::MAX, &mut output),
+        (STATUS_END_OF_FILE, 0)
+    );
+    assert_eq!(
+        fs.read_backing_into(directory.handle, 0, &mut output),
+        (STATUS_INVALID_DEVICE_REQUEST, 0)
+    );
+    fs.zw_close(file.handle);
+    assert_eq!(
+        fs.read_backing_into(file.handle, 0, &mut output),
+        (STATUS_INVALID_HANDLE, 0)
+    );
+    assert_eq!(output, [0xcc; 4]);
+}
+
+#[test]
 fn copied_file_chunks_share_provisioned_source_until_modified() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_file(r"\??\C:\profiles\Default User\ntuser.dat", b"0123456789"));

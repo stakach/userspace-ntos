@@ -95,8 +95,10 @@ below are historical baselines, not acceptance of the current provider cutover.
   short/error-prefix completion (tranche 45, host/build).
 - [x] Separate persistent DLL copy-in aliases from the eight temporary section/COW scratch slots
   with a checked, host-tested layout (tranche 46, host/build).
-- [ ] Implement the executive multi-page preparation adapter; route
-  native and internal file/size mutations through explicit memory authority before activation.
+- [x] Implement multi-page prepared-alias ownership and the executive read/write adapters, with
+  durable cleanup storage and disjoint address reservation (tranche 47, host/build; not activated).
+- [ ] Route native and internal file/size mutations through explicit memory authority before
+  activating coherent native reads/writes; finish whole-operation completion/accounting.
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
   live refault/restart/power-loss tests. Unify ordinary file reads/writes and EOF changes with the
   shared control-area owner; complete storage-port abort/reset recovery without reusing device-owned
@@ -26060,14 +26062,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     agents reviewed read contracts and every current fixed scratch user. No QEMU or desktop
     acceptance is claimed; the scratch correction is wired, while coherent I/O remains host policy.
 
-    Review adjustment: the paired read/write policy is now host-tested. Next build multi-page
-    prepared-alias ownership with explicit VA reservation in the corrected layout; page-table
-    construction alone is not address ownership, and no generic executive VA allocator exists to
-    reuse. Any added fixed slots must update the shared layout. Then route native and internal file
-    mutations through explicit memory authority before activating either cache path. Retained cleanup,
-    current-position/access accounting, destructive create/size changes, CM/hive/provisioning writes,
-    and raw-adapter nonreentry remain mandatory. Live refault/persistence and the unchanged 33-import
-    win32k blocker remain open.
+    B3 prepared canonical aliases tranche 47 (2026-09-06, host/build green):
+    The former single-cap `SectionScratch` is replaced, not supplemented, by a batch owner shared by
+    ordinary one-page writeback and the new multi-page adapters. Metadata is reserved before cap
+    acquisition; every copied cap is adopted before mapping. Handles include unique owner identity,
+    checked generation, and entry index, and validate mapping rights and page bounds. Finish
+    invalidates every handle before deleting anything. Successful deletions are removed exactly once;
+    a failed deletion retains both cap and address ownership and blocks subsequent admission. Empty
+    slots following canonical-owner revoke still require checked deletion acknowledgement. Reentry
+    is rejected before constructing a mutable reference to the executive's global owner. Its retained
+    vector uses durable allocation even under an outer transient request scope.
+
+    `service_section_file_io.rs` supplies real read-only/read-write frame-cap preparation and
+    infallible prepared copies/zeroing to the paired host policies. It reuses the existing alias-rearm
+    mechanism, performs raw backing I/O without recursion into control-area policy, and keeps user
+    completion outside the adapter. The filesystem's new backing-fragment read omits logical file
+    position, access metadata, and read accounting; ordinary reads retain their prior side effects.
+    No native or internal mutation route is switched to coherent I/O in this checkpoint.
+
+    The shared scratch layout now reserves 18 prepared pages below the unchanged eight fixed
+    temporary slots: at most 17 intersected pages for the existing 64 KiB native transfer cap plus
+    a separately resident old-EOF tail. Persistent aliases begin at top minus `0x1b000` and have
+    1,358 slots, with the demand boundary unchanged. Prepared slots are checked before cap acquisition;
+    exceeding the reservation fails before backing mutation. This bound is not a claim that larger
+    internal operations are integrated. Those need explicit larger reservation or a correctly scoped
+    chunking contract. The persistent DLL registry retains its own checked partition; it is not
+    silently migrated into a new dynamic allocator.
+
+    Validation: 171 `nt-memory-manager`, 163 `nt-address-space`, 140 `nt-fs`, and 10 `nt-ahci`
+    tests pass (484 total). New coverage includes last-copy/map failure, partial cleanup, stale and
+    cross-owner handles, generation exhaustion, read-only/bounds enforcement, revoked cap cleanup,
+    real write-transaction preparation failure, every scratch partition pair, and backing-fragment
+    position/timestamp/notification isolation. The executive build passes and stages rootserver/hive,
+    with 262 warnings (six additional unused adapter declarations pending activation). Logs:
+    `.tmp/test-prepared-aliases-20260906.log` and `.tmp/build-prepared-aliases-20260906.log`.
+    Root alone ran serialized builds/tests; two agents reviewed ownership and file/address boundaries.
+    No QEMU or desktop acceptance is claimed.
+
+    Review adjustment: prepared aliases are implemented. Next close native and internal mutation
+    participation before activating either coherent cache path: writable IOSB probes, append-only
+    routing, delayed current-position completion, once-per-operation read accounting including
+    all-resident reads, destructive create/size changes, and CM/hive/provisioning writes. Keep raw
+    page-in/writeback nonreentrant and retain failure ownership throughout. Live refault/persistence
+    and the unchanged 33-import win32k blocker remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -4713,6 +4713,24 @@ impl FileSystem {
         (STATUS_SUCCESS, bytes)
     }
 
+    /// Read backing bytes without logical-file position or access-metadata side effects. Cache
+    /// owners use this for fragments; the native operation accounts for the complete read once.
+    pub fn read_backing_into(&self, handle: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
+        let Some(obj) = self.obj(handle) else {
+            return (STATUS_INVALID_HANDLE, 0);
+        };
+        if self.volume.is_dir(obj.node_id) {
+            return (STATUS_INVALID_DEVICE_REQUEST, 0);
+        }
+        if offset >= self.volume.size(obj.node_id) {
+            return (STATUS_END_OF_FILE, 0);
+        }
+        (
+            STATUS_SUCCESS,
+            self.volume.read_at_into(obj.node_id, offset, output),
+        )
+    }
+
     /// `ZwReadFile` into caller-provided storage. Same semantics as [`Self::zw_read_file`], but
     /// avoids allocating an intermediate byte vector on hot copy paths.
     pub fn zw_read_file_into(
@@ -4725,14 +4743,11 @@ impl FileSystem {
             return (STATUS_INVALID_HANDLE, 0);
         };
         let node_id = obj.node_id;
-        if self.volume.is_dir(node_id) {
-            return (STATUS_INVALID_DEVICE_REQUEST, 0);
-        }
         let offset = byte_offset.unwrap_or(obj.current_offset);
-        if offset >= self.volume.size(node_id) {
-            return (STATUS_END_OF_FILE, 0);
+        let (status, read) = self.read_backing_into(handle, offset, output);
+        if status != STATUS_SUCCESS {
+            return (status, read);
         }
-        let read = self.volume.read_at_into(node_id, offset, output);
         if read != 0 {
             self.volume.touch_access(node_id);
             self.report_handle_change(handle, crate::FILE_NOTIFY_CHANGE_LAST_ACCESS);

@@ -42,7 +42,7 @@ impl SectionScratchIo for Io {
         Ok(self.next_alias)
     }
 
-    fn map_alias(&mut self, alias: u64) -> Result<(), u32> {
+    fn map_alias(&mut self, alias: u64, _: u64, _: SectionAliasAccess) -> Result<(), u32> {
         self.events.push(Event::Map(alias));
         assert_eq!(self.reserved, Some(alias));
         assert!(!self.mapped);
@@ -75,8 +75,8 @@ fn transfer(io: &mut Io) -> (u32, usize) {
 fn success_deletes_mapping_and_capability_once_before_return() {
     let mut scratch = SectionScratch::new();
     let mut io = Io::default();
-    assert_eq!(scratch.with_frame(50, &mut io, transfer), (0, 4096));
-    assert_eq!(scratch.pending_alias, None);
+    assert_eq!(scratch.with_frame(50, 0x1000, &mut io, transfer), (0, 4096));
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), None);
     assert!(!io.mapped);
     scratch.drain(&mut io).unwrap();
     assert_eq!(
@@ -98,12 +98,15 @@ fn invalid_frame_and_failed_copy_never_acquire_cleanup_ownership() {
         ..Io::default()
     };
     assert_eq!(
-        scratch.with_frame(0, &mut io, transfer),
+        scratch.with_frame(0, 0x1000, &mut io, transfer),
         (crate::STATUS_INVALID_HANDLE, 0)
     );
     assert!(io.events.is_empty());
-    assert_eq!(scratch.with_frame(50, &mut io, transfer), (COPY_ERROR, 0));
-    assert_eq!(scratch.pending_alias, None);
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (COPY_ERROR, 0)
+    );
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), None);
     scratch.drain(&mut io).unwrap();
     assert_eq!(io.events, [Event::Copy(50)]);
 }
@@ -115,8 +118,11 @@ fn failed_map_deletes_the_unmapped_copy_without_running_transfer() {
         map_error: true,
         ..Io::default()
     };
-    assert_eq!(scratch.with_frame(50, &mut io, transfer), (MAP_ERROR, 0));
-    assert_eq!(scratch.pending_alias, None);
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (MAP_ERROR, 0)
+    );
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), None);
     assert_eq!(
         io.events,
         [Event::Copy(50), Event::Map(1), Event::Delete(1)]
@@ -131,12 +137,15 @@ fn failed_map_and_failed_delete_retain_the_exact_copy_for_retry() {
         delete_error: true,
         ..Io::default()
     };
-    assert_eq!(scratch.with_frame(50, &mut io, transfer), (MAP_ERROR, 0));
-    assert_eq!(scratch.pending_alias, Some(1));
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (MAP_ERROR, 0)
+    );
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), Some(1));
     assert!(!io.mapped);
     io.delete_error = false;
     scratch.drain(&mut io).unwrap();
-    assert_eq!(scratch.pending_alias, None);
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), None);
     assert_eq!(
         io.events,
         [
@@ -156,17 +165,20 @@ fn failed_cleanup_retains_progress_and_blocks_scratch_reuse() {
         ..Io::default()
     };
     assert_eq!(
-        scratch.with_frame(50, &mut io, transfer),
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
         (DELETE_ERROR, 4096)
     );
-    assert_eq!(scratch.pending_alias, Some(1));
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), Some(1));
     assert!(io.mapped);
     io.events.clear();
-    assert_eq!(scratch.with_frame(51, &mut io, transfer), (DELETE_ERROR, 0));
+    assert_eq!(
+        scratch.with_frame(51, 0x1000, &mut io, transfer),
+        (DELETE_ERROR, 0)
+    );
     assert_eq!(io.events, [Event::Delete(1)]);
     io.delete_error = false;
     io.events.clear();
-    assert_eq!(scratch.with_frame(51, &mut io, transfer), (0, 4096));
+    assert_eq!(scratch.with_frame(51, 0x1000, &mut io, transfer), (0, 4096));
     assert_eq!(
         io.events,
         [
@@ -187,13 +199,13 @@ fn backend_failure_wins_over_cleanup_failure_without_losing_accepted_bytes() {
         ..Io::default()
     };
     assert_eq!(
-        scratch.with_frame(50, &mut io, |_| (WRITE_ERROR, 17)),
+        scratch.with_frame(50, 0x1000, &mut io, |_| (WRITE_ERROR, 17)),
         (WRITE_ERROR, 17)
     );
-    assert_eq!(scratch.pending_alias, Some(1));
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), Some(1));
     io.delete_error = false;
     scratch.drain(&mut io).unwrap();
-    assert_eq!(scratch.pending_alias, None);
+    assert_eq!(scratch.entries.first().map(|entry| entry.cap), None);
 }
 
 #[test]
@@ -203,7 +215,10 @@ fn revoked_mapping_still_requires_copied_slot_acknowledgement() {
         delete_error: true,
         ..Io::default()
     };
-    assert_eq!(scratch.with_frame(50, &mut io, transfer).0, DELETE_ERROR);
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer).0,
+        DELETE_ERROR
+    );
     // Canonical-owner revoke empties the cap but does not release executive slot ownership.
     io.mapped = false;
     io.delete_error = false;
@@ -225,7 +240,8 @@ impl crate::writeback::SectionWritebackIo for Writeback {
         panic!("fixture has no mapped views");
     }
     fn write_page(&mut self, page: crate::writeback::SectionWritebackPage) -> (u32, usize) {
-        self.scratch.with_frame(page.frame, &mut self.io, transfer)
+        self.scratch
+            .with_frame(page.frame, 0x1000, &mut self.io, transfer)
     }
     fn persist(&mut self) -> u32 {
         if let Err(status) = self.scratch.drain(&mut self.io) {
@@ -303,7 +319,7 @@ fn clean_and_uncached_file_flushes_drain_pending_aliases_before_persistence() {
     assert_eq!(io.checkpoints, 1);
     io.io.delete_error = true;
     assert_eq!(
-        io.scratch.with_frame(50, &mut io.io, transfer).0,
+        io.scratch.with_frame(50, 0x1000, &mut io.io, transfer).0,
         DELETE_ERROR
     );
     let mut uncached = backing;
@@ -319,7 +335,7 @@ fn clean_and_uncached_file_flushes_drain_pending_aliases_before_persistence() {
     io.io.delete_error = false;
     assert_eq!(table.writeback_file(backing, &mut io).status, 0);
     assert_eq!(io.checkpoints, 2);
-    assert_eq!(io.scratch.pending_alias, None);
+    assert_eq!(io.scratch.entries.first().map(|entry| entry.cap), None);
 }
 
 impl crate::SectionRetirementIo for Io {
@@ -345,7 +361,10 @@ fn ownership_barrier_retries_copied_alias_before_frames_and_backing() {
         delete_error: true,
         ..Io::default()
     };
-    assert_eq!(scratch.with_frame(50, &mut io, transfer).0, DELETE_ERROR);
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer).0,
+        DELETE_ERROR
+    );
     table.release_handle(0);
     let first = table.next_retirement().unwrap();
     let result = scratch
