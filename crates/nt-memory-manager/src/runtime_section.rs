@@ -660,6 +660,19 @@ impl GenericSectionTable {
             Ok(pages) => pages,
             Err(status) => return crate::writeback::WritebackResult::failure(status),
         };
+        // Rearm the entire batch before the first copy. Faults after this point must dirty-admit
+        // through the memory owner; no writable alias may outlive successful ticket retirement.
+        for page in &pages {
+            let aliases = match self.writeback_aliases(*page) {
+                Ok(aliases) => aliases,
+                Err(status) => return crate::writeback::WritebackResult::failure(status),
+            };
+            for alias in aliases {
+                if let Err(status) = io.rearm_alias(alias) {
+                    return crate::writeback::WritebackResult::failure(status);
+                }
+            }
+        }
         let result = crate::writeback::writeback_pages(&pages, io);
         if result.status == 0 {
             for page in pages {
@@ -667,6 +680,49 @@ impl GenericSectionTable {
             }
         }
         result
+    }
+
+    pub fn writeback_aliases(
+        &self,
+        ticket: crate::writeback::SectionWritebackPage,
+    ) -> Result<Vec<crate::writeback::SectionPageAlias>, u32> {
+        if !self.pages.iter().any(|page| {
+            page.live
+                && page.dirty
+                && page.section_index == ticket.section_index
+                && page.page_index == ticket.page_index
+                && page.frame == ticket.frame
+                && page.dirty_epoch == ticket.dirty_epoch
+        }) || ticket.page_index.checked_mul(0x1000) != Some(ticket.file_offset)
+        {
+            return Err(STATUS_NOT_MAPPED_VIEW);
+        }
+        let mut aliases = Vec::new();
+        for view in &self.views {
+            if !view.live || view.section_index != ticket.section_index {
+                continue;
+            }
+            if view.base & 0xfff != 0
+                || view.section_offset & 0xfff != 0
+                || view.base.checked_add(view.size).is_none()
+                || view.section_offset.checked_add(view.size).is_none()
+            {
+                return Err(STATUS_INVALID_PARAMETER_2);
+            }
+            let Some(displacement) = ticket.file_offset.checked_sub(view.section_offset) else {
+                continue;
+            };
+            if displacement >= view.size {
+                continue;
+            }
+            let page = view
+                .base
+                .checked_add(displacement)
+                .ok_or(STATUS_INVALID_PARAMETER_2)?;
+            aliases.try_reserve(1).map_err(|_| 0xC000_009Au32)?;
+            aliases.push(crate::writeback::SectionPageAlias { pi: view.pi, page });
+        }
+        Ok(aliases)
     }
 
     pub fn next_dirty_page_for_view(

@@ -1715,6 +1715,10 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
+    let pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    if has_managed_section_page(pi, va, src.len()) {
+        return recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed));
+    }
     match smss_mirror(va, src.len() as u64) {
         Some(m) => {
             core::ptr::copy_nonoverlapping(src.as_ptr(), m as *mut u8, src.len());
@@ -1727,6 +1731,13 @@ pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
             ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed),
         ),
     }
+}
+
+unsafe fn has_managed_section_page(pi: u64, va: u64, length: usize) -> bool {
+    nt_address_space::page_chunks(va, length).is_some_and(|mut chunks| {
+        chunks.any(|chunk| crate::process_committed_mapping_basic_information(pi, chunk.page_base)
+            .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED))
+    })
 }
 
 unsafe fn with_recorded_frame_alias(
@@ -1799,11 +1810,18 @@ unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: 
 }
 
 unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64) -> bool {
+    recorded_frame_copyout_impl(pi, va, src, scratch_base, false)
+}
+
+unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
     let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
         return false;
     };
     let mut copied = 0usize;
     for chunk in chunks {
+        if !admitted && crate::service_sec_image::service_admit_section_alias(pi, chunk.page_base, true, None).is_err() {
+            return false;
+        }
         let ok = with_recorded_frame_alias(pi, chunk.page_base, scratch_base, true, |alias| {
             core::ptr::copy_nonoverlapping(
                 src.as_ptr().add(copied),
@@ -1968,6 +1986,10 @@ pub(crate) unsafe fn client_write_mapped(
     nfilled: usize,
     scratch_base: u64,
 ) -> bool {
+    if has_managed_section_page(pi, va, src.len()) {
+        // Preserve the first managed-memory refusal, including consumed guard exceptions.
+        return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
+    }
     if pi == 2 && wl_listener_stack_contains(va, src.len()) {
         return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
     }
@@ -2006,6 +2028,30 @@ pub(crate) unsafe fn client_copyout_mapped(
     nfilled: usize,
     scratch_base: u64,
 ) -> bool {
+    client_copyout_mapped_impl(pi, va, src, filled_pages, nfilled, scratch_base, false)
+}
+
+/// Only for the checked native-copy engine, after its own protection/residency/COW admission.
+pub(crate) unsafe fn client_copyout_mapped_admitted(
+    pi: u64,
+    va: u64,
+    src: &[u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+) -> bool {
+    client_copyout_mapped_impl(pi, va, src, filled_pages, nfilled, scratch_base, true)
+}
+
+unsafe fn client_copyout_mapped_impl(
+    pi: u64,
+    va: u64,
+    src: &[u8],
+    filled_pages: &[u64],
+    nfilled: usize,
+    scratch_base: u64,
+    admitted: bool,
+) -> bool {
     if src.is_empty() {
         return true;
     }
@@ -2018,8 +2064,11 @@ pub(crate) unsafe fn client_copyout_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(src.len() - copied);
         let page = current & !0xfff;
+        if !admitted && crate::service_sec_image::service_admit_section_alias(pi, page, true, None).is_err() {
+            return false;
+        }
         if csrss_frame_get_exact_record(pi, page).is_some() {
-            if !recorded_frame_copyout(pi, current, &src[copied..copied + chunk], scratch_base) {
+            if !recorded_frame_copyout_impl(pi, current, &src[copied..copied + chunk], scratch_base, true) {
                 return false;
             }
             copied += chunk;

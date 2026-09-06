@@ -3095,16 +3095,20 @@ unsafe fn pump_service_win32k_fault(
         return false;
     }
     if foreign {
-        pump_service_win32k_foreign_fault(ch, page, demand)
+        pump_service_win32k_foreign_fault(ch, page, demand, fsr)
     } else {
         pump_map_win32k_private_page(ch, page)
     }
 }
 
 #[inline(never)]
-unsafe fn pump_service_win32k_foreign_fault(ch: &PumpChannel, page: u64, demand: u64) -> bool {
-    if crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.pml4) {
-        return true;
+unsafe fn pump_service_win32k_foreign_fault(ch: &PumpChannel, page: u64, demand: u64, fsr: u64) -> bool {
+    // Client execution belongs to the user callback dispatcher, never an NX data attachment.
+    if fsr & 0x10 != 0 { return false; }
+    match crate::win32k_glue::map_csrss_page_into_win32k(page, ch.client_pi, ch.client_generation, ch.pml4, fsr & 2 != 0) {
+        Ok(true) => return true,
+        Err(_) => return false, // Managed-memory refusals must never enter private zero-fill.
+        Ok(false) => {}
     }
     let win32k_internal_low = page < 0x0000_0100_0000_0000 && page >= 0x10000;
     if win32k_internal_low {

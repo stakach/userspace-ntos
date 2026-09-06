@@ -5557,6 +5557,21 @@ pub(crate) unsafe fn w32_attach_remove(page: u64) -> bool {
     false
 }
 
+/// Revoke only the selected process's attachment. A writeback or COW transition must not leave
+/// win32k holding write access to the old shared frame, or detach another process's colliding VA.
+pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(), u32> {
+    if W32_ATTACHED_PI.load(Ordering::Acquire) != pi { return Ok(()); }
+    let mapping = (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS)).as_ref()
+        .and_then(|mappings| mappings.iter().find(|mapping| mapping.page == page)).copied();
+    let Some(mapping) = mapping else { return Ok(()); };
+    if page_unmap_r(mapping.slot) != 0 {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    let _ = w32_attach_remove(page);
+    let _ = cnode_delete_recycle_r(mapping.slot);
+    Ok(())
+}
+
 /// ★ COPY-ON-WRITE the caller's TEB tail out from under a win32k store.
 ///
 /// Called from the component fault pump when win32k takes a WRITE fault (`fsr` bit 1) on a page that
@@ -5817,10 +5832,32 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
 /// win32k's handler dereferences the caller's real user memory. Returns false if the page isn't
 /// backed by a known client frame (win32k would read garbage → the caller stops with a diagnostic).
 /// Idempotent per page for the currently-attached client (see `w32_client_attach`).
-pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64) -> bool {
+pub(crate) unsafe fn map_csrss_page_into_win32k(
+    page: u64,
+    pi: u64,
+    generation: u64,
+    w_pml4: u64,
+    write: bool,
+) -> Result<bool, u32> {
+    if crate::process_committed_mapping_basic_information(pi, page)
+        .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
+    {
+        if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
+            return Err(nt_fs::STATUS_INVALID_HANDLE);
+        }
+        // Admission can promote COW. Never reuse the old attachment's copy cap afterward.
+        detach_attached_client_page(pi, page)?;
+        let rights = crate::service_sec_image::service_admit_section_alias(pi, page, write, Some(generation))?
+            .ok_or(nt_memory_manager::STATUS_NOT_MAPPED_VIEW)?;
+        let cap = w32_map_registered_client_frame_copy_checked(pi, page, rights, w_pml4, b"section-attach");
+        if cap == 0 || !w32_attach_forget_or_release(page, cap, rights) {
+            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        }
+        return Ok(true);
+    }
     let already_mapped = w32_attach_mapped(page);
     if already_mapped {
-        return true; // already shared for the currently-attached client
+        return Ok(true); // already shared for the currently-attached client
     }
     // RW: win32k (kernel-mode) may read AND write the caller's user memory; the frame is shared with
     // the client so writes propagate back (out-params). Non-executable — client data, not code.
@@ -5840,14 +5877,14 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(page: u64, pi: u64, w_pml4: u64)
     } else {
         let fr = csrss_frame_get(pi, page);
         if fr == 0 {
-            return false;
+            return Ok(false);
         }
         w32_map_frame_copy_checked(fr, page, rights, w_pml4, b"attach")
     };
     if cc == 0 {
-        return false;
+        return Ok(false);
     }
-    w32_attach_forget_or_release(page, cc, rights)
+    Ok(w32_attach_forget_or_release(page, cc, rights))
 }
 
 /// Load ONE driver PE (raw at `src_va` in the executive) into `dst_va` in BOTH the executive (RW,

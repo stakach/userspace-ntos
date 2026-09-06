@@ -27,7 +27,17 @@ pub struct SectionWritebackPage {
     pub(crate) dirty_epoch: u64,
 }
 
+/// A virtual alias of a section page, before filtering residency and private COW ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionPageAlias {
+    pub pi: usize,
+    pub page: u64,
+}
+
 pub trait SectionWritebackIo {
+    /// Remove shared write access from this process and its attached kernel mappings. A failure
+    /// must leave the dirty batch owned for retry. Private COW pages are not shared aliases.
+    fn rearm_alias(&mut self, alias: SectionPageAlias) -> Result<(), u32>;
     /// Report actual accepted bytes even when the write fails.
     fn write_page(&mut self, page: SectionWritebackPage) -> (u32, usize);
     /// Publish through the configured backing-store checkpoint, not merely validate a file handle.

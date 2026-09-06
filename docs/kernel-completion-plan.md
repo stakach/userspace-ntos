@@ -80,9 +80,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   and finish the configured snapshot checkpoint before publishing flush results (tranche 36).
 - [x] Add ordered device-cache barriers to snapshot commits, validate the retained slot's payload,
   and issue capability-selected real AHCI cache flush commands (tranche 37, host/build validation).
-- [ ] Rearm all shared section aliases and dirty-admit win32k attachments/legacy kernel copybacks
-  before repeated-flush acceptance. Validate cache barriers with live restart/power-loss tests;
-  complete storage-port abort/reset recovery without reusing device-owned DMA on a failed command.
+- [x] Rearm tracked data-section page aliases and dirty-admit win32k attachments/legacy kernel
+  copybacks through the existing memory owner (tranche 38, host/build validation).
+- [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
+  live refault/restart/power-loss tests. Complete file-wide control areas across independently
+  created sections and storage-port abort/reset recovery without reusing device-owned DMA.
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25673,6 +25675,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     test ran. Shared aliases still need rearming and dirty admission before repeated-flush claims;
     this remains the next MM target. Port recovery remains explicit storage follow-on. The 33-import
     win32k gate still blocks desktop acceptance; this slice does not change the provider frontier.
+
+    B3 shared-section alias tranche 38 (2026-09-06, host/build green):
+    Writeback now has an explicit alias-rearm phase before any page copy. The host section table
+    enumerates live views of the exact section page with checked view offsets and current dirty
+    ticket/frame epochs. Every alias in the entire batch is rearmed before the first backend write.
+    Planning or rearm failure leaves the full batch dirty and reports zero IO progress; retry redoes
+    admission. Separate section objects backed by the same file are not falsely treated as physical
+    aliases: the current page table is still section-index-owned, pending real shared control areas.
+
+    The executive first detaches a matching win32k attachment, including attachments whose original
+    client record was trimmed or promoted to private COW. It then rearms resident shared mappings
+    using the current process VAD protection and epoch-bound paging context. Private owned frames
+    are excluded from shared writeback; unexpected permanent executive section aliases fail closed.
+    `vm_reprotect_private_page` now propagates unmap failure instead of reporting a successful
+    rights transition while the old leaf may remain writable. Dirty marking precedes both resident
+    WRITE promotion and new writable mapping publication; epoch exhaustion cannot expose an
+    untracked writable page. Writes to already-private COW records no longer dirty the shared file.
+
+    Win32k's foreign-fault pump now carries write access and client generation into managed-section
+    admission. Read faults attach read-only; write faults use the canonical checked memory path for
+    protection, guard, residency, COW, and dirty ownership. Old attachment caps are revoked before
+    promotion and rebuilt from the current frame. The already-attached shortcut no longer bypasses
+    managed-section write admission. Managed failures never enter the unrelated low-VA private
+    fill path, and execute faults cannot loop through an NX data attachment. User callback execution
+    remains in the real user dispatcher, not the win32k VSpace.
+
+    Legacy recorded-frame copybacks now admit managed section writes before obtaining a writable
+    alias, including formerly unresident pages. Checked native copies have a distinct already-admitted
+    low-level entry, avoiding a recursive live-handler borrow. Managed fixed-mirror ranges route to
+    recorded copies, and a failed managed write cannot retry through a mirror or consume a guard
+    exception a second time. Nonsection legacy read/mirror machinery is not claimed converted here.
+
+    Validation: 68 `nt-memory-manager`, 157 `nt-address-space`, 135 `nt-fs`, and 10 `nt-ahci` tests
+    pass (370 total). Seven new tests cover cross-process/offset aliases, dead and distinct-section
+    views, stale tickets, malformed geometry, all-aliases-before-copy ordering, failed rearm/retry,
+    and a second dirty-write checkpoint. The executive build passes with the existing 256 warnings.
+    Logs: `.tmp/test-section-alias-20260906.log` and `.tmp/build-section-alias-20260906.log`.
+    Root serialized builds/tests. No QEMU or physical persistence test ran.
+
+    Review adjustment: tracked data-section alias plumbing is complete at the host/build boundary,
+    not live repeated-flush acceptance. Real CPU refaults across processes, win32k attached COW,
+    trim/attachment lifetime, and restart/power-loss behavior still need integrated validation.
+    File-wide control areas, non-data-view/termination flush semantics, remaining output contracts,
+    and general checked reads remain open. The 33-import win32k gate still blocks desktop acceptance.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

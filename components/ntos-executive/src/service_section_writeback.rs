@@ -1,14 +1,44 @@
 //! Mapped-file snapshot publication, retaining retry ownership until the checkpoint completes.
 
 use super::*;
-use nt_memory_manager::writeback::{SectionWritebackIo, SectionWritebackPage, WritebackResult};
+use nt_memory_manager::writeback::{
+    SectionPageAlias, SectionWritebackIo, SectionWritebackPage, WritebackResult,
+};
 
 struct WritebackIo {
     file_id: u64,
     scratch_base: u64,
+    context: Option<ExecLoopCtx>,
 }
 
 impl SectionWritebackIo for WritebackIo {
+    fn rearm_alias(&mut self, alias: SectionPageAlias) -> Result<(), u32> {
+        unsafe {
+            // An attachment can outlive client residency (or retain the pre-COW frame).
+            crate::win32k_glue::detach_attached_client_page(alias.pi as u64, alias.page)?;
+            let Some(record) = csrss_frame_get_exact_record(alias.pi as u64, alias.page) else {
+                return Ok(());
+            };
+            if record.owns_frame {
+                return Ok(());
+            }
+            let context = self
+                .context
+                .and_then(|ctx| ctx.for_process(alias.pi))
+                .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+            let info = process_committed_mapping_basic_information(alias.pi as u64, alias.page)
+                .filter(|info| info.type_ == nt_address_space::MEM_MAPPED)
+                .ok_or(nt_memory_manager::STATUS_NOT_MAPPED_VIEW)?;
+            // Section records have no permanent executive alias. Refuse an unexpected bypass.
+            if record.alias != 0 {
+                return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+            }
+            let protection =
+                nt_address_space::mapped_view_fault_plan(info.protect, false).map_protection;
+            vm_reprotect_private_page(alias.pi, alias.page, info.protect, protection, context.pml4)
+        }
+    }
+
     fn write_page(&mut self, page: SectionWritebackPage) -> (u32, usize) {
         unsafe {
             let scratch = self.scratch_base + DEMAND_SCRATCH_WINDOW - 0x4000;
@@ -50,6 +80,7 @@ pub(crate) unsafe fn service_generic_section_writeback_view(
     table: &mut GenericSectionTable,
     view: GenericSectionView,
     scratch_base: u64,
+    context: Option<ExecLoopCtx>,
 ) -> WritebackResult {
     let Some(section) = table.section(view.section_index) else {
         return WritebackResult::failure(nt_fs::STATUS_INVALID_HANDLE);
@@ -64,6 +95,7 @@ pub(crate) unsafe fn service_generic_section_writeback_view(
             section_offset: view.section_offset,
         },
         scratch_base,
+        context,
     )
 }
 
@@ -71,6 +103,7 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
     table: &mut GenericSectionTable,
     plan: GenericSectionFlushPlan,
     scratch_base: u64,
+    context: Option<ExecLoopCtx>,
 ) -> WritebackResult {
     if !generic_section_writes_back(plan.section) {
         return WritebackResult::default();
@@ -80,6 +113,7 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
         &mut WritebackIo {
             file_id: plan.section.backing.overlay_file_id,
             scratch_base,
+            context,
         },
     );
     GENERIC_SECTION_WRITEBACKS.fetch_add(result.pages_written, Ordering::Relaxed);

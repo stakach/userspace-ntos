@@ -10,10 +10,22 @@ struct Io {
     barrier_status: u32,
     pages: Vec<u64>,
     barriers: usize,
+    aliases: Vec<SectionPageAlias>,
+    fail_alias: Option<usize>,
+    events: Vec<char>,
 }
 
 impl SectionWritebackIo for Io {
+    fn rearm_alias(&mut self, alias: SectionPageAlias) -> Result<(), u32> {
+        self.events.push('r');
+        if self.fail_alias == Some(self.aliases.len()) {
+            return Err(IO_ERROR);
+        }
+        self.aliases.push(alias);
+        Ok(())
+    }
     fn write_page(&mut self, page: SectionWritebackPage) -> (u32, usize) {
+        self.events.push('w');
         self.pages.push(page.page_index);
         match self.fail_page {
             Some((index, status, bytes)) if index == page.page_index => (status, bytes),
@@ -21,6 +33,7 @@ impl SectionWritebackIo for Io {
         }
     }
     fn persist(&mut self) -> u32 {
+        self.events.push('p');
         self.barriers += 1;
         self.barrier_status
     }
@@ -46,6 +59,148 @@ fn fixture() -> (GenericSectionTable, GenericSectionFlushPlan) {
     }
     let plan = table.plan_flush(3, 0x10000, 0).unwrap();
     (table, plan)
+}
+
+#[test]
+fn aliases_follow_section_offsets_across_processes_and_views() {
+    let (mut table, plan) = fixture();
+    let section = plan.view.section_index;
+    assert!(table.map_view(8, section, 0x20000, 0x1000, 0x1000));
+    assert!(table.map_view(3, section, 0x30000, 0x2000, 0x1000));
+    assert!(table.map_view(9, section, 0x40000, 0x1000, 0x2000));
+    let ticket = table.prepare_writeback(plan).unwrap()[1];
+    assert_eq!(
+        table.writeback_aliases(ticket).unwrap(),
+        vec![
+            SectionPageAlias {
+                pi: 3,
+                page: 0x11000
+            },
+            SectionPageAlias {
+                pi: 8,
+                page: 0x20000
+            },
+            SectionPageAlias {
+                pi: 3,
+                page: 0x30000
+            },
+        ]
+    );
+}
+
+#[test]
+fn aliases_exclude_dead_views_and_distinct_sections_of_the_same_file() {
+    let (mut table, plan) = fixture();
+    let other = table
+        .create(
+            2,
+            0x44,
+            0x2100,
+            PAGE_READWRITE,
+            SECTION_ATTR_SEC_COMMIT,
+            plan.section.backing,
+        )
+        .unwrap();
+    assert!(table.map_view(8, other, 0x20000, 0x3000, 0));
+    assert!(table.map_view(9, plan.view.section_index, 0x30000, 0x3000, 0));
+    table.unmap_view(9, 0x30000).unwrap();
+    let ticket = table.prepare_writeback(plan).unwrap()[0];
+    assert_eq!(
+        table.writeback_aliases(ticket).unwrap(),
+        vec![SectionPageAlias {
+            pi: 3,
+            page: 0x10000
+        }]
+    );
+}
+
+#[test]
+fn alias_planning_rejects_stale_or_inconsistent_tickets() {
+    let (mut table, plan) = fixture();
+    let ticket = table.prepare_writeback(plan).unwrap()[0];
+    let mut invalid = ticket;
+    invalid.file_offset = 0x1000;
+    assert_eq!(
+        table.writeback_aliases(invalid),
+        Err(STATUS_NOT_MAPPED_VIEW)
+    );
+    table.mark_page_dirty(plan.view.section_index, 0);
+    assert_eq!(table.writeback_aliases(ticket), Err(STATUS_NOT_MAPPED_VIEW));
+    let ticket = table.prepare_writeback(plan).unwrap()[0];
+    table.set_page_frame(plan.view.section_index, 0, 900);
+    assert_eq!(table.writeback_aliases(ticket), Err(STATUS_NOT_MAPPED_VIEW));
+}
+
+#[test]
+fn malformed_alias_geometry_prevents_writeback() {
+    for (base, size, offset) in [
+        (0x20001, 0x1000, 0),
+        (0x20000, 0x1000, 1),
+        (u64::MAX & !0xfff, 0x2000, 0),
+        (0x20000, 0x2000, u64::MAX & !0xfff),
+    ] {
+        let (mut table, plan) = fixture();
+        assert!(table.map_view(8, plan.view.section_index, base, size, offset));
+        let mut io = Io::default();
+        assert_eq!(
+            table.writeback(plan, &mut io).status,
+            STATUS_INVALID_PARAMETER_2
+        );
+        assert!(io.pages.is_empty());
+        assert_eq!(io.barriers, 0);
+        assert_eq!(table.prepare_writeback(plan).unwrap().len(), 3);
+    }
+}
+
+#[test]
+fn every_alias_is_rearmed_before_any_page_is_copied() {
+    let (mut table, plan) = fixture();
+    assert!(table.map_view(8, plan.view.section_index, 0x20000, 0x3000, 0));
+    let mut io = Io::default();
+    assert_eq!(table.writeback(plan, &mut io).status, 0);
+    assert_eq!(
+        io.events,
+        vec!['r', 'r', 'r', 'r', 'r', 'r', 'w', 'w', 'w', 'p']
+    );
+}
+
+#[test]
+fn failed_alias_rearm_retains_whole_batch_without_io_then_retries() {
+    for failed in 0..3 {
+        let (mut table, plan) = fixture();
+        let mut io = Io {
+            fail_alias: Some(failed),
+            ..Io::default()
+        };
+        assert_eq!(
+            table.writeback(plan, &mut io),
+            WritebackResult::failure(IO_ERROR)
+        );
+        assert!(io.pages.is_empty());
+        assert_eq!(io.barriers, 0);
+        assert_eq!(table.prepare_writeback(plan).unwrap().len(), 3);
+        let mut retry = Io::default();
+        assert_eq!(table.writeback(plan, &mut retry).status, 0);
+        assert_eq!(retry.aliases.len(), 3);
+        assert!(table.prepare_writeback(plan).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn second_dirty_write_is_rearmed_and_checkpointed_again() {
+    let (mut table, plan) = fixture();
+    assert_eq!(table.writeback(plan, &mut Io::default()).status, 0);
+    assert!(table.mark_page_dirty(plan.view.section_index, 1));
+    let mut io = Io::default();
+    assert_eq!(table.writeback(plan, &mut io).bytes_written, 0x1000);
+    assert_eq!(
+        io.aliases,
+        vec![SectionPageAlias {
+            pi: 3,
+            page: 0x11000
+        }]
+    );
+    assert_eq!(io.events, vec!['r', 'w', 'p']);
 }
 
 #[test]

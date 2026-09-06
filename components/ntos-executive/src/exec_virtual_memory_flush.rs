@@ -56,6 +56,7 @@ impl ExecNtHandler {
             generic_sections,
             plan,
             ctx.scratch_base,
+            Some(ctx),
         );
         if writeback.bytes_written != 0 {
             self.writable_fs_dirty = true;

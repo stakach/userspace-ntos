@@ -12532,7 +12532,7 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     }
     proof |= MAPPED_SECTION_WRITEBACK_DIRTY;
 
-    let writeback = service_generic_section_writeback_view(table, view, scratch_base);
+    let writeback = service_generic_section_writeback_view(table, view, scratch_base, None);
     bytes_written = writeback.bytes_written;
     if writeback.status != 0 {
         status = writeback.status;
@@ -13545,7 +13545,9 @@ unsafe fn vm_reprotect_private_page(
     if frame == 0 {
         return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
     }
-    let _ = page_unmap_r(frame);
+    if page_unmap_r(frame) != 0 {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     if page_map_r(frame, page, vm_page_rights(new_protection), pml4) == 0 {
         Ok(())
     } else {
@@ -19473,6 +19475,7 @@ unsafe fn reclaim_final_process_vm(
                 generic_sections,
                 view,
                 ctx.scratch_base,
+                Some(ctx),
             );
             if writeback.bytes_written != 0 {
                 handler.writable_fs_dirty = true;

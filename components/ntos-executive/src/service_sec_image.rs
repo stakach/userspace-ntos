@@ -3732,7 +3732,13 @@ pub(crate) unsafe fn service_generic_section_fault(
             return Ok(true);
         }
         let fault_plan = nt_address_space::mapped_view_fault_plan(view_info.protect, write_fault);
+        if write_fault && csrss_frame_get_exact_record(pi as u64, page).is_some_and(|record| record.owns_frame) {
+            let protection = nt_address_space::private_backing_protection(view_info.protect);
+            vm_reprotect_private_page(pi, page, protection, protection, pml4)?;
+            return Ok(true);
+        }
         if write_fault && fault_plan.copy_on_write {
+            crate::win32k_glue::detach_attached_client_page(pi as u64, page)?;
             let old_protection =
                 nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
             vm_promote_mapped_cow_page(
@@ -3750,13 +3756,13 @@ pub(crate) unsafe fn service_generic_section_fault(
         if write_fault && fault_plan.mark_dirty {
             let old_protection =
                 nt_address_space::mapped_view_fault_plan(view_info.protect, false).map_protection;
-            vm_reprotect_private_page(pi, page, old_protection, view_info.protect, pml4)?;
             generic_section_mark_dirty_if_backed(
                 generic_sections,
                 section_index,
                 section,
                 page_index,
             )?;
+            vm_reprotect_private_page(pi, page, old_protection, view_info.protect, pml4)?;
             return Ok(true);
         }
         return Err(0xC000_0005); // STATUS_ACCESS_VIOLATION
@@ -3786,6 +3792,9 @@ pub(crate) unsafe fn service_generic_section_fault(
         return Ok(true);
     }
     vm_ensure_private_pt(nt_handler, pi, page, pml4)?;
+    if fault_plan.mark_dirty {
+        generic_section_mark_dirty_if_backed(generic_sections, section_index, section, page_index)?;
+    }
     let (map_cap, copy_error) = copy_cap_r(frame);
     if copy_error != 0 {
         if map_cap != 0 {
@@ -3814,9 +3823,6 @@ pub(crate) unsafe fn service_generic_section_fault(
         let _ = page_unmap_r(map_cap);
         let _ = cnode_delete_recycle_r(map_cap);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    if fault_plan.mark_dirty {
-        generic_section_mark_dirty_if_backed(generic_sections, section_index, section, page_index)?;
     }
     let trace = GENERIC_SECTION_FAULT_TRACE.fetch_add(1, Ordering::Relaxed);
     if trace < 32 {
@@ -4199,6 +4205,30 @@ unsafe fn clear_service_delay_drain_context() {
 struct ProviderDispatcherTransfer {
     local_events: Vec<ProviderLocalEventTransfer>,
     timers: Option<nt_provider_wait::ProviderTimerTable>,
+}
+
+/// Admission for kernel aliases of managed section views. The nested provider pump uses the
+/// existing live handler and process epoch; legacy copybacks are serialized by the same owner.
+/// `None` means this is not a data-section view, never that admission failed.
+pub(crate) unsafe fn service_admit_section_alias(
+    pi: u64,
+    page: u64,
+    write: bool,
+    generation: Option<u64>,
+) -> Result<Option<u64>, u32> {
+    if !process_committed_mapping_basic_information(pi, page)
+        .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
+    {
+        return Ok(None);
+    }
+    let pointer = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
+    if pointer.is_null() { return Err(0xC000_00A3); } // STATUS_DEVICE_NOT_READY
+    let pi = usize::try_from(pi).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+    let handler = &mut *pointer;
+    if generation.is_some_and(|generation| generation == 0 || handler.hosted_process_generation(pi) != Some(generation)) {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    handler.prepare_mapped_section_alias(pi, page, write).map(Some)
 }
 
 unsafe fn take_provider_dispatcher_transfer() -> ProviderDispatcherTransfer {

@@ -181,6 +181,16 @@ impl ExecNtHandler {
         )
     }
 
+    pub(crate) unsafe fn prepare_mapped_section_alias(
+        &mut self,
+        pi: usize,
+        page: u64,
+        write: bool,
+    ) -> Result<u64, u32> {
+        self.prepare_copy_page(pi, page, if write { FaultAccess::Write } else { FaultAccess::Read })?;
+        Ok(if write { RW_NX } else { RO_NX })
+    }
+
     unsafe fn prepare_copy_page(
         &mut self,
         pi: usize,
@@ -357,7 +367,7 @@ impl ExecNtHandler {
             .loop_ctx
             .and_then(|ctx| ctx.for_process(pi))
             .ok_or(STATUS_INVALID_HANDLE)?;
-        if client_copyout_mapped(
+        if crate::img_spawn::client_copyout_mapped_admitted(
             pi as u64,
             address,
             input,
