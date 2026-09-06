@@ -531,6 +531,13 @@ impl PagefileStore {
             .find(|record| record.owner == owner)
     }
 
+    pub fn pages_for_owner(&self, owner: WorkingSetOwnerId) -> impl Iterator<Item = u64> + '_ {
+        self.records
+            .iter()
+            .filter(move |record| record.owner == owner)
+            .map(|record| record.page)
+    }
+
     pub fn stats(&self) -> PagefileStoreStats {
         self.stats
     }
@@ -926,6 +933,39 @@ mod tests {
             Err(STATUS_INSUFFICIENT_RESOURCES)
         );
         assert_eq!(store.page(7, 0x1000).unwrap().protection, 0x104);
+    }
+
+    #[test]
+    fn private_page_enumeration_follows_owner_and_transition_lifetime() {
+        let mut store = PagefileStore::new();
+        for (owner, page, backing) in [(2, 0x1000, 1), (2, 0x2000, 2), (3, 0x1000, 3)] {
+            let plan = store
+                .prepare_publish(PagefilePage {
+                    owner,
+                    page,
+                    protection: 0x04,
+                    backing,
+                })
+                .unwrap();
+            store.commit_publish(plan).unwrap();
+        }
+        assert_eq!(
+            store.pages_for_owner(2).collect::<Vec<_>>(),
+            [0x1000, 0x2000]
+        );
+        assert_eq!(store.pages_for_owner(3).collect::<Vec<_>>(), [0x1000]);
+        let taken = store.take(2, 0x1000).unwrap().unwrap();
+        assert_eq!(store.pages_for_owner(2).collect::<Vec<_>>(), [0x2000]);
+        store.restore(taken).unwrap();
+        let protection = store
+            .prepare_protection_range(2, 0x1000, 0x2000, 0x02)
+            .unwrap()
+            .unwrap();
+        store.commit_protection(protection).unwrap();
+        let mut pages = store.pages_for_owner(2).collect::<Vec<_>>();
+        pages.sort_unstable();
+        assert_eq!(pages, [0x1000, 0x2000]);
+        assert_eq!(store.pages_for_owner(4).count(), 0);
     }
 
     #[test]

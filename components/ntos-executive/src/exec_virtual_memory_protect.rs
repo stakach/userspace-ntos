@@ -147,6 +147,10 @@ impl ExecNtHandler {
                 Err(status) => return status,
             };
             let new_protection = plan.new_protection;
+            let first = before_committed
+                .query_basic(plan.base)
+                .expect("validated protection range retains its first page");
+            let old_protection = virtual_memory_query::native_page_protection(target_pi, first);
             if !self.secured_virtual_memory.permits_protection(
                 u64::from(target_pid),
                 plan.base,
@@ -170,10 +174,7 @@ impl ExecNtHandler {
                     return status;
                 }
             }
-            let mapping_type = before_committed
-                .query_basic(plan.base)
-                .expect("validated protection range retains its mapping type")
-                .type_;
+            let mapping_type = first.type_;
             let transition = match (ProtectionTarget {
                 pi: target_pi,
                 pml4: target.pml4,
@@ -205,7 +206,7 @@ impl ExecNtHandler {
                 plan.size,
                 b"",
             );
-            let _ = self.user_memory_write(memory, oldprot_ptr, &plan.old_protection.to_le_bytes());
+            let _ = self.user_memory_write(memory, oldprot_ptr, &old_protection.to_le_bytes());
             let _ = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
             let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
             return 0;

@@ -13,6 +13,9 @@ mod virtual_memory_copy;
 #[path = "exec_virtual_memory_protect.rs"]
 mod virtual_memory_protect;
 
+#[path = "exec_virtual_memory_query.rs"]
+mod virtual_memory_query;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -19312,79 +19315,6 @@ impl ExecNtHandler {
         self.secured_virtual_memory
             .unsecure(u64::from(pid), handle)
             .map(|_| ())
-    }
-
-    pub(crate) unsafe fn nt_query_virtual_memory_with_user_memory(
-        &mut self,
-        args: &[u64],
-        memory: SyscallUserMemory,
-    ) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
-        const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
-        const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-        const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
-        let process_handle = args.first().copied().unwrap_or(0);
-        let base = args.get(1).copied().unwrap_or(0);
-        let info_class = nt_ulong_arg(args.get(2).copied().unwrap_or(u64::MAX));
-        let buffer = args.get(3).copied().unwrap_or(0);
-        let length = args.get(4).copied().unwrap_or(0);
-        let return_length = args.get(5).copied().unwrap_or(0);
-
-        if base > HIGHEST_USER_ADDRESS {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if info_class != 0 {
-            return STATUS_INVALID_INFO_CLASS;
-        }
-        if length < nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE as u64 {
-            return STATUS_INFO_LENGTH_MISMATCH;
-        }
-        if buffer == 0
-            || !self.user_memory_probe_output(
-                memory,
-                buffer,
-                nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE,
-            )
-            || return_length != 0
-                && !self.user_memory_probe_output(
-                    memory,
-                    return_length,
-                    core::mem::size_of::<u64>(),
-                )
-        {
-            return STATUS_ACCESS_VIOLATION;
-        }
-
-        let (target_pid, target_pi) = match self
-            .resolve_process_for_access(process_handle, nt_process::PROCESS_QUERY_INFORMATION)
-        {
-            Ok(target) => target,
-            Err(status) => return status,
-        };
-        if self.pm.process(target_pid).is_some_and(|process| {
-            matches!(
-                process.state,
-                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated
-            )
-        }) {
-            return nt_process::STATUS_PROCESS_IS_TERMINATING;
-        }
-
-        let info = match self.query_memory_basic_information(target_pi, base) {
-            Ok(info) => info,
-            Err(status) => return status,
-        };
-        if !self.user_memory_write(memory, buffer, &info.encode_x64()) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        if return_length != 0 {
-            let returned = nt_address_space::MEMORY_BASIC_INFORMATION_X64_SIZE as u64;
-            if !self.user_memory_write(memory, return_length, &returned.to_le_bytes()) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-        }
-        0
     }
 
     unsafe fn nt_flush_virtual_memory(&mut self, args: &[u64]) -> u32 {

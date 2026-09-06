@@ -18,6 +18,7 @@ extern crate alloc;
 
 pub mod copy;
 pub mod protection;
+pub mod query;
 
 use alloc::collections::BTreeMap;
 use alloc::vec;

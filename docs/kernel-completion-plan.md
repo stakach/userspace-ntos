@@ -55,9 +55,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   with one atomic transition update and shared resident rollback (tranche 26, host/build validation).
 - [x] Normalize writable image protection requests to write-copy before admission/publication,
   preserving map-time shared policy and exact guard clearing (tranche 27, host/build validation).
-- [ ] Track private COW ownership through query/OldProtect and commitment lifetime, including
-  read-only reprotection, eviction, restoration, and unmap. Carry explicit section/VAD CopyOnWrite
-  policy before extending request normalization to nonimage sections.
+- [x] Project private resident/transition COW backing into native query regions and first-page
+  OldProtect without changing raw fault/writeback policy (tranche 28, host/build validation).
+- [ ] Track private COW commitment lifetime through read-only reprotection, eviction, restoration,
+  and unmap. Include admission at direct image materialization, not just COW promotion. Carry
+  explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
   backing admission and ordinary guards are implemented; current-thread stack-guard expansion,
@@ -25200,6 +25202,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ordinary CPU guard delivery, and live mixed-residency/COW/remap-failure acceptance open. The
     unchanged 33-import win32k barrier still prevents live MM/SEH and desktop acceptance; do not
     bypass it or treat host/build validation as rendered desktop proof.
+
+    B3 private-COW query tranche 28 (2026-09-06, host and executive build green):
+    Native `NtQueryVirtualMemory` now projects privately owned image/mapped WC pages to RW and
+    executable WC pages to executable RW. Allocation identity, allocation protection, MEM_IMAGE /
+    MEM_MAPPED type, and guard modifiers remain unchanged. Region size stops at effective-protection
+    changes or allocation/type/hole boundaries, and equal effective protections coalesce even when
+    their raw view-policy ranges differ. `NtProtectVirtualMemory` captures the first page's effective
+    OldProtect before remapping and publication, including when private backing is nonresident.
+
+    The host-tested `nt-address-space::query` module indexes only relevant private backing in a
+    temporary sparse snapshot. It accepts resident and transition records in any order, deduplicates
+    them, and walks policy ranges/private runs rather than every virtual page. Allocation failure
+    returns a real resource error. The executive filters both backing sources by process and keeps
+    their existing ownership/lifetime authority; query adds no persistent page ledger and causes no
+    faulting, remapping, or commitment changes. Pagefile enumeration has owner/lifecycle coverage.
+    The native handler and adapter moved out of `exec_handler.rs` into
+    `exec_virtual_memory_query.rs`; the old handler was removed.
+
+    Raw committed-view queries deliberately remain unchanged for residency, image sharing, guard
+    consumption, and mapped-file dirty/writeback policy. In particular, feeding projected private
+    RW into the mapped fault planner could incorrectly dirty the shared control area. Only native
+    query output and OldProtect use the new projection. NT5 `mm/queryvm.c` / `mm/protect.c` and Wine's
+    native WC-query expectations establish this boundary; Wine's own missing behavior is not copied.
+
+    Validation: all 116 `nt-address-space` and 41 `nt-memory-manager` tests pass. New regressions
+    cover resident/transition mixtures, query isolation, sparse terabyte views, first-page protection,
+    modifiers, holes, cross-range coalescing, process/unmap lifetime, and every ownership mask over
+    eight-page mixed-policy views compared with an independent pagewise oracle. The freestanding
+    executive build passes with the existing 256 warnings. Logs:
+    `.tmp/test-cow-query-20260906.log` and `.tmp/build-cow-query-20260906.log`. Independent review
+    found no correctness issues in this bounded slice. No QEMU boot was attempted.
+
+    Review adjustment: query/OldProtect implementation is closed; live acceptance remains pending.
+    Complete private COW commitment as a separate transaction spanning creation, reprotection,
+    transition, and retirement. Charge the union of unused COW reservation and consumed private
+    backing, never both, and capture the release before unmap destroys ownership. The audit found
+    direct image-fill paths also publish owned frames for initial writable image protection, outside
+    the COW promotion helpers. Merely adding all owned frames to protect/unmap accounting would
+    count pages that were never admitted. Audit and correct those materialization/charge boundaries,
+    including legitimate shared-writable PE policy, before claiming lifetime accounting complete.
+    Do not add per-page ownership splits to the fixed 512-range mapping table or infer a nonimage
+    section's CopyOnWrite flag from view protection. Stack-guard expansion/overflow, ordinary CPU
+    guard delivery, and live MM/SEH/desktop acceptance remain open behind the unchanged 33-import
+    win32k barrier.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
