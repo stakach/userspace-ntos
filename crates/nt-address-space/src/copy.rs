@@ -73,8 +73,24 @@ mod kernel_buffer_tests;
 /// The native SIZE_T output probe captures the complete value before its self-write. This differs
 /// from probing a range page by page when an unaligned count straddles a guard page.
 pub fn probe_write_u64(memory: &mut impl WriteProbeMemory, address: u64) -> Result<(), u32> {
-    address.checked_add(8).ok_or(STATUS_ACCESS_VIOLATION)?;
-    let mut value = [0; 8];
+    probe_write_scalar::<8>(memory, address, u64::MAX)
+}
+
+/// Scalar outputs may be unaligned. Capture every byte before the first self-write so a later
+/// read fault cannot cause an earlier page's COW promotion.
+pub fn probe_write_scalar<const N: usize>(
+    memory: &mut impl WriteProbeMemory,
+    address: u64,
+    user_limit: u64,
+) -> Result<(), u32> {
+    if N == 0 {
+        return Ok(());
+    }
+    address
+        .checked_add(N as u64)
+        .filter(|end| *end <= user_limit)
+        .ok_or(STATUS_ACCESS_VIOLATION)?;
+    let mut value = [0; N];
     for (offset, byte) in value.iter_mut().enumerate() {
         *byte = memory.read_byte(address + offset as u64)?;
     }
@@ -82,6 +98,23 @@ pub fn probe_write_u64(memory: &mut impl WriteProbeMemory, address: u64) -> Resu
         memory.write_byte(address + offset as u64, byte)?;
     }
     Ok(())
+}
+
+/// Validate the entire user range before probing any page; an empty output touches no address.
+pub fn probe_write_user_range(
+    memory: &mut impl WriteProbeMemory,
+    address: u64,
+    length: u64,
+    user_limit: u64,
+) -> Result<(), u32> {
+    if length == 0 {
+        return Ok(());
+    }
+    address
+        .checked_add(length)
+        .filter(|end| *end <= user_limit)
+        .ok_or(STATUS_ACCESS_VIOLATION)?;
+    probe_write_range(memory, address, length)
 }
 
 /// Native write probing reads before self-writing each touched page. A readable guard therefore

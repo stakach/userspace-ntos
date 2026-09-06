@@ -9110,25 +9110,6 @@ pub(crate) unsafe fn csrss_frame_copy_exact_for_win32k(pi: u64, page: u64) -> (u
     }
     (copied, source_cap, error)
 }
-unsafe fn client_range_has_backing(pi: u64, va: u64, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let Some(end) = va.checked_add(len as u64 - 1) else {
-        return false;
-    };
-    let mut page = va & !0xfff;
-    let last = end & !0xfff;
-    loop {
-        if csrss_frame_get_exact(pi, page).0 == 0 {
-            return false;
-        }
-        if page == last {
-            return true;
-        }
-        page += 0x1000;
-    }
-}
 unsafe fn client_copy_temp_cap() -> u64 {
     let cap = CLIENT_COPY_TEMP_CAP.load(Ordering::Relaxed);
     if cap != 0 {

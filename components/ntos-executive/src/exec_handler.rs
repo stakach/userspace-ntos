@@ -17849,7 +17849,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn user_memory_probe_output(
-        &self,
+        &mut self,
         memory: SyscallUserMemory,
         va: u64,
         len: usize,
@@ -19027,7 +19027,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn capture_virtual_memory_lock_request(
-        &self,
+        &mut self,
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> Result<(usize, nt_address_space::VmResidencyRangePlan, u32, u64, u64), u32> {
@@ -23898,7 +23898,7 @@ impl ExecNtHandler {
 
 
     /// Probe a small writable event output before changing dispatcher state.
-    pub(crate) unsafe fn probe_event_output(&self, va: u64, len: usize) -> bool {
+    pub(crate) unsafe fn probe_event_output(&mut self, va: u64, len: usize) -> bool {
         len <= 8 && self.probe_user_output(va, len)
     }
 
@@ -23906,7 +23906,7 @@ impl ExecNtHandler {
     /// services. NT checks the user ceiling before structure alignment, while `ReturnLength` is an
     /// unaligned `ULONG` probe.
     unsafe fn probe_fixed_query_output(
-        &self,
+        &mut self,
         information: u64,
         information_size: usize,
         information_alignment: u64,
@@ -23928,13 +23928,12 @@ impl ExecNtHandler {
         if information & (information_alignment - 1) != 0 {
             return Err(STATUS_DATATYPE_MISALIGNMENT);
         }
-        if !self.probe_user_output(information, information_size) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        if return_length != 0
-            && (!user_range(return_length, 4) || !self.probe_user_output(return_length, 4))
-        {
-            return Err(STATUS_ACCESS_VIOLATION);
+        self.probe_copy_output(self.pi, information, information_size as u64)?;
+        if return_length != 0 {
+            if !user_range(return_length, 4) {
+                return Err(STATUS_ACCESS_VIOLATION);
+            }
+            self.probe_copy_scalar::<4>(return_length)?;
         }
         Ok(())
     }
@@ -23962,150 +23961,9 @@ impl ExecNtHandler {
         true
     }
 
-    /// Probe an arbitrary user output range without changing its contents.
-    pub(crate) unsafe fn probe_user_output(&self, va: u64, len: usize) -> bool {
-        if len == 0 {
-            return true;
-        }
-        if va == 0 || va.checked_add(len as u64).is_none() {
-            return false;
-        }
-        let Some(ctx) = self.loop_ctx else {
-            let mut address = va;
-            let mut remaining = len;
-            let mut bytes = [0u8; 8];
-            while remaining != 0 {
-                let chunk = remaining.min(bytes.len());
-                if !self.xas_read(address, &mut bytes[..chunk]) {
-                    return false;
-                }
-                address += chunk as u64;
-                remaining -= chunk;
-            }
-            return true;
-        };
-        let end = va + len as u64;
-        if self.current_hosted_thread_user_stack_contains(va, len) {
-            return client_range_has_backing(self.pi as u64, va, len);
-        }
-        let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
-        let stack_end = stack_base + ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
-        if va >= stack_base && end <= stack_end
-            || va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW
-        {
-            return true;
-        }
-        // ★ A hosted thread's stack GROWS BELOW its declared window. `ACTIVE_STACK_BASE/SIZE` are
-        // the pages the spawn pre-mapped; a deeper frame simply faults and the service loop
-        // demand-maps it, so a legitimate buffer can sit below `stack_base` and still be fully
-        // backed. kernel32's `FindFirstFileExW` is exactly that case — it puts a 16 KiB
-        // `DECLSPEC_ALIGN(4) BYTE DirectoryInfo[FIND_DATA_SIZE]` scratch buffer plus its
-        // IO_STATUS_BLOCK on the caller's stack (`kernel32/client/file/find.c:694`), which for
-        // winlogon lands ~12 KiB below the 16 KiB declared window. The window test alone called
-        // that unreachable, so `NtQueryDirectoryFile` returned STATUS_ACCESS_VIOLATION and
-        // `CopyDirectory` reported `GetLastError() == 998` (ERROR_NOACCESS).
-        //
-        // This clause is a strictly MONOTONE widening: it runs only where the code already
-        // returned false, and it does not assume anything — it asks whether every page of the
-        // range REALLY has backing in the caller's VSpace, the same `client_range_has_backing`
-        // test the winlogon listener stack above already uses. Unmapped memory is still refused.
-        const STACK_GROWTH_WINDOW: u64 = 0x10_0000; // 1 MiB, the PE's committed stack reserve
-        if end <= stack_end && va >= stack_base.saturating_sub(STACK_GROWTH_WINDOW) {
-            return client_range_has_backing(self.pi as u64, va, len);
-        }
-
-        unsafe fn committed_mapped_output_range_backed(pi: u64, va: u64, len: usize) -> bool {
-            let Some(chunks) = nt_address_space::page_chunks(va, len) else {
-                return false;
-            };
-            for chunk in chunks {
-                let Some(info) = process_committed_mapping_basic_information(pi, chunk.page_base)
-                else {
-                    return false;
-                };
-                if info.type_ != nt_address_space::MEM_MAPPED
-                    || nt_address_space::mapped_view_fault_access_status(
-                        info.protect,
-                        nt_address_space::FaultAccess::Write,
-                    )
-                    .is_err()
-                    || csrss_frame_get_exact(pi, chunk.page_base).0 == 0
-                {
-                    return false;
-                }
-            }
-            true
-        }
-
-        if committed_mapped_output_range_backed(self.pi as u64, va, len) {
-            return true;
-        }
-
-        fn writable_image_range(pe: &nt_pe_loader::PeFile, base: u64, va: u64, len: usize) -> bool {
-            let rva = match va.checked_sub(base) {
-                Some(rva) => rva,
-                None => return false,
-            };
-            let end = match rva.checked_add(len as u64) {
-                Some(end) => end,
-                None => return false,
-            };
-            pe.sections().iter().any(|section| {
-                let start = section.virtual_address as u64;
-                let section_end = start + section.virtual_size.max(section.size_of_raw_data) as u64;
-                rva >= start && end <= section_end && section.is_writable()
-            })
-        }
-
-        unsafe fn scratch_pages_available(
-            ctx: ExecLoopCtx,
-            pi: u64,
-            va: u64,
-            len: usize,
-            may_fill: bool,
-        ) -> bool {
-            let filled_pages = unsafe { &*ctx.filled_pages };
-            let faults = unsafe { *ctx.faults } as usize;
-            let mut missing = 0usize;
-            let mut page = va & !0xFFF;
-            let last = (va + len as u64 - 1) & !0xFFF;
-            loop {
-                let has_alias = unsafe { csrss_frame_alias_get(pi, page) } != 0;
-                if !has_alias
-                    && unsafe { scratch_for(page, filled_pages, faults, ctx.scratch_base) }
-                        .is_none()
-                {
-                    if !may_fill {
-                        return false;
-                    }
-                    missing += 1;
-                }
-                if page == last {
-                    break;
-                }
-                page += 0x1000;
-            }
-            missing == 0
-                || faults
-                    .checked_add(missing)
-                    .is_some_and(|needed| needed <= filled_pages.len())
-        }
-
-        if va >= PE_LOAD_BASE && end <= ctx.img_end {
-            return ctx.main_image().is_some_and(|pe| writable_image_range(pe, PE_LOAD_BASE, va, len));
-        }
-        if !ctx.ntdll_pe.is_null() && va >= ctx.nt_base && end <= ctx.nt_end {
-            return writable_image_range(&*ctx.ntdll_pe, ctx.nt_base, va, len)
-                && scratch_pages_available(ctx, self.pi as u64, va, len, false);
-        }
-        let reg = &*ctx.reg;
-        if let Some((index, _)) = reg.dll_for_page(self.pi, va) {
-            if let Some(pe) = ctx.dll_pes()[index].as_ref() {
-                return writable_image_range(pe, reg.base(index), va, len)
-                    && scratch_pages_available(ctx, self.pi as u64, va, len, true);
-            }
-        }
-        false
+    /// Probe output through the same protection and residency boundary as the subsequent write.
+    pub(crate) unsafe fn probe_user_output(&mut self, va: u64, len: usize) -> bool {
+        self.probe_copy_output(self.pi, va, len as u64).is_ok()
     }
 
     /// Legacy best-effort adapter. Status-sensitive callers use `xas_try_write_buf` directly.
@@ -24641,17 +24499,6 @@ impl ExecNtHandler {
         Ok(None)
     }
 
-    /// Probe a small user output range using the current process's cross-address-space reader.
-    pub(crate) unsafe fn probe_atom_output(&self, va: u64, len: usize) -> bool {
-        if len == 0 {
-            return true;
-        }
-        if va == 0 || len > 8 {
-            return false;
-        }
-        let mut probe = [0u8; 8];
-        self.xas_read(va, &mut probe[..len])
-    }
     /// Cross-AS UNICODE_STRING read (x64 {u16 Length, u16 Max, u32 pad, u64 Buffer}) via [`xas_read`],
     /// so a Buffer in a not-yet-faulted DLL `.rdata` page resolves from the backing PE. Used for
     /// hosted-process registry name strings (key names + value names).
@@ -34337,10 +34184,11 @@ impl ExecNtHandler {
             // One executive-lifetime table is shared across every hosted process. Add increments a
             // duplicate's reference count, Find does not, and Delete decrements/frees at zero.
             NativeService::NtAddAtom | NativeService::NtFindAtom => unsafe {
-                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 let out_atom = args[2];
-                if out_atom != 0 && !self.probe_atom_output(out_atom, 2) {
-                    return STATUS_ACCESS_VIOLATION;
+                if out_atom != 0 {
+                    if let Err(status) = self.probe_copy_scalar::<2>(out_atom) {
+                        return status;
+                    }
                 }
                 let byte_len = nt_ulong_arg(args[1]);
                 let mut name = [0u16; nt_kernel_exec::rtl_atom::NAME_CAP];
@@ -34375,7 +34223,14 @@ impl ExecNtHandler {
                 match result {
                     Ok(atom) => {
                         if out_atom != 0 {
-                            self.xas_write_buf(out_atom, &atom.to_le_bytes());
+                            // NT retains the atom reference if the final user store faults.
+                            if let Err(status) = self.process_memory_write_status(
+                                self.pi,
+                                out_atom,
+                                &atom.to_le_bytes(),
+                            ) {
+                                return status;
+                            }
                         }
                         nt_kernel_exec::rtl_atom::status::SUCCESS
                     }
@@ -34388,7 +34243,6 @@ impl ExecNtHandler {
                 Err(status) => status,
             },
             NativeService::NtQueryInformationAtom => unsafe {
-                const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
                 const BASIC_HEADER: usize = 6;
                 const TABLE_HEADER: usize = 4;
@@ -34403,14 +34257,17 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
 
-                if return_len_va != 0 && !self.probe_atom_output(return_len_va, 4) {
-                    return STATUS_ACCESS_VIOLATION;
-                }
                 if info_len != 0 {
-                    let mut first = [0u8; 8];
-                    let probe_len = info_len.min(first.len());
-                    if info_va == 0 || !self.xas_read(info_va, &mut first[..probe_len]) {
-                        return STATUS_ACCESS_VIOLATION;
+                    if info_va & 3 != 0 {
+                        return STATUS_DATATYPE_MISALIGNMENT;
+                    }
+                    if let Err(status) = self.probe_copy_output(self.pi, info_va, info_len as u64) {
+                        return status;
+                    }
+                }
+                if return_len_va != 0 {
+                    if let Err(status) = self.probe_copy_scalar::<4>(return_len_va) {
+                        return status;
                     }
                 }
 
@@ -34433,10 +34290,6 @@ impl ExecNtHandler {
                                 let write_len = BASIC_HEADER + copied + 2;
                                 let mut output = [0u8; BASIC_HEADER
                                     + (nt_kernel_exec::rtl_atom::NAME_CAP + 1) * 2];
-                                if info_va == 0 || !self.xas_read(info_va, &mut output[..write_len])
-                                {
-                                    return STATUS_ACCESS_VIOLATION;
-                                }
                                 output[0..2]
                                     .copy_from_slice(&(query.reference_count as u16).to_le_bytes());
                                 output[2..4]
@@ -34447,7 +34300,13 @@ impl ExecNtHandler {
                                     let off = BASIC_HEADER + i * 2;
                                     output[off..off + 2].copy_from_slice(&name[i].to_le_bytes());
                                 }
-                                self.xas_write_buf(info_va, &output[..write_len]);
+                                if let Err(status) = self.process_memory_write_status(
+                                    self.pi,
+                                    info_va,
+                                    &output[..write_len],
+                                ) {
+                                    return status;
+                                }
                                 required_length = write_len as u32;
                             }
                             query.status
@@ -34468,15 +34327,18 @@ impl ExecNtHandler {
                             let copied = list.count.min(slots);
                             let write_len = TABLE_HEADER + copied * 2;
                             let mut output = [0u8; TABLE_HEADER + GLOBAL_ATOM_CAPACITY * 2];
-                            if info_va == 0 || !self.xas_read(info_va, &mut output[..write_len]) {
-                                return STATUS_ACCESS_VIOLATION;
-                            }
                             output[..4].copy_from_slice(&(list.count as u32).to_le_bytes());
                             for (i, atom) in atoms[..copied].iter().enumerate() {
                                 let off = TABLE_HEADER + i * 2;
                                 output[off..off + 2].copy_from_slice(&atom.to_le_bytes());
                             }
-                            self.xas_write_buf(info_va, &output[..write_len]);
+                            if let Err(status) = self.process_memory_write_status(
+                                self.pi,
+                                info_va,
+                                &output[..write_len],
+                            ) {
+                                return status;
+                            }
                             if list.status == nt_kernel_exec::rtl_atom::status::SUCCESS {
                                 required_length = write_len as u32;
                             }
@@ -34487,7 +34349,13 @@ impl ExecNtHandler {
                 };
 
                 if return_len_va != 0 {
-                    self.xas_write_buf(return_len_va, &required_length.to_le_bytes());
+                    if let Err(status) = self.process_memory_write_status(
+                        self.pi,
+                        return_len_va,
+                        &required_length.to_le_bytes(),
+                    ) {
+                        return status;
+                    }
                 }
                 status
             },

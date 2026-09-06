@@ -277,6 +277,90 @@ fn invalid_and_empty_probes_never_touch_memory() {
 }
 
 #[test]
+fn user_range_probe_checks_the_whole_ceiling_before_touching_memory() {
+    let mut memory = Memory::default();
+    memory.add(0x1000, PAGE_READWRITE, false, 0x11);
+    for (address, length) in [(0x1ffc, 8), (0x2000, 1), (u64::MAX, 1)] {
+        assert_eq!(
+            probe_write_user_range(&mut memory, address, length, 0x2000),
+            Err(STATUS_ACCESS_VIOLATION)
+        );
+        assert!(memory.accesses.is_empty());
+    }
+    for address in [0, 0x2000, u64::MAX] {
+        assert_eq!(
+            probe_write_user_range(&mut memory, address, 0, 0x2000),
+            Ok(())
+        );
+        assert!(memory.accesses.is_empty());
+    }
+    assert_eq!(
+        probe_write_user_range(&mut memory, 0x1ffc, 4, 0x2000),
+        Ok(())
+    );
+    assert_eq!(memory.pages[&0x1000].bytes, [0x11; PAGE_SIZE as usize]);
+}
+
+fn small_scalar_probe<const N: usize>() {
+    let mut memory = Memory::default();
+    memory.add(0x1000, PAGE_WRITECOPY, false, 0x11);
+    memory.pages.get_mut(&0x1000).unwrap().info.type_ = MEM_IMAGE;
+    memory.add(0x2000, PAGE_READWRITE | PAGE_GUARD, false, 0x22);
+    let address = 0x2000 - (N as u64 - 1);
+    assert_eq!(
+        probe_write_scalar::<N>(&mut memory, address, 0x3000),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(memory.accesses.len(), N);
+    assert!(memory
+        .accesses
+        .iter()
+        .all(|(access, _)| *access == FaultAccess::Read));
+    assert_eq!(memory.pages[&0x1000].bytes, [0x11; PAGE_SIZE as usize]);
+    assert_eq!(memory.pages[&0x2000].bytes, [0x22; PAGE_SIZE as usize]);
+    memory.accesses.clear();
+    assert_eq!(probe_write_scalar::<N>(&mut memory, address, 0x3000), Ok(()));
+    assert_eq!(memory.accesses.len(), N * 2);
+    assert!(memory.accesses[..N]
+        .iter()
+        .all(|(access, _)| *access == FaultAccess::Read));
+    assert!(memory.accesses[N..]
+        .iter()
+        .all(|(access, _)| *access == FaultAccess::Write));
+    assert_eq!(memory.pages[&0x1000].bytes, [0x11; PAGE_SIZE as usize]);
+    assert_eq!(memory.pages[&0x2000].bytes, [0x22; PAGE_SIZE as usize]);
+    memory.accesses.clear();
+    assert_eq!(
+        probe_write_scalar::<N>(&mut memory, address, 0x2000),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert!(memory.accesses.is_empty());
+}
+
+#[test]
+fn atom_ushort_probe_captures_the_whole_value_before_writing() {
+    small_scalar_probe::<2>();
+}
+
+#[test]
+fn return_length_ulong_probe_captures_the_whole_value_before_writing() {
+    small_scalar_probe::<4>();
+}
+
+#[test]
+fn scalar_probes_reject_readonly_and_noaccess_outputs() {
+    for protection in [PAGE_READONLY, PAGE_NOACCESS] {
+        let mut memory = Memory::default();
+        memory.add(0x1000, protection, false, 0x77);
+        assert_eq!(
+            probe_write_scalar::<2>(&mut memory, 0x1001, 0x2000),
+            Err(STATUS_ACCESS_VIOLATION)
+        );
+        assert_eq!(memory.pages[&0x1000].bytes, [0x77; PAGE_SIZE as usize]);
+    }
+}
+
+#[test]
 fn guard_permission_precedence_and_writecopy_identity_cover_all_backings() {
     for type_ in [MEM_PRIVATE, MEM_MAPPED, MEM_IMAGE] {
         let info = VmBasicInformation {

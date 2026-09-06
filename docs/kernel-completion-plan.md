@@ -68,8 +68,11 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Route legacy XAS and remote LPC outputs through checked mutable copying, delete the old
   filler/COW helpers and process-specific output selectors, and retain exact paging ownership
   through deferred delivery and event checkpoints (tranche 32, host/build validation).
-- [ ] Replace heuristic output probes and audit remaining best-effort/ignored copy results for
-  service-level fault propagation and rollback. Complete genuine shared-writable image/control-area
+- [x] Replace heuristic output probes with checked mutable residency, preserve scalar probe ordering,
+  and propagate atom output failures; validate the paging owner before guard consumption
+  (tranche 33, host/build validation).
+- [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
+  fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
   Carry explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
@@ -25440,6 +25443,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     page-table, trim, or desktop behavior. The unchanged 33-import win32k gate still blocks live
     acceptance; shared-writable control areas, nonimage COW policy, stack guards, and provider
     unwind/exception delivery remain open.
+
+    B3 checked output-probe tranche 33 (2026-09-06, host/build green):
+    `probe_user_output` now enters the same mutable checked memory boundary as actual writes.
+    Removed fixed stack/heap success ranges, the one-megabyte stack-growth guess, raw PE writable
+    section checks, scratch-capacity prediction, and the no-context readable-output fallback.
+    Deleted the now-unused `client_range_has_backing` and read-only atom output probe. Output
+    admission uses current VAD protection, guard state, residency, and private COW backing, not
+    image layout or the mere existence of a frame. All nonempty page admission validates the exact
+    paging owner/generation before querying metadata, including the guard-consumption path.
+
+    The host-tested copy module now provides user-ceiling-checked range probes and generic scalar
+    probes. Empty ranges touch nothing, even at a high address. Unaligned USHORT/ULONG/SIZE_T
+    outputs capture the complete scalar before any self-write, so a later read fault cannot cause
+    an earlier page's write/COW admission. The existing SIZE_T entry shares this implementation.
+    Fixed query outputs retain their service-specific range/alignment order, and return-length
+    probes now preserve the real guard/access status rather than collapsing all failures to AV.
+
+    `NtAddAtom`, `NtFindAtom`, and `NtQueryInformationAtom` now check every final output copy and
+    return the actual memory error. Atom queries probe the entire caller-specified information
+    range at ULONG alignment before the optional unaligned ReturnLength. Removed output prereads
+    of fully initialized local serialization buffers. Add retains its acquired atom reference if
+    the final store faults, matching NT5's exception path rather than inventing rollback. Reference
+    review used `references/nt5/base/ntos/ex/exatom.c`, `references/nt5/base/ntos/ex/probe.c`, and
+    ReactOS's `ntoskrnl/ex/atom.c` and scalar probe definitions.
+
+    Validation: 134 `nt-address-space`, 243 `nt-kernel-exec`, and 50 `nt-memory-manager` tests pass
+    (427 total). Four new regressions cover full-range ceiling/overflow rejection before touching
+    memory, empty probes, cross-page USHORT/ULONG read-before-write ordering with a later guard,
+    and read-only/no-access rejection. Existing atom-table, COW, guard, exact-copy, and paging-owner
+    tests remain green. The executive build passes. Logs: `.tmp/test-output-probes-20260906.log`
+    and `.tmp/build-output-probes-20260906.log`. All builds/tests were serialized; no QEMU boot ran.
+
+    Review adjustment: heuristic output-probe removal is closed, not all NT output exception
+    behavior. Remaining boolean probe/write adapters still collapse specific errors to AV, and
+    void/ignored copies need service-by-service review of late-fault handle/view rollback and
+    terminal completion behavior. Native scalar versus range ordering must be retained during
+    that migration. Historical read-prefetch/PE retries, genuine shared-writable control areas,
+    nonimage COW policy, stack growth/CPU guard delivery, and provider unwind/exception work remain
+    open. Host/build proof is not live page-table or desktop acceptance; the 33-import win32k gate
+    remains the live blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

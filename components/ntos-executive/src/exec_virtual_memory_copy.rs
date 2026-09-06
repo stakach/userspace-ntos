@@ -2,7 +2,7 @@
 
 use super::*;
 use nt_address_space::copy::{
-    copy_page_plan, copy_virtual_memory, probe_write_range, probe_write_u64, CopyPagePlan,
+    copy_page_plan, copy_virtual_memory, probe_write_scalar, probe_write_user_range, CopyPagePlan,
     VirtualMemoryCopy, WriteProbeMemory, STATUS_GUARD_PAGE_VIOLATION,
 };
 use nt_address_space::{FaultAccess, PAGE_SIZE};
@@ -84,13 +84,21 @@ impl ExecNtHandler {
         address: u64,
         input: &[u8],
     ) -> bool {
+        self.process_memory_write_status(pi, address, input).is_ok()
+    }
+
+    pub(super) unsafe fn process_memory_write_status(
+        &mut self,
+        pi: usize,
+        address: u64,
+        input: &[u8],
+    ) -> Result<(), u32> {
         nt_address_space::copy::write_kernel_buffer(
             address,
             input,
             USER_ADDRESS_LIMIT,
             |va, bytes| self.copy_write_page(pi, va, bytes),
         )
-        .is_ok()
     }
 
     unsafe fn prepare_copy_page(
@@ -99,6 +107,10 @@ impl ExecNtHandler {
         address: u64,
         access: FaultAccess,
     ) -> Result<(), u32> {
+        // Guard consumption mutates VAD metadata too, so validate ownership before either path.
+        self.loop_ctx
+            .and_then(|ctx| ctx.for_process(pi))
+            .ok_or(STATUS_INVALID_HANDLE)?;
         let page = address & !(PAGE_SIZE - 1);
         let info = self.query_memory_basic_information(pi, page)?;
         let plan = copy_page_plan(page, info, access, pi != self.pi).map_err(|status| {
@@ -178,30 +190,34 @@ impl ExecNtHandler {
         Ok(())
     }
 
-    unsafe fn probe_copy_output(
+    pub(super) unsafe fn probe_copy_output(
         &mut self,
         pi: usize,
         address: u64,
         length: u64,
     ) -> Result<(), u32> {
-        address
-            .checked_add(length)
-            .filter(|end| *end <= USER_ADDRESS_LIMIT)
-            .ok_or(STATUS_ACCESS_VIOLATION)?;
-        probe_write_range(
+        probe_write_user_range(
             &mut ProcessWriteProbe { handler: self, pi },
             address,
             length,
+            USER_ADDRESS_LIMIT,
+        )
+    }
+
+    pub(super) unsafe fn probe_copy_scalar<const N: usize>(
+        &mut self,
+        address: u64,
+    ) -> Result<(), u32> {
+        let pi = self.pi;
+        probe_write_scalar::<N>(
+            &mut ProcessWriteProbe { handler: self, pi },
+            address,
+            USER_ADDRESS_LIMIT,
         )
     }
 
     unsafe fn probe_copy_count(&mut self, address: u64) -> Result<(), u32> {
-        address
-            .checked_add(8)
-            .filter(|end| *end <= USER_ADDRESS_LIMIT)
-            .ok_or(STATUS_ACCESS_VIOLATION)?;
-        let pi = self.pi;
-        probe_write_u64(&mut ProcessWriteProbe { handler: self, pi }, address)
+        self.probe_copy_scalar::<8>(address)
     }
 
     unsafe fn copy_read_page(
