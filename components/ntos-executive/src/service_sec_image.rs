@@ -3001,7 +3001,7 @@ unsafe fn drain_deferred_user_callback_returns(
             print_str(b"\n");
         } else if outer_dispatch_completed {
             pfilled[current_pi] = *current_filled_pages;
-            let (_, _, safe) = drain_selected_gui_event_signals(nt_handler, pfilled, procs);
+            let (_, _, safe) = drain_selected_gui_event_signals(nt_handler);
             if !safe {
                 print_str(b"[gui-msg-wait] deferred callback drain aborted unsafe redrive\n");
             }
@@ -8148,6 +8148,14 @@ pub(crate) unsafe fn service_sec_image(
         "bootstrap manifest must include CSRSS"
     );
     let hosted_loaded_images = reset_service_hosted_loaded_images_work();
+    // The primary image uses the same loaded-image authority as later child processes. Its
+    // backing bytes remain valid throughout this service loop, like the supplied ntdll image.
+    let primary_bytes = core::slice::from_raw_parts(pe.bytes().as_ptr(), pe.bytes().len());
+    let primary_pe = nt_pe_loader::PeFile::parse(primary_bytes)
+        .expect("the primary image has already passed PE validation");
+    hosted_loaded_images
+        .register_if_loaded(primary_image, Some(primary_pe), primary_bytes.as_ptr() as u64)
+        .expect("primary executable backing must register once");
     let hosted_loaded_images_ptr = hosted_loaded_images as *mut HostedLoadedImageTable;
     if live_service {
         print_str(b"[sec-init] bootstrap-image-load begin\n");
@@ -8689,7 +8697,39 @@ pub(crate) unsafe fn service_sec_image(
     // wall-clock went. Successive dumps turn a runaway into a measurable RATE. The clock is a
     // STATIC because the win32k dispatch arm's nested pump ticks it too (see `w32_census_enter`).
     CENSUS_LAST_DUMP.store(last_progress_t, Ordering::Relaxed);
+    let memory_context = ExecLoopCtx {
+        owner_pi: primary_pi,
+        owner_generation: primary_image.generation,
+        live_paging: None,
+        pml4,
+        procs,
+        pfilled,
+        nls_section_handle: &mut nls_section_handle as *mut u64,
+        reg: &mut reg as *mut nt_dll_registry::Registry,
+        hosted_loaded_images: hosted_loaded_images_ptr,
+        exe_images: exe_images as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
+        exe_image_catalog: exe_image_catalog
+            as *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
+        filled_pages: &mut pfilled[primary_pi] as *mut [u64; 512],
+        faults: &mut procs[primary_pi].faults as *mut u64,
+        scratch_base,
+        ntdll_pe: match ntdll {
+            Some((_, npe)) => npe as *const nt_pe_loader::PeFile as *const ()
+                as *const nt_pe_loader::PeFile<'static>,
+            None => core::ptr::null(),
+        },
+        img_end,
+        nt_base,
+        nt_end,
+        dll_pe_store: dll_pe_store as *mut DllPeStore,
+        generic_sections: generic_sections as *mut GenericSectionTable,
+        dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
+    };
+    nt_handler.loop_ctx = Some(memory_context);
     loop {
+        // Deferred work between events writes canonical tables, never the previous event's
+        // reusable scratch counters. Flush late completion fills before selecting another owner.
+        nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
         // Hardware IRQs share the root TCB's bound notification with the HPET timer. Component
         // pumps only latch these bits; the root loop is the sole dispatcher and therefore the sole
         // owner of ISR ordering and handler acknowledgement.
@@ -9236,6 +9276,25 @@ pub(crate) unsafe fn service_sec_image(
         first = procs[pi].first;
         ntfaults = procs[pi].ntfaults;
         *filled_pages = pfilled[pi];
+        let memory_generation = exe_image_catalog.get_by_pi(pi)
+            .expect("event process retains its executable identity").generation;
+        nt_handler.loop_ctx = Some(ExecLoopCtx {
+            owner_pi: pi,
+            owner_generation: memory_generation,
+            live_paging: Some(LiveProcessPaging {
+                pi,
+                pml4,
+                generation: memory_generation,
+                filled_pages: filled_pages as *mut [u64; 512],
+                faults: &mut faults as *mut u64,
+            }),
+            pml4,
+            filled_pages: filled_pages as *mut [u64; 512],
+            faults: &mut faults as *mut u64,
+            scratch_base,
+            img_end,
+            ..memory_context
+        });
         // A CPU exception (label 3). The DEBUG ntdll emits `int 0x2d` (DebugService/DPRINT),
         // which #GPs with no kernel debugger; emulate it as a no-op by skipping past the
         // `int 0x2d; int3` pair (echo the registers, advance the fault IP by 3, restart).
@@ -11301,8 +11360,6 @@ pub(crate) unsafe fn service_sec_image(
                                         pfilled[pi] = *filled_pages;
                                         let (_, _, safe) = drain_selected_gui_event_signals(
                                             &mut nt_handler,
-                                            pfilled,
-                                            procs,
                                         );
                                         if !safe {
                                             print_str(
@@ -11678,40 +11735,6 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.lpc_connect_completion.is_none(),
                     "previous syscall leaked an LPC connect completion"
                 );
-                // Group-C handlers reach the loop's section/registry/demand-fill state through this
-                // ctx of raw refs (rebuilt each iteration at the current loop locals).
-                nt_handler.loop_ctx = Some(ExecLoopCtx {
-                    pml4,
-                    procs,
-                    pfilled,
-                    nls_section_handle: &mut nls_section_handle as *mut u64,
-                    reg: &mut reg as *mut nt_dll_registry::Registry,
-                    hosted_loaded_images: hosted_loaded_images_ptr,
-                    exe_images: exe_images
-                        as *mut nt_exe_image::ImageTable<HOSTED_PROCESS_IMAGE_CAP>,
-                    exe_image_catalog: exe_image_catalog
-                        as *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
-                    filled_pages: filled_pages as *mut [u64; 512],
-                    faults: &mut faults as *mut u64,
-                    scratch_base,
-                    // Erase the non-'static lifetime through a thin `*const ()` (the image bytes are
-                    // executive-lifetime; the loop outlives every `dispatch`).
-                    pe: pe as *const nt_pe_loader::PeFile as *const ()
-                        as *const nt_pe_loader::PeFile<'static>,
-                    ntdll_pe: match ntdll {
-                        Some((_, npe)) => {
-                            npe as *const nt_pe_loader::PeFile as *const ()
-                                as *const nt_pe_loader::PeFile<'static>
-                        }
-                        None => core::ptr::null(),
-                    },
-                    img_end,
-                    nt_base,
-                    nt_end,
-                    dll_pe_store: dll_pe_store as *mut DllPeStore,
-                    generic_sections: generic_sections as *mut GenericSectionTable,
-                    dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
-                });
                 // ALPC last-mile item (a): NtAlpc* SSNs are registered in the dispatcher via this
                 // recognizer. DORMANT — `ALPC_HOST_PRESENT` is never set at boot (no ALPC binary
                 // yet), and the Win7 ALPC SSNs collide with the live ReactOS SSN space, so it can
@@ -11992,10 +12015,6 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         print_str(b"\n");
                         if drop_reply {
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
-                            pfilled[pi] = *filled_pages;
                             let _ = finalize_service_loop_state(&mut nt_handler);
                             let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
                             let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
@@ -12097,6 +12116,7 @@ pub(crate) unsafe fn service_sec_image(
                 for k in 0..nt_handler.out_writes_n {
                     let (ptr, val) = nt_handler.out_writes[k];
                     if !nt_handler.xas_write_u64(ptr, val) {
+                        result = 0xC000_0005;
                         print_str(b"[copyout] failed pi=");
                         print_u64(pi as u64);
                         print_str(b" ptr=0x");
@@ -17071,7 +17091,7 @@ pub(crate) unsafe fn service_sec_image(
                     && !redirected_user_callback
                 {
                     let (_, _, drain_safe) =
-                        drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
+                        drain_selected_gui_event_signals(&mut nt_handler);
                     if !drain_safe {
                         ok = false;
                         st = 0xC000_0001;
@@ -17496,7 +17516,7 @@ pub(crate) unsafe fn service_sec_image(
             let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
             if gui_message_wait_park_request {
                 let (_, _, prepark_safe) =
-                    drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
+                    drain_selected_gui_event_signals(&mut nt_handler);
                 if prepark_safe
                     && reply_main != 0
                     && gui_message_wait_park(
@@ -17514,7 +17534,7 @@ pub(crate) unsafe fn service_sec_image(
                     )
                 {
                     let (event_signals, _, _drain_safe) =
-                        drain_selected_gui_event_signals(&mut nt_handler, pfilled, procs);
+                        drain_selected_gui_event_signals(&mut nt_handler);
                     if event_signals != 0 {
                         GUI_MESSAGE_WAIT_READY_REDRIVES.fetch_add(1, Ordering::Relaxed);
                     }
@@ -18320,6 +18340,7 @@ pub(crate) unsafe fn service_sec_image(
         // A non-VMFault, non-syscall fault (e.g. #GP) the loop can't service — unrecoverable. Park+log.
         park_and_log!(pi, b"other-fault", m1, m1);
     }
+    nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
     let quiesce_cm_status = checkpoint_boot_hives_at_quiesce(&mut nt_handler);
     if quiesce_cm_status != nt_fs::STATUS_SUCCESS {
         stop = quiesce_cm_status as u64;
@@ -18928,15 +18949,15 @@ pub(crate) unsafe fn service_sec_image(
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
-            // Take the loop context so every client access goes through smss's mirrors (the same
-            // idiom the post-loop pipe / io-completion re-drive helpers use).
-            let saved_ctx = nt_handler.loop_ctx.take();
+            // Retain the process memory owner so syscall outputs use normal write admission.
+            let saved_ctx = nt_handler.loop_ctx;
             ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
             nt_handler.pi = 0;
 
             let mut sc_ok = 0u64;
@@ -19375,7 +19396,7 @@ pub(crate) unsafe fn service_sec_image(
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
-            let saved_ctx = nt_handler.loop_ctx.take();
+            let saved_ctx = nt_handler.loop_ctx;
             ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
@@ -19385,6 +19406,7 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.pi = 0;
 
             let mut ex_ok = 0u64;
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
             let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {
@@ -19822,7 +19844,7 @@ pub(crate) unsafe fn service_sec_image(
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
-            let saved_ctx = nt_handler.loop_ctx.take();
+            let saved_ctx = nt_handler.loop_ctx;
             ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
@@ -19832,6 +19854,7 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.pi = 0;
 
             let mut md_ok = 0u64;
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
             let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {
@@ -20279,7 +20302,7 @@ pub(crate) unsafe fn service_sec_image(
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
-            let saved_ctx = nt_handler.loop_ctx.take();
+            let saved_ctx = nt_handler.loop_ctx;
             ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
@@ -20289,6 +20312,7 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.pi = 0;
 
             let mut bk_ok = 0u64;
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
             let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {
@@ -21458,7 +21482,7 @@ pub(crate) unsafe fn service_sec_image(
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
             let saved_tid = nt_handler.current_tid;
-            let saved_ctx = nt_handler.loop_ctx.take();
+            let saved_ctx = nt_handler.loop_ctx;
             ACTIVE_STACK_BASE.store(STACK_BASE, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
@@ -21468,18 +21492,21 @@ pub(crate) unsafe fn service_sec_image(
             nt_handler.pi = 0;
 
             let mut br_ok = 0u64;
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(0));
             let dbg_origin = SyscallOrigin::new(1, 1, ProcessorMode::UserMode);
             // Every dispatch through the real route, with the out-param write queue drained exactly
             // as the service loop drains it (`xas_write_u64` per queued write).
             macro_rules! sysc {
                 ($ssn:expr, $args:expr) => {{
                     nt_handler.out_writes_n = 0;
-                    let status = nt_dispatcher
+                    let mut status = nt_dispatcher
                         .dispatch($ssn as u32, $args, &dbg_origin, &mut nt_handler)
                         .status;
                     for k in 0..nt_handler.out_writes_n {
                         let (ptr, val) = nt_handler.out_writes[k];
-                        let _ = nt_handler.xas_write_u64(ptr, val);
+                        if !nt_handler.xas_write_u64(ptr, val) {
+                            status = 0xC000_0005;
+                        }
                     }
                     nt_handler.out_writes_n = 0;
                     status
@@ -21836,7 +21863,7 @@ pub(crate) unsafe fn service_sec_image(
                                 nt_handler.commit_hosted_thread_publication(request.publication);
                                 for k in 0..nt_handler.out_writes_n {
                                     let (ptr, val) = nt_handler.out_writes[k];
-                                    let _ = nt_handler.xas_write_u64(ptr, val);
+                                    assert!(nt_handler.xas_write_u64(ptr, val));
                                 }
                                 nt_handler.out_writes_n = 0;
                                 spawned_breakin_tid = request.cid_thread;
@@ -22377,6 +22404,7 @@ pub(crate) unsafe fn service_sec_image(
     let native_driver_load_report = nt_handler.native_driver_load_report;
     let live_device_action_report = print_live_device_action_report(&nt_handler);
     let start_device_call_report = print_start_device_call_report(&nt_handler);
+    nt_handler.loop_ctx = None;
     (
         verdict,
         procs[primary_pi].faults,
@@ -23492,6 +23520,7 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_tid = nt_handler.current_tid;
     let saved_badge = nt_handler.current_badge;
     let saved_user_memory = nt_handler.current_user_memory;
+    let saved_ctx = nt_handler.loop_ctx;
     let mut woken = 0u64;
 
     let mut generation = 0u64;
@@ -23525,6 +23554,7 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
             W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
             nt_handler.pi = pi;
             nt_handler.current_tid = continuation.tid;
             nt_handler.current_badge = continuation.badge;
@@ -23579,6 +23609,7 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.current_tid = saved_tid;
     nt_handler.current_badge = saved_badge;
     nt_handler.current_user_memory = saved_user_memory;
+    nt_handler.loop_ctx = saved_ctx;
     woken
 }
 
@@ -23604,6 +23635,7 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_tid = nt_handler.current_tid;
     let saved_badge = nt_handler.current_badge;
     let saved_user_memory = nt_handler.current_user_memory;
+    let saved_ctx = nt_handler.loop_ctx;
     let mut woken = 0u64;
 
     let mut generation = 0u64;
@@ -23663,6 +23695,7 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
             W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+            nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
             nt_handler.pi = pi;
             nt_handler.current_tid = continuation.tid;
             nt_handler.current_badge = continuation.badge;
@@ -23743,6 +23776,7 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     nt_handler.current_tid = saved_tid;
     nt_handler.current_badge = saved_badge;
     nt_handler.current_user_memory = saved_user_memory;
+    nt_handler.loop_ctx = saved_ctx;
     woken
 }
 
@@ -23774,6 +23808,7 @@ unsafe fn lpc_connect_wait_complete(
     let saved_tid = nt_handler.current_tid;
     let saved_badge = nt_handler.current_badge;
     let saved_user_memory = nt_handler.current_user_memory;
+    let saved_ctx = nt_handler.loop_ctx;
 
     let continuation = wait.continuation;
     let pi = continuation.pi as usize;
@@ -23799,6 +23834,7 @@ unsafe fn lpc_connect_wait_complete(
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+        nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
         nt_handler.pi = pi;
         nt_handler.current_tid = continuation.tid;
         nt_handler.current_badge = continuation.badge;
@@ -23823,6 +23859,7 @@ unsafe fn lpc_connect_wait_complete(
     nt_handler.current_tid = saved_tid;
     nt_handler.current_badge = saved_badge;
     nt_handler.current_user_memory = saved_user_memory;
+    nt_handler.loop_ctx = saved_ctx;
 
     let Some(completed) = (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS)).take(slot) else {
         LPC_CONNECT_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -24098,8 +24135,6 @@ struct GuiEventRedriveResult {
 unsafe fn gui_message_wait_redrive_event(
     nt_handler: &mut ExecNtHandler,
     event: nt_kernel_exec::EventObjectId,
-    pfilled: &[[u64; 512]],
-    procs: &[ProcExec],
 ) -> GuiEventRedriveResult {
     if event.is_null() {
         return GuiEventRedriveResult {
@@ -24120,7 +24155,7 @@ unsafe fn gui_message_wait_redrive_event(
     let saved_resume_ip = nt_handler.current_resume_ip;
     let saved_sp = nt_handler.current_sp;
     let saved_flags = nt_handler.current_flags;
-    let saved_ctx = nt_handler.loop_ctx.take();
+    let saved_ctx = nt_handler.loop_ctx;
     let mut woken = 0u64;
     let mut disposition = GuiEventRedriveDisposition::Complete;
 
@@ -24156,6 +24191,7 @@ unsafe fn gui_message_wait_redrive_event(
             }
             continue;
         }
+        nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
         GUI_MESSAGE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
         let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(waiter.badge, pi);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
@@ -24302,15 +24338,9 @@ unsafe fn gui_message_wait_redrive_event(
             gui_message_waiter_unselect(slot, waiter.queue_event_lease);
             continue;
         }
-        let output = core::slice::from_raw_parts(arg as *const u8, WIN32K_MSG_BYTES);
-        let copy_ok = img_spawn::client_copyout_mapped(
-            waiter.pi as u64,
-            waiter.msg_ptr,
-            output,
-            &pfilled[pi],
-            procs[pi].faults as usize,
-            scratch_base,
-        );
+        let mut output = [0u8; WIN32K_MSG_BYTES];
+        core::ptr::copy_nonoverlapping(arg as *const u8, output.as_mut_ptr(), output.len());
+        let copy_ok = nt_handler.xas_try_write_buf(waiter.msg_ptr, &output);
         let status = if copy_ok { get.0 } else { u64::MAX };
         reply_parked_syscall(waiter.reply_cap, waiter.reply, status);
         release_reply_pool_cap(waiter.reply_cap);
@@ -24360,8 +24390,6 @@ unsafe fn gui_message_wait_redrive_event(
 
 unsafe fn drain_selected_gui_event_signals(
     nt_handler: &mut ExecNtHandler,
-    pfilled: &[[u64; 512]],
-    procs: &[ProcExec],
 ) -> (u64, u64, bool) {
     let mut signals = 0u64;
     let mut woken = 0u64;
@@ -24375,7 +24403,7 @@ unsafe fn drain_selected_gui_event_signals(
         if !gui_message_wait_has_selected(signal.id) {
             let _ = gui_message_wait_select_level_inner(nt_handler, signal.id, false);
         }
-        let result = gui_message_wait_redrive_event(nt_handler, signal.id, pfilled, procs);
+        let result = gui_message_wait_redrive_event(nt_handler, signal.id);
         woken += result.woken;
         match result.disposition {
             GuiEventRedriveDisposition::Complete => nt_handler
@@ -24448,7 +24476,7 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
-    let saved_ctx = nt_handler.loop_ctx.take();
+    let saved_ctx = nt_handler.loop_ctx;
 
     let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
         mirror_ctx_for(waiter.badge, waiter.process_index as usize);
@@ -24458,6 +24486,7 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(waiter.process_index as u64, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+    nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(waiter.process_index as usize));
     nt_handler.pi = waiter.process_index as usize;
 
     let copied = nt_handler
@@ -24533,7 +24562,7 @@ unsafe fn stage_parked_thread_user_apc(
     let saved_resume_ip = nt_handler.current_resume_ip;
     let saved_sp = nt_handler.current_sp;
     let saved_flags = nt_handler.current_flags;
-    let saved_ctx = nt_handler.loop_ctx.take();
+    let saved_ctx = nt_handler.loop_ctx;
 
     let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(badge, pi);
     ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
@@ -24543,6 +24572,7 @@ unsafe fn stage_parked_thread_user_apc(
     ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
+    nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
     nt_handler.pi = pi;
     nt_handler.current_tid = tid;
     nt_handler.current_badge = badge;
@@ -25536,7 +25566,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_resume_ip = nt_handler.current_resume_ip;
     let saved_sp = nt_handler.current_sp;
     let saved_flags = nt_handler.current_flags;
-    let saved_ctx = nt_handler.loop_ctx.take();
+    let saved_ctx = nt_handler.loop_ctx;
     macro_rules! restore_file_io_mirrors {
         () => {{
             ACTIVE_STACK_BASE.store(saved_stack_base, Ordering::Relaxed);
@@ -25551,6 +25581,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             nt_handler.current_resume_ip = saved_resume_ip;
             nt_handler.current_sp = saved_sp;
             nt_handler.current_flags = saved_flags;
+            nt_handler.loop_ctx = saved_ctx;
         }};
     }
 
@@ -25632,6 +25663,7 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
         ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pending.pi as usize));
         nt_handler.pi = pending.pi as usize;
         nt_handler.current_tid = pending.tid;
         nt_handler.current_badge = pending.badge;
@@ -26422,7 +26454,7 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
-    let saved_ctx = nt_handler.loop_ctx.take();
+    let saved_ctx = nt_handler.loop_ctx;
     let mut resumed = 0u64;
     let mut cursor = 0usize;
     while let Some((slot, pending)) =
@@ -26441,6 +26473,7 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
         ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
+        nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pending.pi as usize));
         nt_handler.pi = pending.pi as usize;
 
         let mut delivery_state = pending.delivery_state;

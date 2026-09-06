@@ -53,6 +53,19 @@ impl VirtualMemoryCopy for ProcessMemoryCopy<'_> {
 }
 
 impl ExecNtHandler {
+    /// Scalar and buffer outputs share protection, guard, residency, and COW admission.
+    pub(crate) unsafe fn xas_write_u64(&mut self, va: u64, value: u64) -> bool {
+        self.xas_try_write_buf(va, &value.to_le_bytes())
+    }
+
+    pub(crate) unsafe fn xas_write_u32(&mut self, va: u64, value: u32) -> bool {
+        self.xas_try_write_buf(va, &value.to_le_bytes())
+    }
+
+    pub(crate) unsafe fn xas_try_write_buf(&mut self, va: u64, input: &[u8]) -> bool {
+        self.user_memory_write(SyscallUserMemory::CurrentProcess, va, input)
+    }
+
     pub(super) unsafe fn user_memory_write(
         &mut self,
         memory: SyscallUserMemory,
@@ -62,6 +75,15 @@ impl ExecNtHandler {
         let pi = match memory {
             SyscallUserMemory::CurrentProcess => self.pi,
         };
+        self.process_memory_write(pi, address, input)
+    }
+
+    pub(super) unsafe fn process_memory_write(
+        &mut self,
+        pi: usize,
+        address: u64,
+        input: &[u8],
+    ) -> bool {
         nt_address_space::copy::write_kernel_buffer(
             address,
             input,
@@ -208,20 +230,17 @@ impl ExecNtHandler {
             return Ok(());
         }
         // Residency may change counters or retire COW aliases. Resolve them only afterwards.
-        let ctx = self.loop_ctx.ok_or(STATUS_INVALID_HANDLE)?;
-        let target = (&*ctx.procs).get(pi).ok_or(STATUS_INVALID_HANDLE)?;
-        let (filled, faults) = if pi == self.pi {
-            (&*ctx.filled_pages, *ctx.faults as usize)
-        } else {
-            (&(*ctx.pfilled)[pi], target.faults as usize)
-        };
+        let ctx = self
+            .loop_ctx
+            .and_then(|ctx| ctx.for_process(pi))
+            .ok_or(STATUS_INVALID_HANDLE)?;
         if client_copyin_process_mapped(
             pi as u64,
             address,
             output,
-            filled,
-            faults,
-            target.scratch_base,
+            &*ctx.filled_pages,
+            *ctx.faults as usize,
+            ctx.scratch_base,
             false,
         ) {
             Ok(())
@@ -238,20 +257,17 @@ impl ExecNtHandler {
             return Err(STATUS_ACCESS_VIOLATION);
         }
         self.prepare_copy_page(pi, address, FaultAccess::Write)?;
-        let ctx = self.loop_ctx.ok_or(STATUS_INVALID_HANDLE)?;
-        let target = (&*ctx.procs).get(pi).ok_or(STATUS_INVALID_HANDLE)?;
-        let (filled, faults) = if pi == self.pi {
-            (&*ctx.filled_pages, *ctx.faults as usize)
-        } else {
-            (&(*ctx.pfilled)[pi], target.faults as usize)
-        };
+        let ctx = self
+            .loop_ctx
+            .and_then(|ctx| ctx.for_process(pi))
+            .ok_or(STATUS_INVALID_HANDLE)?;
         if client_copyout_mapped(
             pi as u64,
             address,
             input,
-            filled,
-            faults,
-            target.scratch_base,
+            &*ctx.filled_pages,
+            *ctx.faults as usize,
+            ctx.scratch_base,
         ) {
             Ok(())
         } else {

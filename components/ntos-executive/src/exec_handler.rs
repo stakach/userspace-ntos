@@ -12036,7 +12036,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn readonly_disk_read_to_user(
-        &self,
+        &mut self,
         first_cluster: u32,
         file_size: u32,
         offset: u32,
@@ -14130,7 +14130,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn write_current_iosb(
-        &self,
+        &mut self,
         iosb: u64,
         status: u32,
         information: u64,
@@ -14138,9 +14138,8 @@ impl ExecNtHandler {
         if iosb == 0 || !self.probe_user_output(iosb, 16) {
             return false;
         }
-        self.xas_write_buf(iosb, &status.to_le_bytes());
-        self.xas_write_buf(iosb + 8, &information.to_le_bytes());
-        true
+        self.xas_try_write_buf(iosb, &status.to_le_bytes())
+            && self.xas_try_write_buf(iosb + 8, &information.to_le_bytes())
     }
 
     unsafe fn nt_device_io_control_file_service(&mut self, args: &[u64]) -> u32 {
@@ -16646,7 +16645,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_query_thread_name(
-        &self,
+        &mut self,
         handle: u64,
         information: u64,
         information_length: u32,
@@ -16703,7 +16702,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_query_information_thread(
-        &self,
+        &mut self,
         handle: u64,
         information_class: u32,
         information: u64,
@@ -16821,10 +16820,7 @@ impl ExecNtHandler {
 
     unsafe fn current_process_image_information(&self) -> Option<[u8; 0x40]> {
         let ctx = self.loop_ctx?;
-        if ctx.pe.is_null() {
-            return None;
-        }
-        let pe = &*ctx.pe;
+        let pe = ctx.main_image()?;
         let metadata = image_metadata_from_pe(pe, PE_LOAD_BASE);
         let mut info = nt_dll_registry::image_info(
             PE_LOAD_BASE,
@@ -16876,7 +16872,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_query_process_image_name(
-        &self,
+        &mut self,
         handle: u64,
         information_class: u32,
         information: u64,
@@ -18950,8 +18946,9 @@ impl ExecNtHandler {
         target_pi: usize,
         plan: nt_address_space::VmResidencyPagePlan,
     ) -> Result<(), u32> {
-        let ctx = self.loop_ctx.ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let procs = &mut *ctx.procs;
+        let ctx = self.loop_ctx.and_then(|ctx| ctx.for_process(target_pi))
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let procs = &*ctx.procs;
         let target = procs
             .get(target_pi)
             .copied()
@@ -19012,14 +19009,6 @@ impl ExecNtHandler {
                         .and_then(|slot| slot.as_ref())
                         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?
                 };
-                let (filled_pages, faults) = if target_pi == self.pi {
-                    (&mut *ctx.filled_pages, &mut *ctx.faults)
-                } else {
-                    (
-                        &mut (&mut *ctx.pfilled)[target_pi],
-                        &mut procs[target_pi].faults,
-                    )
-                };
                 service_image_page_residency(
                     self,
                     target_pi,
@@ -19030,8 +19019,8 @@ impl ExecNtHandler {
                     target.scratch_base,
                     plan.access,
                     false,
-                    filled_pages,
-                    faults,
+                    &mut *ctx.filled_pages,
+                    &mut *ctx.faults,
                 )
             }
         }
@@ -20506,7 +20495,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn pnp_write_sized_output(
-        &self,
+        &mut self,
         size_field: u64,
         output: u64,
         output_size: usize,
@@ -20527,7 +20516,7 @@ impl ExecNtHandler {
         0
     }
 
-    unsafe fn pnp_control_interface_device_list(&self, buffer: u64, buffer_len: usize) -> u32 {
+    unsafe fn pnp_control_interface_device_list(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_INTERFACE_LIST_LEN {
             return STATUS_INVALID_PARAMETER;
         }
@@ -20578,7 +20567,7 @@ impl ExecNtHandler {
         0
     }
 
-    unsafe fn pnp_control_property(&self, buffer: u64, buffer_len: usize) -> u32 {
+    unsafe fn pnp_control_property(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_PROPERTY_LEN {
             return STATUS_INVALID_PARAMETER;
         }
@@ -20615,7 +20604,7 @@ impl ExecNtHandler {
         self.pnp_write_sized_output(buffer + 32, output, output_size, &data)
     }
 
-    unsafe fn pnp_control_related_device(&self, buffer: u64, buffer_len: usize) -> u32 {
+    unsafe fn pnp_control_related_device(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_RELATED_DEVICE_LEN {
             return STATUS_INVALID_PARAMETER;
         }
@@ -20794,7 +20783,7 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn pnp_control_device_depth(&self, buffer: u64, buffer_len: usize) -> u32 {
+    unsafe fn pnp_control_device_depth(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_DEPTH_LEN {
             return STATUS_INVALID_PARAMETER;
         }
@@ -20820,7 +20809,7 @@ impl ExecNtHandler {
         0
     }
 
-    unsafe fn pnp_control_device_relations(&self, buffer: u64, buffer_len: usize) -> u32 {
+    unsafe fn pnp_control_device_relations(&mut self, buffer: u64, buffer_len: usize) -> u32 {
         if buffer == 0 || buffer_len < PNP_CONTROL_RELATIONS_LEN {
             return STATUS_INVALID_PARAMETER;
         }
@@ -20867,7 +20856,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_access_check_privilege_set(
-        &self,
+        &mut self,
         privilege_set: u64,
         privilege_set_length: u64,
         captured_length: u32,
@@ -22711,7 +22700,7 @@ impl ExecNtHandler {
     /// Mirror authoritative ETHREAD impersonation state into the target thread's TEB. Like
     /// `PspWriteTebImpersonationInfo`, this is best-effort bookkeeping and never owns the state.
     unsafe fn write_thread_teb_impersonation_state(
-        &self,
+        &mut self,
         tid: nt_process::ThreadId,
         active: bool,
     ) -> bool {
@@ -23788,8 +23777,14 @@ impl ExecNtHandler {
         if va.checked_add(dst.len() as u64).is_none() {
             return false;
         }
-        if let Some(ctx) = self
-            .loop_ctx
+        let context = match self.loop_ctx {
+            Some(ctx) => match ctx.for_process(self.pi) {
+                Some(ctx) => Some(ctx),
+                None => return false,
+            },
+            None => None,
+        };
+        if let Some(ctx) = context
             .as_ref()
             .filter(|_| self.current_hosted_thread_user_stack_contains(va, dst.len()))
         {
@@ -23805,7 +23800,7 @@ impl ExecNtHandler {
         if smss_copyin(va, dst) {
             return true;
         }
-        let ctx = match self.loop_ctx.as_ref() {
+        let ctx = match context.as_ref() {
             Some(c) => c,
             None => return false,
         };
@@ -23828,7 +23823,10 @@ impl ExecNtHandler {
             let cur = va + done as u64;
             let (pe, byte_rva): (&nt_pe_loader::PeFile, u32) =
                 if cur >= PE_LOAD_BASE && cur < ctx.img_end {
-                    (&*ctx.pe, (cur - PE_LOAD_BASE) as u32)
+                    let Some(pe) = ctx.main_image() else {
+                        return false;
+                    };
+                    (pe, (cur - PE_LOAD_BASE) as u32)
                 } else if !ctx.ntdll_pe.is_null() && cur >= ctx.nt_base && cur < ctx.nt_end {
                     (&*ctx.ntdll_pe, (cur - ctx.nt_base) as u32)
                 } else if let Some((i, rva)) = reg.dll_for_page(self.pi, cur) {
@@ -23874,104 +23872,11 @@ impl ExecNtHandler {
         Ok(Some(self.read_user_i64(timeout_ptr)?))
     }
 
-    unsafe fn current_image_protection_for_page(&self, page: u64) -> Option<u32> {
-        process_committed_mapping_basic_information(self.pi as u64, page)
-            .filter(|info| info.type_ == nt_address_space::MEM_IMAGE)
-            .map(|info| info.protect)
-    }
-
-    unsafe fn clear_current_scratch_page(&self, ctx: ExecLoopCtx, page: u64) {
-        let filled_pages = &mut *ctx.filled_pages;
-        let faults = (*ctx.faults as usize).min(filled_pages.len());
-        for filled_page in filled_pages.iter_mut().take(faults) {
-            if *filled_page == page {
-                *filled_page = 0;
-            }
-        }
-    }
-
-    unsafe fn promote_current_image_cow_for_write(&self, va: u64, len: usize) -> bool {
-        if len == 0 {
-            return true;
-        }
-        let Some(ctx) = self.loop_ctx else {
-            return true;
-        };
-        let Some(last) = va.checked_add(len as u64 - 1) else {
-            return false;
-        };
-        let mut page = va & !0xfff;
-        let last_page = last & !0xfff;
-        loop {
-            if let Some(protection) = self.current_image_protection_for_page(page) {
-                if nt_address_space::image_view_fault_access_status(
-                    protection,
-                    nt_address_space::FaultAccess::Write,
-                )
-                .is_err()
-                {
-                    return false;
-                }
-                let write_plan = nt_address_space::image_view_fault_plan(protection, true);
-                if write_plan.copy_on_write {
-                    if vm_promote_image_cow_for_kernel_write(
-                        self.pi,
-                        page,
-                        protection,
-                        ctx.pml4,
-                        ctx.scratch_base,
-                    )
-                    .is_err()
-                    {
-                        return false;
-                    }
-                    self.clear_current_scratch_page(ctx, page);
-                }
-            }
-            if page == last_page {
-                return true;
-            }
-            let Some(next) = page.checked_add(0x1000) else {
-                return false;
-            };
-            page = next;
-        }
-    }
-
-    /// Cross-AS 8-byte out-param write to the current process's VA `va` — handles a target that lives
-    /// in a DLL `.data` global (e.g. advapi32's `DefaultHandleTable[]`, where MapDefaultKey stores the
-    /// predefined-root handle) that the stack/heap mirror can't reach. Delegates to
-    /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
-    /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
-    pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
-        if let Some(ctx) = self.loop_ctx {
-            if !self.promote_current_image_cow_for_write(va, 8) {
-                return false;
-            }
-            let filled_pages = &mut *ctx.filled_pages;
-            let faults = &mut *ctx.faults;
-            let reg = &*ctx.reg;
-            let dll_pes = ctx.dll_pes();
-            client_copyout_or_fill_mapped(
-                self.pi as u64,
-                va,
-                &val.to_le_bytes(),
-                filled_pages,
-                faults,
-                ctx.scratch_base,
-                reg,
-                dll_pes,
-                ctx.pml4,
-            )
-        } else {
-            smss_copyout(va, &val.to_le_bytes())
-        }
-    }
 
     /// Publish the two user-visible outputs of a successful `NtCreateProcess[Ex]`: the process
     /// handle and the child PEB pointer returned through the creator TEB's ArbitraryUserPointer.
     pub(crate) unsafe fn publish_created_process(
-        &self,
+        &mut self,
         process_handle_out: u64,
         process_handle: u64,
         child_peb: u64,
@@ -23991,31 +23896,6 @@ impl ExecNtHandler {
             && self.xas_write_u64(process_handle_out, process_handle)
     }
 
-    /// Cross-address-space DWORD copyout without imposing 8-byte alignment on the user pointer.
-    pub(crate) unsafe fn xas_write_u32(&self, va: u64, val: u32) -> bool {
-        if let Some(ctx) = self.loop_ctx {
-            if !self.promote_current_image_cow_for_write(va, 4) {
-                return false;
-            }
-            let filled_pages = &mut *ctx.filled_pages;
-            let faults = &mut *ctx.faults;
-            let reg = &*ctx.reg;
-            let dll_pes = ctx.dll_pes();
-            client_copyout_or_fill_mapped(
-                self.pi as u64,
-                va,
-                &val.to_le_bytes(),
-                filled_pages,
-                faults,
-                ctx.scratch_base,
-                reg,
-                dll_pes,
-                ctx.pml4,
-            )
-        } else {
-            smss_copyout(va, &val.to_le_bytes())
-        }
-    }
 
     /// Probe a small writable event output before changing dispatcher state.
     pub(crate) unsafe fn probe_event_output(&self, va: u64, len: usize) -> bool {
@@ -24212,7 +24092,7 @@ impl ExecNtHandler {
         }
 
         if va >= PE_LOAD_BASE && end <= ctx.img_end {
-            return writable_image_range(&*ctx.pe, PE_LOAD_BASE, va, len);
+            return ctx.main_image().is_some_and(|pe| writable_image_range(pe, PE_LOAD_BASE, va, len));
         }
         if !ctx.ntdll_pe.is_null() && va >= ctx.nt_base && end <= ctx.nt_end {
             return writable_image_range(&*ctx.ntdll_pe, ctx.nt_base, va, len)
@@ -24228,44 +24108,32 @@ impl ExecNtHandler {
         false
     }
 
-    /// Cross-AS byte-buffer write to the current process's VA `va` — mirror first, else 8-byte chunks
-    /// via [`xas_write_u64`] (each demand-fills a not-yet-faulted DLL/heap page as needed). The last
-    /// partial word is read-modify-written so trailing bytes past `src` in that word are preserved.
-    /// Used for hosted-process registry info-structure copyout (KEY_*_INFORMATION into a heap buffer).
-    pub(crate) unsafe fn xas_write_buf(&self, va: u64, src: &[u8]) {
+    /// Legacy best-effort adapter. Status-sensitive callers use `xas_try_write_buf` directly.
+    pub(crate) unsafe fn xas_write_buf(&mut self, va: u64, src: &[u8]) {
         let _ = self.xas_try_write_buf(va, src);
     }
 
-    unsafe fn write_current_user_buf(&self, va: u64, src: &[u8], use_xas_write: bool) -> bool {
-        if src.is_empty() {
-            return true;
-        }
-        if use_xas_write {
-            self.xas_try_write_buf(va, src)
-        } else {
-            smss_copyout(va, src)
-        }
+    unsafe fn write_current_user_buf(&mut self, va: u64, src: &[u8]) -> bool {
+        self.xas_try_write_buf(va, src)
     }
 
     unsafe fn write_current_user_buf_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         src: &[u8],
-        use_xas_write: bool,
     ) -> bool {
         let Some(dst) = base.checked_add(offset as u64) else {
             return false;
         };
-        self.write_current_user_buf(dst, src, use_xas_write)
+        self.write_current_user_buf(dst, src)
     }
 
     unsafe fn write_current_user_buf_chunked_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         src: &[u8],
-        use_xas_write: bool,
     ) -> bool {
         const CHUNK: usize = 64 * 1024;
         let mut done = 0usize;
@@ -24278,7 +24146,6 @@ impl ExecNtHandler {
                 base,
                 dst_offset,
                 &src[done..done + n],
-                use_xas_write,
             ) {
                 return false;
             }
@@ -24288,41 +24155,38 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_current_user_buf_bounded_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         src: &[u8],
         bound: usize,
-        use_xas_write: bool,
     ) -> bool {
         if offset >= bound {
             return true;
         }
         let n = src.len().min(bound - offset);
-        self.write_current_user_buf_at(base, offset, &src[..n], use_xas_write)
+        self.write_current_user_buf_at(base, offset, &src[..n])
     }
 
     unsafe fn write_current_user_buf_chunked_bounded_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         src: &[u8],
         bound: usize,
-        use_xas_write: bool,
     ) -> bool {
         if offset >= bound {
             return true;
         }
         let n = src.len().min(bound - offset);
-        self.write_current_user_buf_chunked_at(base, offset, &src[..n], use_xas_write)
+        self.write_current_user_buf_chunked_at(base, offset, &src[..n])
     }
 
     unsafe fn write_current_user_zeroes_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         len: usize,
-        use_xas_write: bool,
     ) -> bool {
         let zeroes = [0u8; 64];
         let mut done = 0usize;
@@ -24331,7 +24195,7 @@ impl ExecNtHandler {
             let Some(dst_offset) = offset.checked_add(done) else {
                 return false;
             };
-            if !self.write_current_user_buf_at(base, dst_offset, &zeroes[..n], use_xas_write) {
+            if !self.write_current_user_buf_at(base, dst_offset, &zeroes[..n]) {
                 return false;
             }
             done += n;
@@ -24340,25 +24204,23 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_current_user_zeroes_bounded_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         len: usize,
         bound: usize,
-        use_xas_write: bool,
     ) -> bool {
         if offset >= bound {
             return true;
         }
-        self.write_current_user_zeroes_at(base, offset, len.min(bound - offset), use_xas_write)
+        self.write_current_user_zeroes_at(base, offset, len.min(bound - offset))
     }
 
     unsafe fn write_current_user_utf16le_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         s: &str,
-        use_xas_write: bool,
     ) -> bool {
         let mut scratch = [0u8; 128];
         let mut pending = 0usize;
@@ -24372,7 +24234,6 @@ impl ExecNtHandler {
                     base,
                     dst_offset,
                     &scratch[..pending],
-                    use_xas_write,
                 ) {
                     return false;
                 }
@@ -24386,7 +24247,7 @@ impl ExecNtHandler {
             let Some(dst_offset) = offset.checked_add(written) else {
                 return false;
             };
-            if !self.write_current_user_buf_at(base, dst_offset, &scratch[..pending], use_xas_write)
+            if !self.write_current_user_buf_at(base, dst_offset, &scratch[..pending])
             {
                 return false;
             }
@@ -24395,12 +24256,11 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_current_user_utf16le_bounded_at(
-        &self,
+        &mut self,
         base: u64,
         offset: usize,
         s: &str,
         bound: usize,
-        use_xas_write: bool,
     ) -> bool {
         if offset >= bound {
             return true;
@@ -24423,7 +24283,6 @@ impl ExecNtHandler {
                     base,
                     dst_offset,
                     &scratch[..pending],
-                    use_xas_write,
                 ) {
                     return false;
                 }
@@ -24438,7 +24297,7 @@ impl ExecNtHandler {
             let Some(dst_offset) = offset.checked_add(written) else {
                 return false;
             };
-            if !self.write_current_user_buf_at(base, dst_offset, &scratch[..pending], use_xas_write)
+            if !self.write_current_user_buf_at(base, dst_offset, &scratch[..pending])
             {
                 return false;
             }
@@ -24447,13 +24306,12 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_key_value_info_to_user(
-        &self,
+        &mut self,
         va: u64,
         class: u64,
         name: &str,
         ty: u32,
         data: &[u8],
-        use_xas_write: bool,
     ) -> bool {
         let Ok(layout) = key_value_info_layout(class, name, data.len()) else {
             return false;
@@ -24467,8 +24325,8 @@ impl ExecNtHandler {
                 put_u32_le(&mut header, 0x00, 0);
                 put_u32_le(&mut header, 0x04, ty);
                 put_u32_le(&mut header, 0x08, layout.name_len as u32);
-                self.write_current_user_buf_at(va, 0, &header, use_xas_write)
-                    && self.write_current_user_utf16le_at(va, 0x0c, name, use_xas_write)
+                self.write_current_user_buf_at(va, 0, &header)
+                    && self.write_current_user_utf16le_at(va, 0x0c, name)
             }
             2 => {
                 let Some(data_offset) = layout.data_offset else {
@@ -24478,8 +24336,8 @@ impl ExecNtHandler {
                 put_u32_le(&mut header, 0x00, 0);
                 put_u32_le(&mut header, 0x04, ty);
                 put_u32_le(&mut header, 0x08, layout.data_len as u32);
-                self.write_current_user_buf_at(va, 0, &header, use_xas_write)
-                    && self.write_current_user_buf_chunked_at(va, data_offset, data, use_xas_write)
+                self.write_current_user_buf_at(va, 0, &header)
+                    && self.write_current_user_buf_chunked_at(va, data_offset, data)
             }
             4 => {
                 let Some(data_offset) = layout.data_offset else {
@@ -24488,8 +24346,8 @@ impl ExecNtHandler {
                 let mut header = [0u8; 0x08];
                 put_u32_le(&mut header, 0x00, ty);
                 put_u32_le(&mut header, 0x04, layout.data_len as u32);
-                self.write_current_user_buf_at(va, 0, &header, use_xas_write)
-                    && self.write_current_user_buf_chunked_at(va, data_offset, data, use_xas_write)
+                self.write_current_user_buf_at(va, 0, &header)
+                    && self.write_current_user_buf_chunked_at(va, data_offset, data)
             }
             1 | 3 => {
                 let data_offset = layout.data_offset.unwrap_or(u32::MAX as usize);
@@ -24503,8 +24361,8 @@ impl ExecNtHandler {
                 put_u32_le(&mut header, 0x0c, layout.data_len as u32);
                 put_u32_le(&mut header, 0x10, layout.name_len as u32);
                 let name_end = 0x14usize + layout.name_len;
-                let wrote_prefix = self.write_current_user_buf_at(va, 0, &header, use_xas_write)
-                    && self.write_current_user_utf16le_at(va, 0x14, name, use_xas_write);
+                let wrote_prefix = self.write_current_user_buf_at(va, 0, &header)
+                    && self.write_current_user_utf16le_at(va, 0x14, name);
                 if !wrote_prefix {
                     return false;
                 }
@@ -24513,12 +24371,10 @@ impl ExecNtHandler {
                         va,
                         name_end,
                         data_offset.saturating_sub(name_end),
-                        use_xas_write,
                     ) && self.write_current_user_buf_chunked_at(
                         va,
                         data_offset,
                         data,
-                        use_xas_write,
                     )
                 } else {
                     true
@@ -24529,14 +24385,13 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_key_value_info_prefix_to_user(
-        &self,
+        &mut self,
         va: u64,
         class: u64,
         name: &str,
         ty: u32,
         data: &[u8],
         limit: usize,
-        use_xas_write: bool,
     ) -> bool {
         if limit == 0 {
             return true;
@@ -24553,13 +24408,12 @@ impl ExecNtHandler {
                 put_u32_le(&mut header, 0x00, 0);
                 put_u32_le(&mut header, 0x04, ty);
                 put_u32_le(&mut header, 0x08, layout.name_len as u32);
-                self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                self.write_current_user_buf_bounded_at(va, 0, &header, limit)
                     && self.write_current_user_utf16le_bounded_at(
                         va,
                         0x0c,
                         name,
                         limit,
-                        use_xas_write,
                     )
             }
             2 => {
@@ -24570,13 +24424,12 @@ impl ExecNtHandler {
                 put_u32_le(&mut header, 0x00, 0);
                 put_u32_le(&mut header, 0x04, ty);
                 put_u32_le(&mut header, 0x08, layout.data_len as u32);
-                self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                self.write_current_user_buf_bounded_at(va, 0, &header, limit)
                     && self.write_current_user_buf_chunked_bounded_at(
                         va,
                         data_offset,
                         data,
                         limit,
-                        use_xas_write,
                     )
             }
             4 => {
@@ -24586,13 +24439,12 @@ impl ExecNtHandler {
                 let mut header = [0u8; 0x08];
                 put_u32_le(&mut header, 0x00, ty);
                 put_u32_le(&mut header, 0x04, layout.data_len as u32);
-                self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                self.write_current_user_buf_bounded_at(va, 0, &header, limit)
                     && self.write_current_user_buf_chunked_bounded_at(
                         va,
                         data_offset,
                         data,
                         limit,
-                        use_xas_write,
                     )
             }
             1 | 3 => {
@@ -24608,13 +24460,12 @@ impl ExecNtHandler {
                 put_u32_le(&mut header, 0x10, layout.name_len as u32);
                 let name_end = 0x14usize + layout.name_len;
                 let wrote_prefix =
-                    self.write_current_user_buf_bounded_at(va, 0, &header, limit, use_xas_write)
+                    self.write_current_user_buf_bounded_at(va, 0, &header, limit)
                         && self.write_current_user_utf16le_bounded_at(
                             va,
                             0x14,
                             name,
                             limit,
-                            use_xas_write,
                         );
                 if !wrote_prefix {
                     return false;
@@ -24625,13 +24476,11 @@ impl ExecNtHandler {
                         name_end,
                         data_offset.saturating_sub(name_end),
                         limit,
-                        use_xas_write,
                     ) && self.write_current_user_buf_chunked_bounded_at(
                         va,
                         data_offset,
                         data,
                         limit,
-                        use_xas_write,
                     )
                 } else {
                     true
@@ -24642,7 +24491,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn query_value_key_copyout_status(
-        &self,
+        &mut self,
         info_class: u64,
         output_va: u64,
         output_length: usize,
@@ -24650,7 +24499,6 @@ impl ExecNtHandler {
         name: &str,
         ty: u32,
         data: &[u8],
-        use_xas_write: bool,
     ) -> u32 {
         let layout = match key_value_info_layout(info_class, name, data.len()) {
             Ok(layout) => layout,
@@ -24660,11 +24508,7 @@ impl ExecNtHandler {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         let result_length = result_length.to_le_bytes();
-        let result_length_written = if use_xas_write {
-            self.xas_try_write_buf(result_length_va, &result_length)
-        } else {
-            smss_copyout(result_length_va, &result_length)
-        };
+        let result_length_written = self.xas_try_write_buf(result_length_va, &result_length);
         if !result_length_written {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -24679,13 +24523,12 @@ impl ExecNtHandler {
                 ty,
                 data,
                 output_length,
-                use_xas_write,
             ) {
                 return STATUS_ACCESS_VIOLATION;
             }
             return STATUS_BUFFER_OVERFLOW;
         }
-        if !self.write_key_value_info_to_user(output_va, info_class, name, ty, data, use_xas_write)
+        if !self.write_key_value_info_to_user(output_va, info_class, name, ty, data)
         {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -24693,23 +24536,18 @@ impl ExecNtHandler {
     }
 
     unsafe fn registry_key_information_copyout_status(
-        &self,
+        &mut self,
         information: &[u8],
         minimum_length: usize,
         output_va: u64,
         output_length: usize,
         result_length_va: u64,
-        use_xas_write: bool,
     ) -> u32 {
         let Ok(result_length) = u32::try_from(information.len()) else {
             return STATUS_INSUFFICIENT_RESOURCES;
         };
         let result_length = result_length.to_le_bytes();
-        let result_length_written = if use_xas_write {
-            self.xas_try_write_buf(result_length_va, &result_length)
-        } else {
-            smss_copyout(result_length_va, &result_length)
-        };
+        let result_length_written = self.xas_try_write_buf(result_length_va, &result_length);
         if !result_length_written {
             return STATUS_ACCESS_VIOLATION;
         }
@@ -24717,12 +24555,8 @@ impl ExecNtHandler {
             return STATUS_BUFFER_TOO_SMALL;
         }
         let copy_len = output_length.min(information.len());
-        if use_xas_write {
-            if !self.xas_try_write_buf(output_va, &information[..copy_len]) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-        } else {
-            self.xas_write_buf(output_va, &information[..copy_len]);
+        if !self.xas_try_write_buf(output_va, &information[..copy_len]) {
+            return STATUS_ACCESS_VIOLATION;
         }
         if output_length < information.len() {
             STATUS_BUFFER_OVERFLOW
@@ -24780,57 +24614,6 @@ impl ExecNtHandler {
         )
     }
 
-    pub(crate) unsafe fn xas_try_write_buf(&self, va: u64, src: &[u8]) -> bool {
-        if let Some(ctx) = self
-            .loop_ctx
-            .as_ref()
-            .filter(|_| self.current_hosted_thread_user_stack_contains(va, src.len()))
-        {
-            return client_copyout_mapped(
-                self.pi as u64,
-                va,
-                src,
-                &*ctx.filled_pages,
-                *ctx.faults as usize,
-                ctx.scratch_base,
-            );
-        }
-        if let Some(ctx) = self.loop_ctx {
-            if !self.promote_current_image_cow_for_write(va, src.len()) {
-                return false;
-            }
-            if client_copyout_or_fill_mapped(
-                self.pi as u64,
-                va,
-                src,
-                &mut *ctx.filled_pages,
-                &mut *ctx.faults,
-                ctx.scratch_base,
-                &*ctx.reg,
-                ctx.dll_pes(),
-                ctx.pml4,
-            ) {
-                return true;
-            }
-        }
-        if smss_copyout(va, src) {
-            return true;
-        }
-        let mut i = 0usize;
-        while i < src.len() {
-            let n = (src.len() - i).min(8);
-            let mut w = [0u8; 8];
-            if n < 8 && !self.xas_read(va + i as u64, &mut w) {
-                return false;
-            }
-            w[..n].copy_from_slice(&src[i..i + n]);
-            if !self.xas_write_u64(va + i as u64, u64::from_le_bytes(w)) {
-                return false;
-            }
-            i += 8;
-        }
-        true
-    }
     /// Capture an NtAddAtom/NtFindAtom explicit-length UTF-16 name from the current process. Small
     /// pointer values preserve MAKEINTATOM semantics and are returned directly without a read.
     pub(crate) unsafe fn copyin_atom_name(
@@ -25331,7 +25114,7 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn write_file_basic_information(&self, output: u64, info: nt_fs::FileMetadata) -> bool {
+    unsafe fn write_file_basic_information(&mut self, output: u64, info: nt_fs::FileMetadata) -> bool {
         let mut basic = [0u8; 40];
         if nt_fs::encode_query_information(
             nt_fs::FILE_BASIC_INFORMATION,
@@ -25346,7 +25129,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_file_network_open_information(
-        &self,
+        &mut self,
         output: u64,
         info: nt_fs::FileMetadata,
     ) -> bool {
@@ -31477,7 +31260,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn lpc_publish_request_reply(
-        &self,
+        &mut self,
         pi: usize,
         memory: SyscallUserMemory,
         request: nt_lpc_continuation::RequestWaitRequest,
@@ -31884,35 +31667,19 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn lpc_user_memory_write(
-        &self,
+        &mut self,
         pi: usize,
         memory: SyscallUserMemory,
         va: u64,
         src: &[u8],
     ) -> bool {
         match memory {
-            SyscallUserMemory::CurrentProcess if pi == self.pi => self.xas_try_write_buf(va, src),
-            SyscallUserMemory::CurrentProcess => {
-                let Some(ctx) = self.loop_ctx else {
-                    return false;
-                };
-                let procs = &*ctx.procs;
-                let filled = &*ctx.pfilled;
-                pi < MAX_PI
-                    && client_copyout_mapped(
-                        pi as u64,
-                        va,
-                        src,
-                        &filled[pi],
-                        procs[pi].faults as usize,
-                        procs[pi].scratch_base,
-                    )
-            }
+            SyscallUserMemory::CurrentProcess => self.process_memory_write(pi, va, src),
         }
     }
 
     unsafe fn capture_lpc_port_view(
-        &self,
+        &mut self,
         owner_pi: usize,
         memory: SyscallUserMemory,
         pointer: u64,
@@ -31966,7 +31733,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn capture_lpc_remote_view(
-        &self,
+        &mut self,
         owner_pi: usize,
         memory: SyscallUserMemory,
         pointer: u64,
@@ -36155,7 +35922,6 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let _transient = allocator::enter_transient();
-                let use_xas_write = self.pi >= 2;
                 let index = nt_ulong_arg(args[1]);
                 let output_length = nt_ulong_arg(args[4]) as usize;
                 let lease = self.cm_system_key_target(key).map(|target| target.lease);
@@ -36170,17 +35936,30 @@ impl ExecNtHandler {
                                 &value.name,
                                 value.value_type,
                                 &value.data,
-                                use_xas_write,
                             ),
                             RegistryValueCopyProvenance::default(),
                         ),
                         Err(status) => (status as u32, RegistryValueCopyProvenance::default()),
                     }
                 } else {
-                    match self.registry_value_by_index_with(
+                    let captured = self.registry_value_by_index_with(
                         key,
                         index as usize,
                         |name, ty, data, source| {
+                            let mut captured_name = alloc::string::String::new();
+                            captured_name
+                                .try_reserve(name.len())
+                                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                            captured_name.push_str(name);
+                            let mut captured_data = try_zeroed_transfer_buffer(data.len())?;
+                            captured_data.copy_from_slice(data);
+                            Ok((captured_name, ty, captured_data, source))
+                        },
+                    );
+                    match captured.and_then(|value| value.transpose()) {
+                        Ok(Some((name, ty, data, source))) => {
+                            let name = name.as_str();
+                            let data = data.as_slice();
                             let status = self.query_value_key_copyout_status(
                                 info_class,
                                 args[3],
@@ -36189,25 +35968,23 @@ impl ExecNtHandler {
                                 name,
                                 ty,
                                 data,
-                                use_xas_write,
                             );
-                            if status != 0 {
-                                return (status, RegistryValueCopyProvenance::default());
-                            }
                             (
-                                0,
-                                self.registry_value_copy_provenance_for_copyout(
-                                    info_class,
-                                    args[3],
-                                    name,
-                                    ty,
-                                    data.len(),
-                                    source,
-                                ),
+                                status,
+                                if status == 0 {
+                                    self.registry_value_copy_provenance_for_copyout(
+                                        info_class,
+                                        args[3],
+                                        name,
+                                        ty,
+                                        data.len(),
+                                        source,
+                                    )
+                                } else {
+                                    RegistryValueCopyProvenance::default()
+                                },
                             )
                         },
-                    ) {
-                        Ok(Some(result)) => result,
                         Ok(None) => (
                             STATUS_NO_MORE_ENTRIES,
                             RegistryValueCopyProvenance::default(),
@@ -36275,7 +36052,6 @@ impl ExecNtHandler {
                         args[3],
                         output_length,
                         args[5],
-                        self.pi >= 2,
                     );
                     trace_winlogon_post_lsa_registry(
                         self,
@@ -36324,7 +36100,6 @@ impl ExecNtHandler {
                     args[3],
                     output_length,
                     args[5],
-                    self.pi >= 2,
                 );
                 trace_winlogon_post_lsa_registry(
                     self,
@@ -36350,7 +36125,6 @@ impl ExecNtHandler {
                     Err(status) => return status,
                 };
                 let _transient = allocator::enter_transient();
-                let use_xas_write = self.pi >= 2;
                 let output_length = nt_ulong_arg(args[3]) as usize;
                 let leased_information =
                     match self.cm_system_key_target(key).map(|target| target.lease) {
@@ -36402,7 +36176,6 @@ impl ExecNtHandler {
                     args[2],
                     output_length,
                     args[4],
-                    use_xas_write,
                 )
             },
             // NtCreateNamedPipeFile(FileHandle[R10], DesiredAccess[RDX], ObjectAttributes[R8],
@@ -36873,29 +36646,6 @@ impl ExecNtHandler {
                         name_lc.push(c.to_ascii_lowercase());
                     }
                 }
-                // Set for hosted processes reading real-hive values: their out-params are often
-                // advapi/userenv heap or stack buffers the plain mirror can't reach. Predefined-root
-                // and overlay reads stay on their narrow paths unless a call site below proves it
-                // needs cross-AS copyout.
-                let mut use_xas_write =
-                    shell_com_inproc_bit != 0 || self.current_process_is_noninteractive_service();
-                if pe_backed_registry_strings
-                    && (!is_virtual_registry_key(key)
-                        || self.cm_system_key_target(key).is_some()
-                        || self.cm_runtime_key_target(key).is_some())
-                {
-                    // Hosted clients reading a value out of a real mounted hive or a CM-owned SYSTEM
-                    // lease have out-params in advapi/userenv heap or stack that the plain mirror can't
-                    // reach, so the copyout below must go cross-AS. Early live cases:
-                    //   • SetDefaultLanguage(NULL) -> the `Default` value of the SYSTEM-hive key
-                    //     `...\Control\Nls\Language` (opened through the machine namespace). Was:
-                    //     mirror-only → None → NOT_FOUND → SetDefaultLanguage FALSE →
-                    //     InitializeSAS FALSE → ExitProcess(2).
-                    //   • GetProfilesDirectoryW → `ProfilesDirectory` under the SOFTWARE-hive key
-                    //     `Software\Microsoft\Windows NT\CurrentVersion\ProfileList`.
-                    // Overlay and predefined-root reads stay on their narrow paths.
-                    use_xas_write = true;
-                }
                 let key_is_real_winlogon = key_path.as_deref().is_some_and(is_winlogon_key);
                 let query_status = if self
                     .should_expose_sam_setup_phase(key_path.as_deref(), &name_lc)
@@ -36909,7 +36659,6 @@ impl ExecNtHandler {
                         "",
                         4,
                         &data,
-                        use_xas_write,
                     );
                     trace_winlogon_post_lsa_registry(
                         self,
@@ -36922,131 +36671,134 @@ impl ExecNtHandler {
                     );
                     status
                 } else {
-                    match self.registry_value_with_result(key, &name_lc, |ty, data| {
-                        let mut value_use_xas_write = use_xas_write;
-                        if self.current_process_is_winlogon() && key_is_real_winlogon {
-                            WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
-                            if name_lc == "userinit" {
-                                WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
-                                WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
-                                WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
-                                value_use_xas_write = true;
-                                if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
-                                    print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
-                                    for pair in data.chunks_exact(2) {
-                                        let unit = u16::from_le_bytes([pair[0], pair[1]]);
-                                        if unit == 0 {
-                                            break;
+                    let captured = self.registry_value_with_result(key, &name_lc, |ty, data| {
+                        let mut captured_data = try_zeroed_transfer_buffer(data.len())?;
+                        captured_data.copy_from_slice(data);
+                        Ok((ty, captured_data))
+                    });
+                    match captured.and_then(|value| value.transpose()) {
+                        Ok(Some((ty, data))) => {
+                            let data = data.as_slice();
+                            if self.current_process_is_winlogon() && key_is_real_winlogon {
+                                WINLOGON_KEY_VALUES_SERVED.fetch_add(1, Ordering::Relaxed);
+                                if name_lc == "userinit" {
+                                    WINLOGON_USERINIT_READS.fetch_add(1, Ordering::Relaxed);
+                                    WINLOGON_USERINIT_TYPE.store(ty as u64, Ordering::Relaxed);
+                                    WINLOGON_USERINIT_BYTES.store(data.len() as u64, Ordering::Relaxed);
+                                    if WINLOGON_USERINIT_READS.load(Ordering::Relaxed) == 1 {
+                                        print_str(b"[wl-shell] WlxActivateUserShell Userinit = \"");
+                                        for pair in data.chunks_exact(2) {
+                                            let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                                            if unit == 0 {
+                                                break;
+                                            }
+                                            debug_put_char(if (0x20..0x7f).contains(&unit) {
+                                                unit as u8
+                                            } else {
+                                                b'?'
+                                            });
                                         }
-                                        debug_put_char(if (0x20..0x7f).contains(&unit) {
-                                            unit as u8
-                                        } else {
-                                            b'?'
-                                        });
+                                        print_str(b"\" (REG type ");
+                                        print_u64(ty as u64);
+                                        print_str(b", from the real SOFTWARE hive)\n");
                                     }
-                                    print_str(b"\" (REG type ");
-                                    print_u64(ty as u64);
-                                    print_str(b", from the real SOFTWARE hive)\n");
-                                }
-                            } else if name_lc == "defaultpassword" {
-                                WINLOGON_DEFAULT_PASSWORD_READS.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        // A `PolAcDm[NS]` account-domain attribute served back through
-                        // `LsapGetObjectAttribute` — lsasrv's `LsapGetDomainInfo` at LSA init, and
-                        // msv1_0's `GetAccountDomainSid` on the real logon path (counted separately
-                        // while an `LsaLogonUser` is in flight, which is the credential-validation
-                        // proof).
-                        if key_path.as_deref().is_some_and(|p| {
-                            p.starts_with(r"\registry\machine\security\policy\polacdm")
-                        }) {
-                            LSA_ACCT_DOMAIN_ATTR_READS.fetch_add(1, Ordering::Relaxed);
-                            if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
-                                LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.fetch_add(1, Ordering::Relaxed);
-                            }
-                            if name_lc.is_empty()
-                                && key_path.as_deref()
-                                    == Some(r"\registry\machine\security\policy\polacdms")
-                            {
-                                LSA_ACCT_DOMAIN_SID_LEN.store(data.len() as u64, Ordering::Relaxed);
-                                let mut head = [0u8; 8];
-                                let n = data.len().min(head.len());
-                                head[..n].copy_from_slice(&data[..n]);
-                                LSA_ACCT_DOMAIN_SID_HEAD
-                                    .store(u64::from_le_bytes(head), Ordering::Relaxed);
-                            }
-                        }
-                        if shell_com_inproc_bit != 0 {
-                            if name_lc.is_empty() {
-                                EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK
-                                    .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
-                            } else if name_lc == "threadingmodel" {
-                                EXPLORER_SHELL_COM_THREADING_MODEL_MASK
-                                    .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
-                            }
-                        }
-                        let status = self.query_value_key_copyout_status(
-                            info_class,
-                            args[3],
-                            output_length,
-                            args[5],
-                            "",
-                            ty,
-                            data,
-                            value_use_xas_write,
-                        );
-                        // A value COPIED OUT of the 4th mount, in full, to a hosted process.
-                        // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
-                        // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
-                        // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
-                        let served_from_software = self
-                            .mutable_registry_key(key)
-                            .is_some_and(|key| key.hive == HIVE_SEL_SOFTWARE)
-                            || (!is_virtual_registry_key(key)
-                                && hive_sel(key) == HIVE_SEL_SOFTWARE);
-                        if status == 0 && served_from_software {
-                            SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
-                            if self.current_process_is_winlogon() && name_lc == "profilesdirectory"
-                            {
-                                WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
-                            } else if self.current_process_is_winlogon()
-                                && name_lc == "profileimagepath"
-                                && key_path
-                                    .as_deref()
-                                    .is_some_and(is_profile_list_sid_key_canon)
-                            {
-                                const EXPECTED: &[u8] = b"%SystemDrive%\\Profiles\\Administrator";
-                                let exact = ty == 2
-                                    && data.len() == (EXPECTED.len() + 1) * 2
-                                    && data
-                                        .chunks_exact(2)
-                                        .zip(
-                                            EXPECTED
-                                                .iter()
-                                                .map(|byte| *byte as u16)
-                                                .chain(core::iter::once(0)),
-                                        )
-                                        .all(|(pair, expected)| {
-                                            u16::from_le_bytes([pair[0], pair[1]]) == expected
-                                        });
-                                if exact {
-                                    PROFILE_LIST_PROFILE_IMAGE_PATH_READBACKS
-                                        .fetch_add(1, Ordering::Relaxed);
+                                } else if name_lc == "defaultpassword" {
+                                    WINLOGON_DEFAULT_PASSWORD_READS.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                        }
-                        trace_winlogon_post_lsa_registry(
-                            self,
-                            b"query-value",
-                            key_path.as_deref(),
-                            &name_lc,
-                            status,
-                            Some(ty),
-                            Some(data),
-                        );
-                        status
-                    }) {
-                        Ok(Some(status)) => status,
+                            // A `PolAcDm[NS]` account-domain attribute served back through
+                            // `LsapGetObjectAttribute` — lsasrv's `LsapGetDomainInfo` at LSA init, and
+                            // msv1_0's `GetAccountDomainSid` on the real logon path (counted separately
+                            // while an `LsaLogonUser` is in flight, which is the credential-validation
+                            // proof).
+                            if key_path.as_deref().is_some_and(|p| {
+                                p.starts_with(r"\registry\machine\security\policy\polacdm")
+                            }) {
+                                LSA_ACCT_DOMAIN_ATTR_READS.fetch_add(1, Ordering::Relaxed);
+                                if LSA_LOGON_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
+                                    LSA_ACCT_DOMAIN_ATTR_READS_IN_LOGON.fetch_add(1, Ordering::Relaxed);
+                                }
+                                if name_lc.is_empty()
+                                    && key_path.as_deref()
+                                        == Some(r"\registry\machine\security\policy\polacdms")
+                                {
+                                    LSA_ACCT_DOMAIN_SID_LEN.store(data.len() as u64, Ordering::Relaxed);
+                                    let mut head = [0u8; 8];
+                                    let n = data.len().min(head.len());
+                                    head[..n].copy_from_slice(&data[..n]);
+                                    LSA_ACCT_DOMAIN_SID_HEAD
+                                        .store(u64::from_le_bytes(head), Ordering::Relaxed);
+                                }
+                            }
+                            if shell_com_inproc_bit != 0 {
+                                if name_lc.is_empty() {
+                                    EXPLORER_SHELL_COM_INPROC_DEFAULT_MASK
+                                        .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
+                                } else if name_lc == "threadingmodel" {
+                                    EXPLORER_SHELL_COM_THREADING_MODEL_MASK
+                                        .fetch_or(shell_com_inproc_bit, Ordering::Relaxed);
+                                }
+                            }
+                            let status = self.query_value_key_copyout_status(
+                                info_class,
+                                args[3],
+                                output_length,
+                                args[5],
+                                "",
+                                ty,
+                                data,
+                            );
+                            // A value COPIED OUT of the 4th mount, in full, to a hosted process.
+                            // `ProfilesDirectory` is the one `userenv!GetProfilesDirectoryW`
+                            // (`profile.c:1592`) reads — it is what makes winlogon's post-logon
+                            // `LoadUserProfileW` advance past its old `ERROR_FILE_NOT_FOUND`.
+                            let served_from_software = self
+                                .mutable_registry_key(key)
+                                .is_some_and(|key| key.hive == HIVE_SEL_SOFTWARE)
+                                || (!is_virtual_registry_key(key)
+                                    && hive_sel(key) == HIVE_SEL_SOFTWARE);
+                            if status == 0 && served_from_software {
+                                SOFTWARE_HIVE_VALUE_READS.fetch_add(1, Ordering::Relaxed);
+                                if self.current_process_is_winlogon() && name_lc == "profilesdirectory"
+                                {
+                                    WINLOGON_PROFILES_DIR_READS.fetch_add(1, Ordering::Relaxed);
+                                } else if self.current_process_is_winlogon()
+                                    && name_lc == "profileimagepath"
+                                    && key_path
+                                        .as_deref()
+                                        .is_some_and(is_profile_list_sid_key_canon)
+                                {
+                                    const EXPECTED: &[u8] = b"%SystemDrive%\\Profiles\\Administrator";
+                                    let exact = ty == 2
+                                        && data.len() == (EXPECTED.len() + 1) * 2
+                                        && data
+                                            .chunks_exact(2)
+                                            .zip(
+                                                EXPECTED
+                                                    .iter()
+                                                    .map(|byte| *byte as u16)
+                                                    .chain(core::iter::once(0)),
+                                            )
+                                            .all(|(pair, expected)| {
+                                                u16::from_le_bytes([pair[0], pair[1]]) == expected
+                                            });
+                                    if exact {
+                                        PROFILE_LIST_PROFILE_IMAGE_PATH_READBACKS
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            trace_winlogon_post_lsa_registry(
+                                self,
+                                b"query-value",
+                                key_path.as_deref(),
+                                &name_lc,
+                                status,
+                                Some(ty),
+                                Some(data),
+                            );
+                            status
+                        },
                         Ok(None) => {
                             // POST-PROFILE FRONTIER: once the user hive is loaded, winlogon's remaining
                             // `HandleLogon` steps (`CreateUserEnvironment` -> `SetDefaultLanguage` ->
@@ -40509,6 +40261,10 @@ impl ExecNtHandler {
                 let mut output = match try_zeroed_transfer_buffer(needed) {
                     Ok(output) => output,
                     Err(status) => return status,
+                };
+                let token = match self.token_store.get(token_id) {
+                    Some(token) => token,
+                    None => return STATUS_INVALID_HANDLE,
                 };
                 let encoded = match class {
                     1 => {

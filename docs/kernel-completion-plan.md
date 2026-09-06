@@ -65,8 +65,11 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Remove the untracked fixed main-image mirror, its runtime layout and active selectors;
   reject reclaimed backing and resolve resident image reads through current per-process private
   or shared mappings (tranche 31, host/build validation).
-- [ ] Migrate remaining legacy XAS copyout callers to checked residency/ownership/commitment
-  publication, then remove their image filler. Complete genuine shared-writable image/control-area
+- [x] Route legacy XAS and remote LPC outputs through checked mutable copying, delete the old
+  filler/COW helpers and process-specific output selectors, and retain exact paging ownership
+  through deferred delivery and event checkpoints (tranche 32, host/build validation).
+- [ ] Replace heuristic output probes and audit remaining best-effort/ignored copy results for
+  service-level fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
   Carry explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
@@ -25387,6 +25390,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     mistake host registry tests for live page-table/COW/trim acceptance. Genuine shared-writable
     control-area backing, nonimage CopyOnWrite policy, stack-guard growth, CPU guard delivery, and
     live MM/SEH/desktop proofs remain open.
+
+    B3 checked XAS-output tranche 32 (2026-09-06, host/build green):
+    All XAS scalar/buffer writers now enter the native mutable `write_kernel_buffer` boundary in
+    `exec_virtual_memory_copy.rs`. Remote LPC outputs use its explicit process-targeted form.
+    Deleted `client_copyout_or_fill_mapped`, its untracked raw-PE allocation path, the separate
+    image-COW prepass and kernel-write promotion wrapper, and the unused frame-source accessor.
+    Removed the hosted-stack bypass, mirror retries, and final partial-word read/modify/write;
+    output chunks remain exact, with no retry after admission or copy failure.
+
+    Registry output helpers no longer select a write mechanism by process index, image role, key
+    path, or value name. Enumeration/query capture owned value bytes (and enumeration names) with
+    fallible allocation before mutable residency, so copies do not retain hive/overlay borrows.
+    Token query reacquires the token after return-length publication. Registry key information and
+    `write_current_iosb` now observe copy failure; queued scalar outputs no longer merely log it
+    while leaving a successful syscall status. The old void XAS adapter still identifies callers
+    needing a separate service-level output-fault audit; not every publication is transactional.
+
+    Deferred LPC, GUI, IOCP, APC, File, and cancellation delivery rebind and restore complete memory
+    contexts. A host-tested selector distinguishes the selected process, the loop's live paging
+    owner, and canonical stored bookkeeping, including nested completion back to the live owner.
+    The context is installed for every event, checkpointed before between-event work and on loop
+    exit, and cleared before function return. Late completion fills are no longer overwritten by
+    the next event's reload. Process retirement invalidates live bookkeeping; copied stale contexts
+    reject/discard retired or reused address-space state rather than publishing into another owner.
+    Contexts also validate the process generation, so recycling a PML4 capability cannot revive a
+    retired owner. Main-image PEs are resolved from the current loaded-image table at use time, not
+    retained as pointers into its growable vector. The actual primary PE/backing is now registered
+    in that same table; it previously existed only in the executable identity catalog. Deferred GUI
+    output snapshots the shared MSG before copying.
+    Cancellation-drain IOSB remains deliberately best effort; ordinary pending File completion
+    retains its existing delivery/retry ownership on failed publication.
+
+    Validation: 130 `nt-address-space`, 107 `nt-hosted-runtime`, and 50 `nt-memory-manager` tests
+    pass (287 total). Six new policy tests cover live/current/stored selection, nested recipients,
+    post-checkpoint selection, invalid indices, and retired/reused address-space and generation
+    rejection. Another 389 tests pass across `nt-security`, `nt-io-manager`, `nt-io-completion`, and
+    `nt-lpc-continuation` (676 total across the two serialized suites). Existing
+    exact-chunk, guard, access, COW, residency, and frame-reclaim tests remain green. The executive
+    build passes with the existing 256 warnings. Logs: `.tmp/test-xas-checked-copy-20260906.log` and
+    `.tmp/build-xas-checked-copy-20260906.log`; completion-caller coverage is recorded in
+    `.tmp/test-xas-completion-callers-20260906.log`. Builds and tests were serialized; no QEMU boot ran.
+
+    Review adjustment: checked XAS mechanism migration is closed. Do not equate it with complete
+    NT output probing or exception semantics: the legacy heuristic `probe_user_output` and void/
+    ignored-output call sites still need replacement, including late-fault handle/view rollback
+    and terminal completion behavior. Bootstrap/pre-admitted low-level writes and historical
+    read-prefetch/PE paths remain separate audits. Context policy tests do not prove live callback,
+    page-table, trim, or desktop behavior. The unchanged 33-import win32k gate still blocks live
+    acceptance; shared-writable control areas, nonimage COW policy, stack guards, and provider
+    unwind/exception delivery remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

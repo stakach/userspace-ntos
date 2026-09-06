@@ -22,6 +22,7 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
 mod client_frame;
 mod commit;
+mod copy_context;
 mod private_backing;
 mod runtime_section;
 mod working_set;
@@ -35,6 +36,7 @@ pub use commit::{
     PAGE_SIZE as COMMIT_PAGE_SIZE, STATUS_COMMITMENT_LIMIT,
 };
 pub use private_backing::private_backing_pages;
+pub use copy_context::{copy_bookkeeping, live_checkpoint_matches, CopyBookkeeping};
 
 pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,

@@ -8958,11 +8958,6 @@ unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
         .and_then(ClientFrameRecord::mapped_alias)
         .unwrap_or(0)
 }
-pub(crate) unsafe fn csrss_frame_clone_source_cap_get(pi: u64, page: u64) -> u64 {
-    csrss_frame_get_exact_record(pi, page)
-        .and_then(ClientFrameRecord::clone_source_cap)
-        .unwrap_or(0)
-}
 unsafe fn copy_registered_frame_cap(source: u64) -> (u64, u64) {
     if source == 0 {
         return (0, 3);
@@ -13928,34 +13923,6 @@ unsafe fn vm_promote_image_cow_page(
     Ok(())
 }
 
-pub(crate) unsafe fn vm_promote_image_cow_for_kernel_write(
-    pi: usize,
-    page: u64,
-    image_protection: u32,
-    pml4: u64,
-    scratch_base: u64,
-) -> Result<(), u32> {
-    let write_plan = nt_address_space::image_view_fault_plan(image_protection, true);
-    if !write_plan.copy_on_write {
-        return Ok(());
-    }
-    if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
-        if record.owns_frame {
-            return Ok(());
-        }
-    } else if !shared_image_mapping_contains(pi as u64, page) {
-        return Ok(());
-    }
-    let read_plan = nt_address_space::image_view_fault_plan(image_protection, false);
-    vm_promote_image_cow_page(
-        pi,
-        page,
-        read_plan.map_protection,
-        write_plan.map_protection,
-        pml4,
-        scratch_base,
-    )
-}
 
 unsafe fn vm_promote_mapped_cow_page(
     handler: &mut ExecNtHandler,
@@ -19607,9 +19574,18 @@ unsafe fn reclaim_final_process_vm(
         stats.vspace_released = handler.release_hosted_process_vspace_caps(pi);
     }
     if stats.vspace_released {
-        if let Some(ctx) = handler.loop_ctx {
+        if let Some(mut ctx) = handler.loop_ctx {
+            if ctx.live_paging.is_some_and(|live| live.pi == pi) {
+                ctx.live_paging = None;
+            }
+            if ctx.owner_pi == pi {
+                ctx.pml4 = 0;
+                ctx.filled_pages = &mut (&mut *ctx.pfilled)[pi];
+                ctx.faults = &mut (&mut *ctx.procs)[pi].faults;
+            }
             let procs = &mut *ctx.procs;
             procs[pi] = ProcExec::empty();
+            handler.loop_ctx = Some(ctx);
         }
     }
     stats
@@ -23905,17 +23881,25 @@ impl ObjEntry {
     }
 }
 
-/// Raw references to the fault/syscall loop's per-iteration state, handed to the group-C handlers
-/// (Workstream A) so they can reach the section/registry/demand-fill state that genuinely lives on
-/// the loop (`service_sec_image`), not on the handler. The Tier-1 dispatch arm rebuilds this each
-/// iteration pointing at the current loop locals.
-///
-/// SAFETY: every pointer targets a `service_sec_image` local that outlives each `dispatch` call;
-/// the executive is single-threaded and the loop does not touch these between building the ctx and
-/// draining the handler's signals, so there is no aliasing in practice. Extended as more group-C
-/// cases migrate (reg / dll_pes / csrss handle-tracking / image PEs / demand-fill state).
+/// Paging locals owned by the current event until its checkpoint.
+#[derive(Clone, Copy)]
+struct LiveProcessPaging {
+    pi: usize,
+    pml4: u64,
+    generation: u64,
+    filled_pages: *mut [u64; 512],
+    faults: *mut u64,
+}
+
+/// Loop-owned memory authorities used during dispatch and deferred completion. The context is
+/// cleared before `service_sec_image` returns. Callers must not retain borrowed backing data
+/// across a mutable residency operation; nested delivery rebinds and restores the selected owner.
 #[derive(Clone, Copy)]
 struct ExecLoopCtx {
+    /// Identity of the selected process, distinct from the loop's live local bookkeeping.
+    owner_pi: usize,
+    owner_generation: u64,
+    live_paging: Option<LiveProcessPaging>,
     /// The faulting process's PML4 (page_map target for COMMIT frames / demand-filled pages).
     pml4: u64,
     /// Every hosted process's trusted mechanism state. Cross-process VM services select the target
@@ -23944,10 +23928,9 @@ struct ExecLoopCtx {
     filled_pages: *mut [u64; 512],
     faults: *mut u64,
     /// The faulting image's persistent executive scratch base (smss's), and the two images
-    /// NtQueryDefaultLocale may demand-fill from (the main image `pe` at PE_LOAD_BASE up to
+    /// NtQueryDefaultLocale may demand-fill from (the main image at PE_LOAD_BASE up to
     /// `img_end`, and `ntdll_pe` in [`nt_base`,`nt_end`); `ntdll_pe` is null if absent).
     scratch_base: u64,
-    pe: *const nt_pe_loader::PeFile<'static>,
     ntdll_pe: *const nt_pe_loader::PeFile<'static>,
     img_end: u64,
     nt_base: u64,
@@ -23966,6 +23949,85 @@ struct ExecLoopCtx {
 }
 
 impl ExecLoopCtx {
+    /// Rebind all process-local fields together. Preserve the loop-local owner through nested
+    /// completions: its counters have not yet been written back to `procs`.
+    unsafe fn for_process(self, pi: usize) -> Option<Self> {
+        let selection = nt_memory_manager::copy_bookkeeping(
+            self.owner_pi,
+            self.live_paging.map(|live| live.pi),
+            pi,
+            (&*self.procs).len(),
+        )?;
+        let target = (&mut *self.procs).get_mut(pi)?;
+        if target.pml4 == 0 || target.scratch_base == 0 {
+            return None;
+        }
+        let generation = (&*self.exe_image_catalog).get_by_pi(pi)?.generation;
+        if selection == nt_memory_manager::CopyBookkeeping::Current {
+            return (target.pml4 == self.pml4 && generation == self.owner_generation).then_some(self);
+        }
+        let pe = (&*self.hosted_loaded_images).pe_by_pi(pi)?;
+        let (filled_pages, faults) = if selection == nt_memory_manager::CopyBookkeeping::Live {
+            let live = self.live_paging?;
+            if target.pml4 != live.pml4 || generation != live.generation {
+                return None;
+            }
+            (live.filled_pages, live.faults)
+        } else {
+            (
+                (&mut *self.pfilled).get_mut(pi)? as *mut [u64; 512],
+                &mut target.faults as *mut u64,
+            )
+        };
+        Some(Self {
+            owner_pi: pi,
+            owner_generation: generation,
+            pml4: target.pml4,
+            scratch_base: target.scratch_base,
+            img_end: PE_LOAD_BASE.checked_add(pe.size_of_image() as u64)?,
+            filled_pages,
+            faults,
+            ..self
+        })
+    }
+
+    unsafe fn checkpoint_live(mut self) -> Self {
+        if let Some(live) = self.live_paging {
+            let target = (&mut *self.procs).get_mut(live.pi)
+                .expect("live paging owner remains in the process table");
+            assert_eq!(self.owner_pi, live.pi, "paging checkpoint requires the restored live owner");
+            if !nt_memory_manager::live_checkpoint_matches(
+                self.owner_pi, live.pi, live.pml4, target.pml4,
+                live.generation,
+                (&*self.exe_image_catalog).get_by_pi(live.pi).map(|image| image.generation),
+            ) {
+                // A copied outer context may survive nested process retirement. Discard its
+                // locals rather than publishing them into the retired or reused process slot.
+                self.live_paging = None;
+                self.pml4 = 0;
+                self.filled_pages = &mut (&mut *self.pfilled)[live.pi];
+                self.faults = &mut target.faults;
+                return self;
+            }
+            target.faults = *live.faults;
+            (&mut *self.pfilled)[live.pi] = *live.filled_pages;
+            self.filled_pages = &mut (&mut *self.pfilled)[live.pi];
+            self.faults = &mut target.faults;
+            self.live_paging = None;
+        }
+        self
+    }
+
+    unsafe fn main_image(&self) -> Option<&nt_pe_loader::PeFile<'static>> {
+        let target = (&*self.procs).get(self.owner_pi)?;
+        if self.pml4 == 0 || target.pml4 != self.pml4
+            || (&*self.exe_image_catalog).get_by_pi(self.owner_pi)?.generation != self.owner_generation
+        {
+            return None;
+        }
+        (&*self.hosted_loaded_images).pe_by_pi(self.owner_pi)
+    }
+
     unsafe fn dll_pes(&self) -> &'static [Option<nt_pe_loader::PeFile<'static>>] {
         (&*self.dll_pe_store).as_slice()
     }
