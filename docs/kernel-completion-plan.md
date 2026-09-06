@@ -25720,6 +25720,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     File-wide control areas, non-data-view/termination flush semantics, remaining output contracts,
     and general checked reads remain open. The 33-import win32k gate still blocks desktop acceptance.
 
+    B3 section backing-lifetime tranche 39 (2026-09-06, host/build green):
+    Generic overlay section creation now acquires a FILE_OBJECT I/O reference before publishing
+    the section. Failure before table ownership releases that reference immediately; later handle
+    publication and output-copy failures close/retire the section. Closing the caller's file handle
+    therefore runs normal last-handle cleanup and releases share access without invalidating the
+    backing object used by subsequent page-in and writeback. The retained identity is an owned
+    FILE_OBJECT slot, not a pathname or a guessed process identity.
+
+    Dead sections now retain canonical frame and backing records until an explicit, generation-bound
+    retirement handoff succeeds. The mechanism releases each frame before the backing reference;
+    failures keep the current and later resources owned without replaying completed releases.
+    Pending sections cannot be reused or silently discarded by reset, existing handles cannot
+    overwrite owned backing, and generation exhaustion refuses publication. Retirement policy and
+    retry tests live in focused `section_retirement` modules in `nt-memory-manager`.
+
+    Normal view unmap, map rollback, and process reclaim detach every view page, including clean
+    win32k attachments, and run checked exact-frame registry cleanup before discarding view identity.
+    Failed attachment-cap deletion retains its record for retry. The final service ownership barrier
+    drains retired resources: reserve a free-frame slot, revoke derived caps, check owner unmap, then
+    recycle the source frame. Only after every source frame is released does it drop the FILE_OBJECT
+    reference. The writeback selftest uses the same ownership path, accepts valid file ID zero, and
+    reports final retirement failure rather than claiming successful cleanup.
+
+    Validation: 77 `nt-memory-manager`, 157 `nt-address-space`, 135 `nt-fs`, and 10 `nt-ahci` tests
+    pass (379 total). Nine new tests cover final handle/view lifetime across processes, failed
+    frame/backing release and retry, stale handoffs, generation exhaustion, reset/replacement
+    refusal, real MemFs close/reopen/share cleanup, and delete-on-close with retained section I/O.
+    Logs: `.tmp/test-section-retirement-20260906.log` and
+    `.tmp/build-section-retirement-20260906.log`. The executive build passes with the existing
+    256 warnings. Root serialized all builds/tests; both research agents reviewed ownership paths
+    without running builds or tests.
+
+    Review adjustment: this closes the backing-reference and final source-frame lifetime prerequisite,
+    not file-wide control areas. Next group independently created data sections by stable volume/file
+    identity with shared page and dirty ownership; an opened FILE_OBJECT slot is not that grouping
+    key. Preserve this explicit retirement protocol when introducing shared owners. Backend page-in
+    error propagation, non-data-view/termination flush semantics, integrated alias lifetime and
+    persistence tests remain open. No QEMU, desktop, or physical persistence acceptance is claimed;
+    the 33-import win32k gate is unchanged.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

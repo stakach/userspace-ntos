@@ -12399,9 +12399,13 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     let mut status: u32;
     let mut bytes_written = 0u64;
     let mut frame = 0u64;
-    let mut file_id = 0u64;
+    let mut file_id = nt_fs::INVALID_HANDLE;
     let mut section_index = usize::MAX;
     let table = &mut *core::ptr::addr_of_mut!(MAPPED_SECTION_WRITEBACK_TABLE);
+    if let Err(error) = crate::service_sec_image::service_drain_section_retirement(table) {
+        MAPPED_SECTION_WRITEBACK_STATUS.store(error as u64, Ordering::Relaxed);
+        return;
+    }
     if !table.reset() {
         MAPPED_SECTION_WRITEBACK_STATUS.store(
             nt_address_space::STATUS_INSUFFICIENT_RESOURCES as u64,
@@ -12411,15 +12415,21 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     }
     let cleanup =
         |table: &mut GenericSectionTable, section_index: usize, frame: u64, file_id: u64| unsafe {
+            let section_owns_frame = table.page_frame(section_index, 0) == Some(frame);
+            let mut cleanup_status = 0;
             if section_index != usize::MAX {
                 table.clear_section(section_index);
+                if let Err(error) = crate::service_sec_image::service_drain_section_retirement(table) {
+                    cleanup_status = error;
+                }
             }
-            if frame != 0 {
+            if frame != 0 && !section_owns_frame {
                 vm_frame_release(frame, 0);
             }
-            if file_id != 0 {
+            if file_id != nt_fs::INVALID_HANDLE {
                 crate::writable_fs::close(file_id);
             }
+            cleanup_status
         };
 
     let (create_status, created_file, _info) = crate::writable_fs::create(
@@ -12452,6 +12462,12 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
     }
     proof |= MAPPED_SECTION_WRITEBACK_SEEDED;
 
+    if let Err(error) = crate::writable_fs::retain_io_reference(file_id) {
+        cleanup(table, section_index, frame, file_id);
+        MAPPED_SECTION_WRITEBACK_STATUS.store(error as u64, Ordering::Relaxed);
+        return;
+    }
+
     let Some(created_section) = table.create(
         0,
         0,
@@ -12460,6 +12476,8 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
         SECTION_ATTR_SEC_COMMIT,
         GenericSectionBacking::overlay(file_id),
     ) else {
+        crate::writable_fs::release_io_reference(file_id)
+            .expect("failed test section creation retains its acquired file reference");
         status = STATUS_UNSUCCESSFUL;
         cleanup(table, section_index, frame, file_id);
         MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
@@ -12554,7 +12572,10 @@ pub(crate) unsafe fn mapped_section_writeback_selftest(scratch_base: u64) {
         proof |= MAPPED_SECTION_WRITEBACK_READBACK;
     }
 
-    cleanup(table, section_index, frame, file_id);
+    let cleanup_status = cleanup(table, section_index, frame, file_id);
+    if cleanup_status != 0 {
+        status = cleanup_status;
+    }
     MAPPED_SECTION_WRITEBACK_SELFTEST.store(proof, Ordering::Relaxed);
     MAPPED_SECTION_WRITEBACK_BYTES.store(bytes_written, Ordering::Relaxed);
     MAPPED_SECTION_WRITEBACK_STATUS.store(status as u64, Ordering::Relaxed);
@@ -19494,6 +19515,10 @@ unsafe fn reclaim_final_process_vm(
                 print_str(b" status=0x");
                 print_hex(writeback.status);
                 print_str(b"\n");
+                break;
+            }
+            if crate::service_sec_image::service_unmap_section_view_mappings(view).is_err() {
+                stats.generic_writeback_failures = stats.generic_writeback_failures.saturating_add(1);
                 break;
             }
             let _ = generic_sections.unmap_view(pi, view.base);

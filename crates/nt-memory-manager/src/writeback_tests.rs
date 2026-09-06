@@ -324,6 +324,10 @@ fn replacement_and_reset_cannot_revive_stale_tickets() {
     assert!(table.set_page_frame(plan.view.section_index, ticket.page_index, 999));
     assert!(table.set_page_frame(plan.view.section_index, ticket.page_index, ticket.frame));
     assert!(!table.complete_writeback_page(ticket));
+    table.clear_section(plan.view.section_index);
+    while let Some(retirement) = table.next_retirement() {
+        assert!(table.complete_retirement(retirement));
+    }
     assert!(table.reset());
     let section = table
         .create(

@@ -3515,6 +3515,11 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
     // serialized ownership barrier is the single convergence point for exact-generation final
     // process deletion; individual release sites may still make an eager attempt for low latency.
     let _ = nt_handler.drain_hosted_process_deletion_candidates();
+    if let Some(ctx) = nt_handler.loop_ctx {
+        if let Err(status) = unsafe { service_drain_section_retirement(&mut *ctx.generic_sections) } {
+            return status;
+        }
+    }
     let writable_fs_mount_dirty = crate::writable_fs::take_mount_dirty();
     let writable_fs_runtime_dirty = crate::writable_fs::take_runtime_dirty();
     let writable_fs_touched =
@@ -3695,6 +3700,9 @@ fn generic_section_mark_dirty_if_backed(
 
 #[path = "service_section_writeback.rs"]
 mod section_writeback;
+#[path = "service_section_retirement.rs"]
+mod section_retirement;
+pub(crate) use section_retirement::{service_drain_section_retirement, service_unmap_section_view_mappings};
 pub(crate) use section_writeback::{
     service_generic_section_writeback_plan, service_generic_section_writeback_view,
 };

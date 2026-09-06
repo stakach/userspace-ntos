@@ -40,7 +40,8 @@ pub use copy_context::{copy_bookkeeping, live_checkpoint_matches, CopyBookkeepin
 
 pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
-    GenericSectionTableStats, GenericSectionView, GENERIC_SECTION_BACKING_ANON,
+    GenericSectionTableStats, GenericSectionView, SectionRetirement, SectionRetirementIo,
+    SectionRetirementResource, GENERIC_SECTION_BACKING_ANON,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,
     SECTION_ATTR_SEC_BASED, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
     SECTION_ATTR_SEC_RESERVE,

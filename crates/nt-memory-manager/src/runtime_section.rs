@@ -1,5 +1,9 @@
 use alloc::vec::Vec;
 
+#[path = "section_retirement.rs"]
+mod retirement;
+pub use retirement::{SectionRetirement, SectionRetirementIo, SectionRetirementResource};
+
 use crate::{PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
 
 pub const GENERIC_SECTION_BACKING_NONE: u8 = 0;
@@ -69,6 +73,7 @@ impl GenericSectionBacking {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenericSection {
     pub live: bool,
+    pub generation: u64,
     pub owner_pi: usize,
     pub handle: u64,
     pub size: u64,
@@ -81,6 +86,7 @@ impl GenericSection {
     const fn empty() -> Self {
         Self {
             live: false,
+            generation: 0,
             owner_pi: 0,
             handle: 0,
             size: 0,
@@ -198,6 +204,7 @@ pub struct GenericSectionTable {
     views: Vec<GenericSectionView>,
     pages: Vec<GenericSectionPage>,
     dirty_epoch: u64,
+    section_generation: u64,
     section_growths: u64,
     section_allocation_failures: u64,
     view_growths: u64,
@@ -213,6 +220,7 @@ impl GenericSectionTable {
             views: Vec::new(),
             pages: Vec::new(),
             dirty_epoch: 0,
+            section_generation: 0,
             section_growths: 0,
             section_allocation_failures: 0,
             view_growths: 0,
@@ -236,6 +244,11 @@ impl GenericSectionTable {
         view_reserve: usize,
         page_reserve: usize,
     ) -> bool {
+        if self.sections.iter().any(|section| section.backing.is_live())
+            || self.pages.iter().any(|page| page.live)
+        {
+            return false;
+        }
         self.sections.clear();
         self.views.clear();
         self.pages.clear();
@@ -312,16 +325,15 @@ impl GenericSectionTable {
             return None;
         }
         if handle != 0 {
-            if let Some(index) = self.index_for_handle(owner_pi, handle) {
-                self.sections[index].size = size;
-                self.sections[index].protection = protection;
-                self.sections[index].allocation_attributes = allocation_attributes;
-                self.sections[index].backing = backing;
-                return Some(index);
+            if self.index_for_handle(owner_pi, handle).is_some() {
+                return None;
             }
         }
+        let generation = self.section_generation.checked_add(1)?;
+        self.section_generation = generation;
         let section = GenericSection {
             live: true,
+            generation,
             owner_pi,
             handle,
             size,
@@ -329,7 +341,7 @@ impl GenericSectionTable {
             allocation_attributes,
             backing,
         };
-        if let Some(index) = self.sections.iter().position(|entry| !entry.live) {
+        if let Some(index) = self.sections.iter().position(|entry| !entry.backing.is_live()) {
             self.sections[index] = section;
             Some(index)
         } else {
@@ -353,18 +365,15 @@ impl GenericSectionTable {
 
     pub fn clear_section(&mut self, index: usize) {
         if let Some(section) = self.sections.get_mut(index) {
-            *section = GenericSection::empty();
+            section.live = false;
+            section.handle = 0;
         }
         for view in &mut self.views {
             if view.live && view.section_index == index {
                 *view = GenericSectionView::empty();
             }
         }
-        for page in &mut self.pages {
-            if page.live && page.section_index == index {
-                *page = GenericSectionPage::empty();
-            }
-        }
+        // Keep source frames and backing until the mechanism acknowledges their release.
     }
 
     fn section_has_views(&self, index: usize) -> bool {
@@ -520,6 +529,7 @@ impl GenericSectionTable {
     }
 
     pub fn page_frame(&self, section_index: usize, page_index: u64) -> Option<u64> {
+        self.section(section_index)?;
         self.pages
             .iter()
             .find(|page| {
@@ -530,7 +540,7 @@ impl GenericSectionTable {
     }
 
     pub fn set_page_frame(&mut self, section_index: usize, page_index: u64, frame: u64) -> bool {
-        if frame == 0 {
+        if frame == 0 || self.section(section_index).is_none() {
             return false;
         }
         let Some(epoch) = self.dirty_epoch.checked_add(1) else {
@@ -561,6 +571,7 @@ impl GenericSectionTable {
     }
 
     pub fn mark_page_dirty(&mut self, section_index: usize, page_index: u64) -> bool {
+        if self.section(section_index).is_none() { return false; }
         let Some(epoch) = self.dirty_epoch.checked_add(1) else {
             return false;
         };
@@ -582,6 +593,7 @@ impl GenericSectionTable {
         &mut self,
         ticket: crate::writeback::SectionWritebackPage,
     ) -> bool {
+        if self.section(ticket.section_index).is_none() { return false; }
         if let Some(page) = self.pages.iter_mut().find(|page| {
             page.live
                 && page.dirty
@@ -686,7 +698,7 @@ impl GenericSectionTable {
         &self,
         ticket: crate::writeback::SectionWritebackPage,
     ) -> Result<Vec<crate::writeback::SectionPageAlias>, u32> {
-        if !self.pages.iter().any(|page| {
+        if self.section(ticket.section_index).is_none() || !self.pages.iter().any(|page| {
             page.live
                 && page.dirty
                 && page.section_index == ticket.section_index
@@ -847,6 +859,9 @@ mod tests {
         assert!(table.map_view(3, section, 0x1000, 0x1000, 0));
         assert!(table.set_page_frame(section, 0, 0x100));
         table.clear_section(section);
+        while let Some(ticket) = table.next_retirement() {
+            assert!(table.complete_retirement(ticket));
+        }
         let replacement = create_section(&mut table, 3, 0x44);
         assert_eq!(replacement, section);
         assert!(table.map_view(3, replacement, 0x2000, 0x1000, 0));

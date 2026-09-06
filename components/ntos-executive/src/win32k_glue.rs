@@ -5567,8 +5567,10 @@ pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(
     if page_unmap_r(mapping.slot) != 0 {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
+    if cnode_delete_recycle_r(mapping.slot) != 0 {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     let _ = w32_attach_remove(page);
-    let _ = cnode_delete_recycle_r(mapping.slot);
     Ok(())
 }
 

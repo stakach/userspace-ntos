@@ -31818,6 +31818,9 @@ impl ExecNtHandler {
         if after.unmap_mapped(view.base).is_err() {
             return;
         }
+        if service_unmap_section_view_mappings(view).is_err() {
+            return;
+        }
         *vm_map = *after;
         let _ = process_committed_mapping_unregister_range(pi as u64, view.base, view.size);
         let _ = generic_sections.unmap_view(pi, view.base);
@@ -39281,18 +39284,8 @@ impl ExecNtHandler {
                             Err(status) => return status,
                         };
                         let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
-                        let mut page = plan.base;
-                        while page < plan.base + plan.size {
-                            let old = before.extent_at(page);
-                            let new = after.extent_at(page);
-                            if old.is_some_and(|extent| {
-                                extent.state == nt_address_space::VmExtentState::Committed
-                            }) && new.is_none_or(|extent| {
-                                extent.state != nt_address_space::VmExtentState::Committed
-                            }) {
-                                vm_unmap_private_page(target_pi, page);
-                            }
-                            page += 0x1000;
+                        if let Err(status) = service_unmap_section_view_mappings(view) {
+                            return status;
                         }
                         *vm_map = *after;
                         let _ = process_committed_mapping_unregister_range(
@@ -44939,6 +44932,11 @@ impl ExecNtHandler {
                     return nt_fs::STATUS_INVALID_HANDLE;
                 };
                 let generic_sections = &mut *ctx.generic_sections;
+                if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
+                    if let Err(status) = crate::writable_fs::retain_io_reference(backing.overlay_file_id) {
+                        return status;
+                    }
+                }
                 let Some(index) = generic_sections.create(
                     self.pi,
                     0,
@@ -44947,6 +44945,10 @@ impl ExecNtHandler {
                     allocation_attrs,
                     backing,
                 ) else {
+                    if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {
+                        crate::writable_fs::release_io_reference(backing.overlay_file_id)
+                            .expect("failed section publication retains its acquired file reference");
+                    }
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                 };
                 let h = match self.insert_process_handle(
@@ -44970,6 +44972,7 @@ impl ExecNtHandler {
                     out,
                     &h.to_le_bytes(),
                 ) {
+                    let _ = self.close_process_handle(caller_pid, h);
                     return STATUS_ACCESS_VIOLATION;
                 }
                 print_str(b"[section] create generic pi=");
