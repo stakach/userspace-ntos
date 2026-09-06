@@ -2,10 +2,14 @@
 //!
 //! This is intentionally below the executive writable-overlay policy: it persists an opaque snapshot
 //! byte string to a fixed block range using two commit slots. Payload sectors are written first and
-//! the header sector is written last, so a failed/torn update leaves either the previous slot valid
-//! or no new slot visible.
+//! the header sector is written last, with device-cache barriers separating publication from data.
+//! A failed/torn update preserves the previous payload-valid slot.
 
 use alloc::vec::Vec;
+
+#[cfg(test)]
+#[path = "snapshot_store_tests.rs"]
+mod tests;
 
 const STORE_MAGIC: [u8; 8] = *b"USNTSNP\0";
 const STORE_VERSION: u16 = 1;
@@ -27,6 +31,10 @@ pub trait SnapshotBlockDevice {
     fn sector_count(&self) -> u64;
     fn read_sector(&mut self, lba: u64, out: &mut [u8]) -> Result<(), SnapshotBlockStoreError>;
     fn write_sector(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError>;
+
+    /// Complete all preceding writes to stable storage before returning success. Implementations
+    /// must propagate unsupported barriers and device failures; cached write completion is not enough.
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError>;
 
     fn write_sectors(&mut self, lba: u64, data: &[u8]) -> Result<(), SnapshotBlockStoreError> {
         let sector_size = self.sector_size();
@@ -65,6 +73,7 @@ pub struct PayloadSectorWriter<'a, D: SnapshotBlockDevice> {
     written: usize,
     sector_index: u64,
     sector_offset: usize,
+    crc: Crc32c,
 }
 
 /// Sector-buffered payload reader for [`SnapshotBlockStore::read_latest_streaming`].
@@ -242,9 +251,18 @@ impl SnapshotBlockStore {
         if payload_len > max_payload_len {
             return Err(SnapshotBlockStoreError::OutOfSpace);
         }
-        let latest = self.latest_slot_summary(dev);
+        // A failed earlier commit may have left a read-visible but volatile header. Stabilize it
+        // before deciding which slot is safe to reuse.
+        dev.flush()?;
+        let latest = self.latest_commit_slot(dev)?;
         let (target_slot, generation) = match latest {
-            Some(latest) => (1 - latest.slot, latest.generation.saturating_add(1)),
+            Some(latest) => (
+                1 - latest.slot,
+                latest
+                    .generation
+                    .checked_add(1)
+                    .ok_or(SnapshotBlockStoreError::OutOfSpace)?,
+            ),
             None => (0, 1),
         };
         let payload_sectors = payload_len.div_ceil(sector_size);
@@ -262,10 +280,11 @@ impl SnapshotBlockStore {
         sector.resize(sector_size, 0);
         let mut writer = PayloadSectorWriter::new(dev, sector, sector_size, slot_base, payload_len);
         write_payload(&mut writer)?;
-        let (mut sector, written) = writer.finish()?;
-        if written != payload_len {
+        let (mut sector, written, actual_crc) = writer.finish()?;
+        if written != payload_len || actual_crc != payload_crc {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
+        dev.flush()?;
 
         sector.fill(0);
         encode_header(
@@ -279,6 +298,7 @@ impl SnapshotBlockStore {
             },
         );
         dev.write_sector(slot_base, &sector)?;
+        dev.flush()?;
         Ok(generation)
     }
 
@@ -438,52 +458,36 @@ impl SnapshotBlockStore {
         Ok(())
     }
 
-    fn read_slot_header<D: SnapshotBlockDevice>(
+    fn latest_commit_slot<D: SnapshotBlockDevice>(
         &self,
         dev: &mut D,
-        slot: u32,
     ) -> Result<Option<SlotSummary>, SnapshotBlockStoreError> {
-        let (sector_size, slot_sectors) = self.geometry(dev)?;
-        let slot_base = self.slot_lba(slot_sectors, slot)?;
-        let mut sector = Vec::new();
-        sector
-            .try_reserve_exact(sector_size)
-            .map_err(|_| SnapshotBlockStoreError::OutOfMemory)?;
-        sector.resize(sector_size, 0);
-        dev.read_sector(slot_base, &mut sector)?;
-        let Some(header) = decode_header(&sector)? else {
-            return Ok(None);
-        };
-        if header.slot != slot || header.payload_sectors as u64 > slot_sectors - 1 {
-            return Err(SnapshotBlockStoreError::Corrupt);
+        let mut corrupt = false;
+        let mut candidates = [None, None];
+        for (slot, candidate) in candidates.iter_mut().enumerate() {
+            match self.read_slot_plan(dev, slot as u32) {
+                Ok(plan) => *candidate = plan,
+                Err(SnapshotBlockStoreError::Corrupt) => corrupt = true,
+                Err(err) => return Err(err),
+            }
         }
-        let payload_len =
-            usize::try_from(header.payload_len).map_err(|_| SnapshotBlockStoreError::Corrupt)?;
-        let payload_capacity = usize::try_from(header.payload_sectors)
-            .ok()
-            .and_then(|sectors| sectors.checked_mul(sector_size))
-            .ok_or(SnapshotBlockStoreError::Corrupt)?;
-        if payload_len > payload_capacity {
-            return Err(SnapshotBlockStoreError::Corrupt);
+        candidates.sort_unstable_by_key(|plan| core::cmp::Reverse(plan.map(|p| p.generation)));
+        for plan in candidates.into_iter().flatten() {
+            match self.validate_slot_payload_crc(dev, plan) {
+                Ok(()) => {
+                    return Ok(Some(SlotSummary {
+                        slot: plan.slot,
+                        generation: plan.generation,
+                    }))
+                }
+                Err(SnapshotBlockStoreError::Corrupt) => corrupt = true,
+                Err(err) => return Err(err),
+            }
         }
-        Ok(Some(SlotSummary {
-            slot,
-            generation: header.generation,
-        }))
-    }
-
-    fn latest_slot_summary<D: SnapshotBlockDevice>(&self, dev: &mut D) -> Option<SlotSummary> {
-        match (self.read_slot_header(dev, 0), self.read_slot_header(dev, 1)) {
-            (Ok(a), Ok(b)) => match (a, b) {
-                (Some(a), Some(b)) => Some(if b.generation > a.generation { b } else { a }),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            },
-            (Ok(Some(a)), _) => Some(a),
-            (_, Ok(Some(b))) => Some(b),
-            (Ok(None), _) | (_, Ok(None)) => None,
-            (Err(_), Err(_)) => None,
+        if corrupt {
+            Err(SnapshotBlockStoreError::Corrupt)
+        } else {
+            Ok(None)
         }
     }
 
@@ -521,17 +525,18 @@ impl<'a, D: SnapshotBlockDevice> PayloadSectorWriter<'a, D> {
             written: 0,
             sector_index: 0,
             sector_offset: 0,
+            crc: Crc32c::new(),
         }
     }
 
-    fn finish(mut self) -> Result<(Vec<u8>, usize), SnapshotBlockStoreError> {
+    fn finish(mut self) -> Result<(Vec<u8>, usize, u32), SnapshotBlockStoreError> {
         if self.sector_offset != 0 {
             self.sector[self.sector_offset..].fill(0);
             self.dev
                 .write_sector(self.slot_base + 1 + self.sector_index, &self.sector)?;
             self.sector.fill(0);
         }
-        Ok((self.sector, self.written))
+        Ok((self.sector, self.written, self.crc.finish()))
     }
 }
 
@@ -544,6 +549,7 @@ impl<D: SnapshotBlockDevice> SnapshotPayloadSink for PayloadSectorWriter<'_, D> 
         if bytes.len() > remaining {
             return Err(SnapshotBlockStoreError::Corrupt);
         }
+        self.crc.update(bytes);
         while !bytes.is_empty() {
             if self.sector_offset == 0 && bytes.len() >= self.sector_size {
                 let full_len = bytes.len() - (bytes.len() % self.sector_size);

@@ -489,6 +489,7 @@ struct AhciSnapshotDevice {
     fat: Fat32,
     start_lba: u64,
     sectors: u32,
+    flush_command: Option<nt_ahci::FlushCommand>,
 }
 
 impl AhciSnapshotDevice {
@@ -499,6 +500,7 @@ impl AhciSnapshotDevice {
             fat,
             start_lba,
             sectors,
+            flush_command: None,
         })
     }
 
@@ -513,6 +515,11 @@ impl AhciSnapshotDevice {
 }
 
 impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
+    fn flush(&mut self) -> Result<(), nt_fs::SnapshotBlockStoreError> {
+        unsafe { crate::ahci_maintenance::flush(&self.fat, &mut self.flush_command) }
+            .map_err(|_| nt_fs::SnapshotBlockStoreError::Io)
+    }
+
     fn sector_size(&self) -> usize {
         512
     }
@@ -538,7 +545,7 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
                 absolute,
             )
         };
-        if tfd & 0x89 != 0 {
+        if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
             return Err(nt_fs::SnapshotBlockStoreError::Io);
         }
         unsafe {
@@ -586,20 +593,15 @@ impl nt_fs::SnapshotBlockDevice for AhciSnapshotDevice {
             let byte_start = sector_index * sector_size;
             let byte_end = byte_start + chunk_sectors * sector_size;
             let tfd = unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data[byte_start..byte_end].as_ptr(),
-                    (self.fat.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
-                    byte_end - byte_start,
-                );
                 ahci_write_sectors(
                     self.fat.ahci_vaddr,
                     self.fat.dma_vaddr,
                     self.fat.dma_paddr,
                     absolute,
-                    chunk_sectors as u32,
+                    &data[byte_start..byte_end],
                 )
             };
-            if tfd & 0x89 != 0 {
+            if tfd & nt_ahci::TASK_FILE_FAILURE != 0 {
                 return Err(nt_fs::SnapshotBlockStoreError::Io);
             }
             let n = WRITABLE_FS_SNAPSHOT_WRITE_SECTORS

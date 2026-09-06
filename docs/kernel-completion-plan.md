@@ -78,9 +78,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   full-length query probes, and tested late-fault status boundaries (tranche 35, host/build validation).
 - [x] Retain section dirty batches through snapshot-publication failure, preserve partial progress,
   and finish the configured snapshot checkpoint before publishing flush results (tranche 36).
-- [ ] Add ordered block-device cache flush barriers to snapshot commits; rearm all shared section
-  aliases and dirty-admit win32k attachments/legacy kernel copybacks before claiming repeated-flush
-  or power-loss durability acceptance.
+- [x] Add ordered device-cache barriers to snapshot commits, validate the retained slot's payload,
+  and issue capability-selected real AHCI cache flush commands (tranche 37, host/build validation).
+- [ ] Rearm all shared section aliases and dirty-admit win32k attachments/legacy kernel copybacks
+  before repeated-flush acceptance. Validate cache barriers with live restart/power-loss tests;
+  complete storage-port abort/reset recovery without reusing device-owned DMA on a failed command.
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25623,6 +25625,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Non-data-view/termination flush semantics, the special system-range query branch, unsupported
     query classes, and remaining handle/completion outputs remain open. The 33-import win32k gate
     still blocks live MM/desktop acceptance.
+
+    B3 snapshot device-barrier tranche 37 (2026-09-06, host/build green):
+    `SnapshotBlockDevice::flush` is now a required stable-storage contract, with no default no-op.
+    Snapshot commits perform three barriers: stabilize pending writes before selecting a reusable
+    slot, persist the new payload before publishing its header, and persist that header before
+    returning success. The initial barrier is necessary when a failed prior header flush left a
+    read-visible but volatile generation: retry cannot treat that generation as durable and destroy
+    the sole durable older snapshot. All barrier failures propagate through the existing snapshot/
+    section-writeback retry ownership from tranche 36.
+
+    Removed header-only slot selection. Commits validate the newest candidate's payload CRC before
+    choosing the alternate slot, inspecting the older payload only when the newer one is corrupt.
+    Selection-time I/O/allocation failures abort before writes; an unrecoverable store is not silently
+    reinitialized. Generation increment is checked, not saturating. The streaming writer computes
+    its own CRC and rejects a mismatching producer CRC before header publication. The on-disk format
+    remains unchanged. This adds one validation read of the retained snapshot per commit; future
+    performance work must preserve that recovery authority rather than restore header-only selection.
+
+    Added focused no_std `nt-ahci` maintenance policy and an executive `ahci_maintenance.rs` MMIO/
+    coherent-DMA adapter. IDENTIFY word 83 selects the advertised FLUSH CACHE EXT or FLUSH CACHE
+    command; unsupported/invalid capabilities fail. IDENTIFY must transfer exactly 512 bytes before
+    capability publication. Flush commands have no data PRDT, zeroed task-file/reserved fields, and
+    reset PRDBC. The engine is port-relative, checks fatal interface/host-bus/task-file errors and
+    device fault, uses a calibrated 30-second budget, and refuses active CI/SACT ownership. Port
+    base replacement waits for actual command/FIS engine stop; timeout never falls through to DMA
+    reprogramming. The adapter retains the existing boot-volume transport's port-zero ownership;
+    this is not a new general driver or a hardcoded hosted-image policy.
+
+    Hardened the existing read/write path's fatal-error, engine-stop, and exact-transfer checks.
+    Payload staging moved inside the guarded write helper, so retry cannot overwrite data still
+    owned by a timed-out write. Removed the obsolete prestaged single-sector wrapper and duplicate
+    caller-side DMA copies. A stuck active slot fails closed; genuine port abort/reset and queue
+    recovery remain follow-on work, not an automatic retry against potentially live DMA.
+
+    Validation: 135 `nt-fs`, 10 `nt-ahci`, 61 `nt-memory-manager`, and 157 `nt-address-space` tests
+    pass (363 total). Nine new snapshot tests model separate volatile/durable media, every payload/
+    header write and barrier failure, partial persistence, uncertain-header retry, corrupt newest
+    payload, ambiguous reads, generation exhaustion, CRC mismatch, and empty commits. Ten AHCI
+    tests cover advertised capabilities, command layout, PRDBC, active-slot retention, fatal errors,
+    calibrated-budget exhaustion, stop failure, and invalid geometry. Logs:
+    `.tmp/test-snapshot-barriers-20260906.log` and `.tmp/build-snapshot-barriers-20260906.log`.
+    Root serialized all builds/tests; executive build passes with the existing 256 warnings.
+
+    Review adjustment: ordered cache-barrier implementation is complete at the host/build boundary,
+    not live power-loss durability acceptance. No QEMU boot, real-device fault injection, or restart
+    test ran. Shared aliases still need rearming and dirty admission before repeated-flush claims;
+    this remains the next MM target. Port recovery remains explicit storage follow-on. The 33-import
+    win32k gate still blocks desktop acceptance; this slice does not change the provider frontier.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

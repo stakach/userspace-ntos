@@ -37,6 +37,7 @@ members = [
     "crates/nt-hal-abi",
     "crates/nt-cm-resources",
     "crates/nt-acpi",
+    "crates/nt-ahci",
     "crates/nt-pnp",
     "crates/nt-pnp-abi",
     "crates/nt-power-types",

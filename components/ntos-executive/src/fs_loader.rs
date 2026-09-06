@@ -186,15 +186,10 @@ pub(crate) unsafe fn fat_write_sector(fs: &Fat32, sector: u32, data: &[u8]) -> u
     if fs.bps != 512 || data.len() != fs.bps as usize {
         return 0xff;
     }
-    core::ptr::copy_nonoverlapping(
-        data.as_ptr(),
-        (fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
-        data.len(),
-    );
     let Some(disk_lba) = nt_fs::checked_partition_lba(fs.volume_start_lba, sector) else {
         return 0xff;
     };
-    ahci_write_sector(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba)
+    ahci_write_sectors(fs.ahci_vaddr, fs.dma_vaddr, fs.dma_paddr, disk_lba, data)
 }
 
 #[allow(dead_code)]
@@ -215,17 +210,12 @@ pub(crate) unsafe fn fat_write_sectors(fs: &Fat32, sector: u32, data: &[u8]) -> 
     if nt_fs::checked_partition_lba(fs.volume_start_lba, last).is_none() {
         return 0xff;
     }
-    core::ptr::copy_nonoverlapping(
-        data.as_ptr(),
-        (fs.dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
-        data.len(),
-    );
     ahci_write_sectors(
         fs.ahci_vaddr,
         fs.dma_vaddr,
         fs.dma_paddr,
         disk_lba,
-        sectors,
+        data,
     )
 }
 

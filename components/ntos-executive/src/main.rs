@@ -20,6 +20,7 @@ extern crate alloc;
 pub use sel4_rt::*;
 
 mod acpi_platform;
+mod ahci_maintenance;
 mod allocator;
 mod alpc_selftest;
 pub(crate) use acpi_platform::*;
@@ -29450,6 +29451,10 @@ unsafe fn ahci_read_sectors(
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
     let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
+    // A timed-out maintenance command retains its slot until recovery. Never overwrite its tables.
+    if pr(0x38) != 0 || pr(0x34) != 0 {
+        return 0xFF;
+    }
     // BRING THE PORT UP ONCE, not once per command.
     //
     // This used to stop the port (clear ST+FRE), spin until CR/FR cleared, zero 2 KiB of tables,
@@ -29479,6 +29484,9 @@ unsafe fn ahci_read_sectors(
             core::hint::spin_loop();
         }
         // Zero the command list + FIS + command table region, then program the bases.
+        if pr(0x18) & ((1 << 15) | (1 << 14)) != 0 {
+            return 0xFF;
+        }
         for i in 0..(0x800u64 / 8) {
             core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
         }
@@ -29516,6 +29524,7 @@ unsafe fn ahci_read_sectors(
 
     // Command Header slot 0 @ dma+0. DW0 = CFL(5) | PRDTL(1)<<16; CTBA @ +8.
     core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 16));
+    core::ptr::write_volatile((dma_vaddr + 4) as *mut u32, 0);
     core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32); // CTBA
     core::ptr::write_volatile(
         (dma_vaddr + 12) as *mut u32,
@@ -29523,9 +29532,20 @@ unsafe fn ahci_read_sectors(
     ); // CTBAU
 
     // Issue command slot 0 (PxCI bit 0) + poll for completion.
+    core::sync::atomic::fence(Ordering::Release);
     pw(0x38, 1);
     for _ in 0..5_000_000u64 {
+        if pr(0x10) & nt_ahci::PORT_IS_FATAL != 0 {
+            return 0xFF;
+        }
         if pr(0x38) & 1 == 0 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            if pr(0x10) & nt_ahci::PORT_IS_FATAL != 0 {
+                return 0xFF;
+            }
+            if core::ptr::read_volatile((dma_vaddr + 4) as *const u32) != bytes {
+                return 0xFF;
+            }
             return pr(0x20) & 0xFF; // PxTFD low byte (0 = success)
         }
         core::hint::spin_loop();
@@ -29533,33 +29553,29 @@ unsafe fn ahci_read_sectors(
     0xFF // timeout
 }
 
-/// Bring up AHCI port 0 and WRITE one 512-byte sector (`sector`) from the DMA frame at
-/// `dma_vaddr + 0x800` (paddr `dma_paddr + 0x800`) via ATA WRITE DMA EXT. Command/FIS/table state
-/// reuses the same 4 KiB DMA frame layout as [`ahci_read_sector`]; the data buffer itself is not
-/// cleared here, so the caller must fill exactly one sector before issuing the write.
-#[allow(dead_code)]
-unsafe fn ahci_write_sector(ahci_vaddr: u64, dma_vaddr: u64, dma_paddr: u64, sector: u64) -> u32 {
-    ahci_write_sectors(ahci_vaddr, dma_vaddr, dma_paddr, sector, 1)
-}
-
-/// Bring up AHCI port 0 and WRITE `sector_count` 512-byte sectors from the DMA frame at
-/// `dma_vaddr + AHCI_DMA_DATA_OFFSET` (paddr `dma_paddr + AHCI_DMA_DATA_OFFSET`) via ATA WRITE DMA
-/// EXT. Returns the port Task File Data low byte after completion (0 = success; 0xFF =
-/// timeout/invalid count).
+/// Stage and write complete 512-byte sectors via ATA WRITE DMA EXT, only after confirming that
+/// hardware has released the previous command's DMA frame. Returns TFD or 0xFF on refusal/error.
 #[allow(dead_code)]
 unsafe fn ahci_write_sectors(
     ahci_vaddr: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     sector: u64,
-    sector_count: u32,
+    data: &[u8],
 ) -> u32 {
-    if sector_count == 0 || sector_count > AHCI_MAX_SECTORS_PER_WRITE {
+    if data.is_empty()
+        || data.len() % 512 != 0
+        || data.len() > AHCI_MAX_SECTORS_PER_WRITE as usize * 512
+    {
         return 0xFF;
     }
+    let sector_count = (data.len() / 512) as u32;
     let port = ahci_vaddr + 0x100; // port 0 register set
     let pr = |o: u64| core::ptr::read_volatile((port + o) as *const u32);
     let pw = |o: u64, v: u32| core::ptr::write_volatile((port + o) as *mut u32, v);
+    if pr(0x38) != 0 || pr(0x34) != 0 {
+        return 0xFF;
+    }
     // Same one-time bring-up as the read path — see the note in `ahci_read_sectors`.
     const PX_CMD_ST: u32 = 1 << 0;
     const PX_CMD_FRE: u32 = 1 << 4;
@@ -29578,6 +29594,9 @@ unsafe fn ahci_write_sectors(
             }
             core::hint::spin_loop();
         }
+        if pr(0x18) & ((1 << 15) | (1 << 14)) != 0 {
+            return 0xFF;
+        }
         for i in 0..(0x800u64 / 8) {
             core::ptr::write_volatile((dma_vaddr + i * 8) as *mut u64, 0);
         }
@@ -29590,6 +29609,12 @@ unsafe fn ahci_write_sectors(
         pw(0x18, pr(0x18) | PX_CMD_ST);
     }
     pw(0x10, 0xFFFF_FFFF);
+
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        (dma_vaddr + AHCI_DMA_DATA_OFFSET) as *mut u8,
+        data.len(),
+    );
 
     let ct = dma_vaddr + 0x500;
     let cb = |o: u64, v: u8| core::ptr::write_volatile((ct + o) as *mut u8, v);
@@ -29612,15 +29637,27 @@ unsafe fn ahci_write_sectors(
 
     // Command Header slot 0: CFL(5) | W(1)<<6 | PRDTL(1)<<16.
     core::ptr::write_volatile(dma_vaddr as *mut u32, 5 | (1u32 << 6) | (1u32 << 16));
+    core::ptr::write_volatile((dma_vaddr + 4) as *mut u32, 0);
     core::ptr::write_volatile((dma_vaddr + 8) as *mut u32, (dma_paddr + 0x500) as u32);
     core::ptr::write_volatile(
         (dma_vaddr + 12) as *mut u32,
         ((dma_paddr + 0x500) >> 32) as u32,
     );
 
+    core::sync::atomic::fence(Ordering::Release);
     pw(0x38, 1);
     for _ in 0..5_000_000u64 {
+        if pr(0x10) & nt_ahci::PORT_IS_FATAL != 0 {
+            return 0xFF;
+        }
         if pr(0x38) & 1 == 0 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            if pr(0x10) & nt_ahci::PORT_IS_FATAL != 0 {
+                return 0xFF;
+            }
+            if core::ptr::read_volatile((dma_vaddr + 4) as *const u32) != bytes {
+                return 0xFF;
+            }
             return pr(0x20) & 0xFF;
         }
         core::hint::spin_loop();

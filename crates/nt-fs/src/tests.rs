@@ -34,6 +34,11 @@ impl MemoryBlockDevice {
 }
 
 impl SnapshotBlockDevice for MemoryBlockDevice {
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> {
+        // This test device has no volatile write cache.
+        Ok(())
+    }
+
     fn sector_size(&self) -> usize {
         self.sector_size
     }
@@ -85,6 +90,10 @@ impl BulkCountingBlockDevice {
 }
 
 impl SnapshotBlockDevice for BulkCountingBlockDevice {
+    fn flush(&mut self) -> Result<(), SnapshotBlockStoreError> {
+        self.inner.flush()
+    }
+
     fn sector_size(&self) -> usize {
         self.inner.sector_size()
     }
@@ -2010,7 +2019,7 @@ fn snapshot_block_store_commits_latest_valid_slot() {
     let second_payload = alloc::vec![0x5a; 1400];
     dev.reset_reads();
     assert_eq!(store.commit_next(&mut dev, &second_payload).unwrap(), 2);
-    assert_eq!(dev.reads, 2, "commit should read only the two slot headers");
+    assert_eq!(dev.reads, 3, "commit validates the newest payload before reusing a slot");
     let second = store.read_latest(&mut dev).unwrap().unwrap();
     assert_eq!(second.generation, 2);
     assert_eq!(second.payload, second_payload);
