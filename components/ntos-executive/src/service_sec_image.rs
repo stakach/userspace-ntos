@@ -21736,6 +21736,10 @@ pub(crate) unsafe fn service_sec_image(
                     let mut breakin_runtime_slot = 0usize;
                     if let Some(request) = request {
                         breakin_runtime_slot = request.slot;
+                        let runtime_publication = nt_handler.prepare_hosted_thread_runtime_publication(
+                            test_pi, request.cid_thread, tp_worker_badge(test_pi, request.slot),
+                            HostedThreadRole::TpWorker { slot: request.slot },
+                        ).expect("debugger fixture owns its reserved runtime before construction");
                         let spawned = rendezvous::spawn_slot_thread(
                             &mut nt_handler,
                             &rendezvous::RemoteThreadSpawn {
@@ -21755,26 +21759,24 @@ pub(crate) unsafe fn service_sec_image(
                         );
                         spawned_tcb = spawned.tcb();
                         if spawned_tcb != 0 {
-                            let registered = nt_handler.register_hosted_thread_spawn(
-                                test_pi,
-                                request.cid_thread,
-                                spawned,
-                                tp_worker_badge(test_pi, request.slot),
+                            nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
+                            if request.resume {
+                                assert_eq!(tcb_resume(spawned_tcb), 0);
+                            }
+                            nt_handler.commit_hosted_thread_publication(request.publication);
+                            for k in 0..nt_handler.out_writes_n {
+                                let (ptr, val) = nt_handler.out_writes[k];
+                                assert!(nt_handler.xas_write_u64(ptr, val));
+                            }
+                            nt_handler.out_writes_n = 0;
+                            spawned_breakin_tid = request.cid_thread;
+                            PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+                            nt_handler.abort_unbuilt_hosted_thread_publication(
+                                request.publication, test_pi, tp_worker_badge(test_pi, request.slot),
                                 HostedThreadRole::TpWorker { slot: request.slot },
                             );
-                            if registered {
-                                if request.resume {
-                                    assert_eq!(tcb_resume(spawned_tcb), 0);
-                                }
-                                nt_handler.commit_hosted_thread_publication(request.publication);
-                                for k in 0..nt_handler.out_writes_n {
-                                    let (ptr, val) = nt_handler.out_writes[k];
-                                    assert!(nt_handler.xas_write_u64(ptr, val));
-                                }
-                                nt_handler.out_writes_n = 0;
-                                spawned_breakin_tid = request.cid_thread;
-                                PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
-                            }
                         }
                     }
                     let thread_handle = smss_stack_read(A_THREAD_HANDLE);
@@ -22342,8 +22344,9 @@ unsafe fn spawn_requested_multiplexed_thread(
     if publication.pid() != cid_proc
         || nt_handler.hosted_thread_tid_for_role(owner_pi, spec.role) != Some(tid)
     {
-        let _ = nt_handler.release_hosted_thread_runtime(tid);
-        nt_handler.abort_hosted_thread_publication(publication);
+        nt_handler.abort_unbuilt_hosted_thread_publication(
+            publication, owner_pi, spec.badge, spec.role,
+        );
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
 
@@ -22372,9 +22375,19 @@ unsafe fn spawn_requested_multiplexed_thread(
     print_u64(resume as u64);
     print_str(b"\n");
 
+    let runtime_publication = match nt_handler.prepare_hosted_thread_runtime_publication(
+        owner_pi, tid, spec.badge, spec.role,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => {
+            nt_handler.abort_unbuilt_hosted_thread_publication(publication, owner_pi, spec.badge, spec.role);
+            return Err(status);
+        }
+    };
     let spawned = match spec.spawner {
         HostedMultiplexedThreadSpawner::ServicesListener => spawn_svc_listener_thread(
             nt_handler,
+            owner_pi,
             pml4,
             start,
             initial_teb,
@@ -22384,6 +22397,7 @@ unsafe fn spawn_requested_multiplexed_thread(
         ),
         HostedMultiplexedThreadSpawner::LsassListener => spawn_lsass_listener_thread(
             nt_handler,
+            owner_pi,
             pml4,
             start,
             initial_teb,
@@ -22393,6 +22407,7 @@ unsafe fn spawn_requested_multiplexed_thread(
         ),
         HostedMultiplexedThreadSpawner::LsassListener2 => spawn_lsass_listener2_thread(
             nt_handler,
+            owner_pi,
             pml4,
             start,
             initial_teb,
@@ -22402,6 +22417,7 @@ unsafe fn spawn_requested_multiplexed_thread(
         ),
         HostedMultiplexedThreadSpawner::LsassListener3 => spawn_lsass_listener3_thread(
             nt_handler,
+            owner_pi,
             pml4,
             start,
             initial_teb,
@@ -22412,13 +22428,12 @@ unsafe fn spawn_requested_multiplexed_thread(
     };
     let tcb = spawned.tcb();
 
-    let registered =
-        nt_handler.register_hosted_thread_spawn(owner_pi, tid, spawned, spec.badge, spec.role);
-    if !registered {
-        let _ = nt_handler.release_hosted_thread_runtime(tid);
-        nt_handler.abort_hosted_thread_publication(publication);
+    if tcb == 0 {
+        nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+        nt_handler.abort_unbuilt_hosted_thread_publication(publication, owner_pi, spec.badge, spec.role);
         return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
     }
+    nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
     if resume && tcb_resume(tcb) != 0 {
         let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
         nt_handler.abort_hosted_thread_publication(publication);
@@ -22428,8 +22443,6 @@ unsafe fn spawn_requested_multiplexed_thread(
 
     print_str(spec.spawned_prefix);
     print_hex(tcb as u32);
-    print_str(b" registered=");
-    print_u64(registered as u64);
     print_str(b" stack-record=");
     print_u64(1);
     print_str(b" resume=");
@@ -23016,8 +23029,7 @@ unsafe fn spawn_requested_local_thread(
             publication,
         } => {
             let Some(spec) = hosted_multiplexed_thread_spawn_for(kind) else {
-                let _ = nt_handler.release_hosted_thread_runtime(publication.tid());
-                nt_handler.abort_hosted_thread_publication(publication);
+                nt_handler.abort_unbuilt_hosted_thread_request(publication);
                 return Err(nt_process::STATUS_INVALID_PARAMETER);
             };
             spawn_requested_multiplexed_thread(
@@ -23053,8 +23065,7 @@ unsafe fn spawn_requested_local_thread(
                     WL_WORKER3_TEB_VA,
                 ),
                 _ => {
-                    let _ = nt_handler.release_hosted_thread_runtime(publication.tid());
-                    nt_handler.abort_hosted_thread_publication(publication);
+                    nt_handler.abort_unbuilt_hosted_thread_request(publication);
                     return Err(nt_process::STATUS_INVALID_PARAMETER);
                 }
             };
@@ -23069,8 +23080,9 @@ unsafe fn spawn_requested_local_thread(
                 || nt_handler.hosted_thread_tid_for_role(wl_pi, role) != Some(tid)
             {
                 print_str(b"[wl-thread] missing reserved runtime role before spawn\n");
-                let _ = nt_handler.release_hosted_thread_runtime(tid);
-                nt_handler.abort_hosted_thread_publication(publication);
+                nt_handler.abort_unbuilt_hosted_thread_publication(
+                    publication, wl_pi, badge, role,
+                );
                 return Err(nt_process::STATUS_INVALID_PARAMETER);
             }
             print_str(b"[wl-thread] spawning REAL worker slot=");
@@ -23088,8 +23100,16 @@ unsafe fn spawn_requested_local_thread(
             print_u64(tid);
             print_str(b"\n");
             let suspended = publication.create_suspended();
+            let runtime_publication = match nt_handler.prepare_hosted_thread_runtime_publication(wl_pi, tid, badge, role) {
+                Ok(prepared) => prepared,
+                Err(status) => {
+                    nt_handler.abort_unbuilt_hosted_thread_publication(publication, wl_pi, badge, role);
+                    return Err(status);
+                }
+            };
             let spawned = spawn_wl_listener_thread(
                 nt_handler,
+                wl_pi,
                 slot,
                 pml4,
                 start,
@@ -23099,11 +23119,12 @@ unsafe fn spawn_requested_local_thread(
                 fault_ep,
             );
             let tcb = spawned.tcb();
-            if !nt_handler.register_hosted_thread_spawn(wl_pi, tid, spawned, badge, role) {
-                let _ = nt_handler.release_hosted_thread_runtime(tid);
-                nt_handler.abort_hosted_thread_publication(publication);
+            if tcb == 0 {
+                nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+                nt_handler.abort_unbuilt_hosted_thread_publication(publication, wl_pi, badge, role);
                 return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
             }
+            nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
             if !suspended && tcb_resume(tcb) != 0 {
                 let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
                 nt_handler.abort_hosted_thread_publication(publication);
@@ -23201,6 +23222,13 @@ unsafe fn spawn_requested_tp_worker(
     let cid_proc = nt_handler.pm_pid_for_pi(pi).unwrap_or(0) as u64;
     let suspended = publication.create_suspended();
     let rpc_worker = role.is_scm_rpc_worker() || role.is_lsa_rpc_worker();
+    let runtime_publication = match nt_handler.prepare_hosted_thread_runtime_publication(pi, tid, badge, role) {
+        Ok(prepared) => prepared,
+        Err(status) => {
+            nt_handler.abort_unbuilt_hosted_thread_publication(publication, pi, badge, role);
+            return Err(status);
+        }
+    };
     let spawned = spawn_tp_worker_thread(
         nt_handler,
         pi,
@@ -23213,15 +23241,11 @@ unsafe fn spawn_requested_tp_worker(
     );
     let tcb = spawned.tcb();
     if spawned.tcb() == 0 {
-        nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
-        nt_handler.abort_hosted_thread_publication(publication);
+        nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+        nt_handler.abort_unbuilt_hosted_thread_publication(publication, pi, badge, role);
         return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
     }
-    if !nt_handler.register_hosted_thread_spawn(pi, tid, spawned, badge, role) {
-        nt_handler.release_unmapped_hosted_tp_worker_slot(pi, worker_slot, tid);
-        nt_handler.abort_hosted_thread_publication(publication);
-        return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
-    }
+    nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
     if !suspended && tcb_resume(tcb) != 0 {
         let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
         nt_handler.clear_hosted_tp_worker_window_slot(pi, worker_slot);
@@ -23279,7 +23303,18 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
         nt_handler.abort_hosted_thread_publication(request.publication);
         return Err(nt_process::STATUS_INVALID_PARAMETER);
     }
-    let badged = mint_badged(fault_ep, tp_worker_badge(request.target_pi, request.slot));
+    let badge = tp_worker_badge(request.target_pi, request.slot);
+    let role = HostedThreadRole::TpWorker { slot: request.slot };
+    let runtime_publication = match nt_handler.prepare_hosted_thread_runtime_publication(
+        request.target_pi, request.cid_thread, badge, role,
+    ) {
+        Ok(prepared) => prepared,
+        Err(status) => {
+            nt_handler.abort_unbuilt_hosted_thread_publication(request.publication, request.target_pi, badge, role);
+            return Err(status);
+        }
+    };
+    let badged = mint_badged(fault_ep, badge);
     let spawned = rendezvous::spawn_slot_thread(
         nt_handler,
         &rendezvous::RemoteThreadSpawn {
@@ -23296,39 +23331,20 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     );
     let tcb = spawned.tcb();
     if tcb != 0 {
-        if !nt_handler.register_hosted_thread_spawn(
-            request.target_pi,
-            request.cid_thread,
-            spawned,
-            tp_worker_badge(request.target_pi, request.slot),
-            HostedThreadRole::TpWorker { slot: request.slot },
-        ) {
-            nt_handler.release_unmapped_hosted_tp_worker_slot(
-                request.target_pi,
-                request.slot,
-                request.cid_thread,
-            );
-            nt_handler.abort_hosted_thread_publication(request.publication);
-            return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
-        } else {
-            if request.resume {
-                if tcb_resume(tcb) != 0 {
-                    let _ = nt_handler.abort_registered_hosted_thread_spawn(request.cid_thread);
-                    nt_handler.clear_hosted_tp_worker_window_slot(request.target_pi, request.slot);
-                    nt_handler.abort_hosted_thread_publication(request.publication);
-                    return Err(nt_process::STATUS_UNSUCCESSFUL);
-                }
+        nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
+        if request.resume {
+            if tcb_resume(tcb) != 0 {
+                let _ = nt_handler.abort_registered_hosted_thread_spawn(request.cid_thread);
+                nt_handler.clear_hosted_tp_worker_window_slot(request.target_pi, request.slot);
+                nt_handler.abort_hosted_thread_publication(request.publication);
+                return Err(nt_process::STATUS_UNSUCCESSFUL);
             }
-            nt_handler.commit_hosted_thread_publication(request.publication);
-            PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
         }
+        nt_handler.commit_hosted_thread_publication(request.publication);
+        PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
     } else {
-        nt_handler.release_unmapped_hosted_tp_worker_slot(
-            request.target_pi,
-            request.slot,
-            request.cid_thread,
-        );
-        nt_handler.abort_hosted_thread_publication(request.publication);
+        nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+        nt_handler.abort_unbuilt_hosted_thread_publication(request.publication, request.target_pi, badge, role);
         return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
     }
     print_str(b"[remote-thread] spawned target_pi=");

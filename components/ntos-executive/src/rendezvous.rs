@@ -4,6 +4,7 @@ use crate::*;
 
 pub(crate) unsafe fn spawn_wl_listener_thread(
     handler: &mut ExecNtHandler,
+    owner_pi: usize,
     slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
@@ -46,15 +47,15 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             ),
             _ => return HostedThreadSpawnResult::failed(),
         };
-    let worker_ep = mint_badged(main_fault_ep, badge);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
         return HostedThreadSpawnResult::failed();
     };
+    let worker_ep = mint_badged(main_fault_ep, badge);
     spawn_hosted_thread(
         handler,
         &HostedThread {
             pml4,
-            client_pi: 2,
+            client_pi: owner_pi as u64,
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
@@ -71,12 +72,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
-            // BATCH 19: winlogon (pi 2) runs on OUR ntdll's NATIVE seL4-Call transport, so its rpcrt4
-            // server WORKER thread must too. All three worker slots run in winlogon's VSpace (pi 2) with
-            // distinct TEB-derived IPC buffers. Their faults still arrive on the badged MAIN fault-EP (the
-            // loop's NT_NATIVE_SYSCALL_LABEL NORMALIZE arm re-labels them into the shared servicing body),
-            // so the worker actually RUNS its rpcrt4 RPC-server init + NtSetEvent(s) the event winlogon's
-            // main parks on.
+            // The worker shares its owner's native transport, with a private TEB-derived IPC buffer.
             native: true,
             diag: false,
         },
@@ -240,14 +236,11 @@ pub(crate) unsafe fn spawn_slot_thread(
     )
 }
 
-/// Spawn services' REAL RPC listener thread (ScmStartRpcServer's rpcrt4 io_thread) in services'
-/// VSpace (pi 3) and RESUME it into the main service-loop multiplex. Unlike `spawn_wl_listener_thread`
-/// (suspended, no-receiver EP), this one faults to a cap minted at [`SVC_LISTENER_BADGE`] off the MAIN
-/// service `fault_ep`, so the loop receives + sub-selects it as (pi 3, listener) via its own stack
-/// mirror. `svc_pml4` = services' PML4; `entry_rip`/`param` from the caller's CONTEXT; `main_fault_ep`
-/// = the shared service-loop endpoint (this fn mints the badged cap). Returns the TCB.
+/// Construct the SCM RPC listener in the caller-resolved owner VSpace. Runtime publication and
+/// first resume belong to the caller; faults use the listener's badged service endpoint.
 pub(crate) unsafe fn spawn_svc_listener_thread(
     handler: &mut ExecNtHandler,
+    owner_pi: usize,
     svc_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
@@ -255,15 +248,15 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
         return HostedThreadSpawnResult::failed();
     };
+    let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
             pml4: svc_pml4,
-            client_pi: 3,
+            client_pi: owner_pi as u64,
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
@@ -280,25 +273,17 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
-            // BATCH 33: services (pi 3) runs on OUR ntdll's NATIVE seL4-Call transport, so its SCM RPC
-            // listener thread must too. native:true plus its TEB-derived private IPC buffer makes its
-            // Call dispatch (MR0=SSN), so it runs its rpcrt4 ncacn_np receive loop
-            // (FSCTL_PIPE_LISTEN + NtReadFile on the server pipe) — the reads the pipe-pending
-            // park/re-drive edge then completes.
             native: true,
             diag: false,
         },
     )
 }
 
-/// Spawn lsass' LSA server thread (StartAuthenticationPort / LsapRmServerThread, created by lsass'
-/// LsapInitDatabase via NtCreateThread) in lsass' VSpace (pi 4) and RESUME it into the main service-loop
-/// multiplex — the SERVICE-9 C-c pattern replicated for lsass. Faults to a cap minted at
-/// [`LSASS_LISTENER_BADGE`] off the MAIN service `fault_ep`; the loop sub-selects it as (pi 4, listener)
-/// via its own stack mirror. `lsass_pml4` = lsass' PML4; `entry_rip`/`param` from the caller's CONTEXT.
-/// Returns the TCB.
+/// Construct the LSA listener using the dynamically resolved process owner. The caller publishes
+/// and resumes the returned mechanism.
 pub(crate) unsafe fn spawn_lsass_listener_thread(
     handler: &mut ExecNtHandler,
+    owner_pi: usize,
     lsass_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
@@ -306,15 +291,15 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
         return HostedThreadSpawnResult::failed();
     };
+    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
             pml4: lsass_pml4,
-            client_pi: 4,
+            client_pi: owner_pi as u64,
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
@@ -331,12 +316,6 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
-            // BATCH 24: lsass (pi 4) runs on OUR ntdll's NATIVE seL4-Call transport, so its LSA server
-            // thread must too. native:true makes its Call dispatch (MR0=SSN) through its TEB-derived
-            // private IPC buffer.
-            // Its faults still arrive on the badged MAIN fault-EP (the loop's NT_NATIVE_SYSCALL_LABEL
-            // NORMALIZE arm re-labels them), so it actually RUNS LsarStartRpcServer →
-            // SetEvent(LSA_RPC_SERVER_ACTIVE).
             native: true,
             diag: false,
         },
@@ -347,6 +326,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
 /// VAs (distinct TEB/stack/tramp) + badge (LSASS_LISTENER2_BADGE).
 pub(crate) unsafe fn spawn_lsass_listener2_thread(
     handler: &mut ExecNtHandler,
+    owner_pi: usize,
     lsass_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
@@ -354,15 +334,15 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
         return HostedThreadSpawnResult::failed();
     };
+    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
             pml4: lsass_pml4,
-            client_pi: 4,
+            client_pi: owner_pi as u64,
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
@@ -388,6 +368,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
 
 pub(crate) unsafe fn spawn_lsass_listener3_thread(
     handler: &mut ExecNtHandler,
+    owner_pi: usize,
     lsass_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
@@ -395,15 +376,15 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
         return HostedThreadSpawnResult::failed();
     };
+    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
             pml4: lsass_pml4,
-            client_pi: 4,
+            client_pi: owner_pi as u64,
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,

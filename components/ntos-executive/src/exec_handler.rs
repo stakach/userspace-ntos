@@ -9595,6 +9595,12 @@ impl ExecNtHandler {
         let Some(bit) = Self::pool_slot_bit(slot) else {
             return false;
         };
+        if self.pm_pool_tid_for_slot(pi, slot)
+            .and_then(|tid| self.thread_runtime.get_by_tid(tid as u64))
+            .is_some_and(|runtime| runtime.publication.is_busy())
+        {
+            return false;
+        }
         let Some(used) = self.pool_used.get_mut(pi) else {
             return false;
         };
@@ -9749,28 +9755,36 @@ impl ExecNtHandler {
         }
     }
 
-    pub(crate) fn register_hosted_thread_spawn(
+    pub(crate) fn prepare_hosted_thread_runtime_publication(
         &mut self,
         pi: usize,
         tid: u64,
-        mut spawn: HostedThreadSpawnResult,
         badge: u64,
         role: HostedThreadRole,
-    ) -> bool {
-        if self
-            .thread_runtime
-            .register_spawn(pi, tid, &spawn, badge, role)
-            .is_none()
-        {
-            unsafe { crate::release_unregistered_hosted_thread_spawn(spawn) };
-            return false;
-        }
+    ) -> Result<PreparedHostedThreadRuntime, u32> {
+        self.thread_runtime.prepare_spawn(pi, tid, badge, role)
+    }
+
+    pub(crate) fn cancel_hosted_thread_runtime_publication(
+        &mut self,
+        prepared: PreparedHostedThreadRuntime,
+    ) {
+        self.thread_runtime.cancel_spawn(prepared);
+    }
+
+    pub(crate) fn commit_hosted_thread_runtime_publication(
+        &mut self,
+        prepared: PreparedHostedThreadRuntime,
+        mut spawn: HostedThreadSpawnResult,
+    ) {
+        let pi = prepared.ticket.owner().pi;
+        let role = prepared.ticket.owner().role;
         let commitment = spawn
             .take_commitment()
             .expect("live hosted spawn carries its prepared MM/Ps commitment");
+        self.thread_runtime.commit_spawn(prepared, &spawn);
         unsafe { self.commit_hosted_thread_commitment(pi, commitment) };
         publish_hosted_thread_runtime_gate(pi, role);
-        true
     }
 
     pub(crate) fn reserve_hosted_thread_runtime(
@@ -10776,19 +10790,39 @@ impl ExecNtHandler {
         slot: usize,
         tid: u64,
     ) {
-        let _ = self.release_hosted_thread_runtime(tid);
-        self.clear_hosted_tp_worker_window_slot(pi, slot);
+        let releasable = self.thread_runtime.get_by_tid(tid).is_some_and(|runtime| {
+            runtime.pi == pi
+                && runtime.role.worker_window_slot() == Some(slot)
+                && runtime.is_unbuilt_reservation()
+        });
+        if releasable {
+            assert!(self.release_hosted_thread_runtime(tid).is_some());
+            self.clear_hosted_tp_worker_window_slot(pi, slot);
+        }
     }
 
     pub(crate) fn clear_hosted_tp_worker_window_slot(&mut self, pi: usize, slot: usize) {
-        if pi < MAX_PI {
-            if let Some(bit) = Self::tp_worker_slot_bit(slot) {
-                self.tp_worker_window_used[pi] &= !bit;
-            }
+        if pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT {
+            return;
+        }
+        if self.thread_runtime
+            .get_by_badge(tp_worker_badge(pi, slot))
+            .is_some_and(|runtime| runtime.publication.is_busy())
+        {
+            return;
+        }
+        if let Some(bit) = Self::tp_worker_slot_bit(slot) {
+            self.tp_worker_window_used[pi] &= !bit;
         }
     }
 
     pub(crate) fn clear_hosted_tp_worker_windows(&mut self, pi: usize) {
+        if (0..self.thread_runtime.record_count()).any(|index| {
+            self.thread_runtime.get_by_index(index)
+                .is_some_and(|runtime| runtime.pi == pi && runtime.publication.is_busy())
+        }) {
+            return;
+        }
         if pi < MAX_PI {
             self.tp_worker_window_used[pi] = 0;
         }
@@ -15655,8 +15689,72 @@ impl ExecNtHandler {
         &mut self,
         publication: PreparedHostedThreadPublication,
     ) {
+        let retained = self.thread_runtime
+            .get_by_tid(publication.tid())
+            .is_some_and(|runtime| !runtime.is_unbuilt_reservation());
+        if !retained {
+            self.release_pool_usage_slot(publication.owner_pi, publication.pool_slot);
+        }
+        self.cancel_hosted_thread_caller_publication(publication);
+    }
+
+    fn hosted_thread_publication_owns_pool_slot(
+        &self,
+        publication: &PreparedHostedThreadPublication,
+    ) -> bool {
+        self.pm_pid_for_pi(publication.owner_pi).map(u64::from) == Some(publication.pid())
+            && self.pm_pool_tid_for_slot(publication.owner_pi, publication.pool_slot)
+                .map(u64::from) == Some(publication.tid())
+    }
+
+    pub(crate) fn abort_unbuilt_hosted_thread_request(
+        &mut self,
+        publication: PreparedHostedThreadPublication,
+    ) {
+        if let Some(runtime) = self.thread_runtime.get_by_tid(publication.tid()) {
+            let pi = publication.owner_pi;
+            self.abort_unbuilt_hosted_thread_publication(
+                publication, pi, runtime.badge, runtime.role,
+            );
+        } else {
+            if self.hosted_thread_publication_owns_pool_slot(&publication) {
+                self.release_pool_usage_slot(publication.owner_pi, publication.pool_slot);
+            }
+            self.cancel_hosted_thread_caller_publication(publication);
+        }
+    }
+
+    pub(crate) fn abort_unbuilt_hosted_thread_publication(
+        &mut self,
+        publication: PreparedHostedThreadPublication,
+        pi: usize,
+        badge: u64,
+        role: HostedThreadRole,
+    ) {
+        let tid = publication.tid();
+        let releasable = publication.owner_pi == pi
+            && self.hosted_thread_publication_owns_pool_slot(&publication)
+            && self.thread_runtime.get_by_tid(tid).is_some_and(|runtime| {
+                runtime.pi == pi
+                    && runtime.badge == badge
+                    && runtime.role == role
+                    && runtime.is_unbuilt_reservation()
+            });
+        if releasable {
+            assert!(self.thread_runtime.release_tid(tid).is_some());
+            if let Some(slot) = role.worker_window_slot() {
+                self.clear_hosted_tp_worker_window_slot(pi, slot);
+            }
+            self.release_pool_usage_slot(pi, publication.pool_slot);
+        }
+        self.cancel_hosted_thread_caller_publication(publication);
+    }
+
+    fn cancel_hosted_thread_caller_publication(
+        &mut self,
+        publication: PreparedHostedThreadPublication,
+    ) {
         let _ = self.pm.cancel_bound_handle(publication.handle);
-        self.release_pool_usage_slot(publication.owner_pi, publication.pool_slot);
         if publication.handle_out != 0 {
             self.queue_write(publication.handle_out, 0);
         }

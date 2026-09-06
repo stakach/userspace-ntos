@@ -115,6 +115,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Prevent live runtime rebinding/demotion, check routing identities before reservation or ordinary
   registration, and preserve existing main mechanism ownership (tranche 54, host/build;
   native admission wired).
+- [x] Prepare exclusive runtime publication before worker construction, commit successful spawns
+  once into the reserved row, and remove destructive post-construction registration rejection
+  (tranche 55, host/build; all five worker construction paths wired).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next wire the registered-resume failure path
   with retained runtime/pool/window ownership, once-only caller cancellation, reconciled physical-frame
@@ -26458,6 +26461,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     continuing without a runtime. Pending rollback ownership, execution/control/badge exclusions,
     exact registry transfer and checked retry cleanup from tranches 52-53 remain the immediate work.
     The complete win32k import gate remains blocked by 33 unresolved code imports.
+
+    B3 prepared runtime publication tranche 55 (2026-09-07, host/build green):
+    All five worker construction paths (multiplexed listeners, Winlogon workers, thread-pool workers,
+    remote threads and the debugger fixture) now acquire an exclusive publication ticket for the
+    exact existing runtime reservation before constructing a mechanism. Preparation performs the
+    complete binding-admission scan and refuses missing, conflicting, occupied or resource-owning
+    reservations before endpoint minting. Successful construction commits into that exact row without
+    allocation or a second fallible registration, preserves remembered stack/LPC metadata, and consumes
+    the prepared MM/Ps commitment once. Transfer checks the constructor's live TCB/mechanism/resource
+    invariants and exact resource process owner. The obsolete `register_spawn` path, boolean
+    registration branches, and `release_unregistered_hosted_thread_spawn` destructor are deleted.
+
+    The allocation-free `nt-user-host::thread_publication` policy retains a unique non-wrapping
+    attempt identity and returns the non-cloneable ticket intact on owner/attempt mismatch. Dropping a
+    ticket cannot release its reservation. Native runtime release, rebinding, stack/LPC mutation,
+    pool release and worker-window release refuse active publication; table reset asserts that no
+    publication is outstanding. Failed construction cancels the ticket before exact unbuilt-only
+    reservation cleanup. Early request rejection checks current process/PID, pool/TID, badge and role
+    ownership before cleanup, never releasing a live or busy runtime by TID alone. Caller-handle/output
+    cancellation is separate from target reservation release. The five listener helpers now receive
+    their caller-resolved process index instead of using fixed indices 2/3/4, and validate loader
+    context before minting their endpoint.
+
+    Validation: seven host tests cover exclusive preparation, once-only finish, owner/attempt mismatch
+    retention, same-TID slot reuse, exhaustion, dropped tickets and idle/unbuilt release admission.
+    The serialized nine-crate regression suite passes 929 tests, including 65 `nt-user-host`
+    unit/integration tests; log: `.tmp/test-thread-publication-20260907.log`. The final executive
+    build passes at the unchanged 262-warning baseline and stages rootserver/hive; log:
+    `.tmp/build-thread-publication-final-20260907.log`. Two agents reviewed construction invariants
+    and release paths; root alone ran builds/tests. No live failure injection or desktop proof is
+    claimed.
+
+    Review adjustment: the worker construction-to-publication handoff is closed, not physical
+    rollback. Commit assertions express internal constructor/exclusive-ticket invariants, not normal
+    failure handling. The registered-resume failure path still removes runtime/accounting before
+    unchecked physical teardown; replace it with the retained rollback owner next. Partial-constructor
+    cleanup, minted-endpoint ownership after later construction failure, main-process registration
+    rejection, full capability disjointness, exact registry ownership transfer, process-generation
+    retention, and pending-cleanup execution/control/memory exclusions remain open. A failed
+    constructor's zero result does not yet prove successful physical cleanup. Handler-owned handoffs
+    also remain open. The win32k import barrier is unchanged at 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

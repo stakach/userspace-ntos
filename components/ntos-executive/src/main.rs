@@ -18985,15 +18985,6 @@ unsafe fn release_hosted_thread_mechanism_cnodes(runtime: HostedThreadRuntime) {
     release_hosted_thread_mechanism_caps(runtime.tid, runtime.mechanism);
 }
 
-pub(crate) unsafe fn release_unregistered_hosted_thread_spawn(spawn: HostedThreadSpawnResult) {
-    if spawn.tcb() > 1 {
-        let _ = tcb_suspend_r(spawn.tcb());
-        let _ = cnode_delete_recycle_r(spawn.tcb());
-    }
-    release_hosted_thread_resources(spawn.resources());
-    release_hosted_thread_mechanism_caps(0, spawn.mechanism());
-}
-
 unsafe fn release_unpublished_sec_image_spawn(
     pi: usize,
     spawn: img_spawn::SecImageSpawn,
@@ -25766,6 +25757,14 @@ pub(crate) struct HostedThreadRuntime {
     /// Broker port handle that delivered the server thread's current LPC message.
     lpc_server_port: u64,
     lpc_client_process: u32,
+    publication: nt_user_host::thread_publication::ThreadPublicationSlot,
+}
+
+pub(crate) struct PreparedHostedThreadRuntime {
+    index: usize,
+    ticket: nt_user_host::thread_publication::PreparedThreadPublication<
+        nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    >,
 }
 
 impl HostedThreadRuntime {
@@ -25783,6 +25782,7 @@ impl HostedThreadRuntime {
             user_stack_base: 0,
             lpc_server_port: 0,
             lpc_client_process: 0,
+            publication: nt_user_host::thread_publication::ThreadPublicationSlot::empty(),
         }
     }
 
@@ -25798,6 +25798,13 @@ impl HostedThreadRuntime {
             badge: self.badge,
             role: self.role,
         }
+    }
+
+    fn is_unbuilt_reservation(&self) -> bool {
+        self.publication.can_release_unbuilt(
+            self.tcb,
+            self.mechanism.is_live() || self.resources.is_live() || self.teb_alias != 0,
+        )
     }
 }
 
@@ -25834,6 +25841,7 @@ impl HostedThreadRuntimeTable {
     }
 
     fn reset(&mut self, initial_reserve: usize) {
+        assert!(self.entries.iter().all(|entry| !entry.publication.is_busy()));
         self.entries.clear();
         if self.entries.capacity() < initial_reserve
             && self.entries.try_reserve(initial_reserve).is_err()
@@ -25889,45 +25897,62 @@ impl HostedThreadRuntimeTable {
         })
     }
 
-    fn register_spawn(
+    fn prepare_spawn(
         &mut self,
         pi: usize,
         tid: u64,
-        tcb: u64,
         badge: u64,
         role: HostedThreadRole,
-        mechanism: HostedThreadMechanismCaps,
-        teb_alias: u64,
-        resources: HostedThreadResources,
-    ) -> Option<HostedThreadRuntime> {
-        if tid == 0 || tcb <= 1 || !mechanism.is_live() || !resources.is_live() {
-            return None;
-        }
-        let index = self.entries.iter().position(|entry| {
-            entry.is_live()
-                && entry.tid == tid
-                && entry.tcb == 1
-                && entry.pi == pi
-                && entry.badge == badge
-                && entry.role == role
-        })?;
-        let previous = self.entries[index];
-        let runtime = HostedThreadRuntime {
-            pi,
-            tid,
-            tcb,
-            badge,
-            role,
-            mechanism,
-            teb_alias,
-            resources,
-            user_stack_allocation_base: previous.user_stack_allocation_base,
-            user_stack_base: previous.user_stack_base,
-            lpc_server_port: previous.lpc_server_port,
-            lpc_client_process: previous.lpc_client_process,
+    ) -> Result<PreparedHostedThreadRuntime, u32> {
+        use nt_user_host::thread_binding::{
+            admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
         };
-        self.entries[index] = runtime;
-        Some(runtime)
+        let key = ThreadBinding { pi, tid, badge, role, tcb: 1 };
+        let admission = admit_thread_binding(
+            key,
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.is_live())
+                .map(|(index, entry)| (index, entry.binding())),
+        )
+        .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)?;
+        let ThreadBindingAdmission::Replay { index } = admission else {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        };
+        let entry = &mut self.entries[index];
+        if entry.mechanism.is_live() || entry.resources.is_live() || entry.teb_alias != 0 {
+            return Err(nt_process::STATUS_INVALID_PARAMETER);
+        }
+        let ticket = entry.publication.prepare(key).map_err(|error| match error {
+            nt_user_host::thread_publication::PublicationError::Exhausted => {
+                nt_process::STATUS_INSUFFICIENT_RESOURCES
+            }
+            _ => nt_process::STATUS_INVALID_PARAMETER,
+        })?;
+        Ok(PreparedHostedThreadRuntime { index, ticket })
+    }
+
+    fn cancel_spawn(&mut self, prepared: PreparedHostedThreadRuntime) {
+        let entry = &mut self.entries[prepared.index];
+        let key = entry.binding();
+        entry.publication
+            .finish(prepared.ticket, &key)
+            .expect("cancel must retain its exclusive runtime reservation");
+    }
+
+    fn commit_spawn(&mut self, prepared: PreparedHostedThreadRuntime, spawn: &HostedThreadSpawnResult) {
+        let entry = &mut self.entries[prepared.index];
+        let key = entry.binding();
+        assert!(spawn.tcb() > 1 && spawn.mechanism().is_live() && spawn.resources().is_live());
+        assert_eq!(spawn.resources().client_pi, key.pi);
+        entry.publication
+            .finish(prepared.ticket, &key)
+            .expect("construction must retain its exclusive runtime reservation");
+        entry.tcb = spawn.tcb();
+        entry.mechanism = spawn.mechanism();
+        entry.teb_alias = spawn.teb_alias();
+        entry.resources = spawn.resources();
     }
 
     fn reserve(
@@ -25961,10 +25986,13 @@ impl HostedThreadRuntimeTable {
         )
         .ok()?;
         match admission {
-            ThreadBindingAdmission::Replay { index } => return Some(self.entries[index]),
+            ThreadBindingAdmission::Replay { index } => {
+                return (!self.entries[index].publication.is_busy()).then_some(self.entries[index]);
+            }
             ThreadBindingAdmission::Promote { index } => {
                 let existing = &mut self.entries[index];
-                if existing.mechanism.is_live()
+                if existing.publication.is_busy()
+                    || existing.mechanism.is_live()
                     || existing.resources.is_live()
                     || existing.teb_alias != 0
                 {
@@ -25988,6 +26016,7 @@ impl HostedThreadRuntimeTable {
             user_stack_base: 0,
             lpc_server_port: 0,
             lpc_client_process: 0,
+            publication: nt_user_host::thread_publication::ThreadPublicationSlot::empty(),
         };
         if let Some(empty) = self.entries.iter_mut().find(|entry| !entry.is_live()) {
             *empty = runtime;
@@ -26043,7 +26072,7 @@ impl HostedThreadRuntimeTable {
         let entry = self
             .entries
             .iter_mut()
-            .find(|entry| entry.is_live() && entry.tid == tid)?;
+            .find(|entry| entry.is_live() && entry.tid == tid && !entry.publication.is_busy())?;
         entry.user_stack_allocation_base = allocation_base;
         entry.user_stack_base = stack_base;
         Some(*entry)
@@ -26091,7 +26120,7 @@ impl HostedThreadRuntimeTable {
         let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.is_live() && entry.badge == badge)
+            .find(|entry| entry.is_live() && entry.badge == badge && !entry.publication.is_busy())
         else {
             return false;
         };
@@ -26111,7 +26140,7 @@ impl HostedThreadRuntimeTable {
         let entry = self
             .entries
             .iter_mut()
-            .find(|entry| entry.is_live() && entry.tid == tid)?;
+            .find(|entry| entry.is_live() && entry.tid == tid && !entry.publication.is_busy())?;
         let previous = *entry;
         *entry = HostedThreadRuntime::empty();
         Some(previous)
@@ -26161,26 +26190,22 @@ impl HostedThreadRuntimes {
         unsafe { (&mut *self.table).register_main(pi, tid, tcb, badge, mechanism) }
     }
 
-    fn register_spawn(
+    fn prepare_spawn(
         &mut self,
         pi: usize,
         tid: u64,
-        spawn: &HostedThreadSpawnResult,
         badge: u64,
         role: HostedThreadRole,
-    ) -> Option<HostedThreadRuntime> {
-        unsafe {
-            (&mut *self.table).register_spawn(
-                pi,
-                tid,
-                spawn.tcb(),
-                badge,
-                role,
-                spawn.mechanism(),
-                spawn.teb_alias(),
-                spawn.resources(),
-            )
-        }
+    ) -> Result<PreparedHostedThreadRuntime, u32> {
+        unsafe { (&mut *self.table).prepare_spawn(pi, tid, badge, role) }
+    }
+
+    fn cancel_spawn(&mut self, prepared: PreparedHostedThreadRuntime) {
+        unsafe { (&mut *self.table).cancel_spawn(prepared) }
+    }
+
+    fn commit_spawn(&mut self, prepared: PreparedHostedThreadRuntime, spawn: &HostedThreadSpawnResult) {
+        unsafe { (&mut *self.table).commit_spawn(prepared, spawn) }
     }
 
     fn reserve(
