@@ -3638,7 +3638,8 @@ mod section_writeback;
 mod section_retirement;
 pub(crate) use section_retirement::{service_drain_section_retirement, service_unmap_section_view_mappings};
 pub(crate) use section_writeback::{
-    service_generic_section_writeback_plan, service_generic_section_writeback_view,
+    service_generic_section_writeback_file, service_generic_section_writeback_plan,
+    service_generic_section_writeback_view,
 };
 
 pub(crate) unsafe fn service_generic_section_fault(

@@ -126,6 +126,30 @@ pub(crate) unsafe fn service_generic_section_writeback_plan(
             context,
         },
     );
+    record_writeback(result)
+}
+
+pub(crate) unsafe fn service_generic_section_writeback_file(
+    table: &mut GenericSectionTable,
+    file_id: u64,
+    scratch_base: u64,
+    context: Option<ExecLoopCtx>,
+) -> WritebackResult {
+    let backing = match crate::writable_fs::section_backing(file_id) {
+        Ok(backing) => backing,
+        Err(status) => return record_writeback(WritebackResult::failure(status)),
+    };
+    record_writeback(table.writeback_file(
+        backing,
+        &mut WritebackIo {
+            file_id,
+            scratch_base,
+            context,
+        },
+    ))
+}
+
+fn record_writeback(result: WritebackResult) -> WritebackResult {
     GENERIC_SECTION_WRITEBACKS.fetch_add(result.pages_written, Ordering::Relaxed);
     GENERIC_SECTION_WRITEBACK_BYTES.fetch_add(result.bytes_written, Ordering::Relaxed);
     if result.status != 0 {

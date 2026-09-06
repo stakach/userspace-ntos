@@ -15,6 +15,7 @@ mod byte_lock;
 mod directory;
 mod fat_directory;
 mod file_backing;
+mod flush;
 mod fs;
 mod hive_provider;
 mod notify;
@@ -29,6 +30,7 @@ pub use byte_lock::*;
 pub use directory::*;
 pub use fat_directory::*;
 pub use file_backing::FileBacking;
+pub use flush::file_flush_access_allowed;
 pub use fs::{
     installed_file_open_action, parse_file_basic_information_attributes,
     parse_move_cluster_information, parse_set_file_name_information, parse_short_name_information,

@@ -82,9 +82,15 @@ below are historical baselines, not acceptance of the current provider cutover.
   and issue capability-selected real AHCI cache flush commands (tranche 37, host/build validation).
 - [x] Rearm tracked data-section page aliases and dirty-admit win32k attachments/legacy kernel
   copybacks through the existing memory owner (tranche 38, host/build validation).
+- [x] Retain exact section resources through checked retirement, validate data-section sizing and
+  page-in, and share canonical data pages across mounted-file control areas
+  (tranches 39-41, host/build validation).
+- [x] Flush all live mapped-file dirty pages through native `NtFlushBuffersFile`, with retained
+  file ownership, checked completion, and an explicit storage checkpoint (tranche 42, host/build).
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
-  live refault/restart/power-loss tests. Complete file-wide control areas across independently
-  created sections and storage-port abort/reset recovery without reusing device-owned DMA.
+  live refault/restart/power-loss tests. Unify ordinary file reads/writes and EOF changes with the
+  shared control-area owner; complete storage-port abort/reset recovery without reusing device-owned
+  DMA. Retain temporary writeback alias capabilities through checked cleanup failures.
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25863,6 +25869,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Live cross-process refault/COW and persistence acceptance, full allocation-attribute validation,
     non-data-view/termination flush semantics, and remaining native output contracts stay open.
     The 33-import win32k gate still blocks desktop acceptance and is unchanged by this slice.
+
+    B3 native mapped-file flush tranche 42 (2026-09-06, host/build green):
+    `GenericSectionTable::writeback_file` now selects the complete live control area by mounted-file
+    identity and backend kind, validates actual EOF before updating its extent, and gathers every
+    dirty page independently of section/view size or the calling FILE_OBJECT. It shares the existing
+    complete-batch alias-rearm, write, checkpoint, and dirty-ticket acknowledgement sequence with
+    view flushing; no synthetic view or arbitrary first-section handle is introduced. Uncached and
+    clean files still call the real persistence adapter, while retired areas remain owned by the
+    retirement path. Unsafe shrink and resident partial-page growth continue to fail before I/O.
+
+    Native overlay `NtFlushBuffersFile` uses the new focused `exec_file_flush.rs` adapter. It probes
+    IOSB writability before admission, validates a full-width typed handle, accepts write-data or
+    append-data access for ordinary files, retains and clears the FILE_OBJECT, and uses that caller's
+    open for all writes and the snapshot/device-cache checkpoint. Completion reports the actual
+    status with zero IOSB information, preserves the file position, checks copyout after dropping
+    the section-table borrow, and signals/releases the file even on failure. Admission failures
+    leave IOSB untouched. The old deferred dirty-flag plus raw-flush success branch is removed.
+    The hosted pipe IRP/pending owner is preserved; its access check shares a host-tested policy
+    which correctly excludes the append bit's `FILE_CREATE_PIPE_INSTANCE` alias. Completed hosted
+    flush copyout is checked instead of silently ignored.
+
+    Validation: 121 `nt-memory-manager`, 157 `nt-address-space`, 138 `nt-fs`, and 10 `nt-ahci`
+    tests pass (426 total). Twelve new tests cover file-wide ordered batches, nonzero-offset sibling
+    aliases, final EOF tails, uncached/clean persistence, invalid backing, mount/file/backend
+    isolation, retired/replacement areas, safe and unsafe EOF transitions, rearm/write/short-write/
+    checkpoint retry, and regular/pipe access grants. A real MemFs hardlink integration test uses
+    an independently opened FILE_OBJECT retained after handle closure, flushes canonical page bytes,
+    verifies its position is unchanged, and restores a snapshot to check both names and exact EOF.
+    Logs: `.tmp/test-file-control-flush-20260906.log` and
+    `.tmp/build-file-control-flush-20260906.log`. The executive build passes with the existing
+    256 warnings and stages the rootserver and registry hive.
+    Root alone runs serialized builds/tests; two agents reviewed control-area and native I/O
+    ownership. No QEMU, physical persistence, or desktop acceptance is claimed.
+
+    Review adjustment: file-wide flush is complete at the host/build boundary; it is not ordinary
+    cached-I/O coherence. Activate ordinary reads and writes together: routing reads to canonical
+    pages while raw writes bypass them would return stale data. Next merge ordinary writes and
+    cached reads through this same owner, then implement partial EOF growth/truncation and remove
+    the conservative refusals. Also replace ignored temporary read-only scratch-alias unmap/delete
+    results with a retry-owned capability cleanup queue, drained before canonical-frame retirement;
+    physical-frame recycling must not be used for copied capability slots. Live refault/restart,
+    termination flushing, allocation attributes, and the 33 unresolved win32k imports remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

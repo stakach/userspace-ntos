@@ -7,6 +7,9 @@
 use crate::*;
 use nt_io_abi::major;
 
+#[path = "exec_file_flush.rs"]
+mod file_flush;
+
 #[path = "exec_virtual_memory_copy.rs"]
 mod virtual_memory_copy;
 
@@ -30062,9 +30065,6 @@ impl ExecNtHandler {
     pub(crate) fn npfs_flush_file_route_for(&self, handle: u64) -> Result<HostedFileRoute, u32> {
         const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
         const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
-        const FILE_WRITE_DATA: u32 = 0x0000_0002;
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const GENERIC_ALL: u32 = 0x1000_0000;
 
         let route = self
             .hosted_file_route_for(handle)
@@ -30072,7 +30072,7 @@ impl ExecNtHandler {
         let access = self
             .hosted_file_access_for(handle)
             .ok_or(STATUS_INVALID_HANDLE)?;
-        if access & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL) == 0 {
+        if !nt_fs::file_flush_access_allowed(access, true) {
             return Err(STATUS_ACCESS_DENIED);
         }
         Ok(route)
@@ -44427,15 +44427,19 @@ impl ExecNtHandler {
                 }
                 status
             },
-            // NtFlushBuffersFile(FileHandle[R10], *IoStatusBlock[RDX]). Route the typed pipe handle
-            // through isolated npfs's real IRP_MJ_FLUSH_BUFFERS implementation. NPFS may pend the
+            // NtFlushBuffersFile flushes local mapped data and the filesystem checkpoint, or routes
+            // a typed pipe handle through isolated npfs's real IRP_MJ_FLUSH_BUFFERS. NPFS may pend the
             // flush behind queued write data; driver_launch retains that IRP graph until the peer
             // drains the queue and IoCompleteRequest reclaims it. This syscall has no event argument.
             NativeService::NtFlushBuffersFile => unsafe {
                 let handle = args[0];
                 let iosb = args[1];
-                let mut iosb_probe = [0u8; 16];
-                let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
+                let iosb_ok = iosb != 0 && self.probe_user_output(iosb, 16);
+                if iosb_ok && handle <= u32::MAX as u64 {
+                    if let Some(status) = self.try_flush_overlay_file(handle, iosb) {
+                        return status;
+                    }
+                }
                 let mut information = 0u64;
                 let mut file_id = 0u64;
                 let mut pending_irp_id = 0u64;
@@ -44445,10 +44449,8 @@ impl ExecNtHandler {
                 let mut npfs_route_status = 0xFFFF_FFFEu32;
                 let mut status = if !iosb_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if let Some(overlay_file_id) = self.overlay_file_id_for(handle) {
-                    file_id = overlay_file_id;
-                    self.writable_fs_dirty = true;
-                    crate::writable_fs::flush(overlay_file_id)
+                } else if handle > u32::MAX as u64 {
+                    STATUS_INVALID_HANDLE
                 } else {
                     match self.npfs_flush_file_route_for(handle) {
                         Err(handle_status) => {
@@ -44551,9 +44553,10 @@ impl ExecNtHandler {
                         self.pending_file_io_wait = true;
                     }
                 }
-                if iosb_ok && status != STATUS_PENDING && !self.user_apc_redirected {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
+                if iosb_ok && status != STATUS_PENDING && !self.user_apc_redirected
+                    && !self.write_current_iosb(iosb, status, information)
+                {
+                    status = STATUS_ACCESS_VIOLATION;
                 }
                 if routed && status == 0x0000_0103 {
                     NT_FLUSH_BUFFERS_FILE_PENDING_COUNT.fetch_add(1, Ordering::Relaxed);

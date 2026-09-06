@@ -123,6 +123,15 @@ impl GenericSectionTable {
         let area = self
             .control_area(plan.view.section_index)
             .ok_or(STATUS_NOT_MAPPED_VIEW)?;
+        self.prepare_area_writeback(area, plan.section_offset, end)
+    }
+
+    fn prepare_area_writeback(
+        &self,
+        area: ControlArea,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<crate::writeback::SectionWritebackPage>, u32> {
         let mut pages = Vec::new();
         for page in &self.pages {
             if !page.live || !page.dirty || page.control_area != area.id {
@@ -132,7 +141,7 @@ impl GenericSectionTable {
                 .page_index
                 .checked_mul(0x1000)
                 .ok_or(STATUS_INVALID_PARAMETER_2)?;
-            if offset < plan.section_offset || offset >= end {
+            if offset < start || offset >= end {
                 continue;
             }
             let length = area.extent.saturating_sub(offset).min(0x1000) as usize;
@@ -162,6 +171,45 @@ impl GenericSectionTable {
             Ok(pages) => pages,
             Err(status) => return crate::writeback::WritebackResult::failure(status),
         };
+        self.writeback_batch(pages, io)
+    }
+
+    /// Flush all resident dirty data for the mounted file, not just a particular section or view.
+    /// The caller supplies the current EOF and retains the FILE_OBJECT used by the I/O adapter.
+    pub fn writeback_file(
+        &mut self,
+        backing: GenericSectionBacking,
+        io: &mut impl crate::writeback::SectionWritebackIo,
+    ) -> crate::writeback::WritebackResult {
+        if backing.file.is_none()
+            || !matches!(
+                backing.kind,
+                GENERIC_SECTION_BACKING_DISK | GENERIC_SECTION_BACKING_OVERLAY
+            )
+        {
+            return crate::writeback::WritebackResult::failure(0xc000_000d); // STATUS_INVALID_PARAMETER
+        }
+        let pages = if let Some(index) = self.matching_control_area(backing) {
+            if let Err(status) = self.validate_backing_extent(backing) {
+                return crate::writeback::WritebackResult::failure(status);
+            }
+            self.control_areas[index].extent = backing.file_extent;
+            match self.prepare_area_writeback(self.control_areas[index], 0, backing.file_extent) {
+                Ok(pages) => pages,
+                Err(status) => return crate::writeback::WritebackResult::failure(status),
+            }
+        } else {
+            Vec::new()
+        };
+        // Even an uncached or clean file can have dirty filesystem metadata to persist.
+        self.writeback_batch(pages, io)
+    }
+
+    fn writeback_batch(
+        &mut self,
+        pages: Vec<crate::writeback::SectionWritebackPage>,
+        io: &mut impl crate::writeback::SectionWritebackIo,
+    ) -> crate::writeback::WritebackResult {
         // Rearm the entire batch before the first copy. Faults after this point must dirty-admit
         // through the memory owner; no writable alias may outlive successful ticket retirement.
         for page in &pages {
@@ -285,3 +333,7 @@ impl GenericSectionTable {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "section_file_flush_tests.rs"]
+mod file_flush_tests;
