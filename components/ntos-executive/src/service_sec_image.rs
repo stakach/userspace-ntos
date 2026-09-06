@@ -3942,9 +3942,8 @@ fn sec_image_page_shareable(
                 && sec_image_clean_writecopy_shareable(pe, rva, base)))
 }
 
-unsafe fn discard_unpublished_image_backing(source: u64, mirror: u64, faults: &mut u64) {
+unsafe fn discard_unpublished_image_backing(source: u64, faults: &mut u64) {
     if source != 0 {
-        recycle_mapped_cap(mirror);
         recycle_mapped_cap(source);
         *faults = faults.checked_sub(1).expect("unpublished image fill owns its scratch slot");
     }
@@ -3961,7 +3960,6 @@ pub(crate) unsafe fn service_image_page_residency(
     pe: &nt_pe_loader::PeFile,
     pml4: u64,
     scratch_base: u64,
-    image_mirror: u64,
     fault_access: nt_address_space::FaultAccess,
     fault_observed: bool,
     filled_pages: &mut [u64; 512],
@@ -4060,7 +4058,6 @@ pub(crate) unsafe fn service_image_page_residency(
     } else {
         crate::exec_handler::PreparedProcessCommitCharge::default()
     };
-    let mut mirror_cap = 0;
     let (frame, private_alias, private_source_cap) = if cached != 0 {
         DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
         (cached, 0, 0)
@@ -4093,19 +4090,6 @@ pub(crate) unsafe fn service_image_page_residency(
                 let _ = cnode_delete_recycle_r(frame);
                 return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
             }
-        } else if base == PE_LOAD_BASE {
-            let offset = page - PE_LOAD_BASE;
-            if offset < IMAGE_MIRROR_WINDOW {
-                let (cap, copy_error) = copy_cap_r(frame);
-                if copy_error != 0
-                    || page_map_r(cap, image_mirror + offset, RW_NX, CAP_INIT_THREAD_VSPACE) != 0
-                {
-                    recycle_mapped_cap(cap);
-                    recycle_mapped_cap(frame);
-                    return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-                }
-                mirror_cap = cap;
-            }
         }
         *faults += 1;
         (
@@ -4120,13 +4104,13 @@ pub(crate) unsafe fn service_image_page_residency(
         if map_cap != 0 {
             let _ = cnode_delete_recycle_r(map_cap);
         }
-        discard_unpublished_image_backing(private_source_cap, mirror_cap, faults);
+        discard_unpublished_image_backing(private_source_cap, faults);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let map_error = page_map_r(map_cap, page, rights, pml4);
     if map_error != 0 {
         let _ = cnode_delete_recycle_r(map_cap);
-        discard_unpublished_image_backing(private_source_cap, mirror_cap, faults);
+        discard_unpublished_image_backing(private_source_cap, faults);
         let duplicate_shared_fault = fault_observed
             && map_error == 8
             && shareable
@@ -4155,7 +4139,7 @@ pub(crate) unsafe fn service_image_page_residency(
         ) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
-            discard_unpublished_image_backing(private_source_cap, mirror_cap, faults);
+            discard_unpublished_image_backing(private_source_cap, faults);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         let filled_index = (*faults as usize).saturating_sub(1);
@@ -9236,7 +9220,6 @@ pub(crate) unsafe fn service_sec_image(
             },
             Ordering::Relaxed,
         );
-        ACTIVE_IMAGE_MIRROR.store(hosted_active_image_mirror_for_pi(pi), Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hosted_heap_mirror_for_pi(pi), Ordering::Relaxed);
         let pml4 = procs[pi].pml4;
         let scratch_base = procs[pi].scratch_base;
@@ -10773,7 +10756,6 @@ pub(crate) unsafe fn service_sec_image(
                 tpe,
                 pml4,
                 scratch_base,
-                ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed),
                 image_fault_access,
                 true,
                 filled_pages,
@@ -10837,7 +10819,6 @@ pub(crate) unsafe fn service_sec_image(
                     tpe,
                     pml4,
                     scratch_base,
-                    ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed),
                     nt_address_space::FaultAccess::Lock,
                     false,
                     filled_pages,
@@ -12712,7 +12693,7 @@ pub(crate) unsafe fn service_sec_image(
                 // its recv, so the reply (client_reply_on(REPLY_MAIN)) resumes exactly this caller
                 // — csrss and winlogon never orphan each other. Scalar + handle args ride the registers
                 // exactly as the native x64 syscall passed them (arg1=R10, arg2=RDX, arg3=R8, arg4=R9);
-                // pointer/buffer args are marshaled per SSN as needed. Per-process stack/heap/image
+                // pointer/buffer args are marshaled per SSN as needed. Per-process stack/heap
                 // mirrors are already selected by `pi` above (smss_stack_read reaches winlogon's stack).
                 let a0 = get_recv_mr(9); // R10 = arg1
                 let a1 = m3; // RDX = arg2
@@ -18943,7 +18924,6 @@ pub(crate) unsafe fn service_sec_image(
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
             let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
             let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
             let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
@@ -18955,7 +18935,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
@@ -19353,7 +19332,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
@@ -19393,7 +19371,6 @@ pub(crate) unsafe fn service_sec_image(
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
             let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
             let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
             let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
@@ -19403,7 +19380,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
@@ -19795,7 +19771,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
@@ -19843,7 +19818,6 @@ pub(crate) unsafe fn service_sec_image(
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
             let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
             let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
             let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
@@ -19853,7 +19827,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
@@ -20245,7 +20218,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
@@ -20303,7 +20275,6 @@ pub(crate) unsafe fn service_sec_image(
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
             let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
             let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
             let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
@@ -20313,7 +20284,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
@@ -21425,7 +21395,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
@@ -21485,7 +21454,6 @@ pub(crate) unsafe fn service_sec_image(
             let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
             let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
             let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-            let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
             let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
             let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
             let saved_pi = nt_handler.pi;
@@ -21495,7 +21463,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(STACK_FRAMES * 0x1000, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(SMSS_STACK_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(SMSS_HEAP_MIRROR_VA, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(IMAGE_MIRROR_VA, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(0, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(SMSS_SCRATCH_BASE, Ordering::Relaxed);
             nt_handler.pi = 0;
@@ -21584,7 +21551,7 @@ pub(crate) unsafe fn service_sec_image(
                 peb_mapped && page_map_r(peb_alias, peb_win, RW_NX, CAP_INIT_THREAD_VSPACE) == 0;
             let peb_registered = peb_win_ok
                 && brk_test_claim.is_some()
-                && csrss_frame_put_at(test_pi as u64, SMSS_PEB_VA, peb_frame, peb_win);
+                && csrss_frame_put_at_cap(test_pi as u64, SMSS_PEB_VA, peb_frame, peb_win, peb_alias);
             // The marker page (target-only) + the executive's window on the same frame.
             let mark_frame = make!(OBJ_X86_4K_PAGE, PAGING_BITS);
             let mark_mapped = page_map_r(
@@ -22141,7 +22108,6 @@ pub(crate) unsafe fn service_sec_image(
             ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
@@ -22845,7 +22811,7 @@ unsafe fn dump_hosted_thread_quiesce(
     }
     print_str(b"\n");
 
-    let (stack_base, stack_size, stack_mirror, _, _, _) = mirror_ctx_for(badge, pi);
+    let (stack_base, stack_size, stack_mirror, _, _) = mirror_ctx_for(badge, pi);
     let mirror_stack_end = stack_base.checked_add(stack_size);
     let hosted_stack_range = nt_handler.hosted_thread_user_stack_for_badge(badge, pi);
     let rsp_has_qword =
@@ -23444,10 +23410,10 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
 }
 
 /// The active memory context for the thread identified by `badge`: stack base/size/mirror, process
-/// heap/image mirrors, and its demand scratch window. This is the same selection the main service
+/// heap mirror, and its demand scratch window. This is the same selection the main service
 /// loop makes. Parked-I/O delivery temporarily switches to the parked thread's context.
 #[inline]
-fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
+fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
     let (stack_base, stack_frames, stack_mirror) =
         if let Some((tp_pi, tp_slot)) = tp_worker_identity_from_badge(badge) {
             debug_assert_eq!(tp_pi, pi);
@@ -23504,14 +23470,12 @@ fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64, u64) {
             }
         };
     let heap_mirror = hosted_heap_mirror_for_pi(pi);
-    let image_mirror = hosted_active_image_mirror_for_pi(pi);
     let scratch_base = hosted_scratch_base_for_pi(pi);
     (
         stack_base,
         stack_frames * 0x1000,
         stack_mirror,
         heap_mirror,
-        image_mirror,
         scratch_base,
     )
 }
@@ -23521,7 +23485,6 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
@@ -23554,12 +23517,11 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         let status = if pi >= MAX_PI {
             nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
         } else {
-            let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+            let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
             W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -23610,7 +23572,6 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
@@ -23636,7 +23597,6 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
@@ -23695,12 +23655,11 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         let status = if pi >= MAX_PI {
             nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
         } else {
-            let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+            let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
             ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
             ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
             W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -23777,7 +23736,6 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
@@ -23809,7 +23767,6 @@ unsafe fn lpc_connect_wait_complete(
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
@@ -23834,12 +23791,11 @@ unsafe fn lpc_connect_wait_complete(
     let status = if pi >= MAX_PI {
         nt_status::NtStatus::UNSUCCESSFUL.raw() as u32
     } else {
-        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
+        let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(continuation.badge, pi);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
         ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -23860,7 +23816,6 @@ unsafe fn lpc_connect_wait_complete(
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
@@ -24156,7 +24111,6 @@ unsafe fn gui_message_wait_redrive_event(
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
@@ -24203,12 +24157,11 @@ unsafe fn gui_message_wait_redrive_event(
             continue;
         }
         GUI_MESSAGE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);
-        let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(waiter.badge, pi);
+        let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(waiter.badge, pi);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
         ACTIVE_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         W32_CLIENT_PI.store(waiter.pi as u64, Ordering::Relaxed);
@@ -24392,7 +24345,6 @@ unsafe fn gui_message_wait_redrive_event(
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
@@ -24493,19 +24445,17 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
     let saved_ctx = nt_handler.loop_ctx.take();
 
-    let (stack_base, stack_size, stack_mirror, heap_mirror, image_mirror, scratch_base) =
+    let (stack_base, stack_size, stack_mirror, heap_mirror, scratch_base) =
         mirror_ctx_for(waiter.badge, waiter.process_index as usize);
     ACTIVE_STACK_BASE.store(stack_base, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(waiter.process_index as u64, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
     nt_handler.pi = waiter.process_index as usize;
@@ -24536,7 +24486,6 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;
@@ -24575,7 +24524,6 @@ unsafe fn stage_parked_thread_user_apc(
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_w32_client_pi = W32_CLIENT_PI.load(Ordering::Relaxed);
@@ -24587,12 +24535,11 @@ unsafe fn stage_parked_thread_user_apc(
     let saved_flags = nt_handler.current_flags;
     let saved_ctx = nt_handler.loop_ctx.take();
 
-    let (sb, ss, smv, hmv, imv, scratch_base) = mirror_ctx_for(badge, pi);
+    let (sb, ss, smv, hmv, scratch_base) = mirror_ctx_for(badge, pi);
     ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
     ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(pi as u64, Ordering::Relaxed);
@@ -24609,7 +24556,6 @@ unsafe fn stage_parked_thread_user_apc(
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     W32_CLIENT_PI.store(saved_w32_client_pi, Ordering::Relaxed);
@@ -25582,7 +25528,6 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
@@ -25598,7 +25543,6 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
             ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
             ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-            ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
             ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
             ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
             nt_handler.pi = saved_pi;
@@ -25680,13 +25624,12 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             nt_handler.pipe_endpoint_progress = true;
         }
 
-        let (sb, ss, smv, hmv, imv, scratch_base) =
+        let (sb, ss, smv, hmv, scratch_base) =
             mirror_ctx_for(pending.badge, pending.pi as usize);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
         ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = pending.pi as usize;
@@ -26476,7 +26419,6 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
     let saved_stack_mirror = ACTIVE_STACK_MIRROR.load(Ordering::Relaxed);
     let saved_heap_mirror = ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed);
-    let saved_image_mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
     let saved_client_pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
     let saved_scratch_base = ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed);
     let saved_pi = nt_handler.pi;
@@ -26491,13 +26433,12 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
             continue;
         }
 
-        let (sb, ss, smv, hmv, imv, scratch_base) =
+        let (sb, ss, smv, hmv, scratch_base) =
             mirror_ctx_for(pending.badge, pending.pi as usize);
         ACTIVE_STACK_BASE.store(sb, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(ss, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(smv, Ordering::Relaxed);
         ACTIVE_HEAP_MIRROR.store(hmv, Ordering::Relaxed);
-        ACTIVE_IMAGE_MIRROR.store(imv, Ordering::Relaxed);
         ACTIVE_CLIENT_PI.store(pending.pi as u64, Ordering::Relaxed);
         ACTIVE_SCRATCH_BASE.store(scratch_base, Ordering::Relaxed);
         nt_handler.pi = pending.pi as usize;
@@ -26546,7 +26487,6 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
     ACTIVE_STACK_SIZE.store(saved_stack_size, Ordering::Relaxed);
     ACTIVE_STACK_MIRROR.store(saved_stack_mirror, Ordering::Relaxed);
     ACTIVE_HEAP_MIRROR.store(saved_heap_mirror, Ordering::Relaxed);
-    ACTIVE_IMAGE_MIRROR.store(saved_image_mirror, Ordering::Relaxed);
     ACTIVE_CLIENT_PI.store(saved_client_pi, Ordering::Relaxed);
     ACTIVE_SCRATCH_BASE.store(saved_scratch_base, Ordering::Relaxed);
     nt_handler.pi = saved_pi;

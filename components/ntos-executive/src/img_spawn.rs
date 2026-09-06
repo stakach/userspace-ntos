@@ -828,7 +828,6 @@ pub(crate) unsafe fn spawn_sec_image(
     scr_base: u64,
     stack_mirror: u64,
     heap_mirror: u64,
-    image_mirror: u64,
     client_process_id: u64,
     client_thread_id: u64,
     image_path: &[u8],
@@ -934,10 +933,6 @@ pub(crate) unsafe fn spawn_sec_image(
         assert!(ensure_executive_paging(stack_mirror));
         assert!(ensure_executive_paging(scr_base));
         assert!(ensure_executive_paging(heap_mirror));
-        // A dedicated PT for the IMAGE copyin mirror, when the process needs its own.
-        if image_mirror != 0 {
-            assert!(ensure_executive_paging(image_mirror));
-        }
     }
     trace_spawn_phase(pi, b"exec-mirrors");
     for i in 0..STACK_FRAMES {
@@ -1697,17 +1692,12 @@ pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
         Some(ACTIVE_STACK_MIRROR.load(Ordering::Relaxed) + (va - stack_base))
     } else if va >= SMSS_ALLOC_VA && end <= SMSS_ALLOC_VA + SMSS_HEAP_MIRROR_WINDOW {
         Some(ACTIVE_HEAP_MIRROR.load(Ordering::Relaxed) + (va - SMSS_ALLOC_VA))
-    } else if va >= PE_LOAD_BASE && end <= PE_LOAD_BASE + IMAGE_MIRROR_WINDOW {
-        // Image .rdata/.idata/.data — only valid once the page has been demand-faulted (the process
-        // reads a static string, faulting+mirroring its page, before passing it to a syscall). Uses
-        // the ACTIVE process's image mirror so csrss's import-descriptor names read from ITS image.
-        Some(ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed) + (va - PE_LOAD_BASE))
     } else {
         None
     }
 }
 /// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
-/// Returns false if the range isn't mirror-backed.
+/// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
     match smss_mirror(va, dst.len() as u64) {
         Some(m) => {
@@ -1723,7 +1713,7 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
     }
 }
 /// Copy `src.len()` bytes OUT to a SEC_IMAGE process VA (the executive's copyout).
-/// Returns false if the range isn't mirror-backed.
+/// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
     match smss_mirror(va, src.len() as u64) {
         Some(m) => {
@@ -1752,7 +1742,11 @@ unsafe fn with_recorded_frame_alias(
         return true;
     }
 
-    let clone_source = csrss_frame_clone_source_cap_get(pi, page);
+    let clone_source = match csrss_frame_get_exact_record(pi, page) {
+        Some(record) => record.clone_source_cap().unwrap_or(0),
+        None if !writable && shared_image_mapping_contains(pi, page) => dll_cache_get(page),
+        None => 0,
+    };
     if clone_source == 0 || scratch_base == 0 {
         return false;
     }
@@ -1824,10 +1818,8 @@ unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64
     }
     true
 }
-/// The executive's writable scratch mirror of an already demand-paged csrss page (any region:
-/// image, ntdll, csrsrv .data, …), so a syscall handler can copy OUT an out-param that doesn't live
-/// in the stack/heap/image mirrors. Returns the executive VA aliasing `va`, or None if `va`'s page
-/// hasn't been faulted in (so isn't in `filled_pages`).
+/// Historical demand-fill scratch lookup for callers that have already validated backing.
+/// Image copies must use the current frame record, not this fill-order bookkeeping.
 pub(crate) unsafe fn scratch_for(
     va: u64,
     filled_pages: &[u64],
@@ -1848,10 +1840,9 @@ unsafe fn unregistered_image_mapping(pi: u64, page: u64) -> bool {
         .is_some_and(|info| info.type_ == nt_address_space::MEM_IMAGE)
 }
 
-/// Copy bytes from any already-mapped SEC_IMAGE client page. Prefer the process's persistent
-/// stack/heap/main-image mirrors; fall back page-by-page to the demand-fill scratch aliases, the
-/// client-frame table, and explicit copy-in prefetches. The walk is read-only, bounded by `dst`,
-/// handles cross-page ranges, and never faults in a new page.
+/// Copy resident client bytes, selecting exact private or shared process mappings first.
+/// Missing committed image mappings and reclaiming records are rejected. Nonimage bootstrap
+/// mirrors and copy-in prefetches remain supported. This never faults in a new page.
 #[inline(always)]
 pub(crate) unsafe fn client_copyin_mapped(
     pi: u64,
@@ -1865,7 +1856,7 @@ pub(crate) unsafe fn client_copyin_mapped(
 }
 
 /// Explicit-process variant used by `NtRead/WriteVirtualMemory`. `allow_active_mirrors` must be
-/// false for a remote process because hosted processes reuse identical stack/heap/image VAs.
+/// false for a remote process because hosted processes reuse identical stack/heap VAs.
 #[inline(always)]
 pub(crate) unsafe fn client_copyin_process_mapped(
     pi: u64,
@@ -1887,6 +1878,20 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         let current = va + copied as u64;
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
+        // An exact record is authoritative, including a record undergoing reclamation.
+        // Never substitute shared-cache or historical scratch backing for that record.
+        if csrss_frame_get_exact_record(pi, current & !0xfff).is_some()
+            || shared_image_mapping_contains(pi, current & !0xfff)
+        {
+            if !recorded_frame_copyin(pi, current, &mut dst[copied..copied + chunk], scratch_base) {
+                return false;
+            }
+            copied += chunk;
+            continue;
+        }
+        if unregistered_image_mapping(pi, current & !0xfff) {
+            return false;
+        }
         let mut temporary_cap = 0;
         let mirrored = if !allow_active_mirrors
             || ACTIVE_CLIENT_PI.load(Ordering::Relaxed) != pi
@@ -1900,34 +1905,12 @@ pub(crate) unsafe fn client_copyin_process_mapped(
             source
         } else {
             let page = current & !0xfff;
-            let persistent_alias = {
-                let alias = csrss_frame_alias_get(pi, page);
-                if alias != 0 {
-                    alias
-                } else {
-                    client_copyin_frame_alias_get(pi, page)
-                }
-            };
+            let persistent_alias = client_copyin_frame_alias_get(pi, page);
             if persistent_alias != 0 {
                 persistent_alias + (current & 0xfff)
             } else {
-                let frame = {
-                    let frame = csrss_frame_clone_source_cap_get(pi, page);
-                    if frame != 0 {
-                        frame
-                    } else {
-                        let frame = csrss_frame_get(pi, page);
-                        if frame != 0 {
-                            frame
-                        } else {
-                            client_copyin_frame_get(pi, page)
-                        }
-                    }
-                };
+                let frame = client_copyin_frame_get(pi, page);
                 if frame == 0 {
-                    if unregistered_image_mapping(pi, page) {
-                        return false;
-                    }
                     if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base)
                     {
                         source
@@ -2035,43 +2018,20 @@ pub(crate) unsafe fn client_copyout_mapped(
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(src.len() - copied);
         let page = current & !0xfff;
-        let mut temporary_cap = 0;
-        let persistent_alias = csrss_frame_alias_get(pi, page);
-        let destination = if persistent_alias != 0 {
-            persistent_alias + (current & 0xfff)
-        } else {
-            let frame = csrss_frame_clone_source_cap_get(pi, page);
-            if frame != 0 {
-                let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
-                let cap = client_copy_temp_cap();
-                let _ = cnode_delete_r(cap);
-                let copy_error = copy_cap_into_r(frame, cap);
-                temporary_cap = cap;
-                let map_error = if copy_error == 0 {
-                    page_map_r(cap, alias, RW_NX, CAP_INIT_THREAD_VSPACE)
-                } else {
-                    copy_error
-                };
-                if map_error != 0 {
-                    if temporary_cap != 0 {
-                        let _ = cnode_delete_r(temporary_cap);
-                    }
-                    return false;
-                }
-                alias + (current & 0xfff)
-            } else if let Some(destination) = (!unregistered_image_mapping(pi, page))
-                .then(|| scratch_for(current, filled_pages, nfilled, scratch_base))
-                .flatten()
-            {
-                destination
-            } else {
+        if csrss_frame_get_exact_record(pi, page).is_some() {
+            if !recorded_frame_copyout(pi, current, &src[copied..copied + chunk], scratch_base) {
                 return false;
             }
+            copied += chunk;
+            continue;
+        }
+        if unregistered_image_mapping(pi, page) {
+            return false;
+        }
+        let Some(destination) = scratch_for(current, filled_pages, nfilled, scratch_base) else {
+            return false;
         };
         core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination as *mut u8, chunk);
-        if temporary_cap != 0 {
-            let _ = cnode_delete_r(temporary_cap);
-        }
         copied += chunk;
     }
     true

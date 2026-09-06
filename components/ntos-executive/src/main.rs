@@ -248,48 +248,35 @@ pub const SMSS_HEAP_MIRROR_WINDOW: u64 = 0x0020_0000; // 2 MiB (one PT) of early
 /// the executive must read from CSRSS's heap, not smss's. 2 MiB at 0x200_0000 (past the fill-scratch
 /// region 0x100-0x200, its own PT). ACTIVE_HEAP_MIRROR selects by the current badge.
 pub const CSRSS_HEAP_MIRROR_VA: u64 = 0x0000_0100_1200_0000;
-/// The executive's mirror of smss's demand-filled IMAGE pages, so smss_copyin can read static
-/// pointer args (registry value/subkey names in .rdata, etc.) from the process image. Sits just
-/// below the heap mirror and SHARES its 0x80-0xA0 page table (no extra PT).
-pub const IMAGE_MIRROR_VA: u64 = 0x0000_0100_1080_0000;
-pub const IMAGE_MIRROR_WINDOW: u64 = 0x0010_0000; // 1 MiB (smss image is ~110 KiB)
-/// csrss's own image mirror — its loader reads import-descriptor DLL names ("csrsrv.dll") from its
-/// image .idata, which the executive must read from CSRSS's image, not smss's. 1 MiB at 0xB0_0000
-/// inside the shared-input page table. ACTIVE_IMAGE_MIRROR selects by the current badge.
-pub const CSRSS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_10B0_0000;
 /// winlogon's per-process executive mirrors (3rd hosted process). Stack mirror sits beside the
-/// smss/csrss/SM mirrors in the FILEBUF PT (0x1068/0x1069/0x106A used → 0x106B free). Heap + image
+/// smss/csrss/SM mirrors in the FILEBUF PT (0x1068/0x1069/0x106A used → 0x106B free). Heap
 /// mirrors get their OWN page tables (created in spawn_sec_image, past CSRSS_HEAP_MIRROR 0x1200) so
 /// they can't collide with smss's/csrss's mirrors. ACTIVE_*_MIRROR selects them for pi==2.
 pub const WINLOGON_STACK_MIRROR_VA: u64 = 0x0000_0100_106B_0000; // FILEBUF PT, present
 /// Persistent executive alias of winlogon's main-thread TEB frame.
 pub const WINLOGON_MAIN_TEB_MIRROR_VA: u64 = 0x0000_0100_107C_0000;
 pub const WINLOGON_HEAP_MIRROR_VA: u64 = 0x0000_0100_1220_0000; // own PT (spawn_sec_image creates it)
-pub const WINLOGON_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1240_0000; // own PT (spawn_sec_image creates it)
 /// The 4th hosted process — services.exe (badge 6, pi 3), spawned by winlogon's Win32 CreateProcessW
 /// (StartServicesManager). Same env VAs (SMSS_*) in its own VSpace; only the EXECUTIVE-side mirrors +
 /// the demand-fill scratch must be distinct from smss/csrss/winlogon. STACK mirror is in the FILEBUF
-/// PT (present); HEAP/IMAGE mirrors get their own PTs in spawn_sec_image (past winlogon's 0x1240).
+/// PT (present); HEAP mirrors get their own PTs in spawn_sec_image.
 /// SCRATCH_BASE is PT2 of smss's pre-mapped 8-PT scratch range (0x1100..0x1200; PT0 smss / PT4 csrss /
 /// PT6 winlogon → PT2 free). Env-build scratch sits between smss's 0x1074 and csrss's 0x1078.
 pub const SERVICES_STACK_MIRROR_VA: u64 = 0x0000_0100_106D_0000; // FILEBUF PT, present
 pub const SERVICES_HEAP_MIRROR_VA: u64 = 0x0000_0100_1260_0000; // own PT (spawn_sec_image creates it)
-pub const SERVICES_IMAGE_MIRROR_VA: u64 = 0x0000_0100_1280_0000; // own PT (spawn_sec_image creates it)
 pub const SERVICES_ENV_SCRATCH_VA: u64 = 0x0000_0100_1076_0000; // FILEBUF PT (between smss/csrss env)
 /// The 5th hosted process — lsass.exe (badge 8, pi 4), spawned by winlogon's StartLsass Win32
 /// CreateProcessW(L"lsass.exe") (the LSA subsystem). Same env VAs (SMSS_*) in its OWN VSpace; only
 /// the EXECUTIVE-side mirrors + demand-fill scratch must be distinct. STACK mirror FILEBUF PT;
-/// HEAP/IMAGE get their own PTs (past services' 0x1280); env scratch 0x1077 (past services' 0x1076).
+/// HEAP gets its own PT; env scratch 0x1077 (past services' 0x1076).
 pub const LSASS_STACK_MIRROR_VA: u64 = 0x0000_0100_106E_0000; // FILEBUF PT, present
 pub const LSASS_HEAP_MIRROR_VA: u64 = 0x0000_0100_12A0_0000; // own PT (spawn_sec_image creates it)
-pub const LSASS_IMAGE_MIRROR_VA: u64 = 0x0000_0100_12C0_0000; // own PT (spawn_sec_image creates it)
 pub const LSASS_ENV_SCRATCH_VA: u64 = 0x0000_0100_1077_0000; // FILEBUF PT (past services' 0x1076)
 /// The 6th hosted process — userinit.exe, launched by winlogon's CreateProcessAsUserW after an
 /// interactive logon. Its executive mirrors occupy the free band immediately below FILE POOL.
 pub const USERINIT_STACK_MIRROR_VA: u64 = 0x0000_0100_1480_0000;
 pub const USERINIT_ENV_SCRATCH_VA: u64 = 0x0000_0100_1490_0000;
 pub const USERINIT_HEAP_MIRROR_VA: u64 = 0x0000_0100_14A0_0000;
-pub const USERINIT_IMAGE_MIRROR_VA: u64 = 0x0000_0100_14C0_0000;
 /// The 7th hosted process — explorer.exe, launched by userinit's StartShell. Its image is at
 /// `\SystemRoot\explorer.exe` (root of the ReactOS tree, not System32). Its scratch window is the
 /// next 64 MiB demand-fill lane after userinit; mirrors start immediately after it.
@@ -297,20 +284,17 @@ pub const EXPLORER_SCRATCH_BASE: u64 = SMSS_SCRATCH_BASE + 6 * DEMAND_SCRATCH_WI
 pub const EXPLORER_STACK_MIRROR_VA: u64 = EXPLORER_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW;
 pub const EXPLORER_ENV_SCRATCH_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x10_0000;
 pub const EXPLORER_HEAP_MIRROR_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x20_0000;
-pub const EXPLORER_IMAGE_MIRROR_VA: u64 = EXPLORER_STACK_MIRROR_VA + 0x40_0000;
 const _: () = {
     assert!(USERINIT_STACK_MIRROR_VA & 0x1f_ffff == 0);
     assert!(USERINIT_ENV_SCRATCH_VA >= USERINIT_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
     assert!(USERINIT_ENV_SCRATCH_VA + 0x9000 <= USERINIT_HEAP_MIRROR_VA);
-    assert!(USERINIT_HEAP_MIRROR_VA + 0x20_0000 <= USERINIT_IMAGE_MIRROR_VA);
-    assert!(USERINIT_IMAGE_MIRROR_VA + 0x10_0000 <= fs_loader::POOL_VADDR);
+    assert!(USERINIT_HEAP_MIRROR_VA + 0x20_0000 <= fs_loader::POOL_VADDR);
     assert!(EXPLORER_SCRATCH_BASE == USERINIT_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW);
     assert!(EXPLORER_SCRATCH_BASE + DEMAND_SCRATCH_WINDOW <= EXPLORER_STACK_MIRROR_VA);
     assert!(EXPLORER_STACK_MIRROR_VA & 0x1f_ffff == 0);
     assert!(EXPLORER_ENV_SCRATCH_VA >= EXPLORER_STACK_MIRROR_VA + STACK_FRAMES * 0x1000);
     assert!(EXPLORER_ENV_SCRATCH_VA + 0x9000 <= EXPLORER_HEAP_MIRROR_VA);
-    assert!(EXPLORER_HEAP_MIRROR_VA + 0x20_0000 <= EXPLORER_IMAGE_MIRROR_VA);
-    assert!(EXPLORER_IMAGE_MIRROR_VA + 0x20_0000 <= PRIVATE_VM_LIMIT);
+    assert!(EXPLORER_HEAP_MIRROR_VA + 0x20_0000 <= PRIVATE_VM_LIMIT);
 };
 // Common bootstrap layout for the first ordinary hosted worker in a process. Each process has its
 // own VSpace, so CSR, SCM, LSA, and generic workers may reuse these numeric addresses safely.
@@ -2211,9 +2195,6 @@ static ACTIVE_STACK_SIZE: AtomicU64 = AtomicU64::new(STACK_FRAMES * 0x1000);
 /// Process identity and scratch window used when a user range falls outside the fixed mirrors.
 static ACTIVE_CLIENT_PI: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SCRATCH_BASE: AtomicU64 = AtomicU64::new(SMSS_SCRATCH_BASE);
-/// Executive image-mirror base for the process currently being serviced (smss vs csrss), so the
-/// shared copyin path reads import-descriptor DLL names etc. from the RIGHT process's image.
-static ACTIVE_IMAGE_MIRROR: AtomicU64 = AtomicU64::new(IMAGE_MIRROR_VA);
 /// Executive heap-mirror base for the process currently being serviced, so the copyin path reads
 /// heap-resident syscall args (the loader's built-up DLL search paths) from the RIGHT process's heap.
 static ACTIVE_HEAP_MIRROR: AtomicU64 = AtomicU64::new(SMSS_HEAP_MIRROR_VA);
@@ -8750,9 +8731,6 @@ pub(crate) unsafe fn csrss_frame_put_with_source(
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
-pub(crate) unsafe fn csrss_frame_put_at(pi: u64, page: u64, fr: u64, alias: u64) -> bool {
-    csrss_frame_put_at_cap_source(pi, page, fr, alias, 0, 0)
-}
 unsafe fn csrss_frame_put_at_cap(pi: u64, page: u64, fr: u64, alias: u64, alias_cap: u64) -> bool {
     csrss_frame_put_at_cap_source(pi, page, fr, alias, alias_cap, 0)
 }
@@ -8977,23 +8955,12 @@ unsafe fn csrss_frame_next_page_after(pi: u64, page: u64) -> Option<u64> {
 }
 unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
     csrss_frame_get_exact_record(pi, page)
-        .map(|record| record.alias)
-        .unwrap_or(0)
-}
-pub(crate) unsafe fn csrss_frame_source_cap_get(pi: u64, page: u64) -> u64 {
-    csrss_frame_get_exact_record(pi, page)
-        .map(|record| record.source_cap)
+        .and_then(ClientFrameRecord::mapped_alias)
         .unwrap_or(0)
 }
 pub(crate) unsafe fn csrss_frame_clone_source_cap_get(pi: u64, page: u64) -> u64 {
     csrss_frame_get_exact_record(pi, page)
-        .map(|record| {
-            if record.source_cap != 0 {
-                record.source_cap
-            } else {
-                record.frame
-            }
-        })
+        .and_then(ClientFrameRecord::clone_source_cap)
         .unwrap_or(0)
 }
 unsafe fn copy_registered_frame_cap(source: u64) -> (u64, u64) {
@@ -9136,26 +9103,17 @@ unsafe fn csrss_frame_probe_primary_after_source_failure(
 /// scratch aliases are intentionally not consulted here, because a missing/invalid source is a real
 /// frame-registration bug that should stay visible.
 pub(crate) unsafe fn csrss_frame_copy_exact_for_win32k(pi: u64, page: u64) -> (u64, u64, u64) {
-    let (frame, _) = csrss_frame_get_exact(pi, page);
-    if frame == 0 {
+    let Some(record) = csrss_frame_get_exact_record(pi, page) else {
         return (0, 0, 3);
+    };
+    let Some(source_cap) = record.clone_source_cap() else {
+        return (0, 0, 3);
+    };
+    let (copied, error) = copy_registered_frame_cap(source_cap);
+    if error != 0 && record.source_cap != 0 {
+        csrss_frame_probe_primary_after_source_failure(pi, page, record.frame, source_cap, error);
     }
-    let source_cap = csrss_frame_source_cap_get(pi, page);
-    if source_cap != 0 {
-        let (source_copy, source_error) = copy_registered_frame_cap(source_cap);
-        if source_error != 0 {
-            csrss_frame_probe_primary_after_source_failure(
-                pi,
-                page,
-                frame,
-                source_cap,
-                source_error,
-            );
-        }
-        return (source_copy, source_cap, source_error);
-    }
-    let (copied, error) = copy_registered_frame_cap(frame);
-    (copied, frame, error)
+    (copied, source_cap, error)
 }
 unsafe fn client_range_has_backing(pi: u64, va: u64, len: usize) -> bool {
     if len == 0 {
@@ -11884,17 +11842,11 @@ unsafe fn teb_tail_shadow_prepare_insert(pi: u64, page: u64) -> Option<usize> {
 /// if the client frame is unknown or the executive is out of shadow slots (the caller then leaves
 /// the read-only mapping in place, which is a wall, never a silent scribble).
 pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
-    let (real_frame, _) = csrss_frame_get_exact(pi, page);
-    if real_frame == 0 {
+    let Some(record) = csrss_frame_get_exact_record(pi, page) else {
         return 0;
-    }
-    let real_source = {
-        let source_cap = csrss_frame_source_cap_get(pi, page);
-        if source_cap != 0 {
-            source_cap
-        } else {
-            real_frame
-        }
+    };
+    let Some(real_source) = record.clone_source_cap() else {
+        return 0;
     };
     let mut slot = teb_tail_shadow_index(pi, page).unwrap_or(usize::MAX);
     if slot == usize::MAX {
@@ -30871,7 +30823,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     CAP_INIT_THREAD_VSPACE,
                 );
             }
-            // NLS, hive, and the csrss image mirror retain their original shared-input region.
+            // NLS and hive retain their original shared-input region.
             let shared_input_pt = alloc_slot();
             let _ = untyped_retype(
                 CAP_INIT_UNTYPED,

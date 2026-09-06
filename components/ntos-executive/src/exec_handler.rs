@@ -2887,7 +2887,7 @@ unsafe fn retire_unspawned_dynamic_hosted_identity(
 
 /// `NtCreateToken`'s bounded reader over the CALLING process' address space — the executive's
 /// cross-address-space copy-in behind the pure `nt_security::ClientMemory` capture contract.
-/// `xas_read` resolves the stack/heap/image mirrors, the persistent frame aliases, and finally the
+/// `xas_read` resolves the stack/heap mirrors, the persistent frame aliases, and finally the
 /// backing PE, and returns `false` for anything it cannot reach — which the capture turns into
 /// `STATUS_ACCESS_VIOLATION` rather than reading garbage.
 struct ExecClientMemory<'a> {
@@ -19028,7 +19028,6 @@ impl ExecNtHandler {
                     pe,
                     target.pml4,
                     target.scratch_base,
-                    hosted_active_image_mirror_for_pi(target_pi),
                     plan.access,
                     false,
                     filled_pages,
@@ -23723,7 +23722,7 @@ impl ExecNtHandler {
         }
     }
     /// Read a UNICODE_STRING's UTF-16 buffer from the faulting process for an LPC syscall, handling
-    /// a buffer that lives OUTSIDE the stack/heap/image mirrors — e.g. csrss's `NtConnectPort`
+    /// a buffer that lives OUTSIDE the stack/heap mirrors — e.g. csrss's `NtConnectPort`
     /// PortName `L"\\SmApiPort"` is a static string in csrsrv's `.rdata` (~0x8000_xxxx). The
     /// UNICODE_STRING struct itself is a stack local (mirror-readable); its Buffer is read via the
     /// per-fault scratch alias of the already-demand-faulted `.rdata` page (`scratch_for`). Empty on
@@ -23779,7 +23778,7 @@ impl ExecNtHandler {
         out
     }
     /// Read `dst.len()` bytes from the current process's VA `va`, resolving a page OUTSIDE the
-    /// stack/heap/image mirrors by reading the STATIC content straight from the backing PE image
+    /// stack/heap mirrors by reading the STATIC content straight from the backing PE image
     /// (main image / ntdll / a registered DLL). Hosted GUI/service registry strings are often
     /// `RTL_CONSTANT_STRING` literals in DLL `.rdata` pages the process never dereferences (the
     /// executive is the first reader), so the page is not demand-faulted and not in any mirror or
@@ -23941,7 +23940,7 @@ impl ExecNtHandler {
 
     /// Cross-AS 8-byte out-param write to the current process's VA `va` — handles a target that lives
     /// in a DLL `.data` global (e.g. advapi32's `DefaultHandleTable[]`, where MapDefaultKey stores the
-    /// predefined-root handle) that the stack/heap/image mirror can't reach. Delegates to
+    /// predefined-root handle) that the stack/heap mirror can't reach. Delegates to
     /// [`client_copyout_or_fill_mapped`] (mirror → backed page alias → demand-fill from the DLL PE).
     /// No-op if there is no loop context. Used for hosted-process NtOpenKey handle copyout.
     pub(crate) unsafe fn xas_write_u64(&self, va: u64, val: u64) -> bool {
@@ -36847,7 +36846,7 @@ impl ExecNtHandler {
                     return 0xC000_0005;
                 }
                 // Hosted GUI/service processes commonly pass value names from DLL `.rdata` literals the
-                // stack/heap/image mirror can't reach, so read them from the backing PE (`read_ustr_pe`).
+                // stack/heap mirror can't reach, so read them from the backing PE (`read_ustr_pe`).
                 // read_ustr_pe uses xas_read → resolves any resident/PE page.
                 let key_path = self.registry_target_path(key);
                 let key_is_ifeo = key_path

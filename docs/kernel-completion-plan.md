@@ -62,9 +62,12 @@ below are historical baselines, not acceptance of the current provider cutover.
   fills (tranche 29, host/build validation).
 - [x] Route native user-memory outputs through checked mutable copying and remove the standalone
   section-output image filler (tranche 30, host/build validation).
+- [x] Remove the untracked fixed main-image mirror, its runtime layout and active selectors;
+  reject reclaimed backing and resolve resident image reads through current per-process private
+  or shared mappings (tranche 31, host/build validation).
 - [ ] Migrate remaining legacy XAS copyout callers to checked residency/ownership/commitment
-  publication, then remove their image filler. Remove the untracked fixed main-image mirror and
-  complete genuine shared-writable image/control-area backing.
+  publication, then remove their image filler. Complete genuine shared-writable image/control-area
+  backing. Retire historical read-prefetch/PE retries through checked read residency as well.
   Carry explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
@@ -25350,6 +25353,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Shared-writable control-area backing, nonimage CopyOnWrite VAD policy, stack-guard growth,
     ordinary CPU guard delivery, and live MM/SEH/desktop acceptance remain open behind the unchanged
     33-import win32k barrier.
+
+    B3 recorded image-access tranche 31 (2026-09-06, host/build green):
+    Removed the fixed main-image mirror producer and arithmetic translation, every image-only
+    runtime field/constant, spawn paging setup, active selector, and deferred-context save/restore
+    member. The successful mirror cap had no frame-registry owner and could retain stale backing
+    after COW or eviction. Image accesses now use the current exact frame record; live shared
+    image reads require an explicit per-process shared mapping before consulting shared backing.
+    Shared mappings never authorize a raw write. Stack/heap/environment mirrors, shared-input
+    paging, runtime stride, and all retained offsets are unchanged.
+
+    `ClientFrameRecord` now exposes checked alias and clone-source selection. A persistent alias
+    requires its recorded capability, and frame/alias unmapping or loss of the primary capability
+    makes the record unavailable. Exact records take terminal precedence over historical scratch,
+    prefetch, and shared-cache lookups, including during staged reclamation. Missing committed
+    image mappings are rejected; the ungated DLL-cache lookup is removed from mapped copy-in.
+    Win32k frame attachment and TEB-shadow seeding use the same checked source selection. Removed
+    the unowned-alias registration helper and its now-unused raw source getter; the debug-breakin
+    selftest records its actual alias capability.
+
+    Validation: 130 `nt-address-space`, 107 `nt-hosted-runtime`, and 44 `nt-memory-manager` tests
+    pass (281 total). New coverage checks alias capability ownership, unavailable backing, frame
+    replacement, eviction/restoration, and process isolation; staged-reclaim coverage now asserts
+    that every intermediate state rejects access. Runtime-lane tests cover only the four retained
+    ranges. The executive build passes. Logs: `.tmp/test-image-mirror-removal-20260906.log` and
+    `.tmp/build-image-mirror-removal-20260906.log`. Source audit found no remaining fixed-image
+    mirror identifiers. No QEMU boot was run; the 33-import win32k barrier remains unchanged.
+
+    Review adjustment: fixed-image mirror removal is closed, not all legacy copying. Low-level
+    backed writes still require prior protection/COW admission. Next migrate legacy XAS outputs
+    and deferred completions to the mutable checked boundary, then delete their filler/promotion
+    machinery. Read-prefetch and raw-PE retries remain a separate checked-read migration; do not
+    mistake host registry tests for live page-table/COW/trim acceptance. Genuine shared-writable
+    control-area backing, nonimage CopyOnWrite policy, stack-guard growth, CPU guard delivery, and
+    live MM/SEH/desktop proofs remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

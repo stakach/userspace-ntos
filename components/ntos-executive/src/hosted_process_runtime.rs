@@ -16,8 +16,6 @@ pub(crate) struct HostedProcessRuntime {
     pub(crate) env_scratch_va: u64,
     pub(crate) stack_mirror_va: u64,
     pub(crate) heap_mirror_va: u64,
-    pub(crate) active_image_mirror_va: u64,
-    pub(crate) spawn_image_mirror_va: u64,
     pub(crate) scratch_base: u64,
     pub(crate) spawned: Option<&'static AtomicU64>,
 }
@@ -149,7 +147,6 @@ struct HostedProcessAddressLayout {
     env_scratch_va: u64,
     stack_mirror_va: u64,
     heap_mirror_va: u64,
-    image_mirror_va: u64,
 }
 
 const HOSTED_PROCESS_DEFAULT_PRIORITY: u64 = 100;
@@ -172,12 +169,10 @@ const HOSTED_DYNAMIC_RUNTIME_ARENA: DynamicRuntimeArena = DynamicRuntimeArena {
     stack_offset: DEMAND_SCRATCH_WINDOW,
     env_offset: DEMAND_SCRATCH_WINDOW + 0x10_0000,
     heap_offset: DEMAND_SCRATCH_WINDOW + 0x20_0000,
-    image_offset: DEMAND_SCRATCH_WINDOW + 0x40_0000,
     scratch_len: DEMAND_SCRATCH_WINDOW,
     stack_len: STACK_FRAMES * 0x1000,
     env_len: HOSTED_ENV_SCRATCH_WINDOW,
     heap_len: HOSTED_MIRROR_WINDOW,
-    image_len: HOSTED_MIRROR_WINDOW,
 };
 const _: () = {
     assert!(HOSTED_DYNAMIC_RUNTIME_BASE >= driver_launch::FSD_EXEC_LIMIT);
@@ -258,7 +253,6 @@ fn core_service_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
         env_scratch_va,
         stack_mirror_va,
         heap_mirror_va,
-        image_mirror_va: heap_mirror_va + 0x20_0000,
     })
 }
 
@@ -278,7 +272,6 @@ fn shell_layout(pi: usize) -> Option<HostedProcessAddressLayout> {
         env_scratch_va: stack_mirror_va + 0x10_0000,
         stack_mirror_va,
         heap_mirror_va: stack_mirror_va + 0x20_0000,
-        image_mirror_va: stack_mirror_va + 0x40_0000,
     })
 }
 
@@ -293,7 +286,6 @@ fn address_layout_from_runtime_layout(layout: ProcessRuntimeLayout) -> HostedPro
         env_scratch_va: layout.env_scratch_va,
         stack_mirror_va: layout.stack_mirror_va,
         heap_mirror_va: layout.heap_mirror_va,
-        image_mirror_va: layout.image_mirror_va,
     }
 }
 
@@ -307,7 +299,6 @@ fn address_layout_for_image(
                 env_scratch_va: SMSS_ENV_SCRATCH_VA,
                 stack_mirror_va: SMSS_STACK_MIRROR_VA,
                 heap_mirror_va: SMSS_HEAP_MIRROR_VA,
-                image_mirror_va: IMAGE_MIRROR_VA,
             })
         }
         nt_exe_image::HostedProcessRole::Win32Subsystem if image.pi == 1 => {
@@ -316,7 +307,6 @@ fn address_layout_for_image(
                 env_scratch_va: CSRSS_ENV_SCRATCH_VA,
                 stack_mirror_va: CSRSS_STACK_MIRROR_VA,
                 heap_mirror_va: CSRSS_HEAP_MIRROR_VA,
-                image_mirror_va: CSRSS_IMAGE_MIRROR_VA,
             })
         }
         nt_exe_image::HostedProcessRole::InteractiveLogon
@@ -343,11 +333,6 @@ fn runtime_for_image(
     let layout = address_layout_for_image(image)
         .ok_or(HostedProcessRuntimeRegistrationError::MissingLayout)?;
     let spawned = spawned_signal_for_pi(image.pi);
-    let spawn_image_mirror_va = match image.role {
-        nt_exe_image::HostedProcessRole::NativeSession
-        | nt_exe_image::HostedProcessRole::Win32Subsystem => 0,
-        _ => layout.image_mirror_va,
-    };
     Ok(HostedProcessRuntime {
         pi: image.pi,
         generation: image.generation,
@@ -355,8 +340,6 @@ fn runtime_for_image(
         env_scratch_va: layout.env_scratch_va,
         stack_mirror_va: layout.stack_mirror_va,
         heap_mirror_va: layout.heap_mirror_va,
-        active_image_mirror_va: layout.image_mirror_va,
-        spawn_image_mirror_va,
         scratch_base: layout.scratch_base,
         spawned,
     })
@@ -416,7 +399,6 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         runtime.env_scratch_va,
         runtime.stack_mirror_va,
         runtime.heap_mirror_va,
-        runtime.spawn_image_mirror_va,
         client_process_id,
         client_thread_id,
         image.nt_image_path,
@@ -425,10 +407,6 @@ pub(crate) unsafe fn spawn_hosted_sec_image_for_image(
         start_immediately,
         ldrpinit_rva,
     )
-}
-
-pub(crate) fn hosted_active_image_mirror_for_pi(pi: usize) -> u64 {
-    expect_hosted_process_runtime(pi).active_image_mirror_va
 }
 
 pub(crate) fn hosted_scratch_base_for_pi(pi: usize) -> u64 {

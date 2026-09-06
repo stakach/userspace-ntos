@@ -14,6 +14,25 @@ pub struct ClientFrameRecord {
     pub alias_unmapped: bool,
 }
 
+impl ClientFrameRecord {
+    /// Reclamation is terminal for access, even while some capabilities remain live.
+    pub const fn is_resident(self) -> bool {
+        self.frame != 0 && !self.frame_unmapped && !self.alias_unmapped
+    }
+
+    pub fn mapped_alias(self) -> Option<u64> {
+        (self.is_resident() && self.alias != 0 && self.alias_cap != 0).then_some(self.alias)
+    }
+
+    pub fn clone_source_cap(self) -> Option<u64> {
+        self.is_resident().then_some(if self.source_cap != 0 {
+            self.source_cap
+        } else {
+            self.frame
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientFrameInsert {
     Inserted { grew: bool },
@@ -411,7 +430,86 @@ mod tests {
         let alias_unmapped = registry.mark_alias_unmapped_exact(frame_released).unwrap();
         let alias_released = registry.clear_alias_cap_exact(alias_unmapped).unwrap();
         let source_released = registry.clear_source_cap_exact(alias_released).unwrap();
+        for record in [
+            frame_unmapped,
+            frame_released,
+            alias_unmapped,
+            alias_released,
+            source_released,
+        ] {
+            assert!(!record.is_resident());
+            assert_eq!(record.mapped_alias(), None);
+            assert_eq!(record.clone_source_cap(), None);
+        }
         assert_eq!(registry.take_exact(source_released), Some(source_released));
         assert!(registry.is_process_empty(7));
+    }
+
+    #[test]
+    fn copy_access_requires_owned_alias_and_live_backing() {
+        let mut registry = ClientFrameRegistry::new();
+        registry
+            .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
+            .unwrap();
+        let record = registry.get(7, 0x1000).unwrap();
+        assert_eq!(record.mapped_alias(), Some(0x2000));
+        assert_eq!(record.clone_source_cap(), Some(13));
+        let unowned_alias = ClientFrameRecord {
+            alias_cap: 0,
+            ..record
+        };
+        assert_eq!(unowned_alias.mapped_alias(), None);
+        assert_eq!(unowned_alias.clone_source_cap(), Some(13));
+        assert_eq!(
+            ClientFrameRecord {
+                source_cap: 0,
+                ..unowned_alias
+            }
+            .clone_source_cap(),
+            Some(11)
+        );
+        for unavailable in [
+            ClientFrameRecord { frame: 0, ..record },
+            ClientFrameRecord {
+                alias_unmapped: true,
+                ..record
+            },
+            ClientFrameRecord {
+                frame_unmapped: true,
+                ..record
+            },
+        ] {
+            assert_eq!(unavailable.mapped_alias(), None);
+            assert_eq!(unavailable.clone_source_cap(), None);
+        }
+    }
+
+    #[test]
+    fn copy_access_tracks_replacement_eviction_and_process_identity() {
+        let mut registry = ClientFrameRegistry::new();
+        registry
+            .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
+            .unwrap();
+        registry
+            .insert(8, 0x1000, 21, 0x3000, 22, 23, false)
+            .unwrap();
+        registry.take(7, 0x1000).unwrap();
+        assert!(registry.get(7, 0x1000).is_none());
+        assert_eq!(
+            registry.get(8, 0x1000).unwrap().mapped_alias(),
+            Some(0x3000)
+        );
+        registry
+            .insert(7, 0x1000, 31, 0x4000, 32, 33, true)
+            .unwrap();
+        let replacement = registry.get(7, 0x1000).unwrap();
+        assert_eq!(replacement.mapped_alias(), Some(0x4000));
+        assert_eq!(replacement.clone_source_cap(), Some(33));
+        registry.take_exact(replacement).unwrap();
+        assert!(registry.get(7, 0x1000).is_none());
+        registry.insert(7, 0x1000, 41, 0, 0, 0, true).unwrap();
+        let restored = registry.get(7, 0x1000).unwrap();
+        assert_eq!(restored.mapped_alias(), None);
+        assert_eq!(restored.clone_source_cap(), Some(41));
     }
 }

@@ -673,7 +673,6 @@ pub struct ProcessRuntimeLayout {
     pub env_scratch_va: u64,
     pub stack_mirror_va: u64,
     pub heap_mirror_va: u64,
-    pub image_mirror_va: u64,
 }
 
 impl ProcessRuntimeLayout {
@@ -691,10 +690,6 @@ impl ProcessRuntimeLayout {
 
     pub const fn heap_range(self, heap_len: u64) -> RuntimeRange {
         RuntimeRange::new(self.heap_mirror_va, heap_len)
-    }
-
-    pub const fn image_range(self, image_len: u64) -> RuntimeRange {
-        RuntimeRange::new(self.image_mirror_va, image_len)
     }
 }
 
@@ -1749,12 +1744,10 @@ pub struct DynamicRuntimeArena {
     pub stack_offset: u64,
     pub env_offset: u64,
     pub heap_offset: u64,
-    pub image_offset: u64,
     pub scratch_len: u64,
     pub stack_len: u64,
     pub env_len: u64,
     pub heap_len: u64,
-    pub image_len: u64,
 }
 
 impl DynamicRuntimeArena {
@@ -1774,7 +1767,6 @@ impl DynamicRuntimeArena {
         if self.scratch_offset & (PAGE_TABLE_SPAN - 1) != 0
             || self.stack_offset & (PAGE_TABLE_SPAN - 1) != 0
             || self.heap_offset & (PAGE_TABLE_SPAN - 1) != 0
-            || self.image_offset & (PAGE_TABLE_SPAN - 1) != 0
         {
             return Err(RuntimeLayoutError::InvalidOffset);
         }
@@ -1803,9 +1795,6 @@ impl DynamicRuntimeArena {
         let Some(heap_mirror_va) = lane_base.checked_add(self.heap_offset) else {
             return Err(RuntimeLayoutError::Overflow);
         };
-        let Some(image_mirror_va) = lane_base.checked_add(self.image_offset) else {
-            return Err(RuntimeLayoutError::Overflow);
-        };
         let lane = RuntimeRange::new(lane_base, self.stride);
         let layout = ProcessRuntimeLayout {
             pi,
@@ -1813,13 +1802,11 @@ impl DynamicRuntimeArena {
             env_scratch_va,
             stack_mirror_va,
             heap_mirror_va,
-            image_mirror_va,
         };
         if !lane.contains(layout.scratch_range(self.scratch_len))
             || !lane.contains(layout.stack_range(self.stack_len))
             || !lane.contains(layout.env_range(self.env_len))
             || !lane.contains(layout.heap_range(self.heap_len))
-            || !lane.contains(layout.image_range(self.image_len))
         {
             return Err(RuntimeLayoutError::OutsideArena);
         }
@@ -1833,26 +1820,14 @@ impl DynamicRuntimeArena {
                 .scratch_range(self.scratch_len)
                 .overlaps(layout.heap_range(self.heap_len))
             || layout
-                .scratch_range(self.scratch_len)
-                .overlaps(layout.image_range(self.image_len))
-            || layout
                 .stack_range(self.stack_len)
                 .overlaps(layout.env_range(self.env_len))
             || layout
                 .stack_range(self.stack_len)
                 .overlaps(layout.heap_range(self.heap_len))
             || layout
-                .stack_range(self.stack_len)
-                .overlaps(layout.image_range(self.image_len))
-            || layout
                 .env_range(self.env_len)
                 .overlaps(layout.heap_range(self.heap_len))
-            || layout
-                .env_range(self.env_len)
-                .overlaps(layout.image_range(self.image_len))
-            || layout
-                .heap_range(self.heap_len)
-                .overlaps(layout.image_range(self.image_len))
         {
             return Err(RuntimeLayoutError::Overlap);
         }
@@ -1891,12 +1866,10 @@ mod tests {
         stack_offset: 0x0400_0000,
         env_offset: 0x0410_0000,
         heap_offset: 0x0420_0000,
-        image_offset: 0x0440_0000,
         scratch_len: 0x0400_0000,
         stack_len: 0x4000,
         env_len: 0x9000,
         heap_len: 0x20_0000,
-        image_len: 0x20_0000,
     };
 
     #[test]
@@ -1907,7 +1880,7 @@ mod tests {
         assert_eq!(first.stack_mirror_va, ARENA.base + ARENA.stack_offset);
         assert_eq!(second.scratch_base, ARENA.base + ARENA.stride);
 
-        let mut ranges = [RuntimeRange::new(0, 0); 45];
+        let mut ranges = [RuntimeRange::new(0, 0); 4 * (ARENA.max_pi - ARENA.first_pi)];
         let mut n = 0;
         for pi in ARENA.first_pi..ARENA.max_pi {
             let layout = ARENA.layout_for_pi(pi).unwrap();
@@ -1918,8 +1891,6 @@ mod tests {
             ranges[n] = layout.env_range(ARENA.env_len);
             n += 1;
             ranges[n] = layout.heap_range(ARENA.heap_len);
-            n += 1;
-            ranges[n] = layout.image_range(ARENA.image_len);
             n += 1;
         }
         validate_non_overlapping(&ranges[..n]).unwrap();
