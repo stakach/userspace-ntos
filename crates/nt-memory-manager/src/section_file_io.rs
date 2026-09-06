@@ -11,6 +11,10 @@ const STATUS_USER_MAPPED_FILE: u32 = 0xc000_0243;
 mod read;
 pub use read::SectionFileReadIo;
 
+#[path = "section_file_resize.rs"]
+mod resize;
+pub use resize::SectionFileResizeIo;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionFilePage {
     pub frame: u64,

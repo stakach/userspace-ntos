@@ -91,4 +91,6 @@ pub(super) unsafe fn drain_section_scratch() -> Result<(), u32> {
 
 #[path = "service_section_file_io.rs"]
 mod file_io;
-pub(crate) use file_io::{service_read_file_coherent, service_write_file_coherent};
+pub(crate) use file_io::{
+    service_read_file_coherent, service_resize_file_coherent, service_write_file_coherent,
+};

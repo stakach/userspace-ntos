@@ -10,7 +10,7 @@ mod pages;
 
 #[path = "section_file_io.rs"]
 mod file_io;
-pub use file_io::{SectionFilePage, SectionFileReadIo, SectionFileWriteIo};
+pub use file_io::{SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo};
 
 #[path = "section_retirement.rs"]
 mod retirement;
@@ -400,11 +400,18 @@ impl GenericSectionTable {
         };
         if let Some(area) = existing {
             self.control_areas[area].extent = backing.file_extent;
+            self.control_areas[area].segment_extent =
+                self.control_areas[area].segment_extent.max(size);
         } else {
             let area = ControlArea {
                 id: area_id,
                 file: backing.file,
                 kind: backing.kind,
+                segment_extent: if backing.file.is_some() {
+                    backing.file_extent
+                } else {
+                    size
+                },
                 extent: if backing.file.is_some() {
                     backing.file_extent
                 } else {

@@ -34,6 +34,9 @@ pub(super) struct ControlArea {
     pub file: Option<SectionFileIdentity>,
     pub kind: u8,
     pub extent: u64,
+    /// NT data-segment extent retained while any user section reference survives. File EOF may
+    /// grow independently; closing a larger sibling does not contract this truncation floor.
+    pub segment_extent: u64,
 }
 
 impl ControlArea {
@@ -43,6 +46,7 @@ impl ControlArea {
             file: None,
             kind: GENERIC_SECTION_BACKING_NONE,
             extent: 0,
+            segment_extent: 0,
         }
     }
 }

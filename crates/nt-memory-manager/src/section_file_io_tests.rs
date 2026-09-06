@@ -9,10 +9,14 @@ enum Event {
     Rearm(SectionPageAlias),
     Prepare(u64),
     Backing(u64, usize),
+    Resize(u64),
     Copy(u64, usize, usize),
     Zero(u64, usize, usize),
     Finish,
 }
+
+#[path = "section_file_resize_tests.rs"]
+mod resize;
 
 struct Io {
     file: Vec<u8>,

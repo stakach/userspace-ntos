@@ -2869,13 +2869,13 @@ impl MemFs {
         if allocation_size < requested {
             return STATUS_INVALID_PARAMETER;
         }
-        let Ok(allocation_len) = usize::try_from(allocation_size) else {
+        let Ok(new_eof) = usize::try_from(requested) else {
             return STATUS_INVALID_PARAMETER;
         };
-        if self.size(id) as usize > allocation_len {
+        if self.size(id) as usize > new_eof {
             let node = self.node_mut(id).unwrap();
-            node.data.truncate(allocation_len);
-            node.valid_data_length = node.valid_data_length.min(allocation_size);
+            node.data.truncate(new_eof);
+            node.valid_data_length = node.valid_data_length.min(requested);
         }
         self.node_mut(id).unwrap().allocation_size = allocation_size;
         STATUS_SUCCESS

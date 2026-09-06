@@ -99,6 +99,8 @@ below are historical baselines, not acceptance of the current provider cutover.
   durable cleanup storage and disjoint address reservation (tranche 47, host/build; not activated).
 - [x] Fix native read/write output admission, append-only routing, synchronous completion position,
   and backing-independent read accounting (tranche 48, host/build; native fixes wired).
+- [x] Separate retained segment extent from file EOF, implement transactional canonical EOF resizing,
+  and correct allocation-request truncation (tranche 49, host/build; EOF adapter not activated).
 - [ ] Route native and internal file/size mutations through explicit memory authority before
   activating coherent native reads/writes; verify whole-operation completion/accounting at cutover.
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
@@ -26143,13 +26145,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     researched NT5/ReactOS boundaries and reviewed the changes. No QEMU or desktop acceptance is
     claimed; the unchanged 33-import win32k blocker remains open.
 
-    Review adjustment: native admission and completion prerequisites are wired. Next implement
-    explicit memory-authority participation for destructive create/size changes and
-    CM/hive/provisioning writes, then activate both coherent cache paths together. Preserve retained
-    cleanup and raw page-in/writeback nonreentry. Validate completion/accounting again at cutover,
-    including fully resident reads and late output faults. Direct FAT copyout's partial-failure
-    accounting, noncached alignment contracts, and live refault/persistence remain explicit work;
-    this checkpoint does not claim those broader paths are complete.
+    B3 canonical EOF transaction tranche 49 (2026-09-06, host/build green):
+    Control areas now retain a distinct data-segment extent instead of treating current file EOF as
+    the truncation floor. NT5 creates a new data segment for the full file EOF even when the first
+    user section is smaller (`creasect.c:4195`); subsequent section creation extends it only to the
+    requested resolved section size (`creasect.c:1449`, `extsect.c:544`). The floor is monotonic while
+    user references survive, including handle-only sections; closing a larger sibling does not
+    shrink it. Ordinary file growth can exceed that floor, allowing a later shrink that stays above
+    the retained segment. This implements the data-reference part of `MmCanFileBeTruncated` without
+    a blanket refusal of all size reductions or a check based only on mapped views.
+
+    `resize_file_coherent` exclusively owns the table throughout preflight, the all-or-nothing
+    backing EOF change, and canonical publication. It validates the actual old EOF, collects changed
+    resident boundary pages, reserves epochs, rearms client aliases, and prepares all writable aliases
+    before touching backing bytes. Successful growth zeroes newly valid resident bytes; permitted
+    shrink zeroes the cached terminal-page tail. Both preserve the valid dirty prefix and invalidate
+    older flush tickets. Missing pages are not materialized. Backend failure leaves bytes/EOF
+    unchanged; cleanup failure after success retains the accepted EOF, canonical data, and exact
+    retry-owned mappings. Even a no-op resize retries cleanup. Retiring areas block resize until
+    checked teardown completes, including when a newer section for the same file has been created.
+    Unexpected whole-page residency outside the retained segment requires retirement, not silent
+    frame removal.
+
+    The executive EOF adapter uses the existing prepared-cap owner and real filesystem EOF setter.
+    Its contract explicitly requires the caller's retained FILE_OBJECT and image-section mutation
+    admission. It is compiled but not connected to native mutation routes yet: data-section checks
+    alone cannot replace NT5's `MmFlushImageSection(MmFlushForWrite)` gate. Allocation size and VDL
+    are not aliased to EOF. A separate real filesystem correction now truncates EOF and VDL to the
+    requested allocation byte count while rounding only physical allocation metadata. For example,
+    reducing a 5,000-byte file's allocation request to 4,500 yields EOF 4,500 and allocation 8,192,
+    rather than retaining the discarded 500 bytes. Position is unchanged, snapshots preserve the
+    truncation, and later EOF extension exposes zeros instead of discarded data.
+
+    Validation: 187 `nt-memory-manager`, 169 `nt-address-space`, 143 `nt-fs`, 10 `nt-ahci`,
+    255 `nt-io-manager`, and 33 `nt-io-completion` tests pass (797 total). Sixteen new resize tests
+    cover dirty prefixes, exact zero ranges, sparse residency, handle/sibling segment floors,
+    retirement/recreation, unchanged EOF, identity isolation, epoch overflow, preparation/backend/
+    cleanup failures, and a real MemFs EOF change with unchanged position and unflushed canonical
+    data. The allocation regression tests unaligned, one-byte, and zero-byte truncation plus snapshot
+    restore/regrowth. The executive build passes with 262 warnings and stages rootserver/hive.
+    Logs: `.tmp/test-section-resize-20260906.log` and
+    `.tmp/build-section-resize-20260906.log`. Root alone ran serialized builds/tests; two agents
+    reviewed the NT5 boundaries and mutation/cleanup contracts. No desktop acceptance is claimed.
+
+    Review adjustment: data-section EOF mechanics are implemented, but shared image/data mutation
+    authority still gates activation. Next connect stable file identities to image-section write/
+    truncation admission, route native EOF/allocation and destructive create through that boundary,
+    and integrate CM/hive/provisioning writes before activating both coherent cache paths. Keep
+    allocation/VDL result geometry distinct and preserve raw page-in/writeback nonreentry. Validate
+    whole-operation completion/accounting at cutover, including fully resident reads and late output
+    faults. Direct FAT partial-failure accounting, noncached alignment, live refault/persistence,
+    and the unchanged 33-import win32k blocker remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

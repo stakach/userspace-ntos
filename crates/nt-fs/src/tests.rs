@@ -3451,6 +3451,64 @@ fn writable_volume_hardlinks_share_nodes_and_retain_exact_entries() {
 }
 
 #[test]
+fn allocation_truncates_to_requested_bytes_not_rounded_clusters() {
+    for requested in [4500u64, 4097, 1, 0] {
+        let mut fs = FileSystem::new(MemFs::with_fixture());
+        let file = fs.zw_create_file(
+            r"\??\C:\Temp\allocation",
+            FILE_WRITE_DATA | FILE_READ_DATA,
+            0,
+            0,
+            FILE_CREATE,
+            0,
+        );
+        assert_eq!(
+            fs.zw_write_file(file.handle, None, &[0x5a; 5000]),
+            (STATUS_SUCCESS, 5000)
+        );
+        assert_eq!(
+            fs.zw_set_information_file(
+                file.handle,
+                FILE_ALLOCATION_INFORMATION,
+                &requested.to_le_bytes()
+            ),
+            STATUS_SUCCESS
+        );
+        let metadata = fs.zw_query_metadata(file.handle).unwrap();
+        assert_eq!(metadata.end_of_file, requested);
+        assert_eq!(metadata.valid_data_length, requested);
+        assert_eq!(metadata.allocation_size, requested.div_ceil(4096) * 4096);
+        assert_eq!(fs.current_offset(file.handle), Some(5000));
+        let snapshot = fs.export_volume_snapshot().unwrap();
+        let restored = FileSystem::from_volume_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            restored
+                .file_bytes_owned(r"\??\C:\Temp\allocation")
+                .unwrap(),
+            alloc::vec![0x5a; requested as usize]
+        );
+
+        assert_eq!(
+            fs.zw_set_information_file(
+                file.handle,
+                FILE_END_OF_FILE_INFORMATION,
+                &5000u64.to_le_bytes()
+            ),
+            STATUS_SUCCESS
+        );
+        let data = fs.file_bytes_owned(r"\??\C:\Temp\allocation").unwrap();
+        assert_eq!(
+            &data[..requested as usize],
+            alloc::vec![0x5a; requested as usize]
+        );
+        assert_eq!(
+            &data[requested as usize..],
+            alloc::vec![0; 5000 - requested as usize]
+        );
+    }
+}
+
+#[test]
 fn file_allocation_information_is_distinct_from_end_of_file_and_persists() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_directory(r"\??\C:\allocation"));

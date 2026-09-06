@@ -1,7 +1,9 @@
 //! Prepared canonical page aliases for synchronous coherent file operations.
 use super::*;
 use nt_memory_manager::section_scratch::SectionAliasHandle;
-use nt_memory_manager::{SectionFilePage, SectionFileReadIo, SectionFileWriteIo};
+use nt_memory_manager::{
+    SectionFilePage, SectionFileReadIo, SectionFileResizeIo, SectionFileWriteIo,
+};
 
 struct PreparedFileIo<'a> {
     owner: &'a mut SectionScratch,
@@ -113,6 +115,45 @@ impl SectionFileWriteIo for PreparedFileIo<'_> {
     fn finish(&mut self) -> Result<(), u32> {
         self.finish()
     }
+}
+
+impl SectionFileResizeIo for PreparedFileIo<'_> {
+    fn resize_backing(&mut self, new_eof: u64) -> u32 {
+        unsafe {
+            crate::writable_fs::set_information(
+                self.file,
+                nt_fs::FILE_END_OF_FILE_INFORMATION,
+                &new_eof.to_le_bytes(),
+            )
+        }
+    }
+}
+
+/// Data-section mechanism only. The mutation owner must check image sections before calling and
+/// retain the FILE_OBJECT throughout. Native activation waits for that shared mutation boundary.
+pub(crate) unsafe fn service_resize_file_coherent(
+    table: &mut GenericSectionTable,
+    file: u64,
+    new_eof: u64,
+    context: ExecLoopCtx,
+) -> u32 {
+    let backing = match crate::writable_fs::section_backing(file) {
+        Ok(backing) => backing,
+        Err(status) => return status,
+    };
+    let _borrow = match ScratchBorrow::acquire() {
+        Ok(guard) => guard,
+        Err(status) => return status,
+    };
+    let mut io = PreparedFileIo {
+        owner: &mut *core::ptr::addr_of_mut!(SECTION_SCRATCH),
+        file,
+        scratch_base: context.scratch_base,
+        context: Some(context),
+        access: SectionAliasAccess::ReadWrite,
+        pages: Vec::new(),
+    };
+    table.resize_file_coherent(backing, new_eof, &mut io)
 }
 
 /// The caller retains the FILE_OBJECT, owns user completion, and supplies nonfaultable storage.
