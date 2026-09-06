@@ -112,6 +112,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Share checked private-thread resource geometry with the executive, retain every target range,
   and classify physical backing separately from copied aliases (tranche 53, host/build;
   rollback adapter pending).
+- [x] Prevent live runtime rebinding/demotion, check routing identities before reservation or ordinary
+  registration, and preserve existing main mechanism ownership (tranche 54, host/build;
+  native admission wired).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next wire the registered-resume failure path
   with retained runtime/pool/window ownership, once-only caller cancellation, reconciled physical-frame
@@ -26412,6 +26415,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before dropping exclusions. Keep generic runtime release blocked until exact final cleanup commit.
     Unregistered/early/whole-process spawn rollback and handler-owned pre-park handoffs remain open.
     The win32k import barrier is unchanged at 33 unresolved code imports.
+
+    B3 runtime binding admission tranche 54 (2026-09-07, host/build green):
+    The executive's shared `HostedThreadRuntimeTable::store` path no longer overwrites an existing
+    TID's process, role, badge or TCB while carrying its old mechanism/resource ownership forward.
+    In particular, reservation cannot demote a live TCB to sentinel 1, and a different TCB cannot
+    inherit another live thread's stack, TEB, mechanism or LPC metadata. The allocation-free
+    `nt-user-host::thread_binding` policy scans all live rows before returning insertion, exact replay,
+    or exact reservation promotion. Same-TID process/role/badge changes and cross-row badge,
+    process/role and real-TCB conflicts are refused without mutation. A matching row does not bypass
+    the rest of the scan. Badge zero remains valid, and unrelated reservations may share sentinel 1.
+
+    Native reservation and ordinary/main registration use this policy. Exact replay returns the
+    unchanged runtime; promotion changes only the TCB and rejects reservations that already carry
+    mechanisms, resource geometry or a TEB alias. Remembered stack/LPC metadata survives promotion.
+    Released rows are reusable only after explicit runtime removal. Main registration also rejects
+    sentinel/zero TCBs and checks its mechanism triple before modifying any row: only empty-to-owned
+    or identical replay is accepted, never replacement of already-owned caps. The old same-TID
+    overwrite/copy-forward branch and first-match role collision loop were removed.
+
+    Validation: 13 focused host tests cover insertion/replay/promotion, live demotion and replacement,
+    process/role/badge movement, cross-row conflicts before and after a matching row, duplicated owners,
+    zero badge, shared reservation sentinel, invalid requests, post-removal reuse and mechanism-triple
+    replacement. The serialized nine-crate suite passes 922 tests, including 58 `nt-user-host`
+    unit/integration tests. Logs: `.tmp/test-thread-binding-focused-20260907.log` and
+    `.tmp/test-thread-binding-20260907.log`. The executive build passes at the unchanged 262-warning
+    baseline and stages rootserver/hive; log: `.tmp/build-thread-binding-20260907.log`.
+    Two agents reviewed the policy, native mutation ordering,
+    and existing callsites. Root alone ran builds/tests. No live failure injection or desktop proof
+    is claimed.
+
+    Review adjustment: close binding overwrite prevention, not unpublished-spawn ownership. The
+    one-shot `register_spawn` path remains unchanged: its wrapper destroys the supplied spawn on
+    rejection and commits MM/Ps accounting on success. Do not expand it to idempotent owned-spawn
+    replay (which would double-charge commitment), or add capability-collision rejection that then
+    destroys caps belonging to an existing owner. Identity/badge/role conflicts should be preflighted
+    while reserving, before mechanism construction. Publication-time ownership failures need the
+    retained cleanup owner before further checks can be enabled. Full resource/mechanism-cap
+    disjointness and `resources.client_pi` validation at transfer remain open. The main-registration
+    wrapper also currently ignores a refused registration while callers proceed to process/VSpace
+    publication; give it a retained, explicit failure path rather than discarding the spawn or
+    continuing without a runtime. Pending rollback ownership, execution/control/badge exclusions,
+    exact registry transfer and checked retry cleanup from tranches 52-53 remain the immediate work.
+    The complete win32k import gate remains blocked by 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

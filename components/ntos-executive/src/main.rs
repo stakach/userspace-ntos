@@ -25789,6 +25789,16 @@ impl HostedThreadRuntime {
     const fn is_live(self) -> bool {
         self.tid != 0
     }
+
+    fn binding(&self) -> nt_user_host::thread_binding::ThreadBinding<HostedThreadRole> {
+        nt_user_host::thread_binding::ThreadBinding {
+            pi: self.pi,
+            tid: self.tid,
+            tcb: self.tcb,
+            badge: self.badge,
+            role: self.role,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25854,7 +25864,17 @@ impl HostedThreadRuntimeTable {
         badge: u64,
         mechanism: HostedThreadMechanismCaps,
     ) -> Option<HostedThreadRuntime> {
-        if !mechanism.is_live() {
+        if tcb <= 1 || !mechanism.is_live() {
+            return None;
+        }
+        let previous = self
+            .get_by_tid(tid)
+            .map(|entry| entry.mechanism)
+            .unwrap_or(HostedThreadMechanismCaps::empty());
+        if !nt_user_host::thread_binding::admits_mechanism_publication(
+            [previous.raw_cnode, previous.cnode, previous.sched_context],
+            [mechanism.raw_cnode, mechanism.cnode, mechanism.sched_context],
+        ) {
             return None;
         }
         let runtime = self.store(pi, tid, tcb, badge, HostedThreadRole::Main)?;
@@ -25928,10 +25948,34 @@ impl HostedThreadRuntimeTable {
         badge: u64,
         role: HostedThreadRole,
     ) -> Option<HostedThreadRuntime> {
-        if tid == 0 || tcb == 0 {
-            return None;
+        use nt_user_host::thread_binding::{
+            admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
+        };
+        let admission = admit_thread_binding(
+            ThreadBinding { pi, tid, tcb, badge, role },
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.is_live())
+                .map(|(index, entry)| (index, entry.binding())),
+        )
+        .ok()?;
+        match admission {
+            ThreadBindingAdmission::Replay { index } => return Some(self.entries[index]),
+            ThreadBindingAdmission::Promote { index } => {
+                let existing = &mut self.entries[index];
+                if existing.mechanism.is_live()
+                    || existing.resources.is_live()
+                    || existing.teb_alias != 0
+                {
+                    return None;
+                }
+                existing.tcb = tcb;
+                return Some(*existing);
+            }
+            ThreadBindingAdmission::Insert => {}
         }
-        let mut runtime = HostedThreadRuntime {
+        let runtime = HostedThreadRuntime {
             pi,
             tid,
             tcb,
@@ -25945,24 +25989,6 @@ impl HostedThreadRuntimeTable {
             lpc_server_port: 0,
             lpc_client_process: 0,
         };
-        if let Some(existing) = self.entries.iter_mut().find(|entry| entry.tid == tid) {
-            runtime.mechanism = existing.mechanism;
-            runtime.teb_alias = existing.teb_alias;
-            runtime.resources = existing.resources;
-            runtime.user_stack_allocation_base = existing.user_stack_allocation_base;
-            runtime.user_stack_base = existing.user_stack_base;
-            runtime.lpc_server_port = existing.lpc_server_port;
-            runtime.lpc_client_process = existing.lpc_client_process;
-            *existing = runtime;
-            return Some(runtime);
-        }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.is_live() && entry.pi == pi && entry.role == role)
-        {
-            return None;
-        }
         if let Some(empty) = self.entries.iter_mut().find(|entry| !entry.is_live()) {
             *empty = runtime;
             return Some(runtime);
