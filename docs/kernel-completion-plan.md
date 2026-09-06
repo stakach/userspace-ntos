@@ -91,7 +91,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   scratch reuse, persistence, and frame retirement until cleanup succeeds (tranche 43, host/build).
 - [x] Add the host-tested canonical file-write transaction: prepare all resident mappings before
   backend mutation, merge accepted prefixes, and zero newly valid EOF gaps (tranche 44, host/build).
-- [ ] Implement paired coherent reads and the executive multi-page preparation adapter; route
+- [x] Add paired canonical reads with preflight, EOF-bounded resident/backing runs, and exact
+  short/error-prefix completion (tranche 45, host/build).
+- [x] Separate persistent DLL copy-in aliases from the eight temporary section/COW scratch slots
+  with a checked, host-tested layout (tranche 46, host/build).
+- [ ] Implement the executive multi-page preparation adapter; route
   native and internal file/size mutations through explicit memory authority before activation.
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
   live refault/restart/power-loss tests. Unify ordinary file reads/writes and EOF changes with the
@@ -26011,6 +26015,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     not follow the pathname. Writable IOSB probes, append-only routing, and delayed position
     completion remain part of the native cutover. Live COW/refault/restart and the unchanged
     33-import win32k gate remain open.
+
+    B3 coherent resident-file read policy tranche 45 (2026-09-06, host/build green):
+    `section_file_read.rs` adds the paired `read_file_coherent` operation. Read and write share
+    mounted-file/EOF validation and ordered resident-page discovery; reads exclusively borrow the
+    metadata owner but do not mutate canonical bytes, dirty state, epochs, or extent. Every resident
+    read-only alias is prepared before output mutation or raw I/O. The operation walks contiguous
+    canonical and backing runs, reads raw backing only for gaps, clips at actual EOF, and never
+    exposes resident page padding. It returns a successful short prefix or bytes accompanying an
+    error without skipping ahead to a later resident page. An oversized backend count is an internal
+    contract violation, matching the write policy. Failed preparation leaves output untouched;
+    failed cleanup retains aliases and actual progress, with the original read error taking priority.
+    Admission retries prior cleanup before any new resident or uncached operation.
+
+    This API writes kernel-owned storage, not faultable user memory. The native operation remains
+    responsible for one logical position update, access metadata/accounting even on an all-resident
+    read, checked user copyout, IOSB, and completion. Fragmented raw reads must not advance the file
+    pointer or stand in for whole-operation accounting. Read-only preparation is not a promise of
+    atomicity against concurrent CPU writes. Twelve new tests cover mixed/cross-page reads, clean
+    and dirty canonical authority, private-frame exclusion, unchanged epochs, EOF and untouched tails,
+    short/error gap prefixes, late preparation failures, cleanup retry, identity/retirement isolation,
+    and invalid progress. A real MemFs hardlink integration writes through a retained caller open,
+    then reads the new data, zeroed EOF gap, and earlier unflushed mapped bytes while preserving file
+    position. The raw file still lacks those earlier dirty bytes, proving no hidden flush supplies
+    the canonical result. Runtime coherent reads and writes are not activated yet.
+
+    B3 scratch-window separation tranche 46 (2026-09-06, host/build green):
+    The multi-page-adapter audit found a live collision: persistent DLL copy-in aliases previously
+    began three pages below the scratch top, overlapping section page-in/writeback and COW temporary
+    slots. The microkernel rejects these occupied leaves with `DeleteFirst`; this was a real mapping
+    admission defect, not just unused address constants. `ScratchWindowLayout` now partitions the
+    executive window into 15,000 demand-fill pages, 1,376 persistent-alias pages, and eight fixed
+    temporary tail pages. The first persistent alias is nine pages below the top; the last is page
+    15,000, above the highest admitted demand page (14,999). The old guard arithmetic is removed from
+    `client_copyin_frame_alias_for_index` and replaced by checked layout lookup. Four new tests cover
+    all persistent/fixed-slot pairs, first/last/out-of-range indices, malformed bases, arithmetic
+    overflow, overcommitted layouts, adjacent windows, and different temporary reservations.
+
+    Combined validation: 161 `nt-memory-manager`, 161 `nt-address-space`, 138 `nt-fs`, and 10
+    `nt-ahci` tests pass (470 total), including all prior write-transaction tests. Logs:
+    `.tmp/test-coherent-read-20260906.log` and `.tmp/build-coherent-read-20260906.log`.
+    The executive build passes with the existing 256 warnings and stages rootserver and hive.
+    Root alone ran serialized builds/tests; two
+    agents reviewed read contracts and every current fixed scratch user. No QEMU or desktop
+    acceptance is claimed; the scratch correction is wired, while coherent I/O remains host policy.
+
+    Review adjustment: the paired read/write policy is now host-tested. Next build multi-page
+    prepared-alias ownership with explicit VA reservation in the corrected layout; page-table
+    construction alone is not address ownership, and no generic executive VA allocator exists to
+    reuse. Any added fixed slots must update the shared layout. Then route native and internal file
+    mutations through explicit memory authority before activating either cache path. Retained cleanup,
+    current-position/access accounting, destructive create/size changes, CM/hive/provisioning writes,
+    and raw-adapter nonreentry remain mandatory. Live refault/persistence and the unchanged 33-import
+    win32k blocker remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

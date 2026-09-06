@@ -1,4 +1,4 @@
-//! Serialized resident-file writes: preflight mappings, mutate backing, then merge without failure.
+//! Serialized resident-file I/O with prepared canonical mappings and exact byte progress.
 use super::*;
 use crate::writeback::SectionPageAlias;
 
@@ -6,6 +6,10 @@ const PAGE_SIZE: u64 = 0x1000;
 const STATUS_INVALID_PARAMETER: u32 = 0xc000_000d;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xc000_009a;
 const STATUS_USER_MAPPED_FILE: u32 = 0xc000_0243;
+
+#[path = "section_file_read.rs"]
+mod read;
+pub use read::SectionFileReadIo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionFilePage {
@@ -33,7 +37,7 @@ pub trait SectionFileWriteIo {
     fn finish(&mut self) -> Result<(), u32>;
 }
 
-struct WritePage {
+struct ResidentFilePage {
     index: usize,
     page: SectionFilePage,
 }
@@ -135,7 +139,35 @@ impl GenericSectionTable {
         backing: GenericSectionBacking,
         offset: u64,
         length: usize,
-    ) -> Result<(Option<usize>, Vec<WritePage>, Vec<SectionPageAlias>), u32> {
+    ) -> Result<(Option<usize>, Vec<ResidentFilePage>, Vec<SectionPageAlias>), u32> {
+        let area_index = self.file_io_area(backing)?;
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        if end > crate::data_section::MAX_DATA_SECTION_SIZE {
+            return Err(crate::STATUS_SECTION_TOO_BIG);
+        }
+        let start = if length == 0 {
+            end
+        } else {
+            offset.min(backing.file_extent)
+        };
+        let pages = self.resident_file_pages(area_index, start, end)?;
+        let mut aliases = Vec::new();
+        if let Some(index) = area_index {
+            let area = self.control_areas[index];
+            for page in &pages {
+                let page_aliases = self.aliases_for_area_page(area.id, page.page.file_offset)?;
+                aliases
+                    .try_reserve(page_aliases.len())
+                    .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+                aliases.extend(page_aliases);
+            }
+        }
+        Ok((area_index, pages, aliases))
+    }
+
+    fn file_io_area(&self, backing: GenericSectionBacking) -> Result<Option<usize>, u32> {
         if backing.file.is_none()
             || !matches!(
                 backing.kind,
@@ -144,63 +176,61 @@ impl GenericSectionTable {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let end = offset
-            .checked_add(length as u64)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
-        if end > crate::data_section::MAX_DATA_SECTION_SIZE
-            || backing.file_extent > crate::data_section::MAX_DATA_SECTION_SIZE
-        {
+        if backing.file_extent > crate::data_section::MAX_DATA_SECTION_SIZE {
             return Err(crate::STATUS_SECTION_TOO_BIG);
         }
         let area_index = self.matching_control_area(backing);
-        let mut pages = Vec::new();
-        let mut aliases = Vec::new();
         if let Some(index) = area_index {
             let area = self.control_areas[index];
-            // Out-of-band mutation must not be disguised as a coherent write. Activation requires
+            // Out-of-band mutation must not be disguised as coherent I/O. Activation requires
             // every ordinary/internal mutation to participate in this same ownership protocol.
             if area.extent != backing.file_extent {
                 return Err(STATUS_USER_MAPPED_FILE);
             }
-            if length != 0 {
-                let start = offset.min(backing.file_extent);
-                for (index, page) in self.pages.iter().enumerate() {
-                    if !page.live || page.control_area != area.id {
-                        continue;
-                    }
-                    let file_offset = page
-                        .page_index
-                        .checked_mul(PAGE_SIZE)
-                        .ok_or(STATUS_INVALID_PARAMETER)?;
-                    let page_end = file_offset
-                        .checked_add(PAGE_SIZE)
-                        .ok_or(STATUS_INVALID_PARAMETER)?;
-                    if file_offset >= end || page_end <= start {
-                        continue;
-                    }
-                    pages
-                        .try_reserve(1)
-                        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-                    pages.push(WritePage {
-                        index,
-                        page: SectionFilePage {
-                            frame: page.frame,
-                            file_offset,
-                        },
-                    });
-                }
-                pages.sort_unstable_by_key(|page| page.page.file_offset);
-                for page in &pages {
-                    let page_aliases =
-                        self.aliases_for_area_page(area.id, page.page.file_offset)?;
-                    aliases
-                        .try_reserve(page_aliases.len())
-                        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-                    aliases.extend(page_aliases);
-                }
-            }
         }
-        Ok((area_index, pages, aliases))
+        Ok(area_index)
+    }
+
+    fn resident_file_pages(
+        &self,
+        area_index: Option<usize>,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ResidentFilePage>, u32> {
+        let mut pages = Vec::new();
+        let Some(area) = area_index.map(|index| self.control_areas[index]) else {
+            return Ok(pages);
+        };
+        if start >= end {
+            return Ok(pages);
+        }
+        for (index, page) in self.pages.iter().enumerate() {
+            if !page.live || page.control_area != area.id {
+                continue;
+            }
+            let file_offset = page
+                .page_index
+                .checked_mul(PAGE_SIZE)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            let page_end = file_offset
+                .checked_add(PAGE_SIZE)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            if file_offset >= end || page_end <= start {
+                continue;
+            }
+            pages
+                .try_reserve(1)
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            pages.push(ResidentFilePage {
+                index,
+                page: SectionFilePage {
+                    frame: page.frame,
+                    file_offset,
+                },
+            });
+        }
+        pages.sort_unstable_by_key(|page| page.page.file_offset);
+        Ok(pages)
     }
 }
 

@@ -10,7 +10,7 @@ mod pages;
 
 #[path = "section_file_io.rs"]
 mod file_io;
-pub use file_io::{SectionFilePage, SectionFileWriteIo};
+pub use file_io::{SectionFilePage, SectionFileReadIo, SectionFileWriteIo};
 
 #[path = "section_retirement.rs"]
 mod retirement;

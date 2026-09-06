@@ -10057,7 +10057,17 @@ impl ClientCopyinFrameRecord {
 }
 
 static mut CLIENT_COPYIN_FRAMES: Option<Vec<ClientCopyinFrameRecord>> = None;
-const CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES: usize = 3;
+// Fixed tail slots 1..=8 cover image admission, frame zeroing, section page-in/writeback,
+// section fixtures, and source/destination COW copies. Persistent aliases must start below them.
+const EXECUTIVE_SCRATCH_LAYOUT: nt_address_space::scratch::ScratchWindowLayout =
+    match nt_address_space::scratch::ScratchWindowLayout::new(
+        DEMAND_SCRATCH_WINDOW,
+        service_sec_image::SEC_IMAGE_FAULT_CAP as u64,
+        8,
+    ) {
+        Some(layout) => layout,
+        None => panic!("executive scratch regions must be disjoint"),
+    };
 
 fn client_copyin_frames_mut() -> &'static mut Vec<ClientCopyinFrameRecord> {
     unsafe {
@@ -10081,16 +10091,7 @@ unsafe fn client_copyin_frame_find(pi: u64, page: u64) -> Option<ClientCopyinFra
 }
 
 unsafe fn client_copyin_frame_alias_for_index(index: usize, scratch_base: u64) -> Option<u64> {
-    let window_pages = (DEMAND_SCRATCH_WINDOW / 0x1000) as usize;
-    let low_guard_pages = service_sec_image::SEC_IMAGE_FAULT_CAP as usize;
-    let reserved_pages = low_guard_pages.checked_add(CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES)?;
-    let capacity = window_pages.checked_sub(reserved_pages)?;
-    if index >= capacity {
-        return None;
-    }
-    let page_from_top = index.checked_add(CLIENT_COPYIN_ALIAS_TOP_GUARD_PAGES)?;
-    let offset = (page_from_top as u64).checked_mul(0x1000)?;
-    scratch_base.checked_add(DEMAND_SCRATCH_WINDOW.checked_sub(offset)?)
+    EXECUTIVE_SCRATCH_LAYOUT.alias_address(scratch_base, index as u64)
 }
 
 unsafe fn client_copyin_frame_prepare_insert(pi: u64, page: u64, scratch_base: u64) -> Option<u64> {
