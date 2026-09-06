@@ -306,6 +306,19 @@ impl ExecNtHandler {
         )
     }
 
+    pub(super) unsafe fn probe_file_io_output(
+        &mut self,
+        iosb: u64,
+        read_buffer: Option<(u64, u64)>,
+    ) -> Result<(), u32> {
+        nt_address_space::native_output::probe_file_io_output(
+            &mut ProcessWriteProbe::current(self),
+            iosb,
+            read_buffer,
+            USER_ADDRESS_LIMIT,
+        )
+    }
+
     unsafe fn probe_copy_count(&mut self, address: u64) -> Result<(), u32> {
         self.probe_copy_scalar::<8>(address)
     }

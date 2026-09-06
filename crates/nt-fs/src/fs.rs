@@ -4722,6 +4722,9 @@ impl FileSystem {
         if self.volume.is_dir(obj.node_id) {
             return (STATUS_INVALID_DEVICE_REQUEST, 0);
         }
+        if output.is_empty() {
+            return (STATUS_SUCCESS, 0);
+        }
         if offset >= self.volume.size(obj.node_id) {
             return (STATUS_END_OF_FILE, 0);
         }
@@ -4742,20 +4745,43 @@ impl FileSystem {
         let Some(obj) = self.obj(handle) else {
             return (STATUS_INVALID_HANDLE, 0);
         };
-        let node_id = obj.node_id;
         let offset = byte_offset.unwrap_or(obj.current_offset);
         let (status, read) = self.read_backing_into(handle, offset, output);
         if status != STATUS_SUCCESS {
             return (status, read);
         }
-        if read != 0 {
+        let position = byte_offset.is_none().then_some(offset + read as u64);
+        let status = self.complete_read(handle, read, position);
+        debug_assert_eq!(status, STATUS_SUCCESS);
+        (STATUS_SUCCESS, read)
+    }
+
+    /// Account for one completed read, whether its bytes came from resident pages or backing.
+    /// The I/O Manager supplies a position only when FILE_OBJECT mode requires an update.
+    pub fn complete_read(&mut self, handle: u64, transferred: usize, position: Option<u64>) -> u32 {
+        let Some(obj) = self.obj(handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        let node_id = obj.node_id;
+        if self.volume.is_dir(node_id) {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        if transferred != 0 {
             self.volume.touch_access(node_id);
             self.report_handle_change(handle, crate::FILE_NOTIFY_CHANGE_LAST_ACCESS);
         }
-        if byte_offset.is_none() {
-            self.obj_mut(handle).unwrap().current_offset = offset + read as u64;
+        self.complete_file_position(handle, position)
+    }
+
+    /// Publish the I/O Manager's completed position on the retained FILE_OBJECT.
+    pub fn complete_file_position(&mut self, handle: u64, position: Option<u64>) -> u32 {
+        let Some(obj) = self.obj_mut(handle) else {
+            return STATUS_INVALID_HANDLE;
+        };
+        if let Some(position) = position {
+            obj.current_offset = position;
         }
-        (STATUS_SUCCESS, read)
+        STATUS_SUCCESS
     }
 
     /// `ZwWriteFile` (spec §8.3). `byte_offset` `None` uses + advances the file object offset.

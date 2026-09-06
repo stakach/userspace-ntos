@@ -97,8 +97,10 @@ below are historical baselines, not acceptance of the current provider cutover.
   with a checked, host-tested layout (tranche 46, host/build).
 - [x] Implement multi-page prepared-alias ownership and the executive read/write adapters, with
   durable cleanup storage and disjoint address reservation (tranche 47, host/build; not activated).
+- [x] Fix native read/write output admission, append-only routing, synchronous completion position,
+  and backing-independent read accounting (tranche 48, host/build; native fixes wired).
 - [ ] Route native and internal file/size mutations through explicit memory authority before
-  activating coherent native reads/writes; finish whole-operation completion/accounting.
+  activating coherent native reads/writes; verify whole-operation completion/accounting at cutover.
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
   live refault/restart/power-loss tests. Unify ordinary file reads/writes and EOF changes with the
   shared control-area owner; complete storage-port abort/reset recovery without reusing device-owned
@@ -26099,12 +26101,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Root alone ran serialized builds/tests; two agents reviewed ownership and file/address boundaries.
     No QEMU or desktop acceptance is claimed.
 
-    Review adjustment: prepared aliases are implemented. Next close native and internal mutation
-    participation before activating either coherent cache path: writable IOSB probes, append-only
-    routing, delayed current-position completion, once-per-operation read accounting including
-    all-resident reads, destructive create/size changes, and CM/hive/provisioning writes. Keep raw
-    page-in/writeback nonreentrant and retain failure ownership throughout. Live refault/persistence
-    and the unchanged 33-import win32k blocker remain open.
+    B3 native file-I/O admission/completion tranche 48 (2026-09-06, host/build green):
+    Native `NtReadFile` and `NtWriteFile` now probe the full writable IOSB through the existing
+    fault-aware scalar copy boundary before request capture or side effects. Reads additionally
+    probe every destination page after access/size validation and before event reset or dispatch,
+    so rejected oversized local requests do not page in their destination. The host-tested protocol
+    preserves guard-page versus access-violation status, permits unaligned IOSBs, captures the entire
+    scalar before its self-write, rejects range overflow/user-ceiling violations, and still requires
+    a writable IOSB for zero-length requests. The old readable-only IOSB admission is deleted.
+    Write completion no longer separately queues a local APC, signals the event again, or uses
+    best-effort IOSB stores on inline error paths: publication goes through the shared completion
+    policy, leaving already accepted file bytes independent of later user-output failures.
+
+    Local FILE_OBJECT identity/mode resolution is separated from explicit byte-lock API admission.
+    Append-only handles can now reach ordinary writes while `NtLockFile`/`NtUnlockFile` retain their
+    read/write access requirement. Buffered append-only writes select actual EOF regardless of the
+    captured offset value; asynchronous regular files still require a ByteOffset pointer and pointer
+    capture must succeed. This follows NT5 `iomgr/write.c`, not Wine/ReactOS implementation gaps.
+    The old source-of-offset position flag is removed. A checked completion policy updates synchronous
+    current position for explicit, implicit-current, and EOF/append transfers, preserves asynchronous
+    positions, rejects impossible byte counts/overflow, and distinguishes zero-length requests from
+    positive-length EOF reads. The latter set the synchronous position to the resolved offset, as in
+    NT5 fastfat/NTFS regular-file completion. Native local reads/writes use this policy; ordinary FAT
+    reads now update explicit synchronous offsets and EOF positions too; valid offsets above the
+    32-bit FAT extent report EOF, and zero-length requests do not truncate the offset for validation.
+
+    Writable native operations pass the resolved absolute offset to backing I/O and apply position
+    once at completion. Reads use raw backing fragments followed by `FileSystem::complete_read`,
+    which owns access timestamp/notification and optional file-position publication independently of
+    where the bytes came from. The executive accounts for one logical read and marks changed access
+    metadata for persistence. This happens after the storage transfer and before user copyout, so a
+    late output fault does not roll back completed transfer state. Host tests also exercise completed
+    resident reads with no backing read at all. These are completion prerequisites, not activation
+    of coherent cache reads/writes or a conversion of the remaining direct-to-user FAT copy path.
+
+    Validation: 171 `nt-memory-manager`, 169 `nt-address-space`, 142 `nt-fs`, 10 `nt-ahci`,
+    255 `nt-io-manager`, and 33 `nt-io-completion` tests pass (780 total), including twelve new
+    admission, offset, and accounting tests. The executive build passes with 261 warnings and stages
+    rootserver/hive. Logs: `.tmp/test-file-io-admission-20260906.log` and
+    `.tmp/build-file-io-admission-20260906.log`. Root alone ran serialized builds/tests; two agents
+    researched NT5/ReactOS boundaries and reviewed the changes. No QEMU or desktop acceptance is
+    claimed; the unchanged 33-import win32k blocker remains open.
+
+    Review adjustment: native admission and completion prerequisites are wired. Next implement
+    explicit memory-authority participation for destructive create/size changes and
+    CM/hive/provisioning writes, then activate both coherent cache paths together. Preserve retained
+    cleanup and raw page-in/writeback nonreentry. Validate completion/accounting again at cutover,
+    including fully resident reads and late output faults. Direct FAT copyout's partial-failure
+    accounting, noncached alignment contracts, and live refault/persistence remain explicit work;
+    this checkpoint does not claim those broader paths are complete.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

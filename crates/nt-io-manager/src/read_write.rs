@@ -35,8 +35,29 @@ impl ResolvedFileOffset {
         }
     }
 
-    pub const fn advances_current_position(self) -> bool {
-        matches!(self, Self::Current(_))
+    /// Position follows completed synchronous data transfer, not the source of its offset.
+    /// Admission failures and zero-length requests do not move it. A late output fault does not
+    /// undo accepted bytes; callers invoke this once at the backing-transfer completion boundary.
+    pub fn completion_position(
+        self,
+        synchronous: bool,
+        requested: usize,
+        status: u32,
+        transferred: usize,
+    ) -> Result<Option<u64>, NtStatus> {
+        if transferred > requested {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if !synchronous
+            || requested == 0
+            || (transferred == 0 && status != 0 && status != 0xc000_0011)
+        {
+            return Ok(None);
+        }
+        self.value()
+            .checked_add(transferred as u64)
+            .map(Some)
+            .ok_or(NtStatus::INVALID_PARAMETER)
     }
 }
 
@@ -59,7 +80,7 @@ pub fn resolve_regular_file_read_offset(
 }
 
 /// Resolve `NtWriteFile.ByteOffset` for a regular local file. Append-only access overrides the
-/// caller's otherwise-valid offset, matching the I/O Manager's `FILE_APPEND_DATA` contract.
+/// caller's captured offset value for buffered I/O. Asynchronous files still require a pointer.
 pub fn resolve_regular_file_write_offset(
     byte_offset: Option<i64>,
     synchronous: bool,
@@ -67,11 +88,14 @@ pub fn resolve_regular_file_write_offset(
     end_of_file: u64,
     append_only: bool,
 ) -> Result<ResolvedFileOffset, NtStatus> {
-    if byte_offset.is_some_and(|value| value < FILE_USE_FILE_POINTER_POSITION) {
+    if byte_offset.is_none() && !synchronous {
         return Err(NtStatus::INVALID_PARAMETER);
     }
     if append_only {
         return Ok(ResolvedFileOffset::EndOfFile(end_of_file));
+    }
+    if byte_offset.is_some_and(|value| value < FILE_USE_FILE_POINTER_POSITION) {
+        return Err(NtStatus::INVALID_PARAMETER);
     }
     match byte_offset {
         None if synchronous => Ok(ResolvedFileOffset::Current(current)),
@@ -483,6 +507,66 @@ mod offset_tests {
     use super::*;
 
     #[test]
+    fn completion_position_uses_file_mode_not_offset_source() {
+        for offset in [
+            ResolvedFileOffset::Current(50),
+            ResolvedFileOffset::Absolute(50),
+            ResolvedFileOffset::EndOfFile(50),
+        ] {
+            assert_eq!(offset.completion_position(true, 10, 0, 4), Ok(Some(54)));
+            assert_eq!(offset.completion_position(false, 10, 0, 4), Ok(None));
+        }
+    }
+
+    #[test]
+    fn completion_distinguishes_zero_request_eof_and_failed_transfer() {
+        let offset = ResolvedFileOffset::Absolute(50);
+        assert_eq!(offset.completion_position(true, 0, 0, 0), Ok(None));
+        assert_eq!(
+            offset.completion_position(true, 10, 0xc000_0011, 0),
+            Ok(Some(50))
+        );
+        assert_eq!(
+            offset.completion_position(true, 10, 0xc000_0005, 0),
+            Ok(None)
+        );
+        assert_eq!(
+            offset.completion_position(true, 10, 0xc000_0005, 3),
+            Ok(Some(53))
+        );
+    }
+
+    #[test]
+    fn completion_rejects_impossible_progress_or_offset_overflow() {
+        assert_eq!(
+            ResolvedFileOffset::Absolute(50).completion_position(true, 10, 0, 11),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            ResolvedFileOffset::Current(u64::MAX).completion_position(true, 1, 0, 1),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
+    fn buffered_append_ignores_offset_value_but_async_requires_offset_pointer() {
+        assert_eq!(
+            resolve_regular_file_write_offset(None, false, 10, 20, true),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        for value in [i64::MIN, -3, -2, -1, 0, 99] {
+            assert_eq!(
+                resolve_regular_file_write_offset(Some(value), false, 10, 20, true),
+                Ok(ResolvedFileOffset::EndOfFile(20))
+            );
+        }
+        assert_eq!(
+            resolve_regular_file_write_offset(Some(-3), true, 10, 20, false),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+    }
+
+    #[test]
     fn regular_read_offsets_require_nt_synchronous_file_pointer_semantics() {
         assert_eq!(
             resolve_regular_file_read_offset(None, true, 41),
@@ -534,7 +618,7 @@ mod offset_tests {
         );
         assert_eq!(
             resolve_regular_file_write_offset(Some(-3), true, 11, 22, true),
-            Err(NtStatus::INVALID_PARAMETER)
+            Ok(ResolvedFileOffset::EndOfFile(22))
         );
     }
 }

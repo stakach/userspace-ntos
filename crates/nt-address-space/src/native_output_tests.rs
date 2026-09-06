@@ -19,6 +19,116 @@ const QUERY: VmBasicQueryOutput = VmBasicQueryOutput {
     return_length: OLD,
 };
 
+#[test]
+fn file_io_probes_unaligned_iosb_before_each_read_output_page_without_changing_bytes() {
+    let mut memory = Memory::default();
+    memory.seed(0xff9, &[0xa5; 16]);
+    for address in [0x1fff, 0x2000, 0x3000] {
+        memory.seed(address, &[0x5a]);
+    }
+    let before = memory.bytes.clone();
+    assert_eq!(
+        probe_file_io_output(&mut memory, 0xff9, Some((0x1fff, 4098)), LIMIT),
+        Ok(())
+    );
+    assert_eq!(memory.bytes, before);
+    assert_eq!(
+        memory.accesses[..16],
+        (0xff9..0x1009).map(Access::Read).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        memory.accesses[16..32],
+        (0xff9..0x1009).map(Access::ProbeWrite).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        memory.accesses[32..],
+        [
+            Access::Read(0x1fff),
+            Access::ProbeWrite(0x1fff),
+            Access::Read(0x2000),
+            Access::ProbeWrite(0x2000),
+            Access::Read(0x3000),
+            Access::ProbeWrite(0x3000)
+        ]
+    );
+}
+
+#[test]
+fn file_iosb_guard_stops_before_any_self_write_or_destination_probe() {
+    let mut memory = Memory::default();
+    memory.seed(0xff9, &[0xa5; 16]);
+    memory.fail_read = Some(0x1000);
+    assert_eq!(
+        probe_file_io_output(&mut memory, 0xff9, Some((0x2000, 1)), LIMIT),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert!(memory
+        .accesses
+        .iter()
+        .all(|access| matches!(access, Access::Read(_))));
+}
+
+#[test]
+fn file_readonly_iosb_fails_before_destination_and_preserves_contents() {
+    let mut memory = Memory::default();
+    memory.seed(0x1001, &[0xa5; 16]);
+    let before = memory.bytes.clone();
+    memory.fail_probe_write = Some(0x1010);
+    assert_eq!(
+        probe_file_io_output(&mut memory, 0x1001, Some((0x2000, 1)), LIMIT),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+    assert_eq!(memory.bytes, before);
+    assert!(!memory.accesses.contains(&Access::Read(0x2000)));
+}
+
+#[test]
+fn file_io_rejects_null_overflow_and_user_ceiling_outputs() {
+    for iosb in [0, u64::MAX - 7, LIMIT - 15] {
+        let mut memory = Memory::default();
+        assert_eq!(
+            probe_file_io_output(&mut memory, iosb, None, LIMIT),
+            Err(STATUS_ACCESS_VIOLATION)
+        );
+        assert!(memory.accesses.is_empty());
+    }
+    for buffer in [(0, 1), (u64::MAX, 2), (LIMIT - 1, 2)] {
+        let mut memory = Memory::with_outputs();
+        assert_eq!(
+            probe_file_io_output(&mut memory, OLD, Some(buffer), LIMIT),
+            Err(STATUS_ACCESS_VIOLATION)
+        );
+        assert_eq!(memory.accesses.len(), 32);
+    }
+}
+
+#[test]
+fn zero_length_file_read_still_requires_writable_iosb_but_not_a_buffer() {
+    let mut memory = Memory::with_outputs();
+    assert_eq!(
+        probe_file_io_output(&mut memory, OLD, Some((u64::MAX, 0)), LIMIT),
+        Ok(())
+    );
+    assert_eq!(memory.accesses.len(), 32);
+    memory.fail_probe_write = Some(OLD);
+    assert_eq!(
+        probe_file_io_output(&mut memory, OLD, Some((0, 0)), LIMIT),
+        Err(STATUS_ACCESS_VIOLATION)
+    );
+}
+
+#[test]
+fn file_read_destination_preserves_guard_status_after_iosb_admission() {
+    let mut memory = Memory::with_outputs();
+    memory.fail_read = Some(0x1000);
+    assert_eq!(
+        probe_file_io_output(&mut memory, OLD, Some((0x1000, 1)), LIMIT),
+        Err(STATUS_GUARD_PAGE_VIOLATION)
+    );
+    assert_eq!(memory.accesses.last(), Some(&Access::Read(0x1000)));
+    assert_eq!(memory.accesses.len(), 33);
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Access {
     Read(u64),

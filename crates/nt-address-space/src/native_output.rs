@@ -1,10 +1,31 @@
-//! Native VM parameter capture and ordered output stores. The caller owns operation status and
+//! Native parameter capture and ordered output stores. The caller owns operation status and
 //! decides whether a late output exception is reported; publication never rolls back VM state.
 
 use crate::copy::{probe_write_scalar, probe_write_user_range, WriteProbeMemory};
 
 pub trait VmOutputMemory: WriteProbeMemory {
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), u32>;
+}
+
+/// Admit file I/O before event reset or dispatch. The full (possibly unaligned) IOSB is captured
+/// before its self-write; a read destination is probed only after that scalar succeeds.
+pub fn probe_file_io_output(
+    memory: &mut impl WriteProbeMemory,
+    iosb: u64,
+    read_buffer: Option<(u64, u64)>,
+    user_limit: u64,
+) -> Result<(), u32> {
+    if iosb == 0 {
+        return Err(crate::STATUS_ACCESS_VIOLATION);
+    }
+    probe_write_scalar::<16>(memory, iosb, user_limit)?;
+    if let Some((address, length)) = read_buffer {
+        if address == 0 && length != 0 {
+            return Err(crate::STATUS_ACCESS_VIOLATION);
+        }
+        probe_write_user_range(memory, address, length, user_limit)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]

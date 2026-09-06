@@ -1522,6 +1522,90 @@ fn backing_reads_preserve_output_on_invalid_objects_and_eof() {
 }
 
 #[test]
+fn completed_resident_read_accounts_once_without_backing_io() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    assert!(fs.provision_file(r"\??\C:\Temp\resident", b"data"));
+    let file = fs.zw_create_file(r"\??\C:\Temp\resident", FILE_READ_DATA, 0, 0, FILE_OPEN, 0);
+    let directory = fs.zw_create_file(
+        r"\??\C:\Temp",
+        FILE_LIST_DIRECTORY,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    let notification = fs
+        .zw_notify_change_directory_file(
+            directory.handle,
+            FILE_NOTIFY_CHANGE_LAST_ACCESS,
+            false,
+            256,
+            0,
+        )
+        .unwrap();
+    fs.set_current_time_100ns(123);
+    assert_eq!(fs.complete_read(file.handle, 3, Some(4)), STATUS_SUCCESS);
+    assert_eq!(fs.current_offset(file.handle), Some(4));
+    assert_eq!(
+        fs.zw_query_metadata(file.handle).unwrap().last_access_time,
+        123
+    );
+    assert_eq!(
+        fs.pop_directory_notify_completion().unwrap().id,
+        notification
+    );
+    assert!(fs.pop_directory_notify_completion().is_none());
+    assert_eq!(fs.file_bytes(r"\??\C:\Temp\resident"), Some(&b"data"[..]));
+
+    fs.set_current_time_100ns(456);
+    assert_eq!(fs.complete_read(file.handle, 0, Some(20)), STATUS_SUCCESS);
+    assert_eq!(fs.current_offset(file.handle), Some(20));
+    assert_eq!(
+        fs.zw_query_metadata(file.handle).unwrap().last_access_time,
+        123
+    );
+    assert_eq!(fs.complete_read(file.handle, 1, None), STATUS_SUCCESS);
+    assert_eq!(fs.current_offset(file.handle), Some(20));
+    assert_eq!(
+        fs.zw_query_metadata(file.handle).unwrap().last_access_time,
+        456
+    );
+}
+
+#[test]
+fn read_completion_validates_objects_and_zero_backing_reads_have_no_effects() {
+    let mut fs = FileSystem::new(MemFs::with_fixture());
+    let file = fs.zw_create_file(r"\??\C:\Temp\empty", FILE_READ_DATA, 0, 0, FILE_CREATE, 0);
+    let directory = fs.zw_create_file(
+        r"\??\C:\Temp",
+        FILE_LIST_DIRECTORY,
+        0,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    );
+    assert_eq!(
+        fs.read_backing_into(file.handle, u64::MAX, &mut []),
+        (STATUS_SUCCESS, 0)
+    );
+    assert_eq!(fs.current_offset(file.handle), Some(0));
+    assert_eq!(
+        fs.complete_read(directory.handle, 1, Some(10)),
+        STATUS_INVALID_DEVICE_REQUEST
+    );
+    assert_eq!(fs.current_offset(directory.handle), Some(0));
+    fs.zw_close(file.handle);
+    assert_eq!(
+        fs.complete_read(file.handle, 1, Some(10)),
+        STATUS_INVALID_HANDLE
+    );
+    assert_eq!(
+        fs.complete_file_position(file.handle, Some(10)),
+        STATUS_INVALID_HANDLE
+    );
+}
+
+#[test]
 fn copied_file_chunks_share_provisioned_source_until_modified() {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_file(r"\??\C:\profiles\Default User\ntuser.dat", b"0123456789"));

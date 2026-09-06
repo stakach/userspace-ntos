@@ -29681,10 +29681,6 @@ impl ExecNtHandler {
             .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let process_handle =
             nt_process::Handle::try_from(handle).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
-        let object = self
-            .pm
-            .lookup_handle(pid, process_handle)
-            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let access = self
             .pm
             .handle_access(pid, process_handle)
@@ -29694,6 +29690,24 @@ impl ExecNtHandler {
         {
             return Err(STATUS_ACCESS_DENIED);
         }
+        self.local_file_io_route_for(handle)
+    }
+
+    /// Resolve identity and mode only. Native read/write and explicit lock APIs have different
+    /// access requirements; append-only writes must not inherit the lock API's read/write gate.
+    unsafe fn local_file_io_route_for(
+        &self,
+        handle: u64,
+    ) -> Result<Option<LocalByteLockRoute>, u32> {
+        let pid = self
+            .pm_pid_for_pi(self.pi)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
+        let process_handle =
+            nt_process::Handle::try_from(handle).map_err(|_| nt_fs::STATUS_INVALID_HANDLE)?;
+        let object = self
+            .pm
+            .lookup_handle(pid, process_handle)
+            .ok_or(nt_fs::STATUS_INVALID_HANDLE)?;
         let route = match object {
             nt_process::HandleObject::DiskFile {
                 first_cluster,
@@ -43153,6 +43167,9 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
+                if let Err(status) = self.probe_file_io_output(iosb, None) {
+                    return status;
+                }
                 let trace = NT_WRITE_FILE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 8;
                 let mut offset_bytes = [0u8; 8];
                 let offset_ok = byte_offset == 0 || self.xas_read(byte_offset, &mut offset_bytes);
@@ -43163,8 +43180,6 @@ impl ExecNtHandler {
                 let mut key_bytes = [0u8; 4];
                 let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
                 let key_value = u32::from_le_bytes(key_bytes);
-                let mut iosb_probe = [0u8; 16];
-                let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let apc_completion_conflict =
                     self.npfs_write_file_route_for(fh)
                         .ok()
@@ -43181,6 +43196,9 @@ impl ExecNtHandler {
                     || overlay_access.is_some_and(|access| {
                         access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) != 0
                     });
+                let append_only = overlay_access.is_some_and(|access| {
+                    access & (0x0000_0002 | 0x0000_0004 | 0x4000_0000 | 0x1000_0000) == 0x0000_0004
+                });
                 let write_capacity = if overlay_file.is_some() {
                     OVERLAY_IO_CAP
                 } else {
@@ -43217,11 +43235,9 @@ impl ExecNtHandler {
                 let mut file_retained = false;
                 let mut local_file_io = None;
                 let mut operation_started = false;
-                let mut status = if !iosb_ok {
+                let mut status = if !offset_ok || !key_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_ok || !key_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_semantics_ok {
+                } else if !offset_semantics_ok && !append_only {
                     STATUS_INVALID_PARAMETER
                 } else if len > write_capacity {
                     0xC000_0206 // STATUS_INVALID_BUFFER_SIZE
@@ -43238,19 +43254,11 @@ impl ExecNtHandler {
                             completion_event_index = event_index;
                             if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                let route = self.local_byte_lock_route_for(fh);
+                                let route = self.local_file_io_route_for(fh);
                                 let current = crate::writable_fs::current_offset(file_id);
                                 let metadata = crate::writable_fs::metadata(file_id);
                                 match (route, current, metadata) {
                                     (Ok(Some(route)), Some(current), Some(metadata)) => {
-                                        let append_only = overlay_access.is_some_and(|access| {
-                                            access
-                                                & (0x0000_0002
-                                                    | 0x0000_0004
-                                                    | 0x4000_0000
-                                                    | 0x1000_0000)
-                                                == 0x0000_0004
-                                        });
                                         let resolved =
                                             nt_io_manager::resolve_regular_file_write_offset(
                                                 (byte_offset != 0)
@@ -43265,8 +43273,6 @@ impl ExecNtHandler {
                                             Err(status) => return status.raw() as u32,
                                         };
                                         let actual_offset = resolved.value();
-                                        let explicit = (!resolved.advances_current_position())
-                                            .then_some(actual_offset);
                                         match self.begin_local_file_io(route.file_object) {
                                             Err(status) => status,
                                             Ok(()) => {
@@ -43294,9 +43300,17 @@ impl ExecNtHandler {
                                                     );
                                                     let (status, written) =
                                                         crate::writable_fs::write(
-                                                            file_id, explicit, scratch,
+                                                            file_id,
+                                                            Some(actual_offset),
+                                                            scratch,
                                                         );
-                                                    if status == nt_fs::STATUS_SUCCESS {
+                                                    let position = resolved.completion_position(
+                                                        route.synchronous, len, status, written,
+                                                    ).expect("regular file write reports bounded progress");
+                                                    crate::writable_fs::complete_file_position(
+                                                        file_id, position,
+                                                    );
+                                                    if written != 0 {
                                                         self.writable_fs_dirty = true;
                                                     }
                                                     information = written as u64;
@@ -43397,14 +43411,6 @@ impl ExecNtHandler {
                     status = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES;
                     information = 0;
                 }
-                if operation_started && !routed && status != STATUS_PENDING {
-                    let apc_status =
-                        self.queue_file_user_apc(self.current_tid, apc_routine, apc_context, iosb);
-                    if apc_status != nt_fs::STATUS_SUCCESS {
-                        status = apc_status;
-                        information = 0;
-                    }
-                }
                 if routed && status == STATUS_PENDING {
                     let synchronous = self
                         .file_completion
@@ -43467,9 +43473,6 @@ impl ExecNtHandler {
                         true,
                         completion_port_suppressed,
                     );
-                } else if iosb_ok && status != STATUS_PENDING && !self.user_apc_redirected {
-                    self.xas_write_buf(iosb, &status.to_le_bytes());
-                    self.xas_write_buf(iosb + 8, &information.to_le_bytes());
                 }
                 if file_retained && status != STATUS_PENDING {
                     self.release_file_reference(completion_file_id);
@@ -43483,12 +43486,6 @@ impl ExecNtHandler {
                 // progress trigger; generic pending File I/O owns WRITE completion publication.
                 if routed && (status as i32) >= 0 {
                     self.pipe_endpoint_progress = true;
-                }
-                if operation_started && !terminal_file_owned && status != STATUS_PENDING {
-                    if let Some(index) = completion_event_index {
-                        let _ = self.signal_event_index(index);
-                        self.io_signal_event = index as i64;
-                    }
                 }
                 trace_named_pipe_io(
                     self.pi,
@@ -43601,6 +43598,9 @@ impl ExecNtHandler {
                 let apc_context = args[3];
                 let completion_port_suppressed =
                     nt_io_completion::io_event_suppresses_completion_port(event);
+                if let Err(status) = self.probe_file_io_output(iosb, None) {
+                    return status;
+                }
                 let disk_file = self.disk_file_for(fh);
                 let mut captured_offset_bytes = [0u8; 8];
                 let offset_ok =
@@ -43613,8 +43613,6 @@ impl ExecNtHandler {
                 let mut key_bytes = [0u8; 4];
                 let key_ok = key == 0 || self.xas_read(key, &mut key_bytes);
                 let key_value = u32::from_le_bytes(key_bytes);
-                let mut iosb_probe = [0u8; 16];
-                let iosb_ok = iosb != 0 && self.xas_read(iosb, &mut iosb_probe);
                 let apc_completion_conflict =
                     self.npfs_read_file_route_for(fh).ok().is_some_and(|route| {
                         apc_routine != 0 && self.file_completion.binding(route.file_id).is_some()
@@ -43626,6 +43624,8 @@ impl ExecNtHandler {
                     || self.hosted_file_access_for(fh).is_some_and(|access| {
                         access & (0x0000_0001 | 0x8000_0000 | 0x1000_0000) != 0
                     });
+                let hosted_read_route = (matches!(disk_file, Ok(None)) && overlay_file.is_none())
+                    .then(|| self.npfs_read_file_route_for(fh));
                 const OVERLAY_IO_CAP: usize = LOCAL_FILE_TRANSFER_CAP;
                 let output_capacity = if matches!(disk_file, Ok(Some(_))) || overlay_file.is_some()
                 {
@@ -43648,9 +43648,7 @@ impl ExecNtHandler {
                 let mut completion_event_index = None;
                 let mut completion_event_trace = Ok(None);
                 let mut operation_started = false;
-                let mut status = if !iosb_ok {
-                    0xC000_0005 // STATUS_ACCESS_VIOLATION
-                } else if !offset_ok || !key_ok {
+                let mut status = if !offset_ok || !key_ok {
                     0xC000_0005 // STATUS_ACCESS_VIOLATION
                 } else if !offset_semantics_ok {
                     STATUS_INVALID_PARAMETER
@@ -43662,8 +43660,12 @@ impl ExecNtHandler {
                     handle_status
                 } else if !overlay_read_access {
                     STATUS_ACCESS_DENIED
+                } else if let Some(Err(status)) = hosted_read_route.as_ref() {
+                    *status
                 } else if apc_completion_conflict {
                     STATUS_INVALID_PARAMETER
+                } else if let Err(status) = self.probe_copy_output(self.pi, buffer, len as u64) {
+                    status
                 } else {
                     match self.prepare_io_event_for_request(event) {
                         Err(event_status) => {
@@ -43697,7 +43699,7 @@ impl ExecNtHandler {
                                     Err(status) => status.raw() as u32,
                                     Ok(resolved) => {
                                         let offset = resolved.value();
-                                        match self.local_byte_lock_route_for(fh) {
+                                        match self.local_file_io_route_for(fh) {
                                             Ok(Some(route)) => {
                                                 match self.begin_local_file_io(route.file_object) {
                                                     Err(status) => status,
@@ -43721,11 +43723,14 @@ impl ExecNtHandler {
                                                             );
                                                         if lock_status != nt_fs::STATUS_SUCCESS {
                                                             lock_status
-                                                        } else if offset > u32::MAX as u64 {
-                                                            0xC000_000D // STATUS_INVALID_PARAMETER
                                                         } else if len == 0 {
                                                             nt_fs::STATUS_SUCCESS
-                                                        } else if offset as u32 >= file_size {
+                                                        } else if offset >= file_size as u64 {
+                                                            if synchronous {
+                                                                self.readonly_file_opens.get_mut(object_id)
+                                                                    .expect("retained FAT File disappeared at EOF")
+                                                                    .current_offset = offset;
+                                                            }
                                                             0xC000_0011 // STATUS_END_OF_FILE
                                                         } else {
                                                             match self.readonly_disk_read_to_user(
@@ -43737,18 +43742,15 @@ impl ExecNtHandler {
                                                             ) {
                                                                 Ok(read) => {
                                                                     information = read as u64;
-                                                                    if resolved
-                                                                        .advances_current_position()
+                                                                    let position = resolved.completion_position(
+                                                                        synchronous, len, nt_fs::STATUS_SUCCESS, read,
+                                                                    ).expect("FAT transfer fits its file extent");
+                                                                    if let Some(position) = position
                                                                     {
                                                                         self.readonly_file_opens
                                                                             .get_mut(object_id)
-                                                                            .expect(
-                                                                                "retained FAT File disappeared during read",
-                                                                            )
-                                                                            .current_offset = offset
-                                                                            .saturating_add(
-                                                                                read as u64,
-                                                                            );
+                                                                            .expect("retained FAT File disappeared during read")
+                                                                            .current_offset = position;
                                                                     }
                                                                     nt_fs::STATUS_SUCCESS
                                                                 }
@@ -43765,7 +43767,7 @@ impl ExecNtHandler {
                                 }
                             } else if let Some(file_id) = overlay_file {
                                 operation_started = true;
-                                let route = self.local_byte_lock_route_for(fh);
+                                let route = self.local_file_io_route_for(fh);
                                 let current = crate::writable_fs::current_offset(file_id);
                                 match (route, current) {
                                     (Ok(Some(route)), Some(current)) => {
@@ -43779,9 +43781,6 @@ impl ExecNtHandler {
                                             Err(status) => status.raw() as u32,
                                             Ok(resolved) => {
                                                 let actual_offset = resolved.value();
-                                                let explicit = (!resolved
-                                                    .advances_current_position())
-                                                .then_some(actual_offset);
                                                 match self.begin_local_file_io(route.file_object) {
                                                     Err(status) => status,
                                                     Ok(()) => {
@@ -43814,11 +43813,22 @@ impl ExecNtHandler {
                                                                     OVERLAY_IO_CAP,
                                                                 );
                                                             let (status, read) =
-                                                                crate::writable_fs::read_into(
+                                                                crate::writable_fs::read_backing_into(
                                                                     file_id,
-                                                                    explicit,
+                                                                    actual_offset,
                                                                     &mut scratch[..len],
                                                                 );
+                                                            let position = resolved.completion_position(
+                                                                route.synchronous, len, status, read,
+                                                            ).expect("regular file read reports bounded progress");
+                                                            crate::writable_fs::complete_read(
+                                                                file_id,
+                                                                actual_offset,
+                                                                len,
+                                                                status,
+                                                                read,
+                                                                position,
+                                                            );
                                                             if status == nt_fs::STATUS_SUCCESS
                                                                 && read != 0
                                                                 && !self.xas_try_write_buf(
@@ -43841,7 +43851,7 @@ impl ExecNtHandler {
                                     _ => nt_fs::STATUS_INVALID_HANDLE,
                                 }
                             } else {
-                                match self.npfs_read_file_route_for(fh) {
+                                match hosted_read_route.expect("nonlocal read retains its admitted route") {
                                     Err(handle_status) => {
                                         npfs_route_status = handle_status;
                                         handle_status
@@ -44060,7 +44070,7 @@ impl ExecNtHandler {
                         fh,
                         event,
                         iosb,
-                        iosb_ok,
+                        true,
                         buffer,
                         len,
                         byte_offset,

@@ -1510,11 +1510,51 @@ pub(crate) unsafe fn read(
 }
 
 /// Raw backing fragments, without logical position, access metadata, or read accounting.
-pub(crate) unsafe fn read_backing_into(file_id: u64, offset: u64, output: &mut [u8]) -> (u32, usize) {
+pub(crate) unsafe fn read_backing_into(
+    file_id: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> (u32, usize) {
     let Some(fs) = writable_fs() else {
         return (nt_fs::STATUS_INVALID_HANDLE, 0);
     };
     fs.read_backing_into(file_id, offset, output)
+}
+
+/// Complete one logical read independently of how many backing fragments were needed.
+pub(crate) unsafe fn complete_read(
+    file_id: u64,
+    offset: u64,
+    requested: usize,
+    status: u32,
+    transferred: usize,
+    position: Option<u64>,
+) {
+    let fs = writable_fs().expect("completed read retains its filesystem");
+    if status == nt_fs::STATUS_SUCCESS || transferred != 0 || position.is_some() {
+        assert_eq!(
+            fs.complete_read(file_id, transferred, position),
+            nt_fs::STATUS_SUCCESS
+        );
+    }
+    if status == nt_fs::STATUS_SUCCESS || transferred != 0 {
+        OVERLAY_READS.fetch_add(1, Ordering::Relaxed);
+        OVERLAY_BYTES_READ.fetch_add(transferred as u64, Ordering::Relaxed);
+    }
+    if transferred != 0 {
+        mark_snapshot_dirty();
+    }
+    if status != nt_fs::STATUS_SUCCESS {
+        trace_io_refusal(b"read", file_id, Some(offset), requested, status);
+    }
+}
+
+pub(crate) unsafe fn complete_file_position(file_id: u64, position: Option<u64>) {
+    let fs = writable_fs().expect("completed transfer retains its filesystem");
+    assert_eq!(
+        fs.complete_file_position(file_id, position),
+        nt_fs::STATUS_SUCCESS
+    );
 }
 
 /// `NtReadFile` on a writable-volume file object into caller-owned staging.
