@@ -195,6 +195,42 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
         }
     }
 
+    pub(crate) fn backing_pages(&self) -> impl Iterator<Item = (u64, u64, [u64; 2])> + '_ {
+        let stack = (0..self.stack_frames() as usize).map(|index| {
+            (
+                self.stack_base() + index as u64 * PAGE_SIZE,
+                self.stack_owner[index],
+                [self.stack_target[index], self.stack_mirror[index]],
+            )
+        });
+        let other = self.layout.into_iter().flat_map(|layout| {
+            [
+                (
+                    layout.teb.base,
+                    self.teb_owner,
+                    [self.teb_target, self.teb_scratch],
+                ),
+                (
+                    layout.teb.base + PAGE_SIZE,
+                    self.teb2_owner,
+                    [self.teb2_target, self.teb2_scratch],
+                ),
+                (
+                    layout.teb.base + 2 * PAGE_SIZE,
+                    self.acs_owner,
+                    [self.acs_target, 0],
+                ),
+                (layout.ipc.base, self.ipc_owner, [0, 0]),
+                (
+                    layout.trampoline.base,
+                    self.tramp_owner,
+                    [self.tramp_target, 0],
+                ),
+            ]
+        });
+        stack.chain(other)
+    }
+
     /// One physical owner per private page; copied target/mirror caps are aliases. Includes absent
     /// construction slots as zero, then validates and removes them. Registry and mechanism caps are
     /// intentionally not inferred: the native adapter must capture those additional owners exactly.
@@ -231,7 +267,7 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
     }
 }
 
-fn append_frame(
+pub(crate) fn append_frame(
     result: &mut Vec<ThreadRollbackResource>,
     owner: u64,
     aliases: &[u64],

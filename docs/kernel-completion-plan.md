@@ -124,10 +124,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add an atomic, retained multirow registry handoff that blocks ordinary removal and address
   reuse until exact final cleanup acknowledgement (tranche 57, host/build; native rollback
   acquisition not yet activated).
+- [x] Reconcile runtime physical owners with exact registry target/source/mirror aliases, using
+  explicit page coverage and full revalidation before handoff (tranche 58, host/build;
+  native rollback adapter not yet activated).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next reconcile registry/runtime physical-frame
-  ownership, then wire registered-resume failure with retained runtime/pool/window ownership,
-  once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
+  emptiness as a complete execution-quiescence proof. Next retain pending runtime/pool/window and
+  process-generation ownership, then wire registered-resume failure with once-only caller
+  cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
@@ -26599,6 +26602,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Pending runtime/control/pool/window lifetime, once-only caller cancellation, checked native retry,
     partial construction/main-process cleanup and handler-owned handoffs remain open. The win32k
     import barrier remains 33 unresolved code imports.
+
+    B3 thread/registry physical-owner reconciliation tranche 58 (2026-09-07, host/build green):
+    `nt-user-host::thread_registry` now captures a checked `ThreadRegistrySnapshot` from retained
+    thread resources and the Memory Manager's exact client-frame records. The caller supplies the
+    exhaustive expected registered-page subset; every other page in the retained stack, IPC,
+    TEB/activation-context and trampoline geometry must be absent. Empty coverage explicitly means
+    unregistered memory for any process index, and arbitrary subsets are supported without listener
+    roles or a process-index-zero exception. Invalid/duplicate coverage, incomplete physical owners,
+    wrong process/page/frame, missing rows and reclaiming/transferred rows are refused read-only.
+
+    Runtime `*_owner` caps are the sole physical Frame owners. A selected registry frame must equal
+    that page's owner or known target copy. Registry target/source/live-mirror copies become aliases
+    of the same page, regardless of the legacy registry `owns_frame` flag. The shared per-frame
+    inventory helper coalesces repeated references only within that physical page and refuses
+    cross-page capability reuse, including collisions against the unregistered ACS/IPC/trampoline
+    resources. Registry-only live or dormant copies are retained in the canonical rollback inventory.
+    Unselected registry records may neither overlap retained target geometry nor refer to any of its
+    captured capability slots, even from another process. Distinct cap numbers are not proof of
+    distinct physical frames: native registration provenance remains an explicit requirement.
+
+    Capture retains exact resource and registry snapshots. Allocation-free revalidation checks
+    changed resources, all selected record identities, newly present expected-absent pages and
+    newly shared cap slots before acquisition. `prepare_transfer` performs that complete validation
+    and tranche-57 handoff under one mutable registry borrow; failures leave both original owners
+    intact. An explicitly empty selection reports no registry transfer only after the same checks.
+    The existing rollback admission rejects TCB/mechanism collisions with registry-only aliases
+    before a physical cleanup owner is prepared. The snapshot itself is not that owner or a backend
+    progress journal and does not establish process-generation identity.
+
+    Validation: all 17 new tests pass, including native TEB target ownership, owner/target row
+    representations, same-page duplicate/dormant aliases, explicit zero/nonzero process coverage,
+    arbitrary registered backing pages, malformed/partial resources, cross-page/foreign cap reuse,
+    missing/unexpected/reclaiming rows, exact row replacement, newly present/shared rows at handoff,
+    and TCB/mechanism collision admission. The serialized nine-crate suite passes 975 tests, including
+    82 `nt-user-host` unit/integration tests. Logs: `.tmp/test-thread-registry-focused-20260907.log`
+    (initial 15 focused cases) and `.tmp/test-thread-registry-20260907.log` (all 17 and regressions).
+    The executive build passes at the unchanged 262-warning baseline and stages rootserver/hive;
+    log: `.tmp/build-thread-registry-20260907.log`. Two agents reviewed the host policy and native
+    provenance; root alone ran tests/builds. No live failure injection or desktop proof is claimed.
+
+    Review adjustment: host reconciliation is complete; do not turn it into a fallible native
+    post-construction rejection path that discards resources. Next retain a pending runtime with
+    exact PID/process generation, attempt and pool/window ownership before any fallible preparation.
+    Separate caller cancellation from final target commit and exclude pending runtime/control/badge
+    lookups. Capture external win32k attachments, copy aliases and diagnostic temporary mappings in
+    disjoint retry journals; publish every fault/copy/mirror/VM/pageout exclusion before transfer.
+    Then bind the reconciled inventory, registry transfer and checked physical backend into the
+    registered-resume rollback adapter. Native TEB registry flags and unchecked legacy cleanup are
+    unchanged in this host-first slice. Partial construction/main-process cleanup and handler-owned
+    handoffs remain open. The complete win32k import gate still has 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

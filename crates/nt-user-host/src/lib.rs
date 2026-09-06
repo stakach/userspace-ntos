@@ -17,6 +17,7 @@ mod services;
 pub mod thread_binding;
 pub mod thread_publication;
 pub mod thread_resources;
+pub mod thread_registry;
 pub mod thread_rollback;
 
 use alloc::vec::Vec;
