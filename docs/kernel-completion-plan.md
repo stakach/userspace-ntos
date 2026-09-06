@@ -87,10 +87,12 @@ below are historical baselines, not acceptance of the current provider cutover.
   (tranches 39-41, host/build validation).
 - [x] Flush all live mapped-file dirty pages through native `NtFlushBuffersFile`, with retained
   file ownership, checked completion, and an explicit storage checkpoint (tranche 42, host/build).
+- [x] Retain temporary section-writeback capabilities through checked deletion failures and block
+  scratch reuse, persistence, and frame retirement until cleanup succeeds (tranche 43, host/build).
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
   live refault/restart/power-loss tests. Unify ordinary file reads/writes and EOF changes with the
   shared control-area owner; complete storage-port abort/reset recovery without reusing device-owned
-  DMA. Retain temporary writeback alias capabilities through checked cleanup failures.
+  DMA.
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25911,6 +25913,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     results with a retry-owned capability cleanup queue, drained before canonical-frame retirement;
     physical-frame recycling must not be used for copied capability slots. Live refault/restart,
     termination flushing, allocation attributes, and the 33 unresolved win32k imports remain open.
+
+    B3 section scratch ownership tranche 43 (2026-09-06, host/build green):
+    The host-testable `section_scratch` policy now owns the copied capability before attempting a
+    scratch mapping, retains it when cleanup fails, and drains it before any later acquisition.
+    One serialized scratch mapping has at most one outstanding capability, so its persistent owner
+    needs no allocation or arbitrary-capacity queue. Mapping failure never runs the transfer;
+    cleanup failure after a write preserves the actual accepted bytes and the original backend
+    error, or converts an otherwise successful transfer into a failure. The existing whole-batch
+    writeback owner therefore keeps dirty tickets and does not checkpoint on incomplete cleanup.
+
+    `service_section_scratch.rs` binds that policy to real capability copy, read-only mapping, and
+    checked `CNode_Delete` plus root-slot recycling. The old ignored unmap/delete sequence is removed.
+    The current rust-micro `CNode_Delete` finalizes the exact frame-cap mapping, including PTE/TLB
+    teardown, before clearing the cap. It also accepts an already-empty slot, so canonical-owner
+    revoke cannot strand a deferred capability in an endless failed `PageUnmap` retry. Only the
+    copied slot is recycled; it never enters the physical frame recycler. Persistence, including
+    clean/uncached-file flushes, drains pending scratch ownership first. The service-loop retirement
+    barrier drains it before unpublished frames, canonical frames, or their backing references.
+    The executive adapter explicitly permits only serialized transfers without hosted callback or
+    event-pump reentry; a future asynchronous adapter needs admission before borrowing this owner.
+
+    Validation: 131 `nt-memory-manager`, 157 `nt-address-space`, 138 `nt-fs`, and 10 `nt-ahci`
+    tests pass (436 total). Ten new tests cover exact-once deletion, invalid frames and copy
+    refusal, map refusal, retained failed cleanup, blocked scratch reuse, original-error and accepted
+    byte preservation, acknowledgement after owner revoke, dirty-batch retry without premature
+    checkpointing, clean/uncached-file flush cleanup, and alias-before-frame/backing retirement. Logs:
+    `.tmp/test-section-scratch-20260906.log` and `.tmp/build-section-scratch-20260906.log`.
+    The executive build passes with the existing 256 warnings and stages rootserver and hive.
+    Root alone ran serialized builds/tests; two
+    research agents reviewed capability semantics, reentry, and ordinary file-I/O boundaries.
+    No QEMU, live capability fault injection, or desktop acceptance is claimed.
+
+    Review adjustment: scratch cleanup is closed at the host/build boundary. The next coherent-I/O
+    slice must preflight every touched canonical mapping before backend mutation, then apply only
+    the accepted write prefix without further fallible mapping work. Preserve unrelated mapped dirty
+    bytes and private COW pages; zero newly valid partial-EOF gaps instead of exposing page padding.
+    Read/write activation must also cover or safely exclude internal hive write/truncate/replacement,
+    append helpers, and EOF/allocation/valid-data-length mutation, not merely `NtReadFile` and
+    `NtWriteFile`. Keep raw page-in/writeback adapters nonrecursive. Fix native writable IOSB probes,
+    append-only local route admission, and explicit position completion in that same boundary.
+    The ordinary-I/O, live refault/persistence, and 33-import win32k frontiers remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

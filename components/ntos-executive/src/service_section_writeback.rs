@@ -41,28 +41,18 @@ impl SectionWritebackIo for WritebackIo {
 
     fn write_page(&mut self, page: SectionWritebackPage) -> (u32, usize) {
         unsafe {
-            let scratch = self.scratch_base + DEMAND_SCRATCH_WINDOW - 0x4000;
-            let (alias, error) = copy_cap_r(page.frame);
-            if error != 0 {
-                if alias != 0 {
-                    let _ = cnode_delete_recycle_r(alias);
-                }
-                return (nt_address_space::STATUS_INSUFFICIENT_RESOURCES, 0);
-            }
-            if page_map_r(alias, scratch, RO_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-                let _ = cnode_delete_recycle_r(alias);
-                return (nt_address_space::STATUS_INSUFFICIENT_RESOURCES, 0);
-            }
-            let bytes = core::slice::from_raw_parts(scratch as *const u8, page.length);
-            let result = crate::writable_fs::write(self.file_id, Some(page.file_offset), bytes);
-            let _ = page_unmap_r(alias);
-            let _ = cnode_delete_recycle_r(alias);
-            result
+            section_scratch::with_section_frame(page.frame, self.scratch_base, |scratch| {
+                let bytes = core::slice::from_raw_parts(scratch as *const u8, page.length);
+                crate::writable_fs::write(self.file_id, Some(page.file_offset), bytes)
+            })
         }
     }
 
     fn persist(&mut self) -> u32 {
         unsafe {
+            if let Err(status) = section_scratch::drain_section_scratch() {
+                return status;
+            }
             let status = crate::writable_fs::flush(self.file_id);
             if status != 0 {
                 return status;

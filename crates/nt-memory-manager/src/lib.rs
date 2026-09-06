@@ -26,6 +26,7 @@ mod copy_context;
 pub mod data_section;
 mod private_backing;
 mod runtime_section;
+pub mod section_scratch;
 mod working_set;
 
 pub use client_frame::{

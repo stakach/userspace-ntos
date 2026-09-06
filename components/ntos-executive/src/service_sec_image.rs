@@ -3634,6 +3634,8 @@ fn generic_section_mark_dirty_if_backed(
 
 #[path = "service_section_writeback.rs"]
 mod section_writeback;
+#[path = "service_section_scratch.rs"]
+mod section_scratch;
 #[path = "service_section_retirement.rs"]
 mod section_retirement;
 pub(crate) use section_retirement::{service_drain_section_retirement, service_unmap_section_view_mappings};

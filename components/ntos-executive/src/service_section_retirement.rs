@@ -49,6 +49,7 @@ impl SectionRetirementIo for RetirementIo {
 pub(crate) unsafe fn service_drain_section_retirement(
     table: &mut GenericSectionTable,
 ) -> Result<(), u32> {
+    section_scratch::drain_section_scratch()?;
     (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).drain(&mut RetirementIo)?;
     table.drain_retired(&mut RetirementIo)
 }
