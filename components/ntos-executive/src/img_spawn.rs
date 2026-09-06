@@ -1,7 +1,5 @@
 //! `img_spawn` — PE image build/spawn + SEC_IMAGE spawn (spawn_sec_image) +
-//! the smss/csrss cross-AS memory access helpers (smss_stack_*/smss_copyin/out/
-//! csrss_out_write/scratch_for) + reloc/rva helpers. Extracted verbatim from
-//! `main.rs` (pure reorg; no logic change).
+//! cross-address-space memory access helpers and relocation/RVA helpers.
 #![allow(clippy::all)]
 use crate::*;
 
@@ -2178,55 +2176,6 @@ pub(crate) unsafe fn client_copyout_or_fill_mapped(
         copied += chunk;
     }
     true
-}
-/// Write a u64 OUT-param to a csrss VA that may live ANYWHERE in its VSpace — not just the
-/// stack/heap/image mirrors, but also a csrsrv .data global (~0x8001xxxx). Tries the mirrors
-/// (smss_copyout), then an already-faulted page's scratch alias, then — for a not-yet-faulted csrsrv
-/// page — demand-fills it and writes. csrss stores load-bearing handles/bases here (the CSR section
-/// handle, CsrSrvSharedSectionBase), so a silent miss leaves them NULL and later NULL-derefs.
-pub(crate) unsafe fn csrss_out_write(
-    pi: u64,
-    va: u64,
-    val: u64,
-    filled_pages: &mut [u64; 512],
-    faults: &mut u64,
-    scratch_base: u64,
-    reg: &nt_dll_registry::Registry,
-    dll_pes: &[Option<nt_pe_loader::PeFile>],
-    pml4: u64,
-) -> bool {
-    if ACTIVE_CLIENT_PI.load(Ordering::Relaxed) == pi && smss_copyout(va, &val.to_le_bytes()) {
-        return true;
-    }
-    if va & 0xFFF > 0xFF8 {
-        return false;
-    }
-    let page = va & !0xFFFu64;
-    let mut sva = scratch_for(va, filled_pages, *faults as usize, scratch_base);
-    // A not-yet-faulted page that belongs to a mapped registry DLL (e.g. a csrsrv/basesrv .data
-    // global): demand-fill it from that DLL's PE so the write lands (a silent miss leaves a
-    // load-bearing handle/base NULL → later NULL-deref).
-    if sva.is_none() && (*faults as usize) < filled_pages.len() {
-        if let Some((i, rva)) = reg.dll_for_page(pi as usize, page) {
-            if let Some(pe) = dll_pes[i].as_ref() {
-                let scratch = scratch_base + *faults * 0x1000;
-                let f = alloc_frame();
-                let _ = page_map(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                let rights = fill_image_page(pe, rva, scratch);
-                let _ = page_map(copy_cap(f), page, rights, pml4);
-                filled_pages[*faults as usize] = page;
-                sva = Some(scratch + (va & 0xFFF));
-                *faults += 1;
-            }
-        }
-    }
-    if let Some(m) = sva {
-        let bytes = val.to_le_bytes();
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), m as *mut u8, bytes.len());
-        true
-    } else {
-        false
-    }
 }
 /// Read a UTF-16LE UNICODE_STRING (given its byte Length + Buffer VA) from smss into a UTF-16
 /// code-unit Vec. Caps at 1024 code units. Empty on any copyin failure.

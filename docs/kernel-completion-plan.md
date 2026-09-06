@@ -60,8 +60,11 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Account for registered private backing across reprotection, eviction, restoration, and unmap;
   admit new private pages through the shared image-residency operation and remove duplicate prefetch
   fills (tranche 29, host/build validation).
-- [ ] Replace legacy copyout-only image fills with checked residency/ownership/commitment publication;
-  complete main-image mirror teardown and genuine shared-writable image/control-area backing.
+- [x] Route native user-memory outputs through checked mutable copying and remove the standalone
+  section-output image filler (tranche 30, host/build validation).
+- [ ] Migrate remaining legacy XAS copyout callers to checked residency/ownership/commitment
+  publication, then remove their image filler. Remove the untracked fixed main-image mirror and
+  complete genuine shared-writable image/control-area backing.
   Carry explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
@@ -25304,6 +25307,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Keep nonimage CopyOnWrite VAD policy, stack-guard expansion/overflow, ordinary CPU guard delivery,
     physical remap/fill failure injection, and live MM/SEH/desktop acceptance open. The 33-import
     win32k barrier is unchanged and has not been bypassed.
+
+    B3 checked native-output tranche 30 (2026-09-06, host/build green):
+    `user_memory_write` is now a mutable operation in `exec_virtual_memory_copy.rs`, using the
+    existing `copy_write_page` access/guard/residency/COW/ownership path. It no longer delegates
+    native outputs to legacy XAS mirror/fill retries. The shared `nt-address-space::copy` kernel
+    buffer writer validates the complete destination ceiling/overflow before writing, splits
+    unaligned and cross-page outputs into exact slices, stops on the first failed chunk, and does
+    not pad tails or retry through another alias. Completed prefixes retain normal copy semantics.
+
+    All six `NtCreateSection` / `NtMapViewOfSection` scalar-output sites use this same native
+    boundary, and the separate `img_spawn::csrss_out_write` raw-PE demand filler is deleted. Four
+    map-view outputs previously ignored write failure; they now return failure instead of reporting
+    success with an unpublished base or size. Query-object output helpers are mutable as required
+    by residency. Obsolete caller-local fill counters, PE references, and stale comments were
+    removed. The image-map branch ends its exclusive registry borrow before checked copyout can
+    read that registry through nested residency.
+
+    Validation: all 130 `nt-address-space` and 42 `nt-memory-manager` tests pass. Six new host tests
+    cover unaligned cross-page scalar output with intact neighbors, overflow/ceiling rejection
+    before any write, empty buffers, first-page admission failure, later-page failure with exact
+    status/no retry, and alignment/tail combinations. The executive build passes with the existing
+    256 warnings. Logs: `.tmp/test-native-copyout-20260906.log` and
+    `.tmp/build-native-copyout-20260906.log`. Review confirmed the checked copy chain is nonrecursive;
+    it enters residency and ends at backed-page copying, not the XAS writer. No QEMU boot was run.
+
+    Review adjustment: native user-memory output migration is closed, not all copyout. The remaining
+    `client_copyout_or_fill_mapped` callers are legacy XAS scalar/buffer helpers with shared receivers;
+    propagate a mutable checked-copy boundary through those callers and deferred completions before
+    deleting that filler and its separate COW promotion helpers. The native boolean output adapter
+    retains existing service-level failure translation; complete exception/status propagation and
+    write probing separately rather than claiming full guard delivery here. Failed section-output
+    publication now reports failure but full object/view rollback on late output faults still needs
+    explicit transactional validation.
+
+    Mirror audit: the successful main-image fixed mirror cap is not in the frame registry. COW
+    retargets the registered scratch alias but leaves that mirror stale; eviction/restore and frame
+    reclaim cannot retire its untracked cap. Remove the main-image mirror producer, translation,
+    runtime fields, active selectors, and unused paging setup. Existing recorded-frame aliases or
+    temporary aliases of owned frame caps already provide resident image access after COW/restore;
+    retain stack/heap mirrors separately. Audit partial-reclaim alias flags as part of that change.
+    Shared-writable control-area backing, nonimage CopyOnWrite VAD policy, stack-guard growth,
+    ordinary CPU guard delivery, and live MM/SEH/desktop acceptance remain open behind the unchanged
+    33-import win32k barrier.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

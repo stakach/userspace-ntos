@@ -17852,12 +17852,6 @@ impl ExecNtHandler {
         }
     }
 
-    unsafe fn user_memory_write(&self, memory: SyscallUserMemory, va: u64, src: &[u8]) -> bool {
-        match memory {
-            SyscallUserMemory::CurrentProcess => self.xas_try_write_buf(va, src),
-        }
-    }
-
     unsafe fn user_memory_probe_output(
         &self,
         memory: SyscallUserMemory,
@@ -18315,7 +18309,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_query_object_return_length(
-        &self,
+        &mut self,
         memory: SyscallUserMemory,
         return_length: u64,
         needed: u32,
@@ -18330,7 +18324,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_query_object_type_record(
-        &self,
+        &mut self,
         memory: SyscallUserMemory,
         record_va: u64,
         type_name: &[u8],
@@ -18359,7 +18353,7 @@ impl ExecNtHandler {
     }
 
     unsafe fn write_query_object_all_types(
-        &self,
+        &mut self,
         memory: SyscallUserMemory,
         information: u64,
     ) -> bool {
@@ -18392,7 +18386,7 @@ impl ExecNtHandler {
     }
 
     pub(crate) unsafe fn nt_query_object_with_user_memory(
-        &self,
+        &mut self,
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> u32 {
@@ -45251,9 +45245,6 @@ impl ExecNtHandler {
                 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
-                let dll_pes = ctx.dll_pes();
-                let filled_pages = &mut *ctx.filled_pages;
-                let faults = &mut *ctx.faults;
                 let out = args[0];
                 let desired_access = nt_ulong_arg(args[1]);
                 let maxsize_ptr = args[3];
@@ -45309,16 +45300,10 @@ impl ExecNtHandler {
                                 print_str(b"\n");
                             }
                         }
-                        if !csrss_out_write(
-                            self.pi as u64,
+                        if !self.user_memory_write(
+                            SyscallUserMemory::CurrentProcess,
                             out,
-                            h,
-                            filled_pages,
-                            faults,
-                            ctx.scratch_base,
-                            reg,
-                            dll_pes,
-                            ctx.pml4,
+                            &h.to_le_bytes(),
                         ) {
                             return STATUS_ACCESS_VIOLATION;
                         }
@@ -45423,16 +45408,10 @@ impl ExecNtHandler {
                     let _ = self.close_process_handle(caller_pid, h);
                     return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                 }
-                if !csrss_out_write(
-                    self.pi as u64,
+                if !self.user_memory_write(
+                    SyscallUserMemory::CurrentProcess,
                     out,
-                    h,
-                    filled_pages,
-                    faults,
-                    ctx.scratch_base,
-                    reg,
-                    dll_pes,
-                    ctx.pml4,
+                    &h.to_le_bytes(),
                 ) {
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -45470,10 +45449,7 @@ impl ExecNtHandler {
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
                 let dll_pes = ctx.dll_pes();
-                let filled_pages = &mut *ctx.filled_pages;
-                let faults = &mut *ctx.faults;
                 let pml4 = ctx.pml4;
-                let scratch_base = ctx.scratch_base;
                 let sect = args[0];
                 if let Some(i) = reg.index_for_section(self.pi, sect) {
                     // Reserve every 2 MiB PT window touched by this DLL's compact VA range. Compact
@@ -45551,30 +45527,24 @@ impl ExecNtHandler {
                             return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
                         }
                         self.commit_process_commit_charge(prepared_commit);
-                        csrss_out_write(
-                            self.pi as u64,
+                        // Checked copyout can enter image residency, which reads this registry.
+                        let reg = &*ctx.reg;
+                        if !self.user_memory_write(
+                            SyscallUserMemory::CurrentProcess,
                             args[2],
-                            dbase,
-                            filled_pages,
-                            faults,
-                            scratch_base,
-                            reg,
-                            dll_pes,
-                            pml4,
-                        ); // *BaseAddress
+                            &dbase.to_le_bytes(),
+                        ) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
                         let vs_ptr = args[6];
                         if vs_ptr != 0 {
-                            csrss_out_write(
-                                self.pi as u64,
+                            if !self.user_memory_write(
+                                SyscallUserMemory::CurrentProcess,
                                 vs_ptr,
-                                ext,
-                                filled_pages,
-                                faults,
-                                scratch_base,
-                                reg,
-                                dll_pes,
-                                pml4,
-                            );
+                                &ext.to_le_bytes(),
+                            ) {
+                                return STATUS_ACCESS_VIOLATION;
+                            }
                         }
                         if !self.current_process_is_winlogon() {
                             print_str(b"[ntos-exec] NtMapViewOfSection ");
@@ -45649,30 +45619,22 @@ impl ExecNtHandler {
                             pml4,
                         );
                     }
-                    csrss_out_write(
-                        self.pi as u64,
+                    if !self.user_memory_write(
+                        SyscallUserMemory::CurrentProcess,
                         args[2],
-                        NLS_SECTION_CSRSS_VA,
-                        filled_pages,
-                        faults,
-                        scratch_base,
-                        reg,
-                        dll_pes,
-                        pml4,
-                    ); // *BaseAddress
+                        &NLS_SECTION_CSRSS_VA.to_le_bytes(),
+                    ) {
+                        return STATUS_ACCESS_VIOLATION;
+                    }
                     let vs_ptr = args[6];
                     if vs_ptr != 0 {
-                        csrss_out_write(
-                            self.pi as u64,
+                        if !self.user_memory_write(
+                            SyscallUserMemory::CurrentProcess,
                             vs_ptr,
-                            nls_size,
-                            filled_pages,
-                            faults,
-                            scratch_base,
-                            reg,
-                            dll_pes,
-                            pml4,
-                        );
+                            &nls_size.to_le_bytes(),
+                        ) {
+                            return STATUS_ACCESS_VIOLATION;
+                        }
                     }
                     print_str(b"[ntos-exec] NtMapViewOfSection NlsCP20127 -> base 0xA0000000\n");
                     loader_trace_record(

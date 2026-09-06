@@ -53,6 +53,24 @@ impl VirtualMemoryCopy for ProcessMemoryCopy<'_> {
 }
 
 impl ExecNtHandler {
+    pub(super) unsafe fn user_memory_write(
+        &mut self,
+        memory: SyscallUserMemory,
+        address: u64,
+        input: &[u8],
+    ) -> bool {
+        let pi = match memory {
+            SyscallUserMemory::CurrentProcess => self.pi,
+        };
+        nt_address_space::copy::write_kernel_buffer(
+            address,
+            input,
+            USER_ADDRESS_LIMIT,
+            |va, bytes| self.copy_write_page(pi, va, bytes),
+        )
+        .is_ok()
+    }
+
     unsafe fn prepare_copy_page(
         &mut self,
         pi: usize,

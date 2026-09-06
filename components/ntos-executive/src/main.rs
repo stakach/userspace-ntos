@@ -23988,8 +23988,7 @@ struct ExecLoopCtx {
     /// creation. `NtCreateProcess` consumes this as the target authority instead of re-resolving
     /// static leaf metadata at spawn time.
     exe_image_catalog: *mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
-    /// The active process's demand-fill bookkeeping (page VA per fault index) + fault count — the
-    /// same locals `csrss_out_write` mutates. NtQueryDefaultLocale demand-fills an image .data page.
+    /// The active process's demand-fill bookkeeping, shared by faults and checked native copies.
     filled_pages: *mut [u64; 512],
     faults: *mut u64,
     /// The faulting image's persistent executive scratch base (smss's), and the two images
@@ -24451,11 +24450,7 @@ struct ExecNtHandler {
     /// the remaining ladder cases reference `nt_handler.next_handle`). Migrated off the loop-local
     /// `next_handle` when the create-handle group moved onto the table (Workstream A, group A).
     next_handle: u64,
-    /// Queued out-param writes (Workstream A group B2): out-writing query handlers (NtQuerySystemTime
-    /// /PerformanceCounter/VolumeInformationFile) push `(ptr, value)` here instead of writing
-    /// directly, because a csrss out-ptr can be an arbitrary VA that needs the loop's demand-fill
-    /// bookkeeping (filled_pages/faults/scratch/reg/dll_pes/pml4). The dispatch loop drains this
-    /// after `dispatch`, writing each via `csrss_out_write` (csrss) or `smss_stack_write` (smss).
+    /// Deferred scalar outputs drained by the service loop after dispatch.
     out_writes: [(u64, u64); 8],
     out_writes_n: usize,
     /// Raw refs to the loop's per-iteration state for group-C handlers (see [`ExecLoopCtx`]). Set

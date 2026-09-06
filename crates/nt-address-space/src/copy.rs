@@ -39,6 +39,37 @@ pub trait WriteProbeMemory {
     fn write_byte(&mut self, address: u64, value: u8) -> Result<(), u32>;
 }
 
+/// Copy stable kernel bytes through exact page-contained writes. Validate the whole destination
+/// range first; a later fault preserves completed chunks and never retries via another alias.
+pub fn write_kernel_buffer(
+    address: u64,
+    input: &[u8],
+    user_limit: u64,
+    mut write_page: impl FnMut(u64, &[u8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    if input.is_empty() {
+        return Ok(());
+    }
+    address
+        .checked_add(input.len() as u64)
+        .filter(|end| *end <= user_limit)
+        .ok_or(STATUS_ACCESS_VIOLATION)?;
+    let chunks = crate::page_chunks(address, input.len()).ok_or(STATUS_ACCESS_VIOLATION)?;
+    let mut copied = 0;
+    for chunk in chunks {
+        write_page(
+            address + copied as u64,
+            &input[copied..copied + chunk.length],
+        )?;
+        copied += chunk.length;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "copy_kernel_buffer_tests.rs"]
+mod kernel_buffer_tests;
+
 /// The native SIZE_T output probe captures the complete value before its self-write. This differs
 /// from probing a range page by page when an unaligned count straddles a guard page.
 pub fn probe_write_u64(memory: &mut impl WriteProbeMemory, address: u64) -> Result<(), u32> {
