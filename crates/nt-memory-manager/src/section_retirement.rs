@@ -22,6 +22,47 @@ pub trait SectionRetirementIo {
     fn release_backing(&mut self, backing: GenericSectionBacking) -> Result<(), u32>;
 }
 
+/// Frames whose page-in failed before publication still need checked physical release.
+pub struct PendingSectionFrames {
+    frames: Vec<u64>,
+}
+
+impl PendingSectionFrames {
+    pub const fn new() -> Self {
+        Self { frames: Vec::new() }
+    }
+
+    /// Reserve the failure path before acquiring a frame; deferral must not allocate under failure.
+    pub fn reserve(&mut self) -> bool {
+        self.frames.try_reserve(1).is_ok()
+    }
+
+    pub fn release_or_defer(&mut self, frame: u64, io: &mut impl SectionRetirementIo) {
+        assert!(frame != 0 && !self.frames.contains(&frame));
+        assert!(
+            self.frames.len() < self.frames.capacity(),
+            "page-in reserves its cleanup owner"
+        );
+        if io.release_frame(frame).is_err() {
+            self.frames.push(frame);
+        }
+    }
+
+    pub fn drain(&mut self, io: &mut impl SectionRetirementIo) -> Result<(), u32> {
+        while let Some(frame) = self.frames.last().copied() {
+            io.release_frame(frame)?;
+            self.frames.pop();
+        }
+        Ok(())
+    }
+}
+
+impl Default for PendingSectionFrames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GenericSectionTable {
     pub fn next_retirement(&self) -> Option<SectionRetirement> {
         let (section_index, section) = self

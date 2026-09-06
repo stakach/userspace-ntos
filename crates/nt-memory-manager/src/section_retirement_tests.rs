@@ -26,6 +26,27 @@ impl SectionRetirementIo for Release {
     }
 }
 
+#[test]
+fn failed_unpublished_frames_remain_owned_until_checked_retry() {
+    let mut pending = PendingSectionFrames::new();
+    let mut io = Release {
+        fail_frame: Some(100),
+        ..Release::default()
+    };
+    assert!(pending.reserve());
+    pending.release_or_defer(100, &mut io);
+    assert!(pending.reserve());
+    pending.release_or_defer(101, &mut io);
+    assert_eq!(io.frames, [101]);
+    assert_eq!(pending.drain(&mut io), Err(0xc000_009a));
+    assert_eq!(io.frames, [101]);
+    io.fail_frame = None;
+    pending.drain(&mut io).unwrap();
+    pending.drain(&mut io).unwrap();
+    assert_eq!(io.frames, [101, 100]);
+    assert!(io.files.is_empty());
+}
+
 fn section(table: &mut GenericSectionTable) -> usize {
     table
         .create(

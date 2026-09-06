@@ -25760,6 +25760,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     persistence tests remain open. No QEMU, desktop, or physical persistence acceptance is claimed;
     the 33-import win32k gate is unchanged.
 
+    B3 data-section admission/page-in tranche 40 (2026-09-06, host/build green):
+    The control-area review exposed two prerequisites: generic section creation previously accepted
+    MaximumSize beyond EOF without extending the file, and FAT page-in ignored short reads before
+    publishing a partially filled canonical frame. The new host-testable `data_section` module
+    defines exact data-file access, sizing, and page-read contracts; the executive's corresponding
+    mechanism lives in focused `service_section_pagein.rs`. The old inline fill machinery is removed.
+
+    Data-section creation now uses the NT5 protection-to-file-access table, including execute-only
+    access and read-only file access for private COW. Caller handle width, identity, and granted
+    rights are validated before file mutation; output memory is probed before sizing. Invalid
+    protections return native `STATUS_INVALID_PAGE_PROTECTION` (corrected from the old DATA_ERROR
+    numeric value in `nt-memory-manager`). Zero requested size selects current EOF; empty files,
+    directories, negative sizes, and excessive extents fail explicitly. Positive data extents above
+    NT5's `(1 << 54) - 4096` bound are rejected before extension. Only shared-writable protections
+    extend a writable file, through real FileEndOfFileInformation followed by checked EOF re-query.
+    Backend failures propagate unchanged; a failed re-query does not pretend the preceding extension
+    was rolled back. The immutable boot mount rejects shared-writable sections even without extension,
+    while allowing private COW. Anonymous zero/negative sizes receive the native size errors.
+
+    Page-in queries current backing EOF and reads the complete file prefix into bounded temporary
+    storage before acquiring a physical frame. A smaller section does not shorten a file page read.
+    Only the suffix beyond actual EOF is zero-filled; short/oversized success, EOF in the required
+    prefix, device errors, range overflow, and whole pages past current EOF never publish a frame.
+    Overlay I/O uses the existing allocation-free `read_into` adapter. Failed mapping, owner unmap,
+    or table publication uses a pre-reserved pending-frame owner and the checked retirement mechanism;
+    failed cleanup remains queued for retry at the service barrier rather than entering the free list.
+
+    Validation: 94 `nt-memory-manager`, 157 `nt-address-space`, 135 `nt-fs`, and 10 `nt-ahci` tests
+    pass (396 total). Seventeen new tests cover all protection/access combinations, generic rights,
+    sizing and immutable-storage refusals, failed/inconsistent re-query, exact EOF-prefix reads,
+    short/error reads, truncation of unresident pages, actual MemFs extension/readback, and deferred
+    frame cleanup. Logs: `.tmp/test-section-pagein-20260906.log` and
+    `.tmp/build-section-pagein-20260906.log`. The executive build passes with the existing 256
+    warnings. Root serialized every build/test; two research agents reviewed the reference contracts
+    and implementation without running builds or tests.
+
+    Review adjustment: admission and unresident-page correctness are complete prerequisites, not
+    shared-control-area acceptance. Next allocate live mount-instance identities, combine them with
+    stable backing file IDs (overlay node ID; FAT parent-directory/entry ID), and move page/dirty
+    ownership to generation-bound control areas. Keep per-section size/protection independent; use
+    actual backing extent for shared-page flush lengths so a short sibling cannot clean a partially
+    written page. Retiring areas must not be revived after final frame release starts. Resident-page
+    truncation/extension coherence, full allocation-attribute validation, remaining output contracts,
+    and integrated persistence tests remain open. No QEMU or desktop acceptance is claimed; the
+    33-import win32k gate is unchanged.
+
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
     converting channels. Build one lane-channel resolver over the physical catalog, and route every

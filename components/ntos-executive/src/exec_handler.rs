@@ -44792,7 +44792,6 @@ impl ExecNtHandler {
                 const SEC_IMAGE: u32 = 0x0100_0000;
                 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
                 const STATUS_INVALID_FILE_FOR_SECTION: u32 = 0xC000_0020;
-                const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
                 let ctx = self.loop_ctx.unwrap();
                 let reg = &mut *ctx.reg;
                 let out = args[0];
@@ -44880,56 +44879,56 @@ impl ExecNtHandler {
                     return STATUS_INVALID_FILE_FOR_SECTION;
                 }
 
-                if let Err(status) = nt_address_space::validate_allocate_parameters(
-                    0,
-                    nt_address_space::MEM_COMMIT,
-                    page_protection,
-                ) {
+                if let Err(status) = nt_memory_manager::data_section::data_section_file_access(page_protection) {
                     return status;
                 }
-
-                let (backing, backing_size) = if sec_file == 0 {
-                    if maxsize == 0 {
-                        return STATUS_INVALID_PARAMETER;
-                    }
-                    (GenericSectionBacking::anonymous(), maxsize)
-                } else {
-                    match self.disk_file_for(sec_file) {
-                        Err(status) => return status,
-                        Ok(Some((first_cluster, file_size, _object_id))) => {
-                            let size = if maxsize == 0 {
-                                file_size as u64
-                            } else {
-                                maxsize
-                            };
-                            (GenericSectionBacking::disk(first_cluster, file_size), size)
-                        }
-                        Ok(None) => {
-                            if let Some(file_id) = self.overlay_file_id_for(sec_file) {
-                                let Some(info) = crate::writable_fs::standard_information(file_id)
-                                else {
-                                    return nt_fs::STATUS_INVALID_HANDLE;
-                                };
-                                if info.is_directory {
-                                    return STATUS_INVALID_FILE_FOR_SECTION;
-                                }
-                                let size = if maxsize == 0 {
-                                    info.end_of_file
-                                } else {
-                                    maxsize
-                                };
-                                (GenericSectionBacking::overlay(file_id), size)
-                            } else {
-                                return STATUS_INVALID_FILE_FOR_SECTION;
-                            }
-                        }
-                    }
-                };
-                if backing_size == 0 {
-                    return STATUS_INVALID_PARAMETER;
+                if !self.probe_user_output(out, core::mem::size_of::<u64>()) {
+                    return STATUS_ACCESS_VIOLATION;
                 }
                 let Some(caller_pid) = self.pm_pid_for_pi(self.pi) else {
                     return nt_fs::STATUS_INVALID_HANDLE;
+                };
+
+                let (backing, backing_size) = if sec_file == 0 {
+                    if maxsize == 0 {
+                        return 0xc000_00f2; // STATUS_INVALID_PARAMETER_4
+                    }
+                    if maxsize > i64::MAX as u64 {
+                        return nt_memory_manager::STATUS_SECTION_TOO_BIG;
+                    }
+                    (GenericSectionBacking::anonymous(), maxsize)
+                } else {
+                    let Ok(file_handle) = nt_process::Handle::try_from(sec_file) else {
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    };
+                    let Some(object) = self.pm.lookup_handle(caller_pid, file_handle) else {
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    };
+                    let Some(access) = self.pm.handle_access(caller_pid, file_handle) else {
+                        return nt_fs::STATUS_INVALID_HANDLE;
+                    };
+                    let backing = match object {
+                        nt_process::HandleObject::DiskFile { first_cluster, size, object_id } => {
+                            let open = match self.readonly_file_opens.get(object_id) {
+                                Ok(open) => open,
+                                Err(status) => return status,
+                            };
+                            if open.first_cluster != first_cluster || open.size != size {
+                                return nt_fs::STATUS_INVALID_HANDLE;
+                            }
+                            if open.metadata.is_directory {
+                                return STATUS_INVALID_FILE_FOR_SECTION;
+                            }
+                            GenericSectionBacking::disk(first_cluster, size)
+                        }
+                        nt_process::HandleObject::OverlayFile(file_id) => GenericSectionBacking::overlay(file_id),
+                        _ => return STATUS_INVALID_FILE_FOR_SECTION,
+                    };
+                    let size = match service_prepare_data_section_file(backing, maxsize, page_protection, access) {
+                        Ok(size) => size,
+                        Err(status) => return status,
+                    };
+                    (backing, size)
                 };
                 let generic_sections = &mut *ctx.generic_sections;
                 if backing.kind == GENERIC_SECTION_BACKING_OVERLAY {

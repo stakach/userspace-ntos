@@ -1,6 +1,21 @@
 //! Section resource release after explicit view/handle retirement.
 use super::*;
-use nt_memory_manager::{GenericSectionBacking, SectionRetirementIo};
+use nt_memory_manager::{GenericSectionBacking, PendingSectionFrames, SectionRetirementIo};
+
+static mut PENDING_PAGEIN_FRAMES: PendingSectionFrames = PendingSectionFrames::new();
+
+pub(super) unsafe fn reserve_pagein_cleanup() -> Result<(), u32> {
+    if (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).reserve() {
+        Ok(())
+    } else {
+        Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+    }
+}
+
+pub(super) unsafe fn release_unpublished_section_frame(frame: u64) {
+    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES))
+        .release_or_defer(frame, &mut RetirementIo);
+}
 
 struct RetirementIo;
 
@@ -34,6 +49,7 @@ impl SectionRetirementIo for RetirementIo {
 pub(crate) unsafe fn service_drain_section_retirement(
     table: &mut GenericSectionTable,
 ) -> Result<(), u32> {
+    (&mut *core::ptr::addr_of_mut!(PENDING_PAGEIN_FRAMES)).drain(&mut RetirementIo)?;
     table.drain_retired(&mut RetirementIo)
 }
 

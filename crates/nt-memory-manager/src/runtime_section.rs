@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 #[path = "section_retirement.rs"]
 mod retirement;
-pub use retirement::{SectionRetirement, SectionRetirementIo, SectionRetirementResource};
+pub use retirement::{PendingSectionFrames, SectionRetirement, SectionRetirementIo, SectionRetirementResource};
 
 use crate::{PAGE_NOACCESS, STATUS_INVALID_PARAMETER_2, STATUS_NOT_MAPPED_VIEW};
 

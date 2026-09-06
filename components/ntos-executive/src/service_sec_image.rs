@@ -3606,76 +3606,10 @@ fn checkpoint_boot_hives_at_quiesce(nt_handler: &mut ExecNtHandler) -> u32 {
     snapshot_status
 }
 
-unsafe fn service_generic_section_frame(
-    generic_sections: &mut GenericSectionTable,
-    section_index: usize,
-    section: GenericSection,
-    page_index: u64,
-    scratch_base: u64,
-) -> Result<u64, u32> {
-    if let Some(frame) = generic_sections.page_frame(section_index, page_index) {
-        return Ok(frame);
-    }
-    let frame = vm_frame_acquire(scratch_base)?;
-    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x3000;
-    if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        vm_frame_release(frame, 0);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    core::ptr::write_bytes(scratch as *mut u8, 0, 0x1000);
-    let file_offset = page_index.saturating_mul(0x1000);
-    match section.backing.kind {
-        GENERIC_SECTION_BACKING_ANON => {}
-        GENERIC_SECTION_BACKING_DISK => {
-            if file_offset < section.backing.file_size as u64 {
-                let Some(fs) = exec_fs() else {
-                    let _ = page_unmap_r(frame);
-                    vm_frame_release(frame, 0);
-                    return Err(0xC000_00A3); // STATUS_DEVICE_NOT_READY
-                };
-                let output = core::slice::from_raw_parts_mut(scratch as *mut u8, 0x1000);
-                let _ = fat_read_file_range(
-                    &fs,
-                    section.backing.first_cluster,
-                    section.backing.file_size,
-                    file_offset as u32,
-                    output,
-                );
-            }
-        }
-        GENERIC_SECTION_BACKING_OVERLAY => {
-            let (status, bytes) = crate::writable_fs::read(
-                section.backing.overlay_file_id,
-                Some(file_offset),
-                0x1000,
-            );
-            if status == nt_fs::STATUS_SUCCESS {
-                if !bytes.is_empty() {
-                    core::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        scratch as *mut u8,
-                        bytes.len().min(0x1000),
-                    );
-                }
-            } else if status != nt_fs::STATUS_END_OF_FILE {
-                let _ = page_unmap_r(frame);
-                vm_frame_release(frame, 0);
-                return Err(status);
-            }
-        }
-        _ => {
-            let _ = page_unmap_r(frame);
-            vm_frame_release(frame, 0);
-            return Err(0xC000_0024); // STATUS_OBJECT_TYPE_MISMATCH
-        }
-    }
-    let _ = page_unmap_r(frame);
-    if !generic_sections.set_page_frame(section_index, page_index, frame) {
-        vm_frame_release(frame, 0);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    Ok(frame)
-}
+#[path = "service_section_pagein.rs"]
+mod section_pagein;
+use section_pagein::service_generic_section_frame;
+pub(crate) use section_pagein::service_prepare_data_section_file;
 
 fn generic_section_writes_back(section: GenericSection) -> bool {
     section.backing.kind == GENERIC_SECTION_BACKING_OVERLAY

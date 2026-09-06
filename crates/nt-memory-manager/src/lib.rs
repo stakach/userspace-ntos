@@ -23,6 +23,7 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 mod client_frame;
 mod commit;
 mod copy_context;
+pub mod data_section;
 mod private_backing;
 mod runtime_section;
 mod working_set;
@@ -40,7 +41,7 @@ pub use copy_context::{copy_bookkeeping, live_checkpoint_matches, CopyBookkeepin
 
 pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
-    GenericSectionTableStats, GenericSectionView, SectionRetirement, SectionRetirementIo,
+    GenericSectionTableStats, GenericSectionView, PendingSectionFrames, SectionRetirement, SectionRetirementIo,
     SectionRetirementResource, GENERIC_SECTION_BACKING_ANON,
     GENERIC_SECTION_BACKING_DISK, GENERIC_SECTION_BACKING_NONE, GENERIC_SECTION_BACKING_OVERLAY,
     SECTION_ATTR_SEC_BASED, SECTION_ATTR_SEC_COMMIT, SECTION_ATTR_SEC_FILE, SECTION_ATTR_SEC_IMAGE,
@@ -57,7 +58,7 @@ pub use working_set::{
 // NTSTATUS
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
-pub const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_003E;
+pub const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_0045;
 pub const STATUS_SECTION_TOO_BIG: u32 = 0xC000_0040;
 pub const STATUS_INVALID_VIEW_SIZE: u32 = 0xC000_001F;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
