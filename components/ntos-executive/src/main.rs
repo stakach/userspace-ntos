@@ -52,6 +52,8 @@ mod hosted_loaded_images;
 pub(crate) use hosted_loaded_images::*;
 mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
+mod process_vm_retirement;
+use process_vm_retirement::reclaim_final_process_vm;
 mod hosted_driver_projection;
 mod rendezvous;
 mod writable_fs;
@@ -8511,7 +8513,6 @@ static mut DLL_CACHE_CHUNKS: Option<Vec<*mut DllCacheChunk>> = None;
 static DLL_SHARED_HITS: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_INSERT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static DLL_CACHE_DUPLICATE_INSERTS: AtomicU64 = AtomicU64::new(0);
-static DLL_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn dll_cache_chunks_mut() -> &'static mut Vec<*mut DllCacheChunk> {
     let slot = &mut *core::ptr::addr_of_mut!(DLL_CACHE_CHUNKS);
@@ -8552,18 +8553,6 @@ unsafe fn dll_cache_find(va: u64) -> Option<(usize, usize)> {
             if chunk.records[record_index].va == va {
                 return Some((chunk_index, record_index));
             }
-        }
-    }
-    None
-}
-
-unsafe fn dll_cache_last_nonempty_chunk(chunks: &[*mut DllCacheChunk]) -> Option<(usize, usize)> {
-    let mut index = chunks.len();
-    while index != 0 {
-        index -= 1;
-        let len = dll_cache_chunk_len(chunks[index]);
-        if len != 0 {
-            return Some((index, len));
         }
     }
     None
@@ -8623,58 +8612,6 @@ unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
     chunk.records[index] = DllCacheRecord { va, frame: fr };
     chunk.len += 1;
     true
-}
-
-unsafe fn dll_cache_remove_at(
-    chunks: &mut Vec<*mut DllCacheChunk>,
-    chunk_index: usize,
-    record_index: usize,
-) -> Option<DllCacheRecord> {
-    if chunk_index >= chunks.len() || record_index >= dll_cache_chunk_len(chunks[chunk_index]) {
-        DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let removed = (*chunks[chunk_index]).records[record_index];
-    let Some((last_chunk_index, last_len)) = dll_cache_last_nonempty_chunk(chunks) else {
-        DLL_CACHE_INSERT_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    let last_record_index = last_len - 1;
-    let last = (*chunks[last_chunk_index]).records[last_record_index];
-    (*chunks[last_chunk_index]).records[last_record_index] = DllCacheRecord::empty();
-    (*chunks[last_chunk_index]).len = last_record_index;
-    if chunk_index != last_chunk_index || record_index != last_record_index {
-        (*chunks[chunk_index]).records[record_index] = last;
-    }
-    Some(removed)
-}
-
-unsafe fn dll_cache_evict_unreferenced_all() -> u64 {
-    let Some(chunks) = (*core::ptr::addr_of_mut!(DLL_CACHE_CHUNKS)).as_mut() else {
-        return 0;
-    };
-    let mut evicted = 0u64;
-    let mut chunk_index = 0usize;
-    while chunk_index < chunks.len() {
-        let mut record_index = 0usize;
-        while chunk_index < chunks.len() && record_index < dll_cache_chunk_len(chunks[chunk_index])
-        {
-            let page = (*chunks[chunk_index]).records[record_index].va;
-            if !shared_image_mapping_page_referenced(page) {
-                if let Some(record) = dll_cache_remove_at(chunks, chunk_index, record_index) {
-                    vm_frame_release(record.frame, 0);
-                    DLL_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
-                    evicted = evicted.saturating_add(1);
-                } else {
-                    record_index += 1;
-                }
-            } else {
-                record_index += 1;
-            }
-        }
-        chunk_index += 1;
-    }
-    evicted
 }
 
 // --- per-process private-page frame tracking ------------------------------------------------------
@@ -8930,7 +8867,9 @@ pub(crate) unsafe fn csrss_frame_drop_process_all(pi: u64) -> u64 {
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
             break;
         }
-        detach_win32k_attached_page_for_thread_release(pi as usize, page);
+        if win32k_glue::detach_attached_client_page(pi, page).is_err() {
+            break;
+        }
         if !csrss_frame_reclaim_exact(pi, page) {
             break;
         }
@@ -9786,24 +9725,6 @@ unsafe fn shared_image_mapping_contains(pi: u64, page: u64) -> bool {
     shared_image_mapping_find(pi, page).is_some()
 }
 
-unsafe fn shared_image_mapping_page_referenced(page: u64) -> bool {
-    let Some(chunks) = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref() else {
-        return false;
-    };
-    for chunk in chunks.iter().copied() {
-        let len = shared_image_mapping_chunk_len(chunk);
-        let chunk = &*chunk;
-        let mut index = 0usize;
-        while index < len {
-            if chunk.entries[index].page == page {
-                return true;
-            }
-            index += 1;
-        }
-    }
-    false
-}
-
 unsafe fn shared_image_mapping_debug(pi: u64, page: u64) -> Option<SharedImageMappingCap> {
     let (chunk, index) = shared_image_mapping_find(pi, page)?;
     let chunks = (*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref()?;
@@ -9913,6 +9834,16 @@ unsafe fn shared_image_mapping_unmap_process(pi: u64) -> (u64, u64) {
         IMAGE_MAP_CAP_BANK_NEXT.store(0, Ordering::Relaxed);
     }
     (removed, failures)
+}
+
+unsafe fn shared_image_mapping_process_is_empty(pi: usize) -> bool {
+    let bank_empty = (&*core::ptr::addr_of!(IMAGE_MAP_CAP_BANK_LIVE_BY_PI))
+        .get(pi).is_none_or(|row| row.load(Ordering::Acquire) == 0);
+    bank_empty && (&*core::ptr::addr_of!(SHARED_IMAGE_MAPPING_CHUNKS)).as_ref()
+        .is_none_or(|chunks| chunks.iter().all(|&chunk| {
+            let len = shared_image_mapping_chunk_len(chunk);
+            !(&(*chunk).entries)[..len].iter().any(|mapping| mapping.pi as usize == pi)
+        }))
 }
 
 unsafe fn process_working_set_register(pi: usize) -> Result<(), u32> {
@@ -10935,8 +10866,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(DLL_CACHE_INSERT_FAILURES.load(Ordering::Relaxed));
     print_str(b" shared-dup=");
     print_u64(DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed));
-    print_str(b" shared-evict=");
-    print_u64(DLL_CACHE_EVICTIONS.load(Ordering::Relaxed));
     print_str(b" sec-img-private-skip=");
     print_u64(SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.load(Ordering::Relaxed));
     print_str(b" wc-clean-share=");
@@ -19042,6 +18971,15 @@ unsafe fn release_hosted_thread_mechanism_caps(
 unsafe fn release_sec_image_vspace_caps(
     owner: &mut img_spawn::HostedProcessVspaceCaps,
 ) -> bool {
+    if !release_sec_image_vspace_leaves(owner) {
+        return false;
+    }
+    release_sec_image_vspace_root(owner)
+}
+
+unsafe fn release_sec_image_vspace_leaves(
+    owner: &mut img_spawn::HostedProcessVspaceCaps,
+) -> bool {
     while owner.mapped_len != 0 {
         let index = owner.mapped_len - 1;
         let cap = owner.mapped[index];
@@ -19071,6 +19009,15 @@ unsafe fn release_sec_image_vspace_caps(
         }
         owner.plain[index] = 0;
         owner.plain_len -= 1;
+    }
+    true
+}
+
+unsafe fn release_sec_image_vspace_root(
+    owner: &mut img_spawn::HostedProcessVspaceCaps,
+) -> bool {
+    if owner.mapped_len != 0 || owner.plain_len != 0 {
+        return false;
     }
     for cap in [
         &mut owner.kuser_pd,
@@ -19474,143 +19421,6 @@ unsafe fn terminate_hosted_thread_mechanism(
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct ProcessVmReclaimStats {
-    generic_views: u64,
-    generic_writeback_failures: u64,
-    dll_views: u64,
-    shared_image_maps: u64,
-    shared_image_map_failures: u64,
-    win32k_client_caps: u64,
-    win32k_client_cap_failures: u64,
-    dll_cache_evictions: u64,
-    registered_frames: u64,
-    client_copyin_frames: u64,
-    client_copyin_frame_failures: u64,
-    private_pts: u64,
-    private_pt_failures: u64,
-    vspace_released: bool,
-}
-
-unsafe fn reclaim_final_process_vm(
-    process_index: u8,
-    handler: &mut ExecNtHandler,
-) -> ProcessVmReclaimStats {
-    let pi = process_index as usize;
-    if pi >= MAX_PI {
-        return ProcessVmReclaimStats::default();
-    }
-
-    // Process teardown ends every virtual lock before any backing cap can be reclaimed. The lock
-    // owner is the address-space slot, whose lifetime ends at this exact boundary.
-    let _ = vm_page_lock_retire_owner(pi as u64);
-    let mut stats = ProcessVmReclaimStats::default();
-    revoke_process_teb_tail_alias(pi);
-    if let Some(ctx) = handler.loop_ctx {
-        let generic_sections = &mut *ctx.generic_sections;
-        while let Some(view) = generic_sections.first_view_for_process(pi) {
-            let writeback = crate::service_sec_image::service_generic_section_writeback_view(
-                generic_sections,
-                view,
-                ctx.scratch_base,
-                Some(ctx),
-            );
-            if writeback.bytes_written != 0 {
-                handler.writable_fs_dirty = true;
-            }
-            if writeback.status != 0 {
-                stats.generic_writeback_failures =
-                    stats.generic_writeback_failures.saturating_add(1);
-                print_str(b"[process-vm-reclaim] mapped-section writeback failed pi=");
-                print_u64(pi as u64);
-                print_str(b" base=0x");
-                print_hex((view.base >> 32) as u32);
-                print_hex(view.base as u32);
-                print_str(b" size=0x");
-                print_hex((view.size >> 32) as u32);
-                print_hex(view.size as u32);
-                print_str(b" status=0x");
-                print_hex(writeback.status);
-                print_str(b"\n");
-                break;
-            }
-            if crate::service_sec_image::service_unmap_section_view_mappings(view).is_err() {
-                stats.generic_writeback_failures = stats.generic_writeback_failures.saturating_add(1);
-                break;
-            }
-            let _ = generic_sections.unmap_view(pi, view.base);
-            stats.generic_views = stats.generic_views.saturating_add(1);
-        }
-        if stats.generic_writeback_failures != 0 {
-            return stats;
-        }
-        stats.dll_views = (&mut *ctx.reg).clear_mapped_for_pi(pi) as u64;
-        {
-            let dll_arena_paging = &mut *ctx.dll_arena_paging;
-            let pd = dll_arena_paging.pd_cap(pi);
-            if pd != 0 {
-                if cnode_delete_recycle_r(pd) == 0 {
-                    assert!(dll_arena_paging.clear_process_exact(pi, pd));
-                } else {
-                    stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
-                }
-            }
-        }
-    }
-
-    (stats.shared_image_maps, stats.shared_image_map_failures) =
-        shared_image_mapping_unmap_process(pi as u64);
-    let win32k_reclaim = win32k_glue::release_win32k_client_cap_bank(pi);
-    stats.win32k_client_caps = win32k_reclaim.caps;
-    stats.win32k_client_cap_failures = win32k_reclaim.failures;
-    stats.dll_cache_evictions = dll_cache_evict_unreferenced_all();
-    stats.registered_frames = csrss_frame_drop_process_all(pi as u64);
-    let (copyin_frames, copyin_failures) = client_copyin_frame_drop_process(pi as u64);
-    stats.client_copyin_frames = copyin_frames;
-    stats.client_copyin_frame_failures = copyin_failures;
-    process_committed_mapping_reset(pi);
-    process_vm_region_map_reset(pi);
-    let kuser_released = kuser_page_alias_release(pi);
-    let (private_pts, private_pt_failures) = process_user_page_tables_release(pi, handler);
-    stats.private_pt_failures = stats
-        .private_pt_failures
-        .saturating_add(private_pt_failures);
-    if !kuser_released {
-        stats.private_pt_failures = stats.private_pt_failures.saturating_add(1);
-    }
-    stats.private_pts = private_pts;
-    let leaf_ownership_clear = stats.generic_writeback_failures == 0
-        && stats.shared_image_map_failures == 0
-        && stats.win32k_client_cap_failures == 0
-        && win32k_glue::win32k_client_cap_bank_is_empty(pi)
-        && client_frame_registry_process_is_empty(pi as u64)
-        && stats.client_copyin_frame_failures == 0
-        && client_copyin_frame_process_is_empty(pi as u64)
-        && kuser_page_alias_get(pi) == 0
-        && stats.private_pt_failures == 0
-        && (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
-            .first_for_process(pi as u64)
-            .is_none();
-    if leaf_ownership_clear {
-        stats.vspace_released = handler.release_hosted_process_vspace_caps(pi);
-    }
-    if stats.vspace_released {
-        if let Some(mut ctx) = handler.loop_ctx {
-            if ctx.live_paging.is_some_and(|live| live.pi == pi) {
-                ctx.live_paging = None;
-            }
-            if ctx.owner_pi == pi {
-                ctx.pml4 = 0;
-                ctx.filled_pages = &mut (&mut *ctx.pfilled)[pi];
-                ctx.faults = &mut (&mut *ctx.procs)[pi].faults;
-            }
-            let procs = &mut *ctx.procs;
-            procs[pi] = ProcExec::empty();
-            handler.loop_ctx = Some(ctx);
-        }
-    }
-    stats
-}
 
 unsafe fn terminate_hosted_process_mechanisms(
     process_index: u8,

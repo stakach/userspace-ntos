@@ -2583,6 +2583,30 @@ pub(crate) unsafe fn provider_wait_cancel_client_process(
     )
 }
 
+/// Pure final-VM admission query. Retained continuations block retirement across all provider
+/// domains and phases, even after their user reply has been abandoned. PI-only legacy owners also
+/// fence stale generations: process-slot reuse must not make those records refer to a new VM.
+pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).frames()
+        .any(|(_, frame)| frame.owner.client_pi == pi)
+        || (&*core::ptr::addr_of!(GUI_MESSAGE_WAITERS)).iter()
+            .any(|waiter| waiter.used && waiter.pi == pi)
+        || (&*core::ptr::addr_of!(DEFERRED_CALLBACK_RETURNS)).iter()
+            .any(|entry| entry.used && entry.pi == pi)
+    {
+        return true;
+    }
+    let receives = &*core::ptr::addr_of!(LPC_RECEIVE_WAITS);
+    let connects = &*core::ptr::addr_of!(LPC_CONNECT_WAITS);
+    let requests = &*core::ptr::addr_of!(LPC_REQUEST_WAITS);
+    receives.occupied_slots().any(|slot| receives.get(slot)
+        .is_some_and(|wait| wait.continuation.pi == pi))
+        || connects.occupied_slots().any(|slot| connects.get(slot)
+            .is_some_and(|wait| wait.continuation.pi == pi))
+        || requests.occupied_slots().any(|slot| requests.get(slot)
+            .is_some_and(|wait| wait.continuation.pi == pi))
+}
+
 fn component_suspension_top_owns_dispatch(dispatch_id: u64) -> bool {
     unsafe {
         (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))

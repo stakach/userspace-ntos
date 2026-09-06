@@ -538,6 +538,16 @@ impl PagefileStore {
             .map(|record| record.page)
     }
 
+    /// Preflight final-owner rundown before releasing the VSpace. The caller must serialize this
+    /// store through the subsequent `take` loop and reserve storage for these returned frames.
+    pub fn retirement_frame_count(&self, owner: WorkingSetOwnerId) -> Result<usize, u32> {
+        let count = self.pages_for_owner(owner).count();
+        self.generation
+            .checked_add(count as u64)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        Ok(count)
+    }
+
     pub fn stats(&self) -> PagefileStoreStats {
         self.stats
     }
@@ -990,5 +1000,41 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(store.page(2, 0x1000).is_none());
         assert_eq!(store.page(3, 0x1000).unwrap().backing, 3);
+    }
+
+    #[test]
+    fn owner_rundown_preflights_all_generations_without_consuming_records() {
+        let mut store = PagefileStore::new();
+        for (owner, page, backing) in [(2, 0x1000, 1), (2, 0x2000, 2), (3, 0x1000, 3)] {
+            store.restore(PagefilePage {
+                owner,
+                page,
+                protection: 0x04,
+                backing,
+            }).unwrap();
+        }
+        store.generation = u64::MAX - 1;
+        assert_eq!(
+            store.retirement_frame_count(2),
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        );
+        assert_eq!(store.retirement_frame_count(3), Ok(1));
+        assert_eq!(store.stats().pages, 3);
+        assert_eq!(store.generation, u64::MAX - 1);
+        store.generation = u64::MAX - 2;
+        assert_eq!(store.retirement_frame_count(2), Ok(2));
+        while let Some(page) = store.first_for_owner(2) {
+            store.take(2, page.page).unwrap().unwrap();
+        }
+        assert_eq!(store.generation, u64::MAX);
+        assert_eq!(store.page(3, 0x1000).unwrap().backing, 3);
+    }
+
+    #[test]
+    fn empty_owner_rundown_needs_no_generation_budget() {
+        let mut store = PagefileStore::new();
+        store.generation = u64::MAX;
+        assert_eq!(store.retirement_frame_count(19), Ok(0));
+        assert_eq!(store.generation, u64::MAX);
     }
 }

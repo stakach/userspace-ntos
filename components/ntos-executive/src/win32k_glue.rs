@@ -4796,22 +4796,13 @@ pub(crate) fn win32k_client_cap_bank_is_empty(pi: usize) -> bool {
         .is_some_and(|row| row.load(Ordering::Acquire) == 0)
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Win32kClientCapBankReclaimStats {
-    pub caps: u64,
-    pub failures: u64,
-}
-
-pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCapBankReclaimStats {
+pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> bool {
     if pi >= MAX_PI || pi >= u8::MAX as usize {
-        return Win32kClientCapBankReclaimStats::default();
+        return false;
     }
     let Some(live_row) = win32k_client_cap_bank_live_row(pi) else {
         WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return Win32kClientCapBankReclaimStats {
-            caps: 0,
-            failures: 1,
-        };
+        return false;
     };
     if pi < 64 {
         let bit = !(1u64 << pi);
@@ -4832,7 +4823,7 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
 
     let live = live_row.load(Ordering::Relaxed);
     if live == 0 {
-        return Win32kClientCapBankReclaimStats::default();
+        return true;
     }
 
     let owner = (pi + 1) as u8;
@@ -4929,10 +4920,7 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> Win32kClientCa
         print_u64(WIN32K_CLIENT_CAP_BANK_RELEASES.load(Ordering::Relaxed));
         print_str(b"\n");
     }
-    Win32kClientCapBankReclaimStats {
-        caps: released,
-        failures,
-    }
+    failures == 0
 }
 
 /// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi,
@@ -5571,6 +5559,22 @@ pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let _ = w32_attach_remove(page);
+    Ok(())
+}
+
+/// Quiesced process retirement must detach every retained client alias before releasing backing.
+/// On failure, both the mapping record and attached-process identity remain available for retry.
+pub(crate) unsafe fn detach_attached_client_process(pi: u64) -> Result<(), u32> {
+    if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
+        return Ok(());
+    }
+    loop {
+        let page = (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS)).as_ref()
+            .and_then(|mappings| mappings.last()).map(|mapping| mapping.page);
+        let Some(page) = page else { break; };
+        detach_attached_client_page(pi, page)?;
+    }
+    W32_ATTACHED_PI.store(u32::MAX as u64, Ordering::Release);
     Ok(())
 }
 

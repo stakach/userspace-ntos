@@ -9561,7 +9561,7 @@ impl ExecNtHandler {
             return false;
         }
 
-        if !release_sec_image_vspace_caps(owner) {
+        if !release_sec_image_vspace_root(owner) {
             return false;
         }
         self.process_vspace_caps[pi] = None;
@@ -21922,19 +21922,11 @@ impl ExecNtHandler {
                         .expect("preflighted process deletion must enter VM reclaim exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::ReclaimingVm => {
-                    // ClientIds are never reused. Retire MM leases even when there are no VSpace
-                    // caps left to reclaim, before advancing to canonical Process deletion.
-                    self.secured_virtual_memory.retire_owner(u64::from(pid));
-                    if self.process_vspaces.get(pi).copied().unwrap_or(0) != 0
-                        || self
-                            .process_vspace_caps
-                            .get(pi)
-                            .is_some_and(Option::is_some)
+                    let reclaim = unsafe { reclaim_final_process_vm(candidate, self) };
+                    if reclaim
+                        != nt_memory_manager::process_retirement::ProcessVmRetirement::Complete
                     {
-                        let reclaim = unsafe { reclaim_final_process_vm(pi as u8, self) };
-                        if !reclaim.vspace_released {
-                            return HostedProcessDeletionOutcome::Pending(candidate.phase);
-                        }
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
                     }
                     if self.process_vspaces.get(pi).copied().unwrap_or(1) != 0
                         || self

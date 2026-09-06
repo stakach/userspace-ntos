@@ -103,8 +103,13 @@ below are historical baselines, not acceptance of the current provider cutover.
   and correct allocation-request truncation (tranche 49, host/build; EOF adapter not activated).
 - [x] Implement stable-file image creation, section/view ownership, and checked cache-purge admission
   with retained cleanup failures (tranche 50, host/build; image lifetime adapter not yet wired).
-- [ ] Replace best-effort image teardown with checked retirement and fault/native-copy exclusion
-  while cleanup is incomplete; retain private COW backing and exact failed capabilities.
+- [x] Stage final process VM retirement through checked leaves, page tables, and VSpace release;
+  retain DLL/VAD/transition ownership until commit and recheck quiescence on retries
+  (tranche 51, host/build; executive adapter wired).
+- [ ] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
+  emptiness as a complete execution-quiescence proof; validate retained cleanup with live failures.
+- [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
+  cleanup is incomplete; retain private COW backing and exact failed capabilities.
 - [ ] Bind parsed-image caches, every SEC_IMAGE section reference, mapped view, and process image
   attachment to stable backing identity. Resolve source-origin/copy-up admission before mutation.
 - [ ] Route native and internal file/size mutations through explicit memory authority before
@@ -26243,6 +26248,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     pagefile bytes until commit, with fault/native-copy exclusion and checked rollback; merely clearing
     a registry flag cannot stop access through existing PTEs. Preserve exact retry ownership before
     dropping image references, and remove the superseded best-effort image path.
+
+    B3 final process VM retirement tranche 51 (2026-09-06, host/build green):
+    The executive now uses the host-tested `nt-memory-manager::process_retirement` sequencing driver
+    through a focused `process_vm_retirement.rs` adapter. The existing generation-exact
+    `ProcessDeletionCandidate` owns retries; there is no second pending table. Each attempt rechecks
+    the candidate/phase, current mechanism and VSpace identity, Ps delete blockers, reserved/live
+    thread runtimes, Win32 contexts, active callbacks, component suspensions, GUI wait owners, deferred
+    callback returns, and retained LPC receive/connect/request continuations before retiring secured
+    ranges, page locks, or diagnostic TEB publication. Provider/static continuation scans span every
+    domain and conservatively fence PI-wide stale owners, not just the currently installed provider.
+
+    Cleanup stops at the first incomplete stage. Checked win32k attachment revocation precedes backing
+    recycling. Mapped-data writeback/alias teardown, shared-image records and bank ownership, win32k
+    bank caps, registered private frames, copy-in aliases, KUSER aliases, and bootstrap mapped/plain
+    leaves must all drain before any DLL/private page table is deleted. Bootstrap NLS mappings use
+    those page tables too, so their old late release was not safe ordering. Bootstrap leaf release
+    is now separate from checked paging/fault-endpoint/root release; PML4 publication survives partial
+    root cleanup for an exact retry. The registered-frame process drain also uses checked attachment
+    removal instead of the take-and-ignore helper.
+
+    Only successful physical retirement clears DLL mapped flags, committed ranges, VADs, transition
+    backing, working-set state, and the process execution record. Zero-root processes still run logical
+    cleanup rather than bypassing it. Transition-frame free-list storage and the complete pagefile
+    generation budget are preflighted before page-table/root destruction, leaving their final metadata
+    commit allocation-free under the serialized teardown contract. Failures retain the process's
+    deletion candidate and block mechanism/slot retirement. The old monolithic reclaim function and
+    unused statistics were removed. The unchecked global DLL-cache eviction path, its private helpers,
+    and obsolete eviction counter were also removed: idle image cache records stay owned until a
+    checked identity-bound purge exists, rather than dropping frame ownership during final commit.
+
+    Validation: 217 `nt-memory-manager`, 169 `nt-address-space`, 143 `nt-fs`, 10 `nt-ahci`,
+    255 `nt-io-manager`, 33 `nt-io-completion`, 22 `nt-component-suspension`, 15
+    `nt-lpc-continuation`, and 19 `nt-user-host` unit/integration tests pass (883 total). Eleven new
+    sequencing tests cover quiescence refusal, first/partial/final failures at each physical stage,
+    exact retry progress, zero-resource retirement, and retaining an actual host image-view reference
+    until metadata commit. Two additional pagefile tests cover rundown generation exhaustion and
+    empty-owner admission. The executive build passes and stages rootserver/hive. Logs:
+    `.tmp/test-process-retirement-20260906.log` and `.tmp/build-process-retirement-20260906.log`.
+    Root alone ran serialized builds/tests; two agents reviewed ownership, quiescence and cleanup
+    ordering. Host failure injection covers the sequencing policy, not real seL4 capability failures.
+    No QEMU or desktop acceptance is claimed.
+
+    Review adjustment: this closes final-VM sequencing for the ordinary published-thread exit path,
+    not all quiescence machinery. `abort_registered_hosted_thread_spawn` still removes a runtime before
+    unpublished cleanup ignores TCB suspend/delete failures. Fix that with retained, checked spawn
+    rollback ownership next; audit handler-owned pre-park driver/PnP/LPC handoffs as well. Runtime-empty
+    alone is not a universal proof until those paths are closed. Native image unmap remains unchanged
+    and still needs transactional mapping detach/rollback with fault/native-copy exclusion. The
+    tranche-50 stable-file image table also remains unwired; loader cache identity and source-origin
+    copy-up admission are still required, including checked purge of the now-retained idle cache.
 
     After checked teardown and identity propagation, connect image write/truncation admission, route
     native EOF/allocation and destructive create through the shared mutation boundary, and integrate
