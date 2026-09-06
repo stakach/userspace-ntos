@@ -25,6 +25,18 @@ impl ThreadRollbackId {
     }
 }
 
+pub(crate) fn new_rollback_id(
+    identity: ThreadRollbackIdentity,
+) -> Result<ThreadRollbackId, ThreadRollbackError> {
+    if identity.pid == 0 || identity.tid == 0 || identity.process_generation == 0 {
+        return Err(ThreadRollbackError::InvalidIdentity);
+    }
+    Ok(ThreadRollbackId {
+        identity,
+        attempt: allocate_attempt(&NEXT_ATTEMPT)?,
+    })
+}
+
 fn allocate_attempt(counter: &AtomicU64) -> Result<u64, ThreadRollbackError> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -68,6 +80,8 @@ pub enum ThreadRollbackError {
     ConflictingOwnership,
     InsufficientResources,
     StaleOwner,
+    AlreadyPrepared,
+    NotPrepared,
     Backend {
         stage: ThreadRollbackStage,
         status: u32,
@@ -124,9 +138,14 @@ impl ThreadRollback {
         tcb: u64,
         resources: &[ThreadRollbackResource],
     ) -> Result<Self, ThreadRollbackError> {
-        if identity.pid == 0 || identity.tid == 0 || identity.process_generation == 0 {
-            return Err(ThreadRollbackError::InvalidIdentity);
-        }
+        Self::prepare_with_id(new_rollback_id(identity)?, tcb, resources)
+    }
+
+    pub(crate) fn prepare_with_id(
+        id: ThreadRollbackId,
+        tcb: u64,
+        resources: &[ThreadRollbackResource],
+    ) -> Result<Self, ThreadRollbackError> {
         if tcb <= 1 {
             return Err(ThreadRollbackError::InvalidCapability);
         }
@@ -151,10 +170,7 @@ impl ThreadRollback {
             }
         }
         Ok(Self {
-            id: ThreadRollbackId {
-                identity,
-                attempt: allocate_attempt(&NEXT_ATTEMPT)?,
-            },
+            id,
             tcb,
             stage: ThreadRollbackStage::Suspend,
             resources: owned,

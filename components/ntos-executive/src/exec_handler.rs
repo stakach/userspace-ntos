@@ -17929,7 +17929,7 @@ impl ExecNtHandler {
     fn resolve_hosted_thread_for_control(
         &self,
         handle: u64,
-    ) -> Result<(nt_process::ThreadId, nt_user_host::ThreadMechanism), u32> {
+    ) -> Result<(nt_process::ThreadId, nt_user_host::ThreadMechanism, u64), u32> {
         const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 
         let caller_pid = self
@@ -17944,7 +17944,13 @@ impl ExecNtHandler {
         let mechanism = self
             .hosted_thread_mechanism_for_tid(tid as u64)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        Ok((tid, mechanism))
+        let runtime = self.thread_runtime.get_by_tid(tid as u64)
+            .filter(|runtime| runtime.pi == mechanism.pi && !runtime.publication.is_busy())
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let tcb = self.hosted_thread_tcb(tid as u64)
+            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        debug_assert_eq!(runtime.tcb, tcb);
+        Ok((tid, mechanism, tcb))
     }
 
     unsafe fn user_memory_read(&self, memory: SyscallUserMemory, va: u64, dst: &mut [u8]) -> bool {
@@ -17989,8 +17995,8 @@ impl ExecNtHandler {
         print_hex(previous_count as u32);
         print_str(b"\n");
 
-        let (tid, mechanism) = match self.resolve_hosted_thread_for_control(thread_handle) {
-            Ok((tid, mechanism)) => (tid as u64, mechanism),
+        let (tid, mechanism, tcb) = match self.resolve_hosted_thread_for_control(thread_handle) {
+            Ok((tid, mechanism, tcb)) => (tid as u64, mechanism, tcb),
             Err(status) => {
                 print_str(b"[thread-life] resume failed: handle resolution status=0x");
                 print_hex(status);
@@ -18003,8 +18009,7 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if previous == 1 {
-            let tcb = self.hosted_thread_tcb(tid).unwrap_or(0);
-            if tcb <= 1 || tcb_resume(tcb) != 0 {
+            if tcb_resume(tcb) != 0 {
                 let _ = self.pm.suspend_thread(tid as nt_process::ThreadId);
                 return STATUS_UNSUCCESSFUL;
             }
@@ -18039,8 +18044,8 @@ impl ExecNtHandler {
         if previous_count != 0 && !self.user_memory_probe_output(memory, previous_count, 4) {
             return STATUS_ACCESS_VIOLATION;
         }
-        let (tid, mechanism) = match self.resolve_hosted_thread_for_control(args[0]) {
-            Ok((tid, mechanism)) => (tid as u64, mechanism),
+        let (tid, mechanism, tcb) = match self.resolve_hosted_thread_for_control(args[0]) {
+            Ok((tid, mechanism, tcb)) => (tid as u64, mechanism, tcb),
             Err(status) => return status,
         };
         let previous = match self.pm.suspend_thread(tid as nt_process::ThreadId) {
@@ -18048,8 +18053,7 @@ impl ExecNtHandler {
             Err(status) => return status,
         };
         if previous == 0 {
-            let tcb = self.hosted_thread_tcb(tid).unwrap_or(0);
-            if tcb <= 1 || tcb_suspend_r(tcb) != 0 {
+            if tcb_suspend_r(tcb) != 0 {
                 let _ = self.pm.resume_thread(tid as nt_process::ThreadId);
                 return STATUS_UNSUCCESSFUL;
             }

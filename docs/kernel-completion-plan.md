@@ -127,10 +127,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Reconcile runtime physical owners with exact registry target/source/mirror aliases, using
   explicit page coverage and full revalidation before handoff (tranche 58, host/build;
   native rollback adapter not yet activated).
+- [x] Retain a host pending-runtime payload and exact reservations before fallible cleanup-journal
+  preparation; reuse the same attempt on retry. Preflight native suspend/resume runtime admission
+  before changing Ps counts (tranche 59, host/build; native pending-owner activation still open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next retain pending runtime/pool/window and
-  process-generation ownership, then wire registered-resume failure with once-only caller
-  cancellation and persistent refault/native-copy exclusion. Registry handoff must
+  emptiness as a complete execution-quiescence proof. Next integrate the retained pending owner into
+  native runtime/pool/window tables with process-generation validation, then wire registered-resume
+  failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
@@ -26652,6 +26655,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     registered-resume rollback adapter. Native TEB registry flags and unchecked legacy cleanup are
     unchanged in this host-first slice. Partial construction/main-process cleanup and handler-owned
     handoffs remain open. The complete win32k import gate still has 33 unresolved code imports.
+
+    B3 pending-runtime ownership tranche 59 (2026-09-07, host/build green):
+    `nt-user-host::thread_pending` adds a non-cloneable `PendingThreadRuntime` that retains its
+    payload, TCB, exact process/PID/generation/TID/attempt and captured badge/pool/window reservations
+    without allocating a cleanup journal. Invalid identity or TCB admission returns the original
+    payload. Journal allocation or inventory validation failure leaves this owner intact for retry;
+    the journal uses the already-retained attempt rather than manufacturing a second cleanup owner.
+    Duplicate preparation is refused, including after partial progress or completion. Backend
+    failures preserve the payload and all acknowledged cleanup progress. Only final backend commit
+    permits extraction of retirement bookkeeping; that payload may describe released capabilities
+    and must never be republished as a runtime. Native reservation bounds/ownership validation and
+    mirrored-reference clearing remain adapter responsibilities.
+
+    Native `NtResumeThread` and `NtSuspendThread` now resolve a built, non-busy runtime with the
+    mechanism's process index and a valid TCB before changing the Ps suspend count. Previously the
+    count-only branches could succeed without a published TCB because validation occurred only when
+    the transition required a seL4 operation. Access checks, output probing and count compensation
+    after failed TCB operations remain unchanged. This admission correction is wired; it does not
+    establish pending-cleanup or process-generation validation on its own.
+
+    Validation: 14 new host tests cover payload retention, invalid identity/TCB return, exact captured
+    reservations, same-attempt journal preparation, injected preparation allocation failure,
+    conflicting inventory retry, duplicate preparation, each fallible cleanup stage, stale attempt
+    rejection at each partial stage, missing reservations and once-only completion. The serialized
+    nine-crate suite passes 989 tests, including 96 `nt-user-host` unit/integration tests;
+    log: `.tmp/test-thread-pending-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-thread-pending-20260907.log`.
+    Two agents reviewed ownership and native control admission; root alone ran tests/builds.
+    Native control admission currently has build/review
+    validation rather than live syscall failure injection. No desktop proof is claimed.
+
+    Review adjustment: the host pending-owner prerequisite is complete, but native cleanup is not
+    activated. Keep pending rows visible to ownership, collision, process-retirement and reservation
+    checks while excluding execution/TCB/control/badge dispatch. Guard runtime reset/rebind/release,
+    stack/LPC setters, direct scheduler/diagnostic consumers and mechanism-badge fallbacks. Preserve
+    captured pool/window slots rather than releasing through a potentially reused current mapping;
+    temporary-process/thread clearing must not remove identity before these guards. Then retain
+    complete external-alias journals, publish fault/copy/mirror/VM/pageout exclusions, acquire the
+    reconciled registry handoff and drive checked native cleanup with once-only caller cancellation.
+    Do not replace unchecked registered-resume cleanup with a partially guarded adapter. Early
+    construction/main-process cleanup and handler-owned handoffs remain open. The complete win32k
+    import gate still has 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
