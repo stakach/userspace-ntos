@@ -30,6 +30,40 @@ impl WriteProbeMemory for ProcessWriteProbe<'_> {
     fn write_byte(&mut self, address: u64, value: u8) -> Result<(), u32> {
         unsafe { self.handler.copy_write_page(self.pi, address, &[value]) }
     }
+
+    fn read_scalar<const N: usize>(&mut self, address: u64) -> Result<[u8; N], u32> {
+        let mut value = [0; N];
+        if N == 0 {
+            return Ok(value);
+        }
+        address
+            .checked_add(N as u64)
+            .filter(|end| *end <= USER_ADDRESS_LIMIT)
+            .ok_or(STATUS_ACCESS_VIOLATION)?;
+        let chunks = nt_address_space::page_chunks(address, N).ok_or(STATUS_ACCESS_VIOLATION)?;
+        let mut copied = 0;
+        for chunk in chunks {
+            unsafe {
+                self.handler.copy_read_page(
+                    self.pi,
+                    address + copied as u64,
+                    &mut value[copied..copied + chunk.length],
+                )?;
+            }
+            copied += chunk.length;
+        }
+        Ok(value)
+    }
+
+    fn write_scalar<const N: usize>(&mut self, address: u64, value: [u8; N]) -> Result<(), u32> {
+        unsafe { self.handler.process_memory_write_status(self.pi, address, &value) }
+    }
+}
+
+impl nt_address_space::native_output::VmOutputMemory for ProcessWriteProbe<'_> {
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), u32> {
+        unsafe { self.handler.process_memory_write_status(self.pi, address, bytes) }
+    }
 }
 
 impl VirtualMemoryCopy for ProcessMemoryCopy<'_> {
@@ -53,6 +87,45 @@ impl VirtualMemoryCopy for ProcessMemoryCopy<'_> {
 }
 
 impl ExecNtHandler {
+    pub(super) unsafe fn capture_vm_range(
+        &mut self,
+        memory: SyscallUserMemory,
+        base_pointer: u64,
+        size_pointer: u64,
+        old_protection: Option<u64>,
+    ) -> Result<(u64, u64), u32> {
+        let pi = match memory {
+            SyscallUserMemory::CurrentProcess => self.pi,
+        };
+        nt_address_space::native_output::VmRangeOutput {
+            base_pointer,
+            size_pointer,
+        }
+        .capture(
+            &mut ProcessWriteProbe { handler: self, pi },
+            old_protection,
+            USER_ADDRESS_LIMIT,
+        )
+    }
+
+    pub(super) unsafe fn publish_vm_range(
+        &mut self,
+        memory: SyscallUserMemory,
+        output: nt_address_space::native_output::VmRangeOutput,
+        base: u64,
+        size: u64,
+        old_protection: Option<(u64, u32)>,
+    ) -> Result<(), u32> {
+        let pi = match memory {
+            SyscallUserMemory::CurrentProcess => self.pi,
+        };
+        let memory = &mut ProcessWriteProbe { handler: self, pi };
+        match old_protection {
+            Some(old) => output.publish_protection(memory, base, size, old, USER_ADDRESS_LIMIT),
+            None => output.publish(memory, base, size),
+        }
+    }
+
     /// Scalar and buffer outputs share protection, guard, residency, and COW admission.
     pub(crate) unsafe fn xas_write_u64(&mut self, va: u64, value: u64) -> bool {
         self.xas_try_write_buf(va, &value.to_le_bytes())

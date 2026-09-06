@@ -37,6 +37,24 @@ pub fn copy_page_plan(
 pub trait WriteProbeMemory {
     fn read_byte(&mut self, address: u64) -> Result<u8, u32>;
     fn write_byte(&mut self, address: u64, value: u8) -> Result<(), u32>;
+
+    /// Backends may batch page-contained copies while retaining full capture before self-write.
+    fn read_scalar<const N: usize>(&mut self, address: u64) -> Result<[u8; N], u32> {
+        address.checked_add(N as u64).ok_or(STATUS_ACCESS_VIOLATION)?;
+        let mut value = [0; N];
+        for (offset, byte) in value.iter_mut().enumerate() {
+            *byte = self.read_byte(address + offset as u64)?;
+        }
+        Ok(value)
+    }
+
+    fn write_scalar<const N: usize>(&mut self, address: u64, value: [u8; N]) -> Result<(), u32> {
+        address.checked_add(N as u64).ok_or(STATUS_ACCESS_VIOLATION)?;
+        for (offset, byte) in value.into_iter().enumerate() {
+            self.write_byte(address + offset as u64, byte)?;
+        }
+        Ok(())
+    }
 }
 
 /// Copy stable kernel bytes through exact page-contained writes. Validate the whole destination
@@ -90,14 +108,8 @@ pub fn probe_write_scalar<const N: usize>(
         .checked_add(N as u64)
         .filter(|end| *end <= user_limit)
         .ok_or(STATUS_ACCESS_VIOLATION)?;
-    let mut value = [0; N];
-    for (offset, byte) in value.iter_mut().enumerate() {
-        *byte = memory.read_byte(address + offset as u64)?;
-    }
-    for (offset, byte) in value.into_iter().enumerate() {
-        memory.write_byte(address + offset as u64, byte)?;
-    }
-    Ok(())
+    let value = memory.read_scalar::<N>(address)?;
+    memory.write_scalar(address, value)
 }
 
 /// Validate the entire user range before probing any page; an empty output touches no address.

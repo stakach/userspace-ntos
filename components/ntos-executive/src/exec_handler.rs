@@ -18644,7 +18644,6 @@ impl ExecNtHandler {
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
         const PROCESS_VM_OPERATION: u32 = 0x0008;
@@ -18660,20 +18659,10 @@ impl ExecNtHandler {
         {
             return status;
         }
-        if !self.user_memory_probe_output(memory, base_ptr, 8)
-            || !self.user_memory_probe_output(memory, size_ptr, 8)
-        {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let mut word = [0u8; 8];
-        if !self.user_memory_read(memory, base_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let base_in = u64::from_le_bytes(word);
-        if !self.user_memory_read(memory, size_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let want = u64::from_le_bytes(word);
+        let (base_in, want) = match self.capture_vm_range(memory, base_ptr, size_ptr, None) {
+            Ok(range) => range,
+            Err(status) => return status,
+        };
         if base_in > HIGHEST_VAD_ADDRESS {
             return nt_address_space::STATUS_INVALID_PARAMETER_2;
         }
@@ -18932,10 +18921,21 @@ impl ExecNtHandler {
         }
         *vm_map = *after;
         self.commit_process_commit_charge(prepared_commit);
-        let size_written = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
-        let base_written = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
-        if !created_vad && (!size_written || !base_written) {
-            return STATUS_ACCESS_VIOLATION;
+        let publication = self.publish_vm_range(
+            memory,
+            nt_address_space::native_output::VmRangeOutput {
+                base_pointer: base_ptr,
+                size_pointer: size_ptr,
+            },
+            plan.base,
+            plan.size,
+            None,
+        );
+        // NT retains success for a new VAD; existing private VAD operations report a late fault.
+        if !created_vad {
+            if let Err(status) = publication {
+                return status;
+            }
         }
         NTALLOC_SERVICED.fetch_add(1, Ordering::Relaxed);
         0
@@ -19037,20 +19037,7 @@ impl ExecNtHandler {
         nt_address_space::VmPageLockTable::validate_map_type(map_type)?;
         let base_pointer = args[1];
         let size_pointer = args[2];
-        if !self.user_memory_probe_output(memory, base_pointer, 8)
-            || !self.user_memory_probe_output(memory, size_pointer, 8)
-        {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        let mut encoded = [0u8; 8];
-        if !self.user_memory_read(memory, base_pointer, &mut encoded) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        let address = u64::from_le_bytes(encoded);
-        if !self.user_memory_read(memory, size_pointer, &mut encoded) {
-            return Err(STATUS_ACCESS_VIOLATION);
-        }
-        let size = u64::from_le_bytes(encoded);
+        let (address, size) = self.capture_vm_range(memory, base_pointer, size_pointer, None)?;
         let range = nt_address_space::VmResidencyRangePlan::new(address, size, USER_ADDRESS_LIMIT)?;
         let (target_pid, target_pi) =
             self.resolve_process_for_access(args[0], PROCESS_VM_OPERATION)?;
@@ -19112,12 +19099,20 @@ impl ExecNtHandler {
                 Err(status) => status,
             }
         };
-        if !self.user_memory_write(memory, base_pointer, &range.base.to_le_bytes())
-            || !self.user_memory_write(memory, size_pointer, &range.size.to_le_bytes())
-        {
-            return STATUS_ACCESS_VIOLATION;
+        if (status as i32) < 0 {
+            return status;
         }
-        status
+        self.publish_vm_range(
+            memory,
+            nt_address_space::native_output::VmRangeOutput {
+                base_pointer,
+                size_pointer,
+            },
+            range.base,
+            range.size,
+            None,
+        )
+        .map_or_else(|fault| fault, |_| status)
     }
 
     pub(crate) unsafe fn nt_unlock_virtual_memory_with_user_memory(
@@ -19156,12 +19151,20 @@ impl ExecNtHandler {
                 Err(status) => status,
             }
         };
-        if !self.user_memory_write(memory, base_pointer, &range.base.to_le_bytes())
-            || !self.user_memory_write(memory, size_pointer, &range.size.to_le_bytes())
-        {
-            return STATUS_ACCESS_VIOLATION;
+        if (status as i32) < 0 {
+            return status;
         }
-        status
+        self.publish_vm_range(
+            memory,
+            nt_address_space::native_output::VmRangeOutput {
+                base_pointer,
+                size_pointer,
+            },
+            range.base,
+            range.size,
+            None,
+        )
+        .map_or_else(|fault| fault, |_| status)
     }
 
     unsafe fn query_memory_basic_information(
@@ -19377,7 +19380,6 @@ impl ExecNtHandler {
     }
 
     unsafe fn nt_free_virtual_memory(&mut self, args: &[u64]) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
         const PROCESS_VM_OPERATION: u32 = 0x0008;
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
@@ -19389,18 +19391,11 @@ impl ExecNtHandler {
         }
         let base_ptr = args[1];
         let size_ptr = args[2];
-        if !self.probe_user_output(base_ptr, 8) || !self.probe_user_output(size_ptr, 8) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let mut word = [0u8; 8];
-        if !self.xas_read(base_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let base = u64::from_le_bytes(word);
-        if !self.xas_read(size_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let size = u64::from_le_bytes(word);
+        let memory = SyscallUserMemory::CurrentProcess;
+        let (base, size) = match self.capture_vm_range(memory, base_ptr, size_ptr, None) {
+            Ok(range) => range,
+            Err(status) => return status,
+        };
         if base >= HIGHEST_USER_ADDRESS {
             return nt_address_space::STATUS_INVALID_PARAMETER_2;
         }
@@ -19467,8 +19462,17 @@ impl ExecNtHandler {
         if released_commit != 0 {
             self.release_process_commit(target_pid, released_commit);
         }
-        let _ = self.xas_write_u64(size_ptr, plan.size);
-        let _ = self.xas_write_u64(base_ptr, plan.base);
+        // NT keeps the completed free even if its output pages were among those released.
+        let _ = self.publish_vm_range(
+            memory,
+            nt_address_space::native_output::VmRangeOutput {
+                base_pointer: base_ptr,
+                size_pointer: size_ptr,
+            },
+            plan.base,
+            plan.size,
+            None,
+        );
         0
     }
 

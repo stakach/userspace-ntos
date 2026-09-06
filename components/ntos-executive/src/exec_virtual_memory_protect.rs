@@ -75,7 +75,6 @@ impl ExecNtHandler {
         args: &[u64],
         memory: SyscallUserMemory,
     ) -> u32 {
-        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
         const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
         const PROCESS_VM_OPERATION: u32 = 0x0008;
         const HIGHEST_USER_ADDRESS: u64 = 0x0000_07ff_fffe_ffff;
@@ -86,23 +85,15 @@ impl ExecNtHandler {
         if let Err(status) = nt_address_space::validate_protect_parameters(new_protection) {
             return status;
         }
-        if !self.user_memory_probe_output(memory, base_ptr, 8)
-            || !self.user_memory_probe_output(memory, size_ptr, 8)
-            || oldprot_ptr == 0
-            || !self.user_memory_probe_output(memory, oldprot_ptr, 4)
-        {
-            return STATUS_ACCESS_VIOLATION;
-        }
-
-        let mut word = [0u8; 8];
-        if !self.user_memory_read(memory, base_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let base = u64::from_le_bytes(word);
-        if !self.user_memory_read(memory, size_ptr, &mut word) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let size = u64::from_le_bytes(word);
+        let output = nt_address_space::native_output::VmRangeOutput {
+            base_pointer: base_ptr,
+            size_pointer: size_ptr,
+        };
+        let (base, size) =
+            match self.capture_vm_range(memory, base_ptr, size_ptr, Some(oldprot_ptr)) {
+                Ok(range) => range,
+                Err(status) => return status,
+            };
         if base > HIGHEST_USER_ADDRESS {
             return nt_address_space::STATUS_INVALID_PARAMETER_2;
         }
@@ -207,9 +198,14 @@ impl ExecNtHandler {
                 plan.size,
                 b"",
             );
-            let _ = self.user_memory_write(memory, oldprot_ptr, &old_protection.to_le_bytes());
-            let _ = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
-            let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
+            // Output faults do not undo the protection change or replace its successful status.
+            let _ = self.publish_vm_range(
+                memory,
+                output,
+                plan.base,
+                plan.size,
+                Some((oldprot_ptr, old_protection)),
+            );
             return 0;
         }
         let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
@@ -265,9 +261,13 @@ impl ExecNtHandler {
             plan.size,
             b"",
         );
-        let _ = self.user_memory_write(memory, oldprot_ptr, &plan.old_protection.to_le_bytes());
-        let _ = self.user_memory_write(memory, base_ptr, &plan.base.to_le_bytes());
-        let _ = self.user_memory_write(memory, size_ptr, &plan.size.to_le_bytes());
+        let _ = self.publish_vm_range(
+            memory,
+            output,
+            plan.base,
+            plan.size,
+            Some((oldprot_ptr, plan.old_protection)),
+        );
         0
     }
 }

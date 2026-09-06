@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod copy;
+pub mod native_output;
 pub mod commitment;
 pub mod protection;
 pub mod query;

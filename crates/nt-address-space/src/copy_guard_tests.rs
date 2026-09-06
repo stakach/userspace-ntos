@@ -360,6 +360,68 @@ fn scalar_probes_reject_readonly_and_noaccess_outputs() {
     }
 }
 
+#[derive(Default)]
+struct BatchedProbe {
+    reads: usize,
+    writes: usize,
+    read_fault: Option<u32>,
+}
+
+impl WriteProbeMemory for BatchedProbe {
+    fn read_byte(&mut self, _: u64) -> Result<u8, u32> {
+        panic!("scalar reads must use the backend's batched path");
+    }
+
+    fn write_byte(&mut self, _: u64, _: u8) -> Result<(), u32> {
+        panic!("scalar writes must use the backend's batched path");
+    }
+
+    fn read_scalar<const N: usize>(&mut self, _: u64) -> Result<[u8; N], u32> {
+        self.reads += 1;
+        assert_eq!(self.writes, 0);
+        match self.read_fault {
+            Some(status) => Err(status),
+            None => Ok([0xa5; N]),
+        }
+    }
+
+    fn write_scalar<const N: usize>(&mut self, _: u64, value: [u8; N]) -> Result<(), u32> {
+        assert_eq!(self.reads, 1);
+        assert_eq!(value, [0xa5; N]);
+        self.writes += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn scalar_probes_use_one_batched_capture_and_self_write() {
+    let mut memory = BatchedProbe::default();
+    assert_eq!(
+        probe_write_scalar::<8>(&mut memory, 0x1ffd, 0x3000),
+        Ok(())
+    );
+    assert_eq!((memory.reads, memory.writes), (1, 1));
+}
+
+#[test]
+fn failed_batched_capture_never_enters_the_write_backend() {
+    for status in [
+        STATUS_GUARD_PAGE_VIOLATION,
+        STATUS_ACCESS_VIOLATION,
+        STATUS_COMMITMENT_LIMIT,
+    ] {
+        let mut memory = BatchedProbe {
+            read_fault: Some(status),
+            ..BatchedProbe::default()
+        };
+        assert_eq!(
+            probe_write_scalar::<8>(&mut memory, 0x1ffd, 0x3000),
+            Err(status)
+        );
+        assert_eq!((memory.reads, memory.writes), (1, 0));
+    }
+}
+
 #[test]
 fn guard_permission_precedence_and_writecopy_identity_cover_all_backings() {
     for type_ in [MEM_PRIVATE, MEM_MAPPED, MEM_IMAGE] {

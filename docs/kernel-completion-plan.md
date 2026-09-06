@@ -71,6 +71,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Replace heuristic output probes with checked mutable residency, preserve scalar probe ordering,
   and propagate atom output failures; validate the paging owner before guard consumption
   (tranche 33, host/build validation).
+- [x] Share native VM range capture and ordered output publication for allocate/free/protect/lock/
+  unlock, preserving per-service late-fault contracts and batching scalar memory access
+  (tranche 34, host/build validation).
 - [ ] Audit remaining boolean probes and best-effort/ignored copy results for exact service-level
   fault propagation and rollback. Complete genuine shared-writable image/control-area
   backing. Retire historical read-prefetch/PE retries through checked read residency as well.
@@ -25483,6 +25486,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     nonimage COW policy, stack growth/CPU guard delivery, and provider unwind/exception work remain
     open. Host/build proof is not live page-table or desktop acceptance; the 33-import win32k gate
     remains the live blocker.
+
+    B3 native VM-output tranche 34 (2026-09-06, host/build green):
+    Added the focused `nt-address-space::native_output` policy module. Native allocate, free,
+    protect, lock, and unlock share checked scalar probing and input capture: BaseAddress,
+    RegionSize, optional OldProtect are probed in that order before either input is captured.
+    These services no longer read their parameter values through historical XAS/PE retries or
+    collapse capture errors through boolean probes. Unaligned scalar outputs retain the native
+    contract. The executive batches scalar reads and self-writes into exact page-contained copies,
+    preserving complete capture before the first write without a mapping operation per byte.
+
+    Publication writes RegionSize before BaseAddress and stops at the first failed store. Protect
+    reprobes all three outputs after applying protection, then publishes size, base, and OldProtect.
+    A self-protecting/freeing caller cannot cause later stores to run after an earlier output fault.
+    No output fault undoes completed VM mutations: free/protect and new-VAD allocation retain their
+    successful status; allocation in an existing private VAD, including MEM_RESET, reports the
+    exact late exception. Lock/unlock report exact late publication faults and do not publish
+    normalized parameters when the operation itself failed. Informational STATUS_WAS_LOCKED still
+    permits publication. The explicit retained-status paths are NT behavior, not fallback success.
+
+    Reference review used NT5 `mm/allocvm.c` (1004, 1752, 2105), `mm/freevm.c` (780, 945),
+    `mm/protect.c` (301), and `mm/lockvm.c` (631, 1109), alongside ReactOS ARM3 wrappers. NT5's
+    output ordering and failed-lock no-publication contract are deliberate here; some ReactOS
+    wrappers differ. Scratch-lifetime review found that final copies occur after the last snapshot
+    use, and guard consumption does not reenter checked copies or completion delivery. No new
+    static scratch tables or unneeded rollback machinery were added.
+
+    Validation: 145 `nt-address-space`, 107 `nt-hosted-runtime`, and 50 `nt-memory-manager` tests
+    pass (302 total). Eleven new tests cover capture/probe ordering, unaligned and aliased outputs,
+    exact faults, first-failure termination and preserved prefixes, post-protection reprobes, and
+    batched scalar capture-before-write. The executive build passes. Logs:
+    `.tmp/test-native-vm-outputs-20260906.log` and `.tmp/build-native-vm-outputs-20260906.log`.
+    All builds/tests were serialized; no QEMU boot ran. Host tests exercise the shared memory
+    protocol; the per-service status-retention branches were source-reviewed and build-validated,
+    not exercised through live syscalls.
+
+    Review adjustment: the five VM range services are migrated, not all native outputs. Next audit
+    `NtFlushVirtualMemory` (typed IOSB probe, size/base/IOSB ordering, retained operation status),
+    `NtQueryVirtualMemory`, and the remaining boolean/void output and handle/completion paths.
+    Never replace a documented NT late-fault retention rule with invented rollback or blanket AV.
+    Historical general reads, shared-writable control areas, nonimage COW policy, stack guards,
+    provider unwind/exception delivery, and live MM/desktop acceptance remain open. The complete
+    win32k import gate still has 33 unresolved imports and blocks live acceptance.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
