@@ -101,6 +101,12 @@ below are historical baselines, not acceptance of the current provider cutover.
   and backing-independent read accounting (tranche 48, host/build; native fixes wired).
 - [x] Separate retained segment extent from file EOF, implement transactional canonical EOF resizing,
   and correct allocation-request truncation (tranche 49, host/build; EOF adapter not activated).
+- [x] Implement stable-file image creation, section/view ownership, and checked cache-purge admission
+  with retained cleanup failures (tranche 50, host/build; image lifetime adapter not yet wired).
+- [ ] Replace best-effort image teardown with checked retirement and fault/native-copy exclusion
+  while cleanup is incomplete; retain private COW backing and exact failed capabilities.
+- [ ] Bind parsed-image caches, every SEC_IMAGE section reference, mapped view, and process image
+  attachment to stable backing identity. Resolve source-origin/copy-up admission before mutation.
 - [ ] Route native and internal file/size mutations through explicit memory authority before
   activating coherent native reads/writes; verify whole-operation completion/accounting at cutover.
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
@@ -26188,14 +26194,63 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-section-resize-20260906.log`. Root alone ran serialized builds/tests; two agents
     reviewed the NT5 boundaries and mutation/cleanup contracts. No desktop acceptance is claimed.
 
-    Review adjustment: data-section EOF mechanics are implemented, but shared image/data mutation
-    authority still gates activation. Next connect stable file identities to image-section write/
-    truncation admission, route native EOF/allocation and destructive create through that boundary,
-    and integrate CM/hive/provisioning writes before activating both coherent cache paths. Keep
-    allocation/VDL result geometry distinct and preserve raw page-in/writeback nonreentry. Validate
-    whole-operation completion/accounting at cutover, including fully resident reads and late output
-    faults. Direct FAT partial-failure accounting, noncached alignment, live refault/persistence,
-    and the unchanged 33-import win32k blocker remain open.
+    B3 stable-file image ownership tranche 50 (2026-09-06, host/build green):
+    `nt-memory-manager::image_section` now provides the image-control-area lifetime mechanism keyed
+    by `SectionFileIdentity`, not a DLL name, process index, or observed loader handle slot. Exclusive
+    creation owns the identity before parsing; successful publication creates a section reference.
+    Independent section references (including duplicated handles) and mapped-view references prevent
+    mutation. Views survive the final section close. An idle image cache can be reused under the same
+    identity, but final handle/view release alone never admits a write: `flush_for_write` invokes
+    checked purge of all parsed-image/cache state, frames, aliases, and retained backing references.
+    Modified image pages are discarded, not written back. This follows NT5's image section-reference,
+    mapped-view, and BeingCreated checks (`sectsup.c:2674`, `flushsec.c:2716`). Delete must additionally
+    consult data-section user references/creation; FSDs retain operation-specific refusal statuses.
+
+    Failed publication leaves creation owned and abortable. Aborted creations also require checked
+    purge. Purge failure retains the exact area identity and prevents reuse of a potentially partially
+    destroyed cache until retry succeeds. Typed tokens carry table ownership and monotonically checked
+    generations, so stale, foreign, copied, and recycled-slot tokens cannot release another lifetime.
+    Reference/table storage grows fallibly and reuses empty slots without recycling IDs. The caller
+    must serialize image creation/cache effects and file mutation through admission and retain actual
+    FILE_OBJECT ownership; this host mechanism is not a standalone scan of the existing loader tables.
+
+    Validation: 204 `nt-memory-manager`, 169 `nt-address-space`, 143 `nt-fs`, 10 `nt-ahci`,
+    255 `nt-io-manager`, and 33 `nt-io-completion` tests pass (814 total). Seventeen new image tests
+    cover exclusive/aborted creation, handle-only images, sibling/duplicated sections, views surviving
+    closes, idle-cache reuse, purge failure/retry and partial resource cleanup, mount/node identity,
+    stale/foreign references, double release, generation exhaustion, and 1,000 storage-reusing
+    lifetimes. Fallible allocation ordering was reviewed; allocator failure is not injected. The
+    executive build passes with 262 warnings and stages rootserver/hive. Logs:
+    `.tmp/test-image-ownership-20260906.log` and `.tmp/build-image-ownership-20260906.log`.
+    Root alone ran serialized builds/tests; two agents researched the live loader/NT5 boundaries and
+    reviewed ownership and failure paths. No QEMU or desktop acceptance is claimed.
+
+    Review adjustment: native image ownership is not activated. The audit found that the DLL registry
+    has only one observed file/section handle per process and image caches are still leaf-keyed; neither
+    is an authoritative reference count. Capture stable identity from the actual backing bytes and
+    FILE_OBJECT, then carry the image owner through all sections, views, executable attachments, and
+    cache entries. Disk-to-overlay copy-up creates a new mount/node identity, so overlay-only admission
+    would miss active disk-backed images. Resolve explicit source-origin admission/canonical identity
+    before copy-up; do not correlate active images by filename.
+
+    First replace the unsafe teardown boundary: native DLL unmap clears its mapped flag before the
+    helper ignores private-frame/shared-cap deletion failures; process reclaim likewise clears DLL
+    flags early. Merely moving flag clearing after a boolean check is insufficient. Partial retirement
+    can discard private COW bytes and then let an ordinary fault refill the still-published view from
+    baseline PE data. Start with checked process-exit image retirement after proving process
+    quiescence, retaining registry/VAD/image ownership and preventing process-slot reuse until leaf
+    teardown succeeds. Native unmap then needs transactional detach that retains private frames and
+    pagefile bytes until commit, with fault/native-copy exclusion and checked rollback; merely clearing
+    a registry flag cannot stop access through existing PTEs. Preserve exact retry ownership before
+    dropping image references, and remove the superseded best-effort image path.
+
+    After checked teardown and identity propagation, connect image write/truncation admission, route
+    native EOF/allocation and destructive create through the shared mutation boundary, and integrate
+    CM/hive/provisioning writes before activating both coherent cache paths. Keep allocation/VDL result
+    geometry distinct and preserve raw page-in/writeback nonreentry. Validate whole-operation
+    completion/accounting at cutover, including fully resident reads and late output faults. Direct FAT
+    partial-failure accounting, noncached alignment, live refault/persistence, and the unchanged
+    33-import win32k blocker remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

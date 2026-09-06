@@ -24,6 +24,7 @@ mod client_frame;
 mod commit;
 mod copy_context;
 pub mod data_section;
+pub mod image_section;
 mod private_backing;
 mod runtime_section;
 pub mod section_scratch;
