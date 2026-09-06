@@ -89,6 +89,10 @@ below are historical baselines, not acceptance of the current provider cutover.
   file ownership, checked completion, and an explicit storage checkpoint (tranche 42, host/build).
 - [x] Retain temporary section-writeback capabilities through checked deletion failures and block
   scratch reuse, persistence, and frame retirement until cleanup succeeds (tranche 43, host/build).
+- [x] Add the host-tested canonical file-write transaction: prepare all resident mappings before
+  backend mutation, merge accepted prefixes, and zero newly valid EOF gaps (tranche 44, host/build).
+- [ ] Implement paired coherent reads and the executive multi-page preparation adapter; route
+  native and internal file/size mutations through explicit memory authority before activation.
 - [ ] Validate repeated CPU writes, cross-process aliases, attached COW, and cache barriers with
   live refault/restart/power-loss tests. Unify ordinary file reads/writes and EOF changes with the
   shared control-area owner; complete storage-port abort/reset recovery without reusing device-owned
@@ -25954,6 +25958,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `NtWriteFile`. Keep raw page-in/writeback adapters nonrecursive. Fix native writable IOSB probes,
     append-only local route admission, and explicit position completion in that same boundary.
     The ordinary-I/O, live refault/persistence, and 33-import win32k frontiers remain open.
+
+    B3 coherent resident-file write policy tranche 44 (2026-09-06, host/build green):
+    `section_file_io.rs` adds `GenericSectionTable::write_file_coherent` and a synchronous raw-I/O
+    adapter contract. A stable mounted-file key selects the live control area, independently of the
+    caller's FILE_OBJECT or section size. The operation exclusively borrows the table through
+    preparation and commit instead of exporting a detached plan that could survive page/area reuse.
+    It rejects external EOF drift, invalid backing, overflowing ranges, and excessive section
+    extents before I/O; it gathers every resident page intersecting the requested bytes or potential
+    extension gap, preallocates the worklists, and reserves dirty-epoch space before mutation.
+
+    Admission drains resources retained by earlier failed cleanup even when the new file has no
+    resident pages. All shared aliases are rearmed and every canonical mapping is prepared before
+    the single raw backing write. The general area/page alias walker is shared with ordinary mapped
+    writeback, without fabricating dirty state for clean pages. The adapter excludes private COW
+    frames and must not enter hosted callbacks, pump events, or reenter the section table.
+
+    After backing I/O, only the reported accepted prefix is merged through prepared mappings, with
+    no allocation or fallible mapping after mutation. A positive extension zeroes the resident part
+    of the old-EOF-to-write gap, including an old partial-page tail when the write starts several
+    pages later. Zero acceptance does not extend EOF or alter padding. Bytes outside the accepted
+    prefix/gap remain untouched; changed pages retain dirty ownership and get new versions so old
+    flush tickets cannot acknowledge them. EOF advances only through accepted bytes. Normal short
+    and error-prefix results preserve actual progress. Impossible oversized backend progress is an
+    internal invariant failure, not a recoverable zero-byte result that hides stale canonical data.
+    Cleanup failure retains prepared resources and reports progress without undoing committed bytes.
+
+    Validation: 149 `nt-memory-manager`, 157 `nt-address-space`, 138 `nt-fs`, and 10 `nt-ahci`
+    tests pass (454 total). Eighteen new tests cover partial/cross-page and mixed-residency writes,
+    clean and already-dirty pages, alias ordering, short/error accepted prefixes, EOF-gap padding,
+    no-progress and empty writes, last-page preparation/rearm failures, epoch exhaustion, cleanup
+    retry including uncached files, invalid geometry/external EOF changes, impossible progress,
+    sibling/mount/backend/retired-area isolation, and private-frame independence. A real MemFs
+    hardlink test retains the caller's FILE_OBJECT after closing its handle, preserves current
+    position, merges new bytes without losing earlier mapped dirty data, then uses file-wide
+    writeback and snapshot restore to verify both names, exact EOF, and zero-filled gap bytes.
+    Logs: `.tmp/test-coherent-write-20260906.log` and `.tmp/build-coherent-write-20260906.log`.
+    The executive build passes with the existing 256 warnings and stages rootserver and hive.
+    Root alone ran serialized builds/tests; two
+    agents reviewed the transaction and mapped the internal mutation bypasses. No QEMU or physical
+    persistence run is claimed.
+
+    Review adjustment: this is the host write-policy checkpoint, not runtime coherent-I/O acceptance.
+    Next implement paired reads and an executive adapter that retains all prepared page aliases at
+    once; the single-page scratch helper must not be reused to remap after backing mutation. Isolate
+    raw backing adapters from ordinary coherent operations. Before activating cache reads, route
+    native read/write, EOF/allocation/valid-data-length changes, destructive create/supersede, and
+    internal CM/hive append/truncate/write/atomic-temporary-file/provisioning through explicit memory
+    authority. `WritableHiveIoProvider` currently owns paths, not that authority. Do not install an
+    implicit callback inside raw filesystem methods that may already hold a mutable filesystem or
+    section-table borrow. Rename replacement must keep old mappings attached to the displaced node,
+    not follow the pathname. Writable IOSB probes, append-only routing, and delayed position
+    completion remain part of the native cutover. Live COW/refault/restart and the unchanged
+    33-import win32k gate remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

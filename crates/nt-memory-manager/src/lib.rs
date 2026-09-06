@@ -41,6 +41,7 @@ pub use private_backing::private_backing_pages;
 pub use copy_context::{copy_bookkeeping, live_checkpoint_matches, CopyBookkeeping};
 
 pub use runtime_section::{
+    SectionFilePage, SectionFileWriteIo,
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,
     GenericSectionTableStats, GenericSectionView, PendingSectionFrames, SectionRetirement, SectionRetirementIo,
     SectionRetirementResource, GENERIC_SECTION_BACKING_ANON,

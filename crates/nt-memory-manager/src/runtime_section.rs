@@ -8,6 +8,10 @@ pub use control_area::{SectionFileIdentity, SectionMountId, SectionMountIds};
 #[path = "section_pages.rs"]
 mod pages;
 
+#[path = "section_file_io.rs"]
+mod file_io;
+pub use file_io::{SectionFilePage, SectionFileWriteIo};
+
 #[path = "section_retirement.rs"]
 mod retirement;
 pub use retirement::{

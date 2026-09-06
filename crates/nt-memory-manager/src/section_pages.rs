@@ -253,12 +253,20 @@ impl GenericSectionTable {
         {
             return Err(STATUS_NOT_MAPPED_VIEW);
         }
+        self.aliases_for_area_page(ticket.control_area, ticket.file_offset)
+    }
+
+    pub(super) fn aliases_for_area_page(
+        &self,
+        control_area: u64,
+        file_offset: u64,
+    ) -> Result<Vec<crate::writeback::SectionPageAlias>, u32> {
         let mut aliases = Vec::new();
         for view in &self.views {
             if !view.live
                 || self
                     .section(view.section_index)
-                    .is_none_or(|section| section.control_area != ticket.control_area)
+                    .is_none_or(|section| section.control_area != control_area)
             {
                 continue;
             }
@@ -269,7 +277,7 @@ impl GenericSectionTable {
             {
                 return Err(STATUS_INVALID_PARAMETER_2);
             }
-            let Some(displacement) = ticket.file_offset.checked_sub(view.section_offset) else {
+            let Some(displacement) = file_offset.checked_sub(view.section_offset) else {
                 continue;
             };
             if displacement >= view.size {
