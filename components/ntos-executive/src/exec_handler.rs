@@ -17781,7 +17781,7 @@ impl ExecNtHandler {
         &mut self,
         resources: HostedThreadResources,
     ) {
-        if !resources.live || resources.client_pi >= MAX_PI {
+        if !resources.is_live() || resources.client_pi >= MAX_PI {
             return;
         }
         let Some(pid) = self.pm_pid_for_pi(resources.client_pi) else {
@@ -17791,12 +17791,12 @@ impl ExecNtHandler {
             return;
         };
         let mut after = before;
-        let stack_size = resources.stack_frames * nt_address_space::PAGE_SIZE;
+        let stack_size = resources.stack_frames() * nt_address_space::PAGE_SIZE;
         let stack_removed = after
-            .unregister_range(resources.stack_base, stack_size)
+            .unregister_range(resources.stack_base(), stack_size)
             .is_ok_and(|count| count != 0);
         let teb_removed = after
-            .unregister_range(resources.teb_va, 3 * nt_address_space::PAGE_SIZE)
+            .unregister_range(resources.teb_va(), 3 * nt_address_space::PAGE_SIZE)
             .is_ok_and(|count| count != 0);
         if !stack_removed && !teb_removed {
             return;

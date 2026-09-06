@@ -556,64 +556,9 @@ pub const fn tp_worker_env_scratch_va(pi: usize, slot: usize) -> u64 {
 
 pub const TP_WORKER_STACK_FRAME_COUNT: usize = TP_WORKER_STACK_FRAMES as usize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HostedThreadResources {
-    live: bool,
-    client_pi: usize,
-    stack_base: u64,
-    stack_frames: u64,
-    teb_va: u64,
-    stack_owner: [u64; TP_WORKER_STACK_FRAME_COUNT],
-    stack_target: [u64; TP_WORKER_STACK_FRAME_COUNT],
-    stack_mirror: [u64; TP_WORKER_STACK_FRAME_COUNT],
-    teb_owner: u64,
-    teb_target: u64,
-    teb_scratch: u64,
-    teb2_owner: u64,
-    teb2_target: u64,
-    teb2_scratch: u64,
-    acs_owner: u64,
-    acs_target: u64,
-    ipc_target: u64,
-    tramp_owner: u64,
-    tramp_target: u64,
-}
-
-impl HostedThreadResources {
-    const fn empty() -> Self {
-        Self {
-            live: false,
-            client_pi: 0,
-            stack_base: 0,
-            stack_frames: 0,
-            teb_va: 0,
-            stack_owner: [0; TP_WORKER_STACK_FRAME_COUNT],
-            stack_target: [0; TP_WORKER_STACK_FRAME_COUNT],
-            stack_mirror: [0; TP_WORKER_STACK_FRAME_COUNT],
-            teb_owner: 0,
-            teb_target: 0,
-            teb_scratch: 0,
-            teb2_owner: 0,
-            teb2_target: 0,
-            teb2_scratch: 0,
-            acs_owner: 0,
-            acs_target: 0,
-            ipc_target: 0,
-            tramp_owner: 0,
-            tramp_target: 0,
-        }
-    }
-
-    const fn new(client_pi: usize, stack_base: u64, stack_frames: u64, teb_va: u64) -> Self {
-        let mut resources = Self::empty();
-        resources.live = true;
-        resources.client_pi = client_pi;
-        resources.stack_base = stack_base;
-        resources.stack_frames = stack_frames;
-        resources.teb_va = teb_va;
-        resources
-    }
-}
+use nt_user_host::thread_resources::ThreadMemoryLayout;
+type HostedThreadResources =
+    nt_user_host::thread_resources::ThreadMemoryResources<TP_WORKER_STACK_FRAME_COUNT>;
 
 unsafe fn recycle_mapped_cap(cap: u64) {
     if cap != 0 {
@@ -659,26 +604,26 @@ unsafe fn release_mapped_owned_thread_frame(owner: u64) {
 }
 
 unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
-    if !resources.live {
+    if !resources.is_live() {
         return;
     }
 
-    for index in 0..resources.stack_frames.min(TP_WORKER_STACK_FRAMES) as usize {
-        let page = resources.stack_base + index as u64 * 0x1000;
+    for index in 0..resources.stack_frames() as usize {
+        let page = resources.stack_base() + index as u64 * 0x1000;
         take_registered_thread_page(resources.client_pi, page, resources.stack_owner[index]);
         recycle_mapped_cap(resources.stack_target[index]);
         recycle_mapped_cap(resources.stack_mirror[index]);
         release_unmapped_owned_thread_frame(resources.stack_owner[index]);
     }
 
-    take_registered_thread_page(resources.client_pi, resources.teb_va, resources.teb_owner);
+    take_registered_thread_page(resources.client_pi, resources.teb_va(), resources.teb_owner);
     recycle_mapped_cap(resources.teb_target);
     recycle_mapped_cap(resources.teb_scratch);
     release_unmapped_owned_thread_frame(resources.teb_owner);
 
     take_registered_thread_page(
         resources.client_pi,
-        resources.teb_va + 0x1000,
+        resources.teb_va() + 0x1000,
         resources.teb2_owner,
     );
     recycle_mapped_cap(resources.teb2_target);
@@ -687,22 +632,9 @@ unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
 
     recycle_mapped_cap(resources.acs_target);
     release_mapped_owned_thread_frame(resources.acs_owner);
-    recycle_mapped_cap(resources.ipc_target);
+    recycle_mapped_cap(resources.ipc_owner);
     recycle_mapped_cap(resources.tramp_target);
     release_mapped_owned_thread_frame(resources.tramp_owner);
-}
-
-const fn hosted_thread_layout_is_disjoint(
-    stack_base: u64,
-    stack_frames: u64,
-    ipcbuf_va: u64,
-    teb_va: u64,
-    tramp_va: u64,
-) -> bool {
-    stack_base + stack_frames * 0x1000 <= ipcbuf_va
-        && ipcbuf_va + 0x1000 <= teb_va
-        // TEB page 1 + TEB page 2 + the thread's PRIVATE ACTIVATION_CONTEXT_STACK page.
-        && teb_va + 0x3000 <= tramp_va
 }
 
 const fn ranges_are_disjoint(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
@@ -735,48 +667,48 @@ const _: () = {
     assert!(HOSTED_THREAD_IPCBUF_VA != WL_WORKER2_IPCBUF_VA);
     assert!(HOSTED_THREAD_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
     assert!(WL_WORKER2_IPCBUF_VA != WL_WORKER3_IPCBUF_VA);
-    assert!(hosted_thread_layout_is_disjoint(
+    assert!(ThreadMemoryLayout::new(
         HOSTED_THREAD_STACK_BASE,
         HOSTED_THREAD_STACK_FRAMES,
         HOSTED_THREAD_IPCBUF_VA,
         HOSTED_THREAD_TEB_VA,
         HOSTED_THREAD_TRAMP_VA,
-    ));
-    assert!(hosted_thread_layout_is_disjoint(
+    ).is_some());
+    assert!(ThreadMemoryLayout::new(
         SVC_LISTENER_STACK_BASE,
         SVC_LISTENER_STACK_FRAMES,
         SVC_LISTENER_IPCBUF_VA,
         SVC_LISTENER_TEB_VA,
         SVC_LISTENER_TRAMP_VA,
-    ));
-    assert!(hosted_thread_layout_is_disjoint(
+    ).is_some());
+    assert!(ThreadMemoryLayout::new(
         WL_WORKER2_STACK_BASE,
         WL_WORKER2_STACK_FRAMES,
         WL_WORKER2_IPCBUF_VA,
         WL_WORKER2_TEB_VA,
         WL_WORKER2_TRAMP_VA,
-    ));
-    assert!(hosted_thread_layout_is_disjoint(
+    ).is_some());
+    assert!(ThreadMemoryLayout::new(
         WL_WORKER3_STACK_BASE,
         WL_WORKER3_STACK_FRAMES,
         WL_WORKER3_IPCBUF_VA,
         WL_WORKER3_TEB_VA,
         WL_WORKER3_TRAMP_VA,
-    ));
-    assert!(hosted_thread_layout_is_disjoint(
+    ).is_some());
+    assert!(ThreadMemoryLayout::new(
         TP_WORKER_STACK_BASE,
         TP_WORKER_STACK_FRAMES,
         TP_WORKER_IPCBUF_VA,
         TP_WORKER_TEB_VA,
         TP_WORKER_TRAMP_VA,
-    ));
-    assert!(hosted_thread_layout_is_disjoint(
+    ).is_some());
+    assert!(ThreadMemoryLayout::new(
         TP_WORKER_SLOT1_STACK_BASE,
         TP_WORKER_STACK_FRAMES,
         TP_WORKER_SLOT1_IPCBUF_VA,
         TP_WORKER_SLOT1_TEB_VA,
         TP_WORKER_SLOT1_TRAMP_VA,
-    ));
+    ).is_some());
     assert!(TP_WORKER_SLOT0_REGION_BASE + TP_WORKER_EXEC_STRIDE == TP_WORKER_SLOT1_REGION_BASE);
     assert!(TP_WORKER_SLOT0_REGION_BASE & 0xffff == 0);
     assert!(tp_worker_high_region_base(0) == TP_WORKER_SLOT0_REGION_BASE);
@@ -25948,7 +25880,7 @@ impl HostedThreadRuntimeTable {
         teb_alias: u64,
         resources: HostedThreadResources,
     ) -> Option<HostedThreadRuntime> {
-        if tid == 0 || tcb <= 1 || !mechanism.is_live() || !resources.live {
+        if tid == 0 || tcb <= 1 || !mechanism.is_live() || !resources.is_live() {
             return None;
         }
         let index = self.entries.iter().position(|entry| {
@@ -27308,6 +27240,14 @@ unsafe fn spawn_hosted_thread(
     handler: &mut ExecNtHandler,
     t: &HostedThread,
 ) -> HostedThreadSpawnResult {
+    let Some(layout) = ThreadMemoryLayout::new(
+        t.stack_base, t.stack_frames, t.ipcbuf_va, t.teb_va, t.tramp_va,
+    ) else {
+        return HostedThreadSpawnResult::failed();
+    };
+    let Some(resources) = HostedThreadResources::new(t.client_pi as usize, layout) else {
+        return HostedThreadSpawnResult::failed();
+    };
     if !hosted_thread_client_frame_keys_available(t) {
         return HostedThreadSpawnResult::failed();
     }
@@ -27320,7 +27260,7 @@ unsafe fn spawn_hosted_thread(
         Ok(prepared) => prepared,
         Err(_) => return HostedThreadSpawnResult::failed(),
     };
-    let mut spawned = spawn_hosted_thread_mechanism(t);
+    let mut spawned = spawn_hosted_thread_mechanism(t, resources);
     if spawned.tcb() == 0 {
         return spawned;
     }
@@ -27328,14 +27268,11 @@ unsafe fn spawn_hosted_thread(
     spawned
 }
 
-unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnResult {
+unsafe fn spawn_hosted_thread_mechanism(
+    t: &HostedThread,
+    mut resources: HostedThreadResources,
+) -> HostedThreadSpawnResult {
     let scr = t.scr;
-    let resource_pi = t.client_pi as usize;
-    if t.stack_frames > TP_WORKER_STACK_FRAMES {
-        return HostedThreadSpawnResult::failed();
-    }
-    let mut resources =
-        HostedThreadResources::new(resource_pi, t.stack_base, t.stack_frames, t.teb_va);
     if !ensure_hosted_thread_exec_alias_paging(t, scr) {
         release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
@@ -27636,7 +27573,7 @@ unsafe fn spawn_hosted_thread_mechanism(t: &HostedThread) -> HostedThreadSpawnRe
     } else {
         page_map(ipcbuf, t.ipcbuf_va, RW_NX, t.pml4)
     };
-    resources.ipc_target = ipcbuf;
+    resources.ipc_owner = ipcbuf;
     if e_ipc_target_map != 0 {
         print_str(b"[thread-life] IPC buffer map failure status=");
         print_u64(e_ipc_target_map);

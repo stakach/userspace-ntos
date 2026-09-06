@@ -109,6 +109,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add a host-tested unpublished-thread rollback owner with unique attempt identity, retained
   capability progress, ordered teardown, and once-only target commit (tranche 52, host/build;
   not runtime wired).
+- [x] Share checked private-thread resource geometry with the executive, retain every target range,
+  and classify physical backing separately from copied aliases (tranche 53, host/build;
+  rollback adapter pending).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next wire the registered-resume failure path
   with retained runtime/pool/window ownership, once-only caller cancellation, reconciled physical-frame
@@ -26360,6 +26363,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     under checked journals. Unregistered-spawn failure, earlier construction failure, whole-process
     unpublished cleanup, and pre-park driver/PnP/LPC handoffs remain separately open. No unsafe native
     cleanup path was replaced in this host-only slice; remove each old path when its adapter is enabled.
+
+    B3 private-thread resource description tranche 53 (2026-09-07, host/build green):
+    `nt-user-host::thread_resources` replaces the executive's duplicate `HostedThreadResources`
+    structure and arithmetic-only layout checker. The executive now retains an immutable checked
+    `ThreadMemoryLayout` for the stack, IPC page, both TEB pages plus private activation-context
+    stack, and trampoline. IPC and trampoline target addresses were previously absent from retained
+    resources. Every range is nonzero, page-aligned, overflow-checked and pairwise disjoint; arbitrary
+    address ordering and adjacent ranges are supported. The resource container checks its stack-array
+    capacity rather than letting cleanup truncate an oversized frame count. Native spawn admission
+    validates layout/capacity before registry scanning, commitment preparation, or mechanism allocation.
+    Compile-time checks of the existing fixed layouts use this same constructor.
+    These are geometry checks, not canonical/user-address validation or admission against other live
+    VM mappings; those remain the address-space owner's responsibility.
+
+    The crate also projects the private resource description into an exact rollback cap inventory.
+    Each stack/TEB/ACS/IPC/trampoline page has one physical Frame owner; target, mirror and scratch
+    copies are Alias entries. `ipc_target` was misleading: native construction allocates that frame
+    directly rather than copying another owner. It is now named `ipc_owner` and classified accordingly.
+    Legacy IPC cap deletion is unchanged; no unsafe switch to frame recycling was made. Duplicate
+    references within one physical group coalesce, while cross-page cap reuse, ownerless aliases and
+    capabilities outside the retained layout are rejected. Partial construction retains only present
+    caps. This copyable description is not a second cleanup owner: inventory capture performs no
+    ownership transfer or backend operations. Registry aliases and mechanism caps must still be
+    captured explicitly by the native rollback adapter.
+
+    Validation: 12 new focused tests cover geometry, all range overlap pairs, unordered/adjacent
+    ranges, overflow, capacity, exclusion boundary queries including IPC/ACS/trampoline, empty/partial
+    construction, exact owner/alias projection, duplicate/conflicting caps and compatibility with the
+    tranche-52 rollback owner. The serialized nine-crate regression suite passes 909 tests, including
+    45 `nt-user-host` unit/integration tests. Logs: `.tmp/test-thread-resources-focused-20260907.log`
+    and `.tmp/test-thread-resources-20260907.log`. The executive build passes at the existing
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-thread-resources-20260907.log`.
+    Two agents reviewed the native ownership and
+    geometry; root alone ran builds/tests. No live seL4 failure injection or desktop proof is claimed.
+
+    Review adjustment: native description/admission is wired; retained cleanup is not. Do not activate
+    the adapter by merely checking TCB deletion. Publish a pending runtime before fallible preparation,
+    retain pool/window reservations and process-generation identity, and separate caller cancellation
+    from final target commit. Preserve ownership/slot-collision lookups while excluding pending entries
+    from execution lookup and thread-control admission before Ps suspend counts mutate. Refuse pending
+    rollback badges explicitly before normal fault/syscall routing, which otherwise has mechanism-badge
+    fallbacks. Publish exclusions before inventory capture and retain them through every failure.
+    Cover native copy preparation, lock/residency admission, hosted faults, win32k alias creation,
+    admitted low-level copies and direct/active mirror paths. Other-thread VM mutation must not retire
+    captured backing independently. Transfer exact registry rows only after their ownership is retained;
+    TEB registry target caps must not become second physical owners. Clear active stack/TEB publications
+    before dropping exclusions. Keep generic runtime release blocked until exact final cleanup commit.
+    Unregistered/early/whole-process spawn rollback and handler-owned pre-park handoffs remain open.
+    The win32k import barrier is unchanged at 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
