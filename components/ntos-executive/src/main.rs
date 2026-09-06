@@ -8691,9 +8691,10 @@ unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
     if record.owns_frame && !(&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).reserve(1) {
         return false;
     }
-    record = registry
-        .begin_reclaim_exact(record)
-        .expect("serialized frame reclaim must retain its exact owner before unmapping");
+    let Some(retiring) = registry.begin_reclaim_exact(record) else {
+        return false;
+    };
+    record = retiring;
 
     if record.frame != 0 && !record.frame_unmapped {
         if page_unmap_r(record.frame) != 0 {

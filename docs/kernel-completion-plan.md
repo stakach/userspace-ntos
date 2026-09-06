@@ -121,10 +121,14 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Reject conflicting frame-registry alias/source publication, retain terminal reclamation state,
   and give exact cleanup snapshots a non-reusable record identity (tranche 56, host/build;
   native registry admission and reclamation entry wired).
+- [x] Add an atomic, retained multirow registry handoff that blocks ordinary removal and address
+  reuse until exact final cleanup acknowledgement (tranche 57, host/build; native rollback
+  acquisition not yet activated).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next wire the registered-resume failure path
-  with retained runtime/pool/window ownership, once-only caller cancellation, reconciled physical-frame
-  ownership, and persistent refault/native-copy exclusion. Then cover unregistered/early spawn
+  emptiness as a complete execution-quiescence proof. Next reconcile registry/runtime physical-frame
+  ownership, then wire registered-resume failure with retained runtime/pool/window ownership,
+  once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
+  follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
   cleanup is incomplete; retain private COW backing and exact failed capabilities.
@@ -26551,6 +26555,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     selection. Keep whole-process retirement blocked by retained runtimes. Partial-constructor and
     main-process failure ownership remain open, as do handler-owned handoffs. The current complete
     win32k import gate is still blocked by 33 unresolved code imports.
+
+    B3 retained frame-registry handoff tranche 57 (2026-09-07, host/build green):
+    `ClientFrameRegistry::prepare_transfer_exact` now acquires a complete exact row selection for
+    an external retained cleanup journal. It rejects empty selections, duplicate keys, stale or
+    missing members, and already-reclaiming rows before any ownership change. It preallocates the
+    snapshot vector and checks non-wrapping attempt identity before marking all selected rows
+    terminal and transfer-owned. A private `Option<NonZeroU64>` holds the ownership marker without
+    a separate option discriminant word per page. The non-cloneable transfer retains exact snapshots;
+    these describe captured capabilities, not the external journal's remaining release operations.
+
+    Selected rows remain in the registry as unavailable placeholders. Ordinary `take`, `take_exact`
+    and all exact mutation/reclamation methods refuse them; insertion, age touches and resident
+    access already refuse their terminal state. A dropped transfer cannot silently unlock pages or
+    remove records. Independent transfers coexist, and unrelated vector growth or swap removal
+    cannot change ownership because neither acquisition nor final commit relies on stored indices.
+    `finish_transfer` revalidates every exact row and attempt before removing any member. Failure
+    returns the intact transfer for retry; success removes the whole selection without allocation.
+    The caller must invoke it only after checked external cleanup, not to cancel failed cleanup.
+    The native single-page reclaimer now returns refusal before unmapping when exact admission is
+    held by a transfer, instead of assuming admission cannot fail.
+
+    Validation: 15 new tests cover batch acquisition/commit, empty/duplicate input, stale/missing
+    members, competing reclamation, injected journal allocation failure, identity exhaustion,
+    every ordinary mutation/removal guard, resident/registration refusal, overlapping and independent
+    transfers, wrong-registry retry, all-or-nothing final validation, dropped owners, vector movement,
+    and identical row reuse. The focused registry suite passes 37 tests and the serialized nine-crate
+    suite passes 958 tests, including 246 `nt-memory-manager` tests. Logs:
+    `.tmp/test-frame-transfer-focused-20260907.log` and `.tmp/test-frame-transfer-20260907.log`.
+    The executive build passes at the unchanged 262-warning baseline and stages rootserver/hive;
+    log: `.tmp/build-frame-transfer-20260907.log`. Two agents audited handoff and native physical
+    ownership; root alone ran builds/tests. No live failure injection or desktop proof is claimed.
+
+    Review adjustment: close the registry handoff primitive only. Do not acquire it in the native
+    resume-failure path until runtime resources and all external aliases have retained cleanup
+    journals, and access exclusions are published. Next reconcile stack rows (`frame=stack_owner`)
+    and worker TEB rows (`frame=teb_target`) against the sole runtime physical owner; the latter's
+    current `owns_frame=true` flag must not create a second physical owner. Require explicit
+    registered/unregistered coverage, exact process/page matching, and cross-page cap-conflict checks;
+    process index zero must not become generic unregistered policy. Capture registry-only TEB live
+    mirrors/source caps without losing their physical backing relationship. The transfer neither
+    performs seL4 operations nor blocks raw frame/mirror access, other-thread VM mutation or pageout.
+    Pending runtime/control/pool/window lifetime, once-only caller cancellation, checked native retry,
+    partial construction/main-process cleanup and handler-owned handoffs remain open. The win32k
+    import barrier remains 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -1,5 +1,10 @@
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "client_frame_transfer.rs"]
+mod transfer;
+pub use transfer::{ClientFrameTransfer, ClientFrameTransferError};
 
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -26,6 +31,7 @@ pub struct ClientFrameRecord {
     pub frame_unmapped: bool,
     pub alias_unmapped: bool,
     reclaim_started: bool,
+    transfer_id: Option<NonZeroU64>,
 }
 
 impl ClientFrameRecord {
@@ -232,6 +238,7 @@ impl ClientFrameRegistry {
             frame_unmapped: false,
             alias_unmapped: false,
             reclaim_started: false,
+            transfer_id: None,
         });
         self.next_age = self.next_age.max(age.saturating_add(1));
         self.high_water = self.high_water.max(self.records.len());
@@ -261,6 +268,9 @@ impl ClientFrameRegistry {
 
     pub fn take(&mut self, pi: u64, page: u64) -> Option<ClientFrameRecord> {
         let index = self.index_for(pi, page)?;
+        if self.records[index].transfer_id.is_some() {
+            return None;
+        }
         Some(self.records.swap_remove(index))
     }
 
@@ -355,7 +365,7 @@ impl ClientFrameRegistry {
 
     pub fn take_exact(&mut self, expected: ClientFrameRecord) -> Option<ClientFrameRecord> {
         let index = self.index_for(expected.pi, expected.page)?;
-        if self.records[index] != expected {
+        if self.records[index] != expected || self.records[index].transfer_id.is_some() {
             return None;
         }
         Some(self.records.swap_remove(index))
@@ -363,7 +373,7 @@ impl ClientFrameRegistry {
 
     fn exact_mut(&mut self, expected: ClientFrameRecord) -> Option<&mut ClientFrameRecord> {
         let index = self.index_for(expected.pi, expected.page)?;
-        if self.records[index] != expected {
+        if self.records[index] != expected || self.records[index].transfer_id.is_some() {
             return None;
         }
         Some(&mut self.records[index])

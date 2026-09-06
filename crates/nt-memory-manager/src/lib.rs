@@ -33,7 +33,7 @@ mod working_set;
 
 pub use client_frame::{
     ClientFrameInsert, ClientFrameInsertError, ClientFrameRecord, ClientFrameRegistry,
-    ClientFrameRegistryStats,
+    ClientFrameRegistryStats, ClientFrameTransfer, ClientFrameTransferError,
 };
 pub use commit::{
     CommitChargePlan, CommitLimitPlan, CommitOwnerId, ProcessCommitAccounting, ProcessCommitLedger,
