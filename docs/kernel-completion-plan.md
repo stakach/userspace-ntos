@@ -57,9 +57,12 @@ below are historical baselines, not acceptance of the current provider cutover.
   preserving map-time shared policy and exact guard clearing (tranche 27, host/build validation).
 - [x] Project private resident/transition COW backing into native query regions and first-page
   OldProtect without changing raw fault/writeback policy (tranche 28, host/build validation).
-- [ ] Track private COW commitment lifetime through read-only reprotection, eviction, restoration,
-  and unmap. Include admission at direct image materialization, not just COW promotion. Carry
-  explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
+- [x] Account for registered private backing across reprotection, eviction, restoration, and unmap;
+  admit new private pages through the shared image-residency operation and remove duplicate prefetch
+  fills (tranche 29, host/build validation).
+- [ ] Replace legacy copyout-only image fills with checked residency/ownership/commitment publication;
+  complete main-image mirror teardown and genuine shared-writable image/control-area backing.
+  Carry explicit section/VAD CopyOnWrite policy before extending normalization to nonimage sections.
 - [ ] Complete tail-jump and cross-fragment epilogue recognition using chained-function identity.
 - [~] Complete fault-aware exact virtual-memory copy before using it for SEH readers. Nonresident
   backing admission and ordinary guards are implemented; current-thread stack-guard expansion,
@@ -25246,6 +25249,61 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     section's CopyOnWrite flag from view protection. Stack-guard expansion/overflow, ordinary CPU
     guard delivery, and live MM/SEH/desktop acceptance remain open behind the unchanged 33-import
     win32k barrier.
+
+    B3 registered private-backing commitment tranche 29 (2026-09-06, host/build green):
+    Fixed-mapping commitment now counts the union of view-policy reservations and privately owned
+    resident/transition pages. The allocation-free `nt-memory-manager::private_backing_pages`
+    iterator filters process identity and shared frames and deduplicates overlap between existing
+    backing authorities by virtual page, not physical frame. Query and commitment use this same
+    source; no persistent ownership ledger or per-page fixed mapping splits were added.
+
+    The `nt-address-space::commitment` policy retains charge through RO/NOACCESS/guard changes and
+    eviction, avoids charging existing private backing again on RO-to-WC changes, and excludes
+    unrelated/unregistered pages. Initial process totals and allocation release totals use this
+    union. Native protection computes both sides from the same live backing authorities before
+    preparing MM/Ps admission. Existing mapped/image unmap paths capture release before backing
+    teardown. Private VAD commitment remains owned by its existing allocator.
+
+    `exec_virtual_memory_commit.rs` prepares additional charge for newly private image backing
+    outside an existing COW reservation, after working-set activity and before publication. The
+    shared image-residency operation commits it immediately after owned frame registration, both
+    for fresh fills and promotion of existing nonprivate backing. Reserved WC promotions need no
+    extra charge, including mapped-section promotion that independently admits a page table.
+    Failure leaves the prepared data charge unpublished. Image reprotection no longer creates
+    private ownership as a side effect: its callers already project requested rights by ownership,
+    and guard consumption must not privatize existing shared-writable backing.
+
+    Prefetch neighbors now use the same image-residency operation, removing roughly 400 lines of
+    duplicate fill/mapping machinery and unreachable fault-page branches. Existing pressure and
+    shareability policy is retained; resident/transition neighbors are skipped. Optional failure
+    ends prefetch without parking an already-serviced mandatory fault. Fresh private copy/map/
+    registration failures release source and mirror caps and return the unused scratch slot;
+    already-published shared cache backing remains owned by its cache. Main-image mirror creation
+    is checked instead of ignoring map failure. The legacy current-image copyout promotion check
+    now uses live committed protection and rejects writes to protected images, rather than deriving
+    a stale WC reservation from original PE headers.
+
+    Validation: 124 `nt-address-space` and 42 `nt-memory-manager` tests pass, including union identity,
+    reserve consumption, partial reservation release, direct writable-page admission limits,
+    failed-publication retry, protection failure atomicity, resident/transition transfer, failed
+    restore, unmap capture, and sparse terabyte views. The address-space tests use the real host
+    backing registries and process commit ledger through a dev-only dependency. The executive build
+    passes with the existing 256 warnings. Logs: `.tmp/test-cow-commit-20260906.log` and
+    `.tmp/build-cow-commit-20260906.log`. Independent review of admission/publication and revised
+    failure cleanup found no remaining issue in this bounded slice. No QEMU boot was attempted.
+
+    Review adjustment: registered-backing accounting is implemented, not universal image creation
+    admission. Next consolidate `img_spawn::client_copyout_or_fill_mapped` and related legacy
+    copyout-only fills: their absent-frame branches still use raw PE rights and `filled_pages`
+    without publishing frame ownership or data commitment. Remove those branches when callers use
+    the checked mutable residency boundary; do not merely count their scratch slots as private
+    backing. Successful legacy main-image mirror mappings also need an audited teardown lifetime.
+    Initial shared-writable image sections still use process-private backing in the current loader;
+    this slice charges that actual ownership but does not claim NT5 control-area shared-write
+    semantics. Implement genuine shared backing rather than normalizing PE registration to WC.
+    Keep nonimage CopyOnWrite VAD policy, stack-guard expansion/overflow, ordinary CPU guard delivery,
+    physical remap/fill failure injection, and live MM/SEH/desktop acceptance open. The 33-import
+    win32k barrier is unchanged and has not been bypassed.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

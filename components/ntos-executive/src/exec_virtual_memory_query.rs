@@ -28,15 +28,11 @@ impl ExecNtHandler {
         }
         let table = process_committed_mapping_table(target_pi)
             .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
-        let resident = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
-            .records()
-            .iter()
-            .filter(|record| record.pi == target_pi as u64 && record.owns_frame)
-            .map(|record| record.page);
-        let transition =
-            (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).pages_for_owner(target_pi as u64);
         table
-            .query_basic_with_private_pages(address, resident.chain(transition))?
+            .query_basic_with_private_pages(
+                address,
+                process_private_backing_pages(target_pi as u64),
+            )?
             .ok_or(nt_address_space::STATUS_NOT_COMMITTED)
     }
 

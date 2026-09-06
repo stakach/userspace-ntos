@@ -1478,15 +1478,27 @@ pub(crate) unsafe fn process_committed_mapping_snapshot(
 
 pub(crate) unsafe fn process_committed_mapping_commit_bytes(pi: u64) -> Option<u64> {
     process_committed_mapping_table(pi as usize)
-        .map(nt_address_space::VmCommittedRangeTable::process_commit_bytes)
+        .map(|table| table.process_commit_bytes_with_private_pages(process_private_backing_pages(pi)))
+}
+
+pub(crate) unsafe fn process_private_backing_pages(pi: u64) -> impl Iterator<Item = u64> {
+    nt_memory_manager::private_backing_pages(
+        pi,
+        &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY),
+        &*core::ptr::addr_of!(PROCESS_PAGEFILE),
+    )
 }
 
 pub(crate) unsafe fn process_committed_allocation_commit_bytes(
     pi: u64,
     allocation_base: u64,
 ) -> Option<u64> {
-    process_committed_mapping_table(pi as usize)
-        .map(|table| table.allocation_process_commit_bytes(allocation_base))
+    process_committed_mapping_table(pi as usize).map(|table| {
+        table.allocation_process_commit_bytes_with_private_pages(
+            allocation_base,
+            process_private_backing_pages(pi),
+        )
+    })
 }
 
 pub(crate) unsafe fn process_committed_mapping_replace(
@@ -13596,13 +13608,6 @@ unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
     true
 }
 
-fn vm_protection_writable(protection: u32) -> bool {
-    matches!(
-        protection & 0xff,
-        nt_address_space::PAGE_READWRITE | nt_address_space::PAGE_EXECUTE_READWRITE
-    )
-}
-
 unsafe fn vm_reprotect_private_page(
     pi: usize,
     page: u64,
@@ -14159,29 +14164,14 @@ unsafe fn vm_reprotect_resident_image_page(
     old_protection: u32,
     new_protection: u32,
     pml4: u64,
-    scratch_base: u64,
 ) -> Result<(), u32> {
-    if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
-        if vm_protection_writable(new_protection) && !record.owns_frame {
-            return vm_promote_image_cow_page(
-                pi,
-                page,
-                old_protection,
-                new_protection,
-                pml4,
-                scratch_base,
-            );
-        }
+    if csrss_frame_get_exact_record(pi as u64, page).is_some() {
         return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
     }
     if !shared_image_mapping_contains(pi as u64, page) {
         return Ok(());
     }
-    if vm_protection_writable(new_protection) {
-        vm_promote_image_cow_page(pi, page, old_protection, new_protection, pml4, scratch_base)
-    } else {
-        vm_reprotect_shared_image_mapping(pi, page, old_protection, new_protection, pml4)
-    }
+    vm_reprotect_shared_image_mapping(pi, page, old_protection, new_protection, pml4)
 }
 
 unsafe fn copy_cap(src: u64) -> u64 {

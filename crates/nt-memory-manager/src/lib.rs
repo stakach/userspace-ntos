@@ -22,6 +22,7 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
 mod client_frame;
 mod commit;
+mod private_backing;
 mod runtime_section;
 mod working_set;
 
@@ -33,6 +34,7 @@ pub use commit::{
     CommitChargePlan, CommitLimitPlan, CommitOwnerId, ProcessCommitAccounting, ProcessCommitLedger,
     PAGE_SIZE as COMMIT_PAGE_SIZE, STATUS_COMMITMENT_LIMIT,
 };
+pub use private_backing::private_backing_pages;
 
 pub use runtime_section::{
     GenericSection, GenericSectionBacking, GenericSectionFlushPlan, GenericSectionTable,

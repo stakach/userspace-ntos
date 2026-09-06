@@ -3928,6 +3928,28 @@ pub(crate) unsafe fn service_generic_section_fault(
     Ok(true)
 }
 
+fn sec_image_page_shareable(
+    pe: &nt_pe_loader::PeFile,
+    rva: u32,
+    base: u64,
+    protection: u32,
+    plan: nt_address_space::VmImageViewFaultPlan,
+) -> bool {
+    base != PE_LOAD_BASE
+        && (nt_address_space::image_view_shared_cacheable(protection, plan.map_protection)
+            || (!plan.copy_on_write
+                && (protection & 0xff) == nt_address_space::PAGE_WRITECOPY
+                && sec_image_clean_writecopy_shareable(pe, rva, base)))
+}
+
+unsafe fn discard_unpublished_image_backing(source: u64, mirror: u64, faults: &mut u64) {
+    if source != 0 {
+        recycle_mapped_cap(mirror);
+        recycle_mapped_cap(source);
+        *faults = faults.checked_sub(1).expect("unpublished image fill owns its scratch slot");
+    }
+}
+
 /// Make one committed SEC_IMAGE page resident through the same cache, COW, fill, and registration
 /// authorities used by a real user fault. `fault_observed` requests a remap when a retained private
 /// source frame proves the page was previously filled but the user mapping faulted again.
@@ -3973,6 +3995,7 @@ pub(crate) unsafe fn service_image_page_residency(
     {
         let read_protection =
             nt_address_space::image_view_fault_plan(info.protect, false).map_protection;
+        let prepared = nt_handler.prepare_private_mapping_backing(pi, page)?;
         vm_promote_image_cow_page(
             pi,
             page,
@@ -3981,6 +4004,7 @@ pub(crate) unsafe fn service_image_page_residency(
             pml4,
             scratch_base,
         )?;
+        nt_handler.commit_process_commit_charge(prepared);
         let filled_count = (*faults as usize).min(filled_pages.len());
         for filled_page in filled_pages.iter_mut().take(filled_count) {
             if *filled_page == page {
@@ -3990,13 +4014,7 @@ pub(crate) unsafe fn service_image_page_residency(
         return Ok(());
     }
 
-    let clean_writecopy_shareable = base != PE_LOAD_BASE
-        && !fault_plan.copy_on_write
-        && (info.protect & 0xff) == nt_address_space::PAGE_WRITECOPY
-        && sec_image_clean_writecopy_shareable(pe, rva, base);
-    let shareable = base != PE_LOAD_BASE
-        && (nt_address_space::image_view_shared_cacheable(info.protect, fault_plan.map_protection)
-            || clean_writecopy_shareable);
+    let shareable = sec_image_page_shareable(pe, rva, base, info.protect, fault_plan);
     let cached = if shareable { dll_cache_get(page) } else { 0 };
 
     if !fault_observed
@@ -4037,6 +4055,12 @@ pub(crate) unsafe fn service_image_page_residency(
         }
     }
 
+    let prepared = if fault_plan.requires_private_backing() {
+        nt_handler.prepare_private_mapping_backing(pi, page)?
+    } else {
+        crate::exec_handler::PreparedProcessCommitCharge::default()
+    };
+    let mut mirror_cap = 0;
     let (frame, private_alias, private_source_cap) = if cached != 0 {
         DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
         (cached, 0, 0)
@@ -4072,12 +4096,15 @@ pub(crate) unsafe fn service_image_page_residency(
         } else if base == PE_LOAD_BASE {
             let offset = page - PE_LOAD_BASE;
             if offset < IMAGE_MIRROR_WINDOW {
-                let _ = page_map(
-                    copy_cap(frame),
-                    image_mirror + offset,
-                    RW_NX,
-                    CAP_INIT_THREAD_VSPACE,
-                );
+                let (cap, copy_error) = copy_cap_r(frame);
+                if copy_error != 0
+                    || page_map_r(cap, image_mirror + offset, RW_NX, CAP_INIT_THREAD_VSPACE) != 0
+                {
+                    recycle_mapped_cap(cap);
+                    recycle_mapped_cap(frame);
+                    return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+                }
+                mirror_cap = cap;
             }
         }
         *faults += 1;
@@ -4093,11 +4120,13 @@ pub(crate) unsafe fn service_image_page_residency(
         if map_cap != 0 {
             let _ = cnode_delete_recycle_r(map_cap);
         }
+        discard_unpublished_image_backing(private_source_cap, mirror_cap, faults);
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     let map_error = page_map_r(map_cap, page, rights, pml4);
     if map_error != 0 {
         let _ = cnode_delete_recycle_r(map_cap);
+        discard_unpublished_image_backing(private_source_cap, mirror_cap, faults);
         let duplicate_shared_fault = fault_observed
             && map_error == 8
             && shareable
@@ -4126,11 +4155,11 @@ pub(crate) unsafe fn service_image_page_residency(
         ) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
-            let _ = page_unmap_r(private_source_cap);
-            let _ = cnode_delete_recycle_r(private_source_cap);
+            discard_unpublished_image_backing(private_source_cap, mirror_cap, faults);
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
         let filled_index = (*faults as usize).saturating_sub(1);
+        nt_handler.commit_process_commit_charge(prepared);
         if filled_index < filled_pages.len() {
             filled_pages[filled_index] = if fault_plan.requires_private_backing() {
                 0
@@ -10762,407 +10791,62 @@ pub(crate) unsafe fn service_sec_image(
                 allocation_failed = true;
                 fault_page_serviced = false;
             }
-            let mut bi: u64 = 1;
-            while !allocation_failed && bi < batch_pages {
+            for bi in 1..batch_pages {
+                if allocation_failed || faults >= SEC_IMAGE_FAULT_CAP {
+                    break;
+                }
                 let bpage = batch_start + bi * 0x1000;
                 if bpage >= img_hi || bpage < base {
                     break;
                 }
-                // The single page that actually FAULTED (present in every window). Only this page is
-                // guaranteed unmapped; every other page must be checked before (re)mapping.
-                let is_fault_page = bpage == page;
-                if faults >= SEC_IMAGE_FAULT_CAP {
-                    break;
-                }
-                let rva = (bpage - base) as u32;
-                let Some(image_view_info) =
-                    process_committed_mapping_basic_information(pi as u64, bpage)
+                let Some(info) = process_committed_mapping_basic_information(pi as u64, bpage)
+                    .filter(|info| info.type_ == nt_address_space::MEM_IMAGE)
                 else {
-                    if is_fault_page {
-                        print_str(b"[vmf-image-protect] missing committed image page pi=");
-                        print_u64(pi as u64);
-                        print_str(b" page=0x");
-                        print_hex((bpage >> 32) as u32);
-                        print_hex(bpage as u32);
-                        print_str(b"\n");
-                        allocation_failed = true;
-                    }
                     break;
                 };
-                if image_view_info.type_ != nt_address_space::MEM_IMAGE {
-                    if is_fault_page {
-                        print_str(b"[vmf-image-protect] non-image owner pi=");
-                        print_u64(pi as u64);
-                        print_str(b" page=0x");
-                        print_hex((bpage >> 32) as u32);
-                        print_hex(bpage as u32);
-                        print_str(b" type=0x");
-                        print_hex(image_view_info.type_);
-                        print_str(b"\n");
-                        allocation_failed = true;
-                    }
+                if nt_address_space::image_view_fault_access_status(
+                    info.protect,
+                    nt_address_space::FaultAccess::Lock,
+                )
+                .is_err()
+                {
                     break;
                 }
-                let image_fault_access = vm_fault_access_from_x86_error(m3);
-                if is_fault_page {
-                    if let Err(status) = nt_address_space::image_view_fault_access_status(
-                        image_view_info.protect,
-                        image_fault_access,
-                    ) {
-                        print_str(b"[vmf-image-protect] denied image fault access pi=");
-                        print_u64(pi as u64);
-                        print_str(b" page=0x");
-                        print_hex((bpage >> 32) as u32);
-                        print_hex(bpage as u32);
-                        print_str(b" protect=0x");
-                        print_hex(image_view_info.protect);
-                        print_str(b" status=0x");
-                        print_hex(status);
-                        print_str(b"\n");
-                        image_protect_failed = true;
-                        allocation_failed = true;
-                        break;
-                    }
-                }
-                let image_fault_plan = nt_address_space::image_view_fault_plan(
-                    image_view_info.protect,
-                    is_fault_page && image_fault_access == nt_address_space::FaultAccess::Write,
+                let plan = nt_address_space::image_view_fault_plan(info.protect, false);
+                let shareable = sec_image_page_shareable(
+                    tpe, (bpage - base) as u32, base, info.protect, plan,
                 );
-                let image_map_rights = vm_page_rights(image_fault_plan.map_protection);
-                if image_map_rights == 0 {
-                    if is_fault_page {
-                        print_str(b"[vmf-image-protect] denied image access pi=");
-                        print_u64(pi as u64);
-                        print_str(b" page=0x");
-                        print_hex((bpage >> 32) as u32);
-                        print_hex(bpage as u32);
-                        print_str(b" protect=0x");
-                        print_hex(image_view_info.protect);
-                        print_str(b"\n");
-                        image_protect_failed = true;
-                        allocation_failed = true;
-                    }
+                if !shareable && !forward_policy.private_neighbours {
+                    SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if csrss_frame_get_exact_record(pi as u64, bpage).is_some()
+                    || shared_image_mapping_contains(pi as u64, bpage)
+                    || (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, bpage)
+                    || (shareable && dll_cache_get(bpage) != 0)
+                {
+                    continue;
+                }
+                // Speculation uses the same admission/publication as a demand fault. A failure
+                // stops optional work; it does not undo or park the successfully serviced fault.
+                if service_image_page_residency(
+                    &mut nt_handler,
+                    pi,
+                    bpage,
+                    base,
+                    tpe,
+                    pml4,
+                    scratch_base,
+                    ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed),
+                    nt_address_space::FaultAccess::Lock,
+                    false,
+                    filled_pages,
+                    &mut faults,
+                )
+                .is_err()
+                {
                     break;
                 }
-                // SHAREABLE = a registered DLL image page whose live SEC_IMAGE protection is
-                // immutable, whose read fault plan installs execute/read text, or a plain
-                // write-copy data page that the PE predicate proves has no loader-written state.
-                // Loader-patched pages stay private; later runtime writes to clean shared data still
-                // promote through the normal image COW path.
-                let clean_writecopy_shareable = base != PE_LOAD_BASE
-                    && !image_fault_plan.copy_on_write
-                    && (image_view_info.protect & 0xff) == nt_address_space::PAGE_WRITECOPY
-                    && sec_image_clean_writecopy_shareable(tpe, rva, base);
-                let shareable = base != PE_LOAD_BASE
-                    && (nt_address_space::image_view_shared_cacheable(
-                        image_view_info.protect,
-                        image_fault_plan.map_protection,
-                    ) || clean_writecopy_shareable);
-                let cached = if shareable { dll_cache_get(bpage) } else { 0 };
-                let shared_mapping_registered = shared_image_mapping_contains(pi as u64, bpage);
-                let shareable_mapping_registered = shareable && shared_mapping_registered;
-                if !is_fault_page && !shareable && !forward_policy.private_neighbours {
-                    SEC_IMAGE_PRIVATE_PREFETCH_SKIPS.fetch_add(1, Ordering::Relaxed);
-                    bi += 1;
-                    continue;
-                }
-                if is_fault_page && image_fault_plan.copy_on_write {
-                    let read_fault_protection =
-                        nt_address_space::image_view_fault_plan(image_view_info.protect, false)
-                            .map_protection;
-                    if csrss_frame_get_exact_record(pi as u64, bpage).is_some()
-                        || shared_mapping_registered
-                    {
-                        match vm_promote_image_cow_page(
-                            pi,
-                            bpage,
-                            read_fault_protection,
-                            image_fault_plan.map_protection,
-                            pml4,
-                            scratch_base,
-                        ) {
-                            Ok(()) => {
-                                for filled_page in filled_pages.iter_mut().take(faults as usize) {
-                                    if *filled_page == bpage {
-                                        *filled_page = 0;
-                                    }
-                                }
-                                fault_page_serviced = true;
-                                bi += 1;
-                                continue;
-                            }
-                            Err(status) => {
-                                print_str(b"[image-cow] promote failed pi=");
-                                print_u64(pi as u64);
-                                print_str(b" page=0x");
-                                print_hex((bpage >> 32) as u32);
-                                print_hex(bpage as u32);
-                                print_str(b" status=0x");
-                                print_hex(status);
-                                print_str(b"\n");
-                                allocation_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                // A forward run may overlap pages filled by an earlier run. The faulting page must
-                // still be handled, but speculative neighbours that are already resident must not
-                // be filled into a new frame and mapped over the live page (seL4 DeleteFirst).
-                if !is_fault_page && !shareable && filled_pages.contains(&bpage) {
-                    bi += 1;
-                    continue;
-                }
-                // ★ BATCH 25 — FIXUP-SURVIVAL (the general correctness fix). A per-process image page
-                // (a DLL's headers/.rdata/.idata/IAT or the main image) is filled ONCE from the raw
-                // on-disk PE, then the ON-TARGET ntdll loader applies base RELOCATIONS + snaps the IAT
-                // by WRITING into that mapped frame (in-process). Those fixups live ONLY in the frame,
-                // NOT in the on-disk PE. If such a page is later RE-FAULTED at runtime (its mapping was
-                // dropped / never landed / the demand loader re-touches it) and we naively re-FILL it
-                // from the raw PE, we DISCARD the loader's fixups — a snapped IAT slot reverts to its
-                // raw ILT thunk (a bare IMAGE_IMPORT_BY_NAME RVA), a relocated pointer loses its base.
-                // OBSERVED (lsass, BATCH 24): kernel32's ntdll-IAT page (RVA 0x77000, in .rdata -> RW)
-                // reverted → CloseHandle's `call *[IAT]` jumped to the bare RVA 0x3a288 (should be
-                // NTDLL_BASE+0x3a288) → instr-fetch fault, before SetEvent(LSA_RPC_SERVER_ACTIVE).
-                // FIX: for a per-process page THIS process already has a frame recorded for
-                // (`csrss_frame_get(pi,page)` — populated at the FIRST fill for every hosted image
-                // process), RE-MAP that SAME frame (which holds the loader's in-memory fixups) instead of filling a
-                // fresh raw frame. `csrss_frame_get` falls back to the shared DLL cache, so restrict to
-                // `!shareable` (a genuine per-process frame the caller recorded). Applies to ANY page in
-                // the window (not just the faulting one) so an eager whole-image pass re-maps, never
-                // re-fills, a page whose fixups already landed.
-                if !shareable {
-                    let existing = csrss_frame_get(pi as u64, bpage);
-                    if existing != 0 && existing != dll_cache_get(bpage) {
-                        if is_fault_page {
-                            // A previously-filled per-process frame for THE FAULTING page → re-map it
-                            // (preserving fixups) under the live committed image protection.
-                            let (cc, ce) = copy_cap_r(existing);
-                            let me = page_map_r(cc, bpage, image_map_rights, pml4);
-                            if ce != 0 || me != 0 {
-                                let _ = cnode_delete_recycle_r(cc);
-                            }
-                            let n = FIXUP_REMAP_N.fetch_add(1, Ordering::Relaxed);
-                            if n < 16 {
-                                print_str(b"[fixup-remap] pi=");
-                                print_u64(pi as u64);
-                                print_str(b" page=0x");
-                                print_hex(bpage as u32);
-                                print_str(b" frame preserved (copy=");
-                                print_u64(ce);
-                                print_str(b" map=");
-                                print_u64(me);
-                                print_str(b")\n");
-                            }
-                            if ce != 0 || me != 0 {
-                                allocation_failed = true;
-                                break;
-                            }
-                            fault_page_serviced = true;
-                        }
-                        // Already backed by a recorded per-process frame → it is (or was) mapped; do NOT
-                        // re-fill/double-map a non-faulting page. Advance. (No `faults` bump — no fill.)
-                        bi += 1;
-                        continue;
-                    }
-                }
-                // A non-faulting page must only be (pre)filled if it is genuinely UNMAPPED in this
-                // process. The faulting page always proceeds (it faulted → it is NOT mapped). For a
-                // shared page, `cached != 0` means a frame exists.
-                //  - In the small FORWARD-RUN (non-eager) path, THIS process may already have the
-                //    cached shared page mapped (it's a re-entry) → skip pre-mapping to avoid a
-                //    double-map; let it fault normally if unmapped.
-                // A cached or already-registered shared neighbour may have been installed by an
-                // overlapping prior window. Leave it for its own cheap fault if it is not resident;
-                // the actual faulting page below still repairs stale registry state by mapping and
-                // replacing the old retained cap.
-                if !is_fault_page && shareable && (cached != 0 || shareable_mapping_registered) {
-                    bi += 1;
-                    continue;
-                }
-                let (frame, rights, private_alias, private_source_cap) = if cached != 0 {
-                    DLL_SHARED_HITS.fetch_add(1, Ordering::Relaxed);
-                    (cached, image_map_rights, 0, 0) // shared text -> live read/execute protection
-                } else {
-                    // MISS (shared, first process) or a per-process page: fill a fresh frame `f`,
-                    // mapped at a UNIQUE monotonic scratch slot (seL4 records the mapping on the frame
-                    // object, so a slot must not be reused without an unmap — unique slots are the
-                    // proven model; a COPY of `f` is what gets mapped into the process). The BATCH does
-                    // not change the TOTAL distinct pages a process fills (only WHEN, in fewer
-                    // round-trips), so scratch consumption matches the pre-batch baseline; the widened
-                    // + re-spaced per-process scratch windows (see *_SCRATCH_BASE) give room for the
-                    // higher counts lsass's LSA-init tree reaches.
-                    let scratch = scratch_base + faults * 0x1000;
-                    let (f, fe) = alloc_frame_r();
-                    let se = page_map_r(f, scratch, RW_NX, CAP_INIT_THREAD_VSPACE);
-                    // ★ ROBUSTNESS (must precede the fill): fill_image_page WRITES the PE bytes THROUGH
-                    // the scratch alias. If alloc_frame_r / page_map_r failed (untyped pool or CNode
-                    // slots exhausted — the frame pressure eager-map front-loads), the scratch VA is
-                    // NOT mapped, and an unconditional write here faults the EXECUTIVE ITSELF (tcb=3,
-                    // no fault handler → the whole boot dies). Guard the fill on a successful map, and
-                    // break out of this image's batch so the faulting thread is handled below (it will
-                    // re-fault or park) instead of taking the executive down.
-                    if fe != 0 || se != 0 {
-                        print_str(b"[map-fail] rva=0x");
-                        print_hex(rva);
-                        print_str(b" retype=");
-                        print_u64(fe);
-                        print_str(b" smap=");
-                        print_u64(se);
-                        print_str(b" faults=");
-                        print_u64(faults);
-                        print_str(b" (alloc/map FAILED - skip fill, resource pressure)\n");
-                        allocation_failed = true;
-                        break;
-                    }
-                    let _filled_rights = fill_image_page(tpe, rva, scratch);
-                    if shareable {
-                        // This frame becomes the shared copy for all processes. If the ownership
-                        // table cannot record it, do not leave a scratch-mapped frame without a
-                        // reclaim path; surface the resource wall to the caller instead.
-                        if !dll_cache_put(bpage, f) {
-                            let insert_failures = DLL_CACHE_INSERT_FAILURES.load(Ordering::Relaxed);
-                            let duplicate = DLL_CACHE_DUPLICATE_INSERTS.load(Ordering::Relaxed);
-                            if insert_failures + duplicate <= 16 {
-                                let (records, capacity) = dll_cache_stats();
-                                print_str(b"[image-shared] cache insert failed pi=");
-                                print_u64(pi as u64);
-                                print_str(b" page=0x");
-                                print_hex((bpage >> 32) as u32);
-                                print_hex(bpage as u32);
-                                print_str(b" records=");
-                                print_u64(records as u64);
-                                print_str(b"/");
-                                print_u64(capacity as u64);
-                                print_str(b" alloc-fails=");
-                                print_u64(insert_failures);
-                                print_str(b" dup=");
-                                print_u64(duplicate);
-                                print_str(b"\n");
-                            }
-                            let _ = page_unmap_r(f);
-                            let _ = cnode_delete_recycle_r(f);
-                            allocation_failed = true;
-                            break;
-                        }
-                    } else {
-                        // Per-process page (main image, or DLL headers/rdata/data/IAT): keep its
-                        // scratch alias as the source frame for copyin/copyout and possible COW
-                        // promotion. The process-side mapping cap is recorded after that map succeeds.
-                        if (faults as usize) < filled_pages.len() {
-                            filled_pages[faults as usize] = bpage;
-                        }
-                        if base == PE_LOAD_BASE {
-                            let off = bpage - PE_LOAD_BASE;
-                            if off < IMAGE_MIRROR_WINDOW {
-                                let mirror = ACTIVE_IMAGE_MIRROR.load(Ordering::Relaxed);
-                                let _ = page_map(
-                                    copy_cap(f),
-                                    mirror + off,
-                                    RW_NX,
-                                    CAP_INIT_THREAD_VSPACE,
-                                );
-                            }
-                        }
-                    }
-                    faults += 1; // a fill consumed a scratch slot; shared HITs do not
-                    (
-                        f,
-                        image_map_rights,
-                        if shareable { 0 } else { scratch },
-                        if shareable { 0 } else { f },
-                    )
-                };
-                // Map the frame into the faulting process (RX for shared text, its fill rights otherwise).
-                let (cc, ce) = copy_cap_r(frame);
-                let me = page_map_r(cc, bpage, rights, pml4);
-                let mapped_into_process = ce == 0 && me == 0;
-                if ce != 0 || me != 0 {
-                    let _ = cnode_delete_recycle_r(cc);
-                    // Multiple threads in one process can fault the same shared DLL text page before
-                    // the first handler reply reaches user mode. The first event maps the page; the
-                    // second sees seL4_DeleteFirst on the same VA. That is an idempotent stale fault,
-                    // not resource exhaustion, so resume the second thread.
-                    let duplicate_shared_mapping = ce == 0
-                        && me == 8
-                        && shareable
-                        && (cached != 0 || shared_mapping_registered);
-                    let duplicate_shared_fault = duplicate_shared_mapping && is_fault_page;
-                    if is_fault_page || !duplicate_shared_mapping {
-                        print_str(if duplicate_shared_fault {
-                            b"[map-idempotent] va=0x"
-                        } else {
-                            b"[map-fail] va=0x"
-                        });
-                        print_hex(bpage as u32);
-                        print_str(b" copy=");
-                        print_u64(ce);
-                        print_str(b" map=");
-                        print_u64(me);
-                        print_str(b" shared=");
-                        print_u64(shareable as u64);
-                        print_str(b" cached=");
-                        print_u64((cached != 0) as u64);
-                        print_str(b" registered=");
-                        print_u64(shared_mapping_registered as u64);
-                        print_str(b"\n");
-                    }
-                    if ce != 0 || me != 8 || (is_fault_page && !duplicate_shared_fault) {
-                        allocation_failed = true;
-                        break;
-                    }
-                    if duplicate_shared_fault {
-                        fault_page_serviced = true;
-                    }
-                }
-                if is_fault_page && mapped_into_process {
-                    fault_page_serviced = true;
-                }
-                if mapped_into_process && shareable {
-                    let registered =
-                        shared_image_mapping_replace_banked_after_map(pi as u64, bpage, cc);
-                    if !registered {
-                        let _ = page_unmap_r(cc);
-                        let _ = cnode_delete_recycle_r(cc);
-                        print_str(b"[image-shared] register failed pi=");
-                        print_u64(pi as u64);
-                        print_str(b" page=0x");
-                        print_hex((bpage >> 32) as u32);
-                        print_hex(bpage as u32);
-                        print_str(b"\n");
-                        allocation_failed = true;
-                        break;
-                    }
-                }
-                if mapped_into_process && !shareable && private_source_cap != 0 {
-                    // Record every hosted process's private image page using the process-side map cap.
-                    // The scratch cap remains the stable alias/source for kernel copy helpers and for
-                    // write-copy promotion; without the retained map cap, COW cannot unmap the
-                    // read-only process view before installing the private writable copy.
-                    if !csrss_frame_put_at_cap_source_owned(
-                        pi as u64,
-                        bpage,
-                        cc,
-                        private_alias,
-                        private_source_cap,
-                        private_source_cap,
-                        false,
-                    ) {
-                        let _ = page_unmap_r(cc);
-                        let _ = cnode_delete_recycle_r(cc);
-                        let _ = page_unmap_r(private_source_cap);
-                        let _ = cnode_delete_recycle_r(private_source_cap);
-                        print_str(b"[image-map] register failed pi=");
-                        print_u64(pi as u64);
-                        print_str(b" page=0x");
-                        print_hex((bpage >> 32) as u32);
-                        print_hex(bpage as u32);
-                        print_str(b"\n");
-                        allocation_failed = true;
-                        break;
-                    }
-                }
-                bi += 1;
             }
             // Image faults bypass the native-syscall reply tail below, but can grow several durable
             // mapping/cache authorities. Apply the same ownership barrier as every other receive.

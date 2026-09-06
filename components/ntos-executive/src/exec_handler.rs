@@ -16,6 +16,9 @@ mod virtual_memory_protect;
 #[path = "exec_virtual_memory_query.rs"]
 mod virtual_memory_query;
 
+#[path = "exec_virtual_memory_commit.rs"]
+mod virtual_memory_commit;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -23878,18 +23881,10 @@ impl ExecNtHandler {
         Ok(Some(self.read_user_i64(timeout_ptr)?))
     }
 
-    unsafe fn current_image_protection_for_page(&self, ctx: ExecLoopCtx, page: u64) -> Option<u32> {
-        if page >= PE_LOAD_BASE && page < ctx.img_end {
-            return Some(image_page_protection(&*ctx.pe, PE_LOAD_BASE, page));
-        }
-        if !ctx.ntdll_pe.is_null() && page >= ctx.nt_base && page < ctx.nt_end {
-            return Some(image_page_protection(&*ctx.ntdll_pe, ctx.nt_base, page));
-        }
-        let reg = &*ctx.reg;
-        let dll_pes = ctx.dll_pes();
-        let (index, rva) = reg.dll_for_page(self.pi, page)?;
-        let pe = dll_pes.get(index).and_then(|slot| slot.as_ref())?;
-        Some(image_rva_protection(pe, rva))
+    unsafe fn current_image_protection_for_page(&self, page: u64) -> Option<u32> {
+        process_committed_mapping_basic_information(self.pi as u64, page)
+            .filter(|info| info.type_ == nt_address_space::MEM_IMAGE)
+            .map(|info| info.protect)
     }
 
     unsafe fn clear_current_scratch_page(&self, ctx: ExecLoopCtx, page: u64) {
@@ -23915,7 +23910,15 @@ impl ExecNtHandler {
         let mut page = va & !0xfff;
         let last_page = last & !0xfff;
         loop {
-            if let Some(protection) = self.current_image_protection_for_page(ctx, page) {
+            if let Some(protection) = self.current_image_protection_for_page(page) {
+                if nt_address_space::image_view_fault_access_status(
+                    protection,
+                    nt_address_space::FaultAccess::Write,
+                )
+                .is_err()
+                {
+                    return false;
+                }
                 let write_plan = nt_address_space::image_view_fault_plan(protection, true);
                 if write_plan.copy_on_write {
                     if vm_promote_image_cow_for_kernel_write(

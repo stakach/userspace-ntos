@@ -5,7 +5,6 @@ use super::*;
 struct ProtectionTarget {
     pi: usize,
     pml4: u64,
-    scratch_base: u64,
     mapping_type: u32,
 }
 
@@ -23,7 +22,6 @@ impl ProtectionTarget {
                 effective(old),
                 effective(new),
                 self.pml4,
-                self.scratch_base,
             )
         } else if record.is_some() {
             vm_reprotect_private_page(self.pi, page, effective(old), effective(new), self.pml4)
@@ -159,8 +157,12 @@ impl ExecNtHandler {
             ) {
                 return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
             }
-            let before_commit = before_committed.process_commit_bytes();
-            let after_commit = after_committed.process_commit_bytes();
+            let before_commit = before_committed.process_commit_bytes_with_private_pages(
+                process_private_backing_pages(target_pi as u64),
+            );
+            let after_commit = after_committed.process_commit_bytes_with_private_pages(
+                process_private_backing_pages(target_pi as u64),
+            );
             let added_commit = after_commit.saturating_sub(before_commit);
             let released_commit = before_commit.saturating_sub(after_commit);
             let prepared_commit =
@@ -178,7 +180,6 @@ impl ExecNtHandler {
             let transition = match (ProtectionTarget {
                 pi: target_pi,
                 pml4: target.pml4,
-                scratch_base: target.scratch_base,
                 mapping_type,
             })
             .prepare_and_apply(plan.base, plan.size, new_protection, |page| {
@@ -238,7 +239,6 @@ impl ExecNtHandler {
         let transition = match (ProtectionTarget {
             pi: target_pi,
             pml4: target.pml4,
-            scratch_base: target.scratch_base,
             mapping_type: nt_address_space::MEM_PRIVATE,
         })
         .prepare_and_apply(plan.base, plan.size, new_protection, |page| {

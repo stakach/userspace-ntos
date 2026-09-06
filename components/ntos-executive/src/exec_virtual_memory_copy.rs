@@ -112,14 +112,7 @@ impl ExecNtHandler {
             let new_rights =
                 nt_address_space::resident_backing_protection(new.type_, new.protect, owned);
             if old.type_ == nt_address_space::MEM_IMAGE {
-                vm_reprotect_resident_image_page(
-                    pi,
-                    page,
-                    old_rights,
-                    new_rights,
-                    target.pml4,
-                    target.scratch_base,
-                )?;
+                vm_reprotect_resident_image_page(pi, page, old_rights, new_rights, target.pml4)?;
             } else if csrss_frame_get_exact(pi as u64, page).0 != 0 {
                 vm_reprotect_private_page(pi, page, old_rights, new_rights, target.pml4)?;
             }
