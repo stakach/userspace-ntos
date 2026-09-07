@@ -259,8 +259,9 @@ below are historical baselines, not acceptance of the current provider cutover.
   initialization; let the real CSR request path create and initialize desktop/RIT threads.
 - [~] Add a checked exception search/target-unwind core with owned handler invocations (tranche 103).
   Complete collided unwind, consolidate restore and native linkage before dispatch/export cutover.
-- [~] Add checked native handle scopes and retained Ps references over the existing PM handle tables
-  (tranche 104). Use the designated System table for kernel handles; no second object authority.
+- [x] Add checked native handle scopes and retained Ps references over the existing PM handle tables
+  (tranche 104; host core). Use the designated System table for kernel handles; no second object
+  authority. Complete actual self-grants and shared Ps/Se/USER handle migration before native cutover.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28624,7 +28625,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transport. Bind ExRaiseAccessViolation, ExRaiseStatus and RtlUnwindEx only after those mechanisms
     are complete; a bugcheck or unconditional target jump is not exception dispatch.
 
-    B3 native handle ownership tranche 104 (2026-09-08, in progress):
+    B3 native handle ownership tranche 104 (2026-09-08, host core complete):
 
     Add checked x64 handle decoding, authenticated caller scope and retained Ps references over
     the existing canonical PM, not a new ObjectManager-service identity/table for Ps/Se objects.
@@ -28633,12 +28634,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     UserMode grant/type checks, and preserve type/reference checks for KernelMode too. Captured
     reference or handle publication failure must retire the exact owner once, with failure retained.
 
+    Implemented in `nt-process::native_handle`: an opaque caller captured from the canonical thread
+    lifetime and manager designation, strict full-width native handle decoding, native low-two-bit
+    application tags, typed/grant-checked Ps references, and already-authorized handle publication
+    through existing PM reservations. Kernel handles select the actual designated System table;
+    untagged KernelMode handles still select the caller's table. Each successful reference owns one
+    real pointer count, independently of the source handle and caller. Failed output publication can
+    release that same owner even after caller exit, source handle closure, manager movement or System
+    teardown. Cleanup checks the persistent designation, never re-admits a dead caller.
+
+    No pseudo-handle access mask is fabricated. Until actual process/thread self-grants are assigned,
+    their metadata reports an explicit unavailable grant and nonzero UserMode access returns
+    STATUS_NOT_SUPPORTED. KernelMode skips only grant comparison, not identity/type/reference checks.
+    The native adapter cannot present unavailable metadata as a successful OBJECT_HANDLE_INFORMATION.
+    NT5 requires self-grants computed from the assigned object SD and owning primary token, including
+    recomputation on process primary-token replacement. The existing default registry-key descriptor
+    and unconditional ALL_ACCESS assumptions are not a valid initialization path.
+
+    Eleven new tests cover full-width/tag decoding, real grants and type mismatches, exact counted
+    ownership, publication rollback, manager collision/movement, stale thread activation, System
+    table isolation and post-System teardown cleanup. `cargo test -p nt-process` passes 188 tests;
+    the nineteen-crate regression passes 2,267. Logs: `.tmp/test-native-handle-core-20260908.log` and
+    `.tmp/test-native-handle-core-regression-20260908.log`. Native exports are not switched by this
+    checkpoint; this is not a desktop acceptance result.
+
     Native migration must cover user Nt and provider Zw together, including process/token open,
     reference, duplicate, query and close. TokenStore requires token-object security descriptors;
     a token's default DACL is not its object SD. Existing Nt process/token opens are not fully
     security-checked and cannot be reused as completed authorization. Genuine attached-process
     authority changes the current handle table/primary token but not the original thread or its
     impersonation token. Do not fabricate an attached PID or alter retained logical caller identity.
+
+    Review adjustment: IntResolveDesktop uses an OBJ_KERNEL_HANDLE process handle to duplicate real
+    window-station/desktop handles into another process. Removing FAKE_PROCESS_HANDLE alone would
+    leave incorrect global USER aliases. Migrate USER handle entries to the canonical per-process
+    tables while retaining the existing provider-owned object bodies, and remove both the USER/PM
+    lookup fallbacks and source-process recovery on lookup failure in the same cutover.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

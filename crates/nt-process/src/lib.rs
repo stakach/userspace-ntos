@@ -23,6 +23,7 @@ pub mod dbgk;
 pub mod job;
 pub mod job_abi;
 mod initial_system;
+pub mod native_handle;
 
 pub use initial_system::InitialSystemIdentity;
 

@@ -120,6 +120,14 @@ impl ProcessManager {
         .then_some(identity)
     }
 
+    /// Fence retained-reference cleanup even after the designated objects have been deleted.
+    /// This does not admit new work or prove that the initial System objects remain live.
+    pub(crate) fn has_initial_system_designation(&self, identity: InitialSystemIdentity) -> bool {
+        self.initial_system
+            .as_ref()
+            .is_some_and(|root| root.identity == identity)
+    }
+
     pub fn is_initial_system_process(&self, pid: ProcessId) -> bool {
         self.initial_system_identity()
             .is_some_and(|identity| identity.process_id() == pid)
