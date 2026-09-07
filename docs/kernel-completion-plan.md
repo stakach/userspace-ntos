@@ -166,10 +166,14 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Inventory constructor-owned TEB mirror/source aliases through registry publication, remove
   untracked constructor probes, and require successful scratch mapping before TEB2/ACS initialization
   (tranche 71, host/build; mechanism/empty-slot ownership and native retry cleanup remain open).
+- [x] Retain failed scheduling-context attachment and checked empty-slot recycling in durable,
+  dynamically sized ownership rows shared by all native launch paths
+  (tranche 72, host/build; complete thread-constructor handoff and legacy success lifetimes remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next make native constructor and scheduling-context
-  failures return complete ownership, including allocated empty slots, raw/minted CNodes and optional
-  real TCB. TEB mirror/source inventory now transfers explicitly to registry ownership on publication.
+  emptiness as a complete execution-quiescence proof. Next make native thread-constructor failures return
+  complete ownership, including allocated empty slots, raw/minted CNodes and optional real TCB. Failed SC
+  attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
+  inventory transfers explicitly to registry ownership on publication.
   Retain the complete partial payload through the tested exact-ticket handoff
   before fallible reconciliation, preserving process/pool/window holds. Replace destructive failure exits
   and empty failed-spawn results with ownership-returning failures, then replace
@@ -27259,6 +27263,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     or retry-complete. Constructor failure returns, native pending activation, external-alias journals,
     mirrored-reference clearing, ordinary termination and user-mode SEH remain open. No desktop proof
     is claimed; 33 recorded unresolved win32k imports still block the full gate.
+
+    B3 scheduling-context retirement tranche 72 (2026-09-07, host/build green):
+    `nt-user-host::sched_context` owns scheduling-context construction from empty-slot allocation
+    through retype/configure/bind. Construction failure is sticky: it forgets the target TCB and can
+    only retire the unbound SC or empty slot. Failed retype recycles an empty slot without deleting
+    a nonexistent object; configure/bind failures require checked object deletion first. Deletion
+    acknowledgement survives a later recycle failure, and a successful bound cap transfers once.
+    The original attachment error remains available after cleanup retries, never replaced by a
+    synthetic success or a later cleanup error.
+
+    Native attachment moved out of `main.rs` into focused `thread_sched_context.rs`; the old helper
+    that ignored deletion failure is removed. All nine service, component, image, driver and hosted
+    thread callers use the same implementation. A dynamically sized durable row is reserved before
+    cap allocation, with `allocator::enter_durable()` protecting it from transient allocation scopes.
+    Failed rows survive the caller returning or deleting its TCB and retry retirement on subsequent
+    attachments; success removes the row only after ownership transfer. No process/image identity or
+    fixed driver count controls this table. Direct microkernel operations do not reenter its borrow.
+
+    The SC backend separates CNode deletion from root-slot recycling. Before invoking the legacy
+    recycler it checks exact slot range/live ownership, pinned status and free-list capacity under
+    serialized access. Capacity failure therefore leaves the allocated empty slot and its accounting
+    retained instead of silently dropping it. This checked adapter is scoped to SC retirement; other
+    legacy callers of the recycler still need migration. Local rust-micro review verified configure
+    and legacy TCB bind errors occur before state mutation, making failed SC ownership independent
+    of later target-TCB reuse. Retrying bind after failure is explicitly prohibited.
+
+    Validation: nine new host tests cover admission, successful one-shot transfer, allocation/retype/
+    configure/bind failures, target reuse, repeated failed deletion/recycling, no repeated successful
+    operations, and refusal to retire bound or in-progress construction. The serialized nine-crate
+    suite passes 1,137 tests, including 210 `nt-user-host` tests; log:
+    `.tmp/test-sched-context-retirement-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-sched-context-retirement-20260907.log`.
+    Two read-only agents reviewed microkernel atomicity, heap initialization,
+    allocator lifetime, reentrancy and native ownership; root alone ran tests followed by the build.
+
+    Review adjustment: next finish raw/minted CNode and TCB allocated-slot/object inventory, replace
+    empty failed-spawn results, and connect the complete thread bundle to the tested exact-ticket
+    handoff before registry reconciliation. This tranche closes failed SC attachment ownership, not
+    the complete thread failure chain or pre-existing successful-SC lifetime gaps in legacy launch
+    wrappers. Retirement currently retries on later attachment, not a general idle cleanup worker.
+    Whole-thread checked release, external aliases, mirrored references, ordinary termination,
+    handler handoffs and user-mode SEH remain open. No QEMU or desktop proof is claimed; the recorded
+    33 unresolved win32k imports still block the full desktop gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

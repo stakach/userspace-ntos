@@ -15139,33 +15139,8 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
     reply >> 12
 }
 
-unsafe fn attach_sched_context(tcb: u64) -> Result<u64, u64> {
-    let Some(sc) = try_alloc_slot() else {
-        return Err(u64::MAX);
-    };
-    let e_retype = untyped_retype_r(
-        CAP_INIT_UNTYPED,
-        OBJ_SCHED_CONTEXT,
-        SCHED_CONTEXT_BITS,
-        1,
-        sc,
-    );
-    if e_retype != 0 {
-        recycle_deleted_root_slot(sc);
-        return Err(e_retype);
-    }
-    let e_configure = sched_control_configure_r(sc, 10, 10);
-    if e_configure != 0 {
-        let _ = cnode_delete_recycle_r(sc);
-        return Err(e_configure);
-    }
-    let e_bind = sched_context_bind_r(sc, tcb);
-    if e_bind != 0 {
-        let _ = cnode_delete_recycle_r(sc);
-        return Err(e_bind);
-    }
-    Ok(sc)
-}
+mod thread_sched_context;
+use thread_sched_context::attach_sched_context;
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
 /// sysarg, device MMIO, driver code/arena) at `WORK_CLUSTER_BASE` in `pml4`. The cluster used to

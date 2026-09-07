@@ -15,6 +15,7 @@ mod ntdll;
 mod profile;
 pub mod process_identity;
 mod services;
+pub mod sched_context;
 pub mod thread_binding;
 pub mod thread_publication;
 pub mod thread_pending;
