@@ -3489,6 +3489,9 @@ use nt_object_manager::win32k_ob::{
 /// The single win32k object registry (single-threaded host; handle→(type, body) lives in the crate).
 static mut OBJ_TABLE: ObHandleTable = ObHandleTable::new();
 
+mod object_security;
+pub(crate) use object_security::census as object_security_census;
+
 /// Duplicate a handle owned by win32k's USER object table. Native `NtDuplicateObject` calls this
 /// after the caller's EPROCESS table reports `STATUS_INVALID_HANDLE`, because desktop/window-
 /// station handles are minted by win32k's Ob layer rather than the executive's native table.
@@ -14286,6 +14289,14 @@ fn register_trampolines() -> bool {
     );
     reg.bind("ObCreateObject", s_ob_create_object as usize as u64);
     reg.bind("ObInsertObject", s_ob_insert_object as usize as u64);
+    reg.bind(
+        "ObGetObjectSecurity",
+        object_security::get as *const () as usize as u64,
+    );
+    reg.bind(
+        "ObReleaseObjectSecurity",
+        object_security::release as *const () as usize as u64,
+    );
     reg.bind("ObCloseHandle", s_ob_close_handle as usize as u64);
     reg.bind("ObReferenceObject", s_ob_reference_object as usize as u64);
     reg.bind("ObDereferenceObject", s_ob_dereference_object as usize as u64);
@@ -15875,6 +15886,7 @@ unsafe fn dispatch_ps_provider_command(command: u64, expected: u64, flags: u64) 
 /// `(low32, full_result)` — win32k uses pointer-width syscall returns, with the low 32 bits kept as
 /// status-compatible data for legacy harness readers.
 unsafe fn win32k_dispatch(_req: &crate::spawn_hosts::DispatchReq) -> (i32, u64) {
+    object_security::retry_retirements();
     let callback_frame =
         (WIN32K_SHARED_VADDR + SH_USER_CALLBACK) as *const nt_user_callback::CallbackFrame;
     let dispatch_id = read_volatile(core::ptr::addr_of!((*callback_frame).header.dispatch_id));

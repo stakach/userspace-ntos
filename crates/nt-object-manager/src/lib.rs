@@ -17,6 +17,7 @@ mod access;
 mod handles;
 mod io;
 mod namespace;
+pub mod object_security;
 pub mod object_type;
 mod store;
 mod types;
@@ -24,6 +25,7 @@ pub mod win32k_ob;
 
 pub use access::compute_granted;
 pub use handles::{ClientKind, ClientRegistry, HandleTable};
+pub use object_security::{ObjectSecurityCache, ObjectSecurityCacheIo, ObjectSecurityCacheStats};
 pub use store::{ObjectRef, ObjectStore};
 pub use types::{
     ComponentId, DeleteFn, DeviceBody, DirectoryBody, DriverBody, EventBody, FileBody, ObjectBody,

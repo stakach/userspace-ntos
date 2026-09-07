@@ -786,6 +786,26 @@ impl ObHandleTable {
             .and_then(ObjectEntry::security_descriptor)
     }
 
+    /// Resolve an exact object body, including an object created but not yet inserted. The outer
+    /// `None` rejects unknown or ambiguous bodies; the inner `None` is a valid null descriptor.
+    /// Aliases share their canonical entry and do not introduce duplicate object bodies.
+    pub fn security_descriptor_by_body(&self, body: u64) -> Option<(ObKind, Option<&[u8]>)> {
+        if body == 0 {
+            return None;
+        }
+        let mut entries = self
+            .slots
+            .iter()
+            .flatten()
+            .chain(self.pending.iter())
+            .filter(|entry| entry.body == body);
+        let entry = entries.next()?;
+        if entries.next().is_some() {
+            return None;
+        }
+        Some((entry.kind, entry.security_descriptor()))
+    }
+
     /// Replace the object's self-relative security descriptor.
     pub fn set_security_descriptor(&mut self, handle: u64, descriptor: &[u8]) -> bool {
         let Some(idx) = self.canonical_slot_index(handle) else {

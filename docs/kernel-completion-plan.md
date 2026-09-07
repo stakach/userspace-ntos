@@ -226,6 +226,10 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Keep pagefile transition rows through exact checked retirement and move final process
   transition cleanup before page-table/VSpace teardown (tranche 92; restore handoff remains
   separate).
+- [x] Implement real provider object-security descriptor references and release, with immutable
+  snapshots and operation census (tranche 93). Complete
+  security assignment through a shared inheritance core separately; do not reuse ntdll's
+  creator-or-parent descriptor cloning scaffolding.
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28274,6 +28278,33 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     prioritize the missing real object-security provider imports toward desktop readiness. The
     current 33-import boot admission failure remains open; no boot or desktop acceptance is
     claimed from host tests or a successful build.
+
+    B3 desktop provider object-security tranche 93 (2026-09-08):
+
+    Implement ObGetObjectSecurity/ObReleaseObjectSecurity against the centralized USER object
+    descriptor owner. The host core retains immutable content-deduplicated snapshots independently
+    of mutable object-table bytes. Default-method callers hold references (MemoryAllocated=FALSE),
+    not raw pool ownership. Final free failure retains a retiring allocation, consumes the caller's
+    reference only once, and excludes that allocation from subsequent deduplication. Provider
+    dispatch retries retained frees. Native acquisition copies table data before any yielding pool
+    operation and guards cache reentry. Valid null descriptors remain null; unknown objects and
+    unsupported custom security procedures cannot become synthetic successful empty descriptors.
+    Census reports actual acquisitions/releases, live references, retained entries and failures.
+
+    Validation: all 92 object-manager tests pass, including 18 new cache/body-lookup tests. The
+    serialized ten-crate regression suite passes 1,463 tests. The executive release build passes
+    with the unchanged 262 warnings. Logs: `.tmp/test-object-security-20260908.log`,
+    `.tmp/test-object-security-regression-20260908.log`, `.tmp/build-object-security-20260908.log`.
+    Independent reference and native reviews cover NT5 obse.c and ReactOS obsecure.c, pool yielding,
+    pending object identity and the allocated-versus-referenced release boundary. Root alone ran
+    the tests/build. Two previously missing imports are now bound to these real implementations;
+    this is not a desktop boot acceptance claim.
+
+    Review adjustment: the next security import, ObAssignSecurity, needs a real nt-security
+    inheritance materializer and
+    authenticated subject-token/type-method inputs. Existing RtlNewSecurityObject descriptor
+    cloning ignores those inputs and must not be reused as an implementation. Other missing
+    provider import families and genuine instrumented desktop acceptance remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

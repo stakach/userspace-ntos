@@ -10168,6 +10168,26 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_u64(provider_pool.out_of_memory);
     print_str(b"/");
     print_u64(provider_pool.corruptions);
+    if let Some(security) = win32k_subsystem::object_security_census() {
+        print_str(b" object-security=get/release/live/entries/retiring:");
+        print_u64(security.acquisitions);
+        print_str(b"/");
+        print_u64(security.releases);
+        print_str(b"/");
+        print_u64(security.live_references);
+        print_str(b"/");
+        print_u64(security.entries as u64);
+        print_str(b"/");
+        print_u64(security.retiring as u64);
+        print_str(b" alloc-fail/free-fail/invalid:");
+        print_u64(security.allocation_failures);
+        print_str(b"/");
+        print_u64(security.release_failures);
+        print_str(b"/");
+        print_u64(security.invalid_releases);
+    } else {
+        print_str(b" object-security=busy");
+    }
     let dll_paging = service_sec_image::service_dll_arena_paging_stats();
     print_str(b" dll-paging=");
     print_u64(dll_paging.records as u64);
