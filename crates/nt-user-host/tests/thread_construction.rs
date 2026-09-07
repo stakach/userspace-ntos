@@ -21,6 +21,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::rc::Rc;
 
+#[path = "thread_construction/failed_memory_slot.rs"]
+mod failed_memory_slot;
+
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
@@ -97,6 +100,7 @@ struct Runtime {
     publication: ThreadPublicationSlot,
     partial: Option<Partial>,
     reconciliation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<2>,
+    coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<2>,
 }
 
 impl RuntimeIdentity for Runtime {
@@ -117,15 +121,21 @@ impl RuntimeConstruction for Runtime {
     fn construction_tcb(partial: &Partial) -> Option<u64> {
         partial.tcb
     }
+    fn validate_construction(partial: &Partial) -> Result<(), ThreadRollbackError> {
+        partial.memory_progress.validate_failed_slot(&partial.inventory, &partial.memory)
+    }
     fn publication_mut(&mut self) -> &mut ThreadPublicationSlot {
         &mut self.publication
     }
-    fn retain_partial(&mut self, mut partial: Partial) -> ThreadConstructionInventory {
+    fn retain_partial(&mut self, mut partial: Partial) -> (ThreadConstructionInventory, Option<nt_user_host::thread_construction::FailedMemorySlot>) {
         assert!(self.partial.is_none());
         self.binding.tcb = partial.tcb.unwrap_or(1);
         let inventory = std::mem::replace(&mut partial.inventory, ThreadConstructionInventory::empty());
+        let progress = std::mem::replace(&mut partial.memory_progress, nt_user_host::thread_construction::MemoryConstructionProgress::empty());
+        let (coverage, memory_slot) = progress.into_retained();
+        self.coverage = coverage;
         self.partial = Some(partial);
-        inventory
+        (inventory, memory_slot)
     }
 }
 
@@ -155,6 +165,7 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
         publication: ThreadPublicationSlot::empty(),
         partial: None,
         reconciliation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
+        coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
     })
     .unwrap();
     let ticket = slot
@@ -229,17 +240,18 @@ fn registry_preparation_oom_and_revalidation_keep_pending_ownership() {
     let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
     {
         let runtime = slot.owner().unwrap();
+        let retirement = slot.pending().unwrap().construction_retirement().unwrap();
         let partial = runtime.partial.as_ref().unwrap();
         FAIL_ALLOCATIONS.with(|flag| flag.set(true));
         let reset = ResetAllocationFailure;
-        let failure = runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry);
+        let failure = runtime.reconciliation.reconcile(id, &partial.memory, &runtime.coverage, retirement, &registry);
         drop(reset);
         assert!(matches!(failure, Err(ReconciliationError::Registry(ThreadRegistryError::InsufficientResources))));
         assert!(!runtime.reconciliation.is_prepared());
-        runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry).unwrap();
-        without_allocation(|| runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry)).unwrap();
+        runtime.reconciliation.reconcile(id, &partial.memory, &runtime.coverage, retirement, &registry).unwrap();
+        without_allocation(|| runtime.reconciliation.reconcile(id, &partial.memory, &runtime.coverage, retirement, &registry)).unwrap();
         registry.take(2, 0x1000).unwrap();
-        let result = without_allocation(|| runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry));
+        let result = without_allocation(|| runtime.reconciliation.reconcile(id, &partial.memory, &runtime.coverage, retirement, &registry));
         assert!(matches!(result, Err(ReconciliationError::Registry(ThreadRegistryError::StaleRecord { page: 0x1000 }))));
         assert!(runtime.reconciliation.is_prepared());
     }
@@ -257,11 +269,14 @@ fn memory_failure_and_registry_coverage_move_with_original_reservations() {
         let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
         assert_protected(&mut slot, id);
         let partial = slot.owner().unwrap().partial.as_ref().unwrap();
-        assert_eq!(partial.memory_progress.empty_slot(), Some(601));
-        assert!(partial.memory_progress.stack_registered(0));
-        assert!(!partial.memory_progress.stack_registered(1));
-        assert!(!partial.memory_progress.teb_registered(0));
-        assert!(partial.memory_progress.teb_registered(1));
+        let coverage = &slot.owner().unwrap().coverage;
+        assert_eq!(coverage.empty_slot(), Some(601));
+        assert!(coverage.stack_registered(0));
+        assert!(!coverage.stack_registered(1));
+        assert!(!coverage.teb_registered(0));
+        assert!(coverage.teb_registered(1));
+        assert!(partial.memory_progress.is_empty());
+        assert_eq!(slot.pending().unwrap().construction_retirement().unwrap().pending_memory_slot(), Some(601));
         assert_eq!(partial.memory.stack_owner[0], 200);
         assert_eq!(drops.get(), 0);
     }
@@ -569,6 +584,7 @@ enum Event {
     Suspend(u64),
     Delete(u64),
     Recycle(u64),
+    MemoryRecycle(u64),
     Revoke,
     Unmap(u64),
     Release(u64),
@@ -625,6 +641,9 @@ impl ThreadRetirementIo for Backend {
     }
     fn recycle_slot(&mut self, _: ConstructionRole, slot: u64) -> Result<(), u32> {
         self.record(Event::Recycle(slot))
+    }
+    fn recycle_failed_memory_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.record(Event::MemoryRecycle(slot))
     }
 }
 

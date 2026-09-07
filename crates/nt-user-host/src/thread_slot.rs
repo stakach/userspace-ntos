@@ -23,17 +23,22 @@ pub trait RuntimeConstruction: RuntimeIdentity {
     /// None means no TCB object exists. An allocated empty slot belongs in the partial inventory,
     /// not here. Some must name a real TCB, even if it has not yet been configured or resumed.
     fn construction_tcb(partial: &Self::Partial) -> Option<u64>;
+    /// Read-only, allocation-free validation of failed-memory slot versus retained live owners.
+    fn validate_construction(partial: &Self::Partial) -> Result<(), ThreadRollbackError>;
     fn publication_mut(&mut self) -> &mut ThreadPublicationSlot;
     /// Infallible, allocation-free ownership move with no backend calls or reentrancy. Preserve
     /// identity, reservations and the publication slot; update binding.tcb to the partial TCB, or
     /// keep the unbuilt reservation sentinel when absent. Preserve any resource inventory already
     /// owned by the original row as well. Do not destroy/release any resources.
-    /// Return the mechanism inventory to the same pending row's sealed retirement actor. Do not
-    /// retain a second mutable mechanism owner in the runtime payload.
+    /// Return the mechanism inventory and failed-memory slot to the same pending row's sealed
+    /// retirement actor. Retain immutable coverage, not a second mutable slot owner, in the payload.
     fn retain_partial(
         &mut self,
         partial: Self::Partial,
-    ) -> crate::thread_construction::ThreadConstructionInventory;
+    ) -> (
+        crate::thread_construction::ThreadConstructionInventory,
+        Option<crate::thread_construction::FailedMemorySlot>,
+    );
 }
 
 enum State<R> {
@@ -100,6 +105,7 @@ impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
             if tcb.is_some_and(|cap| cap <= 1) {
                 return Err(SlotError::Cleanup(ThreadRollbackError::InvalidCapability));
             }
+            R::validate_construction(&partial).map_err(SlotError::Cleanup)?;
             let id = construction_rollback_id(
                 ThreadRollbackIdentity {
                     pi: binding.pi,
@@ -123,7 +129,7 @@ impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
         if runtime.publication_mut().finish(ticket, &binding).is_err() {
             unreachable!("validated exclusive construction ticket");
         }
-        let inventory = runtime.retain_partial(partial);
+        let (inventory, memory_slot) = runtime.retain_partial(partial);
         assert_eq!(
             inventory.live_tcb(),
             tcb,
@@ -132,6 +138,7 @@ impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
         self.state = State::Pending(PendingThreadRuntime::retain_construction(
             id,
             inventory,
+            memory_slot,
             reservations,
             runtime,
         ));

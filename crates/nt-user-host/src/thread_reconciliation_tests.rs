@@ -1,5 +1,6 @@
 use super::*;
 use crate::process_identity::ProcessGeneration;
+use crate::thread_construction::{MemoryConstructionProgress, ThreadConstructionInventory};
 use crate::thread_resources::ThreadMemoryLayout;
 use crate::thread_rollback::{new_rollback_id, ThreadRollbackIdentity};
 
@@ -11,6 +12,20 @@ fn attempt() -> ThreadRollbackId {
         process_generation: ProcessGeneration::Hosted(2),
     })
     .unwrap()
+}
+
+fn seal<const STACK: usize>(
+    progress: MemoryConstructionProgress<STACK>,
+    id: ThreadRollbackId,
+) -> (
+    MemoryConstructionCoverage<STACK>,
+    ThreadConstructionRetirement,
+) {
+    let (coverage, slot) = progress.into_retained();
+    (
+        coverage,
+        ThreadConstructionRetirement::retain(id, ThreadConstructionInventory::empty(), slot),
+    )
 }
 
 fn fixture() -> (
@@ -42,8 +57,9 @@ fn partial_coverage_captures_registry_only_aliases_without_transferring_rows() {
     let records = registry.records().to_vec();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     let snapshot = state
-        .reconcile(id, &resources, &progress, &registry)
+        .reconcile(id, &resources, &progress, &retirement, &registry)
         .unwrap();
     assert!(state.is_prepared());
     assert_eq!(snapshot.records(), records);
@@ -57,7 +73,7 @@ fn partial_coverage_captures_registry_only_aliases_without_transferring_rows() {
     assert!(core::ptr::eq(
         snapshot,
         state
-            .reconcile(id, &resources, &progress, &registry)
+            .reconcile(id, &resources, &progress, &retirement, &registry)
             .unwrap()
     ));
 }
@@ -68,8 +84,9 @@ fn missing_published_page_is_not_inferred_away_and_preparation_can_retry() {
     registry.take(7, 0x5000).unwrap();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     assert!(matches!(
-        state.reconcile(id, &resources, &progress, &registry),
+        state.reconcile(id, &resources, &progress, &retirement, &registry),
         Err(ReconciliationError::Registry(
             ThreadRegistryError::MissingRecord { page: 0x5000 }
         ))
@@ -77,7 +94,7 @@ fn missing_published_page_is_not_inferred_away_and_preparation_can_retry() {
     assert!(!state.is_prepared());
     registry.insert(7, 0x5000, 21, 0, 22, 23, false).unwrap();
     assert!(state
-        .reconcile(id, &resources, &progress, &registry)
+        .reconcile(id, &resources, &progress, &retirement, &registry)
         .is_ok());
 }
 
@@ -86,8 +103,9 @@ fn changed_registry_never_replaces_a_prepared_snapshot() {
     let (resources, progress, mut registry) = fixture();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     let original = state
-        .reconcile(id, &resources, &progress, &registry)
+        .reconcile(id, &resources, &progress, &retirement, &registry)
         .unwrap()
         .records()
         .to_vec();
@@ -95,7 +113,7 @@ fn changed_registry_never_replaces_a_prepared_snapshot() {
     registry.insert(7, 0x5000, 21, 0, 24, 25, false).unwrap();
     for _ in 0..3 {
         assert!(matches!(
-            state.reconcile(id, &resources, &progress, &registry),
+            state.reconcile(id, &resources, &progress, &retirement, &registry),
             Err(ReconciliationError::Registry(
                 ThreadRegistryError::StaleRecord { page: 0x5000 }
             ))
@@ -106,19 +124,22 @@ fn changed_registry_never_replaces_a_prepared_snapshot() {
 
 #[test]
 fn another_attempt_or_changed_publication_coverage_is_rejected() {
-    let (resources, mut progress, registry) = fixture();
+    let (resources, progress, registry) = fixture();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     state
-        .reconcile(id, &resources, &progress, &registry)
+        .reconcile(id, &resources, &progress, &retirement, &registry)
         .unwrap();
     assert!(matches!(
-        state.reconcile(attempt(), &resources, &progress, &registry),
+        state.reconcile(attempt(), &resources, &progress, &retirement, &registry),
         Err(ReconciliationError::AttemptChanged)
     ));
-    progress.record_teb(1);
+    let mut changed = fixture().1;
+    changed.record_teb(1);
+    let (changed, _) = seal(changed, id);
     assert!(matches!(
-        state.reconcile(id, &resources, &progress, &registry),
+        state.reconcile(id, &resources, &changed, &retirement, &registry),
         Err(ReconciliationError::ProgressChanged)
     ));
 }
@@ -132,8 +153,10 @@ fn empty_slot_cannot_be_hidden_in_live_resources_or_registry() {
         }
         progress.retain_empty_slot(cap).unwrap();
         let state = ThreadRegistryReconciliation::empty();
+        let id = attempt();
+        let (progress, retirement) = seal(progress, id);
         assert!(
-            matches!(state.reconcile(attempt(), &resources, &progress, &registry),
+            matches!(state.reconcile(id, &resources, &progress, &retirement, &registry),
             Err(ReconciliationError::Registry(ThreadRegistryError::SharedCapability { cap: found })) if found == cap)
         );
         assert!(!state.is_prepared());
@@ -150,11 +173,14 @@ fn registration_outside_the_constructed_layout_is_rejected() {
     let mut progress = MemoryConstructionProgress::empty();
     progress.record_stack(1);
     let state = ThreadRegistryReconciliation::empty();
+    let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     assert!(matches!(
         state.reconcile(
-            attempt(),
+            id,
             &resources,
             &progress,
+            &retirement,
             &ClientFrameRegistry::new()
         ),
         Err(ReconciliationError::Registry(
@@ -169,12 +195,13 @@ fn new_unselected_rows_and_shared_caps_invalidate_without_refreshing() {
         let (resources, progress, mut registry) = fixture();
         let state = ThreadRegistryReconciliation::empty();
         let id = attempt();
+        let (progress, retirement) = seal(progress, id);
         state
-            .reconcile(id, &resources, &progress, &registry)
+            .reconcile(id, &resources, &progress, &retirement, &registry)
             .unwrap();
         registry.insert(pi, page, frame, 0, 0, 0, false).unwrap();
         let error = state
-            .reconcile(id, &resources, &progress, &registry)
+            .reconcile(id, &resources, &progress, &retirement, &registry)
             .unwrap_err();
         assert_eq!(
             error,
@@ -190,15 +217,18 @@ fn new_unselected_rows_and_shared_caps_invalidate_without_refreshing() {
 
 #[test]
 fn empty_slot_progress_cannot_change_after_snapshot_admission() {
-    let (resources, mut progress, registry) = fixture();
+    let (resources, progress, registry) = fixture();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     state
-        .reconcile(id, &resources, &progress, &registry)
+        .reconcile(id, &resources, &progress, &retirement, &registry)
         .unwrap();
-    progress.retain_empty_slot(99).unwrap();
+    let mut changed = fixture().1;
+    changed.retain_empty_slot(99).unwrap();
+    let (changed, changed_retirement) = seal(changed, id);
     assert!(matches!(
-        state.reconcile(id, &resources, &progress, &registry),
+        state.reconcile(id, &resources, &changed, &changed_retirement, &registry),
         Err(ReconciliationError::ProgressChanged)
     ));
 }
@@ -214,14 +244,42 @@ fn unregistered_empty_construction_has_explicit_empty_snapshot() {
     progress.retain_empty_slot(99).unwrap();
     let state = ThreadRegistryReconciliation::empty();
     let id = attempt();
+    let (progress, retirement) = seal(progress, id);
     let registry = ClientFrameRegistry::new();
     let snapshot = state
-        .reconcile(id, &resources, &progress, &registry)
+        .reconcile(id, &resources, &progress, &retirement, &registry)
         .unwrap();
     assert!(snapshot.records().is_empty() && snapshot.rollback_resources().is_empty());
-    progress.record_protected_tail();
+    let mut changed = MemoryConstructionProgress::<2>::empty();
+    changed.retain_empty_slot(99).unwrap();
+    changed.record_protected_tail();
+    let (changed, _) = seal(changed, id);
     assert!(matches!(
-        state.reconcile(id, &resources, &progress, &registry),
+        state.reconcile(id, &resources, &changed, &retirement, &registry),
         Err(ReconciliationError::ProgressChanged)
     ));
+}
+
+#[test]
+fn coverage_cannot_borrow_another_failed_slots_retirement_phase() {
+    let (resources, progress, registry) = fixture();
+    let id = attempt();
+    let (coverage, retirement) = seal(progress, id);
+    let mut changed = fixture().1;
+    changed.retain_empty_slot(99).unwrap();
+    let (changed_coverage, changed_retirement) = seal(changed, id);
+    let state = ThreadRegistryReconciliation::empty();
+    assert!(matches!(
+        state.reconcile(id, &resources, &coverage, &changed_retirement, &registry),
+        Err(ReconciliationError::ProgressChanged)
+    ));
+    assert!(!state.is_prepared());
+    state
+        .reconcile(id, &resources, &coverage, &retirement, &registry)
+        .unwrap();
+    assert!(matches!(
+        state.reconcile(id, &resources, &changed_coverage, &retirement, &registry),
+        Err(ReconciliationError::ProgressChanged)
+    ));
+    assert!(state.is_prepared());
 }

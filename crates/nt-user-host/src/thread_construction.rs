@@ -62,10 +62,63 @@ pub struct ThreadConstructionInventory {
 /// from live frame caps. This state moves with the memory bundle, never independently.
 #[derive(Debug)]
 pub struct MemoryConstructionProgress<const STACK: usize> {
+    empty_slot: Option<FailedMemorySlot>,
+    stack_registered: [bool; STACK],
+    teb_registered: [bool; 2],
+    protected_tail_registered: bool,
+}
+
+/// Exclusive allocated-empty slot from a failed memory retype or copy. No object was created.
+/// Only handoff to the sealed pending actor transfers release authority; Drop does not recycle.
+#[derive(Debug)]
+#[must_use = "retain the failed memory slot until checked recycling"]
+pub struct FailedMemorySlot {
+    slot: u64,
+}
+
+impl FailedMemorySlot {
+    pub(crate) fn slot(&self) -> u64 {
+        self.slot
+    }
+}
+
+/// Immutable constructor provenance, not slot ownership or release authority.
+#[derive(Debug)]
+pub struct MemoryConstructionCoverage<const STACK: usize> {
     empty_slot: Option<u64>,
     stack_registered: [bool; STACK],
     teb_registered: [bool; 2],
     protected_tail_registered: bool,
+}
+
+impl<const STACK: usize> MemoryConstructionCoverage<STACK> {
+    pub const fn empty() -> Self {
+        Self {
+            empty_slot: None,
+            stack_registered: [false; STACK],
+            teb_registered: [false; 2],
+            protected_tail_registered: false,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.empty_slot.is_none()
+            && !self.stack_registered.iter().any(|&v| v)
+            && !self.teb_registered.iter().any(|&v| v)
+            && !self.protected_tail_registered
+    }
+    /// Original slot number only; checked recycling never changes this provenance.
+    pub fn empty_slot(&self) -> Option<u64> {
+        self.empty_slot
+    }
+    pub fn stack_registered(&self, index: usize) -> bool {
+        self.stack_registered[index]
+    }
+    pub fn teb_registered(&self, index: usize) -> bool {
+        self.teb_registered[index]
+    }
+    pub fn protected_tail_registered(&self) -> bool {
+        self.protected_tail_registered
+    }
 }
 
 impl<const STACK: usize> MemoryConstructionProgress<STACK> {
@@ -92,12 +145,48 @@ impl<const STACK: usize> MemoryConstructionProgress<STACK> {
         if self.empty_slot.is_some() {
             return Err(InventoryError::Occupied);
         }
-        self.empty_slot = Some(slot);
+        self.empty_slot = Some(FailedMemorySlot { slot });
         Ok(())
     }
 
-    pub const fn empty_slot(&self) -> Option<u64> {
-        self.empty_slot
+    pub fn empty_slot(&self) -> Option<u64> {
+        self.empty_slot.as_ref().map(FailedMemorySlot::slot)
+    }
+
+    /// Allocation-free separation of immutable provenance from sole recycling authority.
+    pub fn into_retained(self) -> (MemoryConstructionCoverage<STACK>, Option<FailedMemorySlot>) {
+        let coverage = MemoryConstructionCoverage {
+            empty_slot: self.empty_slot(),
+            stack_registered: self.stack_registered,
+            teb_registered: self.teb_registered,
+            protected_tail_registered: self.protected_tail_registered,
+        };
+        (coverage, self.empty_slot)
+    }
+
+    /// Reject contradictory slot ownership before consuming a constructor's publication ticket.
+    /// Registry-only/external aliases are reconciled separately before any backend cleanup.
+    pub fn validate_failed_slot(
+        &self,
+        inventory: &ThreadConstructionInventory,
+        resources: &crate::thread_resources::ThreadMemoryResources<STACK>,
+    ) -> Result<(), crate::thread_rollback::ThreadRollbackError> {
+        let Some(slot) = self.empty_slot() else {
+            return Ok(());
+        };
+        if resources.has_unlocated_capabilities() {
+            return Err(crate::thread_rollback::ThreadRollbackError::InvalidIdentity);
+        }
+        if inventory
+            .entries()
+            .any(|(_, state)| state.slot() == Some(slot))
+            || resources
+                .backing_pages()
+                .any(|(_, owner, aliases)| owner == slot || aliases.contains(&slot))
+        {
+            return Err(crate::thread_rollback::ThreadRollbackError::ConflictingOwnership);
+        }
+        Ok(())
     }
 
     pub fn record_stack(&mut self, index: usize) {

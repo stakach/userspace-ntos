@@ -1,6 +1,6 @@
 //! Retained runtime ownership before fallible rollback-journal construction.
 use crate::thread_binding::ThreadRuntimeReservations;
-use crate::thread_construction::ThreadConstructionInventory;
+use crate::thread_construction::{FailedMemorySlot, ThreadConstructionInventory};
 use crate::thread_retirement::{RetirementError, ThreadConstructionRetirement, ThreadRetirementIo};
 use crate::thread_rollback::{
     new_rollback_id, ThreadRollback, ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity,
@@ -57,13 +57,16 @@ impl<R> PendingThreadRuntime<R> {
     pub(crate) fn retain_construction(
         id: ThreadRollbackId,
         inventory: ThreadConstructionInventory,
+        memory_slot: Option<FailedMemorySlot>,
         reservations: ThreadRuntimeReservations,
         runtime: R,
     ) -> Self {
         Self {
             id,
             mechanisms: PendingMechanisms::Construction(ThreadConstructionRetirement::retain(
-                id, inventory,
+                id,
+                inventory,
+                memory_slot,
             )),
             runtime,
             reservations,
@@ -106,8 +109,8 @@ impl<R> PendingThreadRuntime<R> {
 
     /// Only one journal may attach to this attempt. Failed inventory validation/allocation may
     /// retry on this same pending owner, without recreating its identity or releasing any holds.
-    /// Construction mechanisms must finish first. This journal then owns only memory release;
-    /// separate failed-copy empty slots and external journals remain the adapter's responsibility.
+    /// Construction mechanisms and failed-memory slots must finish first. This journal then owns
+    /// only memory release; disjoint external cleanup journals remain the adapter's responsibility.
     pub fn prepare_journal(
         &mut self,
         resources: &[ThreadRollbackResource],

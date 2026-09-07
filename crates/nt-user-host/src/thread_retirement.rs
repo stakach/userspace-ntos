@@ -1,5 +1,5 @@
 //! Sealed mechanism retirement for an exact pending thread construction.
-use crate::thread_construction::{Role, SlotState, ThreadConstructionInventory};
+use crate::thread_construction::{FailedMemorySlot, Role, SlotState, ThreadConstructionInventory};
 use crate::thread_rollback::{
     ThreadRollbackId, ThreadRollbackResource, ThreadRollbackResourceKind,
 };
@@ -15,6 +15,10 @@ pub enum Operation {
 pub enum RetirementError {
     StaleOwner,
     NotConstruction,
+    ConflictingOwnership,
+    MemoryRecycle {
+        status: u32,
+    },
     Backend {
         role: Role,
         operation: Operation,
@@ -33,6 +37,9 @@ pub trait ThreadRetirementIo {
     /// Checked empty-slot publication. Failure retains the slot. Before publication, clear any
     /// mutable native release references; immutable attribution must never authorize reuse/delete.
     fn recycle_slot(&mut self, role: Role, slot: u64) -> Result<(), u32>;
+    /// Publish the allocated-empty failed-memory slot only. Never delete, unmap, retype, or
+    /// release physical/retype bytes. Failure retains ownership; the same exclusion contract applies.
+    fn recycle_failed_memory_slot(&mut self, slot: u64) -> Result<(), u32>;
 }
 
 /// Consumes constructor mutation authority. Only this actor may suspend/delete/recycle these
@@ -44,10 +51,16 @@ pub struct ThreadConstructionRetirement {
     inventory: ThreadConstructionInventory,
     original_slots: [Option<u64>; 4],
     suspended: bool,
+    memory_slot: Option<FailedMemorySlot>,
+    original_memory_slot: Option<u64>,
 }
 
 impl ThreadConstructionRetirement {
-    pub(crate) fn retain(id: ThreadRollbackId, inventory: ThreadConstructionInventory) -> Self {
+    pub(crate) fn retain(
+        id: ThreadRollbackId,
+        inventory: ThreadConstructionInventory,
+        memory_slot: Option<FailedMemorySlot>,
+    ) -> Self {
         let mut original_slots = [None; 4];
         for (role, state) in inventory.entries() {
             original_slots[role as usize] = state.slot();
@@ -57,6 +70,8 @@ impl ThreadConstructionRetirement {
             inventory,
             original_slots,
             suspended: false,
+            original_memory_slot: memory_slot.as_ref().map(FailedMemorySlot::slot),
+            memory_slot,
         }
     }
 
@@ -65,7 +80,17 @@ impl ThreadConstructionRetirement {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.inventory.is_empty()
+        self.inventory.is_empty() && self.memory_slot.is_none()
+    }
+
+    pub fn pending_memory_slot(&self) -> Option<u64> {
+        self.memory_slot.as_ref().map(FailedMemorySlot::slot)
+    }
+    pub(crate) fn original_memory_slot(&self) -> Option<u64> {
+        self.original_memory_slot
+    }
+    pub(crate) fn id(&self) -> ThreadRollbackId {
+        self.id
     }
 
     /// Retired numeric slots may already have new owners. Never admit their replay through a
@@ -74,7 +99,8 @@ impl ThreadConstructionRetirement {
         resources.iter().any(|resource| {
             resource.cap != 0
                 && (resource.kind == ThreadRollbackResourceKind::Mechanism
-                    || self.original_slots.contains(&Some(resource.cap)))
+                    || self.original_slots.contains(&Some(resource.cap))
+                    || self.original_memory_slot == Some(resource.cap))
         })
     }
 
@@ -84,6 +110,12 @@ impl ThreadConstructionRetirement {
     ) -> Result<(), RetirementError> {
         if !io.is_current(self.id) {
             return Err(RetirementError::StaleOwner);
+        }
+        if self
+            .original_memory_slot
+            .is_some_and(|slot| self.original_slots.contains(&Some(slot)))
+        {
+            return Err(RetirementError::ConflictingOwnership);
         }
         while let Some((role, state)) = self.inventory.next_retirement() {
             let slot = state.slot().expect("selected retained slot");
@@ -116,6 +148,11 @@ impl ThreadConstructionRetirement {
             self.inventory
                 .acknowledge_recycle(role, slot)
                 .expect("exclusive sealed retirement acknowledged its selected empty slot");
+        }
+        if let Some(slot) = self.pending_memory_slot() {
+            io.recycle_failed_memory_slot(slot)
+                .map_err(|status| RetirementError::MemoryRecycle { status })?;
+            self.memory_slot = None;
         }
         Ok(())
     }

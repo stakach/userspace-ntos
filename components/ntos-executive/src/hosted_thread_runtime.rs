@@ -8,7 +8,7 @@ type RuntimeSlot = ThreadRuntimeSlot<HostedThreadRuntimeOwner>;
 #[derive(Debug)]
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
-    memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress<TP_WORKER_STACK_FRAME_COUNT>,
+    memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
     alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasSnapshot>,
 }
@@ -17,14 +17,14 @@ impl HostedThreadRuntimeOwner {
     fn new(runtime: HostedThreadRuntime) -> Self {
         Self {
             runtime,
-            memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress::empty(),
+            memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
             alias_preparation: core::cell::OnceCell::new(),
         }
     }
 
     fn construction_is_empty(&self) -> bool {
-        self.memory_progress.is_empty()
+        self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
     }
 
@@ -298,14 +298,15 @@ impl HostedThreadRuntimeTable {
             .find(|pending| pending.id() == id)
             .ok_or(ThreadReconciliationError::OwnerChanged)?;
         let owner = pending.runtime();
-        let construction = pending.construction_retirement()
-            .ok_or(ThreadReconciliationError::OwnerChanged)?.inventory();
+        let retirement = pending.construction_retirement()
+            .ok_or(ThreadReconciliationError::OwnerChanged)?;
+        let construction = retirement.inventory();
         let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
         let snapshot = owner.registry_preparation.reconcile(
-            id, &owner.resources, &owner.memory_progress, registry,
+            id, &owner.resources, &owner.memory_coverage, retirement, registry,
         ).map_err(ThreadReconciliationError::Registry)?;
         for cap in construction.entries().filter_map(|(_, state)| state.slot()) {
-            if owner.memory_progress.empty_slot() == Some(cap)
+            if owner.memory_coverage.empty_slot() == Some(cap)
                 || snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
                 || registry.records().iter().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
@@ -326,7 +327,7 @@ impl HostedThreadRuntimeTable {
         aliases.revalidate().map_err(ThreadReconciliationError::Aliases)?;
         for cap in aliases.capabilities() {
             if snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
-                || owner.memory_progress.empty_slot() == Some(cap)
+                || owner.memory_coverage.empty_slot() == Some(cap)
                 || construction.entries().any(|(_, state)| state.slot() == Some(cap))
                 || registry.records().iter().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
@@ -921,16 +922,21 @@ impl RuntimeConstruction for HostedThreadRuntimeOwner {
         partial.construction.live_tcb()
     }
 
+    fn validate_construction(partial: &Self::Partial) -> Result<(), nt_user_host::thread_rollback::ThreadRollbackError> {
+        partial.memory_progress.validate_failed_slot(&partial.construction, &partial.resources)
+    }
+
     fn publication_mut(&mut self) -> &mut nt_user_host::thread_publication::ThreadPublicationSlot {
         &mut self.runtime.publication
     }
 
-    fn retain_partial(&mut self, partial: Self::Partial) -> nt_user_host::thread_construction::ThreadConstructionInventory {
+    fn retain_partial(&mut self, partial: Self::Partial) -> (nt_user_host::thread_construction::ThreadConstructionInventory, Option<nt_user_host::thread_construction::FailedMemorySlot>) {
         assert!(self.construction_is_empty() && !self.runtime.resources.is_live());
         self.runtime.tcb = partial.construction.live_tcb().unwrap_or(1);
         self.runtime.resources = partial.resources;
         self.runtime.teb_alias = partial.teb_alias;
-        self.memory_progress = partial.memory_progress;
-        partial.construction
+        let (coverage, memory_slot) = partial.memory_progress.into_retained();
+        self.memory_coverage = coverage;
+        (partial.construction, memory_slot)
     }
 }

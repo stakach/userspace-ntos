@@ -186,20 +186,24 @@ below are historical baselines, not acceptance of the current provider cutover.
   until mechanism retirement completes (tranche 77, host/build; native retirement remains disabled).
 - [x] Add checked root-slot publication and migrate retained SC cleanup off the void recycler;
   reject capacity, ownership and accounting failures before mutation (tranche 78, host/build).
+- [x] Split failed-memory-slot ownership from immutable coverage and move it into sealed retirement;
+  retain recycling failures and make reconciliation phase-aware without cleanup replay
+  (tranche 79, host/build; native retirement remains disabled).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
   holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Exact registry
   coverage and full external alias state are now captured without transferring ownership. Checked
-  root-slot publication is available and used by retained SC cleanup. Next split failed-memory-slot
-  ownership from immutable provenance, retain complete external-alias cleanup journals and implement
+  root-slot publication is available and used by retained SC cleanup. Failed-memory-slot ownership
+  now moves into the sealed actor independently of immutable coverage. Next retain complete
+  external-alias cleanup journals and implement
   checked native frame recycling
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
   longer invokes the destructive legacy release chain. Implement the checked retry backend and
-  failed-memory-slot retirement and checked frame free-list publication before attempting native
+  failed-memory-slot backend and checked frame free-list publication before attempting native
   retirement. Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
@@ -27606,6 +27610,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     complete journals/exclusions and terminal registry transfer still block native thread retirement
     activation. No QEMU/fault-injection/desktop proof is claimed; the recorded 33 unresolved win32k
     imports remain the full desktop-gate blocker.
+
+    B3 failed-memory-slot ownership tranche 79 (2026-09-07):
+    MemoryConstructionProgress owns a non-clone FailedMemorySlot for failed retype/copy allocation.
+    Consuming handoff separates that owner from immutable MemoryConstructionCoverage. Native runtime
+    rows retain only coverage; the exact pre-reserved pending row's sealed retirement actor receives
+    the slot with the mechanism inventory, without allocation or a second queue. Direct collisions
+    with mechanism slots and private memory caps are rejected before ticket consumption, returning
+    the original ticket and partial owners intact. Registry-only and external alias conflicts remain
+    checked by reconciliation before cleanup.
+
+    The actor has a distinct allocated-empty recycling operation with no delete, unmap, retype or
+    physical-byte release authority. It runs after mechanism retirement; errors keep the same slot
+    and attempt, prevent generic journal preparation and do not replay completed TCB/mechanism
+    operations. Completion includes this owner. Original slot attribution remains after recycling
+    and rejects subsequent Alias/Frame/Mechanism journal entries naming a potentially reused slot.
+
+    Registry reconciliation now requires both immutable coverage and the exact sealed actor. It
+    checks attempt and original failed-slot identity before preparing or revalidating the snapshot.
+    The original number must never occur in selected immutable memory inventory; unrelated registry
+    ownership is checked only while the failed slot remains owned. Thus legitimate unrelated slot
+    reuse after acknowledged recycling preserves the original snapshot, while changed coverage,
+    selected rows and cleanup replay still fail. Native selected alias checks retain the historical
+    number as collision provenance, not release authority. No mutable pending-runtime projection or
+    writable coverage API is introduced.
+
+    Validation: seven new construction integration tests cover empty-slot-only failures, repeated
+    recycle refusal after TCB retirement, allocation-free collision rejection/handoff, stale attempts,
+    phase-aware registry reuse without snapshot refresh, historical resource replay and journal OOM
+    after recycling without reconstructed authority. One new unit test rejects mismatched coverage
+    and actor provenance before capture and on retry. Existing reconciliation tests now consume
+    immutable coverage rather than retaining constructor mutation authority. The serialized
+    nine-crate suite passes 1,192 tests (263 in nt-user-host: 230 unit, 3 existing integration and
+    30 construction integration). The subsequent executive build passes with the unchanged
+    262-warning baseline. Logs: `.tmp/test-failed-memory-slot-20260907.log` and
+    `.tmp/build-failed-memory-slot-20260907.log`. Two read-only agents reviewed host and native
+    ownership; only root ran checks.
+
+    Review adjustment: native handoff is active, native destructive retirement is not. Implement the
+    allocated-empty backend over checked root-slot publication without clearing/releasing nonzero
+    retype accounting, and clear stale mutable native references before allocator reuse without
+    reentering the pending slot borrow. Complete disjoint external AliasTransition cleanup journals
+    and checked frame free-list admission before activating the actor. Reconciliation snapshots are
+    not these cleanup journals. Terminal registry transfer and final commit must wait for every
+    retained owner; ordinary termination, first-resume failure, other launch families and live
+    failure validation remain open. No QEMU/desktop proof is claimed; the recorded 33 unresolved
+    win32k imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

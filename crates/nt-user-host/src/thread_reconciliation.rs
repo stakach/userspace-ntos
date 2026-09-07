@@ -3,9 +3,10 @@ use alloc::vec::Vec;
 use core::cell::OnceCell;
 use nt_memory_manager::ClientFrameRegistry;
 
-use crate::thread_construction::MemoryConstructionProgress;
+use crate::thread_construction::MemoryConstructionCoverage;
 use crate::thread_registry::{ThreadRegistryError, ThreadRegistrySnapshot};
 use crate::thread_resources::ThreadMemoryResources;
+use crate::thread_retirement::ThreadConstructionRetirement;
 use crate::thread_rollback::ThreadRollbackId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,9 +50,16 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
         &self,
         id: ThreadRollbackId,
         resources: &ThreadMemoryResources<STACK>,
-        progress: &MemoryConstructionProgress<STACK>,
+        progress: &MemoryConstructionCoverage<STACK>,
+        retirement: &ThreadConstructionRetirement,
         registry: &ClientFrameRegistry,
     ) -> Result<&ThreadRegistrySnapshot<STACK>, ReconciliationError> {
+        if retirement.id() != id {
+            return Err(ReconciliationError::AttemptChanged);
+        }
+        if retirement.original_memory_slot() != progress.empty_slot() {
+            return Err(ReconciliationError::ProgressChanged);
+        }
         if let Some(prepared) = self.prepared.get() {
             if prepared.id != id {
                 return Err(ReconciliationError::AttemptChanged);
@@ -70,7 +78,7 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
                 .snapshot
                 .revalidate(resources, registry)
                 .map_err(ReconciliationError::Registry)?;
-            validate_empty_slot(progress, &prepared.snapshot, registry)?;
+            validate_empty_slot(progress, retirement, &prepared.snapshot, registry)?;
             return Ok(&prepared.snapshot);
         }
         let mut pages = Vec::new();
@@ -80,7 +88,7 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
         pages.extend(registered_pages(resources, progress)?);
         let snapshot = ThreadRegistrySnapshot::capture_partial(resources, registry, &pages)
             .map_err(ReconciliationError::Registry)?;
-        validate_empty_slot(progress, &snapshot, registry)?;
+        validate_empty_slot(progress, retirement, &snapshot, registry)?;
         let prepared = Prepared {
             id,
             snapshot,
@@ -99,7 +107,7 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
 
 fn registered_pages<'a, const STACK: usize>(
     resources: &'a ThreadMemoryResources<STACK>,
-    progress: &'a MemoryConstructionProgress<STACK>,
+    progress: &'a MemoryConstructionCoverage<STACK>,
 ) -> Result<impl Iterator<Item = u64> + 'a, ReconciliationError> {
     if !resources.is_live()
         || (resources.stack_frames() as usize..STACK).any(|index| progress.stack_registered(index))
@@ -119,7 +127,8 @@ fn registered_pages<'a, const STACK: usize>(
 }
 
 fn validate_empty_slot<const STACK: usize>(
-    progress: &MemoryConstructionProgress<STACK>,
+    progress: &MemoryConstructionCoverage<STACK>,
+    retirement: &ThreadConstructionRetirement,
     snapshot: &ThreadRegistrySnapshot<STACK>,
     registry: &ClientFrameRegistry,
 ) -> Result<(), ReconciliationError> {
@@ -130,10 +139,11 @@ fn validate_empty_slot<const STACK: usize>(
         .rollback_resources()
         .iter()
         .any(|resource| resource.cap == slot)
-        || registry
-            .records()
-            .iter()
-            .any(|record| [record.frame, record.alias_cap, record.source_cap].contains(&slot))
+        || (retirement.pending_memory_slot().is_some()
+            && registry
+                .records()
+                .iter()
+                .any(|record| [record.frame, record.alias_cap, record.source_cap].contains(&slot)))
     {
         return Err(ReconciliationError::Registry(
             ThreadRegistryError::SharedCapability { cap: slot },
