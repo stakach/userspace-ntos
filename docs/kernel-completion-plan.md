@@ -198,6 +198,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add checked, allocation-free physical-frame pool publication and migrate retained section/
   registry cleanup to validate allocator ownership before effects and acknowledge publication last
   (tranche 82; legacy void frame release and pending-thread activation remain open).
+- [x] Retain full prefetch phase coverage in exact-attempt claim journals and close process-drop
+  exclusion bypasses; cross-check win32k/prefetch/private owners before either journal claims rows
+  (tranche 83; native prefetch claims active, destructive thread retirement remains disabled).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -206,9 +209,10 @@ below are historical baselines, not acceptance of the current provider cutover.
   root-slot publication is available for retained SC cleanup and alias/prefetch retirement, including
   a strict zero-retype-accounting path for copied/failed slots. Failed-memory-slot ownership now
   moves into the sealed actor independently of immutable coverage. External aliases retain distinct
-  deletion/recycle phases. Win32k attachment journals now claim their exact pending attempt after
-  conflict validation; direct detach and attachment switches cannot bypass them. Complete the
-  remaining external journals and connect the checked native frame publication primitive
+  deletion/recycle phases. Win32k attachment and prefetch journals now claim their exact pending
+  attempt after joint conflict validation; direct detach, attachment switches and process-wide
+  prefetch retirement cannot bypass them. Complete the provider/temporary alias journals and
+  connect the checked native frame publication primitive
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
@@ -27806,6 +27810,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     termination, first-resume failure, other launch families and live failure validation remain
     open. No QEMU/desktop proof is claimed; the recorded 33 unresolved win32k imports remain the
     full desktop-gate blocker.
+
+    B3 exact-attempt prefetch claims tranche 83 (2026-09-07):
+    Added a non-cloneable PrefetchJournal in nt-memory-manager with opaque monotonic claims, exact
+    reservation IDs/indices, fixed range geometry and full original backing snapshots. RetainedAlias
+    now exposes read-only phase snapshots so successful unmap/deletion cannot look like unchanged
+    unavailable-cap coverage. Reserved, allocated-empty, unmapped, mapped and recycle-only rows
+    participate; the existing PrefetchFrames row remains the only frame/slot release authority.
+    Preparation is fallible and effect-free, claim validates every selected row before pinning, and
+    successful retirement acknowledges each row without allocation. Failed operations retain the
+    same claim and successful cleanup phases. Completed row/slot reuse outside the protected ranges
+    is valid; an unrecycled deleted slot still participates in ownership collision checks.
+
+    ThreadPrefetchJournal in nt-user-host binds that memory-manager journal to the complete
+    ThreadRollbackId and current hosted process generation. Temporary process lifetimes explicitly
+    require absence of all same-PI prefetch rows, including outside the thread geometry; matching
+    numeric generations cannot substitute a hosted identity. No reverse crate dependency or NT
+    thread policy was added to the memory manager.
+
+    Native failed-construction reconciliation retains the journal in durable pending ownership.
+    Both win32k and prefetch preparations, immutable revalidation and private/mechanism/registry/
+    cross-family capability checks complete before either claim. Global external capability checks
+    also reject private owners colliding with rows outside the selected thread geometry. Ordinary
+    prefetch lookup, reservation build, direct retire and retry cannot access claimed rows. Native
+    process-wide prefetch drop now checks every page against pending memory exclusions before any
+    row state changes; the table independently rejects claimed or stale-generation process drops.
+    Removed the old unchecked process-drop route. A stale process generation now reports refusal
+    instead of a successful no-op. Native destructive journal driving remains disabled.
+
+    Validation: 13 new memory-manager tests cover ordinary-operation exclusion, whole-process
+    preflight, competing claims, phase changes with unchanged cap numbers, exact reservation reuse,
+    added coverage, cross-range cap conflicts, every backend failure/retry, completed row/slot reuse,
+    failed-allocation strict recycling, pending deleted-slot conflicts, generation/absence/range
+    rejection and empty/reserved coverage. Three thread-wrapper tests cover current PI/generation,
+    temporary identity and exact attempts through completion. Two construction integration tests
+    cover preparation OOM with retained owners and allocation-free claim/revalidation/retirement.
+    The serialized nine-crate suite passes 1,245 tests (299 in nt-memory-manager; 295 in nt-user-host:
+    256 unit, 3 existing integration and 36 construction integration). The subsequent executive
+    build passes with the unchanged 262-warning baseline. Logs: `.tmp/test-prefetch-claims-20260907.log` and
+    `.tmp/build-prefetch-claims-20260907.log`. A read-only agent audited and reviewed the boundary;
+    only root ran tests/builds, sequentially.
+
+    Review adjustment: prefetch and win32k journal claims are now wired. Complete provider/native
+    temporary alias coverage and stale-reference clearing before native destructive retirement,
+    registry transfer and final commit. Keep pre-effect provenance checks separate from retirement
+    retry checks: recycled original cap numbers can have new owners. Generic journal callers must
+    retain admission exclusions for the full geometry until terminal commit; native pending-thread
+    memory admission supplies those exclusions, including originally empty coverage. Legacy frame
+    acquire/release and pagefile transition cleanup still require retained failure phases and
+    checked publication. Ordinary thread termination, first-resume failure, other launch families
+    and live failure validation remain open. No QEMU/desktop proof is claimed; the recorded 33
+    unresolved win32k imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

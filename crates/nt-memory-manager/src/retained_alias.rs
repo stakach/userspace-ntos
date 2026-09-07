@@ -1,12 +1,19 @@
 //! Checked retirement of a mapped copy capability. The owner must retain this record on error.
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Live,
     RetiringMapped,
     RetiringUnmapped,
     RetiringDeleted,
     Released,
+}
+
+/// Read-only phase coverage, not release authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedAliasSnapshot {
+    cap: u64,
+    state: State,
 }
 
 /// A single alias owner, deliberately neither `Copy` nor `Clone`.
@@ -29,6 +36,13 @@ pub trait AliasRetirementIo {
 }
 
 impl RetainedAlias {
+    pub fn snapshot(&self) -> RetainedAliasSnapshot {
+        RetainedAliasSnapshot {
+            cap: self.cap,
+            state: self.state,
+        }
+    }
+
     /// Adopt an already mapped, non-null capability.
     pub fn new(cap: u64) -> Option<Self> {
         (cap != 0).then_some(Self {

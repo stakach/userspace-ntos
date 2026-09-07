@@ -1,6 +1,9 @@
 use super::*;
 use alloc::vec;
 
+#[path = "prefetch_journal_tests.rs"]
+mod journal_tests;
+
 const PROCESS: PrefetchProcess = PrefetchProcess {
     pi: 2,
     generation: 7,
@@ -382,7 +385,7 @@ fn process_generation_mismatch_cannot_observe_replace_or_release_retained_owner(
     assert!(table.reserve(newer, 0x2000, |_| Some(0x300000)).is_err());
     assert!(table.retry_retirement(newer, 0x1000, &mut io).is_err());
     let calls = io.calls.len();
-    assert_eq!(table.retire_process(newer, &mut io), (0, 0));
+    assert_eq!(table.retire_process(newer, &mut io), (0, 1));
     assert_eq!(io.calls.len(), calls);
     assert!(!table.process_is_empty(2));
     table.retire(ticket, &mut io).unwrap();

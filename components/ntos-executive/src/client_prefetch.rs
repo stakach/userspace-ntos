@@ -5,6 +5,16 @@ use nt_memory_manager::retained_alias::AliasRetirementIo;
 
 static mut FRAMES: PrefetchFrames = PrefetchFrames::new();
 
+#[path = "client_prefetch_thread.rs"]
+mod thread;
+pub(crate) use thread::ThreadPrefetchCleanup;
+
+pub(crate) unsafe fn owns_cap(cap: u64) -> bool {
+    (&*core::ptr::addr_of!(FRAMES))
+        .capabilities()
+        .any(|owned| owned == cap)
+}
+
 fn process(pi: u64) -> Result<(PrefetchProcess, u64), u32> {
     let runtime = usize::try_from(pi)
         .ok()
@@ -140,7 +150,15 @@ pub(crate) fn client_copyin_frame_drop_process(pi: u64) -> (u64, u64) {
     let Ok((process, _)) = process(pi) else {
         return (0, 1);
     };
-    unsafe { (&mut *core::ptr::addr_of_mut!(FRAMES)).retire_process(process, &mut Cleanup) }
+    unsafe {
+        let frames = &mut *core::ptr::addr_of_mut!(FRAMES);
+        if !frames.can_retire_process(process, |page| {
+            hosted_thread_memory_access(pi, page, 4096).is_ok()
+        }) {
+            return (0, 1);
+        }
+        frames.retire_process(process, &mut Cleanup)
+    }
 }
 
 pub(crate) fn client_copyin_frame_process_is_empty(pi: u64) -> bool {

@@ -8,6 +8,10 @@ const RESOURCES: u32 = 0xc000_009a;
 const INVALID: u32 = 0xc000_000d;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[path = "prefetch_journal.rs"]
+mod journal;
+pub use journal::{PrefetchJournal, PrefetchJournalError};
+
 fn allocate_id(counter: &AtomicU64) -> Result<u64, u32> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -41,7 +45,7 @@ pub trait PrefetchIo: AliasRetirementIo {
     fn fill(&mut self, alias: u64) -> Result<(), u32>;
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Reserved,
     Building,
@@ -57,6 +61,16 @@ enum Backing {
     Mapped(RetainedAlias),
 }
 
+impl Backing {
+    fn cap(&self) -> Option<u64> {
+        match self {
+            Self::Empty => None,
+            Self::Unmapped(cap) | Self::AllocatedEmpty(cap) | Self::Recycle(cap) => Some(*cap),
+            Self::Mapped(alias) => (alias.cap() != 0).then_some(alias.cap()),
+        }
+    }
+}
+
 struct Entry {
     id: u64,
     process: PrefetchProcess,
@@ -64,6 +78,7 @@ struct Entry {
     alias: u64,
     state: State,
     backing: Backing,
+    claim: Option<u64>,
 }
 
 /// Must live in durable storage until every retained entry has been retired successfully.
@@ -127,6 +142,7 @@ impl PrefetchFrames {
             alias,
             state: State::Reserved,
             backing: Backing::Empty,
+            claim: None,
         });
         if index == self.entries.len() {
             self.entries.push(entry);
@@ -160,6 +176,27 @@ impl PrefetchFrames {
         self.find(pi, page).is_some()
     }
 
+    /// Ownership-inclusive metadata for conflict checks, including unpublished and deleted slots.
+    pub fn capabilities(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.backing.cap())
+    }
+
+    /// Preflight every process row before a caller starts process-wide release effects.
+    pub fn can_retire_process(
+        &self,
+        process: PrefetchProcess,
+        mut allowed: impl FnMut(u64) -> bool,
+    ) -> bool {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.process.pi == process.pi)
+            .all(|entry| entry.process == process && entry.claim.is_none() && allowed(entry.page))
+    }
+
     /// `Err` means an authoritative unavailable record, not absence or permission to use another
     /// source. No capability or address from a reservation/retirement is ordinarily exposed.
     pub fn lookup(&self, process: PrefetchProcess, page: u64) -> Result<Option<PrefetchPage>, u32> {
@@ -167,7 +204,7 @@ impl PrefetchFrames {
             return Ok(None);
         };
         let entry = self.entries[reservation.index].as_ref().unwrap();
-        if entry.process == process && entry.state == State::Published {
+        if entry.process == process && entry.claim.is_none() && entry.state == State::Published {
             if let Backing::Mapped(alias) = &entry.backing {
                 if alias.is_live() {
                     return Ok(Some(PrefetchPage {
@@ -188,7 +225,7 @@ impl PrefetchFrames {
         io: &mut impl PrefetchIo,
     ) -> Result<(), u32> {
         let entry = self.exact(reservation)?;
-        if entry.state != State::Reserved {
+        if entry.claim.is_some() || entry.state != State::Reserved {
             return Err(crate::STATUS_INVALID_HANDLE);
         }
         entry.state = State::Building;
@@ -227,7 +264,19 @@ impl PrefetchFrames {
         reservation: PrefetchReservation,
         io: &mut impl AliasRetirementIo,
     ) -> Result<(), u32> {
+        self.retire_owned(reservation, None, io)
+    }
+
+    fn retire_owned(
+        &mut self,
+        reservation: PrefetchReservation,
+        claim: Option<u64>,
+        io: &mut impl AliasRetirementIo,
+    ) -> Result<(), u32> {
         let entry = self.exact(reservation)?;
+        if entry.claim != claim {
+            return Err(crate::STATUS_INVALID_HANDLE);
+        }
         entry.state = State::Retiring;
         if let Backing::Unmapped(cap) = entry.backing {
             io.delete(cap)?;
@@ -254,7 +303,7 @@ impl PrefetchFrames {
         let Some(reservation) = self.find(process.pi, page) else {
             return Ok(());
         };
-        if self.exact(reservation)?.process != process {
+        if self.exact(reservation)?.process != process || self.exact(reservation)?.claim.is_some() {
             return Err(crate::STATUS_INVALID_HANDLE);
         }
         match self.exact(reservation)?.state {
@@ -270,6 +319,9 @@ impl PrefetchFrames {
         process: PrefetchProcess,
         io: &mut impl AliasRetirementIo,
     ) -> (u64, u64) {
+        if !self.can_retire_process(process, |_| true) {
+            return (0, 1);
+        }
         for entry in self
             .entries
             .iter_mut()

@@ -14,6 +14,11 @@ static mut MAPPINGS: Vec<Mapping> = Vec::new();
 mod thread_aliases;
 pub(crate) use thread_aliases::ThreadAliasCleanup;
 
+pub(crate) unsafe fn attachment_owns_cap(cap: u64) -> bool {
+    (&*core::ptr::addr_of!(MAPPINGS)).iter()
+        .flat_map(|mapping| mapping.snapshot().capabilities()).any(|owned| owned == cap)
+}
+
 fn checked(label: u64) -> Result<(), u32> {
     if label == 0 {
         Ok(())
