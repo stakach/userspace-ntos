@@ -209,6 +209,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Replace two-frame COW scratch and inspection mappings with sequential checked temporary
   aliases, bounded access and conservative untracked-backing exclusion (tranche 86; legacy frame
   acquisition/release, provider-bank journals and native retirement activation remain open).
+- [x] Replace the provider leaf-cap bank's PI-only owner/free-list machinery with exact process/page
+  records, typed capabilities and retained move/recycle/delete phases (tranche 87; segment-CNode
+  construction and pending-thread claims remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -27998,6 +28001,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     locations. Do not merge child slots into the existing root-cap-only conflict set as bare u64s.
     Complete joint journals and exclusions before registry transfer or native destructive cleanup.
     The 33 real provider-import implementations remain required before another desktop push.
+
+    B3 generation-exact provider leaf-alias bank tranche 87 (2026-09-07):
+    Added ProviderAliasBank in nt-user-host and moved its native operations into
+    win32k_client_cap_bank.rs. Every retained leaf records PI plus tagged process identity, client
+    page, source frame, target PML4 and rights. Generation-safe row handles and distinct root-slot
+    versus child-CNode/slot snapshots preserve capability location through copy, map, move,
+    empty-root recycling and deletion. A successful move acknowledges root emptiness before the
+    strict root recycler runs. Failure retains that empty root and the mapped child without copying,
+    mapping or moving again. Failed copies retain any allocated-empty destination; root and child
+    deletions acknowledge their own phases before subsequent effects.
+
+    Removed the old AtomicU8 PI owner array, FREE_HEAD/FREE_NEXT links, manual live-by-PI counters,
+    root-cap store handoff and void root recycling. Ownership metadata and eventual free-index
+    publication capacity are reserved before capability acquisition. Per-process sorted page
+    indexes provide binary lookup and normal contiguous append; free-slot selection is constant
+    time rather than scanning all aliases on each map. Partial release fences the entire exact
+    process and uses generation-bearing page indexes, so another process can reuse an already
+    retired slot without an older cleanup retry deleting it. Segment CNode identities must be
+    stable and unique before a child move; copied source frames remain borrowed provenance.
+
+    Native admission resolves the existing hosted/temporary process authorities without fabricating
+    a generation, checks the current process-owned PML4 and generation, and applies thread/temporary
+    memory exclusions before page-table or leaf effects. Existing mapped-prefix fast paths verify
+    their exact owner, source frames, PML4, rights and completed bank publication. Final VM teardown
+    passes the exact ProcessDeletionCandidate, and clears prefix/guard metadata only after complete
+    bank retirement. The obsolete bank-per-PI allocation census pair is removed; live bank statistics
+    now come from the actual owner. Bounded failure diagnostics retain operation, PI/PID/tagged
+    generation, reason/status and live/mapped/released counts.
+
+    Validation: 20 new host tests cover copy/map/segment/move/recycle/delete failures, idempotent exact
+    retry, typed snapshots, partial process release, PI and child-slot reuse, generation exhaustion,
+    invalid requests, stable unique CNodes and exact prefix publication. The serialized nine-crate
+    suite passes 1,288 tests (319 memory-manager; 318 user-host including integration tests).
+    The executive build passes with the unchanged 262-warning baseline.
+    Logs: `.tmp/test-provider-alias-bank-focused-20260907.log`,
+    `.tmp/test-provider-alias-bank-20260907.log`, and
+    `.tmp/build-provider-alias-bank-20260907.log`. One agent implemented the bounded host core,
+    another reviewed native ownership/admission and diagnostics; root alone ran validation.
+
+    Review adjustment: this closes leaf alias retention, not all provider ownership. The lazily
+    allocated segment CNodes still use the old partial-construction cleanup and need durable
+    retype/mint phases next. Then add exact pending-thread range claims and typed cross-owner
+    conflict validation to joint reconciliation before any destructive native thread activation.
+    Legacy frame/pagefile cleanup and stale runtime references remain open. No additional boot was
+    run; the real 33-name provider-import barrier is unchanged.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -107,7 +107,7 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
             if failures != 0 || !shared_image_mapping_process_is_empty(pi) {
                 return false;
             }
-            if !win32k_glue::release_win32k_client_cap_bank(pi)
+            if !win32k_glue::release_win32k_client_cap_bank(self.candidate)
                 || !win32k_glue::win32k_client_cap_bank_is_empty(pi)
             {
                 return false;

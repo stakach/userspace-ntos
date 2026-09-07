@@ -10109,8 +10109,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
     print_str(b" w32-bank-fails=");
     print_u64(w32_bank_fails);
     let (
-        w32_row_cap_len,
-        w32_row_cap_cap,
         w32_row_heap_len,
         w32_row_heap_cap,
         w32_row_pool_len,
@@ -10120,10 +10118,6 @@ pub(crate) fn print_pool_census(tag: &[u8]) {
         w32_row_fails,
     ) = win32k_glue::win32k_client_process_row_stats();
     print_str(b" w32-rows=");
-    print_u64(w32_row_cap_len as u64);
-    print_str(b"/");
-    print_u64(w32_row_cap_cap as u64);
-    print_str(b":");
     print_u64(w32_row_heap_len as u64);
     print_str(b"/");
     print_u64(w32_row_heap_cap as u64);

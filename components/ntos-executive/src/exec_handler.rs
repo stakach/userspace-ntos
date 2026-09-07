@@ -9808,6 +9808,20 @@ impl ExecNtHandler {
         self.thread_runtime.admit_ingress(badge, current)
     }
 
+    pub(crate) fn capture_process_identity(
+        &self,
+        pi: usize,
+    ) -> Option<nt_user_host::process_identity::ProcessIdentity> {
+        let process = nt_user_host::process_identity::resolve_thread_process_identity(
+            pi,
+            self.pm_pid_for_pi(pi)?,
+            self.process_mechanisms.get(pi),
+            self.temporary_process_slots.get(pi),
+        )?;
+        self.pm.process(process.pid)?;
+        Some(process)
+    }
+
     fn capture_thread_process_identity(
         &self,
         pi: usize,
@@ -9817,14 +9831,8 @@ impl ExecNtHandler {
         if tid == 0 {
             return None;
         }
-        let process = nt_user_host::process_identity::resolve_thread_process_identity(
-            pi,
-            self.pm.thread(tid)?.process_id,
-            self.process_mechanisms.get(pi),
-            self.temporary_process_slots.get(pi),
-        )?;
-        self.pm.process(process.pid)?;
-        Some(process)
+        let process = self.capture_process_identity(pi)?;
+        (self.pm.thread(tid)?.process_id == process.pid).then_some(process)
     }
 
     fn capture_hosted_thread_reservations(

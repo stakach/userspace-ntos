@@ -5,7 +5,6 @@
 #![allow(clippy::all)]
 use crate::*;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU8;
 
 const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
 const WINDOWPROC_PAYLOAD_OFFSET: u32 = 0x40;
@@ -313,31 +312,9 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
     }
     crate::service_sec_image::acquire_idle_component_execution_lane()
 }
-// Win32k shared views carry thousands of mapped frame/page-table caps across GUI clients. Keep the
-// root CSpace to process-global names and move these high-volume mapping caps into lazy global
-// child-CNode segments; a small ownership index keeps per-process teardown exact.
-const WIN32K_CLIENT_CAP_BANK_RADIX: u32 = 12;
-const WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS: u64 = 1u64 << WIN32K_CLIENT_CAP_BANK_RADIX;
-const WIN32K_CLIENT_CAP_BANK_SEGMENTS: usize = 24;
-const WIN32K_CLIENT_CAP_BANK_SLOTS: u64 =
-    WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS * WIN32K_CLIENT_CAP_BANK_SEGMENTS as u64;
-const WIN32K_CLIENT_CAP_BANK_GUARD_BADGE: u64 = 64 - WIN32K_CLIENT_CAP_BANK_RADIX as u64;
-static WIN32K_CLIENT_CAP_BANK_RAW: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SEGMENTS] =
-    [const { AtomicU64::new(0) }; WIN32K_CLIENT_CAP_BANK_SEGMENTS];
-static WIN32K_CLIENT_CAP_BANK_CNODE: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SEGMENTS] =
-    [const { AtomicU64::new(0) }; WIN32K_CLIENT_CAP_BANK_SEGMENTS];
-static WIN32K_CLIENT_CAP_BANK_NEXT: AtomicU64 = AtomicU64::new(0);
-static mut WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI: Vec<AtomicU64> = Vec::new();
-static WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_CAP_BANK_LIVE_HW: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_CAP_BANK_TO_BANK: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_CAP_BANK_RELEASES: AtomicU64 = AtomicU64::new(0);
+#[path = "win32k_client_cap_bank.rs"]
+mod client_cap_bank;
 static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_CAP_BANK_FREE_HEAD: AtomicU64 = AtomicU64::new(0);
-static WIN32K_CLIENT_CAP_BANK_OWNER: [AtomicU8; WIN32K_CLIENT_CAP_BANK_SLOTS as usize] =
-    [const { AtomicU8::new(0) }; WIN32K_CLIENT_CAP_BANK_SLOTS as usize];
-static WIN32K_CLIENT_CAP_BANK_FREE_NEXT: [AtomicU64; WIN32K_CLIENT_CAP_BANK_SLOTS as usize] =
-    [const { AtomicU64::new(0) }; WIN32K_CLIENT_CAP_BANK_SLOTS as usize];
 static WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
 static mut WIN32K_POOL_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
@@ -363,11 +340,8 @@ unsafe fn reset_win32k_atomic_process_rows(rows: &mut Vec<AtomicU64>, slots: usi
 }
 
 pub(crate) fn reset_win32k_client_process_rows(slots: usize) -> bool {
+    if !client_cap_bank::all_empty() { return false; }
     unsafe {
-        let cap_rows = reset_win32k_atomic_process_rows(
-            &mut *core::ptr::addr_of_mut!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI),
-            slots,
-        );
         let heap_rows = reset_win32k_atomic_process_rows(
             &mut *core::ptr::addr_of_mut!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES),
             slots,
@@ -380,12 +354,8 @@ pub(crate) fn reset_win32k_client_process_rows(slots: usize) -> bool {
             &mut *core::ptr::addr_of_mut!(GDI_USERVM_CLIENT_MAPPED_FRAMES),
             slots,
         );
-        cap_rows && heap_rows && pool_rows && uservm_rows
+        heap_rows && pool_rows && uservm_rows
     }
-}
-
-unsafe fn win32k_client_cap_bank_live_row(pi: usize) -> Option<&'static AtomicU64> {
-    (&*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI)).get(pi)
 }
 
 unsafe fn win32k_user_heap_mapped_row(pi: usize) -> Option<&'static AtomicU64> {
@@ -413,15 +383,12 @@ unsafe fn gdi_uservm_mapped_rows() -> &'static [AtomicU64] {
 }
 
 pub(crate) fn win32k_client_process_row_stats(
-) -> (usize, usize, usize, usize, usize, usize, usize, usize, u64) {
+) -> (usize, usize, usize, usize, usize, usize, u64) {
     unsafe {
-        let cap_rows = &*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI);
         let heap_rows = &*core::ptr::addr_of!(WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES);
         let pool_rows = &*core::ptr::addr_of!(WIN32K_POOL_CLIENT_MAPPED_FRAMES);
         let uservm_rows = &*core::ptr::addr_of!(GDI_USERVM_CLIENT_MAPPED_FRAMES);
         (
-            cap_rows.len(),
-            cap_rows.capacity(),
             heap_rows.len(),
             heap_rows.capacity(),
             pool_rows.len(),
@@ -4553,8 +4520,30 @@ unsafe fn map_win32k_arena_prefix_into_client(
     if target_frames == 0 {
         return false;
     }
+    let Some(process) = handler.capture_process_identity(pi) else { return false; };
+    let generation = match process.generation {
+        nt_user_host::process_identity::ProcessGeneration::Hosted(generation)
+        | nt_user_host::process_identity::ProcessGeneration::Temporary(generation) => generation,
+    };
+    if pml4 == 0 || handler.process_vspaces.get(pi).copied() != Some(pml4)
+        || handler.process_vspace_caps.get(pi).and_then(Option::as_ref)
+            .is_none_or(|owner| owner.pml4 != pml4 || owner.generation != generation)
+    {
+        return false;
+    }
+    let Some(bytes) = target_frames.checked_mul(0x1000) else { return false; };
+    if client_base & 0xfff != 0 || client_base.checked_add(bytes).is_none()
+        || frame_base.checked_add(target_frames).is_none()
+        || hosted_thread_memory_access(pi as u64, client_base, bytes).is_err()
+        || client_cap_bank::admit_process(pi, process).is_err()
+    {
+        return false;
+    }
     let bit = 1u64 << pi;
     let already_mapped = mapped_row.load(Ordering::Relaxed).min(max_frames);
+    if already_mapped != 0 && !client_cap_bank::mapped_prefix(
+        pi, process, client_base, already_mapped, pml4, frame_base, rights,
+    ) { return false; }
     if already_mapped >= target_frames {
         mapped_guard.fetch_or(bit, Ordering::Relaxed);
         return true;
@@ -4573,38 +4562,11 @@ unsafe fn map_win32k_arena_prefix_into_client(
         }
     }
     for i in already_mapped..target_frames {
-        let (cp, copy_error) = copy_cap_r(frame_base + i);
-        if copy_error != 0 {
-            print_str(b"[win32k-svc] failed to copy ");
-            print_str(label);
-            print_str(b" frame for pi=");
-            print_u64(pi as u64);
-            print_str(b" index=0x");
-            print_hex(i as u32);
-            print_str(b" error=");
-            print_u64(copy_error);
-            print_str(b"\n");
-            if cp != 0 {
-                let _ = cnode_delete_recycle_r(cp);
-            }
-            return false;
-        }
-        let map_error = page_map_r(cp, client_base + i * 0x1000, rights, pml4);
-        if map_error != 0 {
-            print_str(b"[win32k-svc] failed to map ");
-            print_str(label);
-            print_str(b" into pi=");
-            print_u64(pi as u64);
-            print_str(b" va=0x");
-            print_hex(((client_base + i * 0x1000) >> 32) as u32);
-            print_hex((client_base + i * 0x1000) as u32);
-            print_str(b" error=");
-            print_u64(map_error);
-            print_str(b"\n");
-            let _ = cnode_delete_recycle_r(cp);
-            return false;
-        }
-        if !win32k_client_cap_bank_store(pi, cp) {
+        let request = nt_user_host::provider_alias_bank::ProviderAliasRequest {
+            pi, process, page: client_base + i * 0x1000, pml4,
+            source_frame: frame_base + i, rights,
+        };
+        if client_cap_bank::map(request).is_err() {
             print_str(b"[win32k-svc] failed to retain ");
             print_str(label);
             print_str(b" mapping cap for pi=");
@@ -4612,8 +4574,6 @@ unsafe fn map_win32k_arena_prefix_into_client(
             print_str(b" index=0x");
             print_hex(i as u32);
             print_str(b"\n");
-            let _ = page_unmap_r(cp);
-            let _ = cnode_delete_recycle_r(cp);
             return false;
         }
         mapped_row.store(i + 1, Ordering::Relaxed);
@@ -4647,163 +4607,21 @@ unsafe fn win32k_client_cap_bank_map_page_table(
     true
 }
 
-unsafe fn win32k_client_cap_bank_ensure_segment(segment: usize) -> Option<u64> {
-    if segment >= WIN32K_CLIENT_CAP_BANK_SEGMENTS {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let existing = WIN32K_CLIENT_CAP_BANK_CNODE[segment].load(Ordering::Relaxed);
-    if existing != 0 {
-        return Some(existing);
-    }
-    let Some(raw) = try_alloc_slot() else {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    if untyped_retype_r(
-        CAP_INIT_UNTYPED,
-        OBJ_CNODE,
-        WIN32K_CLIENT_CAP_BANK_RADIX,
-        1,
-        raw,
-    ) != 0
-    {
-        recycle_deleted_root_slot(raw);
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let Some(cnode) = try_alloc_slot() else {
-        let _ = cnode_delete_recycle_r(raw);
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    };
-    let mint = cnode_mint_r(
-        CAP_INIT_THREAD_CNODE,
-        cnode,
-        raw,
-        WIN32K_CLIENT_CAP_BANK_GUARD_BADGE,
-    );
-    if mint != 0 {
-        recycle_deleted_root_slot(cnode);
-        let _ = cnode_delete_recycle_r(raw);
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    WIN32K_CLIENT_CAP_BANK_RAW[segment].store(raw, Ordering::Relaxed);
-    WIN32K_CLIENT_CAP_BANK_CNODE[segment].store(cnode, Ordering::Relaxed);
-    Some(cnode)
-}
-
-fn win32k_client_cap_bank_slot_location(global_slot: u64) -> Option<(usize, u64)> {
-    if global_slot >= WIN32K_CLIENT_CAP_BANK_SLOTS {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    Some((
-        (global_slot / WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS) as usize,
-        global_slot % WIN32K_CLIENT_CAP_BANK_SEGMENT_SLOTS,
-    ))
-}
-
-fn win32k_client_cap_bank_next_slot() -> Option<(u64, usize, u64)> {
-    let free_head = WIN32K_CLIENT_CAP_BANK_FREE_HEAD.load(Ordering::Relaxed);
-    if free_head != 0 {
-        let global_slot = free_head - 1;
-        let owner_slot = global_slot as usize;
-        if global_slot >= WIN32K_CLIENT_CAP_BANK_SLOTS
-            || WIN32K_CLIENT_CAP_BANK_OWNER[owner_slot].load(Ordering::Relaxed) != 0
-        {
-            WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        WIN32K_CLIENT_CAP_BANK_FREE_HEAD.store(
-            WIN32K_CLIENT_CAP_BANK_FREE_NEXT[owner_slot].load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        WIN32K_CLIENT_CAP_BANK_FREE_NEXT[owner_slot].store(0, Ordering::Relaxed);
-        let (segment, segment_slot) = win32k_client_cap_bank_slot_location(global_slot)?;
-        return Some((global_slot, segment, segment_slot));
-    }
-
-    let next = WIN32K_CLIENT_CAP_BANK_NEXT.load(Ordering::Relaxed);
-    let (segment, segment_slot) = win32k_client_cap_bank_slot_location(next)?;
-    Some((next, segment, segment_slot))
-}
-
-unsafe fn win32k_client_cap_bank_store(pi: usize, root_cap: u64) -> bool {
-    if pi >= MAX_PI || pi >= u8::MAX as usize || root_cap == 0 {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    let Some(live_row) = win32k_client_cap_bank_live_row(pi) else {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    let Some((next, segment, segment_slot)) = win32k_client_cap_bank_next_slot() else {
-        return false;
-    };
-    let Some(cnode) = win32k_client_cap_bank_ensure_segment(segment) else {
-        return false;
-    };
-    let label = cnode_move_root_to_cnode_r(cnode, segment_slot, root_cap);
-    if label != 0 {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if WIN32K_CLIENT_CAP_BANK_OWNER[next as usize].swap((pi + 1) as u8, Ordering::Relaxed) != 0 {
-        let _ = cnode_delete_in_cnode_r(cnode, segment_slot);
-        recycle_deleted_root_slot(root_cap);
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    recycle_deleted_root_slot(root_cap);
-    if next == WIN32K_CLIENT_CAP_BANK_NEXT.load(Ordering::Relaxed) {
-        WIN32K_CLIENT_CAP_BANK_NEXT.store(next + 1, Ordering::Relaxed);
-    }
-    WIN32K_CLIENT_CAP_BANK_TO_BANK.fetch_add(1, Ordering::Relaxed);
-    live_row.fetch_add(1, Ordering::Relaxed);
-    let live = WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-    note_high_water(&WIN32K_CLIENT_CAP_BANK_LIVE_HW, live);
-    true
-}
-
 pub(crate) fn win32k_client_cap_bank_stats() -> (u64, u64, u64, u64, u64) {
-    let mut processes = 0u64;
-    let mut banks = 0u64;
-    let rows = unsafe { &*core::ptr::addr_of!(WIN32K_CLIENT_CAP_BANK_LIVE_BY_PI) };
-    for row in rows.iter() {
-        if row.load(Ordering::Relaxed) != 0 {
-            processes += 1;
-        }
-    }
-    for segment in 0..WIN32K_CLIENT_CAP_BANK_SEGMENTS {
-        if WIN32K_CLIENT_CAP_BANK_CNODE[segment].load(Ordering::Relaxed) != 0 {
-            banks += 1;
-        }
-    }
-    let live = WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed);
-    (
-        live,
-        WIN32K_CLIENT_CAP_BANK_NEXT.load(Ordering::Relaxed),
-        processes,
-        banks,
-        WIN32K_CLIENT_CAP_BANK_FAILS.load(Ordering::Relaxed),
-    )
+    let (live, entries, processes, segments, failures) = client_cap_bank::stats();
+    (live, entries, processes, segments,
+        failures.saturating_add(WIN32K_CLIENT_CAP_BANK_FAILS.load(Ordering::Relaxed)))
 }
 
 pub(crate) fn win32k_client_cap_bank_is_empty(pi: usize) -> bool {
-    unsafe { win32k_client_cap_bank_live_row(pi) }
-        .is_some_and(|row| row.load(Ordering::Acquire) == 0)
+    client_cap_bank::is_empty(pi)
 }
 
-pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> bool {
-    if pi >= MAX_PI || pi >= u8::MAX as usize {
+pub(crate) unsafe fn release_win32k_client_cap_bank(candidate: nt_user_host::ProcessDeletionCandidate) -> bool {
+    if client_cap_bank::release(candidate).is_err() {
         return false;
     }
-    let Some(live_row) = win32k_client_cap_bank_live_row(pi) else {
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
+    let pi = candidate.pi;
     if pi < 64 {
         let bit = !(1u64 << pi);
         WIN32K_CLIENT_MAPPED.fetch_and(bit, Ordering::Relaxed);
@@ -4811,116 +4629,10 @@ pub(crate) unsafe fn release_win32k_client_cap_bank(pi: usize) -> bool {
         GDI_SHARED_TABLE_MAPPED.fetch_and(bit, Ordering::Relaxed);
         GDI_USERVM_MAPPED.fetch_and(bit, Ordering::Relaxed);
     }
-    if let Some(row) = win32k_user_heap_mapped_row(pi) {
-        row.store(0, Ordering::Relaxed);
-    }
-    if let Some(row) = win32k_pool_mapped_row(pi) {
-        row.store(0, Ordering::Relaxed);
-    }
-    if let Some(row) = gdi_uservm_mapped_row(pi) {
-        row.store(0, Ordering::Relaxed);
-    }
-
-    let live = live_row.load(Ordering::Relaxed);
-    if live == 0 {
-        return true;
-    }
-
-    let owner = (pi + 1) as u8;
-    let scan_limit = WIN32K_CLIENT_CAP_BANK_NEXT
-        .load(Ordering::Relaxed)
-        .min(WIN32K_CLIENT_CAP_BANK_SLOTS);
-    let mut released = 0u64;
-    let mut failures = 0u64;
-    for global_slot in 0..scan_limit {
-        let owner_slot = global_slot as usize;
-        if WIN32K_CLIENT_CAP_BANK_OWNER[owner_slot].load(Ordering::Relaxed) != owner {
-            continue;
-        }
-        let Some((segment, segment_slot)) = win32k_client_cap_bank_slot_location(global_slot)
-        else {
-            failures = failures.saturating_add(1);
-            continue;
-        };
-        let cnode = WIN32K_CLIENT_CAP_BANK_CNODE[segment].load(Ordering::Relaxed);
-        if cnode == 0 {
-            failures = failures.saturating_add(1);
-            if failures <= 4 {
-                print_str(b"[w32-bank-release] missing cnode pi=");
-                print_u64(pi as u64);
-                print_str(b" global-slot=0x");
-                print_hex(global_slot as u32);
-                print_str(b" segment=");
-                print_u64(segment as u64);
-                print_str(b"\n");
-            }
-            continue;
-        }
-        let label = cnode_delete_in_cnode_r(cnode, segment_slot);
-        if label == 0 {
-            WIN32K_CLIENT_CAP_BANK_OWNER[owner_slot].store(0, Ordering::Relaxed);
-            let head = WIN32K_CLIENT_CAP_BANK_FREE_HEAD.load(Ordering::Relaxed);
-            WIN32K_CLIENT_CAP_BANK_FREE_NEXT[owner_slot].store(head, Ordering::Relaxed);
-            WIN32K_CLIENT_CAP_BANK_FREE_HEAD.store(global_slot + 1, Ordering::Relaxed);
-            released = released.saturating_add(1);
-        } else {
-            failures = failures.saturating_add(1);
-            if failures <= 4 {
-                print_str(b"[w32-bank-release] failed pi=");
-                print_u64(pi as u64);
-                print_str(b" cnode=0x");
-                print_hex(cnode as u32);
-                print_str(b" slot=0x");
-                print_hex(segment_slot as u32);
-                print_str(b" label=");
-                print_u64(label);
-                print_str(b"\n");
-            }
-        }
-    }
-
-    if released < live && failures == 0 {
-        let missing = live - released;
-        failures = failures.saturating_add(missing);
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(1, Ordering::Relaxed);
-        print_str(b"[w32-bank-release] missing records pi=");
-        print_u64(pi as u64);
-        print_str(b" live=");
-        print_u64(live);
-        print_str(b" released=");
-        print_u64(released);
-        print_str(b"\n");
-    }
-    if WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.load(Ordering::Relaxed) == released {
-        WIN32K_CLIENT_CAP_BANK_NEXT.store(0, Ordering::Relaxed);
-        WIN32K_CLIENT_CAP_BANK_FREE_HEAD.store(0, Ordering::Relaxed);
-    }
-
-    let accounted = released.min(live);
-    if accounted != 0 {
-        WIN32K_CLIENT_CAP_BANK_RELEASES.fetch_add(accounted, Ordering::Relaxed);
-        WIN32K_CLIENT_CAP_BANK_LIVE_TOTAL.fetch_sub(accounted, Ordering::Relaxed);
-    }
-    if failures == 0 {
-        live_row.store(0, Ordering::Relaxed);
-    } else {
-        live_row.store(live.saturating_sub(accounted), Ordering::Relaxed);
-        WIN32K_CLIENT_CAP_BANK_FAILS.fetch_add(failures, Ordering::Relaxed);
-    }
-    if released != 0 || failures != 0 {
-        print_str(b"[w32-bank-release] pi=");
-        print_u64(pi as u64);
-        print_str(b" caps=");
-        print_u64(released);
-        print_str(b" failures=");
-        print_u64(failures);
-        print_str(b" next=");
-        print_u64(WIN32K_CLIENT_CAP_BANK_NEXT.load(Ordering::Relaxed));
-        print_str(b" total-released=");
-        print_u64(WIN32K_CLIENT_CAP_BANK_RELEASES.load(Ordering::Relaxed));
-        print_str(b"\n");
-    }
-    failures == 0
+    if let Some(row) = win32k_user_heap_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
+    if let Some(row) = win32k_pool_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
+    if let Some(row) = gdi_uservm_mapped_row(pi) { row.store(0, Ordering::Relaxed); }
+    true
 }
 
 /// RO-map win32k's global USER heap arena ([`win32k_subsystem::WIN32K_HEAP_VADDR`], where gpsi,

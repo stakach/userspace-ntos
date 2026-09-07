@@ -14,6 +14,7 @@ mod mechanism;
 mod ntdll;
 mod profile;
 pub mod process_identity;
+pub mod provider_alias_bank;
 mod services;
 pub mod sched_context;
 pub mod slot_recycle;
