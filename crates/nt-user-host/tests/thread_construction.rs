@@ -2,6 +2,9 @@ use nt_user_host::process_identity::{ProcessGeneration, ProcessIdentity};
 use nt_user_host::thread_binding::{
     admit_thread_binding, ThreadBinding, ThreadRuntimeReservations,
 };
+use nt_user_host::thread_construction::{
+    Role as ConstructionRole, SlotState, ThreadConstructionInventory,
+};
 use nt_user_host::thread_publication::{
     PreparedThreadPublication, PublicationError, ThreadPublicationSlot,
 };
@@ -72,6 +75,7 @@ struct Partial {
     tcb: Option<u64>,
     memory: ThreadMemoryResources<2>,
     mechanisms: Vec<ThreadRollbackResource>,
+    inventory: ThreadConstructionInventory,
     drops: Rc<Cell<usize>>,
 }
 
@@ -172,6 +176,7 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
             vec![]
         },
         drops: drops.clone(),
+        inventory: ThreadConstructionInventory::empty(),
     };
     (slot, ticket, partial, drops)
 }
@@ -190,6 +195,85 @@ fn assert_protected(slot: &mut Slot, id: ThreadRollbackId) {
         ThreadIngressError::Pending
     );
     assert!(binding.holds_pool_slot(2, 3) && binding.holds_window_slot(2, 5));
+}
+
+#[test]
+fn actual_slot_inventory_moves_with_memory_and_holds_without_allocation() {
+    for state in [
+        SlotState::AllocatedEmpty(400),
+        SlotState::LiveObject(400),
+        SlotState::DeleteAcknowledged(400),
+    ] {
+        let tcb = matches!(state, SlotState::LiveObject(_)).then_some(400);
+        let (mut slot, ticket, mut partial, drops) = fixture(tcb, true);
+        partial
+            .inventory
+            .adopt_object(ConstructionRole::RawCnode, 500)
+            .unwrap();
+        partial
+            .inventory
+            .adopt_object(ConstructionRole::GuardedCnode, 501)
+            .unwrap();
+        partial
+            .inventory
+            .adopt_empty(ConstructionRole::Tcb, 400)
+            .unwrap();
+        if state != SlotState::AllocatedEmpty(400) {
+            partial
+                .inventory
+                .acknowledge_object(ConstructionRole::Tcb, 400)
+                .unwrap();
+        }
+        if state == SlotState::DeleteAcknowledged(400) {
+            partial
+                .inventory
+                .acknowledge_delete(ConstructionRole::Tcb, 400)
+                .unwrap();
+        }
+        let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+        assert_protected(&mut slot, id);
+        let snapshot = slot.owner().unwrap().binding;
+        assert_eq!(snapshot.tcb, tcb.unwrap_or(1));
+        let retained = slot.owner().unwrap().partial.as_ref().unwrap();
+        assert_eq!(retained.inventory.state(ConstructionRole::Tcb), state);
+        assert_eq!(retained.inventory.live_tcb(), tcb);
+        assert_eq!(retained.memory.stack_owner[0], 200);
+        assert_eq!(
+            retained.inventory.state(ConstructionRole::RawCnode),
+            SlotState::LiveObject(500)
+        );
+        assert_eq!(drops.get(), 0);
+    }
+}
+
+#[test]
+fn rejected_handoff_returns_the_real_inventory_and_can_retry() {
+    let (mut slot, ticket, mut partial, drops) = fixture(None, true);
+    partial
+        .inventory
+        .adopt_empty(ConstructionRole::Tcb, 400)
+        .unwrap();
+    partial
+        .inventory
+        .adopt_object(ConstructionRole::FaultEndpoint, 500)
+        .unwrap();
+    let (mut wrong, _, _, _) = fixture(None, false);
+    let (error, ticket, partial) =
+        without_allocation(|| wrong.retain_failed_construction(ticket, partial)).unwrap_err();
+    assert_eq!(
+        error,
+        SlotError::Publication(PublicationError::StaleAttempt)
+    );
+    assert_eq!(
+        partial.inventory.state(ConstructionRole::Tcb),
+        SlotState::AllocatedEmpty(400)
+    );
+    assert_eq!(
+        partial.inventory.state(ConstructionRole::FaultEndpoint),
+        SlotState::LiveObject(500)
+    );
+    assert_eq!(drops.get(), 0);
+    assert!(without_allocation(|| slot.retain_failed_construction(ticket, partial)).is_ok());
 }
 
 #[test]

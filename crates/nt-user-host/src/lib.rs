@@ -17,6 +17,7 @@ pub mod process_identity;
 mod services;
 pub mod sched_context;
 pub mod thread_binding;
+pub mod thread_construction;
 pub mod thread_publication;
 pub mod thread_pending;
 pub mod thread_memory_access;

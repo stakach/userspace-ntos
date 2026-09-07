@@ -10738,7 +10738,7 @@ impl ExecNtHandler {
         let mut count = 0usize;
         let mut overflow = false;
         let table = unsafe { &*self.thread_runtime.table };
-        for runtime in table.entries.iter().filter_map(|slot| slot.executable()).copied() {
+        for runtime in table.entries.iter().filter_map(|slot| slot.executable()) {
             if !runtime.is_live() || runtime.tcb <= 1 || runtime.pi != pi {
                 continue;
             }
@@ -10772,7 +10772,7 @@ impl ExecNtHandler {
         let mut suspended = 0usize;
         let mut failures = 0usize;
         let table = unsafe { &*self.thread_runtime.table };
-        for runtime in table.entries.iter().filter_map(|slot| slot.executable()).copied() {
+        for runtime in table.entries.iter().filter_map(|slot| slot.executable()) {
             if !runtime.is_live() || runtime.tcb <= 1 {
                 continue;
             }

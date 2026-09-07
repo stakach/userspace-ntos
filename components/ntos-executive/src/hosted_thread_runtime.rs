@@ -1,8 +1,42 @@
 use super::*;
 use nt_user_host::thread_slot::{RuntimeIdentity, ThreadRuntimeSlot};
 
-type RuntimeSlot = ThreadRuntimeSlot<HostedThreadRuntime>;
+type RuntimeSlot = ThreadRuntimeSlot<HostedThreadRuntimeOwner>;
 
+/// Durable row ownership is distinct from copied routing/diagnostic metadata. Construction
+/// inventory must move with this owner and may never be cloned by an ordinary table lookup.
+#[derive(Debug)]
+pub(crate) struct HostedThreadRuntimeOwner {
+    runtime: HostedThreadRuntime,
+    construction: nt_user_host::thread_construction::ThreadConstructionInventory,
+}
+
+impl HostedThreadRuntimeOwner {
+    fn new(runtime: HostedThreadRuntime) -> Self {
+        Self {
+            runtime,
+            construction: nt_user_host::thread_construction::ThreadConstructionInventory::empty(),
+        }
+    }
+
+    fn into_legacy_runtime(self) -> HostedThreadRuntime {
+        assert!(
+            self.construction.is_empty(),
+            "construction ownership cannot escape through a copied runtime"
+        );
+        self.runtime
+    }
+}
+
+impl core::ops::Deref for HostedThreadRuntimeOwner {
+    type Target = HostedThreadRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+/// Copyable metadata only; pending construction slots belong to HostedThreadRuntimeOwner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedThreadRuntime {
     pub(crate) pi: usize,
@@ -81,7 +115,10 @@ impl HostedThreadRuntimeTable {
     }
 
     pub(crate) fn reset(&mut self, initial_reserve: usize) {
-        assert!(self.entries.iter().all(|entry| !entry.is_protected()));
+        assert!(self.entries.iter().all(|entry| {
+            !entry.is_protected()
+                && entry.owner().is_none_or(|owner| owner.construction.is_empty())
+        }));
         self.entries.clear();
         if self.entries.capacity() < initial_reserve
             && self.entries.try_reserve(initial_reserve).is_err()
@@ -137,7 +174,7 @@ impl HostedThreadRuntimeTable {
             .iter_mut()
             .filter_map(RuntimeSlot::ordinary_mut)
             .find(|entry| entry.is_live() && entry.tid == tid)?;
-        entry.mechanism = mechanism;
+        entry.runtime.mechanism = mechanism;
         Some(HostedThreadRuntime {
             mechanism,
             ..runtime
@@ -179,10 +216,15 @@ impl HostedThreadRuntimeTable {
         let entry = self.entries[index]
             .ordinary_mut()
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        if entry.mechanism.is_live() || entry.resources.is_live() || entry.teb_alias != 0 {
+        if !entry.construction.is_empty()
+            || entry.mechanism.is_live()
+            || entry.resources.is_live()
+            || entry.teb_alias != 0
+        {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         let ticket = entry
+            .runtime
             .publication
             .prepare(key)
             .map_err(|error| match error {
@@ -199,7 +241,12 @@ impl HostedThreadRuntimeTable {
             .publishing_mut(&prepared.ticket)
             .expect("construction ticket retains its runtime slot");
         let key = entry.binding();
+        assert!(
+            entry.construction.is_empty(),
+            "cancellation cannot discard construction slots"
+        );
         entry
+            .runtime
             .publication
             .finish(prepared.ticket, &key)
             .expect("cancel must retain its exclusive runtime reservation");
@@ -214,16 +261,21 @@ impl HostedThreadRuntimeTable {
             .publishing_mut(&prepared.ticket)
             .expect("construction ticket retains its runtime slot");
         let key = entry.binding();
+        assert!(
+            entry.construction.is_empty(),
+            "publication cannot overwrite construction slots"
+        );
         assert!(spawn.tcb() > 1 && spawn.mechanism().is_live() && spawn.resources().is_live());
         assert_eq!(spawn.resources().client_pi, key.pi);
         entry
+            .runtime
             .publication
             .finish(prepared.ticket, &key)
             .expect("construction must retain its exclusive runtime reservation");
-        entry.tcb = spawn.tcb();
-        entry.mechanism = spawn.mechanism();
-        entry.teb_alias = spawn.teb_alias();
-        entry.resources = spawn.resources();
+        entry.runtime.tcb = spawn.tcb();
+        entry.runtime.mechanism = spawn.mechanism();
+        entry.runtime.teb_alias = spawn.teb_alias();
+        entry.runtime.resources = spawn.resources();
     }
 
     pub(crate) fn reserve(
@@ -269,18 +321,22 @@ impl HostedThreadRuntimeTable {
         .ok()?;
         match admission {
             ThreadBindingAdmission::Replay { index } => {
-                return self.entries[index].ordinary_mut().copied();
+                return self.entries[index]
+                    .ordinary_mut()
+                    .filter(|entry| entry.construction.is_empty())
+                    .map(|entry| entry.runtime);
             }
             ThreadBindingAdmission::Promote { index } => {
                 let existing = self.entries[index].ordinary_mut()?;
-                if existing.mechanism.is_live()
+                if !existing.construction.is_empty()
+                    || existing.mechanism.is_live()
                     || existing.resources.is_live()
                     || existing.teb_alias != 0
                 {
                     return None;
                 }
-                existing.tcb = tcb;
-                return Some(*existing);
+                existing.runtime.tcb = tcb;
+                return Some(existing.runtime);
             }
             ThreadBindingAdmission::Insert => {}
         }
@@ -303,7 +359,7 @@ impl HostedThreadRuntimeTable {
         };
         if let Some(empty) = self.entries.iter_mut().find(|entry| entry.is_empty()) {
             empty
-                .insert(runtime)
+                .insert(HostedThreadRuntimeOwner::new(runtime))
                 .expect("admitted runtime fills a vacant row");
             return Some(runtime);
         }
@@ -313,7 +369,7 @@ impl HostedThreadRuntimeTable {
             return None;
         }
         let mut slot = RuntimeSlot::empty();
-        slot.insert(runtime)
+        slot.insert(HostedThreadRuntimeOwner::new(runtime))
             .expect("admitted runtime fills a new row");
         self.entries.push(slot);
         Some(runtime)
@@ -337,7 +393,7 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::owner)
-            .copied()
+            .map(|entry| entry.runtime)
             .find(|entry| entry.is_live() && entry.tid == tid)
     }
 
@@ -345,7 +401,8 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::releasable)
-            .copied()
+            .filter(|entry| entry.construction.is_empty())
+            .map(|entry| entry.runtime)
             .find(|entry| {
                 entry.is_live()
                     && entry.tid == tid
@@ -360,7 +417,7 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::executable)
-            .copied()
+            .map(|entry| entry.runtime)
             .find(|entry| entry.tid == tid)
     }
 
@@ -368,7 +425,7 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::executable)
-            .copied()
+            .map(|entry| entry.runtime)
             .find(|entry| entry.badge == badge)
     }
 
@@ -380,12 +437,12 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::executable)
-            .copied()
+            .map(|entry| entry.runtime)
             .find(|entry| entry.pi == pi && entry.role == role)
     }
 
     pub(crate) fn executable_by_index(&self, index: usize) -> Option<HostedThreadRuntime> {
-        self.entries.get(index)?.executable().copied()
+        self.entries.get(index)?.executable().map(|entry| entry.runtime)
     }
 
     pub(crate) fn pending_for_tid(&self, tid: u64) -> bool {
@@ -418,9 +475,9 @@ impl HostedThreadRuntimeTable {
             .iter_mut()
             .filter_map(RuntimeSlot::ordinary_mut)
             .find(|entry| entry.is_live() && entry.tid == tid)?;
-        entry.user_stack_allocation_base = allocation_base;
-        entry.user_stack_base = stack_base;
-        Some(*entry)
+        entry.runtime.user_stack_allocation_base = allocation_base;
+        entry.runtime.user_stack_base = stack_base;
+        Some(entry.runtime)
     }
 
     pub(crate) fn tcb_by_tid(&self, tid: u64) -> Option<u64> {
@@ -464,7 +521,7 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::owner)
-            .copied()
+            .map(|entry| entry.runtime)
             .find(|entry| entry.is_live() && entry.pi == pi && entry.role == role)
     }
 
@@ -472,7 +529,7 @@ impl HostedThreadRuntimeTable {
         self.entries
             .iter()
             .filter_map(RuntimeSlot::owner)
-            .copied()
+            .map(|entry| entry.runtime)
             .find(|entry| entry.is_live() && entry.badge == badge)
     }
 
@@ -485,8 +542,8 @@ impl HostedThreadRuntimeTable {
         else {
             return false;
         };
-        entry.lpc_server_port = port;
-        entry.lpc_client_process = process;
+        entry.runtime.lpc_server_port = port;
+        entry.runtime.lpc_client_process = process;
         true
     }
 
@@ -498,10 +555,14 @@ impl HostedThreadRuntimeTable {
 
     pub(crate) fn release_tid(&mut self, tid: u64) -> Option<HostedThreadRuntime> {
         (tid != 0).then_some(())?;
-        self.entries
+        let slot = self.entries
             .iter_mut()
-            .find(|slot| slot.owner().is_some_and(|entry| entry.tid == tid))?
-            .release_published()
+            .find(|slot| slot.owner().is_some_and(|entry| entry.tid == tid))?;
+        if !slot.owner()?.construction.is_empty() {
+            return None;
+        }
+        slot.release_published()
+            .map(HostedThreadRuntimeOwner::into_legacy_runtime)
     }
 }
 
@@ -552,7 +613,7 @@ impl HostedThreadRuntimes {
         let slot = table.entries.iter()
             .find(|slot| slot.owner().is_some_and(|runtime| runtime.badge == badge))
             .ok_or(ThreadIngressError::UnknownBadge)?;
-        slot.admit_ingress(badge, current_process).copied()
+        slot.admit_ingress(badge, current_process).map(|entry| entry.runtime)
     }
 
     pub(crate) fn executable_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
@@ -734,14 +795,14 @@ pub(crate) fn hosted_thread_runtime_table_stats() -> (usize, usize, usize, u64, 
     unsafe { (&*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK)).stats() }
 }
 
-impl RuntimeIdentity for HostedThreadRuntime {
+impl RuntimeIdentity for HostedThreadRuntimeOwner {
     type Role = HostedThreadRole;
 
     fn binding(&self) -> nt_user_host::thread_binding::ThreadBinding<Self::Role> {
-        HostedThreadRuntime::binding(self)
+        self.runtime.binding()
     }
 
     fn publication(&self) -> &nt_user_host::thread_publication::ThreadPublicationSlot {
-        &self.publication
+        &self.runtime.publication
     }
 }

@@ -169,9 +169,14 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain failed scheduling-context attachment and checked empty-slot recycling in durable,
   dynamically sized ownership rows shared by all native launch paths
   (tranche 72, host/build; complete thread-constructor handoff and legacy success lifetimes remain open).
+- [x] Separate non-cloneable native runtime ownership from copied metadata and add exact CNode/TCB/
+  SC/owned-endpoint slot inventory with checked retirement admission and real handoff composition
+  (tranche 73, host/build prerequisites; native constructor inventory remains unpopulated).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next make native thread-constructor failures return
-  complete ownership, including allocated empty slots, raw/minted CNodes and optional real TCB. Failed SC
+  complete ownership, including allocated empty slots, raw/minted CNodes, optional real TCB and owned
+  root fault-endpoint copies. Distinguish borrowed endpoint inputs explicitly and replace tcb-zero result
+  inference with success/failure outcomes before activating the handoff. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   Retain the complete partial payload through the tested exact-ticket handoff
@@ -27306,6 +27311,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Whole-thread checked release, external aliases, mirrored references, ordinary termination,
     handler handoffs and user-mode SEH remain open. No QEMU or desktop proof is claimed; the recorded
     33 unresolved win32k imports still block the full desktop gate.
+
+    B3 mechanism inventory tranche 73 (2026-09-07, host/build prerequisites green):
+    `ThreadConstructionInventory` is a non-cloneable, allocation-free owner for raw/guarded CNode,
+    TCB, successful SC and owned root endpoint slots. Each role distinguishes absent, allocated-empty,
+    live-object and deletion-acknowledged states. Failed retype can recycle without inventing an object;
+    successful deletion retains the empty slot until checked recycling. Adoption and acknowledgements
+    reject invalid, duplicate, occupied, stale or wrong-phase slots. A live TCB projection excludes
+    allocated-empty/deleted slots. Retirement selection and exact preflight require TCB before CNodes,
+    guarded CNode before raw, then SC/endpoint. The future backend must preflight before its syscall,
+    not rely on an acknowledgement check after an unsafe operation has already happened.
+
+    Native runtime rows now retain `HostedThreadRuntimeOwner`, distinct from the existing copyable
+    routing/diagnostic metadata. Owner lookups, executable lookups and ingress explicitly project
+    only metadata; pending memory and identity queries borrow the retained owner. Quiescence loops
+    no longer copy whole rows. Cancellation, publication, reset, promotion, replay, unbuilt release
+    and legacy extraction refuse nonempty construction inventory. This prevents a new non-cloneable
+    failure payload from being silently copied or dropped through legacy table APIs. Inventory starts
+    empty: this change does not yet populate it from the native constructor or activate cleanup.
+
+    Validation: ten new tests cover per-role lifecycle, empty-slot retirement, duplicate/stale/phase
+    rejection, TCB/CNode ordering and preflight, repeated failed cleanup, and owned-versus-borrowed
+    inventory boundaries. Integration tests move actual empty/live/deletion-acknowledged TCB and
+    CNode inventory with memory and holds through allocator-counted handoff; foreign-ticket rejection
+    returns the same inventory for retry. The serialized nine-crate suite passes 1,147 tests,
+    including 220 in `nt-user-host` (203 unit, 3 existing integration and 14 construction integration).
+    The subsequent executive build passes with the unchanged 262-warning baseline. Logs:
+    `.tmp/test-thread-mechanism-inventory-20260907.log` and
+    `.tmp/build-thread-mechanism-inventory-20260907.log`.
+    Two read-only agents reviewed microkernel reference semantics and native owner/projection paths;
+    root alone runs the validation commands.
+
+    Review adjustment: do not put failed CNode/TCB cleanup in an independent queue. Microkernel TCB
+    CSpace/VSpace fields and IPC-buffer addresses do not reference-count backing, so failed TCB deletion
+    must keep the entire memory bundle and process/pool/window holds. Final CNode deletion drains its
+    internal PML4/fault endpoint copies; borrowed original arguments are not independent owned caps.
+    Newly identified root endpoint copies minted by rendezvous and remote-thread wrappers need
+    explicit owned/borrowed provenance. Five constructor-result callers still infer failure from
+    `tcb()==0`; convert them to explicit outcomes before a failure can retain a real TCB. Carry the
+    complete failure through the original publication ticket before aborting caller publication.
+    Prepared MM/Ps commitment snapshots are not charged yet and must be dropped on construction
+    failure, never committed later or released as if already charged. Use checked TCB GS/priority/
+    hosted-syscall setup as part of constructor conversion. Legacy destructive failure returns,
+    first-resume failure, ordinary termination and full checked cleanup remain open. No QEMU or
+    desktop proof is claimed; 33 recorded unresolved win32k imports still block the full gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
