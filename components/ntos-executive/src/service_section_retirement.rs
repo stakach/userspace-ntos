@@ -59,6 +59,7 @@ pub(crate) unsafe fn service_drain_section_retirement(
 pub(crate) unsafe fn service_unmap_section_view_mappings(
     view: GenericSectionView,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(view.pi as u64, view.base, view.size)?;
     let end = view
         .base
         .checked_add(view.size)

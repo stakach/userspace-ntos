@@ -4061,6 +4061,7 @@ unsafe fn service_private_guard_page_fault(
     filled_pages: &[u64; 512],
     faults: usize,
 ) -> Result<bool, u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     let Some(vm_map) = process_vm_region_map_mut(pi) else {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     };
@@ -8459,7 +8460,8 @@ pub(crate) unsafe fn service_sec_image(
     macro_rules! dbgk_forward_exception {
         ($pi:expr, $record:expr) => {{
             let __record: nt_process::dbgk::ExceptionRecord = $record;
-            let __forwarded = nt_handler.dbgk_forward_exception($pi, 0, __record, true);
+            let __tid = nt_handler.current_tid;
+            let __forwarded = nt_handler.dbgk_forward_exception($pi, __tid, __record, true);
             if __forwarded {
                 print_str(b"[dbgk] exception forwarded to debugger pi=");
                 print_u64($pi as u64);
@@ -8484,9 +8486,10 @@ pub(crate) unsafe fn service_sec_image(
     // debugger that never continues still lets the boot reach the gate.
     macro_rules! dbgk_block_and_park {
         ($pi:expr, $kind:expr, $ip:expr, $sp:expr, $flags:expr) => {{
+            let __tid = nt_handler.current_tid;
             let __blocked = nt_handler.dbgk_block_reporter(
                 $pi,
-                0,
+                __tid,
                 badge,
                 $kind,
                 0,
@@ -9670,10 +9673,33 @@ pub(crate) unsafe fn service_sec_image(
         }
         if (mi >> 12) == 6 {
             let addr = m1;
+            let page = addr & !0xFFFu64;
+            if hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
+                // This is a valid caller making an invalid memory access, not stale ingress.
+                // Debugger delivery retains the fault Reply; containment must cancel it otherwise.
+                if dbgk_forward_exception!(
+                    pi,
+                    nt_process::dbgk::ExceptionRecord::access_violation(
+                        m0,
+                        if m3 & 0x10 != 0 {
+                            8
+                        } else if m3 & 0x2 != 0 {
+                            1
+                        } else {
+                            0
+                        },
+                        addr,
+                    )
+                ) && dbgk_block_and_park!(pi, nt_process::dbgk::DBGK_BLOCK_VM_FAULT, m0, 0, 0)
+                {
+                    continue;
+                }
+                assert!(drop_current_hosted_reply(), "cannot cancel excluded-memory fault reply");
+                park_and_log!(pi, b"pending-memory", m0, addr);
+            }
             if faults == 0 {
                 first = addr;
             }
-            let page = addr & !0xFFFu64;
             if pi == 2
                 && (m3 & 0x7) == 0x7
                 && WINLOGON_HANDLE_FAULT_DIAG_N.fetch_add(1, Ordering::Relaxed) == 0
@@ -26437,6 +26463,9 @@ unsafe fn ensure_client_copyin_dll_page(
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) -> bool {
+    if hosted_thread_memory_access(pi, page, nt_address_space::PAGE_SIZE).is_err() {
+        return false;
+    }
     if csrss_frame_get(pi, page) != 0 || client_copyin_frame_get(pi, page) != 0 {
         return true;
     }
@@ -26481,6 +26510,9 @@ unsafe fn prefill_client_copyin_dll_range_pages(
     reg: &nt_dll_registry::Registry,
     dll_pes: &[Option<nt_pe_loader::PeFile>],
 ) {
+    if hosted_thread_memory_access(pi, va, len as u64).is_err() {
+        return;
+    }
     if len == 0 {
         return;
     }
@@ -26523,6 +26555,9 @@ unsafe fn prefill_client_large_string_pages(
     };
     let mut offset = 0usize;
     let length = descriptor.length_bytes as usize;
+    if hosted_thread_memory_access(pi, descriptor.buffer, length as u64).is_err() {
+        return;
+    }
     let mut last_page = u64::MAX;
     while offset < length {
         let current = descriptor.buffer + offset as u64;

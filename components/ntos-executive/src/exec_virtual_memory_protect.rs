@@ -37,6 +37,7 @@ impl ProtectionTarget {
         new_protection: u32,
         old_protection: impl Fn(u64) -> Result<u32, u32>,
     ) -> Result<Option<nt_memory_manager::PagefileProtectionPlan>, u32> {
+        hosted_thread_memory_access(self.pi as u64, base, size)?;
         let transition = (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).prepare_protection_range(
             self.pi as u64,
             base,
@@ -135,6 +136,9 @@ impl ExecNtHandler {
                 Ok(plan) => plan,
                 Err(status) => return status,
             };
+            if let Err(status) = hosted_thread_memory_access(target_pi as u64, plan.base, plan.size) {
+                return status;
+            }
             let new_protection = plan.new_protection;
             let first = before_committed
                 .query_basic(plan.base)
@@ -219,6 +223,9 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        if let Err(status) = hosted_thread_memory_access(target_pi as u64, plan.base, plan.size) {
+            return status;
+        }
         if !self.secured_virtual_memory.permits_protection(
             u64::from(target_pid),
             plan.base,

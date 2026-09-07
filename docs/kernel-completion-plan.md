@@ -145,9 +145,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add allocation-free pending-memory exclusions and guard native copies, mirror/recorded aliases,
   managed section residency, page-in and working-set eviction (tranche 64, host/build;
   direct fault/VM mutation exclusions and native cleanup activation remain open).
+- [x] Guard direct fault/stack-growth/guard/prefill dispatch and effective native VM mutation ranges,
+  including whole-allocation identity changes on partial release and exact debugger reporter TIDs
+  (tranche 65, host/build; attachment/journal completion and user-mode SEH delivery remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next close direct private-fault/guard/stack-growth,
-  VM free/protect/unmap and attachment bypasses plus remaining non-ingress routing consumers, then wire registered-resume
+  emptiness as a complete execution-quiescence proof. Next close attachment/publication and remaining
+  non-ingress routing bypasses, retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
@@ -26920,6 +26923,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     use direct retained-cap cleanup operations or separately retained exclusion storage. Keep
     `begin_pending` unactivated until that adapter and all exclusions are complete. Main/early spawn
     failures, ordinary termination release failures and handler-owned handoffs remain open.
+
+    B3 fault and VM-mutation exclusion tranche 65 (2026-09-07, host/build green):
+    The main VMFault path now checks the retained page exclusion before diagnostics, low-address
+    repair, either stack-growth route, guard consumption or backing selection. A live thread's
+    access to excluded memory is classified as an access violation, not stale ingress. Existing
+    debugger delivery retains the fault Reply; otherwise checked Reply cancellation precedes
+    existing crash isolation, without a successful retry or alternate mapping. Review found that
+    both debugger macros previously passed a zero TID and therefore selected the main thread;
+    forwarding and blocking now use the admitted event's exact TID. Private-guard and copy-in
+    prefill helpers also check before VAD mutation, alias reservation or resident fast success.
+
+    Native allocate/recommit/reset, free/decommit and both protection tables check their effective
+    host-planned ranges before commitment, page-table, protection or lock-retirement changes.
+    `VmFreePlan::ownership_range` centralizes the existing secured-memory rule: even a partial
+    `MEM_RELEASE` checks the original allocation because it can rebase/split allocation identity
+    outside the unmapped pages; decommit checks only its normalized pages. Pending and secured
+    checks now share that rule. Whole-view unmap admission precedes writeback, derives the VAD plan
+    without retaining static scratch borrows across writeback, and recomputes/compares it before
+    publication. Image unmap checks both the registry description and actual committed allocation
+    before clearing ownership. Stack-VAD release and generic-view rollback preflight their ranges.
+
+    Owner-aware private mapping, page-table preparation, transition restore, private/shared/image
+    reprotection, COW promotion and unmap wrappers reject excluded pages before fast success or cap
+    mutation. Whole-view/range retirement checks before its first detach/unmap. Raw capability
+    syscalls remain generic and do not infer process identity. These checks deliberately do not
+    provide a cleanup bypass: the future exact-owner cleanup adapter must release retained caps
+    directly after its full journals and exclusions are published.
+
+    Validation: eight new tests compose pending-memory checks with the actual private and committed
+    VM planners, covering zero-size free, partial release, normalized decommit/protection, image/data
+    protection, interior-address unmap, recommit/reset and invalid release plans. The serialized
+    nine-crate suite passes 1,061 tests, including 168 `nt-user-host` unit/integration tests and all
+    169 `nt-address-space` tests; log: `.tmp/test-thread-memory-mutation-20260907.log`. The executive
+    build passes at the unchanged 262-warning baseline and stages rootserver/hive;
+    log: `.tmp/build-thread-memory-mutation-20260907.log`. Two read-only agents reviewed mutation
+    ordering and fault/Reply/debugger identity handling; root alone ran tests/builds.
+
+    Review adjustment: next audit win32k attachment and provider/prefetch alias publication, including
+    retained writeback references and internal callers which discard backend cleanup failures.
+    Complete disjoint external-alias journals and checked mirrored-reference clearing before native
+    pending cleanup activation. The new denial path uses existing debugger/crash containment; it is
+    not complete NT user-mode SEH. Genuine `KiUserExceptionDispatcher` delivery remains an explicit
+    kernel-completion gap, not a claimed fallback implementation. Main/early spawn, ordinary
+    termination resource-release failures and handler-owned handoffs remain open. No live pending
+    cleanup or desktop proof is claimed; 33 unresolved win32k code imports still block the full gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

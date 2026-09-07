@@ -10646,6 +10646,14 @@ impl ExecNtHandler {
                 return;
             }
         };
+        let Some((ownership_base, ownership_size)) = plan.ownership_range(before) else {
+            USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if hosted_thread_memory_access(runtime.pi as u64, ownership_base, ownership_size).is_err() {
+            USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let released_commit = before
             .private_committed_bytes()
             .saturating_sub(after.private_committed_bytes());
@@ -18904,6 +18912,9 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        if let Err(status) = hosted_thread_memory_access(target_pi as u64, plan.base, plan.size) {
+            return status;
+        }
         crate::note_high_water(&crate::VM_REGION_HW, after.extent_count() as u64);
         if !created_vad && allocation_type != nt_address_space::MEM_RESET && copy_on_write {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
@@ -19528,6 +19539,12 @@ impl ExecNtHandler {
             Ok(plan) => plan,
             Err(status) => return status,
         };
+        let Some((ownership_base, ownership_size)) = plan.ownership_range(before) else {
+            return nt_address_space::STATUS_UNABLE_TO_FREE_VM;
+        };
+        if let Err(status) = hosted_thread_memory_access(target_pi as u64, ownership_base, ownership_size) {
+            return status;
+        }
         if !self.secured_virtual_memory.permits_free(u64::from(target_pid), before, plan) {
             return nt_address_space::STATUS_INVALID_PAGE_PROTECTION;
         }
@@ -31969,6 +31986,9 @@ impl ExecNtHandler {
         let Some((_section_index, view)) = generic_sections.view_for_page(pi, base) else {
             return;
         };
+        if hosted_thread_memory_access(pi as u64, view.base, view.size).is_err() {
+            return;
+        }
         let Some(vm_map) = process_vm_region_map_mut(pi) else {
             return;
         };
@@ -39411,6 +39431,25 @@ impl ExecNtHandler {
                     if let Some((_section_index, view)) =
                         generic_sections.view_for_page(target_pi, base)
                     {
+                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, view.base, view.size) {
+                            return status;
+                        }
+                        // Resolve the VAD's effective range before writeback; do not retain static
+                        // scratch borrows across it. The plan is recomputed before publication.
+                        let preflight = {
+                            let Some(vm_map) = process_vm_region_map_mut(target_pi) else {
+                                return nt_process::STATUS_INVALID_HANDLE;
+                            };
+                            let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
+                            *after = *vm_map;
+                            match after.unmap_mapped(view.base) {
+                                Ok(plan) => plan,
+                                Err(status) => return status,
+                            }
+                        };
+                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, preflight.base, preflight.size) {
+                            return status;
+                        }
                         if self.secured_virtual_memory.conflicts_with_delete(
                             u64::from(target_pid),
                             view.base,
@@ -39452,6 +39491,12 @@ impl ExecNtHandler {
                             Ok(plan) => plan,
                             Err(status) => return status,
                         };
+                        if plan != preflight {
+                            return nt_address_space::STATUS_CONFLICTING_ADDRESSES;
+                        }
+                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, plan.base, plan.size) {
+                            return status;
+                        }
                         let _ = vm_page_lock_retire_range(target_pi as u64, plan.base, plan.size);
                         if let Err(status) = service_unmap_section_view_mappings(view) {
                             return status;
@@ -39476,6 +39521,17 @@ impl ExecNtHandler {
                         let (image_base, image_size) = (dll.base, dll.image_size);
                         let allocation =
                             process_committed_image_allocation(target_pi as u64, image_base);
+                        if let Err(status) = hosted_thread_memory_access(target_pi as u64, image_base, image_size as u64) {
+                            return status;
+                        }
+                        if let Some(allocation) = allocation {
+                            let Some(size) = allocation.allocation_end.checked_sub(allocation.allocation_base) else {
+                                return nt_address_space::STATUS_INVALID_PARAMETER;
+                            };
+                            if let Err(status) = hosted_thread_memory_access(target_pi as u64, allocation.allocation_base, size) {
+                                return status;
+                            }
+                        }
                         if self.secured_virtual_memory.conflicts_with_delete(
                             u64::from(target_pid),
                             image_base,

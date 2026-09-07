@@ -149,18 +149,8 @@ impl SecuredVirtualMemoryTable {
         before: &VmRegionMap<N>,
         plan: VmFreePlan,
     ) -> bool {
-        let (base, size) = match plan.free_type {
-            MEM_RELEASE => {
-                let Some(extent) = before.extent_at(plan.base) else {
-                    return false;
-                };
-                let Some(end) = before.allocation_end(extent.allocation_base) else {
-                    return false;
-                };
-                (extent.allocation_base, end - extent.allocation_base)
-            }
-            MEM_DECOMMIT => (plan.base, plan.size),
-            _ => return false,
+        let Some((base, size)) = plan.ownership_range(before) else {
+            return false;
         };
         !self.conflicts_with_delete(owner, base, size)
     }
@@ -733,6 +723,23 @@ pub struct VmFreePlan {
     pub base: u64,
     pub size: u64,
     pub free_type: u32,
+}
+
+impl VmFreePlan {
+    /// Exclusions apply to the original allocation for release: even a partial release changes
+    /// allocation identity outside the unmapped pages. Decommit affects only normalized pages.
+    /// `before` must be the snapshot from which this plan was prepared.
+    pub fn ownership_range<const N: usize>(self, before: &VmRegionMap<N>) -> Option<(u64, u64)> {
+        match self.free_type {
+            MEM_RELEASE => {
+                let extent = before.extent_at(self.base)?;
+                let end = before.allocation_end(extent.allocation_base)?;
+                Some((extent.allocation_base, end.checked_sub(extent.allocation_base)?))
+            }
+            MEM_DECOMMIT => Some((self.base, self.size)),
+            _ => None,
+        }
+    }
 }
 
 /// The normalized private-memory range changed by `NtProtectVirtualMemory`.

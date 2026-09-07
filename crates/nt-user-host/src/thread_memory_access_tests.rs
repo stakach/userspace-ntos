@@ -6,6 +6,9 @@ use crate::thread_resources::ThreadMemoryLayout;
 use crate::thread_rollback::{ThreadRollbackIo, ThreadRollbackResource};
 use crate::thread_slot::{RuntimeIdentity, ThreadRuntimeSlot};
 
+#[path = "thread_memory_mutation_tests.rs"]
+mod mutations;
+
 struct Runtime {
     binding: ThreadBinding<()>,
     publication: ThreadPublicationSlot,

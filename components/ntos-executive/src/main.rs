@@ -13293,6 +13293,7 @@ unsafe fn vm_ensure_private_pt(
     page: u64,
     pml4: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     page.checked_sub(SMSS_ALLOC_VA)
         .filter(|offset| *offset < PRIVATE_VM_LIMIT - SMSS_ALLOC_VA)
         .ok_or(nt_address_space::STATUS_CONFLICTING_ADDRESSES)?;
@@ -13354,6 +13355,7 @@ unsafe fn vm_map_private_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     if handler.restore_process_pagefile_page(pi, page, pml4, scratch_base)? {
         return Ok(());
     }
@@ -13435,6 +13437,9 @@ fn vm_watch(what: &[u8], pi: usize, page: u64, frame: u64) {
 }
 
 unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
+    if hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
+        return false;
+    }
     if vm_page_lock_is_locked(pi as u64, page) {
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -13468,6 +13473,7 @@ unsafe fn vm_reprotect_private_page(
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     let frame = csrss_frame_get_exact(pi as u64, page).0;
     if frame == 0 {
         return Err(nt_address_space::STATUS_MEMORY_NOT_ALLOCATED);
@@ -13531,6 +13537,7 @@ unsafe fn vm_restore_transition_mapping(
     pml4: u64,
     frame: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     if page_map_r(frame, page, vm_page_rights(protection), pml4) != 0 {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -13577,6 +13584,10 @@ unsafe fn recycle_unmapped_frame_record_caps(
 }
 
 unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) -> bool {
+    let Some(size) = end.checked_sub(base) else { return false; };
+    if hosted_thread_memory_access(pi as u64, base, size).is_err() {
+        return false;
+    }
     if vm_page_lock_range_is_locked(pi as u64, base, end) {
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return false;
@@ -13597,6 +13608,7 @@ unsafe fn vm_reprotect_shared_image_mapping(
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     if !shared_image_mapping_contains(pi as u64, page) {
         return Ok(());
     }
@@ -13640,6 +13652,7 @@ unsafe fn vm_promote_image_cow_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     #[derive(Clone, Copy)]
     enum OldImageMapping {
         Exact {
@@ -13842,6 +13855,7 @@ unsafe fn vm_promote_mapped_cow_page(
     pml4: u64,
     scratch_base: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     unsafe fn restore_old_mapped_mapping(
         pi: usize,
         page: u64,
@@ -13992,6 +14006,7 @@ unsafe fn vm_reprotect_resident_image_page(
     new_protection: u32,
     pml4: u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE)?;
     if csrss_frame_get_exact_record(pi as u64, page).is_some() {
         return vm_reprotect_private_page(pi, page, old_protection, new_protection, pml4);
     }
