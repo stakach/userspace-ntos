@@ -28,7 +28,12 @@ pub trait RuntimeConstruction: RuntimeIdentity {
     /// identity, reservations and the publication slot; update binding.tcb to the partial TCB, or
     /// keep the unbuilt reservation sentinel when absent. Preserve any resource inventory already
     /// owned by the original row as well. Do not destroy/release any resources.
-    fn retain_partial(&mut self, partial: Self::Partial);
+    /// Return the mechanism inventory to the same pending row's sealed retirement actor. Do not
+    /// retain a second mutable mechanism owner in the runtime payload.
+    fn retain_partial(
+        &mut self,
+        partial: Self::Partial,
+    ) -> crate::thread_construction::ThreadConstructionInventory;
 }
 
 enum State<R> {
@@ -55,6 +60,7 @@ pub enum SlotError {
     InvalidBinding,
     Publication(crate::thread_publication::PublicationError),
     Cleanup(ThreadRollbackError),
+    Retirement(crate::thread_retirement::RetirementError),
 }
 
 impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
@@ -117,10 +123,15 @@ impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
         if runtime.publication_mut().finish(ticket, &binding).is_err() {
             unreachable!("validated exclusive construction ticket");
         }
-        runtime.retain_partial(partial);
+        let inventory = runtime.retain_partial(partial);
+        assert_eq!(
+            inventory.live_tcb(),
+            tcb,
+            "handoff preserves the validated construction TCB"
+        );
         self.state = State::Pending(PendingThreadRuntime::retain_construction(
             id,
-            tcb,
+            inventory,
             reservations,
             runtime,
         ));
@@ -327,6 +338,18 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
         self.pending_mut_exact(expected)?
             .advance(io)
             .map_err(SlotError::Cleanup)
+    }
+
+    /// The adapter must prepare complete external journals/exclusions before invoking this actor.
+    /// This does not free thread memory or release reservations, even when all mechanisms retire.
+    pub fn advance_construction_retirement(
+        &mut self,
+        expected: ThreadRollbackId,
+        io: &mut impl crate::thread_retirement::ThreadRetirementIo,
+    ) -> Result<(), SlotError> {
+        self.pending_mut_exact(expected)?
+            .advance_construction_retirement(io)
+            .map_err(SlotError::Retirement)
     }
 
     fn pending_mut_exact(

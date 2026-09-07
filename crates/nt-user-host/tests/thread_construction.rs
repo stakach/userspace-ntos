@@ -9,6 +9,7 @@ use nt_user_host::thread_publication::{
     PreparedThreadPublication, PublicationError, ThreadPublicationSlot,
 };
 use nt_user_host::thread_resources::{ThreadMemoryLayout, ThreadMemoryResources};
+use nt_user_host::thread_retirement::{Operation, RetirementError, ThreadRetirementIo};
 use nt_user_host::thread_rollback::{
     ThreadRollbackError, ThreadRollbackId, ThreadRollbackIo, ThreadRollbackResource,
     ThreadRollbackResourceKind as Kind, ThreadRollbackStage,
@@ -119,10 +120,12 @@ impl RuntimeConstruction for Runtime {
     fn publication_mut(&mut self) -> &mut ThreadPublicationSlot {
         &mut self.publication
     }
-    fn retain_partial(&mut self, partial: Partial) {
+    fn retain_partial(&mut self, mut partial: Partial) -> ThreadConstructionInventory {
         assert!(self.partial.is_none());
         self.binding.tcb = partial.tcb.unwrap_or(1);
+        let inventory = std::mem::replace(&mut partial.inventory, ThreadConstructionInventory::empty());
         self.partial = Some(partial);
+        inventory
     }
 }
 
@@ -170,6 +173,10 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
         memory.stack_target[0] = 100;
     }
     let drops = Rc::new(Cell::new(0));
+    let mut inventory = ThreadConstructionInventory::empty();
+    if let Some(cap) = tcb.filter(|&cap| cap > 1) {
+        inventory.adopt_object(ConstructionRole::Tcb, cap).unwrap();
+    }
     let partial = Partial {
         binding,
         tcb,
@@ -183,7 +190,7 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
             vec![]
         },
         drops: drops.clone(),
-        inventory: ThreadConstructionInventory::empty(),
+        inventory,
         memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress::empty(),
     };
     (slot, ticket, partial, drops)
@@ -284,6 +291,7 @@ fn actual_slot_inventory_moves_with_memory_and_holds_without_allocation() {
     ] {
         let tcb = matches!(state, SlotState::LiveObject(_)).then_some(400);
         let (mut slot, ticket, mut partial, drops) = fixture(tcb, true);
+        partial.inventory = ThreadConstructionInventory::empty();
         partial
             .inventory
             .adopt_object(ConstructionRole::RawCnode, 500)
@@ -313,11 +321,13 @@ fn actual_slot_inventory_moves_with_memory_and_holds_without_allocation() {
         let snapshot = slot.owner().unwrap().binding;
         assert_eq!(snapshot.tcb, tcb.unwrap_or(1));
         let retained = slot.owner().unwrap().partial.as_ref().unwrap();
-        assert_eq!(retained.inventory.state(ConstructionRole::Tcb), state);
-        assert_eq!(retained.inventory.live_tcb(), tcb);
+        assert!(retained.inventory.is_empty());
+        let inventory = slot.pending().unwrap().construction_retirement().unwrap().inventory();
+        assert_eq!(inventory.state(ConstructionRole::Tcb), state);
+        assert_eq!(inventory.live_tcb(), tcb);
         assert_eq!(retained.memory.stack_owner[0], 200);
         assert_eq!(
-            retained.inventory.state(ConstructionRole::RawCnode),
+            inventory.state(ConstructionRole::RawCnode),
             SlotState::LiveObject(500)
         );
         assert_eq!(drops.get(), 0);
@@ -558,6 +568,7 @@ fn releasable_projection_matches_ordinary_slot_extraction() {
 enum Event {
     Suspend(u64),
     Delete(u64),
+    Recycle(u64),
     Revoke,
     Unmap(u64),
     Release(u64),
@@ -606,42 +617,64 @@ impl ThreadRollbackIo for Backend {
     }
 }
 
+impl ThreadRetirementIo for Backend {
+    fn is_current(&self, id: ThreadRollbackId) -> bool { id == self.current }
+    fn suspend_tcb(&mut self, cap: u64) -> Result<(), u32> { self.record(Event::Suspend(cap)) }
+    fn delete_cap(&mut self, _: ConstructionRole, cap: u64) -> Result<(), u32> {
+        self.record(Event::Delete(cap))
+    }
+    fn recycle_slot(&mut self, _: ConstructionRole, slot: u64) -> Result<(), u32> {
+        self.record(Event::Recycle(slot))
+    }
+}
+
 #[test]
 fn absent_and_real_tcb_cleanup_retry_every_operation_without_releasing_holds() {
     for tcb in [None, Some(400)] {
         let mut expected = vec![];
         if let Some(cap) = tcb {
-            expected.extend([Event::Suspend(cap), Event::Delete(cap)]);
+            expected.extend([Event::Suspend(cap), Event::Delete(cap), Event::Recycle(cap)]);
         }
+        expected.extend([Event::Delete(300), Event::Recycle(300)]);
+        let mechanism_events = expected.len();
         expected.extend([
             Event::Revoke,
             Event::Unmap(100),
             Event::Release(100),
-            Event::Release(300),
             Event::Unmap(200),
             Event::Release(200),
             Event::Commit,
         ]);
         for fail in 0..expected.len() - 1 {
-            let (mut slot, ticket, partial, drops) = fixture(tcb, true);
-            let mut inventory = partial.memory.rollback_resources().unwrap();
-            inventory.extend_from_slice(&partial.mechanisms);
+            let (mut slot, ticket, mut partial, drops) = fixture(tcb, true);
+            partial.inventory.adopt_object(ConstructionRole::RawCnode, 300).unwrap();
+            let inventory = partial.memory.rollback_resources().unwrap();
             let id = slot.retain_failed_construction(ticket, partial).unwrap();
-            slot.prepare_cleanup(id, &inventory).unwrap();
             assert_eq!(
-                slot.pending().unwrap().cleanup().unwrap().pending_tcb(),
-                tcb
+                slot.prepare_cleanup(id, &inventory),
+                Err(SlotError::Cleanup(ThreadRollbackError::ConstructionPending))
             );
             let mut backend = Backend {
                 current: id,
-                events: vec![],
+                events: Vec::with_capacity(expected.len()),
                 fail: Some(fail),
             };
-            assert!(slot.advance_cleanup(id, &mut backend).is_err());
+            if fail < mechanism_events {
+                assert!(without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).is_err());
+            } else {
+                without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
+                slot.prepare_cleanup(id, &inventory).unwrap();
+                assert_eq!(slot.pending().unwrap().cleanup().unwrap().pending_tcb(), None);
+                assert!(slot.advance_cleanup(id, &mut backend).is_err());
+            }
             assert_eq!(backend.events, expected[..fail]);
             assert_protected(&mut slot, id);
             assert_eq!(drops.get(), 0);
             backend.fail = None;
+            without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
+            if slot.pending().unwrap().cleanup().is_none() {
+                slot.prepare_cleanup(id, &inventory).unwrap();
+            }
             slot.advance_cleanup(id, &mut backend).unwrap();
             slot.advance_cleanup(id, &mut backend).unwrap();
             assert_eq!(backend.events, expected);
@@ -679,13 +712,157 @@ fn invalid_inventory_and_foreign_attempt_leave_partial_owner_retained() {
                 }]
             ),
             Err(SlotError::Cleanup(
-                ThreadRollbackError::ConflictingOwnership
+                ThreadRollbackError::ConstructionPending
             ))
         );
         assert_protected(&mut slot, id);
         assert!(slot.pending().unwrap().cleanup().is_none());
         assert_eq!(drops.get(), 0);
     }
+}
+
+#[test]
+fn all_mechanism_operations_retry_without_replaying_acknowledgements() {
+    let expected = vec![
+        Event::Suspend(400), Event::Delete(400), Event::Recycle(400),
+        Event::Delete(501), Event::Recycle(501),
+        Event::Delete(500), Event::Recycle(500),
+        Event::Delete(600), Event::Recycle(600),
+    ];
+    for fail in 0..expected.len() {
+        let (mut slot, ticket, mut partial, drops) = fixture(Some(400), true);
+        for (role, cap) in [
+            (ConstructionRole::RawCnode, 500),
+            (ConstructionRole::GuardedCnode, 501),
+            (ConstructionRole::SchedContext, 600),
+        ] {
+            partial.inventory.adopt_object(role, cap).unwrap();
+        }
+        let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+        let mut backend = Backend { current: id, events: Vec::with_capacity(expected.len()), fail: Some(fail) };
+        for _ in 0..3 {
+            let error = without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap_err();
+            let operation = match expected[fail] {
+                Event::Suspend(_) => Operation::Suspend,
+                Event::Delete(_) => Operation::Delete,
+                _ => Operation::Recycle,
+            };
+            assert!(matches!(error, SlotError::Retirement(RetirementError::Backend { operation: actual, .. }) if actual == operation));
+            assert_eq!(backend.events, expected[..fail]);
+            assert_protected(&mut slot, id);
+            assert_eq!(slot.prepare_cleanup(id, &[]), Err(SlotError::Cleanup(ThreadRollbackError::ConstructionPending)));
+            assert_eq!(drops.get(), 0);
+        }
+        backend.fail = None;
+        without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
+        without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
+        assert_eq!(backend.events, expected);
+        assert!(slot.pending().unwrap().construction_retirement().unwrap().is_complete());
+        assert_protected(&mut slot, id);
+        assert_eq!(drops.get(), 0);
+    }
+}
+
+#[test]
+fn empty_and_delete_acknowledged_slots_only_recycle() {
+    for role in [ConstructionRole::Tcb, ConstructionRole::RawCnode, ConstructionRole::GuardedCnode, ConstructionRole::SchedContext] {
+        for deleted in [false, true] {
+            let (mut slot, ticket, mut partial, drops) = fixture(None, true);
+            partial.inventory.adopt_empty(role, 500).unwrap();
+            if deleted {
+                partial.inventory.acknowledge_object(role, 500).unwrap();
+                partial.inventory.acknowledge_delete(role, 500).unwrap();
+            }
+            let id = slot.retain_failed_construction(ticket, partial).unwrap();
+            let mut backend = Backend { current: id, events: Vec::with_capacity(1), fail: Some(0) };
+            for _ in 0..3 {
+                assert_eq!(without_allocation(|| slot.advance_construction_retirement(id, &mut backend)),
+                    Err(SlotError::Retirement(RetirementError::Backend { role, operation: Operation::Recycle, status: 0xc000009a })));
+                assert!(backend.events.is_empty());
+                assert_eq!(slot.pending().unwrap().construction_retirement().unwrap().inventory().state(role),
+                    if deleted { SlotState::DeleteAcknowledged(500) } else { SlotState::AllocatedEmpty(500) });
+            }
+            backend.fail = None;
+            without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
+            assert_eq!(backend.events, [Event::Recycle(500)]);
+            assert_protected(&mut slot, id);
+            assert_eq!(drops.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn retirement_requires_exact_slot_and_backend_attempt() {
+    let (mut slot, ticket, partial, drops) = fixture(Some(400), true);
+    let id = slot.retain_failed_construction(ticket, partial).unwrap();
+    let (mut other, ticket, partial, _) = fixture(Some(400), false);
+    let foreign = other.retain_failed_construction(ticket, partial).unwrap();
+    let mut backend = Backend { current: foreign, events: vec![], fail: None };
+    assert_eq!(without_allocation(|| slot.advance_construction_retirement(foreign, &mut backend)), Err(SlotError::OwnerChanged));
+    assert_eq!(without_allocation(|| slot.advance_construction_retirement(id, &mut backend)), Err(SlotError::Retirement(RetirementError::StaleOwner)));
+    assert!(backend.events.is_empty());
+    assert_eq!(slot.pending().unwrap().construction_retirement().unwrap().inventory().live_tcb(), Some(400));
+    assert_protected(&mut slot, id);
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn retired_slots_cannot_reenter_memory_cleanup_under_any_resource_kind() {
+    let (mut slot, ticket, mut partial, drops) = fixture(Some(400), true);
+    partial.inventory.adopt_empty(ConstructionRole::RawCnode, 500).unwrap();
+    let id = slot.retain_failed_construction(ticket, partial).unwrap();
+    let mut backend = Backend { current: id, events: Vec::with_capacity(4), fail: None };
+    slot.advance_construction_retirement(id, &mut backend).unwrap();
+    for cap in [400, 500] {
+        for kind in [Kind::Alias, Kind::Frame, Kind::Mechanism] {
+            assert_eq!(without_allocation(|| slot.prepare_cleanup(id, &[ThreadRollbackResource { cap, kind }])),
+                Err(SlotError::Cleanup(ThreadRollbackError::ConflictingOwnership)));
+        }
+    }
+    assert_eq!(slot.prepare_cleanup(id, &[ThreadRollbackResource { cap: 700, kind: Kind::Mechanism }]),
+        Err(SlotError::Cleanup(ThreadRollbackError::ConflictingOwnership)));
+    assert_eq!(backend.events, [Event::Suspend(400), Event::Delete(400), Event::Recycle(400), Event::Recycle(500)]);
+    assert_protected(&mut slot, id);
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn memory_journal_oom_after_retirement_never_resurrects_tcb_operations() {
+    let (mut slot, ticket, partial, drops) = fixture(Some(400), true);
+    let resources = partial.memory.rollback_resources().unwrap();
+    let id = slot.retain_failed_construction(ticket, partial).unwrap();
+    let mut backend = Backend { current: id, events: Vec::with_capacity(16), fail: None };
+    without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
+    FAIL_ALLOCATIONS.with(|flag| flag.set(true));
+    let result = slot.prepare_cleanup(id, &resources);
+    FAIL_ALLOCATIONS.with(|flag| flag.set(false));
+    assert_eq!(result, Err(SlotError::Cleanup(ThreadRollbackError::InsufficientResources)));
+    assert!(slot.pending().unwrap().cleanup().is_none());
+    assert!(slot.pending().unwrap().construction_retirement().unwrap().is_complete());
+    assert_protected(&mut slot, id);
+    assert_eq!(drops.get(), 0);
+    slot.prepare_cleanup(id, &resources).unwrap();
+    assert_eq!(slot.pending().unwrap().cleanup().unwrap().pending_tcb(), None);
+    assert_eq!(slot.pending().unwrap().cleanup().unwrap().stage(), ThreadRollbackStage::RevokeMemoryAccess);
+    slot.advance_construction_retirement(id, &mut backend).unwrap();
+    slot.advance_cleanup(id, &mut backend).unwrap();
+    assert_eq!(backend.events, [Event::Suspend(400), Event::Delete(400), Event::Recycle(400),
+        Event::Revoke, Event::Unmap(100), Event::Release(100), Event::Unmap(200), Event::Release(200), Event::Commit]);
+}
+
+#[test]
+fn registered_runtime_cannot_use_construction_retirement() {
+    let (mut slot, ticket, partial, _) = fixture(None, false);
+    let runtime = slot.publishing_mut(&ticket).unwrap();
+    runtime.publication.finish(ticket, &runtime.binding).unwrap();
+    runtime.binding.tcb = 400;
+    let binding = runtime.binding;
+    let id = slot.begin_pending(binding).unwrap();
+    let mut backend = Backend { current: id, events: vec![], fail: None };
+    assert_eq!(slot.advance_construction_retirement(id, &mut backend), Err(SlotError::Retirement(RetirementError::NotConstruction)));
+    assert!(slot.pending().unwrap().construction_retirement().is_none());
+    assert!(backend.events.is_empty());
+    drop(partial);
 }
 
 #[test]

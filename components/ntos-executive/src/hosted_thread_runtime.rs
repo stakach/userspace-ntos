@@ -3,12 +3,11 @@ use nt_user_host::thread_slot::{RuntimeConstruction, RuntimeIdentity, ThreadRunt
 
 type RuntimeSlot = ThreadRuntimeSlot<HostedThreadRuntimeOwner>;
 
-/// Durable row ownership is distinct from copied routing/diagnostic metadata. Construction
-/// inventory must move with this owner and may never be cloned by an ordinary table lookup.
+/// Durable memory/progress ownership is distinct from copied routing/diagnostic metadata.
+/// Mechanism inventory stays alongside this payload in the pending row's sealed retirement actor.
 #[derive(Debug)]
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
-    construction: nt_user_host::thread_construction::ThreadConstructionInventory,
     memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress<TP_WORKER_STACK_FRAME_COUNT>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
     alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasSnapshot>,
@@ -18,7 +17,6 @@ impl HostedThreadRuntimeOwner {
     fn new(runtime: HostedThreadRuntime) -> Self {
         Self {
             runtime,
-            construction: nt_user_host::thread_construction::ThreadConstructionInventory::empty(),
             memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress::empty(),
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
             alias_preparation: core::cell::OnceCell::new(),
@@ -26,7 +24,7 @@ impl HostedThreadRuntimeOwner {
     }
 
     fn construction_is_empty(&self) -> bool {
-        self.construction.is_empty() && self.memory_progress.is_empty()
+        self.memory_progress.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
     }
 
@@ -47,7 +45,7 @@ impl core::ops::Deref for HostedThreadRuntimeOwner {
     }
 }
 
-/// Copyable metadata only; pending construction slots belong to HostedThreadRuntimeOwner.
+/// Copyable metadata only; construction slots belong to the pending row's sealed retirement actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedThreadRuntime {
     pub(crate) pi: usize,
@@ -300,11 +298,13 @@ impl HostedThreadRuntimeTable {
             .find(|pending| pending.id() == id)
             .ok_or(ThreadReconciliationError::OwnerChanged)?;
         let owner = pending.runtime();
+        let construction = pending.construction_retirement()
+            .ok_or(ThreadReconciliationError::OwnerChanged)?.inventory();
         let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
         let snapshot = owner.registry_preparation.reconcile(
             id, &owner.resources, &owner.memory_progress, registry,
         ).map_err(ThreadReconciliationError::Registry)?;
-        for cap in owner.construction.entries().filter_map(|(_, state)| state.slot()) {
+        for cap in construction.entries().filter_map(|(_, state)| state.slot()) {
             if owner.memory_progress.empty_slot() == Some(cap)
                 || snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
                 || registry.records().iter().any(|record|
@@ -327,7 +327,7 @@ impl HostedThreadRuntimeTable {
         for cap in aliases.capabilities() {
             if snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
                 || owner.memory_progress.empty_slot() == Some(cap)
-                || owner.construction.entries().any(|(_, state)| state.slot() == Some(cap))
+                || construction.entries().any(|(_, state)| state.slot() == Some(cap))
                 || registry.records().iter().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
             {
@@ -925,12 +925,12 @@ impl RuntimeConstruction for HostedThreadRuntimeOwner {
         &mut self.runtime.publication
     }
 
-    fn retain_partial(&mut self, partial: Self::Partial) {
+    fn retain_partial(&mut self, partial: Self::Partial) -> nt_user_host::thread_construction::ThreadConstructionInventory {
         assert!(self.construction_is_empty() && !self.runtime.resources.is_live());
         self.runtime.tcb = partial.construction.live_tcb().unwrap_or(1);
         self.runtime.resources = partial.resources;
         self.runtime.teb_alias = partial.teb_alias;
-        self.construction = partial.construction;
         self.memory_progress = partial.memory_progress;
+        partial.construction
     }
 }

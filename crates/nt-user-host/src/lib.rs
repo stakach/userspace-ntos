@@ -25,6 +25,7 @@ pub mod thread_memory_access;
 pub mod thread_resources;
 pub mod thread_registry;
 pub mod thread_reconciliation;
+pub mod thread_retirement;
 pub mod thread_rollback;
 pub mod thread_slot;
 

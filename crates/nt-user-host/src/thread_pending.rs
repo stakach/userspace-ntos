@@ -1,5 +1,7 @@
 //! Retained runtime ownership before fallible rollback-journal construction.
 use crate::thread_binding::ThreadRuntimeReservations;
+use crate::thread_construction::ThreadConstructionInventory;
+use crate::thread_retirement::{RetirementError, ThreadConstructionRetirement, ThreadRetirementIo};
 use crate::thread_rollback::{
     new_rollback_id, ThreadRollback, ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity,
     ThreadRollbackIo, ThreadRollbackResource, ThreadRollbackStage,
@@ -15,10 +17,15 @@ use crate::thread_rollback::{
 #[must_use = "retain the pending runtime and its reservations until checked cleanup completes"]
 pub struct PendingThreadRuntime<R> {
     id: ThreadRollbackId,
-    tcb: Option<u64>,
+    mechanisms: PendingMechanisms,
     runtime: R,
     reservations: ThreadRuntimeReservations,
     rollback: Option<ThreadRollback>,
+}
+
+enum PendingMechanisms {
+    Registered(u64),
+    Construction(ThreadConstructionRetirement),
 }
 
 impl<R> PendingThreadRuntime<R> {
@@ -38,7 +45,7 @@ impl<R> PendingThreadRuntime<R> {
         };
         Ok(Self {
             id,
-            tcb: Some(tcb),
+            mechanisms: PendingMechanisms::Registered(tcb),
             runtime,
             reservations,
             rollback: None,
@@ -49,13 +56,15 @@ impl<R> PendingThreadRuntime<R> {
     /// runtime and its attached partial construction in-place before any journal allocation.
     pub(crate) fn retain_construction(
         id: ThreadRollbackId,
-        tcb: Option<u64>,
+        inventory: ThreadConstructionInventory,
         reservations: ThreadRuntimeReservations,
         runtime: R,
     ) -> Self {
         Self {
             id,
-            tcb,
+            mechanisms: PendingMechanisms::Construction(ThreadConstructionRetirement::retain(
+                id, inventory,
+            )),
             runtime,
             reservations,
             rollback: None,
@@ -78,8 +87,27 @@ impl<R> PendingThreadRuntime<R> {
         self.rollback.as_ref()
     }
 
+    pub fn construction_retirement(&self) -> Option<&ThreadConstructionRetirement> {
+        match &self.mechanisms {
+            PendingMechanisms::Construction(owner) => Some(owner),
+            PendingMechanisms::Registered(_) => None,
+        }
+    }
+
+    pub(crate) fn advance_construction_retirement(
+        &mut self,
+        io: &mut impl ThreadRetirementIo,
+    ) -> Result<(), RetirementError> {
+        match &mut self.mechanisms {
+            PendingMechanisms::Construction(owner) => owner.advance(io),
+            PendingMechanisms::Registered(_) => Err(RetirementError::NotConstruction),
+        }
+    }
+
     /// Only one journal may attach to this attempt. Failed inventory validation/allocation may
     /// retry on this same pending owner, without recreating its identity or releasing any holds.
+    /// Construction mechanisms must finish first. This journal then owns only memory release;
+    /// separate failed-copy empty slots and external journals remain the adapter's responsibility.
     pub fn prepare_journal(
         &mut self,
         resources: &[ThreadRollbackResource],
@@ -99,7 +127,19 @@ impl<R> PendingThreadRuntime<R> {
         if self.rollback.is_some() {
             return Err(ThreadRollbackError::AlreadyPrepared);
         }
-        let rollback = prepare(self.id, self.tcb, resources)?;
+        let tcb = match &self.mechanisms {
+            PendingMechanisms::Registered(tcb) => Some(*tcb),
+            PendingMechanisms::Construction(owner) => {
+                if !owner.is_complete() {
+                    return Err(ThreadRollbackError::ConstructionPending);
+                }
+                if owner.conflicts(resources) {
+                    return Err(ThreadRollbackError::ConflictingOwnership);
+                }
+                None
+            }
+        };
+        let rollback = prepare(self.id, tcb, resources)?;
         self.rollback = Some(rollback);
         Ok(())
     }

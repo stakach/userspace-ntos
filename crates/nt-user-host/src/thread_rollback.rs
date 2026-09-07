@@ -104,6 +104,7 @@ pub enum ThreadRollbackError {
     StaleOwner,
     AlreadyPrepared,
     NotPrepared,
+    ConstructionPending,
     Backend {
         stage: ThreadRollbackStage,
         status: u32,

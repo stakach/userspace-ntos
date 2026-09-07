@@ -181,13 +181,16 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain exact-attempt, read-only registry and external win32k alias reconciliation in the
   pending owner; revalidate immutable snapshots and reject changed coverage or shared capabilities
   (tranche 76; registry transfer and destructive cleanup remain disabled).
+- [x] Seal construction inventory into one exact-attempt retirement actor; retain suspend/delete/
+  recycle phases, remove the independent cached construction TCB, and block generic memory cleanup
+  until mechanism retirement completes (tranche 77, host/build; native retirement remains disabled).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
   holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Exact registry
   coverage and full external alias state are now captured without transferring ownership. Next
-  coordinate TCB retirement with the mechanism slot phases and retain complete external-alias cleanup
-  journals before transferring registry ownership or driving cleanup. Failed SC
+  retain complete external-alias cleanup journals and implement checked native slot/frame recycling
+  before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
@@ -27504,6 +27507,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ordinary termination, other launch families, handler handoffs and live failure validation remain
     open. No QEMU or desktop proof is claimed; the recorded 33 unresolved win32k imports still block
     the full desktop gate.
+
+    B3 sealed construction retirement tranche 77 (2026-09-07):
+    PendingThreadRuntime now distinguishes registered-thread TCB ownership from a construction
+    retirement actor. Native failed-construction handoff returns the mechanism inventory directly
+    to that same pending row, alongside its retained memory and reservations. The native payload
+    no longer owns a second mutable inventory. The actor consumes constructor mutation authority:
+    there is no mutable inventory projection, replacement, extraction or completion-token factory.
+    Reconciliation reads the sealed inventory from the pending row. Existing native reset, ingress,
+    promotion and ordinary extraction remain blocked by pending-slot protection.
+
+    The exact-attempt actor retires TCB, guarded CNode, raw CNode and scheduling-context slots in
+    order. Live TCB suspension, capability deletion and empty-slot recycling have separate retained
+    acknowledgements. Delete failure cannot repeat successful suspension; recycle failure cannot
+    repeat successful deletion. Allocated-empty and delete-acknowledged slots only recycle, never
+    receive TCB operations or deletion. Driving retirement is allocation-free and validates both
+    the slot's exact attempt and the backend's current owner before effects. It does not release
+    memory, commitment or reservations.
+
+    Generic memory-journal preparation returns ConstructionPending while any construction slot
+    remains. After completion it starts with no TCB, not the former cached cap. Immutable historical
+    slot numbers reject later replay through any resource kind, and generic Mechanism resources
+    are rejected for construction cleanup. Journal validation/OOM can retry without resurrecting
+    retired TCB operations. The older construction integration test that bypassed slot phases via
+    copied generic mechanism descriptors now exercises the coordinated path instead.
+
+    Validation: six new integration tests cover every live mechanism operation and repeated failure,
+    empty/delete-acknowledged phases for every role, stale slot/backend attempts, historical slot
+    replay, post-retirement memory-journal OOM, and registered-runtime rejection. Allocator-counted
+    tests prove handoff and retirement retries allocate nothing; existing tests continue to verify
+    memory/registry reconciliation and protected reservations. The serialized nine-crate suite
+    passes 1,175 tests (246 in nt-user-host: 220 unit, 3 existing integration and 23 construction
+    integration). The subsequent executive build passes with the unchanged 262-warning baseline.
+    Logs: `.tmp/test-thread-retirement-20260907.log` and
+    `.tmp/build-thread-retirement-20260907.log`.
+    Two read-only agents reviewed the actor contracts and native extraction/admission guards; only
+    root ran the serialized tests/builds.
+
+    Review adjustment: the actor is host-tested and native handoff is wired, but native destructive
+    retirement is not activated. Complete memory/external-alias journals and exclusions must be
+    retained before invoking it; read-only reconciliation snapshots are not cleanup journals.
+    The backend must clear mutable native TCB/cap release references before checked slot publication,
+    without reentering or aliasing the mutably borrowed pending slot. MemoryConstructionProgress's
+    failed-copy empty slot is separate from these four mechanism slots and still needs its own
+    checked recycling owner. Correct the external AliasTransition delete/recycle backend and frame
+    free-list admission, then perform terminal registry transfer and final commit only after all
+    retained owners complete. Ordinary termination, first-resume failure, other launch families
+    and live failure validation remain open. No QEMU/desktop proof is claimed; the recorded 33
+    unresolved win32k imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
