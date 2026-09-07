@@ -6,6 +6,133 @@ use crate::thread_rollback::{
 
 const REGISTERED: [u64; 4] = [0x10000, 0x11000, 0x13000, 0x14000];
 
+fn partial() -> ThreadMemoryResources<3> {
+    ThreadMemoryResources::new(27, resources(27).layout().unwrap()).unwrap()
+}
+
+#[test]
+fn empty_construction_retains_geometry_without_fabricated_frame_owners() {
+    let resources = partial();
+    let mut registry = ClientFrameRegistry::new();
+    assert!(ThreadRegistrySnapshot::capture(&resources, &registry, &[]).is_err());
+    let snapshot = ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]).unwrap();
+    assert!(snapshot.records().is_empty());
+    assert!(snapshot.rollback_resources().is_empty());
+    assert!(snapshot
+        .prepare_transfer(&resources, &mut registry)
+        .unwrap()
+        .is_none());
+    assert_eq!(snapshot.revalidate(&resources, &registry), Ok(()));
+}
+
+#[test]
+fn partial_capture_merges_only_constructed_backing_and_exact_registered_aliases() {
+    let mut resources = partial();
+    resources.stack_owner[0] = 10;
+    resources.stack_target[0] = 11;
+    resources.stack_mirror[0] = 12;
+    resources.ipc_owner = 60;
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert(27, 0x10000, 11, 0x100000, 12, 13, true)
+        .unwrap();
+    let snapshot =
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[0x10000]).unwrap();
+    let owners: Vec<_> = snapshot
+        .rollback_resources()
+        .iter()
+        .filter(|entry| entry.kind == Kind::Frame)
+        .map(|entry| entry.cap)
+        .collect();
+    assert_eq!(owners, [10, 60]);
+    let aliases: Vec<_> = snapshot
+        .rollback_resources()
+        .iter()
+        .filter(|entry| entry.kind == Kind::Alias)
+        .map(|entry| entry.cap)
+        .collect();
+    assert_eq!(aliases, [11, 12, 13]);
+    assert_eq!(snapshot.records(), registry.records());
+}
+
+#[test]
+fn partial_capture_refuses_registry_coverage_for_an_unbuilt_page() {
+    let resources = partial();
+    let registry = ClientFrameRegistry::new();
+    assert!(matches!(
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[0x10000]),
+        Err(ThreadRegistryError::InvalidCoverage)
+    ));
+}
+
+#[test]
+fn partial_capture_refuses_orphan_aliases_and_duplicate_physical_owners() {
+    let mut resources = partial();
+    resources.stack_target[0] = 11;
+    let registry = ClientFrameRegistry::new();
+    assert!(matches!(
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
+        Err(ThreadRegistryError::Resources(
+            crate::thread_rollback::ThreadRollbackError::ConflictingOwnership
+        ))
+    ));
+    resources.stack_owner[0] = 10;
+    resources.stack_owner[1] = 10;
+    assert!(matches!(
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
+        Err(ThreadRegistryError::Resources(
+            crate::thread_rollback::ThreadRollbackError::ConflictingOwnership
+        ))
+    ));
+}
+
+#[test]
+fn partial_capture_checks_unbuilt_geometry_for_unexpected_rows() {
+    let mut resources = partial();
+    resources.stack_owner[0] = 10;
+    let mut registry = ClientFrameRegistry::new();
+    registry.insert(27, 0x14000, 40, 0, 0, 40, true).unwrap();
+    assert!(matches!(
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
+        Err(ThreadRegistryError::UnexpectedRecord { page: 0x14000 })
+    ));
+    assert_eq!(registry.records().len(), 1);
+}
+
+#[test]
+fn partial_snapshot_rejects_later_construction_or_new_aliases_before_transfer() {
+    let mut resources = partial();
+    resources.stack_owner[0] = 10;
+    let mut registry = ClientFrameRegistry::new();
+    let snapshot = ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]).unwrap();
+    resources.teb_owner = 30;
+    assert_eq!(
+        snapshot.revalidate(&resources, &registry),
+        Err(ThreadRegistryError::StaleResources)
+    );
+    resources.teb_owner = 0;
+    registry.insert(27, 0x14000, 40, 0, 0, 40, true).unwrap();
+    assert!(matches!(
+        snapshot.prepare_transfer(&resources, &mut registry),
+        Err(ThreadRegistryError::UnexpectedRecord { page: 0x14000 })
+    ));
+}
+
+#[test]
+fn partial_inventory_rejects_capabilities_shared_by_foreign_registry_rows() {
+    let mut resources = partial();
+    resources.stack_owner[0] = 10;
+    resources.stack_target[0] = 11;
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert(28, 0x80000, 100, 0x90000, 11, 100, false)
+        .unwrap();
+    assert!(matches!(
+        ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]),
+        Err(ThreadRegistryError::SharedCapability { cap: 11 })
+    ));
+}
+
 fn resources(pi: usize) -> ThreadMemoryResources<3> {
     let layout = ThreadMemoryLayout::new(0x10000, 2, 0x12000, 0x13000, 0x16000).unwrap();
     let mut resources = ThreadMemoryResources::new(pi, layout).unwrap();

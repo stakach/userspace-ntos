@@ -64,6 +64,7 @@ struct Backend {
     held: bool,
     calls: Vec<usize>,
     successes: Vec<usize>,
+    unmapped: Vec<u64>,
     fail: Option<usize>,
     drops: Rc<Cell<usize>>,
 }
@@ -75,6 +76,7 @@ impl Backend {
             held: true,
             calls: Vec::new(),
             successes: Vec::new(),
+            unmapped: Vec::new(),
             fail: None,
             drops,
         }
@@ -121,7 +123,19 @@ impl ThreadRollbackIo for Backend {
         self.effect(2)
     }
 
+    fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        assert!(self.held && self.successes.contains(&2));
+        assert_ne!(resource.kind, ThreadRollbackResourceKind::Mechanism);
+        assert!(!self.unmapped.contains(&resource.cap));
+        self.unmapped.push(resource.cap);
+        Ok(())
+    }
+
     fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        assert!(
+            resource.kind == ThreadRollbackResourceKind::Mechanism
+                || self.unmapped.contains(&resource.cap)
+        );
         let (step, expected) = match resource.kind {
             ThreadRollbackResourceKind::Alias => (3, 100),
             ThreadRollbackResourceKind::Mechanism => (4, 300),

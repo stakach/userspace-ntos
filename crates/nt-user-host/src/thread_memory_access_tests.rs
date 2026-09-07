@@ -340,6 +340,9 @@ impl ThreadRollbackIo for Backend {
             Ok(())
         }
     }
+    fn unmap_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+        panic!("empty journal")
+    }
     fn release_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
         panic!("empty journal")
     }

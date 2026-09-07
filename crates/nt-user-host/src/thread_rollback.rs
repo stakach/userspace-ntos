@@ -99,17 +99,24 @@ pub trait ThreadRollbackIo {
     /// Exclude refault/native-copy admission and revoke external mappings before recycling backing.
     /// Reserve any needed bookkeeping first. Partial failure must retain its mapping/registry
     /// journal under this exact attempt for retry. Exclusions must survive through commit and prevent
-    /// other threads, refaults and native copies from introducing new aliases. This callback may
-    /// unmap listed resources, but must never delete/recycle their slots: later stages own those
-    /// releases. Any external aliases it releases require a disjoint, retry-owned journal.
+    /// other threads, refaults and native copies from introducing new aliases. This callback must
+    /// not unmap/delete/recycle listed resources: later stages own those operations and their
+    /// acknowledgements. External aliases require a disjoint, retry-owned cleanup journal.
     fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32>;
+    /// Checked unmap of an Alias or Frame capability, including an already-unmapped cap. The
+    /// rollback owner records acknowledgement separately from deletion/recycling so release retry
+    /// never repeats a successful unmap. Mechanism resources do not pass through this callback.
+    fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32>;
     /// Release exactly this capability. Alias and mechanism deletion precede frame recycling.
-    /// Frame cleanup must checked-unmap the owner's own mapping before recycling physical memory,
-    /// and reserve free-list bookkeeping before losing ownership metadata. A successful
-    /// release also clears every mirrored registry/runtime reference to that capability atomically;
-    /// failure retains the capability and any sub-operation progress in the backend's exact owner.
+    /// Alias/Frame unmapping has already been acknowledged. Frame cleanup must reserve free-list
+    /// bookkeeping before losing ownership metadata. A successful
+    /// release also clears every mutable registry/runtime release reference to that capability.
+    /// Immutable terminal transfer snapshots keep their captured cap numbers until final transfer
+    /// acknowledgement, but must expose neither ordinary access nor a second release authority.
+    /// Failure retains the capability and any sub-operation progress in the backend's exact owner.
     fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32>;
-    /// Release retained commitment and target pool/window reservations once, then retire the
+    /// Finish exact terminal registry transfers before releasing retained commitment and target
+    /// pool/window reservations once, then retire the
     /// runtime. This is an allocation-free target-side commit: never write caller output pointers,
     /// repeat caller handle cancellation, or synthesize activation/termination of the unpublished
     /// ETHREAD. The outer owner must keep this rollback object alive through the callback's return.
@@ -130,7 +137,12 @@ pub struct ThreadRollback {
     id: ThreadRollbackId,
     tcb: u64,
     stage: ThreadRollbackStage,
-    resources: Vec<ThreadRollbackResource>,
+    resources: Vec<OwnedResource>,
+}
+
+struct OwnedResource {
+    resource: ThreadRollbackResource,
+    unmapped: bool,
 }
 
 impl ThreadRollback {
@@ -150,7 +162,7 @@ impl ThreadRollback {
         if tcb <= 1 {
             return Err(ThreadRollbackError::InvalidCapability);
         }
-        let mut owned: Vec<ThreadRollbackResource> = Vec::new();
+        let mut owned: Vec<OwnedResource> = Vec::new();
         owned
             .try_reserve(resources.len())
             .map_err(|_| ThreadRollbackError::InsufficientResources)?;
@@ -162,12 +174,18 @@ impl ThreadRollback {
             if resource.cap == tcb {
                 return Err(ThreadRollbackError::ConflictingOwnership);
             }
-            if let Some(existing) = owned.iter().find(|entry| entry.cap == resource.cap) {
-                if existing.kind != resource.kind {
+            if let Some(existing) = owned
+                .iter()
+                .find(|entry| entry.resource.cap == resource.cap)
+            {
+                if existing.resource.kind != resource.kind {
                     return Err(ThreadRollbackError::ConflictingOwnership);
                 }
             } else {
-                owned.push(resource);
+                owned.push(OwnedResource {
+                    resource,
+                    unmapped: false,
+                });
             }
         }
         Ok(Self {
@@ -197,7 +215,7 @@ impl ThreadRollback {
     pub fn pending_resources(&self) -> impl Iterator<Item = ThreadRollbackResource> + '_ {
         self.resources
             .iter()
-            .copied()
+            .map(|entry| entry.resource)
             .filter(|entry| entry.cap != 0)
     }
 
@@ -246,11 +264,18 @@ impl ThreadRollback {
                             ThreadRollbackStage::Frames,
                         ),
                     };
-                    for resource in &mut self.resources {
+                    for entry in &mut self.resources {
+                        let resource = entry.resource;
                         if resource.cap != 0 && resource.kind == kind {
-                            io.release_resource(*resource)
+                            if kind != ThreadRollbackResourceKind::Mechanism && !entry.unmapped {
+                                io.unmap_resource(resource).map_err(|status| {
+                                    ThreadRollbackError::Backend { stage, status }
+                                })?;
+                                entry.unmapped = true;
+                            }
+                            io.release_resource(resource)
                                 .map_err(|status| ThreadRollbackError::Backend { stage, status })?;
-                            resource.cap = 0;
+                            entry.resource.cap = 0;
                         }
                     }
                     next

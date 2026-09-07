@@ -26970,34 +26970,18 @@ unsafe fn spawn_hosted_thread_mechanism(
         return HostedThreadSpawnResult::failed();
     }
     if t.diag {
-        // Read the FIRST 8 bytes back through what we WROTE (executive alias) AND through a FRESH,
-        // independent alias of the SAME `tramp` frame mapped at a throwaway VA — if these disagree, the
-        // executive-side write and the target map are hitting DIFFERENT physical frames (the silent
-        // SYS_SEND alias-map failure that leaves the target trampoline zero-filled → cr2=0 at entry).
+        // Observe the already-owned executive mapping; diagnostics must not create untracked aliases.
         let wrote = core::ptr::read_volatile((scr + 0x2000) as *const u64);
-        let verify_va = scr + 0x3000; // 4th page of this thread's scratch PT — unused, same PT so mapped
-        let fresh = copy_cap(tramp);
-        let e_fresh = page_map_r(fresh, verify_va, RW_NX, CAP_INIT_THREAD_VSPACE);
-        let via_fresh = if e_fresh == 0 {
-            core::ptr::read_volatile(verify_va as *const u64)
-        } else {
-            0xDEAD_DEAD_DEAD_DEADu64
-        };
         print_str(b"[spawn-diag] tramp_frame_retype=");
         print_u64(e_tramp_frame);
         print_str(b" exec_map=");
         print_u64(e_tramp_exec_map);
         print_str(b" tgt_map=");
         print_u64(e_tramp_tgt_map);
-        print_str(b" fresh_map=");
-        print_u64(e_fresh);
         print_str(b"\n[spawn-diag] tramp[0..8] wrote=0x");
         print_hex((wrote >> 32) as u32);
         print_hex(wrote as u32);
-        print_str(b" via_fresh_alias=0x");
-        print_hex((via_fresh >> 32) as u32);
-        print_hex(via_fresh as u32);
-        print_str(b" (must match; expect 0x...48b9)\n");
+        print_str(b"\n");
     }
     // CNode (PML4 + the dedicated fault EP) + TCB.
     let Some(raw) = try_alloc_slot() else {

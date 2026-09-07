@@ -53,6 +53,23 @@ impl<const STACK: usize> ThreadRegistrySnapshot<STACK> {
                 ThreadRollbackError::InvalidIdentity,
             ));
         }
+        Self::capture_partial(resources, registry, registered_pages)
+    }
+
+    /// Reconcile a partially built bundle without inventing physical owners for unbuilt pages.
+    /// `registered_pages` still describes exact coverage: unbuilt pages must have no registry row
+    /// or alias capability. The original bundle must already have a durable owner before this
+    /// fallible snapshot is prepared; this does not create a pre-TCB cleanup owner by itself.
+    pub fn capture_partial(
+        resources: &ThreadMemoryResources<STACK>,
+        registry: &ClientFrameRegistry,
+        registered_pages: &[u64],
+    ) -> Result<Self, ThreadRegistryError> {
+        if !resources.is_live() {
+            return Err(ThreadRegistryError::Resources(
+                ThreadRollbackError::InvalidIdentity,
+            ));
+        }
         let mut inventory = resources
             .rollback_resources()
             .map_err(ThreadRegistryError::Resources)?;
@@ -60,7 +77,7 @@ impl<const STACK: usize> ThreadRegistrySnapshot<STACK> {
             if registered_pages[..index].contains(page)
                 || !resources
                     .backing_pages()
-                    .any(|(owned, _, _)| owned == *page)
+                    .any(|(owned, owner, _)| owned == *page && owner != 0)
             {
                 return Err(ThreadRegistryError::InvalidCoverage);
             }

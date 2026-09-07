@@ -157,10 +157,16 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain win32k attachment construction, rights remap and backing replacement in-place through
   rollback/commit failures; remove raw record/take machinery and require checked pageout detach
   (tranche 68, host/build; legacy thread-release failure still stops execution, not retry-complete).
+- [x] Retain checked per-capability unmap acknowledgements across rollback release retries, reconcile
+  partial thread construction without fabricated owners, and remove the untracked trampoline
+  diagnostic alias (tranche 69, host/build; native failed-construction handoff remains open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next replace the legacy fatal release boundary
-  with retained resource-bundle failure propagation and close remaining non-ingress routing bypasses; retain complete
-  external-alias journals, then wire registered-resume
+  emptiness as a complete execution-quiescence proof. Next add allocation-free failed-construction
+  handoff from the busy publication ticket into its pre-reserved runtime row, retaining optional/unbuilt
+  TCB, partial memory, mechanism inventory and exact process/pool/window ownership before fallible
+  reconciliation. Replace constructor-local destructive failure exits with this handoff, then replace
+  the legacy fatal release boundary with a checked retry backend. Close remaining non-ingress routing
+  bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
@@ -27121,6 +27127,48 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     clearing before native pending cleanup activation. Image snapshot coherency, main/early spawn,
     ordinary termination, handler handoffs, user-mode SEH and live failure validation remain open.
     No desktop proof is claimed; 33 unresolved win32k imports still block the full gate.
+
+    B3 partial-construction rollback tranche 69 (2026-09-07, host/build green):
+    The existing non-cloneable `ThreadRollback` now owns each Alias/Frame capability's checked unmap
+    acknowledgement separately from release. A failed delete or frame recycle retains both the cap
+    and that acknowledgement; retry never repeats a successful unmap. Mechanism resources bypass
+    unmap, and all aliases and mechanisms still retire before any physical frame. The required
+    backend callback replaces the previous contract that left unmap progress entirely to adapters;
+    there is no default success implementation or second release journal.
+
+    `ThreadRegistrySnapshot::capture_partial` explicitly reconciles incomplete construction while
+    full `capture` retains its strict all-pages-built requirement. Partial capture preserves layout,
+    includes only actual physical owners and their aliases, rejects registered coverage for unbuilt
+    pages, and retains exact registry coverage, conflict and revalidation checks. This read-only,
+    fallible snapshot does not itself provide durable ownership for constructor-local resources.
+    Terminal registry transfer snapshots remain unavailable and non-takeable while cleanup retries;
+    their exact final acknowledgement must precede commitment/pool/window retirement.
+
+    Native trampoline diagnostics no longer allocate a throwaway copied capability and root alias
+    outside the thread inventory. They inspect the existing owned root mapping and retain actual
+    retype/map status reporting. The leaked diagnostic capability, extra alias and fabricated error
+    contents are removed, rather than teaching cleanup to infer their existence later.
+
+    Validation: ten new host tests cover empty/partial construction, exact registered coverage,
+    orphan/conflicting ownership, stale snapshots, failed unmaps, release retry after acknowledged
+    unmap, and composition with the real terminal client-frame transfer. The existing exhaustive
+    rollback failure/stale-identity matrix now includes every unmap operation. The serialized
+    nine-crate suite passes 1,108 tests, including 181 `nt-user-host` tests; log:
+    `.tmp/test-thread-release-progress-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log:
+    `.tmp/build-thread-release-progress-20260907.log`. Two read-only agents reviewed constructor
+    ownership and rollback/registry ordering; root alone ran tests followed by the build.
+
+    Review adjustment: simply propagating release errors would lose resources from roughly twenty
+    constructor-local failure exits. Add allocation-free failed-construction handoff consuming the
+    existing busy publication ticket into its pre-reserved runtime row. Retain optional/unbuilt TCB,
+    partial memory and mechanism inventory, and exact process/pool/window ownership before fallible
+    reconciliation. Replace constructor-local destructive failure exits with this handoff. Keep
+    native cleanup activation gated on complete inventory and a checked retry backend: the legacy
+    fatal release boundary remains, and native `begin_pending` is not activated by this tranche.
+    External-alias journals, checked free-list publication, mirrored-reference clearing, image
+    coherency, ordinary termination, handler handoffs and user-mode SEH remain open. No QEMU or
+    desktop proof is claimed; 33 unresolved win32k imports still block the full gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
