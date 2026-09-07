@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod key_lease;
+mod key_close;
 mod mutation;
 mod snapshot;
 
@@ -1085,6 +1086,7 @@ impl CmServer {
             opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE => self.op_checkpoint_system_hive(in_buf, out_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
+            opcode::CM_OP_SYSTEM_HIVE_KEY_CLOSE => self.op_system_hive_key_close(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_RECORD => {
                 self.op_query_leased_hive_record(in_buf, out_buf)

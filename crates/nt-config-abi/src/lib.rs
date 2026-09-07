@@ -121,6 +121,19 @@ pub mod opcode {
     pub const CM_OP_EXPORT_LEASED_HIVE: u16 = 0x215b;
     /// Peek, stream, and exactly acknowledge the next live PnP device action.
     pub const CM_OP_DEVICE_ACTION: u16 = 0x215c;
+    /// Release an exact SYSTEM key lease through a retained receipt, then acknowledge its receipt.
+    pub const CM_OP_SYSTEM_HIVE_KEY_CLOSE: u16 = 0x215d;
+}
+
+pub mod hive_key_close_operation {
+    pub const PREPARE: u16 = 1;
+    pub const ACKNOWLEDGE: u16 = 2;
+}
+
+pub mod hive_key_close_disposition {
+    pub const RETAINED: u16 = 1;
+    pub const ACKNOWLEDGED: u16 = 2;
+    pub const ALREADY_ACKNOWLEDGED: u16 = 3;
 }
 
 pub mod raw_value_transfer {
@@ -487,6 +500,35 @@ pub struct CmHiveKeyLeaseRequest {
     pub lease_token: u64,
 }
 
+/// PREPARE carries only `lease_token`; ACKNOWLEDGE carries only the exact receipt identity.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveKeyCloseRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub lease_token: u64,
+    pub receipt_bank: u64,
+    pub receipt_slot: u64,
+    pub receipt_generation: u64,
+}
+
+/// RETAINED echoes the lease token; acknowledgement replies have a zero lease token. All replies
+/// identify the exact receipt. Acknowledged generations remain provable after receipt-slot reuse.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveKeyCloseReply {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub disposition: u16,
+    pub reserved: u16,
+    pub lease_token: u64,
+    pub receipt_bank: u64,
+    pub receipt_slot: u64,
+    pub receipt_generation: u64,
+}
+
 /// `query_leased_hive_key`: an immutable snapshot-bank cursor addressed by a previously acquired
 /// key lease. The key lease and snapshot-transfer token have independent lifetimes.
 #[repr(C)]
@@ -685,6 +727,8 @@ wire!(CmDriverServiceRequest);
 wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
 wire!(CmHiveKeyLeaseRequest);
+wire!(CmHiveKeyCloseRequest);
+wire!(CmHiveKeyCloseReply);
 wire!(CmLeasedHiveKeyRequest);
 wire!(CmHiveExportHeader);
 wire!(CmLeasedHiveRecordRequest);
@@ -793,6 +837,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyLeaseRequest>(), 24);
+        assert_eq!(core::mem::size_of::<CmHiveKeyCloseRequest>(), 40);
+        assert_eq!(core::mem::size_of::<CmHiveKeyCloseReply>(), 40);
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);
         assert_eq!(core::mem::size_of::<CmHiveCheckpointRequest>(), 32);

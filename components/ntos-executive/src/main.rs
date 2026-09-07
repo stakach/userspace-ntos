@@ -3390,6 +3390,7 @@ const DELAY_TIMER_SOURCE_JOB_TIME: u64 = 10;
 const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
 const DELAY_TIMER_SOURCE_PROVIDER_WAIT: u64 = 12;
 const DELAY_TIMER_SOURCE_PROVIDER_TIMER: u64 = 13;
+const DELAY_TIMER_SOURCE_REGISTRY_CLOSE: u64 = 14;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -5039,6 +5040,21 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         (&b" references="[..], properties.references as u64),
         (&b" transfers="[..], properties.transfers as u64),
         (&b" retiring="[..], properties.retiring as u64),
+    ] {
+        print_str(label);
+        print_u64(value);
+    }
+    print_str(b"\n");
+    let registry = unsafe { driver_launch::driver_registry_owner_stats() };
+    print_str(b"[driver-registry-owners]");
+    for (label, value) in [
+        (&b" active="[..], registry.active as u64),
+        (&b" unpublished="[..], registry.unpublished as u64),
+        (&b" inflight="[..], registry.inflight as u64),
+        (&b" pending="[..], registry.pending),
+        (&b" close-attempts="[..], registry.close_attempts),
+        (&b" close-failures="[..], registry.close_failures),
+        (&b" retries="[..], registry.retry_attempts),
     ] {
         print_str(label);
         print_u64(value);
@@ -7380,7 +7396,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 13;
+pub(crate) const SUBDRAIN_N: usize = 14;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -16115,6 +16131,24 @@ pub(crate) unsafe fn config_manager_close_system_hive_key(
     Ok(())
 }
 
+pub(crate) unsafe fn config_manager_prepare_system_hive_key_close(
+    lease: nt_config_client::SystemHiveKeyLease,
+) -> Result<nt_config_client::SystemHiveKeyCloseReceipt, i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.prepare_system_hive_key_close(lease)
+}
+
+pub(crate) unsafe fn config_manager_acknowledge_system_hive_key_close(
+    receipt: nt_config_client::SystemHiveKeyCloseReceipt,
+) -> Result<nt_config_client::SystemHiveKeyCloseAcknowledgement, i32> {
+    let client = CONFIG_CLIENT_PTR
+        .as_mut()
+        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
+    client.acknowledge_system_hive_key_close(receipt)
+}
+
 pub(crate) unsafe fn config_manager_query_leased_system_hive_key_information(
     lease: nt_config_client::SystemHiveKeyLease,
 ) -> Result<nt_config_client::LeasedHiveKeyInformation, i32> {
@@ -17247,6 +17281,7 @@ unsafe fn delay_timer_next_deadline(
     let acpi_pci_route_recovery_deadline =
         driver_launch::hosted_acpi_pci_route_recovery_next_deadline();
     let job_time_deadline = handler.job_time_sample_next_deadline();
+    let registry_close_deadline = driver_launch::driver_registry_close_retry_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
         .into_iter()
@@ -17261,6 +17296,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(hosted_driver_deadline)
         .chain(acpi_pci_route_recovery_deadline)
         .chain(job_time_deadline)
+        .chain(registry_close_deadline)
         .chain(deadman_deadline)
         .min()?;
     let source = if delay_deadline == Some(deadline) {
@@ -17287,6 +17323,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY
     } else if job_time_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_JOB_TIME
+    } else if registry_close_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_REGISTRY_CLOSE
     } else {
         DELAY_TIMER_SOURCE_WATCHDOG
     };
@@ -17512,6 +17550,7 @@ unsafe fn delay_timer_drain_due_work(
             handler,
             nt_time_snapshot_at(now_100ns),
         ))
+        + subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
         + watchdog_tick
 }
 

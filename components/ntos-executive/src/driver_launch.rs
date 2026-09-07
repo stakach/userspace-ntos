@@ -30,6 +30,17 @@ pub(crate) mod device_property;
 #[path = "win32k_device_properties.rs"]
 pub(crate) mod win32k_device_properties;
 
+#[path = "driver_registry_handles.rs"]
+pub(crate) mod driver_registry_handles;
+use driver_registry_handles::{
+    close_driver_registry_handle, driver_registry_handle_slot, open_driver_registry_handle,
+    retire_driver_registry_handle,
+};
+pub(crate) use driver_registry_handles::{
+    driver_registry_close_retry_deadline, driver_registry_close_retry_wake_due,
+    retry_driver_registry_closes, stats as driver_registry_owner_stats,
+};
+
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use core::sync::atomic::{compiler_fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -5339,7 +5350,6 @@ impl HostedDriverRegistryIdentity {
 
 #[derive(Clone, Copy)]
 enum DriverRegistryHandleTarget {
-    Empty,
     Generic {
         path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
     },
@@ -5350,11 +5360,10 @@ enum DriverRegistryHandleTarget {
 }
 
 impl DriverRegistryHandleTarget {
-    fn path(self) -> Option<HostedAscii<HOSTED_REGISTRY_PATH_MAX>> {
+    fn path(self) -> HostedAscii<HOSTED_REGISTRY_PATH_MAX> {
         match self {
-            Self::Empty => None,
-            Self::Generic { path } => Some(path),
-            Self::System { physical_path, .. } => Some(physical_path),
+            Self::Generic { path } => path,
+            Self::System { physical_path, .. } => physical_path,
         }
     }
 }
@@ -5414,7 +5423,6 @@ struct HostedSystemRegistrySetTransfer {
     upload: nt_config_client::SystemHiveValueUpload,
 }
 
-static mut DRIVER_REGISTRY_HANDLES: Option<Vec<DriverRegistryHandleSlot>> = None;
 static mut HOSTED_SYSTEM_REGISTRY_SET_TRANSFERS: Option<Vec<HostedSystemRegistrySetTransfer>> =
     None;
 static HOSTED_SYSTEM_REGISTRY_SET_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -5848,7 +5856,7 @@ fn cm_registry_path_from_object_attributes(
     }
 
     let root = root_slot?;
-    let root_path = root.target.path()?;
+    let root_path = root.target.path();
     if name.is_empty() {
         return Some(root_path);
     }
@@ -7004,13 +7012,6 @@ unsafe fn clear_driver_object_extensions_for_driver_object(driver_object: u64) {
     }
 }
 
-unsafe fn driver_registry_handles_mut() -> &'static mut Vec<DriverRegistryHandleSlot> {
-    let slot = &mut *core::ptr::addr_of_mut!(DRIVER_REGISTRY_HANDLES);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().unwrap()
-}
 
 unsafe fn hosted_registry_identities_mut() -> &'static mut Vec<HostedRegistryIdentitySlot> {
     let slot = &mut *core::ptr::addr_of_mut!(HOSTED_REGISTRY_IDENTITIES);
@@ -7077,56 +7078,6 @@ unsafe fn release_hosted_registry_identity(identity_id: HostedRegistryIdentityId
     }
 }
 
-unsafe fn allocate_driver_registry_handle(target: DriverRegistryHandleTarget) -> Option<u64> {
-    if matches!(target, DriverRegistryHandleTarget::Empty) {
-        return None;
-    }
-    let token = DRIVER_REGISTRY_HANDLE_NEXT_TOKEN
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-            (next <= DRIVER_REGISTRY_HANDLE_TOKEN_MASK).then_some(next + 1)
-        })
-        .ok()?;
-    let handle = DRIVER_REGISTRY_HANDLE_BASE | token;
-    let table = driver_registry_handles_mut();
-    for slot in table.iter_mut() {
-        if matches!(slot.target, DriverRegistryHandleTarget::Empty) {
-            *slot = DriverRegistryHandleSlot { handle, target };
-            return Some(handle);
-        }
-    }
-    table.push(DriverRegistryHandleSlot { handle, target });
-    Some(handle)
-}
-
-unsafe fn close_driver_registry_handle(handle: u64) -> Option<DriverRegistryHandleTarget> {
-    if (handle & !DRIVER_REGISTRY_HANDLE_TOKEN_MASK) != DRIVER_REGISTRY_HANDLE_BASE {
-        return None;
-    }
-    let Some(table) = (*core::ptr::addr_of_mut!(DRIVER_REGISTRY_HANDLES)).as_mut() else {
-        return None;
-    };
-    let slot = table.iter_mut().find(|slot| {
-        slot.handle == handle && !matches!(slot.target, DriverRegistryHandleTarget::Empty)
-    })?;
-    slot.handle = 0;
-    Some(core::mem::replace(
-        &mut slot.target,
-        DriverRegistryHandleTarget::Empty,
-    ))
-}
-
-unsafe fn driver_registry_handle_slot(handle: u64) -> Option<DriverRegistryHandleSlot> {
-    if (handle & !DRIVER_REGISTRY_HANDLE_TOKEN_MASK) != DRIVER_REGISTRY_HANDLE_BASE {
-        return None;
-    }
-    let table = (*core::ptr::addr_of!(DRIVER_REGISTRY_HANDLES)).as_ref()?;
-    table
-        .iter()
-        .find(|slot| {
-            slot.handle == handle && !matches!(slot.target, DriverRegistryHandleTarget::Empty)
-        })
-        .copied()
-}
 
 unsafe fn hosted_system_registry_set_transfers_mut(
 ) -> &'static mut Vec<HostedSystemRegistrySetTransfer> {
@@ -53287,36 +53238,10 @@ unsafe fn hosted_registry_identity_by_pdo_object_at(
 unsafe fn service_hosted_driver_open_registry_path(
     path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
 ) -> (i32, u64, u64) {
-    if path.is_empty() {
-        return (STATUS_INVALID_PARAMETER, 0, 0);
+    match open_driver_registry_handle(path, true) {
+        Ok(slot) => (STATUS_SUCCESS, slot.handle, 0),
+        Err(status) => (status, 0, 0),
     }
-    let target = if hosted_registry_path_is_system(path) {
-        let opened = match crate::config_manager_open_system_hive_key(path.as_str()) {
-            Ok(opened) => opened,
-            Err(status) => return (status, 0, 0),
-        };
-        let mut physical_path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
-        if !physical_path.push_str(&opened.physical_path) {
-            let _ = crate::config_manager_close_system_hive_key(opened.lease);
-            return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
-        }
-        DriverRegistryHandleTarget::System {
-            lease: opened.lease,
-            physical_path,
-        }
-    } else {
-        if !crate::config_manager_open_key(path.as_str()) {
-            return (STATUS_OBJECT_NAME_NOT_FOUND, 0, 0);
-        }
-        DriverRegistryHandleTarget::Generic { path }
-    };
-    let Some(handle) = allocate_driver_registry_handle(target) else {
-        if let DriverRegistryHandleTarget::System { lease, .. } = target {
-            let _ = crate::config_manager_close_system_hive_key(lease);
-        }
-        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
-    };
-    (STATUS_SUCCESS, handle, 0)
 }
 
 fn hosted_registry_path_is_system(path: HostedAscii<HOSTED_REGISTRY_PATH_MAX>) -> bool {
@@ -53363,12 +53288,16 @@ unsafe fn service_hosted_driver_create_registry_path(
         return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0);
     };
     let parent = &resolved.physical_path[..separator];
-    let parent_lease = match crate::config_manager_open_system_hive_key(parent) {
-        Ok(opened) => opened.lease,
+    let mut parent_path = HostedAscii::empty();
+    if !parent_path.push_str(parent) {
+        return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
+    }
+    let parent_owner = match open_driver_registry_handle(parent_path, false) {
+        Ok(opened) => opened,
         Err(STATUS_OBJECT_NAME_NOT_FOUND) => return (STATUS_OBJECT_PATH_NOT_FOUND, 0, 0),
         Err(status) => return (status, 0, 0),
     };
-    if let Err(status) = crate::config_manager_close_system_hive_key(parent_lease) {
+    if let Err(status) = retire_driver_registry_handle(parent_owner.handle) {
         return (status, 0, 0);
     }
     if let Err(status) = crate::persist_and_publish_system_hive_mutation(&[
@@ -53391,9 +53320,6 @@ unsafe fn service_hosted_driver_query_registry_value(
     target: DriverRegistryHandleTarget,
     value_name: HostedAscii<HOSTED_REGISTRY_PATH_MAX>,
 ) -> (i32, u64, u64) {
-    if matches!(target, DriverRegistryHandleTarget::Empty) {
-        return (STATUS_INVALID_PARAMETER, 0, 0);
-    }
     let data = core::slice::from_raw_parts_mut(
         (arg + HOSTED_REGISTRY_ARG_DATA_OFF) as *mut u8,
         HOSTED_REGISTRY_VALUE_SCRATCH_MAX,
@@ -53411,7 +53337,6 @@ unsafe fn service_hosted_driver_query_registry_value(
                 Err(error) => Err(error.status),
             }
         }
-        DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
     };
     match value {
         Ok((value_type, value)) if value.len() <= data.len() => {
@@ -53523,16 +53448,9 @@ pub(crate) fn service_hosted_driver_registry(
                 service_hosted_driver_open_registry_path(path)
             }
             HOSTED_REGISTRY_OP_CLOSE => {
-                abort_hosted_system_registry_sets_for_handle(a1);
                 match close_driver_registry_handle(a1) {
-                    Some(DriverRegistryHandleTarget::System { lease, .. }) => {
-                        match crate::config_manager_close_system_hive_key(lease) {
-                            Ok(()) => (STATUS_SUCCESS, 0, 0),
-                            Err(status) => (status, 0, 0),
-                        }
-                    }
-                    Some(DriverRegistryHandleTarget::Generic { .. }) => (STATUS_SUCCESS, 0, 0),
-                    Some(DriverRegistryHandleTarget::Empty) | None => (STATUS_INVALID_HANDLE, 0, 0),
+                    Ok(()) => (STATUS_SUCCESS, 0, 0),
+                    Err(status) => (status, 0, 0),
                 }
             }
             HOSTED_REGISTRY_OP_ENUMERATE_KEY => {
@@ -53559,7 +53477,6 @@ pub(crate) fn service_hosted_driver_registry(
                     DriverRegistryHandleTarget::Generic { path } => {
                         crate::config_manager_enumerate_key(path.as_str(), a2 as u32, data)
                     }
-                    DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                 };
                 match result {
                     Ok(n) => {
@@ -53607,24 +53524,16 @@ pub(crate) fn service_hosted_driver_registry(
                         value_name,
                     );
                 }
-                let opened = match crate::config_manager_open_system_hive_key(key_path.as_str()) {
+                let opened = match open_driver_registry_handle(key_path, false) {
                     Ok(opened) => opened,
                     Err(status) => return (status, 0, 0),
                 };
-                let mut physical_path = HostedAscii::<HOSTED_REGISTRY_PATH_MAX>::empty();
-                if !physical_path.push_str(&opened.physical_path) {
-                    let _ = crate::config_manager_close_system_hive_key(opened.lease);
-                    return (STATUS_INSUFFICIENT_RESOURCES, 0, 0);
-                }
                 let result = service_hosted_driver_query_registry_value(
                     arg,
-                    DriverRegistryHandleTarget::System {
-                        lease: opened.lease,
-                        physical_path,
-                    },
+                    opened.target,
                     value_name,
                 );
-                let close_status = crate::config_manager_close_system_hive_key(opened.lease);
+                let close_status = retire_driver_registry_handle(opened.handle);
                 if result.0 == STATUS_SUCCESS {
                     if let Err(status) = close_status {
                         return (status, 0, 0);
@@ -53660,7 +53569,6 @@ pub(crate) fn service_hosted_driver_registry(
                             .map_err(|status| status as i32)
                         }),
                     DriverRegistryHandleTarget::Generic { .. } => Err(STATUS_NOT_SUPPORTED),
-                    DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                 };
                 match result {
                     Ok(()) => (STATUS_SUCCESS, 0, 0),
@@ -53718,7 +53626,6 @@ pub(crate) fn service_hosted_driver_registry(
                                     data,
                                 )
                             }
-                            DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                         };
                         match result {
                             Ok(()) => (STATUS_SUCCESS, 0, 0),
@@ -53757,7 +53664,6 @@ pub(crate) fn service_hosted_driver_registry(
                                     a3 as usize,
                                 )
                             }
-                            DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                         };
                         match result {
                             Ok(token) => (STATUS_SUCCESS, token, 0),
@@ -53800,7 +53706,6 @@ pub(crate) fn service_hosted_driver_registry(
                                     data,
                                 )
                             }
-                            DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                         };
                         match result {
                             Ok(()) => (STATUS_SUCCESS, 0, 0),
@@ -53840,7 +53745,6 @@ pub(crate) fn service_hosted_driver_registry(
                             DriverRegistryHandleTarget::Generic { .. } => {
                                 crate::config_manager_commit_set_value_transfer(a2, a3 as usize)
                             }
-                            DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                         };
                         match result {
                             Ok(()) => (STATUS_SUCCESS, 0, 0),
@@ -53855,7 +53759,6 @@ pub(crate) fn service_hosted_driver_registry(
                             DriverRegistryHandleTarget::Generic { .. } => {
                                 crate::config_manager_abort_set_value_transfer(a2, a3 as usize)
                             }
-                            DriverRegistryHandleTarget::Empty => Err(STATUS_INVALID_HANDLE),
                         };
                         match result {
                             Ok(()) => (STATUS_SUCCESS, 0, 0),

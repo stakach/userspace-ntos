@@ -285,6 +285,10 @@ below are historical baselines, not acceptance of the current provider cutover.
   ownership across suspension, invalidate on completion, and reject stale transfer consumption.
 - [x] Move device-property snapshot collection into the testable I/O core (tranche 113). Validate
   complete replies and explicit scratch ownership before publishing any native caller-buffer bytes.
+- [x] Retain registry broker keys until acknowledged CM close, with retry-safe close receipts
+  (tranche 114). Closing keys are inaccessible; no take-before-IPC or INVALID_HANDLE success fallback.
+- [ ] Retain CM OPEN request/reply ownership through native path validation and publication
+  (tranche 115). Pre-reserve ownership and remove ignored cleanup errors, including malformed replies.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28962,6 +28966,63 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     complete-output ownership. All 292 I/O-manager tests and its ownership compile-fail test pass in
     `.tmp/test-device-property-query-20260908.log`. Both native adapters now use this core; removed
     the replaced native transaction loop. Final regression/build evidence is recorded in tranche 110.
+
+    B3 retained registry close tranche 114 (2026-09-08, complete):
+
+    The existing driver broker clears its key row before CM acknowledges close. Replace that with
+    a retained, exact-ticket lifecycle over its existing handle namespace, excluding closing rows
+    from query/write/upload and reuse. CM currently deletes a lease before replying, so a lost or
+    malformed success cannot safely become a second close followed by INVALID_HANDLE-as-success.
+    Add explicit retained-close receipts and acknowledged receipt generations: retries return exact
+    evidence, including after receipt slot reuse, without an unbounded per-close tombstone list.
+    Preflight receipt storage before releasing a lease; fence independent server/bank identities.
+    Preserve invalidated outstanding lease owners across mount replacement until their actual
+    retirement. Only validated acknowledgement permits the native row to forget its owner.
+
+    Implemented a dedicated fixed-wire CM retained-close/ACK protocol. Globally issued nonwrapping
+    lease tokens and receipt-bank identities reject foreign/replacement owners. Reusable receipt
+    slots retain sequential acknowledged-generation watermarks, proving repeat ACKs even after
+    reuse without storing a tombstone per close. Capacity and output-buffer validation precede key
+    release. Mount replacement denies reads while retaining exact outstanding owners; both retained
+    and legacy close can release known invalidated owners, but unknown/closed tokens remain invalid.
+
+    BrokerKeyOwner stores an immutable target separately from ticket-gated mutable cleanup metadata.
+    Reservation precedes CM acquisition; publication and close tickets fence exact owner/attempt
+    generations, require explicit completion and retain failures. Dropped tickets cannot reopen
+    access or release a potentially in-flight owner. Native driver_registry_handles.rs replaces the
+    old remove-before-close Vec machinery and Empty target cases. Known ordinary, temporary and
+    unpublished leases retain the same row across PREPARE/ACK failures; a received receipt is stored
+    before ACK IPC, and retries resume ACK rather than restarting close. No table borrow spans CM.
+
+    Maintenance retries at most one eligible row, rotates fairly and uses a one-to-thirty-second
+    bounded backoff. Timer drain only latches readiness; actual CM calls run at the outer hosted-event
+    boundary. Ready work leaves deadline selection until consumed, avoiding repeated overdue IRQs;
+    CM wait time cannot consume the next cooldown. Read-only diagnostics report active/unpublished/
+    in-flight/pending owners and actual close/failure/retry counts. No synthetic success gate added.
+
+    Fifteen owner tests and four compile-fail checks cover immutable target ownership and exact
+    tickets; real in-process client/server tests exercise lost/malformed replies, repeat ACK after
+    reuse, foreign identities, exhaustion and mount replacement. The 24-crate regression passes
+    2,613 tests in `.tmp/test-registry-close-integration-regression-final-20260908.log`. Final native
+    release passes with unchanged 262 warnings in `.tmp/build-retained-registry-close-final-20260908.log`.
+    Review found no remaining introduced lifetime blocker. Tranche 115 and canonical NT Key/security
+    migration remain open; this checkpoint is not desktop acceptance.
+
+    B3 retained registry open tranche 115 (queued after 114):
+
+    Native open and temporary query/create paths also discard cleanup errors. ConfigClient and the
+    executive OPEN helper can discard a returned lease before exposing malformed path/generation
+    failures to the caller. A native reservation alone cannot recover an owner hidden by that API,
+    nor infer an unknown token after an ambiguous OPEN response. Complete retained OPEN request,
+    response and publication ownership, then remove those ignored-close paths. Tranche 114 covers
+    known owners and retry-safe CLOSE, not this distinct publication contract.
+
+    IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
+    forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
+    accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile
+    authority, and has distinct Device Parameters creation/DACL behavior for unprofiled DEVICE keys.
+    Existing path aliases and lease tokens are not access-checked NT Key handles. Do not copy ReactOS
+    gaps in invalid-flag rejection or profile path selection, or fabricate a fixed profile number.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

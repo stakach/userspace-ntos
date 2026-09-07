@@ -10,6 +10,15 @@
 
 extern crate alloc;
 
+mod key_close;
+pub use key_close::{SystemHiveKeyCloseAcknowledgement, SystemHiveKeyCloseReceipt};
+
+mod broker_key_owner;
+pub use broker_key_owner::{
+    BrokerKeyCloseTicket, BrokerKeyOwner, BrokerKeyOwnerError, BrokerKeyOwners,
+    BrokerKeyPhase, BrokerKeyPublicationTicket,
+};
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -4279,6 +4288,7 @@ mod tests {
             client.query_leased_system_hive_key(stale),
             Err(STATUS_INVALID_HANDLE)
         );
+        assert_eq!(client.close_system_hive_key(stale), Ok(3));
         assert_eq!(
             client.close_system_hive_key(stale),
             Err(STATUS_INVALID_HANDLE)
