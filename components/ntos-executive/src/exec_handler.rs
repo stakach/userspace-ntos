@@ -9624,6 +9624,7 @@ impl ExecNtHandler {
                     && !runtime_table
                         .entries
                         .iter()
+                        .filter_map(|slot| slot.owner())
                         .any(|runtime| runtime.is_live() && runtime.pi == pi)
             })
             .ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
@@ -9860,7 +9861,7 @@ impl ExecNtHandler {
 
     pub(crate) fn hosted_thread_tcb_for_badge(&self, badge: u64) -> Option<u64> {
         self.thread_runtime
-            .get_by_badge(badge)
+            .executable_by_badge(badge)
             .map(|runtime| runtime.tcb)
             .filter(|&tcb| tcb > 1)
     }
@@ -10494,14 +10495,14 @@ impl ExecNtHandler {
 
     pub(crate) fn hosted_thread_lpc_client_process(&self, badge: u64) -> u32 {
         self.thread_runtime
-            .get_by_badge(badge)
+            .executable_by_badge(badge)
             .map(|runtime| runtime.lpc_client_process)
             .unwrap_or(0)
     }
 
     pub(crate) fn hosted_thread_lpc_server_port(&self, badge: u64) -> u64 {
         self.thread_runtime
-            .get_by_badge(badge)
+            .executable_by_badge(badge)
             .map(|runtime| runtime.lpc_server_port)
             .unwrap_or(0)
     }
@@ -10511,6 +10512,9 @@ impl ExecNtHandler {
     }
 
     fn set_current_thread_lpc_server_context(&mut self, port: u64, process: u64) {
+        if self.thread_runtime.pending_for_badge(self.current_badge) {
+            return;
+        }
         let process = u32::try_from(process).unwrap_or(0);
         let _ = self
             .thread_runtime
@@ -10519,17 +10523,20 @@ impl ExecNtHandler {
     }
 
     pub(crate) fn hosted_thread_teb_for_badge(&self, badge: u64) -> Option<u64> {
-        let runtime = self.thread_runtime.get_by_badge(badge)?;
+        let runtime = self.thread_runtime.executable_by_badge(badge)?;
         self.pm
             .thread_teb(runtime.tid as nt_process::ThreadId)
             .filter(|teb| *teb != 0)
     }
 
     fn current_hosted_thread_user_stack_range(&self) -> Option<(u64, u64)> {
+        if self.thread_runtime.pending_for_badge(self.current_badge) {
+            return None;
+        }
         let runtime = self
             .thread_runtime
-            .get_by_badge(self.current_badge)
-            .or_else(|| self.thread_runtime.get_by_tid(self.current_tid))?;
+            .executable_by_badge(self.current_badge)
+            .or_else(|| self.thread_runtime.executable_by_tid(self.current_tid))?;
         if runtime.pi != self.pi {
             return None;
         }
@@ -10546,7 +10553,7 @@ impl ExecNtHandler {
         badge: u64,
         pi: usize,
     ) -> Option<(u64, u64, HostedThreadRole)> {
-        let runtime = self.thread_runtime.get_by_badge(badge)?;
+        let runtime = self.thread_runtime.executable_by_badge(badge)?;
         if runtime.pi != pi {
             return None;
         }
@@ -10665,7 +10672,7 @@ impl ExecNtHandler {
         pi: usize,
         role: HostedThreadRole,
     ) -> Option<(u64, u64, u64)> {
-        let runtime = self.thread_runtime.get_by_role(pi, role)?;
+        let runtime = self.thread_runtime.executable_by_role(pi, role)?;
         (runtime.tid != 0 && runtime.tcb > 1).then_some((runtime.tid, runtime.tcb, runtime.badge))
     }
 
@@ -10711,7 +10718,7 @@ impl ExecNtHandler {
         let mut count = 0usize;
         let mut overflow = false;
         let table = unsafe { &*self.thread_runtime.table };
-        for runtime in table.entries.iter().copied() {
+        for runtime in table.entries.iter().filter_map(|slot| slot.executable()).copied() {
             if !runtime.is_live() || runtime.tcb <= 1 || runtime.pi != pi {
                 continue;
             }
@@ -10745,7 +10752,7 @@ impl ExecNtHandler {
         let mut suspended = 0usize;
         let mut failures = 0usize;
         let table = unsafe { &*self.thread_runtime.table };
-        for runtime in table.entries.iter().copied() {
+        for runtime in table.entries.iter().filter_map(|slot| slot.executable()).copied() {
             if !runtime.is_live() || runtime.tcb <= 1 {
                 continue;
             }
@@ -10760,7 +10767,7 @@ impl ExecNtHandler {
 
     fn hosted_thread_role_for_current_badge(&self) -> Option<HostedThreadRole> {
         self.thread_runtime
-            .get_by_badge(self.current_badge)
+            .executable_by_badge(self.current_badge)
             .map(|runtime| runtime.role)
     }
 
@@ -11076,9 +11083,12 @@ impl ExecNtHandler {
     }
 
     fn current_hosted_thread_role(&self) -> Option<HostedThreadRole> {
+        if self.thread_runtime.pending_for_badge(self.current_badge) {
+            return None;
+        }
         self.hosted_thread_role_for_current_badge().or_else(|| {
             self.thread_runtime
-                .get_by_tid(self.current_tid)
+                .executable_by_tid(self.current_tid)
                 .map(|runtime| runtime.role)
         })
     }
@@ -17970,7 +17980,7 @@ impl ExecNtHandler {
         let mechanism = self
             .hosted_thread_mechanism_for_tid(tid as u64)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let runtime = self.thread_runtime.get_by_tid(tid as u64)
+        let runtime = self.thread_runtime.executable_by_tid(tid as u64)
             .filter(|runtime| runtime.pi == mechanism.pi && !runtime.publication.is_busy())
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         if self.capture_thread_process_identity(mechanism.pi, tid as u64) != Some(runtime.process) {
@@ -26574,7 +26584,7 @@ impl ExecNtHandler {
         let records = self.thread_runtime.record_count();
         let mut sampled = 0u64;
         for index in 0..records {
-            let Some(runtime) = self.thread_runtime.get_by_index(index) else {
+            let Some(runtime) = self.thread_runtime.executable_by_index(index) else {
                 continue;
             };
             let Ok(tid) = nt_process::ThreadId::try_from(runtime.tid) else {
@@ -26662,7 +26672,7 @@ impl ExecNtHandler {
     fn sample_hosted_process_scheduler_times(&mut self, pid: nt_process::ProcessId) {
         let records = self.thread_runtime.record_count();
         for index in 0..records {
-            let Some(runtime) = self.thread_runtime.get_by_index(index) else {
+            let Some(runtime) = self.thread_runtime.executable_by_index(index) else {
                 continue;
             };
             let Ok(tid) = nt_process::ThreadId::try_from(runtime.tid) else {

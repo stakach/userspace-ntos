@@ -136,9 +136,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Give temporary process slots exact monotonic claims and retain tagged PID/generation
   provenance in native runtime bindings before worker construction (tranche 61, host/build;
   pending-owner activation remains open).
+- [x] Add in-place non-cloneable pending runtime storage, protected table mutation/release and
+  distinct direct execution projections; extract the native table into a focused module
+  (tranche 62, host/build; native cleanup entry not activated).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next integrate the retained pending owner into
-  native runtime/pool/window tables with process-generation validation, then wire registered-resume
+  emptiness as a complete execution-quiescence proof. Next close pending-owner dispatch ingress and
+  memory-admission bypasses, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
@@ -26787,6 +26790,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     exclusions before activating checked registered-resume cleanup. Main/early construction cleanup,
     ordinary termination resource-release failures and handler-owned handoffs remain open. The full
     win32k import gate still has 33 unresolved code imports; this is not desktop or live failure proof.
+
+    B3 in-place runtime ownership tranche 62 (2026-09-07, host/build green):
+    `nt-user-host::thread_slot` adds a non-cloneable slot with private vacant, published and pending
+    states. The native runtime vector allocates that storage before worker construction; pending
+    admission never pushes into another fallible container. Admission derives PID/generation/TID,
+    TCB and reservation ownership from the retained payload and compares the expected binding.
+    Failure restores the published owner. Repeated admission cannot replace a pending attempt.
+    Journal preparation, driving and final extraction require that exact attempt; incomplete or
+    stale retirement leaves the pending owner in place. Payload extraction is retirement bookkeeping,
+    not permission to republish released capabilities.
+
+    The native runtime table, its row types and its sole-owner wrapper now live in
+    `components/ntos-executive/src/hosted_thread_runtime.rs` instead of `main.rs`. Copyable runtime
+    descriptions remain snapshots, not the slot owner. Insertion requires a vacant row; ordinary
+    mutation/release refuses pending and construction-busy slots. Only the exact prepared
+    publication ticket can access a constructing row. Reset checks protection before clearing.
+    Stats, identity collision checks, process-retirement tests and pool/window ownership still see
+    pending payloads. Obsolete empty-runtime replacement and unfiltered index/main-runtime helpers are
+    removed rather than retained beside the new slot operations.
+
+    Direct TCB, stack, TEB, LPC, control, quiesce and scheduler projections select only executable
+    published rows. Current-badge stack/role fallback explicitly refuses a known pending badge.
+    Common PM wait-state mutation refuses pending TIDs. Final win32k mechanism counting remains
+    ownership-inclusive, so filtering executable TCBs cannot turn a still-retained pending runtime
+    into false process-quiescence proof. These table and direct-projection changes are native;
+    `begin_pending` is deliberately not called by the native failure adapter yet.
+
+    Validation: 14 new host tests cover non-cloneable payload retention, protected construction,
+    foreign publication tickets, invalid/stale pending admission, failed journal preparation,
+    backend failure and stale attempt rejection, completed-only retirement, and pending ownership
+    participating in the real binding/reservation collision policy. The serialized nine-crate suite
+    passes 1,033 tests, including 140 `nt-user-host` unit/integration tests;
+    log: `.tmp/test-runtime-slot-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-runtime-slot-20260907.log`.
+    Two read-only agents reviewed slot invariants, native extraction and lookup consumers; root alone ran
+    tests/builds. No live pending-cleanup injection or desktop proof is claimed.
+
+    Review adjustment: do not activate native pending entry until the service-loop ingress and
+    broader role/TID/badge routing distinguish pending from absent. In particular,
+    `live_hosted_pi_for_fault_badge`, `owner_top_badge_for`, the ingress process-zero substitution and
+    diagnostic worker-to-main TCB substitutions must not revive a pending owner or dispatch it as
+    another process. Preserve reply/continuation ownership when rejecting ingress; simply hiding a
+    row is insufficient. Retain disjoint external-alias journals and publish every fault/native-copy,
+    mirror, VM and pageout exclusion before registry transfer. Final native cleanup needs narrowly
+    checked mirrored-reference clearing and exact reservation commit while the pending owner remains
+    alive, not ordinary slot release or an aliased mutable table borrow. Registered-resume, early/main
+    construction, ordinary termination cleanup and handler-owned handoffs remain open. The complete
+    win32k import gate still has 33 unresolved code imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

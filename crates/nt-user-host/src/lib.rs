@@ -21,6 +21,7 @@ pub mod thread_pending;
 pub mod thread_resources;
 pub mod thread_registry;
 pub mod thread_rollback;
+pub mod thread_slot;
 
 use alloc::vec::Vec;
 
