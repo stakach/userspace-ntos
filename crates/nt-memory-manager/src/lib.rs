@@ -32,6 +32,7 @@ pub mod prefetch;
 pub mod retained_alias;
 mod runtime_section;
 pub mod section_scratch;
+pub mod temporary_alias;
 mod working_set;
 
 pub use client_frame::{

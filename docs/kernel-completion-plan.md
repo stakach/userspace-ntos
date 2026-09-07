@@ -203,6 +203,9 @@ below are historical baselines, not acceptance of the current provider cutover.
   (tranche 83; native prefetch claims active, destructive thread retirement remains disabled).
 - [x] Retain section scratch copy-failure slots and separate deletion from strict recycling through
   coherent I/O/writeback and frame-retirement barriers (tranche 84; other temporary aliases remain open).
+- [x] Retain the fixed resident client-copy alias through checked deletion, block source/page reuse,
+  and retry cleanup before copy admission and at the event boundary (tranche 85; two-frame COW
+  scratch and inspection aliases remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -27897,7 +27900,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Review adjustment: this completes retained slot phases for the existing section scratch owner,
     not all native temporary-alias ownership or pending-thread journal activation. Next migrate
-    img_spawn::with_recorded_frame_alias: it reuses a fixed pinned temporary cap and ignores both
+    img_spawn::with_recorded_frame_alias: it reuses a fixed retained temporary cap and ignores both
     pre-copy and post-access deletion failures. Its ordinary resident-memory read/write callers
     need retained mapping/cleanup state and explicit failure reporting before that cap or scratch
     address can be reused. vm_copy_frame_4k and COW inspection helpers still use unowned temporary
@@ -27906,6 +27909,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     complete disjoint journal reconciliation remain prerequisites for native thread destruction,
     registry transfer and final commit. No QEMU/desktop proof is claimed; the recorded 33 unresolved
     win32k imports remain the full desktop-gate blocker.
+
+    B3 retained resident client-copy alias tranche 85 (2026-09-07):
+    Added the allocation-free, non-cloneable TemporaryAlias owner and moved the fixed client-copy
+    slot out of main.rs into client_copy_alias.rs. One empty slot is reserved for the durable owner
+    and reused only after acknowledged CNode deletion. It is deliberately not root-slot pinned:
+    that mechanism prohibits deleting the slot's contents, not just allocator reuse. No per-copy
+    allocation/recycling, ignored pre-copy delete, or ignored post-access delete remains in
+    with_recorded_frame_alias. Failed copy retains the reserved empty slot; failed map/delete retains
+    the exact copied capability, source process/page/capability, address and access mode. A transfer
+    cannot report success when deletion fails. Checked address arithmetic rejects scratch overflow.
+
+    Source resolution follows previous cleanup, including the persistent-alias fast path. Ordinary
+    copy entry points and the serialized service-event boundary retry the durable owner, so the
+    source exclusion cannot prevent all future cleanup attempts. Deny-only memory probes, registry
+    put/take/reclaim, and process-emptiness checks block the retained source page and process-slot
+    reuse. Checked physical-frame prepare/publication conservatively blocks while any temporary
+    alias remains: a copied source capability need not equal the canonical backing-owner cap.
+    Legacy void thread/frame release and process-spawn boundaries require completed alias cleanup
+    before effects, using their existing fail-closed model. This does not make those legacy APIs
+    retryable; replacing their void ownership handoff remains open. No failed release silently drops
+    a frame or publishes it to the free list.
+
+    Validation: the serialized nine-crate host suite passes 1,263 tests, followed by a focused
+    314-test memory-manager rerun after the review corrections. Seven new tests cover slot reuse,
+    failed deletion and exact snapshot retention, overwrite refusal, map/copy/reservation failures,
+    null-slot success, invalid/overflowing ranges, repeated drain, and release/admission exclusions.
+    The executive build passes with the unchanged 262-warning baseline. Logs:
+    `.tmp/test-client-copy-alias-20260907.log`,
+    `.tmp/test-client-copy-alias-focused-20260907.log`, and
+    `.tmp/build-client-copy-alias-20260907.log`. Read-only agent review identified pin/delete
+    incompatibility and copied-cap versus canonical-backing identity; both are corrected.
+
+    A fresh pre-change baseline, `.tmp/run-desktop-recovery-20260907.log`, reproduced all 33 missing
+    win32k imports and the fail-closed loader panic before hosted boot. QEMU was stopped at that
+    deterministic panic, not left running to the one-hour deadline. This is not a desktop acceptance
+    result and does not validate destructive retained-thread cleanup. The ordinary desktop lane
+    already carries runtime gates; its retained-thread failure instrumentation is not yet activated.
+
+    Review adjustment: continue at vm_copy_frame_4k and the COW inspection aliases, retaining both
+    source and destination lifetimes rather than merely checking final unmaps. Then finish provider
+    capability-bank coverage and complete disjoint retirement journals before enabling native
+    destructive thread cleanup. Desktop readiness still requires real provider exception, attach,
+    section, file, object/security and driver-I/O exports. The bound ZwOpenFile/NtOpenFile hardcoded
+    failure used to suppress font enumeration must be removed alongside those implementations;
+    it is not part of the 33-name unresolved count. Do not weaken the complete import gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

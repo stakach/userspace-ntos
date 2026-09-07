@@ -686,6 +686,9 @@ static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable = HostedThreadRu
 /// holding a mutable slot must use retained capabilities directly, never recurse through here.
 pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
     use nt_user_host::thread_memory_access::{check_pending_thread_memory, PendingThreadMemory};
+    if !crate::client_copy_alias::memory_available(pi, base, size) {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
     let pi = usize::try_from(pi).map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)?;
     let table = unsafe { &*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK) };
     check_pending_thread_memory(

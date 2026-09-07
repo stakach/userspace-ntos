@@ -8641,6 +8641,13 @@ pub(crate) unsafe fn service_sec_image(
     }
     loop {
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
+        // Retry outside registry/runtime borrows, including when the next ingress is excluded.
+        // Failure retains the exact alias and all memory/backing-release exclusions.
+        if let Err(status) = crate::client_copy_alias::drain() {
+            print_str(b"[client-copy-alias] retained cleanup status=0x");
+            print_hex(status);
+            print_str(b"\n");
+        }
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {

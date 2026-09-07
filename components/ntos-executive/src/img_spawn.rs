@@ -841,6 +841,8 @@ pub(crate) unsafe fn spawn_sec_image(
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
     trace_spawn_phase(pi, b"begin");
+    crate::client_copy_alias::drain()
+        .expect("process-slot reuse requires completed client-copy alias retirement");
     // A hosted slot can first carry an unpublished diagnostic image and later a real process. End
     // that old address-space lifetime before any new paging structure is installed; published
     // process teardown uses the commitment-aware reclaim path instead.
@@ -1700,7 +1702,8 @@ pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
 /// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
-    if hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
         return false;
     }
     match smss_mirror(va, dst.len() as u64) {
@@ -1720,7 +1723,8 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
     let pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
     if has_managed_section_page(pi, va, src.len()) {
@@ -1754,7 +1758,8 @@ unsafe fn with_recorded_frame_alias(
     writable: bool,
     access: impl FnOnce(u64),
 ) -> bool {
-    if hosted_thread_memory_access(pi, page, 0x1000).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, page, 0x1000).is_err() {
         return false;
     }
     let persistent_alias = csrss_frame_alias_get(pi, page);
@@ -1771,35 +1776,18 @@ unsafe fn with_recorded_frame_alias(
     if clone_source == 0 || scratch_base == 0 {
         return false;
     }
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
-    let cap = client_copy_temp_cap();
-    let _ = cnode_delete_r(cap);
-    let copy_error = copy_cap_into_r(clone_source, cap);
-    let map_error = if copy_error == 0 {
-        page_map_r(
-            cap,
-            alias,
-            if writable {
-                RW_NX
-            } else {
-                2 | PAGE_EXECUTE_NEVER
-            },
-            CAP_INIT_THREAD_VSPACE,
-        )
-    } else {
-        copy_error
-    };
-    if map_error != 0 {
-        let _ = cnode_delete_r(cap);
+    let Some(alias) = scratch_base.checked_add(DEMAND_SCRATCH_WINDOW - 0x1000) else {
         return false;
-    }
-    access(alias);
-    let _ = cnode_delete_r(cap);
-    true
+    };
+    crate::client_copy_alias::with_frame(
+        nt_memory_manager::temporary_alias::TemporaryAliasSource { process: pi, page, frame: clone_source },
+        alias, writable, access,
+    )
 }
 
 unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: u64) -> bool {
-    if hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
         return false;
     }
     let Some(chunks) = nt_address_space::page_chunks(va, dst.len()) else {
@@ -1827,7 +1815,8 @@ unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64
 }
 
 unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
-    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
     let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
@@ -1901,7 +1890,8 @@ pub(crate) unsafe fn client_copyin_process_mapped(
     scratch_base: u64,
     allow_active_mirrors: bool,
 ) -> bool {
-    if hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
         return false;
     }
     if dst.is_empty() {
@@ -2051,7 +2041,8 @@ unsafe fn client_copyout_mapped_impl(
     scratch_base: u64,
     admitted: bool,
 ) -> bool {
-    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+    if crate::client_copy_alias::drain().is_err()
+        || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
     if src.is_empty() {

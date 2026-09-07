@@ -78,6 +78,7 @@ pub(crate) use hosted_pnp_start::*;
 mod selftests;
 pub(crate) use selftests::*;
 mod img_spawn;
+mod client_copy_alias;
 pub(crate) use img_spawn::*;
 mod win32k_glue;
 pub(crate) use win32k_glue::*;
@@ -576,6 +577,8 @@ unsafe fn recycle_plain_cap(cap: u64) {
 unsafe fn detach_win32k_attached_page_for_thread_release(pi: usize, page: u64) {
     // This legacy void-return release chain cannot yet retain a failed caller-owned resource
     // bundle. Never continue to backing reuse while a service alias still owns the old frame.
+    client_copy_alias::drain()
+        .expect("legacy thread backing release requires completed client-copy alias retirement");
     win32k_glue::detach_attached_client_page(pi as u64, page)
         .expect("legacy thread backing release requires completed win32k alias retirement");
 }
@@ -8573,7 +8576,6 @@ unsafe fn dll_cache_put(va: u64, fr: u64) -> bool {
 // user VA.
 const CLIENT_FRAME_REGISTRY_INITIAL_RESERVE: usize = 16384;
 static mut CLIENT_FRAME_REGISTRY: ClientFrameRegistry = ClientFrameRegistry::new();
-static CLIENT_COPY_TEMP_CAP: AtomicU64 = AtomicU64::new(0);
 static WORKING_SET_AGE: AtomicU64 = AtomicU64::new(1);
 static mut PROCESS_WORKING_SETS: nt_memory_manager::WorkingSetTable =
     nt_memory_manager::WorkingSetTable::new();
@@ -8593,7 +8595,8 @@ fn client_frame_registry_stats() -> ClientFrameRegistryStats {
     unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).stats() }
 }
 fn client_frame_registry_process_is_empty(pi: u64) -> bool {
-    unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
+    client_copy_alias::process_available(pi)
+        && unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
 }
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
 unsafe fn csrss_frame_put(pi: u64, page: u64, fr: u64) -> bool {
@@ -8641,6 +8644,9 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
+    if !client_copy_alias::memory_available(pi, page, 0x1000) {
+        return false;
+    }
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
     match registry.insert_at_age(
         pi,
@@ -8674,6 +8680,9 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     }
 }
 unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> {
+    if !client_copy_alias::memory_available(pi, page, 0x1000) {
+        return None;
+    }
     (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
         .take(pi, page)
         .map(|record| {
@@ -8687,6 +8696,9 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> 
 }
 
 unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
+    if !client_copy_alias::memory_available(pi, page, 0x1000) {
+        return false;
+    }
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
     let Some(mut record) = registry.get(pi, page) else {
         return true;
@@ -8881,16 +8893,6 @@ pub(crate) unsafe fn csrss_frame_create_source_copy(
     0
 }
 
-unsafe fn client_copy_temp_cap() -> u64 {
-    let cap = CLIENT_COPY_TEMP_CAP.load(Ordering::Relaxed);
-    if cap != 0 {
-        cap
-    } else {
-        let cap = alloc_slot();
-        CLIENT_COPY_TEMP_CAP.store(cap, Ordering::Relaxed);
-        cap
-    }
-}
 /// GUI client `pi`'s frame cap for page VA `page`, or 0 if not backed by a recorded per-process
 /// frame (falls back to the shared-DLL-text cache, which backs every client's RX pages identically).
 unsafe fn csrss_frame_get(pi: u64, page: u64) -> u64 {
@@ -12955,6 +12957,8 @@ unsafe fn vm_frame_return_to_free_list(frame: u64) {
     if frame == 0 {
         return;
     }
+    client_copy_alias::drain()
+        .expect("legacy frame publication requires completed client-copy alias retirement");
     if let Err(frame) = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame) {
         let _ = cnode_delete_recycle_r(frame);
     }
@@ -12965,6 +12969,8 @@ unsafe fn vm_frame_release_unmapped(frame: u64) {
 }
 
 unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
+    client_copy_alias::drain()
+        .expect("legacy frame release requires completed client-copy alias retirement");
     let _ = page_unmap_r(frame);
     if alias_cap != 0 {
         let _ = page_unmap_r(alias_cap);
