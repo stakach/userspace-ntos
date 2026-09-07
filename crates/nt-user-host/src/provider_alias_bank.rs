@@ -3,6 +3,8 @@
 //! The caller serializes the entire operation, including backend calls. Segment construction is
 //! a separate backend owner. Source frames and PML4s are borrowed and must outlive retained rows.
 use crate::process_identity::ProcessIdentity;
+#[path = "provider_alias_segment.rs"]
+pub mod segment;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -212,6 +212,8 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Replace the provider leaf-cap bank's PI-only owner/free-list machinery with exact process/page
   records, typed capabilities and retained move/recycle/delete phases (tranche 87; segment-CNode
   construction and pending-thread claims remain open).
+- [x] Retain provider segment CNode construction across reservation/retype/mint failures without
+  teardown or replay of acknowledged stages (tranche 88; pending-thread bank claims remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28046,6 +28048,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     conflict validation to joint reconciliation before any destructive native thread activation.
     Legacy frame/pagefile cleanup and stale runtime references remain open. No additional boot was
     run; the real 33-name provider-import barrier is unchanged.
+
+    B3 retained provider segment construction tranche 88 (2026-09-08):
+    Added ProviderAliasSegment, a non-cloneable owner for the executive-lifetime bank CNodes.
+    Construction retains raw-slot reservation, raw retype, guarded-slot reservation and guarded mint
+    as separate acknowledged stages. A failure keeps the exact partial owner for forward retry;
+    successful retype/mint operations are never replayed and a ready segment returns without any
+    backend effect. Invalid radix, null successful reservation and duplicate raw/guarded slots are
+    refused before publication. Segment geometry remains the existing configured 24 by 4096 leaves;
+    this change does not claim unbounded bank capacity or dynamic segment retirement.
+
+    The native durable segment-owner array replaces the separate ready-only RAW/CNODE arrays and
+    the old void recycle/delete failure chain. Reserved root slots are permanently pinned because
+    these CNodes live as long as the executive and are never moved/deleted by leaf retirement.
+    Pinning does not prohibit retype/mint or deleting a leaf inside the child CNode. This differs
+    intentionally from the reusable temporary-frame slot, whose contents must be deleted after
+    access. Bounded bank diagnostics now include the retained partial segment's raw/guarded caps
+    and retype phase as well as leaf ownership counts.
+
+    Validation: an independent rust-micro audit verified destination-emptiness, layout and CNode
+    capacity preflight before a single-object retype publishes capabilities, and mint rejection
+    before destination mutation. These contracts require the owner's initially empty destination;
+    an occupied-destination error is not treated as evidence of emptiness. Five new tests cover
+    every construction failure stage, repeated mint failure, no replay after readiness, invalid
+    geometry and malformed backend slot results. The focused bank suite passes 25 tests; the
+    serialized nine-crate suite passes 1,293 tests. The executive build passes with the unchanged
+    262 warnings. Logs: `.tmp/test-provider-bank-segments-focused-20260907.log`,
+    `.tmp/test-provider-bank-segments-20260907.log`, and
+    `.tmp/build-provider-bank-segments-20260907.log`. Read-only review found no further concrete
+    correctness issue; root ran all tests/builds sequentially.
+
+    Review adjustment: leaf ownership and segment construction now have durable state. Continue
+    with pending-thread provider range claims, typed capability conflict validation and full joint
+    journal retention. Native destructive thread cleanup remains disabled until those claims,
+    temporary-owner exclusions and remaining stale references are complete. Legacy frame/pagefile
+    cleanup, native failure validation and the genuine provider-import desktop barrier remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
