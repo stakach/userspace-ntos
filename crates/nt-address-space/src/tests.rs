@@ -241,6 +241,38 @@ fn page_chunks_cover_in_page_boundary_and_cross_page_ranges() {
 }
 
 #[test]
+fn reserved_frame_publication_rejects_invalid_duplicate_and_full_without_mutation() {
+    let mut pool = RecycledFramePool::new();
+    let empty = pool.stats();
+    assert_eq!(pool.publish_reserved(0), Err(FramePoolError::InvalidFrame));
+    assert_eq!(pool.publish_reserved(70), Err(FramePoolError::Full));
+    assert_eq!(pool.stats(), empty);
+    assert!(pool.reserve(1));
+    pool.publish_reserved(70).unwrap();
+    let published = pool.stats();
+    assert_eq!(pool.publish_reserved(70), Err(FramePoolError::AlreadyPublished));
+    assert_eq!(pool.stats(), published);
+    assert_eq!(pool.acquire(), Some(70));
+    pool.publish_reserved(70).unwrap();
+    assert_eq!(pool.stats(), published);
+}
+
+#[test]
+fn reserved_frame_preflight_does_not_grant_a_stale_capacity_or_identity_permit() {
+    let mut pool = RecycledFramePool::new();
+    assert!(pool.reserve(1));
+    pool.check_reserved(70).unwrap();
+    pool.publish_reserved(70).unwrap();
+    assert_eq!(pool.publish_reserved(70), Err(FramePoolError::AlreadyPublished));
+    for i in 1..pool.stats().capacity {
+        pool.publish_reserved(70 + i as u64).unwrap();
+    }
+    let full = pool.stats();
+    assert_eq!(pool.publish_reserved(10000), Err(FramePoolError::Full));
+    assert_eq!(pool.stats(), full);
+}
+
+#[test]
 fn page_chunks_reject_address_space_overflow() {
     assert!(page_chunks(u64::MAX, 0).is_some());
     assert!(page_chunks(u64::MAX, 1).is_none());

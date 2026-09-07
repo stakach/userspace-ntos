@@ -358,6 +358,13 @@ pub struct RecycledFramePoolStats {
     pub allocation_failures: u64,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FramePoolError {
+    InvalidFrame,
+    AlreadyPublished,
+    Full,
+}
+
 /// Growable ownership store for unmapped frame capabilities. The caller retains responsibility for
 /// deleting a capability returned by [`Self::try_recycle`] on allocation failure.
 pub struct RecycledFramePool {
@@ -399,6 +406,30 @@ impl RecycledFramePool {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
             return Err(frame);
         }
+        self.frames.push(frame);
+        self.high_water = self.high_water.max(self.frames.len());
+        Ok(())
+    }
+
+    /// Read-only preflight for retained cleanup. Capacity must be reserved before backend effects.
+    /// This checks the pool, not capability type, mapping state or external ownership.
+    pub fn check_reserved(&self, frame: u64) -> Result<(), FramePoolError> {
+        if frame == 0 {
+            return Err(FramePoolError::InvalidFrame);
+        }
+        if self.frames.contains(&frame) {
+            return Err(FramePoolError::AlreadyPublished);
+        }
+        if self.frames.len() == self.frames.capacity() {
+            return Err(FramePoolError::Full);
+        }
+        Ok(())
+    }
+
+    /// Allocation-free ownership publication. Rejection leaves every pool field unchanged and
+    /// transfers nothing; success must be acknowledged by the retained owner before allocator reuse.
+    pub fn publish_reserved(&mut self, frame: u64) -> Result<(), FramePoolError> {
+        self.check_reserved(frame)?;
         self.frames.push(frame);
         self.high_water = self.high_water.max(self.frames.len());
         Ok(())

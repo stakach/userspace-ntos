@@ -8691,7 +8691,7 @@ unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
     let Some(mut record) = registry.get(pi, page) else {
         return true;
     };
-    if record.owns_frame && !(&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).reserve(1) {
+    if record.owns_frame && frame_recycle::prepare(record.frame).is_err() {
         return false;
     }
     let Some(retiring) = registry.begin_reclaim_exact(record) else {
@@ -8757,14 +8757,14 @@ unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
         }
     }
 
-    let removed = registry
+    // Publish before removing the authoritative row. Rejection retains its completed alias
+    // phases and exact frame owner; success and row removal cannot yield to allocator reuse.
+    if record.owns_frame && frame_recycle::publish(record.frame).is_err() {
+        return false;
+    }
+    let _removed = registry
         .take_exact(record)
         .expect("fully reclaimed client frame must retire its exact row");
-    if removed.owns_frame {
-        (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES))
-            .try_recycle(removed.frame)
-            .expect("pre-reserved recycled-frame slot must accept its owned frame");
-    }
     true
 }
 
@@ -15141,6 +15141,7 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
 
 mod thread_sched_context;
 mod root_slot_recycle;
+mod frame_recycle;
 use thread_sched_context::attach_sched_context;
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,

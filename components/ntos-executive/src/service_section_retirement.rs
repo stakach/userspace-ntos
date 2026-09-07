@@ -22,18 +22,13 @@ struct RetirementIo;
 impl SectionRetirementIo for RetirementIo {
     fn release_frame(&mut self, frame: u64) -> Result<(), u32> {
         unsafe {
-            let free = &mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES);
-            if !free.reserve(1) {
-                return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-            }
+            frame_recycle::prepare(frame)?;
             // The view paths remove registered aliases first. Revoke is the final physical
             // safety barrier for any remaining descendants before the owner is recycled.
             if cnode_revoke_r(frame) != 0 || page_unmap_r(frame) != 0 {
                 return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
             }
-            free.try_recycle(frame)
-                .expect("section retirement reserved its frame slot");
-            Ok(())
+            frame_recycle::publish(frame)
         }
     }
 

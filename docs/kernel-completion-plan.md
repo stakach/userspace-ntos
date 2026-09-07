@@ -195,6 +195,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Bind external win32k mapping claims to exact pending attempts, block ordinary alias mutation,
   and host-test phase-preserving journal retirement without duplicating mapping release authority
   (tranche 81; native claims active, destructive retirement remains disabled).
+- [x] Add checked, allocation-free physical-frame pool publication and migrate retained section/
+  registry cleanup to validate allocator ownership before effects and acknowledge publication last
+  (tranche 82; legacy void frame release and pending-thread activation remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -205,14 +208,15 @@ below are historical baselines, not acceptance of the current provider cutover.
   moves into the sealed actor independently of immutable coverage. External aliases retain distinct
   deletion/recycle phases. Win32k attachment journals now claim their exact pending attempt after
   conflict validation; direct detach and attachment switches cannot bypass them. Complete the
-  remaining external journals and implement checked native frame recycling
+  remaining external journals and connect the checked native frame publication primitive
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
   longer invokes the destructive legacy release chain. Connect the checked thread retry backend
-  and failed-memory-slot primitive, and implement checked frame free-list publication before native
-  retirement. Close remaining non-ingress routing
+  and failed-memory-slot primitive. Checked frame free-list publication now serves retained section
+  and registry cleanup; connect it through the complete thread backend before native retirement.
+  Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover other launch families
@@ -27756,6 +27760,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Terminal commit still waits for every owner. Ordinary termination, first-resume failure, other
     launch families and live failure validation remain open. No QEMU/desktop proof is claimed;
     the recorded 33 unresolved win32k imports remain the full desktop-gate blocker.
+
+    B3 checked physical-frame publication tranche 82 (2026-09-07):
+    Added allocation-free check_reserved/publish_reserved operations to RecycledFramePool and a
+    read-only FrameRecycleState contract in nt-user-host. Pool admission rejects zero, duplicate
+    publication and missing reserved capacity without changing the pool. Native allocator checks
+    reject reserved/out-of-range/untracked slots, unowned or pinned caps, absent/wrong retype-byte
+    ownership, aggregate accounting underflow, corrupt root free-slot counts and simultaneous
+    empty-slot publication. Inactive popped root-slot cells are not treated as owners. Success
+    preserves the live cap and all physical retype accounting because the frame still exists;
+    it is not a deleted root capability slot. Preflight is not a durable permit: publication
+    revalidates current allocator/pool state without allocation or capability operations.
+
+    The native frame_recycle adapter validates before capacity growth, reserves durable storage
+    before backend effects, and exposes no delete-on-rejection fallback. Section retirement now
+    uses this boundary around checked revoke/unmap and lets its existing retirement record retain
+    any error. Exact client-frame registry reclaim validates before beginning teardown, retains
+    its existing unmap/alias acknowledgements on publication failure, and publishes before taking
+    the authoritative row. Successful publication and record acknowledgement cannot allocate or
+    yield to a new frame acquisition. The former unchecked push/expect sequence is removed from
+    both migrated paths.
+
+    Validation: two pool tests cover zero/duplicate/full rejection, acquire/reinsert and stale
+    preflight; nine allocator/composition tests cover metadata contradictions, immutable accounting,
+    retained registry unmap acknowledgement and section retry without deleting an existing pool
+    owner. Two construction integration tests verify allocation-free checks/publication/rejection
+    and reservation OOM while the pending runtime stays protected. The serialized nine-crate suite
+    passes 1,227 tests (173 in nt-address-space; 290 in nt-user-host: 253 unit, 3 existing integration
+    and 34 construction integration). The subsequent executive build passes with the unchanged
+    262-warning baseline. Logs:
+    `.tmp/test-frame-publication-20260907.log` and `.tmp/build-frame-publication-20260907.log`.
+    A read-only agent audited and reviewed the boundary; only root ran tests/builds, sequentially.
+
+    Review adjustment: allocator metadata is not proof of frame type or mapping quiescence:
+    page-table objects also account for 4096 bytes. Exact frame provenance and completed external
+    alias retirement must still come from the retained owner. Pending-thread destruction remains
+    disabled. Complete prefetch/provider/temporary journals and stale-reference clearing before
+    connecting this primitive to the sealed thread retirement backend and terminal registry
+    transfer. Legacy try_recycle keeps its prior semantics until its callers are migrated: they
+    currently interpret failure as permission to delete, which is invalid for duplicate ownership.
+    Replace vm_frame_acquire's ignored scratch-unmap failure and vm_frame_release's ignored
+    unmap/delete results with retained phases; likewise retain pagefile transition owners through
+    checked publication and validate complete batches before final process VM destruction. Those
+    paths cannot be fixed by routing them blindly through the new pool checks. Ordinary thread
+    termination, first-resume failure, other launch families and live failure validation remain
+    open. No QEMU/desktop proof is claimed; the recorded 33 unresolved win32k imports remain the
+    full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

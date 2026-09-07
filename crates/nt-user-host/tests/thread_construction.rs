@@ -27,6 +27,9 @@ mod failed_memory_slot;
 #[path = "thread_construction/alias_journal.rs"]
 mod alias_journal;
 
+#[path = "thread_construction/frame_recycle.rs"]
+mod frame_recycle;
+
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };

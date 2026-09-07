@@ -17,6 +17,7 @@ pub mod process_identity;
 mod services;
 pub mod sched_context;
 pub mod slot_recycle;
+pub mod frame_recycle;
 pub mod thread_binding;
 pub mod thread_alias_journal;
 pub mod thread_construction;
