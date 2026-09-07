@@ -204,16 +204,19 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain section scratch copy-failure slots and separate deletion from strict recycling through
   coherent I/O/writeback and frame-retirement barriers (tranche 84; other temporary aliases remain open).
 - [x] Retain the fixed resident client-copy alias through checked deletion, block source/page reuse,
-  and retry cleanup before copy admission and at the event boundary (tranche 85; two-frame COW
-  scratch and inspection aliases remain open).
+  and retry cleanup before copy admission and at the event boundary (tranche 85; COW extension
+  completed in tranche 86).
 - [x] Replace two-frame COW scratch and inspection mappings with sequential checked temporary
   aliases, bounded access and conservative untracked-backing exclusion (tranche 86; legacy frame
-  acquisition/release, provider-bank journals and native retirement activation remain open).
+  acquisition/release and native retirement activation remain open).
 - [x] Replace the provider leaf-cap bank's PI-only owner/free-list machinery with exact process/page
-  records, typed capabilities and retained move/recycle/delete phases (tranche 87; segment-CNode
-  construction and pending-thread claims remain open).
+  records, typed capabilities and retained move/recycle/delete phases (tranche 87; segment and
+  claim extensions completed in tranches 88-89).
 - [x] Retain provider segment CNode construction across reservation/retype/mint failures without
-  teardown or replay of acknowledged stages (tranche 88; pending-thread bank claims remain open).
+  teardown or replay of acknowledged stages (tranche 88).
+- [x] Add exact-attempt provider alias journals to joint native claims, validate typed capability
+  and segment ownership, and require scratch quiescence before reconciliation (tranche 89;
+  native destructive retirement remains disabled).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -222,9 +225,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   root-slot publication is available for retained SC cleanup and alias/prefetch retirement, including
   a strict zero-retype-accounting path for copied/failed slots. Failed-memory-slot ownership now
   moves into the sealed actor independently of immutable coverage. External aliases retain distinct
-  deletion/recycle phases. Win32k attachment and prefetch journals now claim their exact pending
-  attempt after joint conflict validation; direct detach, attachment switches and process-wide
-  prefetch retirement cannot bypass them. Complete the provider/temporary alias journals and
+  deletion/recycle phases. Win32k attachment, prefetch and provider-bank journals now claim their
+  exact pending attempt after joint conflict validation; direct detach, attachment switches,
+  process-wide prefetch retirement and provider-bank teardown cannot bypass them. Known copied
+  temporary aliases must be quiescent before reconciliation. Complete remaining stale-reference
+  exclusions and ownership handoffs, and
   connect the checked native frame publication primitive
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
@@ -28083,6 +28088,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     journal retention. Native destructive thread cleanup remains disabled until those claims,
     temporary-owner exclusions and remaining stale references are complete. Legacy frame/pagefile
     cleanup, native failure validation and the genuine provider-import desktop barrier remain open.
+
+    B3 joint provider alias claims tranche 89 (2026-09-08):
+    ThreadProviderAliasJournal now binds immutable selected bank snapshots to the full
+    ThreadRollbackId and validated thread geometry. Typed Root/Child capability locations remain
+    separate from borrowed source/PML4 provenance. Preparation and complete revalidation precede
+    every allocation-free claim; a stale final entry or conflicting capability cannot leave a
+    partially pinned journal. Claims reject ordinary mapping of selected pages and whole-process
+    teardown before effects, while unrelated pages/processes continue normally. Originally empty
+    geometry remains protected by native pending-thread memory admission, not fabricated rows.
+
+    Host retirement drives the bank's existing checked phases and acknowledges each completed row
+    without allocation. It never creates a second release-resource list. Exact claims, current
+    retained capability locations and generation-safe row handles prevent old root/child numbers
+    from acquiring authority after recycling. Native ThreadProviderAliasCleanup is claim-only: the
+    pending runtime retains it in a durable OnceCell alongside attachment and prefetch journals.
+    Joint reconciliation prepares/revalidates all three journals and checks private, construction,
+    registry, scratch, attachment, prefetch and provider root ownership before the first claim.
+    Provider roots cannot alias permanent segment owners; child locations must belong to a ready
+    native segment. Child slot numbers are never flattened into the root-cap namespace.
+
+    Reconciliation also requires the general temporary-frame alias and section scratch owner to be
+    quiescent. The reusable temporary slot remains owned when empty and participates in conflicts.
+    Section scratch is not quiescent while a batch is active or a deleted slot still awaits checked
+    recycling. These are deny-only checks, not cleanup syscalls under reconciliation borrows.
+    The existing thread-reconcile diagnostic now reports win32k/prefetch/provider claims, and bank
+    conflict diagnostics identify root versus child-CNode/slot locations.
+
+    Validation: 21 new provider-journal tests cover exact attempt/tagged lifetime, complete geometry,
+    read-only preparation, atomic claim refusal, empty/no-cap coverage, process teardown exclusion,
+    partial delete/recycle retry, late conflicts and generation/root-number reuse. A new scratch
+    test verifies closed-batch and acknowledged-recycling quiescence; the existing temporary-slot
+    test now asserts ownership after successful cleanup. The focused bank suite passes 46 tests
+    and the serialized nine-crate suite passes 1,315 tests (320 memory-manager; 344 user-host
+    including integration tests). The executive release build passes with the unchanged 262
+    warnings. Logs: `.tmp/test-provider-thread-claims-focused-20260908.log`,
+    `.tmp/test-provider-thread-claims-20260908.log`, and
+    `.tmp/build-provider-thread-claims-20260908.log`. Host implementation and independent native
+    review used agents; root alone ran tests/builds sequentially.
+
+    Review adjustment: provider claims are active, but native destructive cleanup/registry transfer
+    remains disabled. Next retain vm_frame_acquire's popped recycled frame through checked scratch
+    zeroing; failed fresh retype must retain its empty slot until checked recycling before considering
+    newly available pooled frames. Do not starve the pool behind an exhausted untyped retry. Then
+    close the broader legacy release and pagefile transition handoffs, including aliases discarded
+    before PagefileStore publication, and complete stale-reference/retry activation. No desktop
+    acceptance is claimed; the real 33-name provider-import barrier still precedes hosted boot.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

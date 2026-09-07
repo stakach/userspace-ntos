@@ -13,6 +13,9 @@ static mut SEGMENT_OWNERS: [ProviderAliasSegment; SEGMENTS] =
     [const { ProviderAliasSegment::new(RADIX) }; SEGMENTS];
 static mut BANK: Option<ProviderAliasBank> = None;
 static BORROWED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[path = "win32k_thread_provider_aliases.rs"]
+mod thread_aliases;
+pub(crate) use thread_aliases::ThreadProviderAliasCleanup;
 
 struct Borrow;
 impl Borrow {
@@ -134,6 +137,33 @@ pub(super) fn all_empty() -> bool {
     }
 }
 
+pub(super) fn owns_root_cap(cap: u64) -> bool {
+    if cap == 0 {
+        return false;
+    }
+    let Ok(_borrow) = Borrow::acquire() else {
+        return true;
+    };
+    (unsafe { segment_owns_root_cap(cap) })
+    || unsafe { (&*core::ptr::addr_of!(BANK)).as_ref() }.is_some_and(|bank| bank.owns_root_cap(cap))
+}
+
+/// The caller holds Borrow; these queries must not reacquire it or perform backend operations.
+unsafe fn segment_owns_root_cap(cap: u64) -> bool {
+    cap != 0
+        && (&*core::ptr::addr_of!(SEGMENT_OWNERS)).iter().any(|owner| {
+            let held = owner.snapshot();
+            held.raw == cap || held.guarded == cap
+        })
+}
+
+unsafe fn segment_owns_child(child: ChildCap) -> bool {
+    child.slot < SEGMENT_SLOTS
+        && (&*core::ptr::addr_of!(SEGMENT_OWNERS))
+            .iter()
+            .any(|owner| owner.ready() == Some(child.cnode))
+}
+
 pub(super) fn admit_process(pi: usize, process: ProcessIdentity) -> Result<(), BankError> {
     let _borrow = Borrow::acquire()?;
     match unsafe { (&*core::ptr::addr_of!(BANK)).as_ref() } {
@@ -236,12 +266,30 @@ fn note_error(operation: &[u8], pi: usize, process: ProcessIdentity, error: Bank
             BankError::Releasing => b"releasing",
             BankError::InsufficientResources => b"resources",
             BankError::StaleHandle => b"stale-handle",
+            BankError::Claimed => b"claimed",
+            BankError::NotClaimed => b"not-claimed",
+            BankError::SharedCapability(_) => b"shared-capability",
             BankError::InvalidBackend => b"invalid-backend",
             BankError::Backend(_) => b"backend",
         });
         if let BankError::Backend(status) = error {
             print_str(b" status=0x");
             print_hex(status);
+        }
+        if let BankError::SharedCapability(capability) = error {
+            use nt_user_host::provider_alias_bank::ProviderAliasCapability;
+            match capability {
+                ProviderAliasCapability::Root(slot) => {
+                    print_str(b" root-slot=0x");
+                    print_hex_u64(slot);
+                }
+                ProviderAliasCapability::Child(child) => {
+                    print_str(b" child-cnode/slot=0x");
+                    print_hex_u64(child.cnode);
+                    print_str(b"/0x");
+                    print_hex_u64(child.slot);
+                }
+            }
         }
         print_str(b" live/mapped/released=");
         print_u64(held.live as u64);

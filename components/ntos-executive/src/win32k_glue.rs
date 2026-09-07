@@ -314,6 +314,7 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
 }
 #[path = "win32k_client_cap_bank.rs"]
 mod client_cap_bank;
+pub(crate) use client_cap_bank::ThreadProviderAliasCleanup;
 static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();
@@ -4615,6 +4616,10 @@ pub(crate) fn win32k_client_cap_bank_stats() -> (u64, u64, u64, u64, u64) {
 
 pub(crate) fn win32k_client_cap_bank_is_empty(pi: usize) -> bool {
     client_cap_bank::is_empty(pi)
+}
+
+pub(crate) fn provider_alias_owns_root_cap(cap: u64) -> bool {
+    client_cap_bank::owns_root_cap(cap)
 }
 
 pub(crate) unsafe fn release_win32k_client_cap_bank(candidate: nt_user_host::ProcessDeletionCandidate) -> bool {

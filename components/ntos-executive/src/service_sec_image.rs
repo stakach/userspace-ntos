@@ -3661,6 +3661,7 @@ mod section_writeback;
 #[path = "service_section_scratch.rs"]
 mod section_scratch;
 pub(crate) use section_scratch::{service_read_file_coherent, service_resize_file_coherent, service_write_file_coherent};
+pub(crate) use section_scratch::section_scratch_is_quiescent;
 #[path = "service_section_retirement.rs"]
 mod section_retirement;
 pub(crate) use section_retirement::{service_drain_section_retirement, service_unmap_section_view_mappings};

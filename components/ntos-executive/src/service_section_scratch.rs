@@ -99,6 +99,11 @@ pub(super) unsafe fn drain_section_scratch() -> Result<(), u32> {
     (&mut *core::ptr::addr_of_mut!(SECTION_SCRATCH)).drain(&mut ScratchIo)
 }
 
+pub(crate) fn section_scratch_is_quiescent() -> bool {
+    let Ok(_borrow) = ScratchBorrow::acquire() else { return false; };
+    unsafe { (&*core::ptr::addr_of!(SECTION_SCRATCH)).is_quiescent() }
+}
+
 #[path = "service_section_file_io.rs"]
 mod file_io;
 pub(crate) use file_io::{

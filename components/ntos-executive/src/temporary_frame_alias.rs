@@ -81,6 +81,16 @@ pub(super) fn backing_release_available() -> bool {
     unsafe { (&*core::ptr::addr_of!(ALIAS)).backing_release_available() }
 }
 
+pub(super) fn owns_root_cap(cap: u64) -> bool {
+    if cap == 0 {
+        return false;
+    }
+    let Ok(_borrow) = Borrow::acquire() else {
+        return true;
+    };
+    unsafe { (&*core::ptr::addr_of!(ALIAS)).owns_slot(cap) }
+}
+
 pub(super) unsafe fn with_frame<T>(
     source: TemporaryAliasSource,
     address: u64,

@@ -12,6 +12,7 @@ pub(crate) struct HostedThreadRuntimeOwner {
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
     alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasCleanup>,
     prefetch_preparation: core::cell::OnceCell<client_prefetch::ThreadPrefetchCleanup>,
+    provider_preparation: core::cell::OnceCell<win32k_glue::ThreadProviderAliasCleanup>,
 }
 
 impl HostedThreadRuntimeOwner {
@@ -22,6 +23,7 @@ impl HostedThreadRuntimeOwner {
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
             alias_preparation: core::cell::OnceCell::new(),
             prefetch_preparation: core::cell::OnceCell::new(),
+            provider_preparation: core::cell::OnceCell::new(),
         }
     }
 
@@ -29,6 +31,7 @@ impl HostedThreadRuntimeOwner {
         self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
             && self.prefetch_preparation.get().is_none()
+            && self.provider_preparation.get().is_none()
     }
 
     fn into_legacy_runtime(self) -> HostedThreadRuntime {
@@ -297,6 +300,11 @@ impl HostedThreadRuntimeTable {
         &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
     ) -> Result<(), ThreadReconciliationError> {
         let _durable = allocator::enter_durable();
+        if !temporary_frame_alias::backing_release_available()
+            || !service_sec_image::section_scratch_is_quiescent()
+        {
+            return Err(ThreadReconciliationError::Aliases(nt_address_space::STATUS_INSUFFICIENT_RESOURCES));
+        }
         let pending = self.entries.iter().filter_map(RuntimeSlot::pending)
             .find(|pending| pending.id() == id)
             .ok_or(ThreadReconciliationError::OwnerChanged)?;
@@ -337,32 +345,52 @@ impl HostedThreadRuntimeTable {
                 owner.prefetch_preparation.get().expect("retained prefetch preparation")
             }
         };
+        let provider = match owner.provider_preparation.get() {
+            Some(provider) => provider,
+            None => {
+                let layout = owner.resources.layout().ok_or(ThreadReconciliationError::OwnerChanged)?;
+                let provider = win32k_glue::ThreadProviderAliasCleanup::prepare(id, layout)
+                    .map_err(ThreadReconciliationError::Aliases)?;
+                assert!(owner.provider_preparation.set(provider).is_ok());
+                owner.provider_preparation.get().expect("retained provider alias preparation")
+            }
+        };
         aliases.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
         prefetch.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
+        provider.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
         for cap in snapshot.rollback_resources().iter().map(|resource| resource.cap)
             .chain(construction.entries().filter_map(|(_, state)| state.slot()))
             .chain(owner.memory_coverage.empty_slot())
         {
-            if client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap) {
+            if client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
+                || win32k_glue::provider_alias_owns_root_cap(cap)
+                || temporary_frame_alias::owns_root_cap(cap)
+            {
                 return Err(ThreadReconciliationError::OwnershipConflict);
             }
         }
         if aliases.capabilities().any(|cap| client_prefetch::owns_cap(cap))
             || prefetch.capabilities().any(|cap| win32k_glue::attachment_owns_cap(cap))
+            || aliases.capabilities().chain(prefetch.capabilities()).any(|cap|
+                win32k_glue::provider_alias_owns_root_cap(cap) || temporary_frame_alias::owns_root_cap(cap))
+            || provider.root_capabilities().any(|cap|
+                client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
+                    || temporary_frame_alias::owns_root_cap(cap))
         {
             return Err(ThreadReconciliationError::OwnershipConflict);
         }
-        for cap in aliases.capabilities().chain(prefetch.capabilities()) {
+        for cap in aliases.capabilities().chain(prefetch.capabilities()).chain(provider.root_capabilities()) {
             if registry.records().iter().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);
             }
         }
-        // Both journals and every cross-owner check precede the first pin. No backend call,
+        // All journals and every cross-owner check precede the first pin. No backend call,
         // allocation or reentry occurs between these disjoint, prevalidated claim commits.
         aliases.claim(id).map_err(ThreadReconciliationError::Aliases)?;
-        prefetch.claim(id).map_err(ThreadReconciliationError::Aliases)
+        prefetch.claim(id).map_err(ThreadReconciliationError::Aliases)?;
+        provider.claim(id).map_err(ThreadReconciliationError::Aliases)
     }
 
     pub(crate) fn commit_spawn(

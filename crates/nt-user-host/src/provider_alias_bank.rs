@@ -3,8 +3,11 @@
 //! The caller serializes the entire operation, including backend calls. Segment construction is
 //! a separate backend owner. Source frames and PML4s are borrowed and must outlive retained rows.
 use crate::process_identity::ProcessIdentity;
+use crate::thread_rollback::ThreadRollbackId;
 #[path = "provider_alias_segment.rs"]
 pub mod segment;
+#[path = "thread_provider_alias_journal.rs"]
+pub mod thread_journal;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +41,13 @@ pub struct ChildCap {
     pub slot: u64,
 }
 
+/// Root slot numbers and child-CNode slot numbers belong to different namespaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderAliasCapability {
+    Root(u64),
+    Child(ChildCap),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootAliasSnapshot {
     pub slot: u64,
@@ -52,6 +62,20 @@ pub struct ProviderAliasSnapshot {
     pub root: Option<RootAliasSnapshot>,
     pub child: Option<ChildCap>,
     pub releasing: bool,
+    pub claim: Option<ThreadRollbackId>,
+}
+
+impl ProviderAliasSnapshot {
+    /// Leaf ownership only. Source frames, PML4s and segment CNodes are borrowed provenance.
+    pub fn owned_capabilities(self) -> impl Iterator<Item = ProviderAliasCapability> {
+        [
+            self.root
+                .map(|root| ProviderAliasCapability::Root(root.slot)),
+            self.child.map(ProviderAliasCapability::Child),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +87,9 @@ pub enum BankError {
     InsufficientResources,
     StaleHandle,
     InvalidBackend,
+    Claimed,
+    NotClaimed,
+    SharedCapability(ProviderAliasCapability),
     Backend(u32),
 }
 
@@ -97,6 +124,27 @@ struct Row {
     root: Option<RootAliasSnapshot>,
     child: Option<ChildCap>,
     releasing: bool,
+    claim: Option<ThreadRollbackId>,
+}
+
+impl Row {
+    fn retire(&mut self, io: &mut impl ProviderAliasIo) -> Result<(), BankError> {
+        if let Some(child) = self.child {
+            io.delete_child(child).map_err(BankError::Backend)?;
+            self.child = None;
+        }
+        if let Some(root) = self.root.as_mut() {
+            if root.populated {
+                io.delete_root(root.slot).map_err(BankError::Backend)?;
+                root.populated = false;
+                root.mapped = false;
+            }
+            io.recycle_empty_root(root.slot)
+                .map_err(BankError::Backend)?;
+            self.root = None;
+        }
+        Ok(())
+    }
 }
 
 struct Slot {
@@ -214,7 +262,8 @@ impl ProviderAliasBank {
             let Some(row) = slot.row.as_ref() else {
                 return false;
             };
-            if row.root.is_some()
+            if row.claim.is_some()
+                || row.root.is_some()
                 || row.child.is_none()
                 || row.request
                     != (ProviderAliasRequest {
@@ -244,6 +293,7 @@ impl ProviderAliasBank {
                 root: row.root,
                 child: row.child,
                 releasing: row.releasing,
+                claim: row.claim,
             })
         })
     }
@@ -260,7 +310,17 @@ impl ProviderAliasBank {
             root: row.root,
             child: row.child,
             releasing: row.releasing,
+            claim: row.claim,
         })
+    }
+
+    pub fn owns_root_cap(&self, cap: u64) -> bool {
+        self.snapshots()
+            .any(|row| row.root.is_some_and(|root| root.slot == cap))
+    }
+
+    pub fn owns_child_cap(&self, cap: ChildCap) -> bool {
+        self.snapshots().any(|row| row.child == Some(cap))
     }
 
     pub fn stats(&self) -> ProviderAliasStats {
@@ -304,6 +364,9 @@ impl ProviderAliasBank {
                     let index = handle.index;
                     assert_eq!(self.slots[index].generation, handle.generation);
                     let row = self.slots[index].row.as_ref().expect("live page index");
+                    if row.claim.is_some() {
+                        return Err(BankError::Claimed);
+                    }
                     if row.request != request {
                         return Err(BankError::RequestConflict);
                     }
@@ -366,6 +429,7 @@ impl ProviderAliasBank {
             root: None,
             child: None,
             releasing: false,
+            claim: None,
         });
         self.processes[process_index].pages.insert(
             insertion,
@@ -496,6 +560,14 @@ impl ProviderAliasBank {
         if current.process != process {
             return Err(BankError::OwnerChanged);
         }
+        for &(_, handle) in &current.pages {
+            let slot = &self.slots[handle.index];
+            if slot.generation == handle.generation
+                && slot.row.as_ref().is_some_and(|row| row.claim.is_some())
+            {
+                return Err(BankError::Claimed);
+            }
+        }
         current.releasing = true;
         // Fence every row before the first backend call. Partial release cannot reopen admission.
         for &(_, handle) in &current.pages {
@@ -516,20 +588,7 @@ impl ProviderAliasBank {
             let Some(row) = slot.row.as_mut() else {
                 continue;
             };
-            if let Some(child) = row.child {
-                io.delete_child(child).map_err(BankError::Backend)?;
-                row.child = None;
-            }
-            if let Some(root) = row.root.as_mut() {
-                if root.populated {
-                    io.delete_root(root.slot).map_err(BankError::Backend)?;
-                    root.populated = false;
-                    root.mapped = false;
-                }
-                io.recycle_empty_root(root.slot)
-                    .map_err(BankError::Backend)?;
-                row.root = None;
-            }
+            row.retire(io)?;
             slot.row = None;
             if slot.generation != u64::MAX {
                 self.free.push(index);
@@ -538,6 +597,57 @@ impl ProviderAliasBank {
             self.releases = self.releases.saturating_add(1);
         }
         self.processes.swap_remove(process_index);
+        Ok(())
+    }
+
+    /// Private journal driver. The complete disjoint-journal and quiescence checks belong to the
+    /// caller; this method validates every index before effects and acknowledges removal in place.
+    fn retire_claimed(
+        &mut self,
+        handle: ProviderAliasHandle,
+        id: ThreadRollbackId,
+        io: &mut impl ProviderAliasIo,
+    ) -> Result<(), BankError> {
+        let snapshot = self.get(handle).ok_or(BankError::StaleHandle)?;
+        if snapshot.claim != Some(id) {
+            return Err(BankError::OwnerChanged);
+        }
+        let identity = id.identity();
+        let process = ProcessIdentity {
+            pid: identity.pid,
+            generation: identity.process_generation,
+        };
+        if snapshot.request.pi != identity.pi || snapshot.request.process != process {
+            return Err(BankError::OwnerChanged);
+        }
+        self.admit_process(identity.pi, process)?;
+        let process_index = self
+            .processes
+            .iter()
+            .position(|row| row.pi == identity.pi)
+            .ok_or(BankError::OwnerChanged)?;
+        let position = self.processes[process_index]
+            .pages
+            .binary_search_by_key(&snapshot.request.page, |(page, _)| *page)
+            .map_err(|_| BankError::StaleHandle)?;
+        if self.processes[process_index].pages[position].1 != handle {
+            return Err(BankError::StaleHandle);
+        }
+        let slot = &mut self.slots[handle.index];
+        slot.row
+            .as_mut()
+            .expect("validated claimed row")
+            .retire(io)?;
+        slot.row = None;
+        self.processes[process_index].pages.remove(position);
+        if self.processes[process_index].pages.is_empty() {
+            self.processes.swap_remove(process_index);
+        }
+        if slot.generation != u64::MAX {
+            self.free.push(handle.index);
+        }
+        self.live -= 1;
+        self.releases = self.releases.saturating_add(1);
         Ok(())
     }
 }

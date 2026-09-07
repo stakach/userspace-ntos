@@ -56,6 +56,10 @@ impl TemporaryAlias {
         self.pending
     }
 
+    pub fn owns_slot(&self, slot: u64) -> bool {
+        slot != 0 && self.slot == slot
+    }
+
     pub fn memory_available(&self, process: u64, base: u64, size: u64) -> bool {
         let Some(pending) = self.pending else {
             return true;

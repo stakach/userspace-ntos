@@ -64,6 +64,10 @@ impl SectionScratch {
         }
     }
 
+    pub fn is_quiescent(&self) -> bool {
+        !self.active && self.entries.is_empty()
+    }
+
     /// Refuse reentry; retained cleanup must complete before a new batch can own any addresses.
     pub fn begin(&mut self, io: &mut impl SectionScratchIo) -> Result<(), u32> {
         if self.active {

@@ -7,6 +7,28 @@ const DELETE_ERROR: u32 = 0xc000_0001;
 const RECYCLE_ERROR: u32 = 0xc000_0008;
 const WRITE_ERROR: u32 = 0xc000_0185;
 
+#[test]
+fn quiescence_requires_closed_batch_and_acknowledged_slot_recycling() {
+    let mut scratch = SectionScratch::new();
+    let mut io = Io::default();
+    assert!(scratch.is_quiescent());
+    scratch.begin(&mut io).unwrap();
+    assert!(!scratch.is_quiescent());
+    scratch
+        .prepare(10, 0x8000, SectionAliasAccess::ReadOnly, &mut io)
+        .unwrap();
+    io.delete_error = true;
+    assert_eq!(scratch.finish(&mut io), Err(DELETE_ERROR));
+    assert!(!scratch.is_quiescent());
+    io.delete_error = false;
+    io.recycle_error = true;
+    assert_eq!(scratch.drain(&mut io), Err(RECYCLE_ERROR));
+    assert!(!scratch.is_quiescent());
+    io.recycle_error = false;
+    scratch.drain(&mut io).unwrap();
+    assert!(scratch.is_quiescent());
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
     Copy(u64),

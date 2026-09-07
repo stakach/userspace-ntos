@@ -51,12 +51,16 @@ impl TemporaryAliasIo for Io {
 fn successful_copies_reuse_one_reserved_empty_slot() {
     let mut owner = TemporaryAlias::new();
     let mut io = Io::default();
+    assert!(!owner.owns_slot(0));
+    assert!(!owner.owns_slot(100));
     for writable in [false, true] {
         assert_eq!(
             owner.with_frame(SOURCE, 0x8000, writable, &mut io, |va| va + 4),
             Ok(0x8004)
         );
         assert!(owner.pending().is_none());
+        assert!(owner.owns_slot(100));
+        assert!(!owner.owns_slot(90));
     }
     assert_eq!(
         io.calls.iter().filter(|(op, _)| *op == "reserve").count(),
