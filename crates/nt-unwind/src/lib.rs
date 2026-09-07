@@ -27,6 +27,7 @@ use core::mem::size_of;
 
 mod epilogue;
 pub mod exception_walk;
+pub mod exception_images;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions

@@ -263,6 +263,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add checked native handle scopes and retained Ps references over the existing PM handle tables
   (tranche 104; host core). Use the designated System table for kernel handles; no second object
   authority. Complete actual self-grants and shared Ps/Se/USER handle migration before native cutover.
+- [~] Reject lossy security-descriptor conversion in native access checks (tranche 105). Unsupported
+  ACE semantics must fail explicitly, never disappear before an allow decision or self-grant check.
+- [x] Admit immutable executable image/function-table snapshots for exception walking (tranche 106;
+  host core).
+  Validate metadata before execution; known executable gaps alone may classify as leaf functions.
+- [~] Retain exact invisible Ps handle publications across asynchronous output delivery (tranche 107).
+  Publish or abort the owned reservation, never compensate by closing a possibly reused raw handle.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28691,6 +28698,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     leave incorrect global USER aliases. Migrate USER handle entries to the canonical per-process
     tables while retaining the existing provider-owned object bodies, and remove both the USER/PM
     lookup fallbacks and source-process recovery on lookup failure in the same cutover.
+
+    B3 strict native access conversion tranche 105 (2026-09-08, in progress):
+
+    The legacy semantic ACL conversion intentionally omits ACE types its model cannot represent.
+    That conversion cannot authorize access: a skipped deny followed by a supported allow could
+    grant rights incorrectly. Add explicit strict conversion over the existing checked native ACL/SD
+    parser, reject unsupported semantics before calling the evaluator, and switch the shared native
+    NtAccessCheck/NtAccessCheckByType path. Lossless storage/query compatibility remains separate.
+
+    B3 admitted exception images tranche 106 (2026-09-08, host core complete):
+
+    Build an immutable catalog of owned mapped-image snapshots using nt-pe-loader's existing PE
+    parser and nt-unwind's metadata readers. Validate actual load ranges, executable section bounds,
+    runtime-function ordering and overlap, and unwind metadata before admitting any frame. Reject
+    unknown images, data/header/gap PCs and malformed metadata; never infer a leaf from a failed
+    table lookup. This supplies image admission, not physical lane/assembly handler linkage.
+
+    Implemented `nt-unwind::exception_images` with owned boxed mapped-image bytes and immutable
+    catalog construction. PE headers, sections and mapped exception directories use nt-pe-loader;
+    runtime rows and unwind headers/operands use existing nt-unwind readers. Admission never repairs
+    or sorts runtime rows. It rejects overlapping image/section/function ranges, data/header PCs,
+    malformed or truncated metadata, non-executable handler targets, contradictory frame-pointer
+    fields, invalid prologue ordering/operands, inconsistent chained frame state and cyclic/deep
+    chains. Legitimate indirect or chained parent rows outside the exception directory remain valid.
+    The caller must separately retain the catalog and prove its native mappings match the snapshot.
+
+    Independent review found unsupported version-specific opcode 6/7 semantics in the old unwind
+    interpreter and incomplete frame-pointer validation. The new catalog explicitly rejects those
+    opcode forms until real interpretation is implemented, and now validates the frame contract.
+    It does not silently treat an omitted XMM restore as a no-op. This is an explicit compatibility
+    limitation, not a completed exception-export surface.
+
+    Validation passes 150 unit tests, including 26 new image-admission tests, and two compile-fail
+    ownership checks. Log: `.tmp/test-exception-images-20260908.log`. Native exception dispatch,
+    collided unwind, consolidate restore, low-memory allocation behavior and physical handler
+    linkage remain open; no desktop proof is claimed.
+
+    B3 retained Ps handle publication tranche 107 (2026-09-08, in progress):
+
+    Extend the existing PM bound-reservation transaction with a non-Clone native publication owner.
+    Hold an invisible exact slot through output delivery, with target/table deletion blocked until
+    publish or abort succeeds. Fence manager identity and reservation generation, retain ownership
+    on failure and reject generation exhaustion before mutation. Native provider/call ACK journals
+    still need to own these transactions; a host prepare/publish helper is not IPC acceptance.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
