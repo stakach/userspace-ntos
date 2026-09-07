@@ -173,8 +173,44 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
     pub const fn is_live(&self) -> bool {
         self.layout.is_some()
     }
+
+    pub fn has_capabilities(&self) -> bool {
+        self.stack_owner
+            .iter()
+            .chain(self.stack_target.iter())
+            .chain(self.stack_mirror.iter())
+            .any(|&cap| cap != 0)
+            || [
+                self.teb_owner,
+                self.teb_target,
+                self.teb_scratch,
+                self.teb2_owner,
+                self.teb2_target,
+                self.teb2_scratch,
+                self.acs_owner,
+                self.acs_target,
+                self.ipc_owner,
+                self.tramp_owner,
+                self.tramp_target,
+            ]
+            .iter()
+            .any(|&cap| cap != 0)
+    }
     pub const fn layout(&self) -> Option<ThreadMemoryLayout> {
         self.layout
+    }
+
+    /// Capability slots outside retained target geometry cannot justify a disjoint access.
+    pub fn has_unlocated_capabilities(&self) -> bool {
+        if self.layout.is_none() {
+            return self.has_capabilities();
+        }
+        let pages = self.stack_frames() as usize;
+        self.stack_owner[pages..]
+            .iter()
+            .chain(self.stack_target[pages..].iter())
+            .chain(self.stack_mirror[pages..].iter())
+            .any(|&cap| cap != 0)
     }
     pub const fn stack_base(&self) -> u64 {
         match self.layout {

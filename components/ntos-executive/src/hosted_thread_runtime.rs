@@ -499,6 +499,31 @@ impl HostedThreadRuntimeTable {
 
 static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable = HostedThreadRuntimeTable::new();
 
+/// Deny-only query for ordinary memory paths, including copies already borrowing ExecNtHandler.
+/// No allocation, IPC or callbacks may occur during this short table borrow. Cleanup backends
+/// holding a mutable slot must use retained capabilities directly, never recurse through here.
+pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
+    use nt_user_host::thread_memory_access::{check_pending_thread_memory, PendingThreadMemory};
+    let pi = usize::try_from(pi).map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)?;
+    let table = unsafe { &*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK) };
+    check_pending_thread_memory(
+        pi,
+        base,
+        size,
+        table.entries.iter().filter_map(|slot| {
+            let owner = slot.pending()?;
+            let runtime = owner.runtime();
+            Some(PendingThreadMemory {
+                owner: owner.id(),
+                memory: &runtime.resources,
+                user_stack_allocation_base: runtime.user_stack_allocation_base,
+                user_stack_base: runtime.user_stack_base,
+            })
+        }),
+    )
+    .map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)
+}
+
 /// Exclusive pointer to the serialized executive's hosted TID -> seL4 TCB table.
 ///
 /// The table is deliberately not stored inline in `ExecNtHandler`; that handler is constructed on the

@@ -1685,6 +1685,7 @@ pub(crate) unsafe fn smss_stack_read(stack_va: u64) -> u64 {
 /// can't walk smss's page tables, so it reaches smss memory through the same frames it mapped.
 #[inline(always)]
 pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
+    hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, len).ok()?;
     let end = va.checked_add(len)?;
     let stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);
@@ -1699,6 +1700,9 @@ pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
 /// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
+    if hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
+        return false;
+    }
     match smss_mirror(va, dst.len() as u64) {
         Some(m) => {
             core::ptr::copy_nonoverlapping(m as *const u8, dst.as_mut_ptr(), dst.len());
@@ -1716,6 +1720,9 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
     let pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
+    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+        return false;
+    }
     if has_managed_section_page(pi, va, src.len()) {
         return recorded_frame_copyout(pi, va, src, ACTIVE_SCRATCH_BASE.load(Ordering::Relaxed));
     }
@@ -1747,6 +1754,9 @@ unsafe fn with_recorded_frame_alias(
     writable: bool,
     access: impl FnOnce(u64),
 ) -> bool {
+    if hosted_thread_memory_access(pi, page, 0x1000).is_err() {
+        return false;
+    }
     let persistent_alias = csrss_frame_alias_get(pi, page);
     if persistent_alias != 0 {
         access(persistent_alias);
@@ -1789,6 +1799,9 @@ unsafe fn with_recorded_frame_alias(
 }
 
 unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: u64) -> bool {
+    if hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
+        return false;
+    }
     let Some(chunks) = nt_address_space::page_chunks(va, dst.len()) else {
         return false;
     };
@@ -1814,6 +1827,9 @@ unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64
 }
 
 unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
+    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+        return false;
+    }
     let Some(chunks) = nt_address_space::page_chunks(va, src.len()) else {
         return false;
     };
@@ -1885,6 +1901,9 @@ pub(crate) unsafe fn client_copyin_process_mapped(
     scratch_base: u64,
     allow_active_mirrors: bool,
 ) -> bool {
+    if hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
+        return false;
+    }
     if dst.is_empty() {
         return true;
     }
@@ -1986,6 +2005,9 @@ pub(crate) unsafe fn client_write_mapped(
     nfilled: usize,
     scratch_base: u64,
 ) -> bool {
+    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+        return false;
+    }
     if has_managed_section_page(pi, va, src.len()) {
         // Preserve the first managed-memory refusal, including consumed guard exceptions.
         return client_copyout_mapped(pi, va, src, filled_pages, nfilled, scratch_base);
@@ -2052,6 +2074,9 @@ unsafe fn client_copyout_mapped_impl(
     scratch_base: u64,
     admitted: bool,
 ) -> bool {
+    if hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
+        return false;
+    }
     if src.is_empty() {
         return true;
     }
@@ -2065,6 +2090,9 @@ unsafe fn client_copyout_mapped_impl(
         let chunk = page_remaining.min(src.len() - copied);
         let page = current & !0xfff;
         if !admitted && crate::service_sec_image::service_admit_section_alias(pi, page, true, None).is_err() {
+            return false;
+        }
+        if hosted_thread_memory_access(pi, page, 0x1000).is_err() {
             return false;
         }
         if csrss_frame_get_exact_record(pi, page).is_some() {

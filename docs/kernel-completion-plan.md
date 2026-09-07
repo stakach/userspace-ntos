@@ -142,9 +142,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Require exact executable runtime/process authority at service ingress, cancel rejected callers'
   Reply bindings before receiving again, and remove mechanism/process-zero and worker-to-main TCB
   substitutions (tranche 63, host/build; native cleanup entry not activated).
+- [x] Add allocation-free pending-memory exclusions and guard native copies, mirror/recorded aliases,
+  managed section residency, page-in and working-set eviction (tranche 64, host/build;
+  direct fault/VM mutation exclusions and native cleanup activation remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next close pending-owner memory-admission
-  bypasses and remaining non-ingress routing consumers, then wire registered-resume
+  emptiness as a complete execution-quiescence proof. Next close direct private-fault/guard/stack-growth,
+  VM free/protect/unmap and attachment bypasses plus remaining non-ingress routing consumers, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
@@ -26876,6 +26879,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     clearing and once-only reservation commit are wired. Registered-resume, early/main construction,
     ordinary termination resource-release failures and handler-owned handoffs remain open. The full
     win32k import gate still has 33 unresolved code imports; rebuilding the executive is not boot proof.
+
+    B3 pending-memory admission tranche 64 (2026-09-07, host/build green):
+    `nt-user-host::thread_memory_access` adds an allocation-free, deny-only query over borrowed
+    pending-runtime memory descriptions. Each refusal retains the exact rollback attempt and tagged
+    process identity. The query deliberately includes every pending generation at the requested PI:
+    stale retained ownership must not disappear because a caller presents newer routing metadata.
+    It unions hosted transport stack, IPC, TEB/activation-context and trampoline geometry with the
+    complete application stack reservation, including guard/uncommitted growth. Geometry remains
+    excluded before capability/journal allocation and through failed or completed-but-not-retired
+    cleanup. Empty operations are no-ops; overflowing requests and malformed owner geometry fail
+    closed. Missing layouts with unlocated caps, out-of-layout stack capability slots, inconsistent
+    process slots and malformed stack endpoints cannot be mistaken for disjoint memory.
+
+    The native runtime module exposes one short immutable query without allocation, IPC, callbacks
+    or reacquiring a global handler pointer. Native copy preparation checks before querying memory,
+    consuming guards or ensuring residency. Kernel-buffer writes and legacy copy entry points
+    preflight the full range. Fixed mirrors, persistent/temporary recorded aliases, pre-admitted
+    copyout and its legacy alternate path all retain the exclusion; section-alias preparation is
+    checked before accessing the live handler. Managed section/image residency and pagefile restore
+    check before resident-frame fast success, COW or remapping. Working-set eviction preflights the
+    complete victim set before its first mutation and individually guards owned-page eviction.
+
+    Validation: 14 host tests cover published versus pending slots, all layout pages, partial caps,
+    full application-stack reservations, half-open boundaries, overflow/zero length, process scope
+    across tagged generations, multiple pending owners, malformed/missing geometry, unlocated
+    owner/target/mirror caps, journal failure, cleanup failure and completed-only retirement. The
+    serialized nine-crate suite passes 1,053 tests, including 160 `nt-user-host` unit/integration tests;
+    log: `.tmp/test-thread-memory-access-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-thread-memory-access-20260907.log`.
+    Two read-only agents reviewed geometry and native alias/copy/lifetime ordering; root alone ran
+    tests/builds. Review caught and closed the out-of-layout capability case. No live cleanup or
+    desktop proof is claimed; the 33 unresolved win32k code imports remain a separate boot blocker.
+
+    Review adjustment: the checked memory paths above are wired, not every memory entry point.
+    Next cover direct private-fault guard/stack-growth/prefill paths, VM free/protect/unmap and
+    attachment publication before external-alias registry handoff. Retain complete disjoint journals
+    and checked mirrored-reference clearing before recycling caps. Native cleanup must not hold a
+    mutable runtime-slot/table borrow while a backend recurses into ordinary guarded memory helpers;
+    use direct retained-cap cleanup operations or separately retained exclusion storage. Keep
+    `begin_pending` unactivated until that adapter and all exclusions are complete. Main/early spawn
+    failures, ordinary termination release failures and handler-owned handoffs remain open.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

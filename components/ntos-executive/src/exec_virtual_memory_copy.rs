@@ -173,6 +173,7 @@ impl ExecNtHandler {
         address: u64,
         input: &[u8],
     ) -> Result<(), u32> {
+        hosted_thread_memory_access(pi as u64, address, input.len() as u64)?;
         nt_address_space::copy::write_kernel_buffer(
             address,
             input,
@@ -197,6 +198,7 @@ impl ExecNtHandler {
         address: u64,
         access: FaultAccess,
     ) -> Result<(), u32> {
+        hosted_thread_memory_access(pi as u64, address & !(PAGE_SIZE - 1), PAGE_SIZE)?;
         // Guard consumption mutates VAD metadata too, so validate ownership before either path.
         self.loop_ctx
             .and_then(|ctx| ctx.for_process(pi))

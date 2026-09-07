@@ -17568,6 +17568,11 @@ impl ExecNtHandler {
         pi: usize,
         victims: &[u64],
     ) -> Result<(), u32> {
+        // Reject the whole victim set before its first pagefile, alias or mapping mutation.
+        for &page in victims {
+            hosted_thread_memory_access(pi as u64, page, 0x1000)
+                .map_err(|_| nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT)?;
+        }
         for page in victims.iter().copied() {
             if vm_page_lock_is_locked(pi as u64, page) {
                 return Err(nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT);
@@ -17594,6 +17599,8 @@ impl ExecNtHandler {
         page: u64,
         protection: u32,
     ) -> Result<bool, u32> {
+        hosted_thread_memory_access(pi as u64, page, 0x1000)
+            .map_err(|_| nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT)?;
         if vm_page_lock_is_locked(pi as u64, page) {
             return Err(nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT);
         }
@@ -17696,6 +17703,7 @@ impl ExecNtHandler {
         pml4: u64,
         scratch_base: u64,
     ) -> Result<bool, u32> {
+        hosted_thread_memory_access(pi as u64, page, 0x1000)?;
         if !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi as u64, page) {
             return Ok(false);
         }
@@ -19106,6 +19114,7 @@ impl ExecNtHandler {
         target_pi: usize,
         plan: nt_address_space::VmResidencyPagePlan,
     ) -> Result<(), u32> {
+        hosted_thread_memory_access(target_pi as u64, plan.page, 0x1000)?;
         let ctx = self.loop_ctx.and_then(|ctx| ctx.for_process(target_pi))
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         let procs = &*ctx.procs;

@@ -3678,6 +3678,7 @@ pub(crate) unsafe fn service_generic_section_fault(
     scratch_base: u64,
     fault_access: nt_address_space::FaultAccess,
 ) -> Result<bool, u32> {
+    hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let write_fault = fault_access == nt_address_space::FaultAccess::Write;
     let Some((section_index, view)) = generic_sections.view_for_page(pi, page) else {
         return Ok(false);
@@ -3847,6 +3848,7 @@ pub(crate) unsafe fn service_image_page_residency(
     filled_pages: &mut [u64; 512],
     faults: &mut u64,
 ) -> Result<(), u32> {
+    hosted_thread_memory_access(pi as u64, page, 0x1000)?;
     let info = process_committed_mapping_basic_information(pi as u64, page)
         .ok_or(nt_address_space::STATUS_NOT_COMMITTED)?;
     let residency = nt_address_space::vm_residency_page_plan(page, info)?;
@@ -4186,6 +4188,7 @@ pub(crate) unsafe fn service_admit_section_alias(
     write: bool,
     generation: Option<u64>,
 ) -> Result<Option<u64>, u32> {
+    hosted_thread_memory_access(pi, page, 0x1000)?;
     if !process_committed_mapping_basic_information(pi, page)
         .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
     {
