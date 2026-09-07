@@ -9748,7 +9748,7 @@ impl ExecNtHandler {
     pub(crate) fn commit_hosted_thread_runtime_publication(
         &mut self,
         prepared: PreparedHostedThreadRuntime,
-        mut spawn: HostedThreadSpawnResult,
+        mut spawn: HostedThreadSpawn,
     ) {
         let pi = prepared.ticket.owner().pi;
         let role = prepared.ticket.owner().role;

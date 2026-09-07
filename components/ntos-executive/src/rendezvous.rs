@@ -45,12 +45,11 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
                 WINLOGON_WORKER3_STACK_MIRROR_VA,
                 WINLOGON_WORKER3_BADGE,
             ),
-            _ => return HostedThreadSpawnResult::failed(),
+            _ => return Err(HostedThreadSpawnFailure::LegacyUnretained),
         };
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
-    let worker_ep = mint_badged(main_fault_ep, badge);
     spawn_hosted_thread(
         handler,
         &HostedThread {
@@ -68,7 +67,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             tramp_va,
             peb_va: SMSS_PEB_VA,
             stack_mirror_va,
-            fault_ep: worker_ep,
+            fault_ep: ThreadFaultEndpoint::Badged { source: main_fault_ep, badge },
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
@@ -106,12 +105,11 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     if pi >= MAX_PI || worker_slot >= TP_WORKER_SLOT_COUNT {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     if img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed) == 0 {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
-    let worker_ep = mint_badged(main_fault_ep, tp_worker_badge(pi, worker_slot));
     spawn_slot_thread(
         handler,
         &RemoteThreadSpawn {
@@ -121,7 +119,10 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
             start,
             cid_proc,
             cid_thread,
-            fault_ep: worker_ep,
+            fault_ep: ThreadFaultEndpoint::Badged {
+                source: main_fault_ep,
+                badge: tp_worker_badge(pi, worker_slot),
+            },
             use_loader: true,
             native: true,
         },
@@ -142,8 +143,8 @@ pub(crate) struct RemoteThreadSpawn {
     /// The `ClientId` stamped into the new thread's TEB.
     pub cid_proc: u64,
     pub cid_thread: u64,
-    /// Endpoint the thread's faults/syscalls are delivered to.
-    pub fault_ep: u64,
+    /// Borrowed endpoint source, copied as-is or badged directly into the thread's CNode.
+    pub fault_ep: ThreadFaultEndpoint,
     /// Enter `LdrInitializeThunk` first (a real hosted process) or the start routine directly.
     pub use_loader: bool,
     /// NATIVE seL4-Call transport (our ntdll). Hosted threads still get rust-micro's hybrid
@@ -184,13 +185,13 @@ pub(crate) unsafe fn spawn_slot_thread(
         use_loader,
         native,
     } = *spawn;
-    if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || fault_ep == 0 {
-        return HostedThreadSpawnResult::failed();
+    if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || !fault_ep.is_valid() {
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let loader_context = if use_loader {
         let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
         if loader_rva == 0 {
-            return HostedThreadSpawnResult::failed();
+            return Err(HostedThreadSpawnFailure::LegacyUnretained);
         }
         // The caller-supplied stack allocation is not mapped into this userspace kernel, so
         // normalize both INITIAL_TEB and CONTEXT.Rsp to the fixed 16-page slot stack before entering
@@ -249,9 +250,8 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
-    let listener_ep = mint_badged(main_fault_ep, SVC_LISTENER_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
@@ -269,7 +269,10 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
             tramp_va: SVC_LISTENER_TRAMP_VA,
             peb_va: SMSS_PEB_VA,
             stack_mirror_va: SVC_LISTENER_STACK_MIRROR_VA,
-            fault_ep: listener_ep,
+            fault_ep: ThreadFaultEndpoint::Badged {
+                source: main_fault_ep,
+                badge: SVC_LISTENER_BADGE,
+            },
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
@@ -292,9 +295,8 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
-    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
@@ -312,7 +314,10 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
             tramp_va: LSASS_LISTENER_TRAMP_VA,
             peb_va: SMSS_PEB_VA,
             stack_mirror_va: LSASS_LISTENER_STACK_MIRROR_VA,
-            fault_ep: listener_ep,
+            fault_ep: ThreadFaultEndpoint::Badged {
+                source: main_fault_ep,
+                badge: LSASS_LISTENER_BADGE,
+            },
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
@@ -335,9 +340,8 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
-    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER2_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
@@ -355,7 +359,10 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
             tramp_va: LSASS_LISTENER2_TRAMP_VA,
             peb_va: SMSS_PEB_VA,
             stack_mirror_va: LSASS_LISTENER2_STACK_MIRROR_VA,
-            fault_ep: listener_ep,
+            fault_ep: ThreadFaultEndpoint::Badged {
+                source: main_fault_ep,
+                badge: LSASS_LISTENER2_BADGE,
+            },
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,
@@ -377,9 +384,8 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
-    let listener_ep = mint_badged(main_fault_ep, LSASS_LISTENER3_BADGE);
     spawn_hosted_thread(
         handler,
         &HostedThread {
@@ -397,7 +403,10 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
             tramp_va: LSASS_LISTENER3_TRAMP_VA,
             peb_va: SMSS_PEB_VA,
             stack_mirror_va: LSASS_LISTENER3_STACK_MIRROR_VA,
-            fault_ep: listener_ep,
+            fault_ep: ThreadFaultEndpoint::Badged {
+                source: main_fault_ep,
+                badge: LSASS_LISTENER3_BADGE,
+            },
             cid_proc,
             cid_thread,
             prio: HOSTED_USER_THREAD_PRIORITY,

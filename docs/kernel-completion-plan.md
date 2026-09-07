@@ -172,16 +172,20 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Separate non-cloneable native runtime ownership from copied metadata and add exact CNode/TCB/
   SC/owned-endpoint slot inventory with checked retirement admission and real handoff composition
   (tranche 73, host/build prerequisites; native constructor inventory remains unpopulated).
+- [x] Remove intermediate root fault-endpoint mints, install borrowed/badged sources directly into
+  the thread-owned CNode, and replace TCB-zero constructor outcomes with exhaustive success/failure
+  results and success-only publication (tranche 74, host/build; retained native rollback remains open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next make native thread-constructor failures return
-  complete ownership, including allocated empty slots, raw/minted CNodes, optional real TCB and owned
-  root fault-endpoint copies. Distinguish borrowed endpoint inputs explicitly and replace tcb-zero result
-  inference with success/failure outcomes before activating the handoff. Failed SC
+  complete ownership, including allocated empty slots, raw/minted CNodes and optional real TCB.
+  Thread fault-endpoint copies now belong directly to the CNode; wrapper-owned root intermediates
+  have been removed. Explicit results and success-only publication are in place, but the error still
+  marks legacy unretained cleanup until the full partial payload is connected. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   Retain the complete partial payload through the tested exact-ticket handoff
   before fallible reconciliation, preserving process/pool/window holds. Replace destructive failure exits
-  and empty failed-spawn results with ownership-returning failures, then replace
+  and legacy unretained errors with ownership-returning failures, then replace
   the legacy fatal release boundary with a checked retry backend. Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
@@ -27355,6 +27359,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     hosted-syscall setup as part of constructor conversion. Legacy destructive failure returns,
     first-resume failure, ordinary termination and full checked cleanup remain open. No QEMU or
     desktop proof is claimed; 33 recorded unresolved win32k imports still block the full gate.
+
+    B3 endpoint/outcome tranche 74 (2026-09-07):
+    The native constructor now installs CT_FAULT directly from an explicit borrowed source policy.
+    `ThreadFaultEndpoint::Borrowed` uses checked copy and preserves the existing badge;
+    `Badged { source, badge }` uses checked mint into the owned child CNode. Six rendezvous wrapper
+    root mints and the remote-thread wrapper root mint are removed. The debugger fixture keeps
+    ownership of its separately serviced endpoint and supplies it as borrowed. Source validation
+    precedes constructor allocation. No intermediate root slot, endpoint retirement queue, fallback
+    copy or source deletion is introduced. CNode destruction owns the installed endpoint copy.
+    The superseded standalone root-endpoint inventory role from tranche 73 is removed; inventory
+    now covers only raw/guarded CNodes, TCB and successful SC. Handoff tests use actual mechanism
+    roles instead of retaining a root endpoint that this constructor no longer creates.
+
+    `HostedThreadSpawnResult` is now `Result<HostedThreadSpawn, HostedThreadSpawnFailure>`.
+    The five outer consumers explicitly match the outcome, and publication accepts only the success
+    payload. The inner commitment adapter uses `?`, so failed construction drops the inert prepared
+    MM/Ps plan without committing or releasing an uncharged snapshot. TCB-zero result inference and
+    empty failed-success payloads are removed. The focused `hosted_thread_spawn.rs` module contains
+    the outcome types and checked endpoint adapter. `LegacyUnretained` explicitly marks the existing
+    rollback limitation, not a proof that native deletion succeeded. Exhaustive matches must be
+    revisited when the retained-failure variant is introduced; they cannot silently discard it.
+
+    Validation: four host tests cover badge-preserving copy, direct mint (including zero and maximal
+    badges), invalid-source rejection before backend work, and propagation of failed copy/mint
+    without retry or fallback. The serialized nine-crate suite passes 1,151 tests, including 224 in
+    `nt-user-host` (207 unit, 3 existing integration and 14 construction integration). The subsequent
+    executive build passes with the unchanged 262-warning baseline. Logs:
+    `.tmp/test-thread-endpoint-outcomes-20260907.log` and
+    `.tmp/build-thread-endpoint-outcomes-20260907.log`.
+    Two read-only agents audited endpoint ABI/derivation lifetime and every constructor consumer;
+    root alone runs tests and builds, strictly serialized.
+
+    Review adjustment: eliminate the unnecessary root endpoint copies rather than add them to a
+    retirement queue. The microkernel's checked mint resolves its source in the invoking root CSpace
+    and destination in the child CNode, and final CNode deletion drains the installed child and its
+    derivation reference. Next populate the existing non-cloneable runtime inventory, return complete
+    native failure payloads, and hand them off through the original publication ticket before caller
+    abort. Checked GS/priority/hosted-syscall setup, destructive legacy failure exits, first-resume
+    failure, normal termination and checked retry cleanup remain open. No QEMU or desktop proof is
+    claimed; the recorded 33 unresolved win32k imports still block the full desktop gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

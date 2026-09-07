@@ -255,7 +255,7 @@ impl HostedThreadRuntimeTable {
     pub(crate) fn commit_spawn(
         &mut self,
         prepared: PreparedHostedThreadRuntime,
-        spawn: &HostedThreadSpawnResult,
+        spawn: &HostedThreadSpawn,
     ) {
         let entry = self.entries[prepared.index]
             .publishing_mut(&prepared.ticket)
@@ -696,7 +696,7 @@ impl HostedThreadRuntimes {
     pub(crate) fn commit_spawn(
         &mut self,
         prepared: PreparedHostedThreadRuntime,
-        spawn: &HostedThreadSpawnResult,
+        spawn: &HostedThreadSpawn,
     ) {
         unsafe { (&mut *self.table).commit_spawn(prepared, spawn) }
     }

@@ -6,17 +6,13 @@ pub enum Role {
     GuardedCnode,
     Tcb,
     SchedContext,
-    /// Only a caller-owned root endpoint copy. Borrowed PML4/endpoint arguments are not inventory;
-    /// their child CNode copies are destroyed with the final CNode capability.
-    FaultEndpoint,
 }
 
-const ROLES: [Role; 5] = [
+const ROLES: [Role; 4] = [
     Role::RawCnode,
     Role::GuardedCnode,
     Role::Tcb,
     Role::SchedContext,
-    Role::FaultEndpoint,
 ];
 
 /// A read-only description, not release authority. Acknowledged deletion still owns the empty
@@ -53,17 +49,18 @@ pub enum InventoryError {
 /// Non-cloneable ownership. Keep this inside the original publication row together with the
 /// partial memory bundle and process/pool/window reservations before driving any cleanup. It must
 /// not live in an independent retirement queue: TCB references do not keep backing memory alive.
+/// Borrowed PML4/endpoint sources are not inventory; their child copies belong to the CNode.
 /// No method allocates or invokes the backend, and Drop is not a cleanup operation.
 #[derive(Debug)]
 #[must_use = "retain construction slots with their thread memory and reservations"]
 pub struct ThreadConstructionInventory {
-    slots: [SlotState; 5],
+    slots: [SlotState; 4],
 }
 
 impl ThreadConstructionInventory {
     pub const fn empty() -> Self {
         Self {
-            slots: [SlotState::Absent; 5],
+            slots: [SlotState::Absent; 4],
         }
     }
 
@@ -99,7 +96,6 @@ impl ThreadConstructionInventory {
             Role::GuardedCnode,
             Role::RawCnode,
             Role::SchedContext,
-            Role::FaultEndpoint,
         ]
         .into_iter()
         .find_map(|role| {
@@ -126,8 +122,8 @@ impl ThreadConstructionInventory {
         Ok(state)
     }
 
-    /// Receive an already-created owned cap (for example successful SC attachment or an owned
-    /// badged root endpoint). Failed SC attachment remains with its separate unbound SC owner.
+    /// Receive an already-created owned cap, such as a successful SC attachment. Failed SC
+    /// attachment remains with its separate unbound SC owner.
     pub fn adopt_object(&mut self, role: Role, cap: u64) -> Result<(), InventoryError> {
         self.adopt(role, cap, SlotState::LiveObject(cap))
     }

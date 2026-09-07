@@ -255,7 +255,7 @@ fn rejected_handoff_returns_the_real_inventory_and_can_retry() {
         .unwrap();
     partial
         .inventory
-        .adopt_object(ConstructionRole::FaultEndpoint, 500)
+        .adopt_object(ConstructionRole::RawCnode, 500)
         .unwrap();
     let (mut wrong, _, _, _) = fixture(None, false);
     let (error, ticket, partial) =
@@ -269,7 +269,7 @@ fn rejected_handoff_returns_the_real_inventory_and_can_retry() {
         SlotState::AllocatedEmpty(400)
     );
     assert_eq!(
-        partial.inventory.state(ConstructionRole::FaultEndpoint),
+        partial.inventory.state(ConstructionRole::RawCnode),
         SlotState::LiveObject(500)
     );
     assert_eq!(drops.get(), 0);

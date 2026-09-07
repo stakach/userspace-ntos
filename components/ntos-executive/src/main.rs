@@ -25421,65 +25421,8 @@ impl HostedThreadMechanismCaps {
     }
 }
 
-pub(crate) struct HostedThreadSpawnResult {
-    tcb: u64,
-    mechanism: HostedThreadMechanismCaps,
-    teb_alias: u64,
-    resources: HostedThreadResources,
-    commitment: Option<exec_handler::PreparedHostedThreadCommitment>,
-}
-
-impl HostedThreadSpawnResult {
-    pub(crate) const fn failed() -> Self {
-        Self {
-            tcb: 0,
-            mechanism: HostedThreadMechanismCaps::empty(),
-            teb_alias: 0,
-            resources: HostedThreadResources::empty(),
-            commitment: None,
-        }
-    }
-
-    const fn new(
-        tcb: u64,
-        mechanism: HostedThreadMechanismCaps,
-        teb_alias: u64,
-        resources: HostedThreadResources,
-    ) -> Self {
-        Self {
-            tcb,
-            mechanism,
-            teb_alias,
-            resources,
-            commitment: None,
-        }
-    }
-
-    pub(crate) const fn tcb(&self) -> u64 {
-        self.tcb
-    }
-
-    pub(crate) const fn mechanism(&self) -> HostedThreadMechanismCaps {
-        self.mechanism
-    }
-
-    pub(crate) const fn teb_alias(&self) -> u64 {
-        self.teb_alias
-    }
-
-    const fn resources(&self) -> HostedThreadResources {
-        self.resources
-    }
-
-    fn attach_commitment(&mut self, commitment: exec_handler::PreparedHostedThreadCommitment) {
-        debug_assert!(self.commitment.is_none());
-        self.commitment = Some(commitment);
-    }
-
-    fn take_commitment(&mut self) -> Option<exec_handler::PreparedHostedThreadCommitment> {
-        self.commitment.take()
-    }
-}
+mod hosted_thread_spawn;
+use hosted_thread_spawn::*;
 
 mod hosted_thread_runtime;
 use hosted_thread_runtime::*;
@@ -26397,9 +26340,8 @@ struct HostedThread {
     /// rendezvous that writes their syscall out-params need a mirror (SM/CSR); a park-only thread
     /// (the RPC listener) needs none.
     stack_mirror_va: u64,
-    /// The dedicated fault endpoint this thread faults to (no standing receiver → it PARKS until a
-    /// rendezvous drives it, or forever for a park-only listener).
-    fault_ep: u64,
+    /// Borrowed source and copy/mint policy for the thread-owned CT_FAULT capability.
+    fault_ep: ThreadFaultEndpoint,
     /// The `ClientId` written into the TEB (`0,0` leaves the TEB's zero-fill).
     cid_proc: u64,
     cid_thread: u64,
@@ -26425,7 +26367,7 @@ struct HostedThread {
 /// a dedicated fault EP, a stack, an SC) — a trimmed `spawn_sec_image` (the image/ntdll/PEB/KUSER are
 /// already mapped, shared with the main thread) — then a trampoline that restores RCX/RDX and
 /// `call`s the context RIP (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$ is a net).
-/// Returns the TCB cap. This is the single path the SM-loop / CSR-API / RPC-listener
+/// Returns an explicit construction outcome. This is the single path the SM-loop / CSR-API / RPC-listener
 /// spawns all express (see the thin wrappers below).
 unsafe fn ensure_hosted_thread_exec_alias_paging(t: &HostedThread, scr: u64) -> bool {
     let mut ok = true;
@@ -26486,16 +26428,19 @@ unsafe fn spawn_hosted_thread(
     handler: &mut ExecNtHandler,
     t: &HostedThread,
 ) -> HostedThreadSpawnResult {
+    if !t.fault_ep.is_valid() {
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+    }
     let Some(layout) = ThreadMemoryLayout::new(
         t.stack_base, t.stack_frames, t.ipcbuf_va, t.teb_va, t.tramp_va,
     ) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
     let Some(resources) = HostedThreadResources::new(t.client_pi as usize, layout) else {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
     if !hosted_thread_client_frame_keys_available(t) {
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let prepared = match handler.prepare_hosted_thread_commitment(
         t.client_pi as usize,
@@ -26504,14 +26449,11 @@ unsafe fn spawn_hosted_thread(
         t.teb_va,
     ) {
         Ok(prepared) => prepared,
-        Err(_) => return HostedThreadSpawnResult::failed(),
+        Err(_) => return Err(HostedThreadSpawnFailure::LegacyUnretained),
     };
-    let mut spawned = spawn_hosted_thread_mechanism(t, resources);
-    if spawned.tcb() == 0 {
-        return spawned;
-    }
+    let mut spawned = spawn_hosted_thread_mechanism(t, resources)?;
     spawned.attach_commitment(prepared);
-    spawned
+    Ok(spawned)
 }
 
 unsafe fn spawn_hosted_thread_mechanism(
@@ -26521,7 +26463,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     let scr = t.scr;
     if !ensure_hosted_thread_exec_alias_paging(t, scr) {
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     // Stack, mapped into the target VSpace AND (optionally) mirrored into the executive for a
     // rendezvous's out-param copyout. GUI-client stacks must also be discoverable by win32k's
@@ -26561,7 +26503,7 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_u64(registered as u64);
             print_str(b"\n");
             release_hosted_thread_resources(resources);
-            return HostedThreadSpawnResult::failed();
+            return Err(HostedThreadSpawnFailure::LegacyUnretained);
         }
     }
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
@@ -26600,7 +26542,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(teb_live_map);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     if t.client_pi != 0 {
         let source_cap =
@@ -26626,7 +26568,7 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_hex(t.teb_va as u32);
             print_str(b"\n");
             release_hosted_thread_resources(resources);
-            return HostedThreadSpawnResult::failed();
+            return Err(HostedThreadSpawnFailure::LegacyUnretained);
         }
     }
     core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
@@ -26691,7 +26633,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(teb2_live_map);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     // DeallocationStack is in TEB page 2; write only after scratch mapping succeeded.
     core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
@@ -26724,7 +26666,7 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_hex(page as u32);
             print_str(b"\n");
             release_hosted_thread_resources(resources);
-            return HostedThreadSpawnResult::failed();
+            return Err(HostedThreadSpawnFailure::LegacyUnretained);
         }
         // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
         let tail_page = t.teb_va + 0x1000;
@@ -26754,7 +26696,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(acs_target_map);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let acs = scr + 0x4000;
     core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
@@ -26780,7 +26722,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(e_ipc_target_map);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
     let (tramp, e_tramp_frame) = if t.diag {
@@ -26794,7 +26736,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(e_tramp_frame);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let e_tramp_exec_map = if t.diag {
         page_map_r(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE)
@@ -26807,7 +26749,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(e_tramp_exec_map);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     if let Some(loader) = t.loader_context {
         const CONTEXT_OFFSET: u64 = 0x1900;
@@ -26861,7 +26803,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_u64(e_tramp_tgt_map);
         print_str(b"\n");
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     if t.diag {
         // Observe the already-owned executive mapping; diagnostics must not create untracked aliases.
@@ -26880,39 +26822,39 @@ unsafe fn spawn_hosted_thread_mechanism(
     // CNode (PML4 + the dedicated fault EP) + TCB.
     let Some(raw) = try_alloc_slot() else {
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
     let e_cn = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_CNODE, CN_RADIX, 1, raw);
     if e_cn != 0 {
         recycle_deleted_root_slot(raw);
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let Some(cnode) = try_alloc_slot() else {
         let _ = cnode_delete_recycle_r(raw);
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
     let e_cnode_mint = cnode_mint_r(CAP_INIT_THREAD_CNODE, cnode, raw, CN_GUARD_BADGE);
     if e_cnode_mint != 0 {
         recycle_deleted_root_slot(cnode);
         let _ = cnode_delete_recycle_r(raw);
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let e_cnode_pml4 = cnode_copy_at_r(cnode, CT_PML4, t.pml4);
-    let e_cnode_fault = cnode_copy_at_r(cnode, CT_FAULT, t.fault_ep);
-    if e_cnode_pml4 != 0 || e_cnode_fault != 0 {
+    let e_cnode_fault = install_hosted_thread_endpoint(t.fault_ep, cnode);
+    if e_cnode_pml4 != 0 || e_cnode_fault.is_err() {
         let _ = cnode_delete_recycle_r(cnode);
         let _ = cnode_delete_recycle_r(raw);
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let Some(tcb) = try_alloc_slot() else {
         let _ = cnode_delete_recycle_r(cnode);
         let _ = cnode_delete_recycle_r(raw);
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     };
     let new_sp = t.stack_base + t.stack_frames * 0x1000 - 16;
     let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
@@ -26940,7 +26882,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         let _ = cnode_delete_recycle_r(cnode);
         let _ = cnode_delete_recycle_r(raw);
         release_hosted_thread_resources(resources);
-        return HostedThreadSpawnResult::failed();
+        return Err(HostedThreadSpawnFailure::LegacyUnretained);
     }
     let _ = tcb_set_gs_base(tcb, t.teb_va);
     let _ = tcb_set_priority(
@@ -26977,7 +26919,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b" ipcbuf=0x");
         print_hex(ipcbuf as u32);
         print_str(b" fault_ep=0x");
-        print_hex(t.fault_ep as u32);
+        print_hex(t.fault_ep.source() as u32);
         print_str(b"\n");
     }
     // Transport (ntdll_plan Step 6.A / BATCH 6): all hosted Windows threads get the hosted-syscalls
@@ -26999,10 +26941,10 @@ unsafe fn spawn_hosted_thread_mechanism(
             let _ = cnode_delete_recycle_r(cnode);
             let _ = cnode_delete_recycle_r(raw);
             release_hosted_thread_resources(resources);
-            return HostedThreadSpawnResult::failed();
+            return Err(HostedThreadSpawnFailure::LegacyUnretained);
         }
     };
-    HostedThreadSpawnResult::new(
+    Ok(HostedThreadSpawn::new(
         tcb,
         HostedThreadMechanismCaps::new(raw, cnode, sched_context),
         if teb_live_alias != 0 && teb_live_map == 0 && teb2_live_map == 0 {
@@ -27011,7 +26953,7 @@ unsafe fn spawn_hosted_thread_mechanism(
             0
         },
         resources,
-    )
+    ))
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).

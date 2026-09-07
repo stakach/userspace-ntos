@@ -8,7 +8,7 @@ fn admission_starts_without_fabricated_tcbs_or_slots() {
     assert_eq!(inventory.live_tcb(), None);
     assert!(inventory.tcb_deleted_or_absent());
     assert_eq!(inventory.next_retirement(), None);
-    assert_eq!(inventory.entries().count(), 5);
+    assert_eq!(inventory.entries().count(), 4);
 }
 
 #[test]
@@ -144,28 +144,22 @@ fn failed_delete_and_recycle_keep_tcb_before_cnode_retirement() {
     }
     assert_eq!(
         retired,
-        [
-            Role::GuardedCnode,
-            Role::RawCnode,
-            Role::SchedContext,
-            Role::FaultEndpoint
-        ]
+        [Role::GuardedCnode, Role::RawCnode, Role::SchedContext,]
     );
     assert!(inventory.is_empty());
 }
 
 #[test]
-fn transferred_sc_and_owned_endpoint_are_distinct_from_borrowed_inputs() {
+fn transferred_sc_remains_owned_after_tcb_and_cnode_retirement() {
     let mut inventory = ThreadConstructionInventory::empty();
     // A borrowed original PML4 or endpoint has no ownership entry.
-    inventory.adopt_object(Role::FaultEndpoint, 200).unwrap();
     inventory.adopt_object(Role::SchedContext, 201).unwrap();
     assert_eq!(
         inventory
             .entries()
             .filter(|(_, state)| state.slot().is_some())
             .count(),
-        2
+        1
     );
     assert_eq!(inventory.live_tcb(), None);
     assert_eq!(
