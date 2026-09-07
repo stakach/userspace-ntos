@@ -60,7 +60,8 @@ pub use runtime_section::{
 };
 pub mod writeback;
 pub use working_set::{
-    PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileStore, PagefileStoreStats,
+    PagefilePage, PagefileProtectionPlan, PagefilePublishPlan, PagefileRetirement,
+    PagefileRetirementIo, PagefileStore, PagefileStoreStats,
     WorkingSetAdjustmentPlan, WorkingSetLimits, WorkingSetOwnerId, WorkingSetPage, WorkingSetTable,
     WorkingSetTableStats, DEFAULT_WORKING_SET_MAXIMUM_PAGES, DEFAULT_WORKING_SET_MINIMUM_PAGES,
     FLUID_WORKING_SET_PAGES, STATUS_BAD_WORKING_SET_LIMIT, WORKING_SET_PAGE_SIZE,

@@ -9645,10 +9645,15 @@ impl ExecNtHandler {
         let pi = claim.pi();
         if self.process_mechanisms.pid_for_pi(pi).is_some()
             || self.thread_runtime.has_process(pi)
-            || self.temporary_process_slots.release_exact(claim).is_err()
+            || self.temporary_process_slots.get(pi) != Some(claim)
         {
             return false;
         }
+        if unsafe { process_working_set_retire(pi) }.is_err() {
+            return false;
+        }
+        self.temporary_process_slots.release_exact(claim)
+            .expect("serialized cleanup retains the exact temporary process claim");
         self.process_vspaces[pi] = 0;
         unsafe { process_committed_mapping_reset(pi) };
         self.clear_hosted_tp_worker_windows(pi);
@@ -11430,6 +11435,9 @@ impl ExecNtHandler {
     }
 
     fn rollback_hosted_process_creation(&mut self, pi: usize, pid: nt_process::ProcessId) {
+        // No user execution has been admitted, so this metadata-only rollback cannot own
+        // transition backing. Detect a stale process-slot lifetime before releasing Ps ownership.
+        unsafe { process_working_set_clear_metadata(pi) };
         while let Some(object) = self.pm.take_any_handle(pid) {
             self.release_handle_object(object);
         }
@@ -11448,7 +11456,6 @@ impl ExecNtHandler {
         debug_assert!(deletion.exception_port.is_none());
         self.process_vspaces[pi] = 0;
         self.pool_used[pi] = 0;
-        unsafe { process_working_set_retire(pi) };
         self.clear_hosted_tp_worker_windows(pi);
         self.drain_job_notifications();
         self.drain_job_destructions();

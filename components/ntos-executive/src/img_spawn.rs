@@ -846,6 +846,8 @@ pub(crate) unsafe fn spawn_sec_image(
     // A hosted slot can first carry an unpublished diagnostic image and later a real process. End
     // that old address-space lifetime before any new paging structure is installed; published
     // process teardown uses the commitment-aware reclaim path instead.
+    process_working_set_retire(pi as usize)
+        .expect("process-slot reuse requires completed transition backing retirement");
     let stale_page_tables = reclaim_unpublished_process_page_tables(pi as usize);
     process_committed_mapping_reset(pi as usize);
     if stale_page_tables != 0 {

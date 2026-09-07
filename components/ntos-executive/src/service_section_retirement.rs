@@ -54,7 +54,7 @@ pub(crate) unsafe fn service_drain_section_retirement(
 pub(crate) unsafe fn service_unmap_section_view_mappings(
     view: GenericSectionView,
 ) -> Result<(), u32> {
-    hosted_thread_memory_access(view.pi as u64, view.base, view.size)?;
+    hosted_thread_memory_retirement_access(view.pi as u64, view.base, view.size)?;
     let end = view
         .base
         .checked_add(view.size)
@@ -67,7 +67,7 @@ pub(crate) unsafe fn service_unmap_section_view_mappings(
         {
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
-        process_pagefile_discard(view.pi as u64, page);
+        process_pagefile_discard(view.pi as u64, page)?;
         page = page
             .checked_add(0x1000)
             .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;

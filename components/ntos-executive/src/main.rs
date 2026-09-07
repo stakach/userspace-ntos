@@ -1398,7 +1398,7 @@ pub(crate) unsafe fn process_committed_mapping_reset(pi: usize) {
     // This is an address-space lifetime boundary (fresh VSpace, temporary-slot release, or final
     // teardown), so no virtual lock may survive into the next owner of this process slot.
     let _ = vm_page_lock_retire_owner(pi as u64);
-    process_working_set_retire(pi);
+    process_working_set_clear_metadata(pi);
     if let Some(table) = process_committed_mapping_table_mut(pi) {
         *table = nt_address_space::VmCommittedRangeTable::new();
     }
@@ -1652,6 +1652,9 @@ pub(crate) unsafe fn reclaim_unpublished_process_page_tables(pi: usize) -> u64 {
 }
 
 pub(crate) unsafe fn reset_process_vm_state(slots: usize) -> bool {
+    if (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).stats().pages != 0 {
+        return false;
+    }
     (&mut *core::ptr::addr_of_mut!(VM_PAGE_LOCKS)).reset();
     (&mut *core::ptr::addr_of_mut!(PROCESS_USER_PAGE_TABLES)).clear();
     *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS) = nt_memory_manager::WorkingSetTable::new();
@@ -8739,7 +8742,9 @@ pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u6
         if vm_page_lock_is_locked(pi, page) {
             VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         } else {
-            process_pagefile_discard(pi, page);
+            if process_pagefile_discard(pi, page).is_err() {
+                break;
+            }
             if csrss_frame_get_exact_record(pi, page).is_some()
                 && csrss_frame_reclaim_exact(pi, page)
             {
@@ -9554,9 +9559,9 @@ unsafe fn shared_image_mapping_delete_cap(pi: u8, cap: SharedImageMappingCap) ->
     }
 }
 
-unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
+unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) -> Result<(), u32> {
     let Some(chunks) = (*core::ptr::addr_of_mut!(SHARED_IMAGE_MAPPING_CHUNKS)).as_mut() else {
-        return;
+        return Ok(());
     };
     let mut chunk_index = 0usize;
     while chunk_index < chunks.len() {
@@ -9566,7 +9571,7 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
         {
             let mapping = (*chunks[chunk_index]).entries[entry_index];
             if mapping.pi as u64 == pi && mapping.page >= base && mapping.page < end {
-                process_pagefile_discard(pi, mapping.page);
+                process_pagefile_discard(pi, mapping.page)?;
                 if shared_image_mapping_delete_cap(mapping.pi, mapping.cap) {
                     let removed =
                         shared_image_mapping_remove_at(chunks, chunk_index, entry_index);
@@ -9576,7 +9581,7 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
                             && removed.cap == mapping.cap
                     }));
                 } else {
-                    entry_index += 1;
+                    return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
                 }
             } else {
                 entry_index += 1;
@@ -9584,6 +9589,7 @@ unsafe fn shared_image_mapping_unmap_range(pi: u64, base: u64, end: u64) {
         }
         chunk_index += 1;
     }
+    Ok(())
 }
 
 unsafe fn shared_image_mapping_unmap_process(pi: u64) -> (u64, u64) {
@@ -9718,28 +9724,20 @@ unsafe fn process_working_set_pageout_mapping(pi: usize, page: u64) -> bool {
     false
 }
 
-unsafe fn process_working_set_retire(pi: usize) {
-    let _ = (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).unregister(pi as u64);
-    loop {
-        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
-        let Some(record) = pagefile.first_for_owner(pi as u64) else {
-            break;
-        };
-        let record = pagefile
-            .take(pi as u64, record.page)
-            .expect("transition generation remains available through owner rundown")
-            .expect("the serialized transition record remains present through owner rundown");
-        vm_frame_release_unmapped(record.backing);
-    }
+unsafe fn process_working_set_retire(pi: usize) -> Result<(), u32> {
+    pagefile_retirement::retire_owner(pi as u64)?;
+    process_working_set_clear_metadata(pi);
+    Ok(())
 }
 
-unsafe fn process_pagefile_discard(pi: u64, page: u64) {
-    if let Some(record) = (&mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE))
-        .take(pi, page)
-        .expect("transition generation remains available during explicit unmap")
-    {
-        vm_frame_release_unmapped(record.backing);
-    }
+unsafe fn process_working_set_clear_metadata(pi: usize) {
+    assert!((&*core::ptr::addr_of!(PROCESS_PAGEFILE)).first_for_owner(pi as u64).is_none(),
+        "working-set metadata cannot forget retained transition backing");
+    let _ = (&mut *core::ptr::addr_of_mut!(PROCESS_WORKING_SETS)).unregister(pi as u64);
+}
+
+unsafe fn process_pagefile_discard(pi: u64, page: u64) -> Result<(), u32> {
+    pagefile_retirement::discard(pi, page)
 }
 
 mod client_prefetch;
@@ -13045,7 +13043,9 @@ unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
         VM_LOCK_RECLAIM_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    process_pagefile_discard(pi as u64, page);
+    if process_pagefile_discard(pi as u64, page).is_err() {
+        return false;
+    }
     if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
         vm_watch(b"unmap", pi, page, record.frame);
         csrss_frame_reclaim_exact(pi as u64, page)
@@ -13156,8 +13156,7 @@ unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) ->
         }
         page += 0x1000;
     }
-    shared_image_mapping_unmap_range(pi as u64, base, end);
-    true
+    shared_image_mapping_unmap_range(pi as u64, base, end).is_ok()
 }
 
 unsafe fn vm_reprotect_shared_image_mapping(
@@ -14967,6 +14966,7 @@ mod root_slot_recycle;
 mod frame_acquisition;
 mod frame_recycle;
 mod client_frame_cleanup;
+mod pagefile_retirement;
 use thread_sched_context::attach_sched_context;
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
@@ -18584,8 +18584,6 @@ unsafe fn release_unpublished_sec_image_spawn(
     }
     let _ = csrss_frame_drop_process_all(pi as u64);
     let (_, copyin_failures) = client_copyin_frame_drop_process(pi as u64);
-    process_committed_mapping_reset(pi);
-    process_vm_region_map_reset(pi);
     if !kuser_page_alias_release(pi)
         || copyin_failures != 0
         || !client_frame_registry_process_is_empty(pi as u64)
@@ -18593,6 +18591,11 @@ unsafe fn release_unpublished_sec_image_spawn(
     {
         return false;
     }
+    if process_working_set_retire(pi).is_err() {
+        return false;
+    }
+    process_committed_mapping_reset(pi);
+    process_vm_region_map_reset(pi);
     let _ = reclaim_unpublished_process_page_tables(pi);
     if (&*core::ptr::addr_of!(PROCESS_USER_PAGE_TABLES))
         .first_for_process(pi as u64)

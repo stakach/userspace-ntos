@@ -128,14 +128,9 @@ impl ProcessVmRetirementIo for FinalProcessVm<'_> {
                     return false;
                 }
             }
-            // Metadata commit returns transition frames to this free list after every alias and
-            // root is gone. Reserve now, while failure can still retain the complete VM owner.
-            let Ok(transitions) =
-                (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).retirement_frame_count(pi as u64)
-            else {
-                return false;
-            };
-            (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).reserve(transitions)
+            // Transition backing is physical ownership, not metadata cleanup. Complete it while
+            // a failure can still retain the exact process and its page tables/VSpace.
+            process_working_set_retire(pi).is_ok()
         }
     }
 

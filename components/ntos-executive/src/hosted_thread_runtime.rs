@@ -720,6 +720,9 @@ pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Resu
     if !unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).memory_available(pi, base, size) } {
         return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
     }
+    if !unsafe { (&*core::ptr::addr_of!(PROCESS_PAGEFILE)).memory_available(pi, base, size) } {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
     Ok(())
 }
 

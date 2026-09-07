@@ -8651,6 +8651,7 @@ pub(crate) unsafe fn service_sec_image(
             print_str(b"\n");
         }
         crate::client_frame_cleanup::retry_pending();
+        crate::pagefile_retirement::retry_pending();
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {

@@ -223,6 +223,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain exact resident-frame release/pageout intent, explicit backing-cap provenance and
   independent unmap/delete/recycle/revoke acknowledgements; wire common cleanup and retry before
   ordinary memory admission (tranche 91; pagefile retirement/restore remain open).
+- [x] Keep pagefile transition rows through exact checked retirement and move final process
+  transition cleanup before page-table/VSpace teardown (tranche 92; restore handoff remains
+  separate).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28231,6 +28234,46 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     release bundles and user-stack VAD retirement retry. Shared-image cap-bank range retirement and
     generic pending-thread destructive activation remain open. Desktop acceptance still requires
     implementing the 33 missing real provider imports; no fallback or synthetic paint is introduced.
+
+    B3 retained pagefile retirement tranche 92 (2026-09-08):
+
+    PagefileStore now keeps transition rows through an exact retirement intent. Store and record
+    identities fence snapshots against same-page/backing reuse and cross-store plan replay. Each
+    unmap/revoke acknowledgement is retained independently, and terminal publication checks exact
+    readiness plus generation headroom before calling the checked frame-pool publisher. Ordinary
+    take/restore, replacement, protection and user-memory admission cannot consume a retiring row.
+    Contains and private-backing enumeration retain terminal ownership until final publication.
+
+    The native adapter replaces transition take-before-void-release with retained discard and
+    per-owner rundown. Existing scratch, runtime-transport and attachment exclusions precede
+    cleanup. Event-boundary retries keep exact state and bounded genuine-failure diagnostics.
+    Range and section unmap propagate incomplete retirement. Working-set metadata clears only after
+    transitions are empty. Final process cleanup now retires transition backing in its fallible
+    leaf stage, before page tables and VSpace, instead of returning frames during infallible
+    metadata commit. The obsolete late capacity reservation/counting mechanism is removed.
+
+    Temporary process claims remain installed through fallible transition retirement and release
+    only after it succeeds. Fresh process-slot setup checks transition cleanup before reclaiming
+    old page tables. Metadata-only unpublished Ps rollback asserts it has no transition backing
+    before releasing Ps ownership. The global VM-state initializer also refuses to overwrite a
+    nonempty transition store.
+
+    Validation: 19 focused retirement tests cover exact identity, acknowledged cleanup stages,
+    failed publication, protection exclusion and partial rundown. A host integration test joins
+    PagefileStore, the recycled-frame pool and ordered process VM retirement to prove that
+    unmap/revoke/publication failure cannot advance to page-table, VSpace or metadata teardown.
+    The serialized nine-crate suite passes 1,371 tests (372 memory-manager; 348 user-host including
+    integration tests). The executive release build passes with 262 warnings. Logs:
+    `.tmp/test-pagefile-retirement-focused-20260908.log`,
+    `.tmp/test-pagefile-retirement-20260908.log`, `.tmp/build-pagefile-retirement-20260908.log`.
+    Native review also moved unpublished-process transition cleanup behind retained runtime and
+    prefetch exclusion, before metadata reset. Root alone ran all tests/builds.
+
+    Review adjustment: restore's old take/map/restore rollback remains the next MM ownership
+    handoff; it is not claimed complete by this retirement change. In parallel with that backlog,
+    prioritize the missing real object-security provider imports toward desktop readiness. The
+    current 33-import boot admission failure remains open; no boot or desktop acceptance is
+    claimed from host tests or a successful build.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

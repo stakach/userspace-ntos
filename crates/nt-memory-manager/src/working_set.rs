@@ -323,8 +323,45 @@ pub struct PagefilePage {
     pub backing: u64,
 }
 
+#[path = "pagefile_retirement.rs"]
+mod pagefile_retirement;
+pub use pagefile_retirement::{PagefileRetirement, PagefileRetirementIo};
+
+static NEXT_PAGEFILE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn allocate_pagefile_id(counter: &core::sync::atomic::AtomicU64) -> Result<u64, u32> {
+    counter
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |value| {
+                if value == 0 {
+                    None
+                } else {
+                    value.checked_add(1)
+                }
+            },
+        )
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagefileState {
+    Available,
+    Retiring { unmapped: bool, revoked: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PagefileRecord {
+    id: u64,
+    page: PagefilePage,
+    state: PagefileState,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagefilePublishPlan {
+    store_id: u64,
+    record_id: u64,
     generation: u64,
     next_generation: u64,
     page: PagefilePage,
@@ -332,6 +369,7 @@ pub struct PagefilePublishPlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagefileProtectionPlan {
+    store_id: u64,
     generation: u64,
     next_generation: u64,
     owner: WorkingSetOwnerId,
@@ -348,10 +386,13 @@ pub struct PagefileStoreStats {
     pub restores: u64,
     pub takes: u64,
     pub stale_commits: u64,
+    pub retiring: usize,
+    pub retirements: u64,
 }
 
 pub struct PagefileStore {
-    records: Vec<PagefilePage>,
+    records: Vec<PagefileRecord>,
+    identity: u64,
     generation: u64,
     stats: PagefileStoreStats,
 }
@@ -360,6 +401,7 @@ impl PagefileStore {
     pub const fn new() -> Self {
         Self {
             records: Vec::new(),
+            identity: 0,
             generation: 1,
             stats: PagefileStoreStats {
                 pages: 0,
@@ -368,6 +410,8 @@ impl PagefileStore {
                 restores: 0,
                 takes: 0,
                 stale_commits: 0,
+                retiring: 0,
+                retirements: 0,
             },
         }
     }
@@ -375,7 +419,7 @@ impl PagefileStore {
     fn index_for(&self, owner: WorkingSetOwnerId, page: u64) -> Option<usize> {
         self.records
             .iter()
-            .position(|record| record.owner == owner && record.page == page)
+            .position(|record| record.page.owner == owner && record.page.page == page)
     }
 
     pub fn contains(&self, owner: WorkingSetOwnerId, page: u64) -> bool {
@@ -383,7 +427,16 @@ impl PagefileStore {
     }
 
     pub fn prepare_publish(&mut self, page: PagefilePage) -> Result<PagefilePublishPlan, u32> {
+        self.prepare_publish_with_counter(page, &NEXT_PAGEFILE_ID)
+    }
+
+    fn prepare_publish_with_counter(
+        &mut self,
+        page: PagefilePage,
+        counter: &core::sync::atomic::AtomicU64,
+    ) -> Result<PagefilePublishPlan, u32> {
         if page.page & (WORKING_SET_PAGE_SIZE - 1) != 0
+            || page.page.checked_add(WORKING_SET_PAGE_SIZE).is_none()
             || page.backing == 0
             || self.index_for(page.owner, page.page).is_some()
         {
@@ -396,7 +449,13 @@ impl PagefileStore {
             .generation
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        if self.identity == 0 {
+            self.identity = allocate_pagefile_id(counter)?;
+        }
+        let record_id = allocate_pagefile_id(counter)?;
         Ok(PagefilePublishPlan {
+            store_id: self.identity,
+            record_id,
             generation: self.generation,
             next_generation,
             page,
@@ -404,23 +463,38 @@ impl PagefileStore {
     }
 
     pub fn commit_publish(&mut self, plan: PagefilePublishPlan) -> Result<(), u32> {
-        if self.generation != plan.generation
+        self.commit_insert(plan, false)
+    }
+
+    fn commit_insert(&mut self, plan: PagefilePublishPlan, restoration: bool) -> Result<(), u32> {
+        if self.identity == 0
+            || self.identity != plan.store_id
+            || self.generation != plan.generation
             || self.index_for(plan.page.owner, plan.page.page).is_some()
         {
             self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
             return Err(STATUS_INVALID_PARAMETER);
         }
         self.generation = plan.next_generation;
-        self.records.push(plan.page);
+        self.records.push(PagefileRecord {
+            id: plan.record_id,
+            page: plan.page,
+            state: PagefileState::Available,
+        });
         self.stats.pages = self.records.len();
         self.stats.high_water = self.stats.high_water.max(self.records.len());
-        self.stats.publications = self.stats.publications.saturating_add(1);
+        if restoration {
+            self.stats.restores = self.stats.restores.saturating_add(1);
+        } else {
+            self.stats.publications = self.stats.publications.saturating_add(1);
+        }
         Ok(())
     }
 
     pub fn page(&self, owner: WorkingSetOwnerId, page: u64) -> Option<PagefilePage> {
         let index = self.index_for(owner, page)?;
-        Some(self.records[index])
+        let record = self.records[index];
+        (record.state == PagefileState::Available).then_some(record.page)
     }
 
     /// Reserve the fallible generation change before altering resident or VAD protection.
@@ -448,11 +522,14 @@ impl PagefileStore {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let end = base.checked_add(size).ok_or(STATUS_INVALID_PARAMETER)?;
+        if !self.memory_available(owner, base, size) {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         if !self.records.iter().any(|record| {
-            record.owner == owner
-                && record.page >= base
-                && record.page < end
-                && record.protection != protection
+            record.page.owner == owner
+                && record.page.page >= base
+                && record.page.page < end
+                && record.page.protection != protection
         }) {
             return Ok(None);
         }
@@ -461,6 +538,7 @@ impl PagefileStore {
             .checked_add(1)
             .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         Ok(Some(PagefileProtectionPlan {
+            store_id: self.identity,
             generation: self.generation,
             next_generation,
             owner,
@@ -471,13 +549,20 @@ impl PagefileStore {
     }
 
     pub fn commit_protection(&mut self, plan: PagefileProtectionPlan) -> Result<(), u32> {
-        if self.generation != plan.generation {
+        if self.identity == 0
+            || self.identity != plan.store_id
+            || self.generation != plan.generation
+            || !self.memory_available(plan.owner, plan.base, plan.end - plan.base)
+        {
             self.stats.stale_commits = self.stats.stale_commits.saturating_add(1);
             return Err(STATUS_INVALID_PARAMETER);
         }
         for record in &mut self.records {
-            if record.owner == plan.owner && record.page >= plan.base && record.page < plan.end {
-                record.protection = plan.protection;
+            if record.page.owner == plan.owner
+                && record.page.page >= plan.base
+                && record.page.page < plan.end
+            {
+                record.page.protection = plan.protection;
             }
         }
         self.generation = plan.next_generation;
@@ -492,6 +577,9 @@ impl PagefileStore {
         let Some(index) = self.index_for(owner, page) else {
             return Ok(None);
         };
+        if self.records[index].state != PagefileState::Available {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let next_generation = self
             .generation
             .checked_add(1)
@@ -500,52 +588,26 @@ impl PagefileStore {
         self.generation = next_generation;
         self.stats.pages = self.records.len();
         self.stats.takes = self.stats.takes.saturating_add(1);
-        Ok(Some(record))
+        Ok(Some(record.page))
     }
 
     pub fn restore(&mut self, page: PagefilePage) -> Result<(), u32> {
-        if page.page & (WORKING_SET_PAGE_SIZE - 1) != 0
-            || self.index_for(page.owner, page.page).is_some()
-            || page.backing == 0
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        self.records
-            .try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let next_generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        self.records.push(page);
-        self.generation = next_generation;
-        self.stats.pages = self.records.len();
-        self.stats.restores = self.stats.restores.saturating_add(1);
-        Ok(())
+        let plan = self.prepare_publish(page)?;
+        self.commit_insert(plan, true)
     }
 
     pub fn first_for_owner(&self, owner: WorkingSetOwnerId) -> Option<PagefilePage> {
         self.records
             .iter()
-            .copied()
-            .find(|record| record.owner == owner)
+            .find(|record| record.page.owner == owner)
+            .map(|record| record.page)
     }
 
     pub fn pages_for_owner(&self, owner: WorkingSetOwnerId) -> impl Iterator<Item = u64> + '_ {
         self.records
             .iter()
-            .filter(move |record| record.owner == owner)
-            .map(|record| record.page)
-    }
-
-    /// Preflight final-owner rundown before releasing the VSpace. The caller must serialize this
-    /// store through the subsequent `take` loop and reserve storage for these returned frames.
-    pub fn retirement_frame_count(&self, owner: WorkingSetOwnerId) -> Result<usize, u32> {
-        let count = self.pages_for_owner(owner).count();
-        self.generation
-            .checked_add(count as u64)
-            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-        Ok(count)
+            .filter(move |record| record.page.owner == owner)
+            .map(|record| record.page.page)
     }
 
     pub fn stats(&self) -> PagefileStoreStats {
@@ -856,6 +918,7 @@ mod tests {
         store.commit_protection(plan).unwrap();
         assert_eq!(store.generation, generation + 1);
         for record in original {
+            let record = record.page;
             let expected = if record.owner == 7 && record.page < 0x4000 {
                 PagefilePage {
                     protection: 0x02,
@@ -1000,41 +1063,5 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(store.page(2, 0x1000).is_none());
         assert_eq!(store.page(3, 0x1000).unwrap().backing, 3);
-    }
-
-    #[test]
-    fn owner_rundown_preflights_all_generations_without_consuming_records() {
-        let mut store = PagefileStore::new();
-        for (owner, page, backing) in [(2, 0x1000, 1), (2, 0x2000, 2), (3, 0x1000, 3)] {
-            store.restore(PagefilePage {
-                owner,
-                page,
-                protection: 0x04,
-                backing,
-            }).unwrap();
-        }
-        store.generation = u64::MAX - 1;
-        assert_eq!(
-            store.retirement_frame_count(2),
-            Err(STATUS_INSUFFICIENT_RESOURCES)
-        );
-        assert_eq!(store.retirement_frame_count(3), Ok(1));
-        assert_eq!(store.stats().pages, 3);
-        assert_eq!(store.generation, u64::MAX - 1);
-        store.generation = u64::MAX - 2;
-        assert_eq!(store.retirement_frame_count(2), Ok(2));
-        while let Some(page) = store.first_for_owner(2) {
-            store.take(2, page.page).unwrap().unwrap();
-        }
-        assert_eq!(store.generation, u64::MAX);
-        assert_eq!(store.page(3, 0x1000).unwrap().backing, 3);
-    }
-
-    #[test]
-    fn empty_owner_rundown_needs_no_generation_budget() {
-        let mut store = PagefileStore::new();
-        store.generation = u64::MAX;
-        assert_eq!(store.retirement_frame_count(19), Ok(0));
-        assert_eq!(store.generation, u64::MAX);
     }
 }
