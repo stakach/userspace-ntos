@@ -9776,6 +9776,18 @@ impl ExecNtHandler {
         self.thread_runtime.reserve(pi, process, tid, badge, role, reservations).is_some()
     }
 
+    pub(crate) fn admit_hosted_thread_ingress(
+        &self,
+        badge: u64,
+    ) -> Result<HostedThreadRuntime, nt_user_host::thread_slot::ThreadIngressError> {
+        use nt_user_host::thread_slot::ThreadIngressError;
+        let owner = self.thread_runtime
+            .get_by_badge(badge)
+            .ok_or(ThreadIngressError::UnknownBadge)?;
+        let current = self.capture_thread_process_identity(owner.pi, owner.tid);
+        self.thread_runtime.admit_ingress(badge, current)
+    }
+
     fn capture_thread_process_identity(
         &self,
         pi: usize,

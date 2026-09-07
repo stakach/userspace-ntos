@@ -57,6 +57,157 @@ fn slot(tcb: u64) -> (ThreadRuntimeSlot<Runtime>, Rc<Cell<usize>>) {
     (slot, drops)
 }
 
+#[test]
+fn ingress_rejects_vacant_and_foreign_badges_without_mutation() {
+    let empty = ThreadRuntimeSlot::<Runtime>::empty();
+    assert_eq!(
+        empty.admit_ingress(0, None).unwrap_err(),
+        ThreadIngressError::UnknownBadge
+    );
+    let (slot, drops) = slot(100);
+    let binding = slot.owner().unwrap().binding;
+    assert_eq!(
+        slot.admit_ingress(5, Some(binding.process)).unwrap_err(),
+        ThreadIngressError::UnknownBadge
+    );
+    assert_eq!(slot.owner().unwrap().binding, binding);
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn ingress_admits_exact_owner_including_badge_zero() {
+    let (mut slot, _) = slot(100);
+    for badge in [4, 0] {
+        let owner = slot.ordinary_mut().unwrap();
+        owner.binding.badge = badge;
+        owner.binding.reservations.as_mut().unwrap().badge = badge;
+        let binding = owner.binding;
+        assert_eq!(
+            slot.admit_ingress(badge, Some(binding.process))
+                .unwrap()
+                .binding,
+            binding
+        );
+    }
+}
+
+#[test]
+fn ingress_rejects_missing_or_replaced_process_authority() {
+    let (slot, _) = slot(100);
+    let binding = slot.owner().unwrap().binding;
+    for current in [
+        None,
+        Some(ProcessIdentity {
+            pid: 9,
+            ..binding.process
+        }),
+        Some(ProcessIdentity {
+            generation: ProcessGeneration::Hosted(8),
+            ..binding.process
+        }),
+        Some(ProcessIdentity {
+            generation: ProcessGeneration::Temporary(7),
+            ..binding.process
+        }),
+    ] {
+        assert_eq!(
+            slot.admit_ingress(binding.badge, current).unwrap_err(),
+            ThreadIngressError::ProcessChanged
+        );
+    }
+    assert_eq!(slot.owner().unwrap().binding, binding);
+}
+
+#[test]
+fn ingress_rejects_unbuilt_and_busy_publications() {
+    for tcb in [1, 100] {
+        let (mut slot, _) = slot(tcb);
+        let binding = slot.owner().unwrap().binding;
+        if tcb == 1 {
+            assert_eq!(
+                slot.admit_ingress(binding.badge, Some(binding.process))
+                    .unwrap_err(),
+                ThreadIngressError::Unbuilt
+            );
+        }
+        let ticket = slot
+            .ordinary_mut()
+            .unwrap()
+            .publication
+            .prepare(binding)
+            .unwrap();
+        assert_eq!(
+            slot.admit_ingress(binding.badge, Some(binding.process))
+                .unwrap_err(),
+            ThreadIngressError::Publishing
+        );
+        slot.publishing_mut(&ticket)
+            .unwrap()
+            .publication
+            .finish(ticket, &binding)
+            .unwrap();
+        assert_eq!(
+            slot.admit_ingress(binding.badge, Some(binding.process))
+                .is_ok(),
+            tcb > 1
+        );
+    }
+}
+
+#[test]
+fn ingress_stops_at_pending_entry_before_journal_preparation() {
+    let (mut slot, drops) = slot(100);
+    let binding = slot.owner().unwrap().binding;
+    assert!(slot
+        .admit_ingress(binding.badge, Some(binding.process))
+        .is_ok());
+    let id = slot.begin_pending(binding).unwrap();
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::Pending
+    );
+    assert_eq!(slot.pending().unwrap().id(), id);
+    assert_eq!(slot.owner().unwrap().binding, binding);
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn ingress_stays_rejected_through_failed_and_completed_cleanup() {
+    let (mut slot, drops) = slot(100);
+    let binding = slot.owner().unwrap().binding;
+    let id = slot.begin_pending(binding).unwrap();
+    slot.prepare_cleanup(id, &[]).unwrap();
+    let mut backend = Backend {
+        current: id,
+        drops: drops.clone(),
+        effects: 0,
+        fail_revoke: true,
+    };
+    assert!(slot.advance_cleanup(id, &mut backend).is_err());
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::Pending
+    );
+    backend.fail_revoke = false;
+    slot.advance_cleanup(id, &mut backend).unwrap();
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::Pending
+    );
+    let retired = slot.take_retired_payload(id).unwrap();
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::UnknownBadge
+    );
+    assert_eq!(drops.get(), 0);
+    drop(retired);
+    assert_eq!(drops.get(), 1);
+}
+
 struct Backend {
     current: ThreadRollbackId,
     drops: Rc<Cell<usize>>,

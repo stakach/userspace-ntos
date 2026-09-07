@@ -38,6 +38,15 @@ pub enum SlotError {
     Cleanup(ThreadRollbackError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadIngressError {
+    UnknownBadge,
+    Pending,
+    Publishing,
+    Unbuilt,
+    ProcessChanged,
+}
+
 impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
     pub const fn empty() -> Self {
         Self {
@@ -77,6 +86,33 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
             }
             _ => None,
         }
+    }
+
+    /// Admit only the exact published caller under its current process authority. Ownership
+    /// visibility must never provide an alternate dispatch route for a pending runtime.
+    pub fn admit_ingress(
+        &self,
+        badge: u64,
+        current_process: Option<crate::process_identity::ProcessIdentity>,
+    ) -> Result<&R, ThreadIngressError> {
+        let runtime = self.owner().ok_or(ThreadIngressError::UnknownBadge)?;
+        let binding = runtime.binding();
+        if binding.badge != badge {
+            return Err(ThreadIngressError::UnknownBadge);
+        }
+        if self.is_pending() {
+            return Err(ThreadIngressError::Pending);
+        }
+        if runtime.publication().is_busy() {
+            return Err(ThreadIngressError::Publishing);
+        }
+        if binding.tcb <= 1 {
+            return Err(ThreadIngressError::Unbuilt);
+        }
+        if current_process != Some(binding.process) {
+            return Err(ThreadIngressError::ProcessChanged);
+        }
+        Ok(runtime)
     }
 
     pub fn ordinary_mut(&mut self) -> Option<&mut R> {

@@ -18842,11 +18842,12 @@ unsafe fn keyed_release_wait_cancel_thread(handler: &ExecNtHandler, tid: u64) {
     thread_wait_state_clear_tid(handler, tid);
 }
 
-/// Consume the Reply object bound to the current native-syscall fault without sending on it, then
+/// Consume the Reply object bound to the current hosted fault/native Call without sending, then
 /// rotate a fresh pool object into `REPLY_MAIN_SLOT`. Deleting the bound object clears the only
 /// capability that can resume this Call; the caller remains blocked until its TCB is destroyed.
-/// The vacated cptr is immediately retyped as an unbound Reply object and returned to the pool.
-unsafe fn drop_current_syscall_reply() -> bool {
+/// The vacated cptr is retyped as an unbound Reply, or removed from the pool if retype fails.
+/// Never call for bound notifications: they do not bind the receive's offered Reply object.
+unsafe fn drop_current_hosted_reply() -> bool {
     let active = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if active == 0 {
         return false;
@@ -18859,7 +18860,7 @@ unsafe fn drop_current_syscall_reply() -> bool {
     };
     let delete = cnode_delete_r(active);
     if delete != 0 {
-        print_str(b"[thread-term] reply-drop cap=0x");
+        print_str(b"[hosted-reply] drop cap=0x");
         print_hex(active as u32);
         print_str(b" delete=");
         print_u64(delete);
@@ -18873,7 +18874,7 @@ unsafe fn drop_current_syscall_reply() -> bool {
     if retype != 0 {
         wait_reply_pool_clear_cap(active_index);
     }
-    print_str(b"[thread-term] reply-drop cap=0x");
+    print_str(b"[hosted-reply] drop cap=0x");
     print_hex(active as u32);
     print_str(b" next=0x");
     print_hex(fresh as u32);

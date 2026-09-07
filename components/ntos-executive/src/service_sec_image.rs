@@ -5378,15 +5378,8 @@ fn hosted_owner_has_role(
     badge: u64,
     role: nt_exe_image::HostedProcessRole,
 ) -> bool {
-    let owner = owner_top_badge_for(nt_handler, badge);
-    hosted_main_badge_has_role(nt_handler, owner, role)
-}
-
-fn hosted_pi_for_mechanism_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
-    if let Some((pi, _)) = tp_worker_identity_from_badge(badge) {
-        return Some(pi);
-    }
-    hosted_pi_for_top_badge(nt_handler, badge)
+    owner_top_badge_for(nt_handler, badge)
+        .is_some_and(|owner| hosted_main_badge_has_role(nt_handler, owner, role))
 }
 
 fn live_hosted_pi_for_role(
@@ -5407,20 +5400,9 @@ fn live_hosted_pi_for_role(
     None
 }
 
-fn live_hosted_pi_for_thread_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
-    nt_handler
-        .hosted_thread_pi_for_badge(badge)
-        .filter(|&pi| nt_handler.pm_pid_for_pi(pi).is_some())
-}
-
-fn live_hosted_pi_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<usize> {
-    live_hosted_pi_for_thread_badge(nt_handler, badge)
-        .or_else(|| hosted_pi_for_mechanism_badge(nt_handler, badge))
-}
-
 fn hosted_leaf_for_fault_badge(nt_handler: &ExecNtHandler, badge: u64) -> Option<&[u8]> {
-    let pi = live_hosted_pi_for_fault_badge(nt_handler, badge)?;
-    nt_handler.hosted_process_leaf(pi)
+    let runtime = nt_handler.admit_hosted_thread_ingress(badge).ok()?;
+    nt_handler.hosted_process_leaf(runtime.pi)
 }
 
 fn interactive_shell_frontier_pi(nt_handler: &ExecNtHandler) -> Option<usize> {
@@ -8369,8 +8351,7 @@ pub(crate) unsafe fn service_sec_image(
     macro_rules! park_and_log {
         ($pi:expr, $label:expr, $ip:expr, $cr2:expr) => {{
             let __pi: usize = $pi;
-            let __owner = owner_top_badge_for(&nt_handler, badge);
-            let __bit = 1u64 << __owner;
+            let __bit = owner_bit_for_badge(&nt_handler, badge);
             // ★ THE LOG LINE IS PER *THREAD* BADGE, the crash BIT is per process. A hosted process
             // has several threads and one of them can already have milestone-parked (which sets the
             // process's crash bit) — suppressing the print on the process bit then SILENCED a
@@ -8632,7 +8613,36 @@ pub(crate) unsafe fn service_sec_image(
         dll_arena_paging: dll_arena_paging as *mut DllArenaPagingState,
     };
     nt_handler.loop_ctx = Some(memory_context);
+    // This endpoint admits hosted faults/native Calls, not asynchronous Send traffic. A rejected
+    // caller stays blocked; its uniquely owned Reply must be cancelled before the next receive.
+    macro_rules! reject_hosted_ingress {
+        () => {{
+            print_str(b"[service-loop] rejected hosted ingress badge=");
+            print_u64(badge);
+            print_str(b" label=");
+            print_u64(mi >> 12);
+            print_str(b"\n");
+            assert!(drop_current_hosted_reply(), "cannot cancel rejected hosted ingress");
+            let received = recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
+            badge = received.0;
+            mi = received.1;
+            m0 = received.2;
+            m1 = received.3;
+            m2 = received.4;
+            m3 = received.5;
+            continue;
+        }};
+    }
     loop {
+        // Bound notifications do not bind the offered Reply and use a separate badge namespace.
+        let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
+            None
+        } else {
+            match nt_handler.admit_hosted_thread_ingress(badge) {
+                Ok(runtime) => Some(runtime),
+                Err(_) => reject_hosted_ingress!(),
+            }
+        };
         // Deferred work between events writes canonical tables, never the previous event's
         // reusable scratch counters. Flush late completion fills before selecting another owner.
         nt_handler.loop_ctx = nt_handler.loop_ctx.map(|ctx| ctx.checkpoint_live());
@@ -8918,6 +8928,12 @@ pub(crate) unsafe fn service_sec_image(
             stop = durability_status as u64;
             break;
         }
+        // Deferred work may retire a process/thread. Revalidate the complete binding before
+        // selecting any role, LPC context, stack mirror or process memory state.
+        let event_runtime = match (ingress, nt_handler.admit_hosted_thread_ingress(badge)) {
+            (Some(admitted), Ok(current)) if admitted.binding() == current.binding() => current,
+            _ => reject_hosted_ingress!(),
+        };
         iters += 1;
         // `iters` is diagnostic only. A real NT kernel does not stop a runnable hosted process set at a
         // historical boot-frontier count; quiesce is driven by wait/crash/stall predicates above.
@@ -8940,7 +8956,7 @@ pub(crate) unsafe fn service_sec_image(
         // processes use the aux range decoded by tp_worker_identity_from_badge. The role is
         // orthogonal to listener recognizers: it shares process state and mirrors, but not
         // RPC-listener-specific parking or quiesce policy.
-        let hosted_thread_role = nt_handler.hosted_thread_role_for_badge(badge);
+        let hosted_thread_role = Some(event_runtime.role);
         let tp_worker_identity = tp_worker_identity_from_badge(badge);
         let tp_worker_slot = tp_worker_identity.map(|(_, slot)| slot);
         let is_tp_worker = tp_worker_identity.is_some();
@@ -9053,7 +9069,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_str(b" (N-threads sub-select: pi 4 listener)\n");
             }
         }
-        let pi = live_hosted_pi_for_fault_badge(&nt_handler, badge).unwrap_or(0);
+        let pi = event_runtime.pi;
         // This thread is producing an event, so it is runnable even if the owning process still has
         // other parked threads. The owner mask is derived from all live hosted threads below.
         thread_wait_state_clear_badge_running(&mut nt_handler, badge);
@@ -9076,7 +9092,7 @@ pub(crate) unsafe fn service_sec_image(
             pi < MAX_PI,
             "hosted process pi exceeds MAX_PI - raise the runtime ceiling"
         );
-        let event_current_tid = nt_handler.hosted_thread_tid_for_badge(badge).unwrap_or(0);
+        let event_current_tid = event_runtime.tid;
         nt_handler.pi = pi;
         nt_handler.current_badge = badge;
         nt_handler.current_tid = event_current_tid;
@@ -9268,15 +9284,7 @@ pub(crate) unsafe fn service_sec_image(
                 nt_exe_image::HostedProcessRole::InteractiveLogon,
             ) && crate::WL_CPUEXC_DIAG_N.fetch_add(1, Ordering::Relaxed) < 4
             {
-                let tcb = if hosted_main_badge_has_role(
-                    &nt_handler,
-                    badge,
-                    nt_exe_image::HostedProcessRole::InteractiveLogon,
-                ) {
-                    nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0)
-                } else {
-                    0
-                };
+                let tcb = event_runtime.tcb;
                 let mut regs = [0u64; 20];
                 if tcb != 0 {
                     crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -9441,7 +9449,7 @@ pub(crate) unsafe fn service_sec_image(
                 print_hex((fip >> 32) as u32);
                 print_hex(fip as u32);
                 print_str(b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n");
-                crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                 service_watchdog_record_crash_parked(crash_parked);
                 procs[pi].faults = faults;
                 procs[pi].first = first;
@@ -9485,7 +9493,7 @@ pub(crate) unsafe fn service_sec_image(
         if (mi >> 12) == 4 {
             let debug_ip = m0;
             let debug_reason = m1;
-            let tcb = nt_handler.hosted_main_thread_tcb_for_pi(pi).unwrap_or(0);
+            let tcb = event_runtime.tcb;
             if tcb != 0 && ntdll.is_some() {
                 let mut regs = [0u64; 20];
                 crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -9808,10 +9816,7 @@ pub(crate) unsafe fn service_sec_image(
                         print_hex(value as u32);
                     }
                 }
-                let tcb = tp_worker_identity
-                    .and_then(|(tp_pi, tp_slot)| nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot))
-                    .or_else(|| nt_handler.hosted_main_thread_tcb_for_pi(pi))
-                    .unwrap_or(0);
+                let tcb = event_runtime.tcb;
                 if tcb != 0 {
                     let mut regs = [0u64; 20];
                     win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -9842,10 +9847,7 @@ pub(crate) unsafe fn service_sec_image(
             // value and the loop never makes progress (deterministic hang). So STOP the loop cleanly
             // with a diagnostic instead — exactly like the win32k `[vmf-out]` stop path.
             if addr < 0x10000 {
-                let tcb = tp_worker_identity
-                    .and_then(|(tp_pi, tp_slot)| nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot))
-                    .or_else(|| nt_handler.hosted_main_thread_tcb_for_pi(pi))
-                    .unwrap_or(0);
+                let tcb = event_runtime.tcb;
                 if tcb != 0 {
                     let mut regs = [0u64; 20];
                     win32k_glue::tcb_read_regs20(tcb, &mut regs);
@@ -9873,29 +9875,8 @@ pub(crate) unsafe fn service_sec_image(
                 // exact fault in the TEB that owns it (main or one of winlogon's worker TEBs), then
                 // retry the instruction. This must precede the generic worker-wall park below.
                 if pi == 2 && m0 == 0x801a_0009 && addr == 0x10 {
-                    let tcb = match badge {
-                        _ if tp_worker_identity.is_some() => {
-                            let (tp_pi, tp_slot) = tp_worker_identity.unwrap();
-                            nt_handler.hosted_tp_worker_tcb(tp_pi, tp_slot).unwrap_or(0)
-                        }
-                        WINLOGON_WORKER_BADGE => nt_handler
-                            .hosted_thread_tcb_for_role(2, HostedThreadRole::WinlogonListener)
-                            .unwrap_or(0),
-                        WINLOGON_WORKER2_BADGE => nt_handler
-                            .hosted_thread_tcb_for_role(
-                                2,
-                                HostedThreadRole::WinlogonWorker { slot: 1 },
-                            )
-                            .unwrap_or(0),
-                        WINLOGON_WORKER3_BADGE => nt_handler
-                            .hosted_thread_tcb_for_role(
-                                2,
-                                HostedThreadRole::WinlogonWorker { slot: 2 },
-                            )
-                            .unwrap_or(0),
-                        _ => nt_handler.hosted_main_thread_tcb_for_pi(2).unwrap_or(0),
-                    };
-                    let repair_tid = nt_handler.hosted_thread_tid_for_badge(badge).unwrap_or(0);
+                    let tcb = event_runtime.tcb;
+                    let repair_tid = event_runtime.tid;
                     if let Some((_teb_alias, client_deskinfo, pti, _, _, _old_pti)) =
                         refresh_hosted_gui_thread_client_info(
                             &mut nt_handler,
@@ -10111,7 +10092,7 @@ pub(crate) unsafe fn service_sec_image(
                     )
                     && !defer_quiesce_for_active_user_callbacks(b"winlogon-frontier-crash")
                 {
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
                     let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
                     procs[pi].faults = faults;
@@ -10430,10 +10411,7 @@ pub(crate) unsafe fn service_sec_image(
                 };
                 (base, image_owner.allocation_end, tpe)
             } else {
-                let fault_tcb = nt_handler
-                    .hosted_thread_tcb_for_badge(badge)
-                    .or_else(|| nt_handler.hosted_main_thread_tcb_for_pi(pi))
-                    .unwrap_or(0);
+                let fault_tcb = event_runtime.tcb;
                 // DIAG: dump the fault so we can tell a stack-growth fault (addr just below the
                 // stack) from a real null deref. m0=IP, m1=addr(cr2), m2=prefetch, m3=fsr.
                 print_str(b"[vmf-out] ip=0x");
@@ -10565,7 +10543,7 @@ pub(crate) unsafe fn service_sec_image(
                 {
                     print_str(b"[wait] lsass main unrecoverable fault POST-LSA-signal -> PARK (boot continues)\n");
                     // Terminal for lsass main — count toward quiesce (lsass has done its signalling job).
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
                     procs[pi].faults = faults;
                     procs[pi].first = first;
@@ -10636,7 +10614,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(
                         b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n",
                     );
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
                     procs[pi].faults = faults;
                     procs[pi].first = first;
@@ -11748,7 +11726,7 @@ pub(crate) unsafe fn service_sec_image(
                         tcb,
                         registers,
                     } => {
-                        let reply_dropped = drop_current_syscall_reply();
+                        let reply_dropped = drop_current_hosted_reply();
                         let write_error = if reply_dropped {
                             crate::win32k_glue::tcb_write_regs20(tcb, &registers, true)
                         } else {
@@ -11817,7 +11795,7 @@ pub(crate) unsafe fn service_sec_image(
                                 REPLY_MAIN_SLOT.load(Ordering::Relaxed),
                             );
                         }
-                        let reply_dropped = drop_current_syscall_reply();
+                        let reply_dropped = drop_current_hosted_reply();
                         let mechanism_deleted =
                             terminate_hosted_thread_mechanism(tid, delay_queue, &mut nt_handler);
                         if reply_dropped && mechanism_deleted {
@@ -11867,7 +11845,7 @@ pub(crate) unsafe fn service_sec_image(
                             None
                         };
                         let reply_dropped = if drop_reply {
-                            drop_current_syscall_reply()
+                            drop_current_hosted_reply()
                         } else {
                             false
                         };
@@ -11934,7 +11912,7 @@ pub(crate) unsafe fn service_sec_image(
                         }
                     }
                     ExecPostAction::CriticalTermination { code, object } => {
-                        let reply_dropped = drop_current_syscall_reply();
+                        let reply_dropped = drop_current_hosted_reply();
                         // A critical process can bugcheck while it is running a win32k user-mode
                         // callback; unwind those continuations so win32k is idle (not stranded in its
                         // callback receive loop) for the gate. No-op when it held none.
@@ -12545,7 +12523,7 @@ pub(crate) unsafe fn service_sec_image(
                                     && badge != userinit_top_badge
                                     && n < EMPTY_QUEUE_PARK_GRACE)
                                     || (owner_top_badge_for(&nt_handler, badge)
-                                        != userinit_top_badge
+                                        != Some(userinit_top_badge)
                                         && userinit_shell_frontier_pending(
                                             &nt_handler,
                                             crash_parked,
@@ -17134,7 +17112,7 @@ pub(crate) unsafe fn service_sec_image(
                     procs[pi].first = first;
                     procs[pi].ntfaults = ntfaults;
                     pfilled[pi] = *filled_pages;
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
                     let userinit_shell_pending =
                         userinit_shell_frontier_pending(&nt_handler, crash_parked, wait_parked);
@@ -17198,7 +17176,7 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(
                         b" -> MILESTONE park (holds no win32k callback frame; boot continues)\n",
                     );
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
                     procs[pi].faults = faults;
                     procs[pi].first = first;
@@ -17359,8 +17337,8 @@ pub(crate) unsafe fn service_sec_image(
                 continue;
             }
             if active_callback_bad_resume && reply_main != 0 {
-                if drop_current_syscall_reply() {
-                    crash_parked |= 1u64 << owner_top_badge_for(&nt_handler, badge);
+                if drop_current_hosted_reply() {
+                    crash_parked |= owner_bit_for_badge(&nt_handler, badge);
                     service_watchdog_record_crash_parked(crash_parked);
                     let _ = win32k_glue::unwind_dead_client_user_callbacks(pi as u32);
                     drain_deferred_user_callback_returns(
@@ -26555,14 +26533,17 @@ unsafe fn prefill_client_large_string_pages(
     }
 }
 
-/// Map any fault badge to the TOP-LEVEL process badge that owns it. Named listener/worker
-/// ownership is runtime metadata; top-level and generic TP-worker badges are mechanism-level decodes.
+/// Resolve an executable thread's current process owner without decoding a replacement identity.
 #[inline]
-fn owner_top_badge_for(nt_handler: &ExecNtHandler, badge: u64) -> u64 {
-    nt_handler
-        .hosted_thread_pi_for_badge(badge)
-        .or_else(|| hosted_pi_for_mechanism_badge(nt_handler, badge))
-        .map(|pi| hosted_top_badge_for_pi(nt_handler, pi))
+fn owner_top_badge_for(nt_handler: &ExecNtHandler, badge: u64) -> Option<u64> {
+    let runtime = nt_handler.admit_hosted_thread_ingress(badge).ok()?;
+    nt_handler.hosted_process_top_badge(runtime.pi)
+}
+
+fn owner_bit_for_badge(nt_handler: &ExecNtHandler, badge: u64) -> u64 {
+    owner_top_badge_for(nt_handler, badge)
+        .and_then(|owner| u32::try_from(owner).ok())
+        .and_then(|owner| 1u64.checked_shl(owner))
         .unwrap_or(0)
 }
 
@@ -26655,15 +26636,7 @@ fn trace_wait_owner_mask_after_mark(
     }
     const OWNER_THREAD_BADGE_SNAPSHOT: usize = 64;
     let mut threads = [HostedThreadQuiesceRecord::empty(); OWNER_THREAD_BADGE_SNAPSHOT];
-    let snapshot = hosted_process_wait_snapshot(nt_handler, pi, &mut threads).unwrap_or(
-        HostedProcessWaitSnapshot {
-            owner: owner_top_badge_for(nt_handler, badge),
-            count: 0,
-            live: false,
-            all_parked: false,
-            overflow: false,
-        },
-    );
+    let snapshot = hosted_process_wait_snapshot(nt_handler, pi, &mut threads);
     print_str(b"[wait-owner] #");
     print_u64(n);
     print_str(b" pi=");
@@ -26671,7 +26644,11 @@ fn trace_wait_owner_mask_after_mark(
     print_str(b" badge=");
     print_u64(badge);
     print_str(b" owner=");
-    print_u64(snapshot.owner);
+    if let Some(snapshot) = snapshot {
+        print_u64(snapshot.owner);
+    } else {
+        print_str(b"unknown");
+    }
     print_str(b" live=0x");
     print_hex_u64(live);
     print_str(b" crash=0x");
@@ -26680,6 +26657,10 @@ fn trace_wait_owner_mask_after_mark(
     print_hex_u64(wait_parked);
     print_str(b" remaining=0x");
     print_hex_u64(live & !(crash_parked | wait_parked));
+    let Some(snapshot) = snapshot else {
+        print_str(b" snapshot=unavailable\n");
+        return;
+    };
     print_str(b" owner-bit=");
     print_u64(((snapshot.owner < 64) && (wait_parked & (1u64 << snapshot.owner)) != 0) as u64);
     print_str(b" snapshot-live=");
@@ -26733,7 +26714,10 @@ fn trace_indefinite_wait_park(
     print_str(b"[wait-park] badge=");
     print_u64(badge);
     print_str(b" owner=");
-    print_u64(owner_top_badge_for(nt_handler, badge));
+    match owner_top_badge_for(nt_handler, badge) {
+        Some(owner) => print_u64(owner),
+        None => print_str(b"unknown"),
+    }
     print_str(b" top-level=");
     print_u64(pi_is_top_level(nt_handler, badge) as u64);
     print_str(b" live=0x");

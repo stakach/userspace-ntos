@@ -509,6 +509,19 @@ pub(crate) struct HostedThreadRuntimes {
 }
 
 impl HostedThreadRuntimes {
+    pub(crate) fn admit_ingress(
+        &self,
+        badge: u64,
+        current_process: Option<nt_user_host::process_identity::ProcessIdentity>,
+    ) -> Result<HostedThreadRuntime, nt_user_host::thread_slot::ThreadIngressError> {
+        use nt_user_host::thread_slot::ThreadIngressError;
+        let table = unsafe { &*self.table };
+        let slot = table.entries.iter()
+            .find(|slot| slot.owner().is_some_and(|runtime| runtime.badge == badge))
+            .ok_or(ThreadIngressError::UnknownBadge)?;
+        slot.admit_ingress(badge, current_process).copied()
+    }
+
     pub(crate) fn executable_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         unsafe { (&*self.table).executable_by_tid(tid) }
     }

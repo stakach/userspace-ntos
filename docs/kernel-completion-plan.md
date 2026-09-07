@@ -139,9 +139,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add in-place non-cloneable pending runtime storage, protected table mutation/release and
   distinct direct execution projections; extract the native table into a focused module
   (tranche 62, host/build; native cleanup entry not activated).
+- [x] Require exact executable runtime/process authority at service ingress, cancel rejected callers'
+  Reply bindings before receiving again, and remove mechanism/process-zero and worker-to-main TCB
+  substitutions (tranche 63, host/build; native cleanup entry not activated).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next close pending-owner dispatch ingress and
-  memory-admission bypasses, then wire registered-resume
+  emptiness as a complete execution-quiescence proof. Next close pending-owner memory-admission
+  bypasses and remaining non-ingress routing consumers, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
@@ -26838,6 +26841,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     alive, not ordinary slot release or an aliased mutable table borrow. Registered-resume, early/main
     construction, ordinary termination cleanup and handler-owned handoffs remain open. The complete
     win32k import gate still has 33 unresolved code imports.
+
+    B3 exact service-ingress tranche 63 (2026-09-07, host/build green):
+    `ThreadRuntimeSlot::admit_ingress` rejects unknown badges, pending cleanup, busy publication,
+    unbuilt TCBs and absent/changed process authority. Native admission checks the actual PM thread's
+    process owner against the runtime's captured tagged PID/generation, not merely a live PI. The
+    service loop admits hosted faults/native Calls before checkpointing or deferred work, then
+    revalidates the full binding before role/LPC/stack/process-memory selection. Valid timer/IRQ
+    notifications remain a separate route and never consume a caller-bound Reply.
+
+    Rejected ingress uses the existing checked Reply cancellation/rotation operation, now named
+    `drop_current_hosted_reply`. Successful deletion leaves the caller blocked without a fabricated
+    service result; failure stops before another receive can overwrite the Reply's owner. Retype
+    failure removes the old spare from the pool. No second cancellation mechanism was introduced.
+    The old mechanism-badge resolver and unknown-PI-to-zero dispatch are deleted. Owner lookup
+    returns an option, masks use checked shifts, and unavailable diagnostic snapshots are reported
+    explicitly. Fault diagnostics and the existing low-fault repair select the admitted event's TCB
+    and TID instead of substituting a main thread or matching named Winlogon worker badges.
+
+    Validation: six new host tests cover vacant/foreign badges, valid badge zero, replaced PID or
+    generation authority, unfinished construction, pending entry before journal preparation, failed
+    cleanup, completed-but-retained cleanup and final retirement. The serialized nine-crate suite
+    passes 1,039 tests, including 146 `nt-user-host` unit/integration tests;
+    log: `.tmp/test-thread-ingress-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-thread-ingress-20260907.log`.
+    Two read-only agents reviewed native routing and microkernel Reply/notification semantics;
+    root alone ran tests/builds. No desktop or live pending-cleanup proof is claimed.
+
+    Review adjustment: main service ingress is guarded, but this does not exclude pending owners
+    from unrelated deferred memory work. Next publish exact fault/native-copy, mirror, VM and pageout
+    exclusions before retaining/transferring external aliases. Audit non-ingress role/TID/badge
+    consumers and derive worker-window routing from admitted reservations where possible. Keep
+    native `begin_pending` unactivated until those guards, complete journals, checked reference
+    clearing and once-only reservation commit are wired. Registered-resume, early/main construction,
+    ordinary termination resource-release failures and handler-owned handoffs remain open. The full
+    win32k import gate still has 33 unresolved code imports; rebuilding the executive is not boot proof.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
