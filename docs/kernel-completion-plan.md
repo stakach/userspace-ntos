@@ -251,7 +251,7 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Move real Ps/token bootstrap ownership ahead of provider DriverEntry, retaining one initial
   System process and thread through handler initialization (tranche 100). Bind PsIsSystemProcess
   only against its pinned canonical EPROCESS, separate from provider GUI initialization.
-- [~] Add provider-domain-bound subject leases over authenticated hosted or initial-System callers
+- [x] Add provider-domain-bound subject leases over authenticated hosted or initial-System callers
   (tranche 101; host core). Retain actual primary/client references through publication, replacement
   and rundown. Never interpret a missing hosted caller as System authority.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
@@ -28527,6 +28527,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     diagnostic/live double-consumption defect, exact object references and address publication,
     provider-visible backing, ABI layout, and actual SMSS ClientId admission. Root serialized all
     validation. Desktop acceptance still requires the remaining real imports and provider authority.
+
+    B3 provider subject ownership tranche 101 (2026-09-08):
+
+    Retain captured token references in a non-cloneable provider subject registry. Prepare and
+    publish are separate ownership phases; failed output preparation must abort the exact prepared
+    owner, not leak it or fabricate a valid native context. Hosted capture validates the retained
+    caller against fresh admitted runtime routing and the canonical PM activation. Initial-System
+    capture instead requires its exact manager-scoped designation. Both select actual current
+    primary and impersonation tokens with the captured effective level. Published leases survive
+    later token replacement or caller teardown until their explicit release.
+
+    Bind each lease to the provider's catalog instance as well as domain/generation. A fresh catalog
+    can reuse the same numeric domain/generation tuple; it must not resurrect the old provider's
+    subjects. Trusted rundown can retire prepared/published references after domain retirement,
+    retaining failed releases for retry. Native SECURITY_SUBJECT_CONTEXT keeps its actual ABI:
+    no hidden lease cookie in padding, no context-address-only authority, and no live-token mutation
+    lock claimed by this ownership layer.
+
+    Validation: 174 process, 60 provider-wait, 171 security and 333 user-host tests plus 43 integrations
+    pass (781 total), including 15 new focused tests. The nineteen-crate regression passes 2,253
+    tests. Logs: `.tmp/test-provider-subject-20260908.log` and
+    `.tmp/test-provider-subject-regression-20260908.log`. Independent review found the replacement
+    catalog authority gap; the new opaque catalog identity and replacement/move/retirement tests
+    close it. Native token projections, lock/privilege brokers, audit delivery and desktop acceptance
+    remain separate and are not claimed by this host-core checkpoint.
+
+    B3 native kernel-caller cutover tranche 102 (2026-09-08, in progress):
+
+    DriverEntry must execute as the canonical initial System thread, with its real neutral objects
+    selected in provider KPCR state. Do not give that thread a fabricated PEB, TEB or GUI context.
+    Remove the post-DriverEntry fake process callout and CSRSS re-keying machinery. Real CSRSS
+    process/thread callouts and its CSR-created desktop thread must own GUI state. Separate dynamic
+    SSDT-resolution instrumentation from process-callout instrumentation and record the latter only
+    when the genuine client callout executes. Root-issued kernel caller authority must remain
+    distinct from hosted runtime admission through provider suspension and early/live store transfer.
+
+    B3 exception walk core tranche 103 (2026-09-08, in progress):
+
+    Add a checked, host-testable search/target-unwind walk over nt-unwind, using owned continuations
+    so language-handler calls cannot retain a mutable Rust walk borrow across re-entry. Validate
+    dispositions, noncontinuability, stack/function-table bounds, target-frame termination handlers
+    and restored nonvolatile state. A missing target must never produce a successful transfer.
+    Collided unwind requires real dispatcher/linkage provenance; until implemented, report an
+    explicit unsupported outcome and do not bind native exports or replace the ntdll dispatcher.
+
+    Native exception cutover additionally requires the physical provider lane's stack bounds,
+    immutable image/function-table registration (including unwindable handler linkage thunks),
+    Win64 capture/restore and genuine first/second-chance delivery. Do not copy the existing ntdll
+    dispatcher unchanged: its ignored dispositions, skipped target handler and incomplete restored
+    context require correction. Provider exceptions cannot use hosted-user NtContinue/NtRaiseException
+    transport. Bind ExRaiseAccessViolation, ExRaiseStatus and RtlUnwindEx only after those mechanisms
+    are complete; a bugcheck or unconditional target jump is not exception dispatch.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
