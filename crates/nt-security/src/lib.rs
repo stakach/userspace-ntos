@@ -53,7 +53,8 @@ pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
     assign_object_security, assign_object_security_with_audit, capture_object_type_list,
-    capture_security_descriptor, capture_security_descriptor_bytes, native_acl_to_acl,
+    capture_security_descriptor_bytes, capture_security_descriptor_for_access,
+    native_acl_to_access_acl,
     query_security_descriptor_bytes, set_security_descriptor_bytes, ObjectSecurityAssignment,
     SecurityAssignmentAudit, SecurityAssignmentClient, SecurityAssignmentInheritance,
     SecurityAssignmentPrivilegeOutcome, DACL_SECURITY_INFORMATION, DEFAULT_KEY_SECURITY_DESCRIPTOR,
@@ -104,3 +105,5 @@ pub use token_set::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod native_access_conversion_tests;

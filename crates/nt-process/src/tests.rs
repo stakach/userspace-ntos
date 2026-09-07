@@ -1678,7 +1678,12 @@ fn hosted_thread_activation_stays_invisible_until_explicit_commit_and_handle_pub
 
     assert_eq!(pm.thread(worker).unwrap().state, ThreadState::Initialized);
     assert_eq!(pm.lookup_handle(pid, reservation.handle), None);
-    pm.commit_thread_activation(activation).unwrap();
+    assert_eq!(
+        pm.commit_thread_activation(activation),
+        Err(STATUS_INVALID_PARAMETER)
+    );
+    pm.commit_thread_activation_with_handle(activation, reservation)
+        .unwrap();
     assert_eq!(
         pm.publish_reserved_handle(reservation),
         Ok(reservation.handle)

@@ -136,6 +136,103 @@ impl NativeObjectReference {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativePsHandlePublicationPhase {
+    Bound,
+    Published,
+    Aborted,
+}
+
+/// Owns one exact, invisible handle-table reference until output publication or rollback.
+/// This does not own the pointer reference used to prepare it. Dropping that pointer reference,
+/// closing unrelated handles, or terminating the target cannot remove this bound table entry.
+/// No implicit Drop can contact the manager; retain a failed transaction for explicit retry.
+#[must_use = "publish or abort the exact bound handle reservation"]
+#[derive(Debug)]
+pub struct NativePsHandlePublication {
+    system: InitialSystemIdentity,
+    reservation: crate::HandleReservation,
+    object: HandleObject,
+    body: u64,
+    thread: Option<ThreadLifetime>,
+    granted_access: u32,
+    flags: HandleFlags,
+    value: u64,
+    phase: NativePsHandlePublicationPhase,
+}
+
+impl NativePsHandlePublication {
+    /// Value to write into the caller's output before acknowledging publication. Lookup still
+    /// rejects this value while the transaction is Bound.
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    pub const fn phase(&self) -> NativePsHandlePublicationPhase {
+        self.phase
+    }
+
+    fn validate(&self, pm: &ProcessManager) -> Result<(), u32> {
+        if self.phase != NativePsHandlePublicationPhase::Bound
+            || !pm.has_initial_system_designation(self.system)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let table = &pm
+            .process(self.reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .handles;
+        let slot = crate::handle_to_slot(self.reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let exact = matches!(table.get(slot), Some(crate::HandleSlot::Bound { generation, entry })
+            if *generation == self.reservation.generation
+                && entry.object == self.object
+                && entry.granted_access == self.granted_access
+                && entry.flags == self.flags);
+        let target = match self.object {
+            HandleObject::Process(pid) => pm.process_kernel_object(pid) == Some(self.body),
+            HandleObject::Thread(tid) => {
+                pm.thread_kernel_object(tid) == Some(self.body)
+                    && self
+                        .thread
+                        .is_some_and(|thread| pm.validate_thread_lifetime(thread))
+            }
+            _ => false,
+        };
+        if exact && target {
+            Ok(())
+        } else {
+            Err(STATUS_INVALID_HANDLE)
+        }
+    }
+
+    /// Acknowledges successful output delivery. Native adapters must authenticate the request
+    /// before calling this method; it does not reconstruct a caller or validate an IPC channel.
+    /// A terminated target remains referenceable, but a terminated table owner must be rolled
+    /// back instead of receiving a new visible handle after its close-all pass.
+    pub fn publish(&mut self, pm: &mut ProcessManager) -> Result<u64, u32> {
+        self.validate(pm)?;
+        let owner = pm
+            .process(self.reservation.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if owner.state != ProcessState::Running || owner.exit_status.is_some() {
+            return Err(crate::STATUS_PROCESS_IS_TERMINATING);
+        }
+        pm.publish_reserved_handle(self.reservation)?;
+        self.phase = NativePsHandlePublicationPhase::Published;
+        Ok(self.value)
+    }
+
+    /// Roll back only the owned bound generation. Even an externally cancelled/reused slot is
+    /// not an excuse to close another handle; failure leaves this transaction intact.
+    pub fn abort(&mut self, pm: &mut ProcessManager) -> Result<(), u32> {
+        self.validate(pm)?;
+        let object = pm.cancel_bound_handle(self.reservation)?;
+        debug_assert_eq!(object, self.object);
+        self.phase = NativePsHandlePublicationPhase::Aborted;
+        Ok(())
+    }
+}
+
 impl ProcessManager {
     /// Capture an unattached caller after the native adapter has authenticated its live runtime.
     /// A caller from the initial System thread additionally requires its retained bootstrap root.
@@ -311,13 +408,13 @@ impl ProcessManager {
     /// security policy. A retained target supplies stable identity, and its pointer reference is
     /// independent of the new handle's table-owned reference. Only KernelMode can select System's
     /// table. The original reference remains owned by the caller on every outcome.
-    pub fn insert_authorized_native_ps_handle(
+    pub fn prepare_authorized_native_ps_handle(
         &mut self,
         caller: NativeHandleCaller,
         reference: &NativeObjectReference,
         granted_access: u32,
         attributes: u32,
-    ) -> Result<u64, u32> {
+    ) -> Result<NativePsHandlePublication, u32> {
         self.validate_native_handle_caller(caller)?;
         reference.validate(self)?;
         if attributes & !(OBJ_KERNEL_HANDLE | OBJ_INHERIT) != 0 {
@@ -347,20 +444,58 @@ impl ProcessManager {
             self.cancel_reserved_handle(reservation)?;
             return Err(status);
         }
-        // No re-entry or allocation can intervene between binding and publication.
-        let handle = self
-            .publish_reserved_handle(reservation)
-            .expect("exact native Ps reservation remains bound");
-        self.set_handle_flags(
-            owner,
-            handle,
-            HandleFlags {
-                inherit: attributes & OBJ_INHERIT != 0,
-                protect_from_close: false,
-            },
-        )
-        .expect("published native Ps handle remains present");
-        Ok(u64::from(handle) | if kernel { KERNEL_HANDLE_TAG } else { 0 })
+        let flags = HandleFlags {
+            inherit: attributes & OBJ_INHERIT != 0,
+            protect_from_close: false,
+        };
+        let slot = crate::handle_to_slot(reservation.handle).expect("reserved native handle");
+        let crate::HandleSlot::Bound { generation, entry } = &mut self
+            .processes
+            .get_mut(&owner)
+            .expect("reserved table owner")
+            .handles[slot]
+        else {
+            unreachable!("new native Ps reservation remains bound");
+        };
+        assert_eq!(*generation, reservation.generation);
+        entry.flags = flags;
+        Ok(NativePsHandlePublication {
+            system: caller.system,
+            reservation,
+            object: reference.object,
+            body: reference.body,
+            thread: reference.thread,
+            granted_access,
+            flags,
+            value: u64::from(reservation.handle) | if kernel { KERNEL_HANDLE_TAG } else { 0 },
+            phase: NativePsHandlePublicationPhase::Bound,
+        })
+    }
+
+    /// Synchronous convenience for already-authorized internal callers. Provider IPC output
+    /// delivery must instead retain the prepare result until its explicit publish/abort decision.
+    pub fn insert_authorized_native_ps_handle(
+        &mut self,
+        caller: NativeHandleCaller,
+        reference: &NativeObjectReference,
+        granted_access: u32,
+        attributes: u32,
+    ) -> Result<u64, u32> {
+        let mut publication = self.prepare_authorized_native_ps_handle(
+            caller,
+            reference,
+            granted_access,
+            attributes,
+        )?;
+        match publication.publish(self) {
+            Ok(handle) => Ok(handle),
+            Err(status) => {
+                publication
+                    .abort(self)
+                    .expect("uninterrupted native handle preparation remains owned");
+                Err(status)
+            }
+        }
     }
 }
 

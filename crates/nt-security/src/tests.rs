@@ -589,7 +589,7 @@ fn native_acl_validates_known_and_object_ace_sids() {
     object_with_guid.extend_from_slice(&[0x5a; 16]);
     object_with_guid.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 5]);
     let native = NativeAcl::from_bytes(&acl_with_ace(4, &object_with_guid, 0)).unwrap();
-    let semantic = native_acl_to_acl(&native).unwrap();
+    let semantic = native_acl_to_access_acl(&native).unwrap();
     assert_eq!(semantic.aces.len(), 1);
     assert_eq!(semantic.aces[0].ace_type, AceType::AccessDenied);
     assert_eq!(semantic.aces[0].object_type, Some([0x5a; 16]));
@@ -2460,7 +2460,7 @@ fn capture_self_relative_security_descriptor_drives_access_check() {
     let sd_bytes = self_relative_sd(&owner, &group, Some(&acl));
     client.map(0xB000, &sd_bytes);
 
-    let sd = capture_security_descriptor(&client, 0xB000).unwrap();
+    let sd = capture_security_descriptor_for_access(&client, 0xB000).unwrap();
     assert_eq!(sd.owner, Some(Sid::local_account(MACHINE, 1000)));
     assert_eq!(sd.group, Some(Sid::users()));
     let result = access_check(
@@ -2496,7 +2496,7 @@ fn capture_absolute_security_descriptor_dereferences_native_pointers() {
     client.map(GROUP_VA, &group);
     client.map(DACL_VA, &acl);
 
-    let sd = capture_security_descriptor(&client, SD_VA).unwrap();
+    let sd = capture_security_descriptor_for_access(&client, SD_VA).unwrap();
     assert_eq!(sd.owner, Some(Sid::local_account(MACHINE, 1000)));
     assert_eq!(sd.group, Some(Sid::users()));
     let result = access_check(
@@ -2601,11 +2601,11 @@ fn capture_security_descriptor_reports_native_statuses() {
         &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     );
     assert_eq!(
-        capture_security_descriptor(&client, 0xC000),
+        capture_security_descriptor_for_access(&client, 0xC000),
         Err(STATUS_UNKNOWN_REVISION)
     );
     assert_eq!(
-        capture_security_descriptor(&client, 0),
+        capture_security_descriptor_for_access(&client, 0),
         Err(STATUS_INVALID_SECURITY_DESCR)
     );
 }

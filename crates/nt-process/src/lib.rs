@@ -1391,6 +1391,18 @@ impl ProcessManager {
         };
         if process.kernel_pointer_references != 0
             || process.handles.iter().any(|slot| !slot.is_free())
+            || self.processes.values().any(|owner| {
+                owner.handles.iter().any(|slot| {
+                    slot.reference_entry().is_some_and(|entry| match entry.object {
+                        HandleObject::Process(target) => target == pid,
+                        HandleObject::Thread(tid) => self
+                            .threads
+                            .get(&tid)
+                            .is_some_and(|thread| thread.process_id == pid),
+                        _ => false,
+                    })
+                })
+            })
         {
             return None;
         }
@@ -1447,7 +1459,10 @@ impl ProcessManager {
     pub fn try_reserve_handle_slot(&mut self, pid: ProcessId) -> Result<HandleReservation, u32> {
         let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
         let generation = proc.next_handle_reservation_generation;
-        proc.next_handle_reservation_generation = generation.wrapping_add(1).max(1);
+        let next_generation = generation
+            .checked_add(1)
+            .filter(|_| generation != 0)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let slot = if let Some(slot) = proc.handles.iter().position(HandleSlot::is_free) {
             proc.handles[slot] = HandleSlot::Reserved(generation);
             slot
@@ -1461,6 +1476,7 @@ impl ProcessManager {
             proc.handles.push(HandleSlot::Reserved(generation));
             slot
         };
+        proc.next_handle_reservation_generation = next_generation;
         Ok(HandleReservation {
             process_id: pid,
             handle: slot_to_handle(slot),
@@ -3068,10 +3084,41 @@ impl ProcessManager {
         )
     }
 
-    /// A terminated ETHREAD may only be recycled after every process handle referring to it has
-    /// closed. Hosts can use this predicate to avoid TID/slot aliasing while reclaiming mechanism
-    /// resources independently of the policy object.
+    /// A terminated ETHREAD may only be recycled after every visible or bound process handle
+    /// referring to it has released ownership. Hosts can use this predicate to avoid TID/slot
+    /// aliasing while reclaiming mechanism resources independently of the policy object.
     pub fn can_reclaim_thread(&self, tid: ThreadId) -> bool {
+        self.can_reclaim_thread_except(tid, None)
+    }
+
+    fn has_thread_handle_reference_except(
+        &self,
+        tid: ThreadId,
+        activation_handle: Option<HandleReservation>,
+    ) -> bool {
+        self.processes.iter().any(|(&owner, process)| {
+            process.handles.iter().enumerate().any(|(slot, entry)| {
+                if !entry
+                    .reference_entry()
+                    .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
+                {
+                    return false;
+                }
+                !activation_handle.is_some_and(|reservation| {
+                    reservation.process_id == owner
+                        && handle_to_slot(reservation.handle) == Some(slot)
+                        && matches!(entry, HandleSlot::Bound { generation, .. }
+                            if *generation == reservation.generation)
+                })
+            })
+        })
+    }
+
+    fn can_reclaim_thread_except(
+        &self,
+        tid: ThreadId,
+        activation_handle: Option<HandleReservation>,
+    ) -> bool {
         self.thread(tid).is_some_and(|thread| {
             thread.state == ThreadState::Terminated
                 && thread.wait_references == 0
@@ -3080,13 +3127,7 @@ impl ProcessManager {
                 && thread.impersonation.is_none()
                 && thread.win32_thread.is_none()
                 && thread.user_apc_queue.is_empty()
-        }) && !self.processes.values().any(|process| {
-            process.handles.iter().any(|entry| {
-                entry
-                    .entry()
-                    .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
-            })
-        })
+        }) && !self.has_thread_handle_reference_except(tid, activation_handle)
     }
 
     /// Validate an activation without changing the ETHREAD or making it debugger-reportable.
@@ -3121,13 +3162,7 @@ impl ProcessManager {
                     && thread.termination_ports.is_empty()
                     && thread.impersonation.is_none()
                     && thread.user_apc_queue.is_empty()
-                    && !self.processes.values().any(|process| {
-                        process.handles.iter().any(|entry| {
-                            entry
-                                .entry()
-                                .is_some_and(|entry| entry.object == HandleObject::Thread(tid))
-                        })
-                    })
+                    && !self.has_thread_handle_reference_except(tid, None)
             }
             ThreadState::Terminated => self.can_reclaim_thread(tid),
             _ => false,
@@ -3161,6 +3196,25 @@ impl ProcessManager {
     /// Publish a prepared hosted ETHREAD activation. Debug notification remains a separate final
     /// step so the host can make the already-bound user handle visible first.
     pub fn commit_thread_activation(&mut self, plan: ThreadActivationPlan) -> Result<(), u32> {
+        self.commit_thread_activation_inner(plan, None)
+    }
+
+    /// Commit thread creation while transferring only its exact, bound unpublished handle to
+    /// the new activation. Other handles and pointer/wait owners still prohibit reuse. The
+    /// caller retains the reservation and must publish it or perform exact creation rollback.
+    pub fn commit_thread_activation_with_handle(
+        &mut self,
+        plan: ThreadActivationPlan,
+        reservation: HandleReservation,
+    ) -> Result<(), u32> {
+        self.commit_thread_activation_inner(plan, Some(reservation))
+    }
+
+    fn commit_thread_activation_inner(
+        &mut self,
+        plan: ThreadActivationPlan,
+        activation_handle: Option<HandleReservation>,
+    ) -> Result<(), u32> {
         let current = self.threads.get(&plan.tid).ok_or(STATUS_INVALID_HANDLE)?;
         if current.process_id != plan.process_id
             || current.activation_generation != plan.generation
@@ -3178,6 +3232,20 @@ impl ProcessManager {
         ) {
             return Err(STATUS_PROCESS_IS_TERMINATING);
         }
+        if let Some(reservation) = activation_handle {
+            let owner = self
+                .process(reservation.process_id)
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            if owner.state != ProcessState::Running || owner.exit_status.is_some() {
+                return Err(STATUS_PROCESS_IS_TERMINATING);
+            }
+            let slot = handle_to_slot(reservation.handle).ok_or(STATUS_INVALID_HANDLE)?;
+            if !matches!(owner.handles.get(slot), Some(HandleSlot::Bound { generation, entry })
+                if *generation == reservation.generation && entry.object == HandleObject::Thread(plan.tid))
+            {
+                return Err(STATUS_INVALID_HANDLE);
+            }
+        }
         let affinity_mask = process.affinity_mask;
         let base_priority = process.base_priority;
         let reusable = match current.state {
@@ -3187,15 +3255,9 @@ impl ProcessManager {
                     && current.termination_ports.is_empty()
                     && current.impersonation.is_none()
                     && current.user_apc_queue.is_empty()
-                    && !self.processes.values().any(|process| {
-                        process.handles.iter().any(|entry| {
-                            entry
-                                .entry()
-                                .is_some_and(|entry| entry.object == HandleObject::Thread(plan.tid))
-                        })
-                    })
+                    && !self.has_thread_handle_reference_except(plan.tid, activation_handle)
             }
-            ThreadState::Terminated => self.can_reclaim_thread(plan.tid),
+            ThreadState::Terminated => self.can_reclaim_thread_except(plan.tid, activation_handle),
             _ => false,
         };
         if !reusable {

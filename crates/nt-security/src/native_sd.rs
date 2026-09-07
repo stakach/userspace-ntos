@@ -168,14 +168,20 @@ pub fn capture_object_type_list(
     Ok(captured)
 }
 
-/// Capture a caller-supplied native `SECURITY_DESCRIPTOR`.
-///
-/// A self-relative descriptor stores 32-bit offsets from the descriptor base. An absolute x64
-/// descriptor stores four pointers at offsets 8, 16, 24, and 32. The returned descriptor keeps only
-/// the access-check semantics currently modelled by the crate: owner, group, DACL, and SACL ACEs.
-pub fn capture_security_descriptor(
+/// Capture a descriptor for an authorization decision without silently discarding unknown ACEs.
+/// Both ACLs must use semantics represented by the access evaluator. Unsupported ACE payloads
+/// are rejected, not treated as absent; this does not itself perform an access check or audit.
+pub fn capture_security_descriptor_for_access(
     memory: &dyn ClientMemory,
     va: u64,
+) -> Result<SecurityDescriptor, u32> {
+    capture_descriptor(memory, va, true)
+}
+
+fn capture_descriptor(
+    memory: &dyn ClientMemory,
+    va: u64,
+    strict: bool,
 ) -> Result<SecurityDescriptor, u32> {
     if va == 0 {
         return Err(STATUS_INVALID_SECURITY_DESCR);
@@ -220,7 +226,7 @@ pub fn capture_security_descriptor(
     };
     let sacl = if control & SE_SACL_PRESENT != 0 {
         match sacl_va {
-            Some(sacl_va) => Some(capture_access_acl(memory, sacl_va)?),
+            Some(sacl_va) => Some(capture_access_acl(memory, sacl_va, strict)?),
             None => None,
         }
     } else {
@@ -228,7 +234,7 @@ pub fn capture_security_descriptor(
     };
     let dacl = if control & SE_DACL_PRESENT != 0 {
         match dacl_va {
-            Some(dacl_va) => Some(capture_access_acl(memory, dacl_va)?),
+            Some(dacl_va) => Some(capture_access_acl(memory, dacl_va, strict)?),
             None => None,
         }
     } else {
@@ -250,7 +256,9 @@ pub fn capture_security_descriptor_bytes(
     memory: &dyn ClientMemory,
     va: u64,
 ) -> Result<Vec<u8>, u32> {
-    capture_security_descriptor(memory, va)?;
+    // Structural preflight only: opaque ACEs must remain byte-for-byte in the owned native
+    // descriptor. The temporary semantic value is discarded, never returned for authorization.
+    capture_descriptor(memory, va, false)?;
 
     let mut relative_header = [0u8; SECURITY_DESCRIPTOR_RELATIVE_SIZE];
     if !memory.read(va, &mut relative_header) {
@@ -450,7 +458,14 @@ pub fn set_security_descriptor_bytes(
 /// preserve their optional object GUID for access-check-by-type while still acting like ordinary
 /// ACEs when no type list is supplied. Unknown/callback ACEs are preserved by [`NativeAcl`] for
 /// token queries but ignored by this semantic evaluator.
-pub fn native_acl_to_acl(native: &NativeAcl) -> Result<Acl, u32> {
+/// Convert only ACE semantics represented by the access evaluator: allow, deny, audit, and
+/// object-specific allow/deny (types 0, 1, 2, 5, 6). Alarm, compound, object audit/alarm,
+/// callback/conditional and unknown ACEs fail explicitly, including inherit-only ACEs.
+pub fn native_acl_to_access_acl(native: &NativeAcl) -> Result<Acl, u32> {
+    convert_native_acl(native, true)
+}
+
+fn convert_native_acl(native: &NativeAcl, strict: bool) -> Result<Acl, u32> {
     let bytes = native.as_bytes();
     if bytes.len() < ACL_HEADER_SIZE {
         return Err(STATUS_INVALID_ACL);
@@ -477,6 +492,15 @@ pub fn native_acl_to_acl(native: &NativeAcl) -> Result<Acl, u32> {
             return Err(STATUS_INVALID_ACL);
         }
 
+        if strict {
+            crate::native_acl_inheritance::validate_known_native_ace(
+                &bytes[offset..ace_end], bytes[0],
+            )?;
+            if !matches!(ace_type, 0 | 1 | 2 | 5 | 6) {
+                return Err(0xc000_00bb); // STATUS_NOT_SUPPORTED
+            }
+        }
+
         if let Some((semantic_type, sid_offset, object_type)) =
             semantic_ace(ace_type, bytes, offset, ace_end)?
         {
@@ -496,9 +520,9 @@ pub fn native_acl_to_acl(native: &NativeAcl) -> Result<Acl, u32> {
     Ok(Acl::new(aces))
 }
 
-fn capture_access_acl(memory: &dyn ClientMemory, va: u64) -> Result<Acl, u32> {
+fn capture_access_acl(memory: &dyn ClientMemory, va: u64, strict: bool) -> Result<Acl, u32> {
     let native = capture_acl(memory, va)?;
-    native_acl_to_acl(&native)
+    convert_native_acl(&native, strict)
 }
 
 fn semantic_ace(

@@ -15802,7 +15802,7 @@ impl ExecNtHandler {
         publication: PreparedHostedThreadPublication,
     ) {
         self.pm
-            .commit_thread_activation(publication.activation)
+            .commit_thread_activation_with_handle(publication.activation, publication.handle)
             .expect(
                 "serialized hosted ETHREAD activation remains current through mechanism admission",
             );
@@ -21143,7 +21143,7 @@ impl ExecNtHandler {
         };
         let sd = {
             let memory = ExecClientMemory { handler: &*self };
-            nt_security::capture_security_descriptor(&memory, security_descriptor)
+            nt_security::capture_security_descriptor_for_access(&memory, security_descriptor)
         };
         let sd = match sd {
             Ok(sd) => sd,

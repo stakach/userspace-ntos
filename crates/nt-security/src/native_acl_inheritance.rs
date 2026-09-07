@@ -124,6 +124,15 @@ fn parse_ace(bytes: &[u8], revision: u8) -> Result<ParsedAce<'_>, u32> {
     })
 }
 
+/// Share the known native payload validation with authorization conversion. NativeAcl preserves
+/// opaque extension ACEs; a consumer that assigns meaning must validate the complete known layout.
+pub(crate) fn validate_known_native_ace(bytes: &[u8], revision: u8) -> Result<(), u32> {
+    if bytes.is_empty() {
+        return Err(STATUS_INVALID_ACL);
+    }
+    parse_ace(bytes, revision).map(|_| ())
+}
+
 enum SidSource<'a> {
     Original(&'a [u8]),
     Replaced(&'a Sid),

@@ -263,12 +263,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add checked native handle scopes and retained Ps references over the existing PM handle tables
   (tranche 104; host core). Use the designated System table for kernel handles; no second object
   authority. Complete actual self-grants and shared Ps/Se/USER handle migration before native cutover.
-- [~] Reject lossy security-descriptor conversion in native access checks (tranche 105). Unsupported
+- [x] Reject lossy security-descriptor conversion in native access checks (tranche 105). Unsupported
   ACE semantics must fail explicitly, never disappear before an allow decision or self-grant check.
 - [x] Admit immutable executable image/function-table snapshots for exception walking (tranche 106;
   host core).
   Validate metadata before execution; known executable gaps alone may classify as leaf functions.
-- [~] Retain exact invisible Ps handle publications across asynchronous output delivery (tranche 107).
+- [x] Retain exact invisible Ps handle publications across asynchronous output delivery (tranche 107;
+  host core plus native thread-creation ownership integration).
   Publish or abort the owned reservation, never compensate by closing a possibly reused raw handle.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
@@ -28699,13 +28700,29 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     tables while retaining the existing provider-owned object bodies, and remove both the USER/PM
     lookup fallbacks and source-process recovery on lookup failure in the same cutover.
 
-    B3 strict native access conversion tranche 105 (2026-09-08, in progress):
+    B3 strict native access conversion tranche 105 (2026-09-08):
 
     The legacy semantic ACL conversion intentionally omits ACE types its model cannot represent.
     That conversion cannot authorize access: a skipped deny followed by a supported allow could
     grant rights incorrectly. Add explicit strict conversion over the existing checked native ACL/SD
     parser, reject unsupported semantics before calling the evaluator, and switch the shared native
     NtAccessCheck/NtAccessCheckByType path. Lossless storage/query compatibility remains separate.
+
+    Implemented and wired into the common native access-check path. Known native ACE layouts reuse
+    the inheritance parser; represented allow/deny/audit/object allow/object deny forms are converted,
+    while unsupported semantics return STATUS_NOT_SUPPORTED and malformed known layouts return
+    STATUS_INVALID_ACL. Unsupported inherit-only or SACL entries cannot silently disappear either.
+    Removed both public lossy conversion APIs after migrating their remaining consumers. Raw SD
+    capture preserves the original bytes and does not expose a permissively converted authority.
+
+    Eleven focused tests cover every ACE type byte, malformed known forms, unsupported deny before
+    allow, absolute/self-relative descriptors, SACL/inherit-only handling, GUID/order preservation
+    and lossless raw capture. Security tests pass 182/182. The combined twenty-one-crate regression
+    passes 2,471 tests and the native release build passes with unchanged 262 warnings. Logs:
+    `.tmp/test-strict-native-access-final-20260908.log`,
+    `.tmp/test-native-ownership-security-regression-final-20260908.log`, and
+    `.tmp/build-native-publication-access-20260908.log`. Unsupported ACE evaluation remains work to
+    implement, not an authorization fallback; this does not complete native security assignment.
 
     B3 admitted exception images tranche 106 (2026-09-08, host core complete):
 
@@ -28735,13 +28752,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     collided unwind, consolidate restore, low-memory allocation behavior and physical handler
     linkage remain open; no desktop proof is claimed.
 
-    B3 retained Ps handle publication tranche 107 (2026-09-08, in progress):
+    B3 retained Ps handle publication tranche 107 (2026-09-08):
 
     Extend the existing PM bound-reservation transaction with a non-Clone native publication owner.
     Hold an invisible exact slot through output delivery, with target/table deletion blocked until
     publish or abort succeeds. Fence manager identity and reservation generation, retain ownership
     on failure and reject generation exhaustion before mutation. Native provider/call ACK journals
     still need to own these transactions; a host prepare/publish helper is not IPC acceptance.
+
+    Implemented NativePsHandlePublication over the existing Bound reservation, retaining exact
+    manager designation, slot generation, target body/lifetime, grant and flags. Publish/abort
+    failures retain the owner; terminal phases cannot affect a reused slot. A terminated target
+    remains referenceable, while a terminated table owner must abort. Immediate authorized insertion
+    now delegates to this same transaction; reservation generations fail before wrap or mutation.
+
+    Review exposed two older ownership bypasses: thread reclaim/activation ignored Bound handles,
+    and process-creation abort ignored incoming references. Both now include invisible bound owners.
+    Genuine thread creation deliberately transfers its own bound handle to a new activation through
+    commit_thread_activation_with_handle, validating the exact reservation and exempting only that
+    one owner. All other bound/visible handles and pointer/wait references still block recycling.
+    The native common hosted-thread commit uses this explicit transfer; the ordinary commit remains
+    fail-closed. No raw-handle compensation or broad Bound exemption was introduced.
+
+    Fifteen new tests beyond tranche 104 cover invisible ownership, terminal/repeated completion,
+    ABA/foreign-manager/changed metadata, generation exhaustion, creation-abort and thread-recycle
+    blockers, and exact creation-handle transfer. PM tests pass 203/203. Shared PM/security/user-host
+    validation passes 761 tests; the twenty-one-crate regression passes 2,471 and the native release
+    build passes (262 warnings), in the same final logs as tranche 105. Provider IPC ACK journals and
+    full Ps/Se/USER native handle cutover remain open; no desktop acceptance is claimed.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
