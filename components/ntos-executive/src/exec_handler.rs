@@ -9746,7 +9746,21 @@ impl ExecNtHandler {
         match failure {
             HostedThreadSpawnFailure::Unstarted => self.thread_runtime.cancel_spawn(prepared),
             HostedThreadSpawnFailure::Retained(partial) => {
-                self.thread_runtime.retain_failed_spawn(prepared, partial);
+                let id = self.thread_runtime.retain_failed_spawn(prepared, partial);
+                let result = unsafe { self.thread_runtime.reconcile_failed_spawn(id) };
+                print_str(b"[thread-reconcile] pending tid=");
+                print_u64(id.identity().tid);
+                print_str(b" snapshot=");
+                print_str(match &result {
+                    Ok(()) => b"prepared; cleanup remains pending",
+                    Err(ThreadReconciliationError::OwnerChanged) => b"owner changed; retained",
+                    Err(ThreadReconciliationError::OwnershipConflict) => b"ownership conflict; retained",
+                    Err(ThreadReconciliationError::Registry(_)) => b"registry unavailable or changed; retained",
+                    Err(ThreadReconciliationError::Aliases(_)) => b"alias unavailable or changed; retained",
+                });
+                print_str(b" status=0x");
+                print_hex(result.as_ref().err().map_or(0, |error| error.status()));
+                print_str(b"\n");
             }
         }
     }

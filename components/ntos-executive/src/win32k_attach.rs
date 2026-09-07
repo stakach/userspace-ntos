@@ -14,6 +14,10 @@ struct Mapping {
 
 static mut MAPPINGS: Vec<Mapping> = Vec::new();
 
+#[path = "win32k_thread_aliases.rs"]
+mod thread_aliases;
+pub(crate) use thread_aliases::ThreadAliasSnapshot;
+
 fn checked(label: u64) -> Result<(), u32> {
     if label == 0 {
         Ok(())

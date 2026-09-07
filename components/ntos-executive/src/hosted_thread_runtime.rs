@@ -10,6 +10,8 @@ pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     construction: nt_user_host::thread_construction::ThreadConstructionInventory,
     memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress<TP_WORKER_STACK_FRAME_COUNT>,
+    registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
+    alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasSnapshot>,
 }
 
 impl HostedThreadRuntimeOwner {
@@ -18,11 +20,14 @@ impl HostedThreadRuntimeOwner {
             runtime,
             construction: nt_user_host::thread_construction::ThreadConstructionInventory::empty(),
             memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress::empty(),
+            registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
+            alias_preparation: core::cell::OnceCell::new(),
         }
     }
 
     fn construction_is_empty(&self) -> bool {
         self.construction.is_empty() && self.memory_progress.is_empty()
+            && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
     }
 
     fn into_legacy_runtime(self) -> HostedThreadRuntime {
@@ -274,15 +279,62 @@ impl HostedThreadRuntimeTable {
 
     pub(crate) fn retain_failed_spawn(
         &mut self, prepared: PreparedHostedThreadRuntime, partial: FailedHostedThreadConstruction,
-    ) {
+    ) -> nt_user_host::thread_rollback::ThreadRollbackId {
         let slot = self.entries.get_mut(prepared.index)
             .expect("constructor retains its pre-reserved runtime row");
         match slot.retain_failed_construction(prepared.ticket, partial) {
-            Ok(_) => {}
+            Ok(id) => id,
             Err((_error, _ticket, _partial)) => {
                 panic!("constructor lost its exclusive runtime publication ticket");
             }
         }
+    }
+
+    /// Read-only preparation is attached through single-assignment cells only after exact pending
+    /// admission. No mutable runtime projection or registry ownership transfer is exposed.
+    pub(crate) unsafe fn reconcile_failed_spawn(
+        &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), ThreadReconciliationError> {
+        let _durable = allocator::enter_durable();
+        let pending = self.entries.iter().filter_map(RuntimeSlot::pending)
+            .find(|pending| pending.id() == id)
+            .ok_or(ThreadReconciliationError::OwnerChanged)?;
+        let owner = pending.runtime();
+        let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
+        let snapshot = owner.registry_preparation.reconcile(
+            id, &owner.resources, &owner.memory_progress, registry,
+        ).map_err(ThreadReconciliationError::Registry)?;
+        for cap in owner.construction.entries().filter_map(|(_, state)| state.slot()) {
+            if owner.memory_progress.empty_slot() == Some(cap)
+                || snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
+                || registry.records().iter().any(|record|
+                    [record.frame, record.alias_cap, record.source_cap].contains(&cap))
+            {
+                return Err(ThreadReconciliationError::OwnershipConflict);
+            }
+        }
+        let aliases = match owner.alias_preparation.get() {
+            Some(aliases) => aliases,
+            None => {
+                let layout = owner.resources.layout().ok_or(ThreadReconciliationError::OwnerChanged)?;
+                let aliases = win32k_glue::ThreadAliasSnapshot::capture(owner.pi as u64, layout)
+                    .map_err(ThreadReconciliationError::Aliases)?;
+                assert!(owner.alias_preparation.set(aliases).is_ok());
+                owner.alias_preparation.get().expect("retained alias preparation")
+            }
+        };
+        aliases.revalidate().map_err(ThreadReconciliationError::Aliases)?;
+        for cap in aliases.capabilities() {
+            if snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
+                || owner.memory_progress.empty_slot() == Some(cap)
+                || owner.construction.entries().any(|(_, state)| state.slot() == Some(cap))
+                || registry.records().iter().any(|record|
+                    [record.frame, record.alias_cap, record.source_cap].contains(&cap))
+            {
+                return Err(ThreadReconciliationError::OwnershipConflict);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn commit_spawn(
@@ -734,8 +786,14 @@ impl HostedThreadRuntimes {
 
     pub(crate) fn retain_failed_spawn(
         &mut self, prepared: PreparedHostedThreadRuntime, partial: FailedHostedThreadConstruction,
-    ) {
+    ) -> nt_user_host::thread_rollback::ThreadRollbackId {
         unsafe { (&mut *self.table).retain_failed_spawn(prepared, partial) }
+    }
+
+    pub(crate) unsafe fn reconcile_failed_spawn(
+        &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), ThreadReconciliationError> {
+        (&*self.table).reconcile_failed_spawn(id)
     }
 
     pub(crate) fn commit_spawn(

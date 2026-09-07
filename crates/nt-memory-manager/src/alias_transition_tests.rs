@@ -85,6 +85,46 @@ fn live() -> (AliasTransition, Io) {
 }
 
 #[test]
+fn snapshots_observe_live_and_unpublished_caps_without_backend_effects() {
+    let (mut owner, mut io) = live();
+    let before = owner.snapshot();
+    assert_eq!(before.capabilities().collect::<Vec<_>>(), vec![42]);
+    assert_eq!(owner.snapshot(), before);
+    assert!(io.calls.is_empty());
+    io.fail_delete = Some(42);
+    assert_eq!(owner.replace(2, &mut io), Err(5));
+    let pending = owner.snapshot();
+    assert_eq!(pending.capabilities().collect::<Vec<_>>(), vec![42, 43]);
+    assert_ne!(pending, before);
+    assert!(!pending.old.mapped && pending.new.mapped);
+    let calls = io.calls.len();
+    assert_eq!(owner.snapshot(), pending);
+    assert_eq!(io.calls.len(), calls);
+}
+
+#[test]
+fn snapshots_distinguish_retirement_and_failed_copy_state_from_empty() {
+    let (mut owner, mut io) = live();
+    let live = owner.snapshot();
+    io.fail_delete = Some(42);
+    assert_eq!(owner.retire(&mut io), Err(5));
+    let retiring = owner.snapshot();
+    assert_ne!(retiring, live);
+    assert!(!retiring.old.mapped);
+    io.fail_delete = None;
+    owner.retire(&mut io).unwrap();
+    let empty = owner.snapshot();
+    assert_eq!(empty.capabilities().count(), 0);
+    io.copy_status = 2;
+    io.fail_delete = Some(43);
+    assert_eq!(owner.replace(1, &mut io), Err(2));
+    let failed = owner.snapshot();
+    assert_ne!(failed, empty);
+    assert_eq!(failed.capabilities().collect::<Vec<_>>(), vec![43]);
+    assert!(!failed.new.mapped);
+}
+
+#[test]
 fn initial_copy_is_published_only_after_mapping_and_detach_is_idempotent() {
     let mut owner = AliasTransition::empty();
     let mut io = Io::default();

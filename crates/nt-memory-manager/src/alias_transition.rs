@@ -11,7 +11,7 @@ pub trait AliasTransitionIo: AliasRetirementIo {
     fn map(&mut self, cap: u64, rights: u64) -> Result<(), u32>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Cap {
     slot: u64,
     mapped: bool,
@@ -36,13 +36,33 @@ impl Cap {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Empty,
     Live,
     Rollback,
     Commit,
     Retiring,
+}
+
+/// Read-only description of all retained alias slots, including an unpublished candidate and
+/// already-unmapped caps awaiting deletion. This is not ownership or retirement authority.
+/// Callers comparing snapshots must exclude new admission/replacement for the selected VA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AliasTransitionSnapshot {
+    old: Cap,
+    new: Cap,
+    rights: u64,
+    new_rights: u64,
+    phase: Phase,
+}
+
+impl AliasTransitionSnapshot {
+    pub fn capabilities(&self) -> impl Iterator<Item = u64> {
+        [self.old.slot, self.new.slot]
+            .into_iter()
+            .filter(|&slot| slot != 0)
+    }
 }
 
 /// Non-cloneable owner. Its containing row must be reserved before construction and retained
@@ -74,6 +94,16 @@ impl AliasTransition {
 
     pub fn live(&self) -> Option<(u64, u64)> {
         (self.phase == Phase::Live).then_some((self.old.slot, self.rights))
+    }
+
+    pub fn snapshot(&self) -> AliasTransitionSnapshot {
+        AliasTransitionSnapshot {
+            old: self.old,
+            new: self.new,
+            rights: self.rights,
+            new_rights: self.new_rights,
+            phase: self.phase,
+        }
     }
 
     pub fn is_empty(&self) -> bool {

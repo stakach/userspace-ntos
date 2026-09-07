@@ -23,6 +23,7 @@ use std::rc::Rc;
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static FAIL_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
 }
 
 struct CountingAllocator;
@@ -38,14 +39,17 @@ fn count_allocation() {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count_allocation();
+        if FAIL_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) { return std::ptr::null_mut(); }
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count_allocation();
+        if FAIL_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) { return std::ptr::null_mut(); }
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         count_allocation();
+        if FAIL_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) { return std::ptr::null_mut(); }
         unsafe { System.realloc(ptr, layout, size) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -91,6 +95,7 @@ struct Runtime {
     binding: ThreadBinding<u32>,
     publication: ThreadPublicationSlot,
     partial: Option<Partial>,
+    reconciliation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<2>,
 }
 
 impl RuntimeIdentity for Runtime {
@@ -146,6 +151,7 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
         binding,
         publication: ThreadPublicationSlot::empty(),
         partial: None,
+        reconciliation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
     })
     .unwrap();
     let ticket = slot
@@ -197,6 +203,41 @@ fn assert_protected(slot: &mut Slot, id: ThreadRollbackId) {
         ThreadIngressError::Pending
     );
     assert!(binding.holds_pool_slot(2, 3) && binding.holds_window_slot(2, 5));
+}
+
+#[test]
+fn registry_preparation_oom_and_revalidation_keep_pending_ownership() {
+    use nt_memory_manager::ClientFrameRegistry;
+    use nt_user_host::thread_reconciliation::ReconciliationError;
+    use nt_user_host::thread_registry::ThreadRegistryError;
+    struct ResetAllocationFailure;
+    impl Drop for ResetAllocationFailure {
+        fn drop(&mut self) { FAIL_ALLOCATIONS.with(|flag| flag.set(false)); }
+    }
+    let (mut slot, ticket, mut partial, drops) = fixture(None, true);
+    partial.memory_progress.record_stack(0);
+    partial.memory_progress.retain_empty_slot(601).unwrap();
+    let mut registry = ClientFrameRegistry::new();
+    registry.insert(2, 0x1000, 200, 0, 201, 202, false).unwrap();
+    let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+    {
+        let runtime = slot.owner().unwrap();
+        let partial = runtime.partial.as_ref().unwrap();
+        FAIL_ALLOCATIONS.with(|flag| flag.set(true));
+        let reset = ResetAllocationFailure;
+        let failure = runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry);
+        drop(reset);
+        assert!(matches!(failure, Err(ReconciliationError::Registry(ThreadRegistryError::InsufficientResources))));
+        assert!(!runtime.reconciliation.is_prepared());
+        runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry).unwrap();
+        without_allocation(|| runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry)).unwrap();
+        registry.take(2, 0x1000).unwrap();
+        let result = without_allocation(|| runtime.reconciliation.reconcile(id, &partial.memory, &partial.memory_progress, &registry));
+        assert!(matches!(result, Err(ReconciliationError::Registry(ThreadRegistryError::StaleRecord { page: 0x1000 }))));
+        assert!(runtime.reconciliation.is_prepared());
+    }
+    assert_protected(&mut slot, id);
+    assert_eq!(drops.get(), 0);
 }
 
 #[test]

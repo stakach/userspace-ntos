@@ -178,12 +178,16 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Connect native hosted-thread constructor failures to exact-ticket pending ownership; retain
   checked memory-copy/retype empty slots, mechanism phases and registry publication coverage before
   cancelling caller publication (tranche 75; native retirement/retry activation remains open).
+- [x] Retain exact-attempt, read-only registry and external win32k alias reconciliation in the
+  pending owner; revalidate immutable snapshots and reject changed coverage or shared capabilities
+  (tranche 76; registry transfer and destructive cleanup remain disabled).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
-  holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Next reconcile
-  the retained registry publication coverage and complete external-alias journal before transferring
-  registry ownership or driving cleanup. Failed SC
+  holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Exact registry
+  coverage and full external alias state are now captured without transferring ownership. Next
+  coordinate TCB retirement with the mechanism slot phases and retain complete external-alias cleanup
+  journals before transferring registry ownership or driving cleanup. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
@@ -27448,6 +27452,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     failure, ordinary termination, other launch families and handler-owned handoffs still use legacy
     lifetime paths. No QEMU/fault-injection/desktop proof is claimed; 33 recorded unresolved win32k
     imports still block the full desktop gate.
+
+    B3 pending construction reconciliation tranche 76 (2026-09-07):
+    Failed-construction handoff returns its exact pending rollback ID. Only after matching that ID
+    to the protected runtime row does the native adapter prepare registry and external alias
+    snapshots. Single-assignment cells on the non-cloneable owner retain successful preparation;
+    there is no mutable runtime projection or snapshot replacement API. A durable allocation guard
+    covers both snapshots even when construction failed inside a transient syscall arena. Immediate
+    reconciliation reports prepared versus retained failure; it neither releases ownership nor
+    schedules a general idle retry worker.
+
+    Expected registry pages come from retained stack/TEB registration progress, not surviving rows.
+    Unregistered construction is explicit empty coverage; missing expected rows and unexpected
+    rows fail closed. Capture failure leaves preparation unset and retryable. Once captured, exact
+    attempt, resources, registration coverage, empty-slot and protected-tail progress must still
+    match. Revalidation is allocation-free and retains the original snapshot on every rejection.
+    Empty memory slots and mechanism slots cannot collide with live memory inventory or any
+    registry capability, including rows outside the selected process and geometry.
+
+    The win32k snapshot describes both old and candidate alias slots, their mapping flags, rights
+    and transition phase, rather than only the currently live projection. The original non-cloneable
+    AliasTransition remains in MAPPINGS. Revalidation requires exactly one matching mapping per
+    retained page and rejects new, missing, changed or duplicate mappings. Each selected alias cap
+    must occur once across all mappings and must not collide with registry, construction or memory
+    slots. These descriptions confer no independent deletion authority. No registry transfer,
+    detach, unmap, capability deletion or free-list publication is activated here.
+
+    Validation: nine new registry preparation unit tests cover partial and empty coverage, stale
+    attempts/resources/progress/rows, external cap sharing and immutable retries. One allocator-
+    controlled integration test injects preparation OOM after protected handoff, retries capture,
+    checks allocation-free revalidation and confirms reservations survive stale-row rejection.
+    Two alias tests distinguish live, pending replacement, retiring and failed-copy snapshots
+    without backend calls. The serialized nine-crate suite passes 1,169 tests (240 in nt-user-host:
+    220 unit, 3 existing integration and 17 construction integration; 280 in nt-memory-manager).
+    The subsequent executive build passes with the unchanged 262-warning baseline.
+    Logs: `.tmp/test-thread-reconciliation-20260907.log` and
+    `.tmp/build-thread-reconciliation-20260907.log`.
+    Read-only agents reviewed ownership sequencing, durable allocation and global capability
+    collisions; only root ran tests/builds. The native alias adapter has build/review coverage,
+    not live failure-injection coverage.
+
+    Review adjustment: coordinate one retirement actor before enabling cleanup. Pending runtime
+    state retains the original optional TCB while construction inventory tracks its slot phase;
+    independently retiring the latter and then preparing ordinary cleanup could suspend/delete a
+    stale or reused TCB cap. Allocated-empty and delete-acknowledged slots also cannot be represented
+    as generic live mechanisms. Preserve checked delete and recycle acknowledgements separately;
+    legacy void recycling can refuse publication without reporting it. External AliasTransition
+    cleanup still has combined delete/recycle semantics, so it must remain a disjoint owner until
+    its backend is corrected. Terminal registry transfer must follow complete journals and access
+    exclusions. Shared protected-tail metadata is not exclusive ownership. First-resume failure,
+    ordinary termination, other launch families, handler handoffs and live failure validation remain
+    open. No QEMU or desktop proof is claimed; the recorded 33 unresolved win32k imports still block
+    the full desktop gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
