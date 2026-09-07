@@ -125,6 +125,26 @@ impl ProcessManager {
             .is_some_and(|identity| identity.process_id() == pid)
     }
 
+    /// Validate explicit kernel-originated work against this manager's live bootstrap identity.
+    /// This is structural caller admission, not token authorization: consumers must still resolve
+    /// the canonical current primary and thread impersonation, without assuming System privileges.
+    /// A parked thread may retain work, but terminated or uninitialized identities cannot admit it.
+    pub fn validate_initial_system_caller(&self, identity: InitialSystemIdentity) -> bool {
+        self.initial_system_identity() == Some(identity)
+            && self.initial_system_references_held()
+            && self.process(identity.process_id()).is_some_and(|process| {
+                process.state == ProcessState::Running && process.exit_status.is_none()
+            })
+            && self.thread(identity.thread_id()).is_some_and(|thread| {
+                thread.is_system_thread
+                    && thread.exit_status.is_none()
+                    && !matches!(
+                        thread.state,
+                        ThreadState::Initialized | ThreadState::Terminated
+                    )
+            })
+    }
+
     pub fn initial_system_references_held(&self) -> bool {
         self.initial_system
             .as_ref()

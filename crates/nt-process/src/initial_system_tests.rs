@@ -257,3 +257,74 @@ fn release_validation_failure_leaves_both_reference_owners_untouched() {
     pm.release_initial_system_references(identity).unwrap();
     assert_eq!(references(&pm, pid, tid), (0, 0));
 }
+
+#[test]
+fn caller_validation_preserves_identity_across_move_and_live_thread_states() {
+    let (mut pm, pid, tid) = bootstrap_objects();
+    let identity = pm.designate_initial_system(pid, tid).unwrap();
+    let mut moved = alloc::boxed::Box::new(pm);
+    for state in [
+        ThreadState::Ready,
+        ThreadState::Running,
+        ThreadState::Waiting,
+        ThreadState::Suspended,
+    ] {
+        moved.set_thread_state(tid, state).unwrap();
+        assert!(moved.validate_initial_system_caller(identity));
+        assert_eq!(moved.initial_system_identity(), Some(identity));
+        assert_eq!(references(&moved, pid, tid), (1, 1));
+    }
+}
+
+#[test]
+fn caller_validation_rejects_foreign_designation_and_released_bootstrap_references() {
+    let (mut pm, pid, tid) = bootstrap_objects();
+    let (mut other, other_pid, other_tid) = bootstrap_objects();
+    let identity = pm.designate_initial_system(pid, tid).unwrap();
+    let foreign = other
+        .designate_initial_system(other_pid, other_tid)
+        .unwrap();
+    assert_eq!(identity.thread(), foreign.thread());
+    assert!(!pm.validate_initial_system_caller(foreign));
+    assert!(pm.validate_initial_system_caller(identity));
+    pm.release_initial_system_references(identity).unwrap();
+    assert_eq!(pm.initial_system_identity(), Some(identity));
+    assert!(!pm.validate_initial_system_caller(identity));
+    assert_eq!(references(&pm, pid, tid), (0, 0));
+}
+
+#[test]
+fn caller_validation_rejects_exit_and_non_system_state_without_mutation() {
+    let (mut pm, pid, tid) = bootstrap_objects();
+    let identity = pm.designate_initial_system(pid, tid).unwrap();
+    for state in [
+        ProcessState::Created,
+        ProcessState::LoadingImage,
+        ProcessState::Ready,
+        ProcessState::Exiting,
+        ProcessState::Terminated,
+    ] {
+        pm.processes.get_mut(&pid).unwrap().state = state;
+        assert!(!pm.validate_initial_system_caller(identity));
+        assert_eq!(pm.process(pid).unwrap().state, state);
+        assert_eq!(references(&pm, pid, tid), (1, 1));
+    }
+    pm.processes.get_mut(&pid).unwrap().state = ProcessState::Running;
+    pm.processes.get_mut(&pid).unwrap().exit_status = Some(0);
+    assert!(!pm.validate_initial_system_caller(identity));
+    pm.processes.get_mut(&pid).unwrap().exit_status = None;
+    for state in [ThreadState::Initialized, ThreadState::Terminated] {
+        pm.threads.get_mut(&tid).unwrap().state = state;
+        assert!(!pm.validate_initial_system_caller(identity));
+        assert_eq!(pm.thread(tid).unwrap().state, state);
+    }
+    pm.threads.get_mut(&tid).unwrap().state = ThreadState::Running;
+    pm.threads.get_mut(&tid).unwrap().exit_status = Some(0);
+    assert!(!pm.validate_initial_system_caller(identity));
+    pm.threads.get_mut(&tid).unwrap().exit_status = None;
+    pm.threads.get_mut(&tid).unwrap().is_system_thread = false;
+    assert!(!pm.validate_initial_system_caller(identity));
+    pm.threads.get_mut(&tid).unwrap().is_system_thread = true;
+    assert!(pm.validate_initial_system_caller(identity));
+    assert_eq!(references(&pm, pid, tid), (1, 1));
+}

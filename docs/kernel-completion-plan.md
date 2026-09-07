@@ -254,6 +254,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add provider-domain-bound subject leases over authenticated hosted or initial-System callers
   (tranche 101; host core). Retain actual primary/client references through publication, replacement
   and rundown. Never interpret a missing hosted caller as System authority.
+- [x] Replace win32k's fake initialization process/thread with canonical System execution context and
+  an explicit root-issued Ps caller (tranche 102). Remove CSRSS re-keying and synthetic desktop-worker
+  initialization; let the real CSR request path create and initialize desktop/RIT threads.
+- [~] Add a checked exception search/target-unwind core with owned handler invocations (tranche 103).
+  Complete collided unwind, consolidate restore and native linkage before dispatch/export cutover.
+- [~] Add checked native handle scopes and retained Ps references over the existing PM handle tables
+  (tranche 104). Use the designated System table for kernel handles; no second object authority.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28553,7 +28560,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     close it. Native token projections, lock/privilege brokers, audit delivery and desktop acceptance
     remain separate and are not claimed by this host-core checkpoint.
 
-    B3 native kernel-caller cutover tranche 102 (2026-09-08, in progress):
+    B3 native kernel-caller cutover tranche 102 (2026-09-08):
 
     DriverEntry must execute as the canonical initial System thread, with its real neutral objects
     selected in provider KPCR state. Do not give that thread a fabricated PEB, TEB or GUI context.
@@ -28562,6 +28569,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     SSDT-resolution instrumentation from process-callout instrumentation and record the latter only
     when the genuine client callout executes. Root-issued kernel caller authority must remain
     distinct from hosted runtime admission through provider suspension and early/live store transfer.
+
+    Implemented an explicit kernel caller only on win32k's root-issued DriverEntry pump. Mixed
+    hosted/kernel authority is rejected; no hosted authority does not imply System. One checked Ps
+    request decoder operates on the original canonical PM before and after handler transfer. The
+    shared host-tested initial-System validator rejects foreign designations, released references,
+    exiting processes and dead/uninitialized/nonsystem threads without mutating ownership.
+    Other driver/provider channels deliberately retain no new kernel authority until their own
+    initialization boundaries are converted.
+
+    Native Ps object classification includes the exact initial-System projections, so pseudo-handle
+    and pointer reference/dereference paths acquire/release canonical PM references even without
+    GUI rows. Hosted ETHREAD allocation and retirement now use the full tested 0x438 ABI extent.
+    Existing-context selection validates all requested TEB/thread fields before publishing any
+    current identity/KPCR state, and required-thread selection rejects zero TID. Rundown clears
+    selected pointers before backing release.
+
+    Deleted fake initial PID/TID derivation, CSRSS bootstrap object adoption, the synthetic desktop
+    worker's gpti/class binding, dead direct desktop-creation helpers and their fixed code RVAs,
+    and the one-shot window-list reset that compensated for conflated desktop/client threads.
+    Real ReactOS startup is: IntCreateWindowStation -> UserCreateSystemThread -> usersrv CSR request
+    -> CsrExecServerThread/RtlCreateUserThread -> NtUserCallOneParam(CREATESYSTEMTHREADS) ->
+    DesktopThreadMain/RIT. Those genuine routines own globals, classes and startup signaling.
+
+    Remaining GUI debts are explicit, not acceptance shortcuts: fake process-handle adapters still
+    need real kernel-handle brokerage; per-client callout TEB/PEB fabrication and THREADINFO repairs
+    need genuine attached-client mappings and callback/lifecycle ownership; partial-failure process
+    attachment must not infer successful completion from a nonzero PROCESSINFO pointer. None of
+    these may be substituted for a rendered desktop or silently promoted to System authority.
+
+    Validation: 177 process and 333 user-host tests plus 43 integrations pass (553 total), including
+    three new initial-caller validation tests. The nineteen-crate regression passes 2,256 tests.
+    The native executive release build passes with the unchanged 262 warnings. Logs:
+    `.tmp/test-kernel-provider-caller-20260908.log`,
+    `.tmp/test-kernel-provider-caller-regression-20260908.log`,
+    `.tmp/build-kernel-provider-caller-final-20260908.log`. Independent review found the mixed-context
+    publication hazard and the missing System-object reference classification; both were corrected
+    before checkpoint. This is not native desktop acceptance or complete token/handle brokerage.
 
     B3 exception walk core tranche 103 (2026-09-08, in progress):
 
@@ -28579,6 +28623,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     context require correction. Provider exceptions cannot use hosted-user NtContinue/NtRaiseException
     transport. Bind ExRaiseAccessViolation, ExRaiseStatus and RtlUnwindEx only after those mechanisms
     are complete; a bugcheck or unconditional target jump is not exception dispatch.
+
+    B3 native handle ownership tranche 104 (2026-09-08, in progress):
+
+    Add checked x64 handle decoding, authenticated caller scope and retained Ps references over
+    the existing canonical PM, not a new ObjectManager-service identity/table for Ps/Se objects.
+    NT's kernel handle table is System's actual object table. Recognize -1/-2 before decoding
+    the 0xffffffff80000000 kernel tag, reject malformed high bits before narrowing, enforce
+    UserMode grant/type checks, and preserve type/reference checks for KernelMode too. Captured
+    reference or handle publication failure must retire the exact owner once, with failure retained.
+
+    Native migration must cover user Nt and provider Zw together, including process/token open,
+    reference, duplicate, query and close. TokenStore requires token-object security descriptors;
+    a token's default DACL is not its object SD. Existing Nt process/token opens are not fully
+    security-checked and cannot be reused as completed authorization. Genuine attached-process
+    authority changes the current handle table/primary token but not the original thread or its
+    impersonation token. Do not fabricate an attached PID or alter retained logical caller identity.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

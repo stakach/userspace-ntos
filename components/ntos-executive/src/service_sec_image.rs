@@ -4599,20 +4599,32 @@ pub(crate) unsafe fn service_win32k_ps_request(
     client_pi: u64,
     client_generation: u64,
     logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+    kernel_caller: Option<nt_process::InitialSystemIdentity>,
     op: u64,
     object: u64,
     value: u64,
 ) -> (i32, u64, u64, u64) {
-    const STATUS_INVALID_HANDLE: i32 = 0xC000_0008u32 as i32;
     const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
     const STATUS_DEVICE_NOT_READY: i32 = 0xC000_00A3u32 as i32;
-    const STATUS_NO_YIELD_PERFORMED: i32 = 0x4000_0024u32 as i32;
 
+    if logical_caller.is_some() && kernel_caller.is_some() {
+        return (STATUS_INVALID_PARAMETER, 0, 0, 0);
+    }
     let handler_ptr = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *mut ExecNtHandler;
     if handler_ptr.is_null() {
-        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+        return match kernel_caller {
+            Some(caller) => ps_bootstrap::service_initial_system_request(caller, op, object, value),
+            None => (STATUS_DEVICE_NOT_READY, 0, 0, 0),
+        };
     }
     let handler = &mut *handler_ptr;
+    if let Some(caller) = kernel_caller {
+        return if handler.pm.validate_initial_system_caller(caller) {
+            provider_ps::dispatch(&mut handler.pm, op, object, value)
+        } else {
+            (STATUS_DEVICE_NOT_READY, 0, 0, 0)
+        };
+    }
     let Ok(pi) = usize::try_from(client_pi) else {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     };
@@ -4627,80 +4639,7 @@ pub(crate) unsafe fn service_win32k_ps_request(
     {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     }
-
-    match op {
-        crate::win32k_subsystem::W32_PS_OP_QUERY_PROCESS => handler
-            .pm
-            .kernel_process_state(object)
-            .map(|state| {
-                (
-                    0,
-                    u64::from(state.exit_status),
-                    u64::from(state.session_id),
-                    u64::from(state.exit_process_called),
-                )
-            })
-            .unwrap_or((STATUS_INVALID_HANDLE, 0, 0, 0)),
-        crate::win32k_subsystem::W32_PS_OP_QUERY_THREAD => handler
-            .pm
-            .kernel_thread_state(object)
-            .map(|state| {
-                let flags = u64::from(state.terminating) | (u64::from(state.system_thread) << 1);
-                (
-                    0,
-                    u64::from(state.exit_status),
-                    u64::from(state.freeze_count),
-                    flags | (u64::from(state.priority as u32) << 32),
-                )
-            })
-            .unwrap_or((STATUS_INVALID_HANDLE, 0, 0, 0)),
-        crate::win32k_subsystem::W32_PS_OP_SET_THREAD_PRIORITY => handler
-            .pm
-            .set_kernel_thread_priority(object, value as u32 as i32)
-            .map(|previous| (0, u64::from(previous as u32), 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_PS_OP_LOOKUP_PROCESS => {
-            let Ok(pid) = nt_process::ProcessId::try_from(object) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-            };
-            handler
-                .pm
-                .lookup_kernel_process_by_id(pid)
-                .map(|(object, references)| (0, object, u64::from(references), 0))
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_PS_OP_LOOKUP_THREAD => {
-            let Ok(tid) = nt_process::ThreadId::try_from(object) else {
-                return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-            };
-            handler
-                .pm
-                .lookup_kernel_thread_by_id(tid)
-                .map(|(object, references)| (0, object, u64::from(references), 0))
-                .unwrap_or_else(|status| (status as i32, 0, 0, 0))
-        }
-        crate::win32k_subsystem::W32_PS_OP_RETAIN_POINTER => handler
-            .pm
-            .retain_kernel_object_pointer(object)
-            .map(|references| (0, u64::from(references), 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_PS_OP_RELEASE_POINTER => handler
-            .pm
-            .release_kernel_object_pointer(object)
-            .map(|references| (0, u64::from(references), 0, 0))
-            .unwrap_or_else(|status| (status as i32, 0, 0, 0)),
-        crate::win32k_subsystem::W32_PS_OP_YIELD_EXECUTION => {
-            let Some(tid) = handler.pm.tid_for_kernel_thread_object(object) else {
-                return (STATUS_INVALID_HANDLE, 0, 0, 0);
-            };
-            if !handler.pm.has_yield_candidate(tid) {
-                return (STATUS_NO_YIELD_PERFORMED, 0, 0, 0);
-            }
-            sel4_rt::yield_now();
-            (0, 0, 0, 0)
-        }
-        _ => (STATUS_INVALID_PARAMETER, 0, 0, 0),
-    }
+    provider_ps::dispatch(&mut handler.pm, op, object, value)
 }
 
 /// Service `MmSecureVirtualMemory` for the authenticated hosted process generation. The returned

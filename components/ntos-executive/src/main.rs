@@ -54,6 +54,7 @@ mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
 mod ps_bootstrap;
+mod provider_ps;
 mod sec_image_diagnostic;
 use process_vm_retirement::reclaim_final_process_vm;
 mod hosted_driver_projection;
@@ -30759,6 +30760,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 client_pi: 0,
                 client_generation: 0,
                 logical_caller: None,
+                kernel_caller: Some(ps_bootstrap::initial_system_projection()
+                    .expect("DriverEntry requires the canonical initial System objects").identity),
                 // DriverEntry runs before any client exists: no client_attach (its faults are its
                 // OWN pages, zero-filled), no usermode callbacks, no assert-skip — the same set the
                 // bespoke loop implemented inline.

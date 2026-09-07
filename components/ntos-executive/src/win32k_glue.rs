@@ -187,6 +187,7 @@ unsafe fn win32k_lane_channel(
         client_pi: client.pi as u64,
         client_generation: client.generation,
         logical_caller: client.logical_caller,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
@@ -259,6 +260,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,

@@ -1178,6 +1178,10 @@ pub(crate) struct PumpChannel {
     /// Retained logical caller, independent of this channel's physical provider executor.
     /// None explicitly carries no hosted security authority (startup/provider-only work).
     pub logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
+    /// Explicit root-issued authority for this pump's kernel-originated work, currently only
+    /// genuine win32k DriverEntry. Absence of a hosted logical caller never implies System;
+    /// ordinary dispatches and resumed callbacks must not acquire this authority implicitly.
+    pub kernel_caller: Option<nt_process::InitialSystemIdentity>,
     /// The win32k capability gates (all-false for the FSD).
     pub caps: HostCaps,
 }
@@ -2482,6 +2486,7 @@ unsafe fn component_pump_loop(
                     ch.client_pi,
                     ch.client_generation,
                     ch.logical_caller,
+                    ch.kernel_caller,
                     msg.m0,
                     msg.m1,
                     msg.m2,

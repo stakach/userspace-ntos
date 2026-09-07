@@ -146,12 +146,7 @@ impl ProviderSubjectRegistry {
         tokens: &mut TokenStore,
     ) -> Result<ProviderSubjectLeaseId, ProviderSubjectError> {
         let catalog = validate_provider(provider, catalog)?;
-        if pm.initial_system_identity() != Some(identity)
-            || !pm.initial_system_references_held()
-            || !pm
-                .thread(identity.thread_id())
-                .is_some_and(|thread| thread.is_system_thread)
-        {
+        if !pm.validate_initial_system_caller(identity) {
             return Err(ProviderSubjectError::InvalidCaller);
         }
         self.prepare(

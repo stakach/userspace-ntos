@@ -28956,6 +28956,7 @@ unsafe fn dispatch_hosted_provider_export_legacy(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -29398,6 +29399,7 @@ unsafe fn dispatch_hosted_component_target(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -36969,6 +36971,7 @@ unsafe fn load_driver_reserved(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -47368,6 +47371,7 @@ unsafe fn hosted_irq_lane_channel(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -55141,6 +55145,7 @@ unsafe fn dispatch_driver_unload_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -55198,6 +55203,7 @@ unsafe fn dispatch_device_projection_control_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -55329,6 +55335,7 @@ unsafe fn dispatch_video_add_device_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -55403,6 +55410,7 @@ unsafe fn dispatch_provider_add_device_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -55483,6 +55491,7 @@ unsafe fn dispatch_add_device_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -57185,6 +57194,7 @@ unsafe fn dispatch_video_find_adapter_pnp_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -57369,6 +57379,7 @@ unsafe fn dispatch_video_initialize_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -57437,6 +57448,7 @@ unsafe fn dispatch_video_start_io_for_instance(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,
@@ -58661,6 +58673,7 @@ unsafe fn dispatch_irp_for_instance_exact(
         client_pi: 0,
         client_generation: 0,
         logical_caller: None,
+        kernel_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Irp,

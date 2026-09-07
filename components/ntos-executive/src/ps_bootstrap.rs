@@ -26,6 +26,23 @@ struct InitialObjectPage([u8; 4096]);
 static mut INITIAL_PROCESS: InitialObjectPage = InitialObjectPage([0; 4096]);
 static mut INITIAL_THREAD: InitialObjectPage = InitialObjectPage([0; 4096]);
 static INITIAL_PROCESS_BODY: AtomicU64 = AtomicU64::new(0);
+static mut INITIAL_SYSTEM_PROJECTION: Option<InitialSystemProjection> = None;
+
+#[derive(Clone, Copy)]
+pub(crate) struct InitialSystemProjection {
+    pub identity: nt_process::InitialSystemIdentity,
+    pub process_body: u64,
+    pub thread_body: u64,
+}
+
+/// Immutable projection metadata, published before any provider can execute. It is not a grant
+/// to impersonate System: root-issued call channels separately authenticate the logical caller.
+pub(crate) fn initial_system_projection() -> Option<InitialSystemProjection> {
+    if INITIAL_PROCESS_BODY.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    unsafe { core::ptr::addr_of!(INITIAL_SYSTEM_PROJECTION).read() }
+}
 
 pub(crate) fn is_initial_system_process(body: u64) -> bool {
     body != 0 && INITIAL_PROCESS_BODY.load(Ordering::Acquire) == body
@@ -65,6 +82,11 @@ unsafe fn publish_initial_objects(
     // collide with a hosted object; a failed invariant is fatal, never a partial live bootstrap.
     assert!(pm.publish_process_kernel_object(identity.process_id(), process as u64));
     assert!(pm.publish_thread_kernel_object(identity.thread_id(), thread as u64));
+    core::ptr::addr_of_mut!(INITIAL_SYSTEM_PROJECTION).write(Some(InitialSystemProjection {
+        identity,
+        process_body: process as u64,
+        thread_body: thread as u64,
+    }));
     INITIAL_PROCESS_BODY.store(process as u64, Ordering::Release);
     Ok(())
 }
@@ -102,6 +124,22 @@ pub(crate) unsafe fn hosted_main_client_id(pi: usize) -> Option<nt_process::Clie
     let &tid = seed.main_tids.get(pi)?;
     let client_id = seed.ps.process_manager().client_id(tid)?;
     (client_id.unique_process == pid).then_some(client_id)
+}
+
+pub(crate) unsafe fn service_initial_system_request(
+    caller: nt_process::InitialSystemIdentity,
+    op: u64,
+    object: u64,
+    value: u64,
+) -> (i32, u64, u64, u64) {
+    let BootstrapPhase::Owned(seed) = &mut *core::ptr::addr_of_mut!(BOOTSTRAP) else {
+        return (0xc000_00a3u32 as i32, 0, 0, 0);
+    };
+    let (pm, _) = seed.ps.managers_mut();
+    if !pm.validate_initial_system_caller(caller) {
+        return (0xc000_00a3u32 as i32, 0, 0, 0);
+    }
+    provider_ps::dispatch(pm, op, object, value)
 }
 
 #[inline(never)]
