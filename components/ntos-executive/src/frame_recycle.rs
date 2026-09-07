@@ -17,7 +17,7 @@ unsafe fn state() -> FrameRecycleState<'static> {
 
 /// Capacity growth precedes release effects; drop allocator borrows before any capability syscall.
 pub(super) unsafe fn prepare(frame: u64) -> Result<(), u32> {
-    if !client_copy_alias::backing_release_available() {
+    if !temporary_frame_alias::backing_release_available() {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     state()
@@ -42,7 +42,7 @@ pub(super) unsafe fn prepare(frame: u64) -> Result<(), u32> {
 /// Caller retains the exact owner on error; on success it must acknowledge the transfer without
 /// allocation, IPC or callback before another frame can be acquired from the pool.
 pub(super) unsafe fn publish(frame: u64) -> Result<(), u32> {
-    if !client_copy_alias::backing_release_available() {
+    if !temporary_frame_alias::backing_release_available() {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
     state()

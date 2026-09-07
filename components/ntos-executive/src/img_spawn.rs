@@ -841,8 +841,8 @@ pub(crate) unsafe fn spawn_sec_image(
     ldrpinit_rva: u64,
 ) -> SecImageSpawn {
     trace_spawn_phase(pi, b"begin");
-    crate::client_copy_alias::drain()
-        .expect("process-slot reuse requires completed client-copy alias retirement");
+    crate::temporary_frame_alias::drain()
+        .expect("process-slot reuse requires completed temporary-frame alias retirement");
     // A hosted slot can first carry an unpublished diagnostic image and later a real process. End
     // that old address-space lifetime before any new paging structure is installed; published
     // process teardown uses the commitment-aware reclaim path instead.
@@ -1702,7 +1702,7 @@ pub(crate) unsafe fn smss_mirror(va: u64, len: u64) -> Option<u64> {
 /// Copy `dst.len()` bytes IN from a SEC_IMAGE process VA (the executive's ProbeForRead+copyin).
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(ACTIVE_CLIENT_PI.load(Ordering::Relaxed), va, dst.len() as u64).is_err() {
         return false;
     }
@@ -1723,7 +1723,7 @@ pub(crate) unsafe fn smss_copyin(va: u64, dst: &mut [u8]) -> bool {
 /// Image pages use their current recorded frame, not an inferred fixed mirror address.
 pub(crate) unsafe fn smss_copyout(va: u64, src: &[u8]) -> bool {
     let pi = ACTIVE_CLIENT_PI.load(Ordering::Relaxed);
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
@@ -1758,7 +1758,7 @@ unsafe fn with_recorded_frame_alias(
     writable: bool,
     access: impl FnOnce(u64),
 ) -> bool {
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, page, 0x1000).is_err() {
         return false;
     }
@@ -1779,14 +1779,17 @@ unsafe fn with_recorded_frame_alias(
     let Some(alias) = scratch_base.checked_add(DEMAND_SCRATCH_WINDOW - 0x1000) else {
         return false;
     };
-    crate::client_copy_alias::with_frame(
-        nt_memory_manager::temporary_alias::TemporaryAliasSource { process: pi, page, frame: clone_source },
+    crate::temporary_frame_alias::with_frame(
+        nt_memory_manager::temporary_alias::TemporaryAliasSource {
+            scope: nt_memory_manager::temporary_alias::TemporaryAliasScope::ClientPage { process: pi, page },
+            frame: clone_source,
+        },
         alias, writable, access,
-    )
+    ).is_ok()
 }
 
 unsafe fn recorded_frame_copyin(pi: u64, va: u64, dst: &mut [u8], scratch_base: u64) -> bool {
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
         return false;
     }
@@ -1815,7 +1818,7 @@ unsafe fn recorded_frame_copyout(pi: u64, va: u64, src: &[u8], scratch_base: u64
 }
 
 unsafe fn recorded_frame_copyout_impl(pi: u64, va: u64, src: &[u8], scratch_base: u64, admitted: bool) -> bool {
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }
@@ -1890,7 +1893,7 @@ pub(crate) unsafe fn client_copyin_process_mapped(
     scratch_base: u64,
     allow_active_mirrors: bool,
 ) -> bool {
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, dst.len() as u64).is_err() {
         return false;
     }
@@ -2041,7 +2044,7 @@ unsafe fn client_copyout_mapped_impl(
     scratch_base: u64,
     admitted: bool,
 ) -> bool {
-    if crate::client_copy_alias::drain().is_err()
+    if crate::temporary_frame_alias::drain().is_err()
         || hosted_thread_memory_access(pi, va, src.len() as u64).is_err() {
         return false;
     }

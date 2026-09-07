@@ -8643,8 +8643,8 @@ pub(crate) unsafe fn service_sec_image(
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
         // Retry outside registry/runtime borrows, including when the next ingress is excluded.
         // Failure retains the exact alias and all memory/backing-release exclusions.
-        if let Err(status) = crate::client_copy_alias::drain() {
-            print_str(b"[client-copy-alias] retained cleanup status=0x");
+        if let Err(status) = crate::temporary_frame_alias::drain() {
+            print_str(b"[temporary-frame-alias] retained cleanup status=0x");
             print_hex(status);
             print_str(b"\n");
         }

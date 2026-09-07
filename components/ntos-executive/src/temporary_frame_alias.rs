@@ -1,4 +1,4 @@
-//! Durable ownership of the resident client-copy scratch mapping.
+//! Durable ownership of sequential executive scratch mappings.
 use super::*;
 use nt_memory_manager::temporary_alias::{TemporaryAlias, TemporaryAliasIo, TemporaryAliasSource};
 
@@ -81,16 +81,75 @@ pub(super) fn backing_release_available() -> bool {
     unsafe { (&*core::ptr::addr_of!(ALIAS)).backing_release_available() }
 }
 
-pub(super) unsafe fn with_frame(
+pub(super) unsafe fn with_frame<T>(
     source: TemporaryAliasSource,
     address: u64,
     writable: bool,
-    access: impl FnOnce(u64),
-) -> bool {
-    let Ok(_borrow) = Borrow::acquire() else {
-        return false;
-    };
-    (&mut *core::ptr::addr_of_mut!(ALIAS))
-        .with_frame(source, address, writable, &mut Io, access)
-        .is_ok()
+    access: impl FnOnce(u64) -> T,
+) -> Result<T, u32> {
+    let _borrow = Borrow::acquire()?;
+    (&mut *core::ptr::addr_of_mut!(ALIAS)).with_frame(source, address, writable, &mut Io, access)
+}
+
+fn scratch_address(base: u64) -> Result<u64, u32> {
+    if base == 0 || base & 0xfff != 0 {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
+    base.checked_add(DEMAND_SCRATCH_WINDOW)
+        .map(|end| end - 0x1000)
+        .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)
+}
+
+pub(super) unsafe fn with_scratch_range<T>(
+    frame: u64,
+    scratch_base: u64,
+    range: core::ops::Range<usize>,
+    writable: bool,
+    access: impl FnOnce(u64) -> T,
+) -> Result<T, u32> {
+    let address = scratch_address(scratch_base)?;
+    if range.start > range.end || range.end > 0x1000 || frame == 0 {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
+    let _borrow = Borrow::acquire()?;
+    let owner = &mut *core::ptr::addr_of_mut!(ALIAS);
+    owner.drain(&mut Io)?;
+    owner.with_range(
+        TemporaryAliasSource {
+            scope: nt_memory_manager::temporary_alias::TemporaryAliasScope::Frame,
+            frame,
+        },
+        address,
+        range,
+        writable,
+        &mut Io,
+        access,
+    )
+}
+
+#[inline(never)]
+pub(super) unsafe fn copy_page(
+    source: u64,
+    destination: u64,
+    scratch_base: u64,
+) -> Result<(), u32> {
+    let address = scratch_address(scratch_base)?;
+    if source == 0 || destination == 0 {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
+    let _borrow = Borrow::acquire()?;
+    let owner = &mut *core::ptr::addr_of_mut!(ALIAS);
+    owner.drain(&mut Io)?;
+    owner.copy_page(
+        source,
+        destination,
+        address,
+        &mut Io,
+        |address, bytes| {
+            core::ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), bytes.len())
+        },
+        |address, bytes| {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
+        },
+    )
 }

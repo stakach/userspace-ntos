@@ -206,6 +206,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain the fixed resident client-copy alias through checked deletion, block source/page reuse,
   and retry cleanup before copy admission and at the event boundary (tranche 85; two-frame COW
   scratch and inspection aliases remain open).
+- [x] Replace two-frame COW scratch and inspection mappings with sequential checked temporary
+  aliases, bounded access and conservative untracked-backing exclusion (tranche 86; legacy frame
+  acquisition/release, provider-bank journals and native retirement activation remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -27954,6 +27957,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     section, file, object/security and driver-I/O exports. The bound ZwOpenFile/NtOpenFile hardcoded
     failure used to suppress font enumeration must be removed alongside those implementations;
     it is not part of the 33-name unresolved count. Do not weaken the complete import gate.
+
+    B3 checked COW temporary-alias tranche 86 (2026-09-07):
+    Generalized the same retained slot to TemporaryAliasScope::ClientPage and ::Frame, and renamed
+    the native owner to temporary_frame_alias.rs. Untracked physical-frame aliases conservatively
+    exclude every process and nonempty client-memory range until checked deletion, as well as all
+    physical-frame publication. A frame cap is not treated as a process identity. No second scratch
+    owner or compatibility alias was introduced.
+
+    vm_copy_frame_4k now uses the host-tested copy_page operation: read through a copied source cap
+    into one 4 KiB local buffer, require deletion, then write through a copied destination cap and
+    require deletion. It never maps the destination's original owning cap. The old simultaneous
+    -0x6000/-0x7000 scratch mappings and ignored unmap/delete chains are removed. The buffer stays in
+    a non-inlined frame and both transfer closures borrow it; the configured external executive
+    stack is 256 KiB. A source cleanup failure prevents any destination access. A destination
+    cleanup failure retains its exact alias and reports failure, not a completed COW copy.
+
+    The four COW seed/inspect/read/write helpers use the same bounded with_range owner. Lengths
+    exceeding one page and byte offsets outside the page are rejected before effects. Seeding no
+    longer temporarily maps the source owner itself, and byte/comparison results are returned only
+    after successful cleanup. Removed their repeated copy_cap_r/unmap/delete scaffolding and former
+    -0x8000 scratch window use. Both existing COW callers retain the checked temporary-alias drain
+    before legacy destination release, preventing immediate reuse of an aliased destination.
+
+    Validation: five new tests cover all-process exclusion and retry, bounded/empty range edges,
+    exact 4 KiB data transfer, every reserve/copy/map/delete failure stage, destination non-access
+    after failed source cleanup, retained source versus destination identity, and invalid frame
+    rejection before backend effects. The focused memory-manager suite passes 319 tests; the
+    serialized nine-crate suite passes 1,268 tests. The executive build passes with 262 warnings,
+    unchanged. Logs: `.tmp/test-cow-temporary-alias-focused-20260907.log`,
+    `.tmp/test-cow-temporary-alias-20260907.log`, and
+    `.tmp/build-cow-temporary-alias-20260907.log`. Read-only agent review found no further concrete
+    correctness issue; no parallel tests/builds or extra QEMU run occurred.
+
+    Review adjustment: the named resident/COW temporary aliases now retain cleanup, but this is not
+    complete native thread retirement. Continue with provider capability-bank lifetime coverage,
+    legacy frame acquire/release and pagefile phases, and remaining stale references. The bank holds
+    provider arena leaf mappings, not the ordinary process-owned page tables: retain process
+    generation, page, source frame, rights/VSpace and typed root-versus-child-CNode capability
+    locations. Do not merge child slots into the existing root-cap-only conflict set as bare u64s.
+    Complete joint journals and exclusions before registry transfer or native destructive cleanup.
+    The 33 real provider-import implementations remain required before another desktop push.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

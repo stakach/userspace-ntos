@@ -2,8 +2,10 @@ use super::*;
 use alloc::vec::Vec;
 
 const SOURCE: TemporaryAliasSource = TemporaryAliasSource {
-    process: 7,
-    page: 0x2000,
+    scope: TemporaryAliasScope::ClientPage {
+        process: 7,
+        page: 0x2000,
+    },
     frame: 90,
 };
 
@@ -90,7 +92,10 @@ fn failed_delete_retains_exact_source_and_rejects_overwrite() {
     assert_eq!(
         owner.with_frame(
             TemporaryAliasSource {
-                process: 8,
+                scope: TemporaryAliasScope::ClientPage {
+                    process: 8,
+                    page: 0x2000
+                },
                 ..SOURCE
             },
             0x9000,
@@ -168,10 +173,22 @@ fn failed_copy_keeps_empty_slot_without_deletion_or_reallocation() {
 fn invalid_ranges_have_no_backend_effects() {
     for (source, address) in [
         (TemporaryAliasSource { frame: 0, ..SOURCE }, 0x8000),
-        (TemporaryAliasSource { page: 1, ..SOURCE }, 0x8000),
         (
             TemporaryAliasSource {
-                page: u64::MAX - 4095,
+                scope: TemporaryAliasScope::ClientPage {
+                    process: 7,
+                    page: 1,
+                },
+                ..SOURCE
+            },
+            0x8000,
+        ),
+        (
+            TemporaryAliasSource {
+                scope: TemporaryAliasScope::ClientPage {
+                    process: 7,
+                    page: u64::MAX - 4095,
+                },
                 ..SOURCE
             },
             0x8000,
@@ -240,4 +257,204 @@ fn retained_mapping_excludes_source_until_acknowledged_deletion() {
     assert!(owner.process_available(7));
     assert!(owner.backing_release_available());
     assert!(owner.memory_available(7, 0x2000, 0x1000));
+}
+
+#[test]
+fn untracked_frame_cleanup_excludes_all_address_spaces() {
+    let mut owner = TemporaryAlias::new();
+    let mut io = Io {
+        delete_error: 13,
+        ..Io::default()
+    };
+    let source = TemporaryAliasSource {
+        scope: TemporaryAliasScope::Frame,
+        frame: 90,
+    };
+    assert_eq!(
+        owner.with_frame(source, 0x8000, false, &mut io, |_| ()),
+        Err(13)
+    );
+    for process in [0, 7, 8, u64::MAX] {
+        assert!(!owner.process_available(process));
+        assert!(!owner.memory_available(process, 0, 1));
+        assert!(!owner.memory_available(process, 0x9000, 4096));
+        assert!(owner.memory_available(process, 0x9000, 0));
+    }
+    assert!(!owner.backing_release_available());
+    io.delete_error = 0;
+    owner.drain(&mut io).unwrap();
+    assert!(owner.process_available(0));
+    assert!(owner.memory_available(7, 0, 1));
+    assert!(owner.backing_release_available());
+}
+
+#[test]
+fn bounded_access_rejects_invalid_ranges_before_backend_effects() {
+    let mut owner = TemporaryAlias::new();
+    let mut io = Io::default();
+    for range in [2..1, 0..4097, usize::MAX..usize::MAX] {
+        assert_eq!(
+            owner.with_range(SOURCE, 0x8000, range, true, &mut io, |_| panic!()),
+            Err(INVALID)
+        );
+        assert!(io.calls.is_empty());
+    }
+    assert_eq!(
+        owner.with_range(SOURCE, 0x8000, 4095..4096, false, &mut io, |address| {
+            address
+        }),
+        Ok(0x8fff)
+    );
+    assert_eq!(
+        owner.with_range(SOURCE, 0x8000, 4096..4096, false, &mut io, |address| {
+            address
+        }),
+        Ok(0x9000)
+    );
+}
+
+#[derive(Default)]
+struct PageIo {
+    calls: Vec<(&'static str, u64)>,
+    fail_at: Option<usize>,
+}
+impl PageIo {
+    fn step(&mut self, operation: &'static str, argument: u64) -> Result<(), u32> {
+        let index = self.calls.len();
+        self.calls.push((operation, argument));
+        if self.fail_at == Some(index) {
+            Err(42)
+        } else {
+            Ok(())
+        }
+    }
+}
+impl TemporaryAliasIo for PageIo {
+    fn reserve_slot(&mut self) -> Result<u64, u32> {
+        self.step("reserve", 0)?;
+        Ok(100)
+    }
+    fn copy(&mut self, source: u64, slot: u64) -> Result<(), u32> {
+        assert_eq!(slot, 100);
+        self.step("copy", source)
+    }
+    fn map(&mut self, slot: u64, address: u64, writable: bool) -> Result<(), u32> {
+        assert_eq!(slot, 100);
+        self.step(if writable { "write-map" } else { "read-map" }, address)
+    }
+    fn delete(&mut self, slot: u64) -> Result<(), u32> {
+        self.step("delete", slot)
+    }
+}
+
+#[test]
+fn page_copy_closes_source_before_mapping_destination_and_preserves_all_bytes() {
+    let mut owner = TemporaryAlias::new();
+    let mut io = PageIo::default();
+    let mut destination = [0u8; 4096];
+    owner
+        .copy_page(
+            90,
+            91,
+            0x8000,
+            &mut io,
+            |address, bytes| {
+                assert_eq!(address, 0x8000);
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = (index % 251) as u8;
+                }
+            },
+            |address, bytes| {
+                assert_eq!(address, 0x8000);
+                destination.copy_from_slice(bytes);
+            },
+        )
+        .unwrap();
+    assert!(destination
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| *byte == (index % 251) as u8));
+    assert_eq!(
+        io.calls,
+        [
+            ("reserve", 0),
+            ("copy", 90),
+            ("read-map", 0x8000),
+            ("delete", 100),
+            ("copy", 91),
+            ("write-map", 0x8000),
+            ("delete", 100)
+        ]
+    );
+    assert!(owner.pending().is_none());
+}
+
+#[test]
+fn page_copy_failure_matrix_retains_cleanup_and_never_publishes_success() {
+    for fail_at in 0..7 {
+        let mut owner = TemporaryAlias::new();
+        let mut io = PageIo {
+            fail_at: Some(fail_at),
+            ..PageIo::default()
+        };
+        let mut read = false;
+        let mut written = false;
+        assert_eq!(
+            owner.copy_page(
+                90,
+                91,
+                0x8000,
+                &mut io,
+                |_, bytes| {
+                    read = true;
+                    bytes.fill(0xab);
+                },
+                |_, bytes| {
+                    written = true;
+                    assert!(bytes.iter().all(|byte| *byte == 0xab));
+                },
+            ),
+            Err(42)
+        );
+        assert_eq!(read, fail_at >= 3);
+        assert_eq!(written, fail_at == 6);
+        if [3, 6].contains(&fail_at) {
+            let pending = owner.pending().unwrap();
+            assert_eq!(pending.source.scope, TemporaryAliasScope::Frame);
+            assert_eq!(pending.source.frame, if fail_at == 3 { 90 } else { 91 });
+            assert!(!owner.backing_release_available());
+            assert!(!owner.process_available(7));
+            let calls = io.calls.len();
+            assert_eq!(
+                owner.copy_page(92, 93, 0x8000, &mut io, |_, _| panic!(), |_, _| panic!()),
+                Err(RESOURCES)
+            );
+            assert_eq!(io.calls.len(), calls);
+        } else {
+            assert!(owner.pending().is_none());
+        }
+        io.fail_at = None;
+        owner.drain(&mut io).unwrap();
+        assert!(owner.backing_release_available());
+    }
+}
+
+#[test]
+fn page_copy_rejects_null_frames_without_side_effects() {
+    for (source, destination) in [(0, 91), (90, 0)] {
+        let mut owner = TemporaryAlias::new();
+        let mut io = PageIo::default();
+        assert_eq!(
+            owner.copy_page(
+                source,
+                destination,
+                0x8000,
+                &mut io,
+                |_, _| panic!(),
+                |_, _| panic!()
+            ),
+            Err(INVALID)
+        );
+        assert!(io.calls.is_empty());
+    }
 }

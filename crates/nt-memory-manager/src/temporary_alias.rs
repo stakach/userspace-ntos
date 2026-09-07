@@ -4,9 +4,18 @@ const RESOURCES: u32 = 0xc000_009a;
 const INVALID: u32 = 0xc000_000d;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporaryAliasScope {
+    ClientPage {
+        process: u64,
+        page: u64,
+    },
+    /// No proven process/page identity; exclude all address spaces until cleanup completes.
+    Frame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemporaryAliasSource {
-    pub process: u64,
-    pub page: u64,
+    pub scope: TemporaryAliasScope,
     pub frame: u64,
 }
 
@@ -51,16 +60,28 @@ impl TemporaryAlias {
         let Some(pending) = self.pending else {
             return true;
         };
-        if pending.source.process != process || size == 0 {
+        if size == 0 {
+            return true;
+        }
+        let TemporaryAliasScope::ClientPage {
+            process: owner,
+            page,
+        } = pending.source.scope
+        else {
+            return false;
+        };
+        if owner != process {
             return true;
         }
         base.checked_add(size)
-            .is_some_and(|end| end <= pending.source.page || base >= pending.source.page + 0x1000)
+            .is_some_and(|end| end <= page || base >= page + 0x1000)
     }
 
     pub fn process_available(&self, process: u64) -> bool {
-        self.pending
-            .is_none_or(|pending| pending.source.process != process)
+        self.pending.is_none_or(|pending| {
+            matches!(pending.source.scope,
+            TemporaryAliasScope::ClientPage { process: owner, .. } if owner != process)
+        })
     }
 
     /// A copied-cap number does not identify every alias of the same physical backing. Until
@@ -91,9 +112,14 @@ impl TemporaryAlias {
         if self.pending.is_some() {
             return Err(RESOURCES);
         }
+        let invalid_source = match source.scope {
+            TemporaryAliasScope::ClientPage { page, .. } => {
+                page & 0xfff != 0 || page.checked_add(0x1000).is_none()
+            }
+            TemporaryAliasScope::Frame => false,
+        };
         if source.frame == 0
-            || source.page & 0xfff != 0
-            || source.page.checked_add(0x1000).is_none()
+            || invalid_source
             || address == 0
             || address & 0xfff != 0
             || address.checked_add(0x1000).is_none()
@@ -120,6 +146,61 @@ impl TemporaryAlias {
         let result = access(address);
         self.drain(io)?;
         Ok(result)
+    }
+
+    pub fn with_range<T>(
+        &mut self,
+        source: TemporaryAliasSource,
+        address: u64,
+        range: core::ops::Range<usize>,
+        writable: bool,
+        io: &mut impl TemporaryAliasIo,
+        access: impl FnOnce(u64) -> T,
+    ) -> Result<T, u32> {
+        if range.start > range.end || range.end > 0x1000 {
+            return Err(INVALID);
+        }
+        self.with_frame(source, address, writable, io, |address| {
+            access(address + range.start as u64)
+        })
+    }
+
+    /// Retire the read alias before touching the destination. The local buffer is never lent
+    /// across backend calls; each closure performs only a synchronous bounded memory transfer.
+    #[inline(never)]
+    pub fn copy_page(
+        &mut self,
+        source: u64,
+        destination: u64,
+        address: u64,
+        io: &mut impl TemporaryAliasIo,
+        read: impl FnOnce(u64, &mut [u8; 0x1000]),
+        write: impl FnOnce(u64, &[u8; 0x1000]),
+    ) -> Result<(), u32> {
+        if destination == 0 {
+            return Err(INVALID);
+        }
+        let mut bytes = [0u8; 0x1000];
+        self.with_frame(
+            TemporaryAliasSource {
+                scope: TemporaryAliasScope::Frame,
+                frame: source,
+            },
+            address,
+            false,
+            io,
+            |address| read(address, &mut bytes),
+        )?;
+        self.with_frame(
+            TemporaryAliasSource {
+                scope: TemporaryAliasScope::Frame,
+                frame: destination,
+            },
+            address,
+            true,
+            io,
+            |address| write(address, &bytes),
+        )
     }
 }
 

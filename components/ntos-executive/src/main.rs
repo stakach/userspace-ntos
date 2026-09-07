@@ -78,7 +78,7 @@ pub(crate) use hosted_pnp_start::*;
 mod selftests;
 pub(crate) use selftests::*;
 mod img_spawn;
-mod client_copy_alias;
+mod temporary_frame_alias;
 pub(crate) use img_spawn::*;
 mod win32k_glue;
 pub(crate) use win32k_glue::*;
@@ -577,8 +577,8 @@ unsafe fn recycle_plain_cap(cap: u64) {
 unsafe fn detach_win32k_attached_page_for_thread_release(pi: usize, page: u64) {
     // This legacy void-return release chain cannot yet retain a failed caller-owned resource
     // bundle. Never continue to backing reuse while a service alias still owns the old frame.
-    client_copy_alias::drain()
-        .expect("legacy thread backing release requires completed client-copy alias retirement");
+    temporary_frame_alias::drain()
+        .expect("legacy thread backing release requires completed temporary-frame alias retirement");
     win32k_glue::detach_attached_client_page(pi as u64, page)
         .expect("legacy thread backing release requires completed win32k alias retirement");
 }
@@ -8595,7 +8595,7 @@ fn client_frame_registry_stats() -> ClientFrameRegistryStats {
     unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).stats() }
 }
 fn client_frame_registry_process_is_empty(pi: u64) -> bool {
-    client_copy_alias::process_available(pi)
+    temporary_frame_alias::process_available(pi)
         && unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).is_process_empty(pi) }
 }
 /// Record GUI client `pi`'s frame cap `fr` for page VA `page` (once per (pi,page)).
@@ -8644,7 +8644,7 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
-    if !client_copy_alias::memory_available(pi, page, 0x1000) {
+    if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
         return false;
     }
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
@@ -8680,7 +8680,7 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     }
 }
 unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> {
-    if !client_copy_alias::memory_available(pi, page, 0x1000) {
+    if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
         return None;
     }
     (&mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY))
@@ -8696,7 +8696,7 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> 
 }
 
 unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
-    if !client_copy_alias::memory_available(pi, page, 0x1000) {
+    if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
         return false;
     }
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
@@ -12544,13 +12544,9 @@ pub(crate) unsafe fn mapped_section_writecopy_cow_selftest(
 }
 
 unsafe fn cow_seed_source_frame(frame: u64, scratch_base: u64, pattern: &[u8]) -> Result<(), u32> {
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
-    if page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    core::ptr::copy_nonoverlapping(pattern.as_ptr(), alias as *mut u8, pattern.len());
-    let _ = page_unmap_r(frame);
-    Ok(())
+    temporary_frame_alias::with_scratch_range(frame, scratch_base, 0..pattern.len(), true, |alias| {
+        core::ptr::copy_nonoverlapping(pattern.as_ptr(), alias as *mut u8, pattern.len());
+    })
 }
 
 unsafe fn cow_frame_prefix_matches(
@@ -12558,49 +12554,17 @@ unsafe fn cow_frame_prefix_matches(
     scratch_base: u64,
     expected: &[u8],
 ) -> Result<bool, u32> {
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
-    let (copy, copy_error) = copy_cap_r(frame);
-    if copy_error != 0 {
-        if copy != 0 {
-            let _ = cnode_delete_recycle_r(copy);
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    if page_map_r(copy, alias, RO_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        let _ = cnode_delete_recycle_r(copy);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let mut index = 0usize;
-    let mut matches = true;
-    while index < expected.len() {
-        if core::ptr::read_volatile((alias + index as u64) as *const u8) != expected[index] {
-            matches = false;
-            break;
-        }
-        index += 1;
-    }
-    let _ = page_unmap_r(copy);
-    let _ = cnode_delete_recycle_r(copy);
-    Ok(matches)
+    temporary_frame_alias::with_scratch_range(frame, scratch_base, 0..expected.len(), false, |alias| {
+        expected.iter().enumerate().all(|(index, expected)| {
+            core::ptr::read_volatile((alias + index as u64) as *const u8) == *expected
+        })
+    })
 }
 
 unsafe fn cow_frame_byte(frame: u64, scratch_base: u64, offset: u64) -> Result<u8, u32> {
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
-    let (copy, copy_error) = copy_cap_r(frame);
-    if copy_error != 0 {
-        if copy != 0 {
-            let _ = cnode_delete_recycle_r(copy);
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    if page_map_r(copy, alias, RO_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        let _ = cnode_delete_recycle_r(copy);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let value = core::ptr::read_volatile((alias + offset) as *const u8);
-    let _ = page_unmap_r(copy);
-    let _ = cnode_delete_recycle_r(copy);
-    Ok(value)
+    if offset >= 0x1000 { return Err(nt_address_space::STATUS_INVALID_PARAMETER); }
+    temporary_frame_alias::with_scratch_range(frame, scratch_base, offset as usize..offset as usize + 1, false,
+        |alias| core::ptr::read_volatile(alias as *const u8))
 }
 
 unsafe fn cow_write_frame_byte(
@@ -12609,22 +12573,9 @@ unsafe fn cow_write_frame_byte(
     offset: u64,
     value: u8,
 ) -> Result<(), u32> {
-    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x8000;
-    let (copy, copy_error) = copy_cap_r(frame);
-    if copy_error != 0 {
-        if copy != 0 {
-            let _ = cnode_delete_recycle_r(copy);
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    if page_map_r(copy, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        let _ = cnode_delete_recycle_r(copy);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    core::ptr::write_volatile((alias + offset) as *mut u8, value);
-    let _ = page_unmap_r(copy);
-    let _ = cnode_delete_recycle_r(copy);
-    Ok(())
+    if offset >= 0x1000 { return Err(nt_address_space::STATUS_INVALID_PARAMETER); }
+    temporary_frame_alias::with_scratch_range(frame, scratch_base, offset as usize..offset as usize + 1, true,
+        |alias| core::ptr::write_volatile(alias as *mut u8, value))
 }
 
 unsafe fn finish_image_writecopy_cow_selftest(
@@ -12957,8 +12908,8 @@ unsafe fn vm_frame_return_to_free_list(frame: u64) {
     if frame == 0 {
         return;
     }
-    client_copy_alias::drain()
-        .expect("legacy frame publication requires completed client-copy alias retirement");
+    temporary_frame_alias::drain()
+        .expect("legacy frame publication requires completed temporary-frame alias retirement");
     if let Err(frame) = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame) {
         let _ = cnode_delete_recycle_r(frame);
     }
@@ -12969,8 +12920,8 @@ unsafe fn vm_frame_release_unmapped(frame: u64) {
 }
 
 unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
-    client_copy_alias::drain()
-        .expect("legacy frame release requires completed client-copy alias retirement");
+    temporary_frame_alias::drain()
+        .expect("legacy frame release requires completed temporary-frame alias retirement");
     let _ = page_unmap_r(frame);
     if alias_cap != 0 {
         let _ = page_unmap_r(alias_cap);
@@ -13235,41 +13186,9 @@ unsafe fn vm_reprotect_private_page(
     }
 }
 
+#[inline(never)]
 unsafe fn vm_copy_frame_4k(source_cap: u64, dest_frame: u64, scratch_base: u64) -> Result<(), u32> {
-    let source_alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x6000;
-    let dest_alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x7000;
-    let (source_copy, source_error) = copy_cap_r(source_cap);
-    if source_error != 0 {
-        if source_copy != 0 {
-            let _ = cnode_delete_recycle_r(source_copy);
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let source_map = page_map_r(source_copy, source_alias, RO_NX, CAP_INIT_THREAD_VSPACE);
-    if source_map != 0 {
-        let _ = cnode_delete_recycle_r(source_copy);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let dest_map = page_map_r(dest_frame, dest_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
-    if dest_map != 0 {
-        let _ = page_unmap_r(source_copy);
-        let _ = cnode_delete_recycle_r(source_copy);
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-
-    let mut offset = 0u64;
-    while offset < 0x1000 {
-        core::ptr::write_volatile(
-            (dest_alias + offset) as *mut u64,
-            core::ptr::read_volatile((source_alias + offset) as *const u64),
-        );
-        offset += 8;
-    }
-
-    let _ = page_unmap_r(dest_frame);
-    let _ = page_unmap_r(source_copy);
-    let _ = cnode_delete_recycle_r(source_copy);
-    Ok(())
+    temporary_frame_alias::copy_page(source_cap, dest_frame, scratch_base)
 }
 
 unsafe fn vm_restore_transition_mapping(
