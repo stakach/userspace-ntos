@@ -26,6 +26,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 mod epilogue;
+pub mod exception_walk;
 
 // =================================================================================================
 // EXCEPTION_RECORD / dispositions

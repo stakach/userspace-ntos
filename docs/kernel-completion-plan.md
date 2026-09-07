@@ -257,7 +257,8 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Replace win32k's fake initialization process/thread with canonical System execution context and
   an explicit root-issued Ps caller (tranche 102). Remove CSRSS re-keying and synthetic desktop-worker
   initialization; let the real CSR request path create and initialize desktop/RIT threads.
-- [~] Add a checked exception search/target-unwind core with owned handler invocations (tranche 103).
+- [x] Add a checked exception search/target-unwind core with owned handler invocations (tranche 103;
+  host core).
   Complete collided unwind, consolidate restore and native linkage before dispatch/export cutover.
 - [x] Add checked native handle scopes and retained Ps references over the existing PM handle tables
   (tranche 104; host core). Use the designated System table for kernel handles; no second object
@@ -28608,7 +28609,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     publication hazard and the missing System-object reference classification; both were corrected
     before checkpoint. This is not native desktop acceptance or complete token/handle brokerage.
 
-    B3 exception walk core tranche 103 (2026-09-08, in progress):
+    B3 exception walk core tranche 103 (2026-09-08, host core complete):
 
     Add a checked, host-testable search/target-unwind walk over nt-unwind, using owned continuations
     so language-handler calls cannot retain a mutable Rust walk borrow across re-entry. Validate
@@ -28616,6 +28617,26 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and restored nonvolatile state. A missing target must never produce a successful transfer.
     Collided unwind requires real dispatcher/linkage provenance; until implemented, report an
     explicit unsupported outcome and do not bind native exports or replace the ntdll dispatcher.
+
+    Implemented in `nt-unwind::exception_walk`. HandlerInvocation privately owns its non-Clone
+    continuation; consuming `returned` resumes only that invocation's walk, without a separately
+    pairable response or mutable walk borrow across handler re-entry. Search keeps original exception
+    context separate from virtually unwound dispatcher context. Unwind invokes the target frame's
+    termination handler, preserves Current until the handler completes, and transfers only with the
+    actual restored/modified context. Missing targets produce second-chance outcomes, not jumps.
+    Nested regions, noncontinuability, invalid dispositions, stack/metadata bounds and frame budgets
+    are explicit. Progress uses PC plus immutable frame-entry RSP, allowing recursive calls at the
+    same instruction while rejecting a genuinely unchanged frame.
+
+    The required ExceptionImageReader classifies each new PC as a known function or affirmative
+    executable leaf, or reports unknown/unreadable/corrupt metadata. A missing lookup is never a
+    leaf fallback; handler-modified PCs are reclassified before accessing the next frame's stack.
+    Native adoption still needs an immutable admitted-image catalog and physical lane ownership.
+
+    Validation: 124 unit tests (36 focused new walk cases) and two compile-fail ownership checks
+    pass in `.tmp/test-exception-walk-final-20260908.log`. Collided unwind and unwind-consolidate
+    remain explicit unsupported outcomes. No native exports or ntdll dispatch paths are switched,
+    and no desktop acceptance is claimed by this host checkpoint.
 
     Native exception cutover additionally requires the physical provider lane's stack bounds,
     immutable image/function-table registration (including unwindable handler linkage thunks),
