@@ -71,6 +71,8 @@ def main() -> int:
     parser.add_argument("--completion-file")
     parser.add_argument("--completion-text")
     parser.add_argument("--completion-grace-seconds", type=float, default=5.0)
+    parser.add_argument("--failure-file")
+    parser.add_argument("--failure-text")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -86,6 +88,8 @@ def main() -> int:
         parser.error("--completion-file and --completion-text must be specified together")
     if args.completion_grace_seconds < 0:
         parser.error("--completion-grace-seconds cannot be negative")
+    if bool(args.failure_file) != bool(args.failure_text):
+        parser.error("--failure-file and --failure-text must be specified together")
 
     ready_path = Path(args.ready_file) if args.ready_file else None
     ready_marker = args.ready_text.encode() if args.ready_text else None
@@ -101,7 +105,23 @@ def main() -> int:
     except FileNotFoundError:
         completion_offset = 0
     completion_tail = b""
+    failure_path = Path(args.failure_file) if args.failure_file else None
+    failure_marker = args.failure_text.encode() if args.failure_text else None
+    try:
+        failure_offset = failure_path.stat().st_size if failure_path else 0
+    except FileNotFoundError:
+        failure_offset = 0
+    failure_tail = b""
     status_messages: list[str] = []
+
+    def failure_observed() -> bool:
+        nonlocal failure_offset, failure_tail
+        if failure_path is None or failure_marker is None:
+            return False
+        failed, failure_offset, failure_tail = ready_marker_observed(
+            failure_path, failure_marker, failure_offset, failure_tail
+        )
+        return failed
 
     def flush_status_messages() -> None:
         for message in status_messages:
@@ -120,10 +140,23 @@ def main() -> int:
 
     process = subprocess.Popen(command, cwd=args.cwd, start_new_session=True)
     deadline: float | None = time.monotonic() + args.seconds
+    completion_deadline: float | None = None
     try:
         while True:
+            if failure_observed():
+                status_messages.append(
+                    "terminal failure marker observed; terminating process group"
+                )
+                terminate_and_wait(process, signal.SIGTERM)
+                flush_status_messages()
+                return 125
             result = process.poll()
             if result is not None:
+                # Drain bytes written between the first log read and process exit.
+                if failure_observed():
+                    status_messages.append("terminal failure marker observed at process exit")
+                    flush_status_messages()
+                    return 125
                 flush_status_messages()
                 return result
 
@@ -138,17 +171,24 @@ def main() -> int:
                     status_messages.append(
                         "completion marker observed; awaiting process exit"
                     )
-                    try:
-                        result = process.wait(timeout=args.completion_grace_seconds)
-                        flush_status_messages()
-                        return result
-                    except subprocess.TimeoutExpired:
-                        status_messages.append(
-                            "completion exit grace expired; terminating process group",
-                        )
-                        terminate_and_wait(process, signal.SIGTERM)
-                        flush_status_messages()
-                        return 0
+                    completion_deadline = time.monotonic() + args.completion_grace_seconds
+                    completion_path = None
+                    completion_marker = None
+                    deadline = None
+                    ready_path = None
+                    ready_marker = None
+
+            if completion_deadline is not None and time.monotonic() >= completion_deadline:
+                status_messages.append(
+                    "completion exit grace expired; terminating process group",
+                )
+                terminate_and_wait(process, signal.SIGTERM)
+                if failure_observed():
+                    status_messages.append("terminal failure marker observed during shutdown")
+                    flush_status_messages()
+                    return 125
+                flush_status_messages()
+                return 0
 
             if ready_path is not None and ready_marker is not None:
                 ready, ready_offset, ready_tail = ready_marker_observed(
@@ -175,6 +215,10 @@ def main() -> int:
                         "boot validation deadline exceeded; terminating process group",
                     )
                     terminate_and_wait(process, signal.SIGTERM)
+                    if failure_observed():
+                        status_messages.append("terminal failure marker observed during shutdown")
+                        flush_status_messages()
+                        return 125
                     flush_status_messages()
                     return 124
                 time.sleep(min(POLL_INTERVAL_SECONDS, remaining))

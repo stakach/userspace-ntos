@@ -1456,6 +1456,7 @@ static PUMP_DEADMAN_UNWINDS: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
     label == ch.dispatch_label
+        || label == crate::provider_bugcheck::BUGCHECK_LABEL
         || (crate::driver_launch::is_fsd_component_service_label(label)
             && ch.caps.kind == ReqKind::Irp)
         || (label == crate::win32k_subsystem::W32_USER_CALLBACK_LABEL && ch.caps.usermode_callback)
@@ -2254,6 +2255,7 @@ enum PumpResume {
 
 #[inline(never)]
 unsafe fn component_pump_inner(ch: &PumpChannel, resume: PumpResume) -> PumpResult {
+    crate::provider_bugcheck::stop_if_pending();
     // (Step 4, win32k) The request fill — `w32_client_attach(client_pi)`, the SSN/args write, and the
     // wide-arg source selection — caller RSP for real syscalls or explicit SH_REQ_A4.. staging for
     // executive-originated calls — is done by the win32k caller wrapper `win32k_dispatch_wide`
@@ -2357,7 +2359,22 @@ unsafe fn component_pump_loop(
             break;
         }
         let label = msg.label();
-        if label == ch.dispatch_label {
+        if label == crate::provider_bugcheck::BUGCHECK_LABEL {
+            match crate::provider_bugcheck::accept(
+                ch,
+                *reply_cap,
+                msg.badge,
+                msg.mi,
+                [msg.m0, msg.m1, msg.m2, msg.m3, msg.m4],
+            ) {
+                Ok(report) => crate::provider_bugcheck::stop(report),
+                Err(_) => {
+                    crate::print_str(b"[provider-bugcheck] rejected malformed or unauthorized report\n");
+                    outcome.wall(msg);
+                    break;
+                }
+            }
+        } else if label == ch.dispatch_label {
             // ★ There is nothing to check. This message is the return half of the component's OWN
             // `Call`, the kernel bound our reply object to that exact caller when it paired, and the
             // component could not have spoken at all without first being replied to. A stale or

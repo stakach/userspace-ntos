@@ -33708,7 +33708,7 @@ pub(crate) unsafe fn call_on4(
 }
 
 #[inline(never)]
-unsafe fn call_on5(
+pub(crate) unsafe fn call_on5(
     msginfo: u64,
     arg0: u64,
     arg1: u64,

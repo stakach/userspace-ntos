@@ -8643,6 +8643,7 @@ pub(crate) unsafe fn service_sec_image(
     }
     loop {
         // Bound notifications do not bind the offered Reply and use a separate badge namespace.
+        crate::provider_bugcheck::stop_if_pending();
         // Retry outside registry/runtime borrows, including when the next ingress is excluded.
         // Failure retains the exact alias and all memory/backing-release exclusions.
         if let Err(status) = crate::temporary_frame_alias::drain() {

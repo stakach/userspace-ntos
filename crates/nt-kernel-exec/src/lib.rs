@@ -31,6 +31,7 @@ mod lookaside;
 mod mutant;
 pub mod np_prefix;
 pub mod provider_pool;
+pub mod provider_bugcheck;
 pub mod rtl_atom;
 pub mod rtl_bitmap;
 pub mod rtl_time;

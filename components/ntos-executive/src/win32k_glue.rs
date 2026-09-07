@@ -202,14 +202,17 @@ unsafe fn win32k_lane_channel(
 /// This is deliberately separate from dispatch routing: the lane is not eligible until its initial
 /// ready `Call` has been received and bound to its own reply object.
 pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
-    let lanes = win32k_physical_lanes_mut();
-    if lanes.is_empty() {
-        return false;
-    }
-    let worker_index = lanes.iter().filter(|lane| lane.worker.is_some()).count();
-    if worker_index >= win32k_subsystem::WIN32K_LANE_CAPACITY || lanes.try_reserve(1).is_err() {
-        return false;
-    }
+    let worker_index = {
+        let lanes = win32k_physical_lanes_mut();
+        if lanes.is_empty() {
+            return false;
+        }
+        let index = lanes.iter().filter(|lane| lane.worker.is_some()).count();
+        if index >= win32k_subsystem::WIN32K_LANE_CAPACITY || lanes.try_reserve(1).is_err() {
+            return false;
+        }
+        index
+    };
     let Some(offset) = (worker_index as u64).checked_mul(win32k_subsystem::WIN32K_LANE_STRIDE)
     else {
         return false;
@@ -287,6 +290,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
     let Some(handle) = crate::service_sec_image::register_component_execution_lane(binding) else {
         return false;
     };
+    let lanes = win32k_physical_lanes_mut();
     lanes.push(Win32kPhysicalLane {
         handle,
         binding,
@@ -3025,6 +3029,38 @@ unsafe fn redirect_pending_user_callback(
 /// this is defensive; if it ever fires, the boot says so loudly and every later win32k call fails
 /// cleanly instead of corrupting.
 pub(crate) static WIN32K_RETIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Terminal system failure cannot resume other lanes in the same damaged provider VSpace.
+/// Keep every reply/callback owner retained; no release or foreign callback is safe here.
+pub(crate) unsafe fn retire_bugchecked_vspace(vspace: u64, reporting_tcb: u64) {
+    if vspace == 0
+        || (vspace != crate::WIN32K_HOST_PML4.load(Ordering::Acquire)
+            && reporting_tcb != crate::WIN32K_TCB.load(Ordering::Acquire))
+    {
+        return;
+    }
+    WIN32K_RETIRED.store(1, Ordering::Release);
+    let mut index = 0;
+    loop {
+        let binding = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+            .as_ref()
+            .and_then(|lanes| lanes.get(index))
+            .map(|lane| lane.binding);
+        let Some(binding) = binding else {
+            break;
+        };
+        index += 1;
+        if binding.executor_id == reporting_tcb {
+            continue;
+        }
+        let error = crate::tcb_suspend_r(binding.executor_id);
+        print_str(b"[provider-bugcheck] sibling-tcb=0x");
+        crate::print_hex_u64(binding.executor_id);
+        print_str(b" suspend=");
+        print_u64(error);
+        print_str(b"\n");
+    }
+}
 
 unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
     if pr.completed || pr.callback_suspended || pr.provider_wait_suspended || pr.lpc_wait_suspended

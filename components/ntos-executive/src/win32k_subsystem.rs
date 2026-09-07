@@ -14198,6 +14198,14 @@ fn register_trampolines() -> bool {
     );
     reg.bind("ExFreePoolWithTag", s_ex_free_pool_with_tag as usize as u64);
     reg.bind("ExFreePool", s_ex_free_pool as usize as u64);
+    reg.bind(
+        "KeBugCheck",
+        crate::provider_bugcheck::ke_bug_check as *const () as usize as u64,
+    );
+    reg.bind(
+        "KeBugCheckEx",
+        crate::provider_bugcheck::ke_bug_check_ex as *const () as usize as u64,
+    );
     reg.bind("ProbeForRead", s_probe_for_read as usize as u64);
     reg.bind("ProbeForWrite", s_probe_for_write as usize as u64);
     reg.bind("RtlGetVersion", s_rtl_get_version as usize as u64);

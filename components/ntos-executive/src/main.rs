@@ -14986,6 +14986,7 @@ mod root_slot_recycle;
 mod frame_acquisition;
 mod frame_recycle;
 mod client_frame_cleanup;
+mod provider_bugcheck;
 mod pagefile_retirement;
 use thread_sched_context::attach_sched_context;
 

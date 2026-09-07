@@ -230,6 +230,9 @@ below are historical baselines, not acceptance of the current provider cutover.
   snapshots and operation census (tranche 93). Complete
   security assignment through a shared inheritance core separately; do not reuse ntdll's
   creator-or-parent descriptor cloning scaffolding.
+- [x] Give KeBugCheck/KeBugCheckEx a pointer-free terminal provider report, preserve first-failure
+  evidence and stop without replying or re-entering damaged callbacks; make the run harness fail
+  fast on the terminal marker (tranche 94; native destructive validation remains open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28305,6 +28308,36 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     authenticated subject-token/type-method inputs. Existing RtlNewSecurityObject descriptor
     cloning ignores those inputs and must not be reused as an implementation. Other missing
     provider import families and genuine instrumented desktop acceptance remain open.
+
+    B3 terminal provider bugcheck tranche 94 (2026-09-08):
+
+    KeBugCheck and KeBugCheckEx report a ULONG code and four pointer-width scalar parameters over
+    the current provider channel. A host-tested protocol checks exact message framing, absence of
+    capability transfer, channel identity and badge; identity comes from the executive's retained
+    PumpChannel rather than provider-supplied pointers or a current hosted process. This includes
+    DriverEntry before global lane publication. The executive retains the first report, never
+    replies to the reporting call, suspends the reporting executor and registered win32k siblings,
+    fences redispatch, and stops without unwinding callbacks through the damaged provider. This
+    does not reuse the FSD guarded-recovery jump as a bugcheck implementation.
+
+    The runner watches a fresh terminal marker independently of desktop readiness and completion.
+    It terminates the process group and returns failure 125 immediately, including a fatal report
+    during completion grace or coincident with a successful process exit. Stale log markers do not
+    poison a new run. The full-verdict check also rejects any terminal marker. Existing one-hour
+    boot and 60-second post-paint limits remain unchanged.
+
+    Validation: all 250 kernel-exec tests pass, including seven new report/admission tests. The
+    serialized eleven-crate regression suite passes 1,713 tests. The runner passes 16 tests,
+    including failure during timeout shutdown; `bash -n run.sh` passes. The executive release
+    build passes with the unchanged 262 warnings. Logs: `.tmp/test-provider-bugcheck-20260908.log`,
+    `.tmp/test-provider-bugcheck-regression-20260908.log`, `.tmp/test-terminal-runner-20260908.log`,
+    `.tmp/build-provider-bugcheck-20260908.log`. Independent review checked MR4 on all receive
+    paths, after-timer admission, startup channel identity and nonreturning stop. Root alone ran
+    tests/builds. No intentional native bugcheck or desktop acceptance has been run for this slice.
+
+    Review adjustment: the old FSD-only guarded bugcheck recovery remains separate legacy debt;
+    it is not called by these new win32k bindings. Finish shared ACL inheritance and actual security
+    assignment, then close remaining real provider import families before the desktop run.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

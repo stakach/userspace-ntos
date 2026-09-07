@@ -48,6 +48,8 @@ run_boot_lane() {
   python3 "$ROOT/scripts/run_with_timeout.py" \
     --seconds "$BOOT_TIMEOUT_SECONDS" \
     --cwd "$RM" \
+    --failure-file "$RUN_LOG" \
+    --failure-text '[provider-bugcheck] terminal' \
     --completion-file "$RUN_LOG" \
     --completion-text '[microtest sentinel matched -- exiting QEMU]' \
     -- "$@"
@@ -57,6 +59,8 @@ run_desktop_boot_lane() {
   python3 "$ROOT/scripts/run_with_timeout.py" \
     --seconds "$BOOT_TIMEOUT_SECONDS" \
     --cwd "$RM" \
+    --failure-file "$RUN_LOG" \
+    --failure-text '[provider-bugcheck] terminal' \
     --ready-file "$RUN_LOG" \
     --ready-text 'PASS exec_explorer_shell_chrome_painted' \
     --post-ready-seconds 60 \
@@ -76,6 +80,7 @@ complete_boot_verdict() {
   if grep -q 'PASS exec_explorer_shell_chrome_painted' "$log" \
      && ! grep -q 'FAIL exec_explorer_shell_chrome_painted' "$log" \
      && ! grep -q '^  FAIL ' "$log" \
+     && ! grep -Fq '[provider-bugcheck] terminal' "$log" \
      && grep -q '\[microtest sentinel matched -- exiting QEMU\]' "$log" \
      && [ -n "$passed" ] \
      && [ "$passed" = "$total" ] \
@@ -256,6 +261,11 @@ if [ "$GRAPHICS" = 1 ]; then
     err "         Log: $RUN_LOG"
     exit 124
   fi
+  if [ "$rc" = 125 ]; then
+    err "FAILED: terminal provider bugcheck; QEMU was terminated."
+    err "        Log: $RUN_LOG"
+    exit 125
+  fi
   if verdict="$(complete_boot_verdict "$RUN_LOG" "$rc")"; then
     read -r passed total <<< "$verdict"
     say "SUCCESS — the visible ReactOS desktop completed its full gate ($passed/$total checks)."
@@ -289,6 +299,11 @@ if [ "$rc" = 124 ]; then
   err "FAILED — boot validation exceeded ${BOOT_TIMEOUT_SECONDS}s; QEMU was terminated."
   err "         Log: $RUN_LOG"
   exit 124
+fi
+if [ "$rc" = 125 ]; then
+  err "FAILED: terminal provider bugcheck; QEMU was terminated."
+  err "        Log: $RUN_LOG"
+  exit 125
 fi
 if verdict="$(complete_boot_verdict "$RUN_LOG" "$rc")"; then
   read -r passed total <<< "$verdict"
