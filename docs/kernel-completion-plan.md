@@ -217,6 +217,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add exact-attempt provider alias journals to joint native claims, validate typed capability
   and segment ownership, and require scratch quiescence before reconciliation (tranche 89;
   native destructive retirement remains disabled).
+- [x] Retain recycled frame acquisition through checked owner unmap and scratch zeroing, and
+  retain failed fresh retype slots through strict recycling before selecting another frame
+  (tranche 90; broader release and pagefile transition ownership remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28134,6 +28137,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     close the broader legacy release and pagefile transition handoffs, including aliases discarded
     before PagefileStore publication, and complete stale-reference/retry activation. No desktop
     acceptance is claimed; the real 33-name provider-import barrier still precedes hosted boot.
+
+    B3 retained frame acquisition tranche 90 (2026-09-08):
+
+    Added an allocation-free, nonclone FrameAcquisition owner in nt-memory-manager. A cached frame
+    transfers out of the pool into retained state before any backend operation. Owner unmap must
+    succeed before zeroing through the existing checked copied scratch alias; unmap acknowledgement
+    survives later zero/delete failures. Success transfers the frame only after scratch cleanup.
+    Failed fresh retype retains its allocated-empty destination until publish_unretyped acknowledges
+    root-slot recycling. The next call then rechecks the current pool, so exhausted untyped memory
+    cannot force endless fresh retries while usable pooled frames accumulate.
+
+    The native adapter replaces vm_frame_acquire's owner-cap scratch mapping, ignored PageUnmap,
+    local restore-to-pool and fallback deletion branches. Pooled admission checks root ownership
+    accounting and rejects duplicate pool entries without dropping the acquired owner. The retained
+    cap (including a failed-retype empty slot) participates in registry publication, physical-frame
+    publication and pending-thread cross-owner checks. Legacy void release also refuses to consume
+    an acquisition-owned cap. Native adapter borrow guards reject recursive acquisition.
+
+    Reference review verified that CAP_INIT_UNTYPED is the non-device rootserver untyped and
+    rust-micro zeros newly retyped frame bytes before publishing its capability. It also identified
+    why checked owner unmap is required: legacy release can still admit a frame after ignoring an
+    unmap failure. Mapping only a copied zeroing cap would otherwise bypass the old map refusal.
+
+    Validation: 15 focused acquisition tests pass, including repeated unmap/zero/recycle failure,
+    exact phase acknowledgement, null backend capabilities, ownership transfer and cache refill
+    after failed retype. The serialized nine-crate suite passes 1,330 tests (335 memory-manager),
+    and the executive release build passes with the unchanged 262 warnings.
+    Logs: `.tmp/test-frame-acquisition-focused-20260908.log`,
+    `.tmp/test-frame-acquisition-20260908.log`, `.tmp/build-frame-acquisition-20260908.log`.
+    Root alone runs builds/tests; agents implemented the host core and independently audited the
+    microkernel contract and native integration.
+
+    Review adjustment: acquisition is now retained; do not mistake that for safe legacy release.
+    Next extend the authoritative resident-frame row with explicit release/pageout intent and
+    delete-versus-recycle acknowledgements. Pageout must retain all aliases until cleanup completes
+    before publishing a frame-only transition record. Then close pagefile discard/restore and the
+    remaining void release handoffs. Native destructive thread cleanup and desktop acceptance remain
+    open; the 33 unresolved real win32k imports are still a separate boot barrier.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

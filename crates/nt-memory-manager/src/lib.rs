@@ -22,6 +22,7 @@ use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
 mod client_frame;
 pub mod alias_transition;
+pub mod frame_acquisition;
 mod commit;
 mod copy_context;
 pub mod data_section;

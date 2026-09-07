@@ -365,6 +365,7 @@ impl HostedThreadRuntimeTable {
             if client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
                 || win32k_glue::provider_alias_owns_root_cap(cap)
                 || temporary_frame_alias::owns_root_cap(cap)
+                || frame_acquisition::owns_root_cap(cap)
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);
             }
@@ -372,10 +373,12 @@ impl HostedThreadRuntimeTable {
         if aliases.capabilities().any(|cap| client_prefetch::owns_cap(cap))
             || prefetch.capabilities().any(|cap| win32k_glue::attachment_owns_cap(cap))
             || aliases.capabilities().chain(prefetch.capabilities()).any(|cap|
-                win32k_glue::provider_alias_owns_root_cap(cap) || temporary_frame_alias::owns_root_cap(cap))
+                win32k_glue::provider_alias_owns_root_cap(cap) || temporary_frame_alias::owns_root_cap(cap)
+                    || frame_acquisition::owns_root_cap(cap))
             || provider.root_capabilities().any(|cap|
                 client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
                     || temporary_frame_alias::owns_root_cap(cap))
+            || provider.root_capabilities().any(frame_acquisition::owns_root_cap)
         {
             return Err(ThreadReconciliationError::OwnershipConflict);
         }

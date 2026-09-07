@@ -8644,6 +8644,9 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
+    if [fr, alias_cap, source_cap].into_iter().any(frame_acquisition::owns_root_cap) {
+        return false;
+    }
     if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
         return false;
     }
@@ -12872,36 +12875,14 @@ unsafe fn alloc_frame() -> u64 {
 }
 
 unsafe fn vm_frame_acquire(scratch_base: u64) -> Result<u64, u32> {
-    let cached = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).acquire();
-    let Some(frame) = cached else {
-        let (frame, error) = alloc_frame_r();
-        return if error == 0 {
-            Ok(frame)
-        } else {
-            let _ = cnode_delete_recycle_r(frame);
-            Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
-        };
-    };
-    let scratch = scratch_base + DEMAND_SCRATCH_WINDOW - 0x2000;
-    if page_map_r(frame, scratch, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        // `acquire` retained the vector's capacity, so restoring this entry cannot allocate.
-        if (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES))
-            .try_recycle(frame)
-            .is_err()
-        {
-            let _ = cnode_delete_recycle_r(frame);
-        }
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    core::ptr::write_bytes(scratch as *mut u8, 0, 0x1000);
-    let _ = page_unmap_r(frame);
-    Ok(frame)
+    frame_acquisition::acquire(scratch_base)
 }
 
 unsafe fn vm_frame_return_to_free_list(frame: u64) {
     if frame == 0 {
         return;
     }
+    assert!(!frame_acquisition::owns_root_cap(frame), "frame acquisition retains this owner");
     temporary_frame_alias::drain()
         .expect("legacy frame publication requires completed temporary-frame alias retirement");
     if let Err(frame) = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame) {
@@ -12914,6 +12895,8 @@ unsafe fn vm_frame_release_unmapped(frame: u64) {
 }
 
 unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
+    assert!(!frame_acquisition::owns_root_cap(frame), "frame acquisition retains this owner");
+    assert!(!frame_acquisition::owns_root_cap(alias_cap), "frame acquisition retains this alias slot");
     temporary_frame_alias::drain()
         .expect("legacy frame release requires completed temporary-frame alias retirement");
     let _ = page_unmap_r(frame);
@@ -15060,6 +15043,7 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
 
 mod thread_sched_context;
 mod root_slot_recycle;
+mod frame_acquisition;
 mod frame_recycle;
 use thread_sched_context::attach_sched_context;
 

@@ -15,8 +15,22 @@ unsafe fn state() -> FrameRecycleState<'static> {
     }
 }
 
+/// A popped owner remains live and must not still occur in the free pool. Pool capacity is not
+/// needed for acquisition: another retirement may fill the free vector between retries.
+pub(super) unsafe fn validate_acquisition(frame: u64) -> Result<(), u32> {
+    state().validate_owner(frame)
+        .map_err(|_| nt_address_space::STATUS_INVALID_PARAMETER)?;
+    match (&*core::ptr::addr_of!(VM_FREE_FRAMES)).check_reserved(frame) {
+        Ok(()) | Err(nt_address_space::FramePoolError::Full) => Ok(()),
+        Err(_) => Err(nt_address_space::STATUS_INVALID_PARAMETER),
+    }
+}
+
 /// Capacity growth precedes release effects; drop allocator borrows before any capability syscall.
 pub(super) unsafe fn prepare(frame: u64) -> Result<(), u32> {
+    if frame_acquisition::owns_root_cap(frame) {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
     if !temporary_frame_alias::backing_release_available() {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -42,6 +56,9 @@ pub(super) unsafe fn prepare(frame: u64) -> Result<(), u32> {
 /// Caller retains the exact owner on error; on success it must acknowledge the transfer without
 /// allocation, IPC or callback before another frame can be acquired from the pool.
 pub(super) unsafe fn publish(frame: u64) -> Result<(), u32> {
+    if frame_acquisition::owns_root_cap(frame) {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
     if !temporary_frame_alias::backing_release_available() {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
