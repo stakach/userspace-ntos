@@ -151,10 +151,13 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Guard win32k client-window reuse/publication and section writeback aliases; retain checked
   detach progress through unmap/delete failures and reuse it for client switches
   (tranche 66, host/build; construction/remap/prefetch ownership and native cleanup remain open).
+- [x] Replace independent prefetch prepare/put selection with exact reserved/published/retiring
+  ownership, generation-checked publication and checked slot/alias cleanup; remove temporary
+  remapping of unavailable prefetch frames (tranche 67, host/build; native pending cleanup open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next close attachment construction/remap,
-  prefetch publication and remaining
-  non-ingress routing bypasses, retain complete external-alias journals, then wire registered-resume
+  legacy release failure propagation and remaining non-ingress routing bypasses, retain complete
+  external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
   failures and handler-owned handoffs; validate retained cleanup with live failures.
@@ -27017,6 +27020,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     ordinary termination, handler-owned handoffs and real user-mode SEH remain open. This checkpoint
     does not claim live pending cleanup or desktop proof; 33 unresolved win32k code imports still
     block the complete gate.
+
+    B3 prefetch ownership tranche 67 (2026-09-07, host/build green):
+    `nt-memory-manager::prefetch` now owns root-only prefetch reservations, construction, publication
+    and retirement. Reservation occupies the exact row and actual root alias before acquiring any
+    slot/frame; a globally unique checked ticket prevents stale or foreign reservations from acting
+    on reused rows, keys, aliases or capability numbers. Keys capture hosted process generation.
+    Reserved and retiring records block duplicate keys, mixed generations at a PI and actual root
+    alias collisions across processes. Address geometry and scratch capacity fail before acquisition.
+
+    Construction adopts every nonzero allocation result before examining retype status, so even a
+    failed allocation's empty root slot remains cleanup-owned. Mapping failure retains an unmapped
+    owner; successful mapping transfers to the shared `RetainedAlias` state machine before filling.
+    Publication uses that same row without allocation. Cleanup failures keep both exact ownership
+    and unavailable state. Process retirement hides all matching-generation rows before its first
+    backend operation and remembers successful unmapping across failed deletion. Ownership-inclusive
+    emptiness continues to block PI reuse. Retry never revives an unfinished reservation.
+
+    Native registry/adapters moved from `main.rs` to focused `client_prefetch.rs`. Construction uses
+    the hosted runtime's generation and exact scratch base, with the existing disjoint scratch-window
+    layout. Its backend holds no runtime-table borrow and performs only direct capability operations
+    and immutable PE copying while the prefetch table is mutably borrowed. All deletion paths use
+    checked deletion/recycling. Pending-memory admission precedes lookup, retry and construction.
+    Missing records do not require hosted runtime metadata, preserving early/temporary ordinary
+    copies; retained records do require exact generation. Copy-in refuses unavailable records before
+    exact/shared, mirror or scratch substitution. The old independent prepare/put machinery and
+    temporary remap branch for a frame whose persistent alias had been removed are deleted.
+
+    Validation: 12 host tests cover exact reservation/publication, zero/malformed geometry,
+    unavailable address capacity, identity exhaustion, null and failed allocation slots, map/fill
+    failures, unmap/delete retry, process scope, zero/stale generations and stale/foreign tickets.
+    Two cross-crate tests use the real `ScratchWindowLayout` to verify persistent-band capacity and
+    isolation from demand/fixed/prepared scratch, including an actual root-address collision from
+    overlapping process windows. The final nine-crate suite passes 1,082 tests (262 memory-manager,
+    171 address-space and 171 user-host unit/integration tests); log:
+    `.tmp/test-prefetch-owner-20260907.log`. The standalone executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log: `.tmp/build-prefetch-owner-20260907.log`.
+    Two read-only agents reviewed ownership and native caller compatibility; root alone ran tests
+    and builds. The initial build overlapped the tail of doctests; after both exited, the executive
+    build was rerun alone for the recorded validation.
+
+    Review adjustment: next close win32k construction/COW/remap rollback and propagate legacy
+    thread-release errors through durable resource owners, then reconcile complete external-alias
+    journals and mirrored-reference clearing before native `begin_pending`. This change repairs
+    prefetch ownership, not image coherency: the existing PE-byte prefetch is a root-only snapshot,
+    not a resident process image page. Reconcile remaining snapshot read paths with canonical image
+    backing rather than claiming this tranche removes all raw-image/scratch sources. Main/early
+    spawn, ordinary termination, handler-owned handoffs, user-mode SEH and live cleanup validation
+    remain open. No desktop proof is claimed; 33 unresolved win32k imports still block the full gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

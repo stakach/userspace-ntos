@@ -26466,6 +26466,9 @@ unsafe fn ensure_client_copyin_dll_page(
     if hosted_thread_memory_access(pi, page, nt_address_space::PAGE_SIZE).is_err() {
         return false;
     }
+    if client_copyin_frame_retry_retirement(pi, page).is_err() {
+        return false;
+    }
     if csrss_frame_get(pi, page) != 0 || client_copyin_frame_get(pi, page) != 0 {
         return true;
     }
@@ -26478,28 +26481,7 @@ unsafe fn ensure_client_copyin_dll_page(
     let Some(tpe) = slot.as_ref() else {
         return false;
     };
-    // Reserve the high end of each process scratch window for bounded copy-in prefetches. Demand
-    // fills are capped below this range, so every prefetched page keeps a distinct live alias.
-    let Some(alias) = client_copyin_frame_prepare_insert(pi, page, scratch_base) else {
-        return false;
-    };
-    let (frame, fe) = alloc_frame_r();
-    if fe != 0 {
-        let _ = cnode_delete_r(frame);
-        return false;
-    }
-    if page_map_r(frame, alias, RW_NX, CAP_INIT_THREAD_VSPACE) != 0 {
-        let _ = cnode_delete_r(frame);
-        return false;
-    }
-    let _ = fill_image_page(tpe, rva, alias);
-    if client_copyin_frame_put(pi, page, frame, alias) {
-        true
-    } else {
-        let _ = page_unmap(frame);
-        let _ = cnode_delete_r(frame);
-        false
-    }
+    client_copyin_frame_build(pi, page, scratch_base, tpe, rva).is_ok()
 }
 
 unsafe fn prefill_client_copyin_dll_range_pages(

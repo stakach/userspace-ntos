@@ -1915,6 +1915,9 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         let current = va + copied as u64;
         let page_remaining = 0x1000usize - (current as usize & 0xfff);
         let chunk = page_remaining.min(dst.len() - copied);
+        if client_copyin_frame_unavailable(pi, current & !0xfff) {
+            return false;
+        }
         // An exact record is authoritative, including a record undergoing reclamation.
         // Never substitute shared-cache or historical scratch backing for that record.
         if csrss_frame_get_exact_record(pi, current & !0xfff).is_some()
@@ -1929,7 +1932,6 @@ pub(crate) unsafe fn client_copyin_process_mapped(
         if unregistered_image_mapping(pi, current & !0xfff) {
             return false;
         }
-        let mut temporary_cap = 0;
         let mirrored = if !allow_active_mirrors
             || ACTIVE_CLIENT_PI.load(Ordering::Relaxed) != pi
             || pi == 2 && wl_listener_stack_contains(current, chunk)
@@ -1946,39 +1948,14 @@ pub(crate) unsafe fn client_copyin_process_mapped(
             if persistent_alias != 0 {
                 persistent_alias + (current & 0xfff)
             } else {
-                let frame = client_copyin_frame_get(pi, page);
-                if frame == 0 {
-                    if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base)
-                    {
-                        source
-                    } else {
-                        return false;
-                    }
+                if let Some(source) = scratch_for(current, filled_pages, nfilled, scratch_base) {
+                    source
                 } else {
-                    let alias = scratch_base + DEMAND_SCRATCH_WINDOW - 0x1000;
-                    let cap = client_copy_temp_cap();
-                    let _ = cnode_delete_r(cap);
-                    let copy_error = copy_cap_into_r(frame, cap);
-                    temporary_cap = cap;
-                    let map_error = if copy_error == 0 {
-                        page_map_r(cap, alias, 2 | PAGE_EXECUTE_NEVER, CAP_INIT_THREAD_VSPACE)
-                    } else {
-                        copy_error
-                    };
-                    if map_error != 0 {
-                        if temporary_cap != 0 {
-                            let _ = cnode_delete_r(temporary_cap);
-                        }
-                        return false;
-                    }
-                    alias + (current & 0xfff)
+                    return false;
                 }
             }
         };
         core::ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr().add(copied), chunk);
-        if temporary_cap != 0 {
-            let _ = cnode_delete_r(temporary_cap);
-        }
         copied += chunk;
     }
     true

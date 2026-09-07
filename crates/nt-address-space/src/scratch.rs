@@ -85,6 +85,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefetch_reservations_use_only_the_disjoint_persistent_band() {
+        use nt_memory_manager::prefetch::{PrefetchFrames, PrefetchProcess};
+        let layout = ScratchWindowLayout::with_prepared(0x10000, 2, 1, 1).unwrap();
+        let process = PrefetchProcess {
+            pi: 2,
+            generation: 7,
+        };
+        let mut frames = PrefetchFrames::new();
+        let base = 0x10000;
+        for index in 0..layout.alias_capacity() {
+            let address = layout.alias_address(base, index).unwrap();
+            assert!(address >= base + 2 * PAGE_SIZE);
+            assert!(address < layout.prepared_address(base, 0).unwrap());
+            assert!(address < layout.temporary_address(base, 1).unwrap());
+            frames
+                .reserve(process, index * PAGE_SIZE, |reserved| {
+                    assert_eq!(reserved as u64, index);
+                    layout.alias_address(base, reserved as u64)
+                })
+                .unwrap();
+        }
+        assert!(frames
+            .reserve(process, 0x80000, |index| {
+                layout.alias_address(base, index as u64)
+            })
+            .is_err());
+        assert!(!frames.contains(process.pi, 0x80000));
+    }
+
+    #[test]
+    fn prefetch_reservations_reject_actual_alias_collisions_across_overlapping_windows() {
+        use nt_memory_manager::prefetch::{PrefetchFrames, PrefetchProcess};
+        let layout = ScratchWindowLayout::with_prepared(0x10000, 2, 1, 1).unwrap();
+        let first = PrefetchProcess {
+            pi: 2,
+            generation: 7,
+        };
+        let other = PrefetchProcess {
+            pi: 3,
+            generation: 8,
+        };
+        let mut frames = PrefetchFrames::new();
+        frames
+            .reserve(first, 0x1000, |index| {
+                layout.alias_address(0x10000, index as u64)
+            })
+            .unwrap();
+        assert_eq!(
+            layout.alias_address(0x10000, 0),
+            layout.alias_address(0x11000, 1)
+        );
+        assert!(frames
+            .reserve(other, 0x1000, |index| {
+                layout.alias_address(0x11000, index as u64)
+            })
+            .is_err());
+        assert!(frames.process_is_empty(other.pi));
+        assert!(frames
+            .reserve(other, 0x1000, |index| {
+                layout.alias_address(0x20000, index as u64)
+            })
+            .is_ok());
+    }
+
+    #[test]
     fn prepared_native_batch_is_disjoint_from_every_fixed_and_persistent_slot() {
         let layout = ScratchWindowLayout::with_prepared(0x400_0000, 15_000, 8, 18).unwrap();
         assert_eq!(layout.alias_capacity(), 1358);
