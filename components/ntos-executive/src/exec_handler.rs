@@ -9813,6 +9813,33 @@ impl ExecNtHandler {
         self.thread_runtime.admit_ingress(badge, current)
     }
 
+    pub(crate) fn capture_provider_logical_caller(
+        &self,
+        pi: usize,
+        tid: u64,
+        badge: u64,
+        tcb: u64,
+    ) -> Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller> {
+        let runtime = self.admit_hosted_thread_ingress(badge).ok()?;
+        if (runtime.pi, runtime.tid, runtime.tcb) != (pi, tid, tcb) {
+            return None;
+        }
+        let lifetime = self.pm.thread_lifetime(u32::try_from(tid).ok()?)?;
+        nt_user_host::provider_logical_caller::ProviderLogicalCaller::capture(
+            runtime.binding(), lifetime,
+        ).ok()
+    }
+
+    pub(crate) fn validate_provider_logical_caller(
+        &self,
+        caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+    ) -> bool {
+        caller.validate(
+            self.admit_hosted_thread_ingress(caller.badge()).ok().map(|runtime| runtime.binding()),
+            self.pm.thread_lifetime(caller.thread().thread_id()),
+        ).is_ok()
+    }
+
     pub(crate) fn capture_process_identity(
         &self,
         pi: usize,
@@ -22194,6 +22221,7 @@ impl ExecNtHandler {
                 nt_user_host::ProcessDeletionPhase::FinalizingProviderObjects => {
                     if candidate.provider_objects {
                         let finalizer_client = win32k_glue::Win32kClientContext {
+                            logical_caller: None,
                             pi: pi as u32,
                             generation: candidate.generation,
                             pid: u64::from(pid),

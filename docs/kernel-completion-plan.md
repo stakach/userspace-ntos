@@ -245,7 +245,7 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add atomic directory create/open and genuine enumeration to the canonical object service
   (tranche 98; host service). Migrate Nt and Zw callers together and remove the
   executive's duplicate ASCII name tree; provider-only namespace routing is not acceptable.
-- [~] Retain a generation-exact logical caller through provider dispatch, callback and wait resumes
+- [x] Retain a generation-exact logical caller through hosted win32k dispatch, callback and wait resumes
   (tranche 99). Validate the actual runtime binding and PM thread activation before capturing tokens;
   neither ambient current-thread state nor a physical executor TCB is client authority.
 - [ ] Move real Ps/token bootstrap ownership ahead of provider DriverEntry, retaining one initial
@@ -28456,13 +28456,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     review found two wire/name boundary gaps, both fixed with tests before acceptance. Native bindings
     remain deliberately absent until the single-namespace/security cutover.
 
-    B3 logical provider caller tranche 99 (2026-09-08, in progress):
+    B3 logical provider caller tranche 99 (2026-09-08):
 
     PM thread activation generations must not wrap: dormant slots intentionally reuse both TID and
     ETHREAD address. Preserve the exact activation alongside process lifetime and admitted runtime
     routing through every provider dispatch, callback registry and parked message waiter. Missing
     retained callback metadata must fail, not reconstruct authority from current state. Token capture
     consumes this authenticated channel identity, never provider-supplied identity fields.
+
+    Implemented ThreadLifetime snapshots and checked activation increments, plus a host-tested
+    ProviderLogicalCaller joining the tagged process lifetime, thread activation and exact admitted
+    runtime route. Native hosted win32k context, callback records, parked provider/LPC requests and
+    GUI message waiters preserve that snapshot. Dispatch/lane entry and Ps broker requests revalidate
+    it; failed hosted capture cannot downgrade to a provider-only context. Callback completion now
+    requires its original registry snapshot rather than reconstructing identity with generation zero.
+    Missing/stale callback ownership remains parked, including dead-client cases that require explicit
+    provider retirement. Re-entrant GDI work holds no mutable callback-stack borrow, and completion
+    rechecks the exact frame before popping it.
+
+    The suspension selector filters inadmissible tops without consuming them or blocking unrelated
+    eligible lanes. GUI cancellation always releases its own reply/Event leases but cannot clear a
+    newly reused badge's parked marker. Initialization and provider-only cleanup explicitly carry no
+    hosted security authority. Driver IRP/provider-to-provider channels remain provider-only; this
+    tranche does not claim general driver caller propagation or native token-lease capture is wired.
+
+    Validation: 159 process tests, 313 user-host unit tests plus 43 integrations, and 26 suspension
+    tests pass (541 total), including 19 new focused tests. The seventeen-crate regression passes
+    2,146 tests. The executive release build passes with the unchanged 262 warnings. Logs:
+    `.tmp/test-provider-caller-lifetime-20260908.log`,
+    `.tmp/test-provider-caller-regression-20260908.log`,
+    `.tmp/build-provider-caller-lifetime-20260908.log`. Root ran all validation sequentially;
+    independent reviews checked generation exhaustion, caller retention, callback borrow lifetimes,
+    and rejection before continuation mutation. No desktop acceptance is claimed: remaining real
+    provider imports and initialization authority still block the desktop push.
 
     Review adjustment: the current PM/TokenStore are created after win32k DriverEntry, PID 4 is
     presently allocated to SMSS, and the temporary provider process body is later re-keyed to CSRSS.

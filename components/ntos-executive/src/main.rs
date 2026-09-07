@@ -18747,6 +18747,7 @@ fn win32k_lifecycle_client(
         .primary_token_user_sid_for_pi(pi, &mut user_sid)
         .unwrap_or(0) as u32;
     Some(win32k_glue::Win32kClientContext {
+        logical_caller: handler.capture_provider_logical_caller(pi, tid, badge, tcb),
         pi: pi as u32,
         generation,
         pid: u64::from(pid),
@@ -30781,6 +30782,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                 reply_cap: REPLY_W32_SLOT.load(Ordering::Relaxed),
                 client_pi: 0,
                 client_generation: 0,
+                logical_caller: None,
                 // DriverEntry runs before any client exists: no client_attach (its faults are its
                 // OWN pages, zero-filled), no usermode callbacks, no assert-skip — the same set the
                 // bespoke loop implemented inline.

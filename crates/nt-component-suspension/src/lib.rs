@@ -1118,6 +1118,16 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
 
 impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
     pub fn next_resumable(&self) -> Option<LaneResume<R>> {
+        self.next_resumable_if(|_| true)
+    }
+
+    /// Select the oldest eligible lane top without changing any frame or lane phase. Rejected
+    /// tops remain retained and never expose buried frames. The predicate sees only selected or
+    /// cancelled tops of suspended lanes, and is not called while a provider lane is running.
+    pub fn next_resumable_if(
+        &self,
+        mut predicate: impl FnMut(&SuspensionFrame<C, R>) -> bool,
+    ) -> Option<LaneResume<R>> {
         if self.running.is_some() {
             return None;
         }
@@ -1129,8 +1139,16 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
                 if lane.phase != LanePhase::Suspended {
                     return None;
                 }
+                let frame = lane.suspensions.top()?;
+                if !matches!(
+                    frame.phase,
+                    SuspensionPhase::Selected { .. } | SuspensionPhase::Cancelled { .. }
+                ) || !predicate(frame)
+                {
+                    return None;
+                }
                 let suspension = lane.suspensions.top_resume()?;
-                let sequence = lane.suspensions.top()?.admission_sequence;
+                let sequence = frame.admission_sequence;
                 Some((
                     sequence,
                     LaneResume {
@@ -1513,6 +1531,101 @@ mod tests {
         assert_eq!(lanes.phase(winlogon), Ok(LanePhase::Idle));
         assert_eq!(lanes.phase(desktop), Ok(LanePhase::Suspended));
         assert_eq!(lanes.suspension_count(desktop), Ok(1));
+    }
+
+    #[test]
+    fn eligibility_skips_rejected_oldest_and_keeps_oldest_valid_sibling() {
+        let mut lanes = ComponentSuspensionLanes::new(3, 2);
+        let mut handles = alloc::vec::Vec::new();
+        // Allocation order differs from admission order to exercise sequence-based selection.
+        for id in 1..=3 {
+            handles.push(lanes.allocate(binding(id)).unwrap());
+        }
+        for (index, sequence) in [(0, 1), (1, 3), (2, 2)] {
+            let lane = handles[index];
+            let reply = binding(index as u64 + 1).reply_object;
+            let key = SuspensionKey::lpc_request(sequence);
+            lanes.begin_dispatch(lane, reply).unwrap();
+            lanes.admit_running(lane, reply, key, sequence, owner(sequence), sequence).unwrap();
+            lanes.select(key, sequence as u32).unwrap();
+        }
+        let rejected = lanes.top(handles[0]).unwrap().unwrap().clone();
+        let ready = lanes.next_resumable_if(|frame| frame.continuation != 1).unwrap();
+        assert_eq!(ready.lane, handles[2]);
+        assert_eq!(ready.suspension.key, SuspensionKey::lpc_request(2));
+        assert_eq!(lanes.top(handles[0]).unwrap(), Some(&rejected));
+        assert_eq!(lanes.phase(handles[0]), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.running(), None);
+        assert_eq!(lanes.next_resumable().unwrap().lane, handles[0]);
+    }
+
+    #[test]
+    fn eligibility_rejecting_every_top_preserves_frames_and_phases() {
+        let mut lanes = ComponentSuspensionLanes::new(2, 2);
+        let first = lanes.allocate(binding(1)).unwrap();
+        let second = lanes.allocate(binding(2)).unwrap();
+        for (id, lane) in [(1, first), (2, second)] {
+            let key = SuspensionKey::provider_wait(id);
+            lanes.begin_dispatch(lane, binding(id).reply_object).unwrap();
+            lanes.admit_running(lane, binding(id).reply_object, key, id, owner(id), id).unwrap();
+            lanes.select(key, id as u32).unwrap();
+        }
+        let first_before = lanes.top(first).unwrap().unwrap().clone();
+        let second_before = lanes.top(second).unwrap().unwrap().clone();
+        let mut examined = 0;
+        assert_eq!(lanes.next_resumable_if(|_| { examined += 1; false }), None);
+        assert_eq!(examined, 2);
+        assert_eq!(lanes.total_suspensions(), 2);
+        assert_eq!(lanes.top(first).unwrap(), Some(&first_before));
+        assert_eq!(lanes.top(second).unwrap(), Some(&second_before));
+        assert_eq!(lanes.phase(first), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.phase(second), Ok(LanePhase::Suspended));
+        assert_eq!(lanes.running(), None);
+        assert_eq!(lanes.next_resumable().unwrap().lane, first);
+    }
+
+    #[test]
+    fn rejecting_inner_top_never_admits_eligible_outer_frame() {
+        let mut lanes = ComponentSuspensionLanes::new(1, 3);
+        let lane = lanes.allocate(binding(1)).unwrap();
+        let reply = binding(1).reply_object;
+        let outer = SuspensionKey::lpc_request(1);
+        let inner = SuspensionKey::provider_wait(2);
+        lanes.begin_dispatch(lane, reply).unwrap();
+        lanes.admit_running(lane, reply, outer, 1, owner(1), 10u64).unwrap();
+        lanes.select(outer, 7u32).unwrap();
+        lanes.begin_resume(lane, reply, outer).unwrap();
+        lanes.admit_running(lane, reply, inner, 2, owner(2), 20).unwrap();
+        let mut examined = alloc::vec::Vec::new();
+        assert_eq!(lanes.next_resumable_if(|frame| { examined.push(frame.key); true }), None);
+        assert!(examined.is_empty());
+        lanes.select(inner, 8).unwrap();
+        let before = lanes.top(lane).unwrap().unwrap().clone();
+        assert_eq!(lanes.next_resumable_if(|frame| {
+            examined.push(frame.key);
+            frame.key == outer
+        }), None);
+        assert_eq!(examined, [inner]);
+        assert_eq!(lanes.top(lane).unwrap(), Some(&before));
+        assert_eq!(lanes.suspension_count(lane), Ok(2));
+        assert_eq!(lanes.next_resumable().unwrap().suspension.key, inner);
+    }
+
+    #[test]
+    fn eligibility_does_not_run_while_any_lane_is_running() {
+        let mut lanes = ComponentSuspensionLanes::new(2, 2);
+        let suspended = lanes.allocate(binding(1)).unwrap();
+        let running = lanes.allocate(binding(2)).unwrap();
+        let key = SuspensionKey::lpc_request(1);
+        lanes.begin_dispatch(suspended, binding(1).reply_object).unwrap();
+        lanes.admit_running(suspended, binding(1).reply_object, key, 1, owner(1), 10u64).unwrap();
+        lanes.select(key, 0u32).unwrap();
+        lanes.begin_dispatch(running, binding(2).reply_object).unwrap();
+        assert_eq!(lanes.next_resumable_if(|_| panic!("running provider excludes selection")), None);
+        assert_eq!(lanes.phase(running), Ok(LanePhase::Running));
+        assert_eq!(lanes.phase(suspended), Ok(LanePhase::Suspended));
+        lanes.finish_dispatch(running, binding(2).reply_object).unwrap();
+        assert_eq!(lanes.next_resumable_if(|_| true), lanes.next_resumable());
     }
 
     #[test]

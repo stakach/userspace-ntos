@@ -1175,12 +1175,16 @@ pub(crate) struct PumpChannel {
     /// ambient last-writer state, so a nested GUI dispatch cannot change the outer caller's owner.
     pub client_pi: u64,
     pub client_generation: u64,
+    /// Retained logical caller, independent of this channel's physical provider executor.
+    /// None explicitly carries no hosted security authority (startup/provider-only work).
+    pub logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
     /// The win32k capability gates (all-false for the FSD).
     pub caps: HostCaps,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct UserCallbackClient {
+    pub logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
     pub pi: u32,
     /// Process-manager generation paired with `pi`; callback nesting must retain the exact lifetime.
     pub generation: u64,
@@ -2477,6 +2481,7 @@ unsafe fn component_pump_loop(
                 crate::service_sec_image::service_win32k_ps_request(
                     ch.client_pi,
                     ch.client_generation,
+                    ch.logical_caller,
                     msg.m0,
                     msg.m1,
                     msg.m2,

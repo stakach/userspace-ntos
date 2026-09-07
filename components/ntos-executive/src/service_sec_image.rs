@@ -510,6 +510,7 @@ const GUI_MESSAGE_WAITER_INITIAL_RESERVE: usize = 16;
 
 #[derive(Clone, Copy)]
 struct GuiMessageWaiter {
+    logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
     used: bool,
     sequence: u64,
     pi: u32,
@@ -531,6 +532,7 @@ struct GuiMessageWaiter {
 
 impl GuiMessageWaiter {
     const EMPTY: Self = Self {
+        logical_caller: None,
         used: false,
         sequence: 0,
         pi: 0,
@@ -1230,7 +1232,16 @@ unsafe fn gui_message_waiter_cancel_slot(
     nt_handler
         .release_gui_event_wait(waiter.queue_event_lease)
         .expect("cancelled GUI waiter lost its Event lease");
-    thread_wait_state_clear_badge(waiter.badge);
+    // Retirement may outlive a badge/TID reuse. Only clear the parked marker belonging to this
+    // exact old route; live-ingress admission is not required for the owner's own cleanup.
+    if waiter.logical_caller.is_some_and(|caller| {
+        caller.validate(
+            nt_handler.thread_runtime.get_by_badge(caller.badge()).map(|runtime| runtime.binding()),
+            nt_handler.pm.thread_lifetime(caller.thread().thread_id()),
+        ).is_ok()
+    }) {
+        thread_wait_state_clear_badge(waiter.badge);
+    }
     true
 }
 
@@ -1664,8 +1675,10 @@ unsafe fn component_suspension_resume_top(
     nt_handler: &mut ExecNtHandler,
 ) -> Option<ComponentSuspensionRuntimeOutcome> {
     loop {
-        let lane_resume =
-            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS)).next_resumable()?;
+        let lane_resume = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+            .next_resumable_if(|frame| {
+                win32k_glue::win32k_client_context_is_admitted(frame.continuation.pending.client())
+            })?;
         let lane = lane_resume.lane;
         let reply_object = lane_resume.binding.reply_object;
         let resume = lane_resume.suspension;
@@ -4572,11 +4585,20 @@ pub(crate) unsafe fn service_win32k_event_request(
     }
 }
 
+/// Revalidate retained routing metadata without holding any handler borrow across provider IPC.
+pub(crate) unsafe fn validate_provider_logical_caller(
+    caller: nt_user_host::provider_logical_caller::ProviderLogicalCaller,
+) -> bool {
+    let handler = SERVICE_DELAY_DRAIN_HANDLER.load(Ordering::Acquire) as *const ExecNtHandler;
+    handler.as_ref().is_some_and(|handler| handler.validate_provider_logical_caller(caller))
+}
+
 /// Service Ps queries issued by the win32k component against the canonical Process Manager.
 /// Stable EPROCESS/ETHREAD projections cross this boundary; mutable Ps state does not.
 pub(crate) unsafe fn service_win32k_ps_request(
     client_pi: u64,
     client_generation: u64,
+    logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
     op: u64,
     object: u64,
     value: u64,
@@ -4594,6 +4616,11 @@ pub(crate) unsafe fn service_win32k_ps_request(
     let Ok(pi) = usize::try_from(client_pi) else {
         return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
     };
+    if logical_caller.is_some_and(|caller| {
+        caller.pi() != pi || !handler.validate_provider_logical_caller(caller)
+    }) {
+        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
+    }
     if client_generation == 0
         || handler.pm_pid_for_pi(pi).is_none()
         || handler.hosted_process_generation(pi) != Some(client_generation)
@@ -4955,6 +4982,7 @@ fn win32k_client_context_for_thread(
     let pid = nt_handler.pm_pid_for_pi(pi).unwrap_or(0);
     let token = win32k_token_context(nt_handler, pi);
     win32k_glue::Win32kClientContext {
+        logical_caller: nt_handler.capture_provider_logical_caller(pi, tid, badge, tcb),
         pi: pi as u32,
         generation: nt_handler
             .hosted_process_image(pi)
@@ -5170,6 +5198,7 @@ unsafe fn dispatch_win32k_for_client_with_completion_args(
 }
 
 unsafe fn post_winlogon_second_sas_after_welcome_drain(
+    logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
     pi: usize,
     generation: u64,
     badge: u64,
@@ -5253,6 +5282,7 @@ unsafe fn post_winlogon_second_sas_after_welcome_drain(
         0,
         &[],
         win32k_glue::Win32kClientContext {
+            logical_caller,
             pi: pi as u32,
             generation,
             pid,
@@ -12471,6 +12501,7 @@ pub(crate) unsafe fn service_sec_image(
                             .map(u64::from)
                             .unwrap_or(0);
                         if post_winlogon_second_sas_after_welcome_drain(
+                            client.logical_caller,
                             pi,
                             nt_handler.hosted_process_generation(pi).unwrap_or(0),
                             badge,
@@ -16632,6 +16663,7 @@ pub(crate) unsafe fn service_sec_image(
                             .map(u64::from)
                             .unwrap_or(0);
                         let _ = post_winlogon_second_sas_after_welcome_drain(
+                            dispatch_client.logical_caller,
                             pi,
                             nt_handler.hosted_process_generation(pi).unwrap_or(0),
                             badge,
@@ -23972,6 +24004,11 @@ unsafe fn gui_message_wait_park(
     if queue_event_body == 0 || msg_ptr == 0 {
         return false;
     }
+    let Some(logical_caller) = nt_handler.capture_provider_logical_caller(
+        pi as usize, tid, badge, hosted_thread_tcb_or_zero(nt_handler, tid),
+    ) else {
+        return false;
+    };
     let Some(slot) = gui_message_waiter_alloc_slot() else {
         return false;
     };
@@ -24003,6 +24040,7 @@ unsafe fn gui_message_wait_park(
     {
         let table = &mut *core::ptr::addr_of_mut!(GUI_MESSAGE_WAITERS);
         table[slot] = GuiMessageWaiter {
+            logical_caller: Some(logical_caller),
             used: true,
             sequence: crate::next_dispatcher_wait_sequence(),
             pi,
@@ -24105,6 +24143,7 @@ unsafe fn gui_message_wait_redrive_event(
         }
         let pi = waiter.pi as usize;
         let live_identity = pi < MAX_PI
+            && waiter.logical_caller.is_some_and(|caller| nt_handler.validate_provider_logical_caller(caller))
             && nt_handler.hosted_process_generation(pi) == Some(waiter.process_generation)
             && nt_handler
                 .pm
@@ -24143,7 +24182,7 @@ unsafe fn gui_message_wait_redrive_event(
             .thread_teb(waiter.tid as nt_process::ThreadId)
             .filter(|teb| *teb != 0)
             .unwrap_or(SMSS_TEB_VA);
-        let client = win32k_client_context_for_thread(
+        let mut client = win32k_client_context_for_thread(
             nt_handler,
             pi,
             waiter.badge,
@@ -24154,6 +24193,7 @@ unsafe fn gui_message_wait_redrive_event(
             peb_mirror,
             scratch_base,
         );
+        client.logical_caller = waiter.logical_caller;
         let arg = win32k_subsystem::WIN32K_ARG_VADDR;
         core::ptr::write_bytes(arg as *mut u8, 0, WIN32K_MSG_BYTES);
         let peek = dispatch_win32k_for_client(

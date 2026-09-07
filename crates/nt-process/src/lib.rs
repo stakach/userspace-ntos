@@ -208,6 +208,30 @@ pub type Handle = u32;
 pub type SectionId = u32;
 pub type AddressSpaceId = u32;
 
+/// One activation of an ETHREAD in its owning ProcessManager. Hosted runtimes can retain this
+/// alongside their process-lifetime identity to reject work from a recycled dormant thread.
+/// This is identity metadata, not a reference or a claim that the thread is still executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadLifetime {
+    thread_id: ThreadId,
+    process_id: ProcessId,
+    generation: u64,
+}
+
+impl ThreadLifetime {
+    pub const fn thread_id(self) -> ThreadId {
+        self.thread_id
+    }
+
+    pub const fn process_id(self) -> ProcessId {
+        self.process_id
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 /// Broker-owned reference to one exact LPC port object. This is deliberately distinct from a
 /// process-local user handle: it remains valid after that handle table entry is closed and must be
 /// returned to the broker during process teardown.
@@ -1808,6 +1832,23 @@ impl ProcessManager {
         self.threads.get(&tid)
     }
 
+    /// Capture without mutation or allocation, including dormant and terminated objects.
+    /// Callers authorizing execution must also validate their live runtime and process lifetime.
+    pub fn thread_lifetime(&self, tid: ThreadId) -> Option<ThreadLifetime> {
+        let thread = self.thread(tid)?;
+        Some(ThreadLifetime {
+            thread_id: thread.thread_id,
+            process_id: thread.process_id,
+            generation: thread.activation_generation,
+        })
+    }
+
+    /// Validate only against the ProcessManager that issued the snapshot. A snapshot must not be
+    /// imported from a different manager whose independent client-ID namespace can overlap.
+    pub fn validate_thread_lifetime(&self, lifetime: ThreadLifetime) -> bool {
+        self.thread_lifetime(lifetime.thread_id) == Some(lifetime)
+    }
+
     /// Replace a process primary-token reference and return the prior identity to its owner.
     pub fn replace_process_primary_token(
         &mut self,
@@ -3073,6 +3114,10 @@ impl ProcessManager {
         {
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
+        thread
+            .activation_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         Ok(ThreadActivationPlan {
             tid,
             process_id: thread.process_id,
@@ -3131,6 +3176,10 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
 
+        let next_generation = current
+            .activation_generation
+            .checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
         let default_security = &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..];
         let thread = self
             .threads
@@ -3171,7 +3220,7 @@ impl ProcessManager {
         thread.thread_name_len = 0;
         thread.thread_name.clear();
         thread.user_apc_queue.clear();
-        thread.activation_generation = thread.activation_generation.wrapping_add(1).max(1);
+        thread.activation_generation = next_generation;
         Ok(())
     }
 
@@ -5074,3 +5123,6 @@ impl ProcessManager {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod thread_lifetime_tests;

@@ -162,6 +162,9 @@ unsafe fn win32k_lane_channel(
     usermode_callback: bool,
     provider_wait: bool,
 ) -> Option<crate::spawn_hosts::PumpChannel> {
+    if !win32k_client_context_is_admitted(client) {
+        return None;
+    }
     let lane = (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
         .as_ref()?
         .iter()
@@ -183,6 +186,7 @@ unsafe fn win32k_lane_channel(
         reply_cap: lane.binding.reply_object,
         client_pi: client.pi as u64,
         client_generation: client.generation,
+        logical_caller: client.logical_caller,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
@@ -254,6 +258,7 @@ pub(crate) unsafe fn initialize_win32k_physical_lane(pml4: u64) -> bool {
         reply_cap: worker.reply_cap,
         client_pi: 0,
         client_generation: 0,
+        logical_caller: None,
         caps: crate::spawn_hosts::HostCaps {
             dispatch_server: true,
             kind: crate::spawn_hosts::ReqKind::Syscall,
@@ -690,6 +695,7 @@ pub(crate) enum UserCallbackDisposition {
 pub(crate) struct Win32kClientContext {
     pub pi: u32,
     pub generation: u64,
+    pub logical_caller: Option<nt_user_host::provider_logical_caller::ProviderLogicalCaller>,
     pub pid: u64,
     pub badge: u64,
     pub tid: u64,
@@ -712,6 +718,7 @@ impl Win32kClientContext {
         crate::spawn_hosts::UserCallbackClient {
             pi: self.pi,
             generation: self.generation,
+            logical_caller: self.logical_caller,
             pid: self.pid,
             badge: self.badge,
             tid: self.tid,
@@ -737,6 +744,7 @@ fn win32k_client_context_from_callback_client(
     Win32kClientContext {
         pi: client.pi,
         generation: client.generation,
+        logical_caller: client.logical_caller,
         pid: client.pid,
         badge: client.badge,
         tid: client.tid,
@@ -753,6 +761,28 @@ fn win32k_client_context_from_callback_client(
         token_user_sid: client.token_user_sid,
         token_user_sid_len: client.token_user_sid_len,
     }
+}
+
+pub(crate) unsafe fn win32k_client_context_is_admitted(client: Win32kClientContext) -> bool {
+    let Some(caller) = client.logical_caller else {
+        return client.tid == 0 && client.tcb == 0;
+    };
+    if caller.pi() != client.pi as usize
+        || u64::from(caller.process().pid) != client.pid
+        || u64::from(caller.thread().thread_id()) != client.tid
+        || caller.badge() != client.badge
+        || caller.tcb() != client.tcb
+    {
+        return false;
+    }
+    if let nt_user_host::process_identity::ProcessGeneration::Hosted(generation) =
+        caller.process().generation
+    {
+        if generation != client.generation {
+            return false;
+        }
+    }
+    crate::service_sec_image::validate_provider_logical_caller(caller)
 }
 
 fn user_callback_client_record_matches(
@@ -3077,39 +3107,38 @@ unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
 fn callback_client_from_frame(
     request: nt_user_callback::CallbackHeader,
     frame: nt_user_callback::ActiveCallbackFrame,
-) -> crate::spawn_hosts::UserCallbackClient {
-    let mut token_user_sid = [0u8; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX];
-    token_user_sid.copy_from_slice(frame.client_token_user_sid());
-    crate::spawn_hosts::UserCallbackClient {
-        pi: request.client_pi,
-        generation: unsafe {
-            user_callback_client_for_request(&request)
-                .map(|client| client.generation)
-                .unwrap_or(0)
-        },
-        pid: frame.client_pid(),
-        badge: request.client_badge,
-        tid: request.client_tid,
-        tcb: frame.client_tcb(),
-        teb: frame.client_teb(),
-        eprocess: frame.client_eprocess(),
-        ethread: frame.client_ethread(),
-        role: callback_runtime_role_from_code(frame.client_runtime_role()),
-        process_role: callback_process_role_from_code(frame.client_process_role()),
-        top_badge: frame.client_top_badge(),
-        peb_mirror: frame.client_peb_mirror(),
-        scratch_base: frame.client_scratch_base(),
-        token_authentication_id: frame.client_token_authentication_id(),
-        token_user_sid,
-        token_user_sid_len: frame.client_token_user_sid_len(),
+) -> Option<crate::spawn_hosts::UserCallbackClient> {
+    let client = unsafe { user_callback_client_for_request(&request) }?;
+    if frame.request() != &request
+        || frame.dispatch_context().dispatch_id != request.dispatch_id
+        || client.pid != frame.client_pid()
+        || client.tcb != frame.client_tcb()
+        || client.teb != frame.client_teb()
+        || client.eprocess != frame.client_eprocess()
+        || client.ethread != frame.client_ethread()
+        || client.role != callback_runtime_role_from_code(frame.client_runtime_role())
+        || client.process_role != callback_process_role_from_code(frame.client_process_role())
+        || client.top_badge != frame.client_top_badge()
+        || client.peb_mirror != frame.client_peb_mirror()
+        || client.scratch_base != frame.client_scratch_base()
+        || client.token_authentication_id != frame.client_token_authentication_id()
+        || client.token_user_sid.as_slice() != frame.client_token_user_sid()
+        || client.token_user_sid_len != frame.client_token_user_sid_len()
+    {
+        return None;
     }
+    if !unsafe {
+        win32k_client_context_is_admitted(win32k_client_context_from_callback_client(client))
+    } {
+        return None;
+    }
+    Some(client)
 }
 
 unsafe fn flush_returned_user_callback_gdi_batch(
     request: nt_user_callback::CallbackHeader,
-    frame: nt_user_callback::ActiveCallbackFrame,
+    client: crate::spawn_hosts::UserCallbackClient,
 ) {
-    let client = callback_client_from_frame(request, frame);
     let Some(teb_alias) = client_callback_teb_alias(client) else {
         return;
     };
@@ -3132,6 +3161,7 @@ unsafe fn resume_suspended_user_callback_component(
     if client.pi != request.client_pi
         || client.tid != request.client_tid
         || client.badge != request.client_badge
+        || !win32k_client_context_is_admitted(win32k_client_context_from_callback_client(client))
     {
         return crate::spawn_hosts::PumpResult {
             status: 0xC000_000Du32 as i32,
@@ -3175,6 +3205,16 @@ unsafe fn resume_suspended_user_callback_component(
             demand: 0,
         };
     }
+    let Some(channel) = win32k_lane_channel(
+        lane,
+        win32k_client_context_from_callback_client(client),
+        crate::spawn_hosts::InitialAction::ReplyRequest,
+        true,
+        true,
+        true,
+    ) else {
+        panic!("callback execution lane is absent from the physical catalog");
+    };
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     core::ptr::write_volatile(
         (sh + win32k_subsystem::SH_REQ_PROCESS_ID) as *mut u64,
@@ -3252,16 +3292,6 @@ unsafe fn resume_suspended_user_callback_component(
             demand: 0,
         };
     }
-    let Some(channel) = win32k_lane_channel(
-        lane,
-        win32k_client_context_from_callback_client(client),
-        crate::spawn_hosts::InitialAction::ReplyRequest,
-        true,
-        true,
-        true,
-    ) else {
-        panic!("callback execution lane is absent from the physical catalog");
-    };
     let pr = crate::spawn_hosts::component_pump_resume_user_callback(&channel);
     retire_win32k_on_wall(&pr);
     let transition_ok = if pr.callback_suspended {
@@ -3293,6 +3323,9 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     wait_id: u64,
     status: i32,
 ) -> ProviderWaitPumpCompletion {
+    if !win32k_client_context_is_admitted(pending.client) {
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
     let Some(request) = pending.request.validate().ok() else {
         release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
@@ -3308,6 +3341,16 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
 
+    let Some(channel) = win32k_lane_channel(
+        pending.dispatch.lane,
+        pending.client,
+        crate::spawn_hosts::InitialAction::ReplyRequest,
+        true,
+        true,
+        true,
+    ) else {
+        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    };
     let sh = win32k_subsystem::WIN32K_SHARED_VADDR;
     let page = win32k_subsystem::WIN32K_PROVIDER_WAIT_VADDR
         as *mut nt_provider_wait::ProviderWaitSharedPage;
@@ -3374,17 +3417,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
 
-    let Some(channel) = win32k_lane_channel(
-        pending.dispatch.lane,
-        client,
-        crate::spawn_hosts::InitialAction::ReplyRequest,
-        true,
-        true,
-        true,
-    ) else {
-        release_dispatch_output_stage(pending.dispatch);
-        return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
-    };
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -3474,6 +3506,9 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     status: i32,
     reply: &[u8],
 ) -> LpcWaitPumpCompletion {
+    if !win32k_client_context_is_admitted(pending.client) {
+        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    }
     if !pending.request.validate()
         || pending.request.port_handle == 0
         || pending.request.client_process != pending.client.pid
@@ -3491,6 +3526,16 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
 
+    let Some(channel) = win32k_lane_channel(
+        pending.dispatch.lane,
+        pending.client,
+        crate::spawn_hosts::InitialAction::ReplyRequest,
+        true,
+        true,
+        true,
+    ) else {
+        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
+    };
     let lpc = win32k_subsystem::WIN32K_LPC_VADDR;
     core::ptr::write_volatile(
         (lpc + win32k_subsystem::LPC_WAIT_MESSAGE_ID) as *mut u32,
@@ -3578,17 +3623,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
-    let Some(channel) = win32k_lane_channel(
-        pending.dispatch.lane,
-        client,
-        crate::spawn_hosts::InitialAction::ReplyRequest,
-        true,
-        true,
-        true,
-    ) else {
-        release_dispatch_output_stage(pending.dispatch);
-        return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
-    };
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
     core::ptr::write(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
@@ -3692,9 +3726,12 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     let mut cancelled_count = 0u64;
     let mut last_status = STATUS_UNSUCCESSFUL;
     while cancelled_count < nt_user_callback::MAX_CONTINUATION_DEPTH as u64 {
-        let (request, dispatch_context, cancelled_frame) = {
-            let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-            let Some(active_frame) = active.top().copied() else {
+        let (request, dispatch_context, client) = {
+            let active_frame = {
+                let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+                active.top().copied()
+            };
+            let Some(active_frame) = active_frame else {
                 if cancelled_count != 0 {
                     abort_controlled_user_callbacks();
                 }
@@ -3707,11 +3744,17 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
                 return (STATUS_UNSUCCESSFUL, false);
             }
             let request = *active_frame.request();
+            let Some(client) = callback_client_from_frame(request, active_frame) else {
+                return (STATUS_UNSUCCESSFUL, false);
+            };
             let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
             let dispatch_context = *active_frame.dispatch_context();
             write_callback_failure_reply(request, STATUS_UNSUCCESSFUL);
             let unwind_ok = unwind_controlled_callback(request);
-            let cancelled = active.cancel_pending(correlation);
+            let cancelled = {
+                let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
+                active.cancel_pending(correlation)
+            };
             let Ok(cancelled_frame) = cancelled else {
                 abort_controlled_user_callbacks();
                 return (STATUS_UNSUCCESSFUL, false);
@@ -3721,7 +3764,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
                 abort_controlled_user_callbacks();
                 return (STATUS_UNSUCCESSFUL, false);
             }
-            (request, dispatch_context, cancelled_frame)
+            (request, dispatch_context, client)
         };
 
         cancelled_count += 1;
@@ -3731,10 +3774,7 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let result = resume_suspended_user_callback_component(
-            request,
-            callback_client_from_frame(request, cancelled_frame),
-        );
+        let result = resume_suspended_user_callback_component(request, client);
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
@@ -3920,16 +3960,23 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
     }
     let mut unwound = 0u64;
     loop {
-        let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
         // The INNERMOST frame of the dead process, across all of its threads. Frames of OTHER
         // processes are LIVE and are stepped over, not torn down: the stack interleaves several
         // client threads' chains, so "not mine" no longer means "stop". Because every thread of this
         // process shares `client_pi`, the innermost matching frame is always the top of its own
         // thread's chain, which is what keeps each teardown innermost-first.
-        let Some(frame) = active.top_for_pi(client_pi).copied() else {
+        let frame = {
+            let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+            active.top_for_pi(client_pi).copied()
+        };
+        let Some(frame) = frame else {
             break;
         };
         let request = *frame.request();
+        let Some(client) = callback_client_from_frame(request, frame) else {
+            print_str(b"[user-callback] dead-client retained caller unavailable; frame retained\n");
+            return unwound;
+        };
         let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
         let dispatch_context = *frame.dispatch_context();
         // (1) Fail the withheld KeUserModeCallback.
@@ -3941,10 +3988,13 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             break;
         }
         let was_redirected = frame.is_redirected();
-        let popped = if was_redirected {
-            active.pop(correlation)
-        } else {
-            active.cancel_pending(correlation)
+        let popped = {
+            let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
+            if was_redirected {
+                active.pop(correlation)
+            } else {
+                active.cancel_pending(correlation)
+            }
         };
         let Ok(popped) = popped else {
             print_str(b"[user-callback] dead-client active frame rejected -> reset\n");
@@ -3959,10 +4009,7 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             dispatch_context,
         );
-        let component = resume_suspended_user_callback_component(
-            request,
-            callback_client_from_frame(request, popped),
-        );
+        let component = resume_suspended_user_callback_component(request, client);
         core::ptr::write(
             core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
             previous_dispatch,
@@ -4080,9 +4127,14 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // `NtCallbackReturn` returns the callback that is innermost ON THE CALLING THREAD — the caller's
     // own identity selects the frame, never the interleaved stack's global top.
     let identity = nt_user_callback::ClientThreadIdentity::new(client_pi, client_tid, client_badge);
-    let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
-    let Some(active_frame) = active.top_for(&identity).copied() else {
-        return None;
+    let (active_frame, correlation) = {
+        let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+        let active_frame = active.top_for(&identity).copied()?;
+        let correlation = nt_user_callback::CallbackCorrelation::from_request(active_frame.request());
+        if !active_frame.is_redirected() || active.is_lane_top(correlation) != Ok(true) {
+            return None;
+        }
+        (active_frame, correlation)
     };
     let client_process_role = callback_process_role_from_code(active_frame.client_process_role());
     let client_is_winlogon =
@@ -4092,14 +4144,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     let request = *active_frame.request();
     let frame = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
         as *mut nt_user_callback::CallbackFrame;
-    // (The frame's client identity is the caller's by construction — `top_for` selected it.)
-    if !active_frame.is_redirected() {
-        return None;
-    }
-    let correlation = nt_user_callback::CallbackCorrelation::from_request(&request);
-    if active.is_lane_top(correlation) != Ok(true) {
-        return None;
-    }
+    let completed_client = callback_client_from_frame(request, active_frame)?;
     let contract = nt_user_callback::UserCallbackContract::for_api(request.api_index);
     if result_length > request.output_capacity as u64
         || (result_length != 0 && result_pointer == 0)
@@ -4254,7 +4299,18 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     // `KeUserModeCallback`, before the suspended win32k continuation runs again. Normal win32k
     // syscalls already do this at syscall entry; callbacks need the same kernel-owned boundary so
     // user32/GDI work performed inside WndProc cannot keep stale records across chained callbacks.
-    flush_returned_user_callback_gdi_batch(request, active_frame);
+    flush_returned_user_callback_gdi_batch(request, completed_client);
+    // Nested GDI work may have changed runtime admission. Keep the active frame
+    // and its parked continuation if the retained caller can no longer resume.
+    let frame_still_current = {
+        let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+        active.top_for(&identity).copied() == Some(active_frame)
+            && active.is_lane_top(correlation) == Ok(true)
+    };
+    if !frame_still_current {
+        return None;
+    }
+    let completed_client = callback_client_from_frame(request, active_frame)?;
     // The flush can itself enter win32k, and win32k reuses the same shared callback page for every
     // nested dispatch. Re-publish the reply after the flush so the parked `KeUserModeCallback`
     // continuation consumes the result for THIS callback, not the last nested dispatch's header.
@@ -4287,7 +4343,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             b"[user-callback] A real callback completed through NtCallbackReturn; resuming B component\n",
         );
     }
-    let Ok(completed_frame) = active.pop(correlation) else {
+    let completed_frame = {
+        let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
+        active.pop(correlation)
+    };
+    let Ok(completed_frame) = completed_frame else {
         abort_controlled_user_callbacks();
         return None;
     };
@@ -4310,7 +4370,6 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         core::ptr::addr_of_mut!(USER_CALLBACK_CURRENT_DISPATCH),
         dispatch_context,
     );
-    let completed_client = callback_client_from_frame(request, completed_frame);
     let completed_context = win32k_client_context_from_callback_client(completed_client);
     let component = resume_suspended_user_callback_component(request, completed_client);
     core::ptr::write(
@@ -4359,7 +4418,8 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             outer_dispatch: None,
         });
     }
-    let nested_user_callback = active.top_for(&identity).is_some();
+    let nested_user_callback = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE))
+        .top_for(&identity).is_some();
     let arg_snapshot_len = completed_frame.arg_snapshot_len();
     let mut arg_snapshot = [0u8; COMPLETED_ARG_SNAPSHOT_BYTES];
     if arg_snapshot_len as usize > arg_snapshot.len() {
@@ -4477,7 +4537,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
     USER_CALLBACK_REAL_RETURNS.fetch_add(1, Ordering::Relaxed);
     if callback_trace {
         print_str(b"[user-callback] B completed; restored A with result in RAX depth=");
-        print_u64(active.len() as u64);
+        print_u64((&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).len() as u64);
         print_str(b"\n");
     }
     let mut outer_dispatch = CompletedWin32kDispatch::new(
@@ -5813,6 +5873,7 @@ pub(crate) unsafe fn win32k_dispatch(ssn: u64, a0: u64, a1: u64, a2: u64, a3: u6
         Win32kClientContext {
             pi,
             generation: 0,
+            logical_caller: None,
             pid: 0,
             badge: 0,
             tid: 0,
@@ -5992,6 +6053,9 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     request_kind: u64,
     attach_client: bool,
 ) -> (u64, bool) {
+    if !win32k_client_context_is_admitted(client) {
+        return (0xC000_000Du64, false);
+    }
     let debug_flags = WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.swap(0, Ordering::Relaxed);
     if WIN32K_RETIRED.load(Ordering::Relaxed) != 0 {
         return (0xC000_0001u64, false);
