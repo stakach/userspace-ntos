@@ -146,6 +146,15 @@ pub(crate) unsafe fn win32k_physical_lane_for_channel(
         .map(|lane| lane.handle)
 }
 
+/// Execution quiescence only; callers must separately retire published pointers and mappings.
+pub(crate) unsafe fn win32k_physical_lanes_quiescent() -> bool {
+    (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))
+        .as_ref()
+        .is_some_and(|lanes| !lanes.is_empty() && lanes.iter().all(|lane| {
+            crate::service_sec_image::component_execution_lane_is_idle(lane.handle)
+        }))
+}
+
 #[allow(dead_code)]
 pub(crate) unsafe fn win32k_physical_lane_count() -> usize {
     (&*core::ptr::addr_of!(WIN32K_PHYSICAL_LANES))

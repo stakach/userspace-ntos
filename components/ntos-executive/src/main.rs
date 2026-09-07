@@ -5025,6 +5025,25 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     print_str(b"/");
     print_u64(gdi_batch_records);
     print_str(b"\n");
+    let properties = unsafe { driver_launch::win32k_device_properties::stats() };
+    print_str(b"[win32k-device-properties]");
+    for (label, value) in [
+        (&b" domain="[..], properties.domain),
+        (&b" cookie="[..], properties.cookie),
+        (&b" requests="[..], properties.requests),
+        (&b" begin="[..], properties.queries),
+        (&b" pull="[..], properties.pulls),
+        (&b" abort="[..], properties.aborts),
+        (&b" failures="[..], properties.failures),
+        (&b" projections="[..], properties.projections as u64),
+        (&b" references="[..], properties.references as u64),
+        (&b" transfers="[..], properties.transfers as u64),
+        (&b" retiring="[..], properties.retiring as u64),
+    ] {
+        print_str(label);
+        print_u64(value);
+    }
+    print_str(b"\n");
     let fb_readback = unsafe { explorer_framebuffer_final_readback() };
     let fb_span_x = fb_readback.span_x();
     let fb_span_y = fb_readback.span_y();
@@ -30774,6 +30793,28 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     ..spawn_hosts::HostCaps::default()
                 },
             };
+            // DriverEntry owns a real dispatch epoch before servicing its first request. Readiness
+            // remains unpublished until its completion sentinel arrives.
+            driver_launch::win32k_device_properties::register_consumer(host_pml4)
+                .expect("win32k I/O consumer domain registration failed");
+            assert!(
+                win32k_glue::register_primary_win32k_physical_lane(
+                    init_ch.tcb,
+                    init_ch.fault_ep,
+                    init_ch.reply_cap,
+                ),
+                "primary win32k execution lane registration failed"
+            );
+            let init_lane = win32k_glue::win32k_physical_lane_for_channel(
+                init_ch.tcb,
+                init_ch.fault_ep,
+                init_ch.reply_cap,
+            )
+            .expect("registered DriverEntry channel must have a physical lane");
+            assert!(
+                service_sec_image::begin_component_execution_lane(init_lane),
+                "primary win32k initialization dispatch admission failed"
+            );
             let init_pr = spawn_hosts::component_pump(&init_ch);
             let faults = init_pr.faults;
             let demand = init_pr.demand;
@@ -30785,15 +30826,12 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // now blocked awaiting reply — record its fault EP + host PML4 so `win32k_dispatch` can
             // drive its persistent service loop (Milestone B) from anywhere (the csrss loop, later).
             if finished {
+                assert!(
+                    service_sec_image::finish_component_execution_lane(init_lane),
+                    "primary win32k initialization dispatch completion failed"
+                );
                 WIN32K_FAULT_EP.store(w_fault, Ordering::Relaxed);
                 WIN32K_HOST_PML4.store(host_pml4, Ordering::Relaxed);
-                if !win32k_glue::register_primary_win32k_physical_lane(
-                    WIN32K_TCB.load(Ordering::Relaxed),
-                    w_fault,
-                    REPLY_W32_SLOT.load(Ordering::Relaxed),
-                ) {
-                    panic!("primary win32k execution lane registration failed");
-                }
                 if !win32k_glue::initialize_win32k_physical_lane(host_pml4) {
                     panic!("win32k secondary execution lane failed its ready handshake");
                 }

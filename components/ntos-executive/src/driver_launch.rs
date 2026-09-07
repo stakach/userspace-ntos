@@ -24,6 +24,12 @@
 #[allow(dead_code)] // Activated only by the atomic ISR/DPC/provider cutover tracked in the plan.
 mod hosted_irq_broker;
 
+#[path = "device_property.rs"]
+pub(crate) mod device_property;
+
+#[path = "win32k_device_properties.rs"]
+pub(crate) mod win32k_device_properties;
+
 use core::mem::MaybeUninit;
 use core::ptr::{read_unaligned, read_volatile, write_unaligned, write_volatile};
 use core::sync::atomic::{compiler_fence, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -6058,44 +6064,6 @@ unsafe fn hosted_registry_broker_call(op: u64, a1: u64, a2: u64, a3: u64) -> (i3
     (status as u32 as i32, out1, out2)
 }
 
-unsafe fn hosted_device_property_begin(
-    pdo: u64,
-    property: u32,
-    buffer_len: u32,
-) -> (i32, u64, u64, u64) {
-    let (_label, status, required_len, token, chunk_len) = call_on4(
-        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-        HOSTED_DEVICE_OP_QUERY_PROPERTY_BEGIN,
-        pdo,
-        property as u64,
-        buffer_len as u64,
-    );
-    (status as u32 as i32, required_len, token, chunk_len)
-}
-
-unsafe fn hosted_device_property_pull(pdo: u64, token: u64, offset: u64) -> (i32, u64, u64, u64) {
-    let (_label, status, required_len, reply_token, chunk_len) = call_on4(
-        (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-        HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL,
-        pdo,
-        token,
-        offset,
-    );
-    (status as u32 as i32, required_len, reply_token, chunk_len)
-}
-
-unsafe fn hosted_device_property_abort(pdo: u64, token: u64) {
-    if token != 0 {
-        let _ = call_on4(
-            (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
-            HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT,
-            pdo,
-            token,
-            0,
-        );
-    }
-}
-
 unsafe fn hosted_device_claim_port_range(pdo: u64, start: u64, length: u64) -> i32 {
     let (_label, status, _, _, _) = call_on4(
         (FSD_SERVICE_DEVICE_LABEL << 12) | 4,
@@ -7428,109 +7396,16 @@ extern "win64" fn s_io_get_device_property(
     result_len: u64,
 ) -> i32 {
     unsafe {
-        if result_len == 0 {
-            trace_io_get_device_property(pdo, property, buffer_len, STATUS_INVALID_PARAMETER, 0);
-            return STATUS_INVALID_PARAMETER;
-        }
-        write_unaligned(result_len as *mut u32, 0);
-        if buffer_len != 0 && buffer == 0 {
-            trace_io_get_device_property(pdo, property, buffer_len, STATUS_INVALID_PARAMETER, 0);
-            return STATUS_INVALID_PARAMETER;
-        }
         let _reply_guard = component_device_reply_lock();
-        let (mut status, required_len_wire, token, first_chunk_wire) =
-            hosted_device_property_begin(pdo, property, buffer_len);
-        let (required_len, first_chunk) = match (
-            u32::try_from(required_len_wire),
-            u32::try_from(first_chunk_wire),
-        ) {
-            (Ok(required_len), Ok(first_chunk)) => (required_len, first_chunk),
-            _ => {
-                hosted_device_property_abort(pdo, token);
-                status = STATUS_INVALID_PARAMETER;
-                (0, 0)
-            }
-        };
-        write_unaligned(result_len as *mut u32, required_len);
-        if status != STATUS_SUCCESS {
-            trace_io_get_device_property(pdo, property, buffer_len, status, 0);
-            return status;
-        }
-        if required_len > buffer_len
-            || first_chunk > required_len
-            || first_chunk as u64 > HOSTED_DEVICE_ARG_DATA_CAP
-            || (first_chunk < required_len && token == 0)
-            || (first_chunk == required_len && token != 0)
-        {
-            hosted_device_property_abort(pdo, token);
-            status = if required_len > buffer_len {
-                STATUS_BUFFER_TOO_SMALL
-            } else {
-                STATUS_INVALID_PARAMETER
-            };
-            trace_io_get_device_property(pdo, property, buffer_len, status, 0);
-            return status;
-        }
-
-        let scratch = if required_len == 0 {
-            0
-        } else {
-            pool_alloc(required_len as u64)
-        };
-        if required_len != 0 && scratch == 0 {
-            hosted_device_property_abort(pdo, token);
-            trace_io_get_device_property(
-                pdo,
-                property,
-                buffer_len,
-                STATUS_INSUFFICIENT_RESOURCES,
-                0,
-            );
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-        if first_chunk != 0 {
-            copy_bytes_unchecked(
-                scratch,
-                FSD_ARG_VADDR + HOSTED_DEVICE_ARG_DATA_OFF,
-                first_chunk as u64,
-            );
-        }
-        let mut offset = first_chunk;
-        while offset < required_len {
-            let (pull_status, pull_total, pull_token, chunk_wire) =
-                hosted_device_property_pull(pdo, token, offset as u64);
-            let chunk = u32::try_from(chunk_wire).unwrap_or(0);
-            if pull_status != STATUS_SUCCESS
-                || pull_total != required_len as u64
-                || pull_token != token
-                || chunk == 0
-                || chunk > required_len - offset
-                || chunk as u64 > HOSTED_DEVICE_ARG_DATA_CAP
-            {
-                hosted_device_property_abort(pdo, token);
-                if scratch != 0 {
-                    pool_free(scratch);
-                }
-                status = if pull_status == STATUS_SUCCESS {
-                    STATUS_INVALID_PARAMETER
-                } else {
-                    pull_status
-                };
-                trace_io_get_device_property(pdo, property, buffer_len, status, 0);
-                return status;
-            }
-            copy_bytes_unchecked(
-                scratch + offset as u64,
-                FSD_ARG_VADDR + HOSTED_DEVICE_ARG_DATA_OFF,
-                chunk as u64,
-            );
-            offset += chunk;
-        }
-        if required_len != 0 {
-            copy_bytes_unchecked(buffer, scratch, required_len as u64);
-            pool_free(scratch);
-        }
-        let value = if status == STATUS_SUCCESS && required_len == 4 {
+        let status = device_property::query(
+            &mut device_property::DriverPropertyClient,
+            pdo,
+            property,
+            buffer_len,
+            buffer,
+            result_len,
+        );
+        let value = if status == STATUS_SUCCESS && read_unaligned(result_len as *const u32) == 4 {
             read_unaligned(buffer as *const u32)
         } else {
             0
@@ -33674,6 +33549,19 @@ pub(crate) unsafe fn call_on4(
     arg2: u64,
     arg3: u64,
 ) -> (u64, u64, u64, u64, u64) {
+    let (reply_info, m0, m1, m2, m3) = call_on4_raw(msginfo, arg0, arg1, arg2, arg3);
+    (reply_info >> 12, m0, m1, m2, m3)
+}
+
+/// Preserve the reply length for transports carrying lane-private extended message registers.
+#[inline(never)]
+pub(crate) unsafe fn call_on4_raw(
+    msginfo: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+) -> (u64, u64, u64, u64, u64) {
     let reply_info: u64;
     let m0: u64;
     let m1: u64;
@@ -33708,7 +33596,7 @@ pub(crate) unsafe fn call_on4(
         inlateout("rax") arg3 => m3,
         lateout("rcx") _, lateout("r11") _,
     );
-    (reply_info >> 12, m0, m1, m2, m3)
+    (reply_info, m0, m1, m2, m3)
 }
 
 #[inline(never)]
@@ -49545,7 +49433,7 @@ pub(crate) fn service_hosted_device(
         );
     }
     let (_projection_instance, inst, pdo_device_id) =
-        match authenticated_hosted_root_pdo(ch, pdo_object, active_reply_cap) {
+        match authenticated_hosted_pdo(ch, pdo_object, active_reply_cap) {
             Ok(resolved) => resolved,
             Err(status) => return (status.raw(), 0, 0, 0),
         };
@@ -49563,77 +49451,17 @@ pub(crate) fn service_hosted_device(
     let data = unsafe {
         core::slice::from_raw_parts_mut(
             (inst.exec_arg_va + HOSTED_DEVICE_ARG_DATA_OFF) as *mut u8,
-            HOSTED_DEVICE_ARG_DATA_CAP as usize,
+            device_property::PROPERTY_CHUNK_BYTES,
         )
     };
-
-    if op == HOSTED_DEVICE_OP_QUERY_PROPERTY_PULL {
-        let Ok(offset) = usize::try_from(arg3) else {
-            return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-        };
-        return match unsafe {
-            hosted_device_property_transfers_mut().pull(owner, arg2, offset, data)
-        } {
-            Ok(pull) => (
-                STATUS_SUCCESS,
-                pull.total_len as u64,
-                pull.token,
-                pull.written as u64,
-            ),
-            Err(error) => (hosted_device_property_transfer_status(error), 0, 0, 0),
-        };
-    }
-    if op == HOSTED_DEVICE_OP_QUERY_PROPERTY_ABORT {
-        let aborted = unsafe { hosted_device_property_transfers_mut().abort(owner, arg2) };
-        return if aborted {
-            (STATUS_SUCCESS, 0, 0, 0)
-        } else {
-            (STATUS_INVALID_PARAMETER, 0, 0, 0)
-        };
-    }
-
-    let (Ok(property), Ok(output_capacity)) = (u32::try_from(arg2), u32::try_from(arg3)) else {
-        return (STATUS_INVALID_PARAMETER, 0, 0, 0);
-    };
-    if unsafe { hosted_device_property_transfers_mut().domain_busy(owner.domain) } {
-        return (STATUS_DEVICE_NOT_READY, 0, 0, 0);
-    }
-    let value = match nt_config_manager::device_property::source(property) {
-        nt_config_manager::DevicePropertySource::Invalid => {
-            return (STATUS_INVALID_PARAMETER_2, 0, 0, 0)
-        }
-        nt_config_manager::DevicePropertySource::Configuration => {
-            let Some(instance_path) = (unsafe {
-                hosted_root_bus_mut()
-                    .pdo(pdo_device_id)
-                    .map(nt_root_bus::Pdo::enum_instance_path)
-            }) else {
-                return (STATUS_INVALID_DEVICE_REQUEST, 0, 0, 0);
-            };
-            match unsafe { config_device_property_snapshot(&instance_path, property) } {
-                Ok(value) => value,
-                Err(error) => return (error.status, error.required_len as u64, 0, 0),
-            }
-        }
-        nt_config_manager::DevicePropertySource::External => {
-            match unsafe { pnp_device_property_snapshot(pdo_device_id, property) } {
-                Ok(value) => value,
-                Err(status) => return (status, 0, 0, 0),
-            }
-        }
-    };
-    if value.len() > output_capacity as usize {
-        return (STATUS_BUFFER_TOO_SMALL, value.len() as u64, 0, 0);
-    }
-    match unsafe { hosted_device_property_transfers_mut().begin(owner, value, data) } {
-        Ok(pull) => (
-            STATUS_SUCCESS,
-            pull.total_len as u64,
-            pull.token,
-            pull.written as u64,
-        ),
-        Err(error) => (hosted_device_property_transfer_status(error), 0, 0, 0),
-    }
+    device_property::service(
+        owner,
+        op,
+        arg2,
+        arg3,
+        data,
+        &mut device_property::DriverPropertyTransfers,
+    )
 }
 
 fn hosted_root_pdo_identity_status(error: nt_root_bus::RootBusPdoError) -> nt_status::NtStatus {

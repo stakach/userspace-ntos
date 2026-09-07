@@ -244,6 +244,32 @@ pub(crate) unsafe fn acquire_idle_component_execution_lane(
     Some(lane)
 }
 
+pub(crate) unsafe fn begin_component_execution_lane(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.begin_dispatch(lane, reply_object).is_ok()
+}
+
+pub(crate) unsafe fn component_execution_dispatch_identity(
+    lane: nt_component_suspension::LaneHandle,
+) -> Option<nt_component_suspension::LaneDispatchIdentity> {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .active_dispatch_identity(lane)
+        .ok()
+        .flatten()
+}
+
+pub(crate) unsafe fn component_execution_lane_is_idle(
+    lane: nt_component_suspension::LaneHandle,
+) -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).phase(lane)
+        == Ok(nt_component_suspension::LanePhase::Idle)
+}
+
 pub(crate) unsafe fn component_execution_lane_needs_capacity() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).needs_idle_lane()
 }
@@ -266,7 +292,11 @@ pub(crate) unsafe fn finish_component_execution_lane(
     let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
         return false;
     };
-    lanes.finish_dispatch(lane, reply_object).is_ok()
+    let finished = lanes.finish_dispatch(lane, reply_object).is_ok();
+    if finished {
+        crate::driver_launch::win32k_device_properties::retire_completed_transfers();
+    }
+    finished
 }
 
 pub(crate) unsafe fn suspend_component_execution_lane_for_callback(
@@ -299,7 +329,11 @@ pub(crate) unsafe fn complete_external_component_execution_lane(
     let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
         return false;
     };
-    lanes.complete_external(lane, reply_object, token).is_ok()
+    let completed = lanes.complete_external(lane, reply_object, token).is_ok();
+    if completed {
+        crate::driver_launch::win32k_device_properties::retire_completed_transfers();
+    }
+    completed
 }
 
 pub(crate) unsafe fn replace_external_component_execution_lane(
@@ -1757,6 +1791,7 @@ unsafe fn component_suspension_resume_top(
                 let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .complete_running(lane, reply_object, resume.key, frame.owner)
                     .ok()?;
+                crate::driver_launch::win32k_device_properties::retire_completed_transfers();
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1790,6 +1825,7 @@ unsafe fn component_suspension_resume_top(
                 let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .complete_running(lane, reply_object, resume.key, frame.owner)
                     .ok()?;
+                crate::driver_launch::win32k_device_properties::retire_completed_transfers();
                 if provider_resume {
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1813,6 +1849,7 @@ unsafe fn component_suspension_resume_top(
                             ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32),
                         )
                         .expect("invalid component re-wait lost its active continuation");
+                    crate::driver_launch::win32k_device_properties::retire_completed_transfers();
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ComponentSuspensionRuntimeOutcome::Failed {
@@ -1833,6 +1870,7 @@ unsafe fn component_suspension_resume_top(
                                     ComponentSuspensionCompletion::provider(0xC000_009Au32 as i32),
                                 )
                                 .expect("LPC readiness reservation failure lost its continuation");
+                            crate::driver_launch::win32k_device_properties::retire_completed_transfers();
                             COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                             return Some(ComponentSuspensionRuntimeOutcome::Failed {
                                 continuation: completed.continuation,
@@ -1872,6 +1910,7 @@ unsafe fn component_suspension_resume_top(
                             ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32),
                         )
                         .expect("rejected component re-wait lost its active continuation");
+                    crate::driver_launch::win32k_device_properties::retire_completed_transfers();
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                     return Some(ComponentSuspensionRuntimeOutcome::Failed {

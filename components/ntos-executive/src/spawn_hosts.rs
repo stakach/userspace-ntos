@@ -1484,6 +1484,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_MM_SECURE_LABEL
             && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -2772,6 +2774,35 @@ unsafe fn component_pump_loop(
                 handled as u64,
                 0,
                 0
+            );
+            continue;
+        } else if label == crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let mut bytes = [0u8; crate::driver_launch::device_property::PROPERTY_CHUNK_BYTES];
+            let (status, total, token, chunk) = if msg.badge != 0
+                || msg.mi != ((crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL << 12) | 4)
+            {
+                (0xc000_000du32 as i32, 0, 0, 0)
+            } else {
+                crate::driver_launch::win32k_device_properties::service(
+                    ch, *reply_cap, msg.m0, msg.m1, msg.m2, msg.m3, &mut bytes,
+                )
+            };
+            let words = (chunk as usize + 7) / 8;
+            for word in 0..words {
+                let mut value = [0u8; 8];
+                let start = word * 8;
+                let end = core::cmp::min(start + 8, chunk as usize);
+                value[..end - start].copy_from_slice(&bytes[start..end]);
+                core::ptr::write_volatile(
+                    (crate::IPCBUF_VADDR + 8 + (4 + word as u64) * 8) as *mut u64,
+                    u64::from_le_bytes(value),
+                );
+            }
+            pump_reply_recv4_into!(
+                ch, *reply_cap, msg, 4 + words,
+                status as u32 as u64, total, token, chunk
             );
             continue;
         } else if label == crate::driver_launch::FSD_SERVICE_DEVICE_LABEL

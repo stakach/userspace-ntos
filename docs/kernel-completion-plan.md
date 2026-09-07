@@ -276,14 +276,14 @@ below are historical baselines, not acceptance of the current provider cutover.
   collision linkage and low-memory delivery still require their physical-lane implementation.
 - [x] Add canonical native Ps close semantics over the shared table scopes (tranche 109; host core). Preserve
   protected-handle status/bugcheck behavior; do not probe alternate object tables after failure.
-- [~] Route win32k IoGetDeviceProperty through canonical PnP/configuration snapshots and an
+- [x] Route win32k IoGetDeviceProperty through canonical PnP/configuration snapshots and an
   authenticated dynamic I/O consumer domain (tranche 110). Share transport policy, not FSD-private
   buffers or driver authority; retain each physical lane's reply/publication ownership.
 - [x] Add counted canonical Device references for retained consumer projections (tranche 111).
   Pointer bindings alone are not references; protect both normal and raw device/driver removal.
 - [x] Fence physical-lane dispatch lifetimes with checked job identities (tranche 112; host core). Preserve
   ownership across suspension, invalidate on completion, and reject stale transfer consumption.
-- [~] Move device-property snapshot collection into the testable I/O core (tranche 113). Validate
+- [x] Move device-property snapshot collection into the testable I/O core (tranche 113). Validate
   complete replies and explicit scratch ownership before publishing any native caller-buffer bytes.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
@@ -28842,7 +28842,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     targets. PM tests pass 210/210 in `.tmp/test-native-ps-close-20260908.log`. Existing native Nt/Zw
     close wrappers are not switched independently of the whole Ps/Se/USER handle migration.
 
-    B3 native win32k device properties tranche 110 (2026-09-08, in progress):
+    B3 native win32k device properties tranche 110 (2026-09-08, implementation complete):
 
     Reuse the real driver property snapshot/retained-transfer core with explicit caller identity,
     canonical DeviceId, reply buffer and allocator, instead of copying FSD globals into win32k.
@@ -28866,6 +28866,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     invalidation must wait for its exact completed sequence, not return success when merely queued.
     IoOpenDeviceRegistryKey also needs real key-type/access semantics; the old driver wrapper drops
     both and is not a reusable completed implementation.
+
+    Implemented the independent provider-catalog-fenced I/O consumer and real retained projection
+    binding. Requests validate the exact physical TCB/endpoint/Reply, active dispatch epoch, four-word
+    unbadged envelope, VSpace and canonical PDO/devnode generation. Snapshot acquisition holds no
+    mutable registry borrow across CM IPC and revalidates projection/devnode authority afterward.
+    Win32k replies use the actual lane IPC buffer's extended MRs; private reply bytes are captured
+    before allocator IPC. Normal job completion retires only obsolete snapshots; live/suspended
+    jobs retain them. Explicit projection retirement checks all physical lanes and still requires
+    genuine pointer/mapping retirement. Bugcheck/wall retirement retains provider ownership.
+
+    Replaced the duplicated native collector with tranche 113's tested core. The existing FSD
+    shared-bank guard is preserved, not presented as a completed per-worker transport conversion.
+    Its property source now uses the canonical PnP devnode instead of root-bus-only identity.
+    Read-only desktop diagnostics report consumer identity, request/begin/pull/abort/failure counts,
+    retained projections/references and pending transfers. No synthetic property or boot gate added.
+
+    The final native release passes with the unchanged 262 warnings in
+    `.tmp/build-win32k-device-properties-final-20260908.log`. The 21-crate regression passes 2,527
+    tests in `.tmp/test-native-property-integration-regression-20260908.log`. Independent source
+    review found no remaining introduced blocker. This closes the import implementation, not live
+    desktop acceptance: the real video projection is still an FDO and cannot satisfy PDO property
+    queries until the genuine relation-producing IRP family is implemented. No new QEMU run yet.
 
     B3 retained canonical Device references tranche 111 (2026-09-08, host core complete):
 
@@ -28923,7 +28945,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     build passes in `.tmp/build-win32k-device-properties-20260908.log`; client extraction and
     final completion-cleanup validation remain outstanding before that integration checkpoint.
 
-    B3 property snapshot client tranche 113 (2026-09-08, in progress):
+    B3 property snapshot client tranche 113 (2026-09-08, complete):
 
     Extract transport-independent collection into nt-io-manager with owned private reply bytes,
     typed begin/pull/abort requests and explicit allocator/scratch ownership. Native adapters retain
@@ -28931,6 +28953,15 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     publication. Test allocation failure, malformed/changed lengths and tokens, interrupted pulls,
     abort handling and zero-progress rejection. No partial caller output and no reply-bank borrow
     may survive an allocator IPC.
+
+    Implemented PropertyQueryTransport with typed requests, owned fixed reply banks and explicit
+    scratch allocation/release. Only a complete successful snapshot returns ownership for native
+    publication. Malformed error envelopes preserve a decoded token for abort; bad pulls abort only
+    the original token. Seventeen focused tests cover allocator clobber/failure, short scratch,
+    status/size/token corruption, monotonic multi-bank progress, zero length, transport failures and
+    complete-output ownership. All 292 I/O-manager tests and its ownership compile-fail test pass in
+    `.tmp/test-device-property-query-20260908.log`. Both native adapters now use this core; removed
+    the replaced native transaction loop. Final regression/build evidence is recorded in tranche 110.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

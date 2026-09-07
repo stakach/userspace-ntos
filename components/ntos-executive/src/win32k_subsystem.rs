@@ -1144,6 +1144,7 @@ pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 /// Process-scoped `MmSecureVirtualMemory` leases. The executive validates the current client VAD
 /// and owns the opaque lease; win32k receives no mutable MM state or raw executive pointer.
 pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
+pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
 pub const W32_MM_SECURE_OP_UNSECURE: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
@@ -1497,6 +1498,12 @@ unsafe fn provider_pool_release_owned(objects: &[(u64, u64)]) -> bool {
 
 unsafe fn provider_pool_free(p: u64) -> bool {
     provider_pool_release_owned(&[(p, 1)])
+}
+
+pub(crate) unsafe fn property_pool_free(p: u64) {
+    if !provider_pool_free(p) {
+        panic!("device-property snapshot pool ownership failure");
+    }
 }
 
 unsafe fn provider_pool_note_invalid_free() {
@@ -14510,6 +14517,10 @@ fn register_trampolines() -> bool {
     reg.bind(
         "IoGetRelatedDeviceObject",
         s_io_get_related_device_object as usize as u64,
+    );
+    reg.bind(
+        "IoGetDeviceProperty",
+        crate::driver_launch::win32k_device_properties::io_get_device_property as *const () as u64,
     );
     reg.bind(
         "KeUserModeCallback",

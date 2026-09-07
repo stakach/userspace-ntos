@@ -27,6 +27,7 @@ mod completion_unwind;
 mod device;
 mod device_reference;
 mod device_control;
+mod device_property_query;
 mod device_property_transfer;
 mod directory_control;
 mod dispatch;
@@ -73,6 +74,10 @@ pub use completion_unwind::{
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use device_reference::DeviceReference;
+pub use device_property_query::{
+    query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
+    PropertyQueryTransport, PROPERTY_QUERY_CHUNK_BYTES,
+};
 pub use device_property_transfer::{
     HostedDevicePropertyOwner, HostedDevicePropertyPull, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable,
