@@ -243,7 +243,7 @@ fn journal_allocation_failure_preserves_owner_for_same_attempt_retry() {
         assert_eq!(
             owner.prepare_journal_with(&resources(), |actual, tcb, inventory| {
                 assert_eq!(actual, id);
-                assert_eq!(tcb, 10);
+                assert_eq!(tcb, Some(10));
                 assert_eq!(inventory, resources());
                 Err(ThreadRollbackError::InsufficientResources)
             }),

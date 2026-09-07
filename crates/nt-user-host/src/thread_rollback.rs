@@ -17,7 +17,13 @@ pub struct ThreadRollbackIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadRollbackId {
     identity: ThreadRollbackIdentity,
-    attempt: u64,
+    attempt: RollbackAttempt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RollbackAttempt {
+    Registered(u64),
+    Construction(u64),
 }
 
 impl ThreadRollbackId {
@@ -34,7 +40,22 @@ pub(crate) fn new_rollback_id(
     }
     Ok(ThreadRollbackId {
         identity,
-        attempt: allocate_attempt(&NEXT_ATTEMPT)?,
+        attempt: RollbackAttempt::Registered(allocate_attempt(&NEXT_ATTEMPT)?),
+    })
+}
+
+/// Reuse the already reserved publication attempt in a distinct identity domain. Failure handoff
+/// must not need another counter reservation after construction has acquired resources.
+pub(crate) fn construction_rollback_id<T>(
+    identity: ThreadRollbackIdentity,
+    ticket: &crate::thread_publication::PreparedThreadPublication<T>,
+) -> Result<ThreadRollbackId, ThreadRollbackError> {
+    if identity.pid == 0 || identity.tid == 0 || !identity.process_generation.is_valid() {
+        return Err(ThreadRollbackError::InvalidIdentity);
+    }
+    Ok(ThreadRollbackId {
+        identity,
+        attempt: RollbackAttempt::Construction(ticket.attempt()),
     })
 }
 
@@ -162,6 +183,17 @@ impl ThreadRollback {
         if tcb <= 1 {
             return Err(ThreadRollbackError::InvalidCapability);
         }
+        Self::prepare_optional_tcb(id, Some(tcb), resources)
+    }
+
+    pub(crate) fn prepare_optional_tcb(
+        id: ThreadRollbackId,
+        tcb: Option<u64>,
+        resources: &[ThreadRollbackResource],
+    ) -> Result<Self, ThreadRollbackError> {
+        if tcb.is_some_and(|cap| cap <= 1) {
+            return Err(ThreadRollbackError::InvalidCapability);
+        }
         let mut owned: Vec<OwnedResource> = Vec::new();
         owned
             .try_reserve(resources.len())
@@ -171,7 +203,7 @@ impl ThreadRollback {
             if resource.cap == 0 {
                 continue;
             }
-            if resource.cap == tcb {
+            if Some(resource.cap) == tcb {
                 return Err(ThreadRollbackError::ConflictingOwnership);
             }
             if let Some(existing) = owned
@@ -190,8 +222,12 @@ impl ThreadRollback {
         }
         Ok(Self {
             id,
-            tcb,
-            stage: ThreadRollbackStage::Suspend,
+            tcb: tcb.unwrap_or(0),
+            stage: if tcb.is_some() {
+                ThreadRollbackStage::Suspend
+            } else {
+                ThreadRollbackStage::RevokeMemoryAccess
+            },
             resources: owned,
         })
     }

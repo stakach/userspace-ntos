@@ -1,0 +1,544 @@
+use nt_user_host::process_identity::{ProcessGeneration, ProcessIdentity};
+use nt_user_host::thread_binding::{
+    admit_thread_binding, ThreadBinding, ThreadRuntimeReservations,
+};
+use nt_user_host::thread_publication::{
+    PreparedThreadPublication, PublicationError, ThreadPublicationSlot,
+};
+use nt_user_host::thread_resources::{ThreadMemoryLayout, ThreadMemoryResources};
+use nt_user_host::thread_rollback::{
+    ThreadRollbackError, ThreadRollbackId, ThreadRollbackIo, ThreadRollbackResource,
+    ThreadRollbackResourceKind as Kind, ThreadRollbackStage,
+};
+use nt_user_host::thread_slot::{
+    RuntimeConstruction, RuntimeIdentity, SlotError, ThreadIngressError, ThreadRuntimeSlot,
+};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::rc::Rc;
+
+thread_local! {
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+struct CountingAllocator;
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn count_allocation() {
+    if COUNTING.try_with(Cell::get).unwrap_or(false) {
+        ALLOCATIONS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count_allocation();
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count_allocation();
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        count_allocation();
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+fn without_allocation<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COUNTING.with(|flag| flag.set(false));
+        }
+    }
+    ALLOCATIONS.with(|count| count.set(0));
+    COUNTING.with(|flag| assert!(!flag.replace(true)));
+    let reset = Reset;
+    let result = f();
+    drop(reset);
+    assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+    result
+}
+
+#[derive(Debug)]
+struct Partial {
+    binding: ThreadBinding<u32>,
+    tcb: Option<u64>,
+    memory: ThreadMemoryResources<2>,
+    mechanisms: Vec<ThreadRollbackResource>,
+    drops: Rc<Cell<usize>>,
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+#[derive(Debug)]
+struct Runtime {
+    binding: ThreadBinding<u32>,
+    publication: ThreadPublicationSlot,
+    partial: Option<Partial>,
+}
+
+impl RuntimeIdentity for Runtime {
+    type Role = u32;
+    fn binding(&self) -> ThreadBinding<u32> {
+        self.binding
+    }
+    fn publication(&self) -> &ThreadPublicationSlot {
+        &self.publication
+    }
+}
+
+impl RuntimeConstruction for Runtime {
+    type Partial = Partial;
+    fn construction_binding(partial: &Partial) -> ThreadBinding<u32> {
+        partial.binding
+    }
+    fn construction_tcb(partial: &Partial) -> Option<u64> {
+        partial.tcb
+    }
+    fn publication_mut(&mut self) -> &mut ThreadPublicationSlot {
+        &mut self.publication
+    }
+    fn retain_partial(&mut self, partial: Partial) {
+        assert!(self.partial.is_none());
+        self.binding.tcb = partial.tcb.unwrap_or(1);
+        self.partial = Some(partial);
+    }
+}
+
+type Slot = ThreadRuntimeSlot<Runtime>;
+type Ticket = PreparedThreadPublication<ThreadBinding<u32>>;
+
+fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usize>>) {
+    let binding = ThreadBinding {
+        pi: 2,
+        tid: 24,
+        badge: 4,
+        role: 1,
+        tcb: 1,
+        process: ProcessIdentity {
+            pid: 8,
+            generation: ProcessGeneration::Hosted(7),
+        },
+        reservations: Some(ThreadRuntimeReservations {
+            badge: 4,
+            pool_slot: 3,
+            window_slot: Some(5),
+        }),
+    };
+    let mut slot = Slot::empty();
+    slot.insert(Runtime {
+        binding,
+        publication: ThreadPublicationSlot::empty(),
+        partial: None,
+    })
+    .unwrap();
+    let ticket = slot
+        .ordinary_mut()
+        .unwrap()
+        .publication
+        .prepare(binding)
+        .unwrap();
+    let mut memory = ThreadMemoryResources::new(
+        2,
+        ThreadMemoryLayout::new(0x1000, 2, 0x4000, 0x5000, 0x8000).unwrap(),
+    )
+    .unwrap();
+    if built {
+        memory.stack_owner[0] = 200;
+        memory.stack_target[0] = 100;
+    }
+    let drops = Rc::new(Cell::new(0));
+    let partial = Partial {
+        binding,
+        tcb,
+        memory,
+        mechanisms: if built {
+            vec![ThreadRollbackResource {
+                cap: 300,
+                kind: Kind::Mechanism,
+            }]
+        } else {
+            vec![]
+        },
+        drops: drops.clone(),
+    };
+    (slot, ticket, partial, drops)
+}
+
+fn assert_protected(slot: &mut Slot, id: ThreadRollbackId) {
+    let binding = slot.owner().unwrap().binding;
+    assert!(slot.is_pending() && slot.is_protected());
+    assert!(slot.executable().is_none());
+    assert!(slot.ordinary_mut().is_none());
+    assert!(slot.releasable().is_none());
+    assert!(slot.release_published().is_none());
+    assert!(slot.take_retired_payload(id).is_none());
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::Pending
+    );
+    assert!(binding.holds_pool_slot(2, 3) && binding.holds_window_slot(2, 5));
+}
+
+#[test]
+fn empty_construction_handoff_is_allocation_free_and_not_releasable() {
+    let (mut slot, ticket, partial, drops) = fixture(None, false);
+    let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+    assert_protected(&mut slot, id);
+    let owner = slot.owner().unwrap();
+    assert_eq!(owner.binding.tcb, 1);
+    // This copied metadata alone would incorrectly allow native unbuilt-reservation release.
+    assert!(owner.publication.can_release_unbuilt(1, false));
+    assert!(slot.pending().unwrap().cleanup().is_none());
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn partial_handoff_moves_existing_inventory_without_allocation() {
+    let (mut slot, ticket, partial, drops) = fixture(Some(400), true);
+    let inventory_ptr = partial.mechanisms.as_ptr();
+    let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+    assert_protected(&mut slot, id);
+    let runtime = slot.owner().unwrap();
+    let partial = runtime.partial.as_ref().unwrap();
+    assert_eq!(partial.mechanisms.as_ptr(), inventory_ptr);
+    assert_eq!(partial.memory.stack_owner, [200, 0]);
+    assert_eq!(runtime.binding.tcb, 400);
+    let competitor = ThreadBinding {
+        tid: 25,
+        badge: 5,
+        role: 2,
+        reservations: None,
+        ..runtime.binding
+    };
+    assert!(admit_thread_binding(competitor, [(0, runtime.binding)]).is_err());
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn partial_identity_mismatches_return_exact_ticket_and_payload() {
+    for field in 0..10 {
+        let (mut slot, ticket, mut partial, drops) = fixture(Some(400), true);
+        let original = partial.binding;
+        match field {
+            0 => partial.binding.pi += 1,
+            1 => partial.binding.process.pid += 1,
+            2 => partial.binding.process.generation = ProcessGeneration::Hosted(8),
+            3 => partial.binding.process.generation = ProcessGeneration::Temporary(7),
+            4 => partial.binding.tid += 1,
+            5 => partial.binding.badge += 1,
+            6 => partial.binding.role += 1,
+            7 => partial.binding.tcb = 400,
+            8 => partial.binding.reservations.as_mut().unwrap().pool_slot += 1,
+            _ => partial.binding.reservations.as_mut().unwrap().window_slot = None,
+        }
+        let ptr = partial.mechanisms.as_ptr();
+        let (error, ticket, mut partial) =
+            without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap_err();
+        assert_eq!(error, SlotError::OwnerChanged);
+        assert_eq!(partial.mechanisms.as_ptr(), ptr);
+        assert!(slot.publishing_mut(&ticket).is_some());
+        assert_eq!(slot.owner().unwrap().binding, original);
+        assert_eq!(drops.get(), 0);
+        partial.binding = original;
+        assert!(slot.retain_failed_construction(ticket, partial).is_ok());
+    }
+}
+
+#[test]
+fn wrong_slot_ticket_cannot_replace_its_owner() {
+    let (mut first, ticket, partial, drops) = fixture(None, true);
+    let (mut second, second_ticket, second_partial, _) = fixture(None, false);
+    let (error, ticket, partial) =
+        without_allocation(|| second.retain_failed_construction(ticket, partial)).unwrap_err();
+    assert_eq!(
+        error,
+        SlotError::Publication(PublicationError::StaleAttempt)
+    );
+    assert!(first.publishing_mut(&ticket).is_some());
+    assert!(second.publishing_mut(&second_ticket).is_some());
+    assert_eq!(drops.get(), 0);
+    assert!(first.retain_failed_construction(ticket, partial).is_ok());
+    assert!(second
+        .retain_failed_construction(second_ticket, second_partial)
+        .is_ok());
+}
+
+#[test]
+fn invalid_tcb_caps_return_ownership_and_never_reach_cleanup() {
+    for cap in [0, 1] {
+        let (mut slot, ticket, mut partial, drops) = fixture(Some(cap), true);
+        let (error, ticket, returned) =
+            without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap_err();
+        partial = returned;
+        assert_eq!(
+            error,
+            SlotError::Cleanup(ThreadRollbackError::InvalidCapability)
+        );
+        assert!(slot.publishing_mut(&ticket).is_some());
+        assert_eq!(drops.get(), 0);
+        partial.tcb = None;
+        assert!(slot.retain_failed_construction(ticket, partial).is_ok());
+    }
+}
+
+#[test]
+fn stale_original_row_binding_preserves_busy_ownership() {
+    let (mut slot, ticket, partial, drops) = fixture(None, true);
+    // Simulate an adapter violating the exclusive publication contract.
+    slot.publishing_mut(&ticket)
+        .unwrap()
+        .binding
+        .process
+        .generation = ProcessGeneration::Hosted(8);
+    let (error, ticket, partial) =
+        without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap_err();
+    assert_eq!(
+        error,
+        SlotError::Publication(PublicationError::OwnerChanged)
+    );
+    assert!(slot.is_protected());
+    assert!(slot.release_published().is_none());
+    assert_eq!(ticket.owner(), &partial.binding);
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn vacant_or_pending_destination_returns_owners_without_replacement() {
+    let (mut source, ticket, partial, drops) = fixture(None, true);
+    let mut empty = Slot::empty();
+    let (error, ticket, partial) =
+        without_allocation(|| empty.retain_failed_construction(ticket, partial)).unwrap_err();
+    assert_eq!(error, SlotError::Vacant);
+    assert!(empty.is_empty());
+    let (mut pending, other_ticket, other_partial, other_drops) = fixture(None, false);
+    let id = pending
+        .retain_failed_construction(other_ticket, other_partial)
+        .unwrap();
+    let (error, ticket, partial) =
+        without_allocation(|| pending.retain_failed_construction(ticket, partial)).unwrap_err();
+    assert_eq!(error, SlotError::AlreadyPending);
+    assert_eq!(pending.pending().unwrap().id(), id);
+    assert!(source.publishing_mut(&ticket).is_some());
+    assert_eq!(drops.get(), 0);
+    assert_eq!(other_drops.get(), 0);
+    assert!(source.retain_failed_construction(ticket, partial).is_ok());
+}
+
+#[test]
+fn handoff_requires_unbuilt_reservation_and_captured_holds() {
+    for built in [false, true] {
+        let (mut slot, ticket, mut partial, drops) = fixture(None, true);
+        let runtime = slot.publishing_mut(&ticket).unwrap();
+        runtime
+            .publication
+            .finish(ticket, &runtime.binding)
+            .unwrap();
+        if built {
+            runtime.binding.tcb = 400;
+        } else {
+            runtime.binding.reservations = None;
+        }
+        partial.binding = runtime.binding;
+        let ticket = runtime.publication.prepare(runtime.binding).unwrap();
+        let (error, ticket, partial) =
+            without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap_err();
+        assert_eq!(
+            error,
+            if built {
+                SlotError::InvalidBinding
+            } else {
+                SlotError::MissingReservations
+            }
+        );
+        assert!(slot.publishing_mut(&ticket).is_some());
+        assert_eq!(ticket.owner(), &partial.binding);
+        assert_eq!(drops.get(), 0);
+    }
+}
+
+#[test]
+fn releasable_projection_matches_ordinary_slot_extraction() {
+    let (mut slot, ticket, partial, _) = fixture(None, false);
+    assert!(slot.releasable().is_none());
+    assert!(slot.release_published().is_none());
+    let binding = *ticket.owner();
+    slot.publishing_mut(&ticket)
+        .unwrap()
+        .publication
+        .finish(ticket, &binding)
+        .unwrap();
+    assert_eq!(slot.releasable().unwrap().binding, binding);
+    let runtime = slot.release_published().unwrap();
+    assert_eq!(runtime.binding, binding);
+    assert!(slot.releasable().is_none());
+    slot.insert(runtime).unwrap();
+    slot.ordinary_mut().unwrap().binding.tcb = 400;
+    let expected = slot.releasable().unwrap().binding;
+    assert_eq!(expected.tcb, 400);
+    assert_eq!(slot.release_published().unwrap().binding, expected);
+    drop(partial);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Event {
+    Suspend(u64),
+    Delete(u64),
+    Revoke,
+    Unmap(u64),
+    Release(u64),
+    Commit,
+}
+
+struct Backend {
+    current: ThreadRollbackId,
+    events: Vec<Event>,
+    fail: Option<usize>,
+}
+
+impl Backend {
+    fn record(&mut self, event: Event) -> Result<(), u32> {
+        if self.fail == Some(self.events.len()) {
+            return Err(0xc000009a);
+        }
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+impl ThreadRollbackIo for Backend {
+    fn is_current(&self, id: ThreadRollbackId) -> bool {
+        id == self.current
+    }
+    fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32> {
+        assert!(tcb > 1);
+        self.record(Event::Suspend(tcb))
+    }
+    fn delete_tcb(&mut self, tcb: u64) -> Result<(), u32> {
+        assert!(tcb > 1);
+        self.record(Event::Delete(tcb))
+    }
+    fn revoke_memory_access(&mut self, _: ThreadRollbackId) -> Result<(), u32> {
+        self.record(Event::Revoke)
+    }
+    fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        self.record(Event::Unmap(resource.cap))
+    }
+    fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        self.record(Event::Release(resource.cap))
+    }
+    fn commit_rollback(&mut self, _: ThreadRollbackId) {
+        self.events.push(Event::Commit);
+    }
+}
+
+#[test]
+fn absent_and_real_tcb_cleanup_retry_every_operation_without_releasing_holds() {
+    for tcb in [None, Some(400)] {
+        let mut expected = vec![];
+        if let Some(cap) = tcb {
+            expected.extend([Event::Suspend(cap), Event::Delete(cap)]);
+        }
+        expected.extend([
+            Event::Revoke,
+            Event::Unmap(100),
+            Event::Release(100),
+            Event::Release(300),
+            Event::Unmap(200),
+            Event::Release(200),
+            Event::Commit,
+        ]);
+        for fail in 0..expected.len() - 1 {
+            let (mut slot, ticket, partial, drops) = fixture(tcb, true);
+            let mut inventory = partial.memory.rollback_resources().unwrap();
+            inventory.extend_from_slice(&partial.mechanisms);
+            let id = slot.retain_failed_construction(ticket, partial).unwrap();
+            slot.prepare_cleanup(id, &inventory).unwrap();
+            assert_eq!(
+                slot.pending().unwrap().cleanup().unwrap().pending_tcb(),
+                tcb
+            );
+            let mut backend = Backend {
+                current: id,
+                events: vec![],
+                fail: Some(fail),
+            };
+            assert!(slot.advance_cleanup(id, &mut backend).is_err());
+            assert_eq!(backend.events, expected[..fail]);
+            assert_protected(&mut slot, id);
+            assert_eq!(drops.get(), 0);
+            backend.fail = None;
+            slot.advance_cleanup(id, &mut backend).unwrap();
+            slot.advance_cleanup(id, &mut backend).unwrap();
+            assert_eq!(backend.events, expected);
+            assert_eq!(
+                slot.pending().unwrap().cleanup().unwrap().stage(),
+                ThreadRollbackStage::Complete
+            );
+            let retired = slot.take_retired_payload(id).unwrap();
+            assert!(slot.is_empty());
+            assert_eq!(drops.get(), 0);
+            drop(retired);
+            assert_eq!(drops.get(), 1);
+        }
+    }
+}
+
+#[test]
+fn invalid_inventory_and_foreign_attempt_leave_partial_owner_retained() {
+    let (mut slot, ticket, partial, drops) = fixture(Some(400), true);
+    let id = slot.retain_failed_construction(ticket, partial).unwrap();
+    let (mut other, ticket, partial, _) = fixture(Some(400), true);
+    let other_id = other.retain_failed_construction(ticket, partial).unwrap();
+    assert_ne!(id, other_id);
+    assert_eq!(
+        slot.prepare_cleanup(other_id, &[]),
+        Err(SlotError::OwnerChanged)
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            slot.prepare_cleanup(
+                id,
+                &[ThreadRollbackResource {
+                    cap: 400,
+                    kind: Kind::Frame
+                }]
+            ),
+            Err(SlotError::Cleanup(
+                ThreadRollbackError::ConflictingOwnership
+            ))
+        );
+        assert_protected(&mut slot, id);
+        assert!(slot.pending().unwrap().cleanup().is_none());
+        assert_eq!(drops.get(), 0);
+    }
+}
+
+#[test]
+fn pending_memory_is_excluded_before_fallible_journal_preparation() {
+    use nt_user_host::thread_memory_access::{check_pending_thread_memory, PendingThreadMemory};
+    let (mut slot, ticket, partial, _) = fixture(None, true);
+    let id = slot.retain_failed_construction(ticket, partial).unwrap();
+    let owner = slot.pending().unwrap();
+    let memory = &owner.runtime().partial.as_ref().unwrap().memory;
+    let pending = PendingThreadMemory {
+        owner: id,
+        memory,
+        user_stack_allocation_base: 0,
+        user_stack_base: 0,
+    };
+    assert!(check_pending_thread_memory(2, 0x1000, 1, [pending]).is_err());
+    assert!(owner.cleanup().is_none());
+}

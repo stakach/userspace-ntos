@@ -15,7 +15,7 @@ use crate::thread_rollback::{
 #[must_use = "retain the pending runtime and its reservations until checked cleanup completes"]
 pub struct PendingThreadRuntime<R> {
     id: ThreadRollbackId,
-    tcb: u64,
+    tcb: Option<u64>,
     runtime: R,
     reservations: ThreadRuntimeReservations,
     rollback: Option<ThreadRollback>,
@@ -38,11 +38,28 @@ impl<R> PendingThreadRuntime<R> {
         };
         Ok(Self {
             id,
-            tcb,
+            tcb: Some(tcb),
             runtime,
             reservations,
             rollback: None,
         })
+    }
+
+    /// The slot has validated and consumed this exact publication attempt. Keep the original
+    /// runtime and its attached partial construction in-place before any journal allocation.
+    pub(crate) fn retain_construction(
+        id: ThreadRollbackId,
+        tcb: Option<u64>,
+        reservations: ThreadRuntimeReservations,
+        runtime: R,
+    ) -> Self {
+        Self {
+            id,
+            tcb,
+            runtime,
+            reservations,
+            rollback: None,
+        }
     }
 
     pub fn id(&self) -> ThreadRollbackId {
@@ -67,7 +84,7 @@ impl<R> PendingThreadRuntime<R> {
         &mut self,
         resources: &[ThreadRollbackResource],
     ) -> Result<(), ThreadRollbackError> {
-        self.prepare_journal_with(resources, ThreadRollback::prepare_with_id)
+        self.prepare_journal_with(resources, ThreadRollback::prepare_optional_tcb)
     }
 
     fn prepare_journal_with(
@@ -75,7 +92,7 @@ impl<R> PendingThreadRuntime<R> {
         resources: &[ThreadRollbackResource],
         prepare: impl FnOnce(
             ThreadRollbackId,
-            u64,
+            Option<u64>,
             &[ThreadRollbackResource],
         ) -> Result<ThreadRollback, ThreadRollbackError>,
     ) -> Result<(), ThreadRollbackError> {

@@ -3,14 +3,32 @@ use crate::thread_binding::{admit_thread_binding, ThreadBinding};
 use crate::thread_pending::PendingThreadRuntime;
 use crate::thread_publication::{PreparedThreadPublication, ThreadPublicationSlot};
 use crate::thread_rollback::{
-    ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity, ThreadRollbackIo,
-    ThreadRollbackResource,
+    construction_rollback_id, ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity,
+    ThreadRollbackIo, ThreadRollbackResource,
 };
 
 pub trait RuntimeIdentity {
     type Role: Copy + Eq;
     fn binding(&self) -> ThreadBinding<Self::Role>;
     fn publication(&self) -> &ThreadPublicationSlot;
+}
+
+/// Adapter for moving a constructor's complete partial inventory into its original reservation.
+/// Partial payloads must retain all allocated slots, object caps and memory/alias owners, including
+/// failed allocations. Journal reconciliation is a separate, later, fallible operation.
+pub trait RuntimeConstruction: RuntimeIdentity {
+    type Partial;
+    /// Original reservation captured before construction, not a replacement runtime identity.
+    fn construction_binding(partial: &Self::Partial) -> ThreadBinding<Self::Role>;
+    /// None means no TCB object exists. An allocated empty slot belongs in the partial inventory,
+    /// not here. Some must name a real TCB, even if it has not yet been configured or resumed.
+    fn construction_tcb(partial: &Self::Partial) -> Option<u64>;
+    fn publication_mut(&mut self) -> &mut ThreadPublicationSlot;
+    /// Infallible, allocation-free ownership move with no backend calls or reentrancy. Preserve
+    /// identity, reservations and the publication slot; update binding.tcb to the partial TCB, or
+    /// keep the unbuilt reservation sentinel when absent. Preserve any resource inventory already
+    /// owned by the original row as well. Do not destroy/release any resources.
+    fn retain_partial(&mut self, partial: Self::Partial);
 }
 
 enum State<R> {
@@ -35,7 +53,79 @@ pub enum SlotError {
     MissingReservations,
     OwnerChanged,
     InvalidBinding,
+    Publication(crate::thread_publication::PublicationError),
     Cleanup(ThreadRollbackError),
+}
+
+impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
+    /// Consume the exact construction ticket and partial inventory into this pre-reserved row.
+    /// All rejection happens before mutation and returns both owners intact. Success allocates
+    /// nothing, reserves no new attempt ID, and immediately enables the existing pending guards.
+    pub fn retain_failed_construction(
+        &mut self,
+        ticket: PreparedThreadPublication<ThreadBinding<R::Role>>,
+        partial: R::Partial,
+    ) -> Result<
+        ThreadRollbackId,
+        (
+            SlotError,
+            PreparedThreadPublication<ThreadBinding<R::Role>>,
+            R::Partial,
+        ),
+    > {
+        let validate = || {
+            if self.is_pending() {
+                return Err(SlotError::AlreadyPending);
+            }
+            let runtime = self.owner().ok_or(SlotError::Vacant)?;
+            let binding = runtime.binding();
+            runtime
+                .publication()
+                .validate(&ticket, &binding)
+                .map_err(SlotError::Publication)?;
+            if binding.tcb != 1 || admit_thread_binding(binding, []).is_err() {
+                return Err(SlotError::InvalidBinding);
+            }
+            if R::construction_binding(&partial) != binding {
+                return Err(SlotError::OwnerChanged);
+            }
+            let reservations = binding.reservations.ok_or(SlotError::MissingReservations)?;
+            let tcb = R::construction_tcb(&partial);
+            if tcb.is_some_and(|cap| cap <= 1) {
+                return Err(SlotError::Cleanup(ThreadRollbackError::InvalidCapability));
+            }
+            let id = construction_rollback_id(
+                ThreadRollbackIdentity {
+                    pi: binding.pi,
+                    pid: binding.process.pid,
+                    process_generation: binding.process.generation,
+                    tid: binding.tid,
+                },
+                &ticket,
+            )
+            .map_err(SlotError::Cleanup)?;
+            Ok((binding, reservations, tcb, id))
+        };
+        let (binding, reservations, tcb, id) = match validate() {
+            Ok(validated) => validated,
+            Err(error) => return Err((error, ticket, partial)),
+        };
+        let State::Published(mut runtime) = core::mem::replace(&mut self.state, State::Vacant)
+        else {
+            unreachable!("construction ticket validated its published reservation");
+        };
+        if runtime.publication_mut().finish(ticket, &binding).is_err() {
+            unreachable!("validated exclusive construction ticket");
+        }
+        runtime.retain_partial(partial);
+        self.state = State::Pending(PendingThreadRuntime::retain_construction(
+            id,
+            tcb,
+            reservations,
+            runtime,
+        ));
+        Ok(id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +207,15 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
 
     pub fn ordinary_mut(&mut self) -> Option<&mut R> {
         match &mut self.state {
+            State::Published(runtime) if !runtime.publication().is_busy() => Some(runtime),
+            _ => None,
+        }
+    }
+
+    /// Read-only eligibility for ordinary extraction. Callers deciding whether to release an
+    /// empty reservation must consult the slot, not a copied runtime that hides pending state.
+    pub fn releasable(&self) -> Option<&R> {
+        match &self.state {
             State::Published(runtime) if !runtime.publication().is_busy() => Some(runtime),
             _ => None,
         }

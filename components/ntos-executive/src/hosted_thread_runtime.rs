@@ -46,13 +46,6 @@ impl HostedThreadRuntime {
             reservations: self.reservations,
         }
     }
-
-    pub(crate) fn is_unbuilt_reservation(&self) -> bool {
-        self.publication.can_release_unbuilt(
-            self.tcb,
-            self.mechanism.is_live() || self.resources.is_live() || self.teb_alias != 0,
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -346,6 +339,21 @@ impl HostedThreadRuntimeTable {
             .filter_map(RuntimeSlot::owner)
             .copied()
             .find(|entry| entry.is_live() && entry.tid == tid)
+    }
+
+    pub(crate) fn unbuilt_reservation_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
+        self.entries
+            .iter()
+            .filter_map(RuntimeSlot::releasable)
+            .copied()
+            .find(|entry| {
+                entry.is_live()
+                    && entry.tid == tid
+                    && entry.publication.can_release_unbuilt(
+                        entry.tcb,
+                        entry.mechanism.is_live() || entry.resources.is_live() || entry.teb_alias != 0,
+                    )
+            })
     }
 
     pub(crate) fn executable_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
@@ -653,6 +661,10 @@ impl HostedThreadRuntimes {
     pub(crate) fn get_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
         // SAFETY: shared access is bounded by the borrow of this sole-owner wrapper.
         unsafe { (&*self.table).get_by_tid(tid) }
+    }
+
+    pub(crate) fn unbuilt_reservation_by_tid(&self, tid: u64) -> Option<HostedThreadRuntime> {
+        unsafe { (&*self.table).unbuilt_reservation_by_tid(tid) }
     }
 
     pub(crate) fn record_count(&self) -> usize {

@@ -31,6 +31,10 @@ impl<T> PreparedThreadPublication<T> {
     pub fn owner(&self) -> &T {
         &self.owner
     }
+
+    pub(crate) fn attempt(&self) -> u64 {
+        self.attempt
+    }
 }
 
 impl ThreadPublicationSlot {

@@ -677,3 +677,17 @@ fn backend_failure_status_is_preserved() {
         })
     );
 }
+#[test]
+fn construction_and_registered_attempt_numbers_have_distinct_authority() {
+    let mut publication = crate::thread_publication::ThreadPublicationSlot::empty();
+    let ticket = publication.prepare(24u64).unwrap();
+    let id = construction_rollback_id(identity(), &ticket).unwrap();
+    let registered = ThreadRollbackId {
+        identity: identity(),
+        attempt: RollbackAttempt::Registered(ticket.attempt()),
+    };
+    assert_eq!(id.identity(), registered.identity());
+    assert_ne!(id, registered);
+    let again = construction_rollback_id(identity(), &ticket).unwrap();
+    assert_eq!(id, again);
+}

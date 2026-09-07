@@ -160,11 +160,15 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain checked per-capability unmap acknowledgements across rollback release retries, reconcile
   partial thread construction without fabricated owners, and remove the untracked trampoline
   diagnostic alias (tranche 69, host/build; native failed-construction handoff remains open).
+- [x] Add allocation-free, exact-ticket failed-construction handoff into the pre-reserved runtime
+  slot, with explicit absent TCB cleanup and slot-aware native unbuilt-reservation release checks
+  (tranche 70, host/build; native constructor inventory and handoff activation remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next add allocation-free failed-construction
-  handoff from the busy publication ticket into its pre-reserved runtime row, retaining optional/unbuilt
-  TCB, partial memory, mechanism inventory and exact process/pool/window ownership before fallible
-  reconciliation. Replace constructor-local destructive failure exits with this handoff, then replace
+  emptiness as a complete execution-quiescence proof. Next make native constructor and scheduling-context
+  failures return complete ownership, including allocated empty slots, raw/minted CNodes, optional real
+  TCB, and local/registry TEB aliases. Retain that partial payload through the tested exact-ticket handoff
+  before fallible reconciliation, preserving process/pool/window holds. Replace destructive failure exits
+  and empty failed-spawn results with ownership-returning failures, then replace
   the legacy fatal release boundary with a checked retry backend. Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
@@ -27169,6 +27173,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     External-alias journals, checked free-list publication, mirrored-reference clearing, image
     coherency, ordinary termination, handler handoffs and user-mode SEH remain open. No QEMU or
     desktop proof is claimed; 33 unresolved win32k imports still block the full gate.
+
+    B3 construction handoff tranche 70 (2026-09-07, host/build green):
+    `ThreadRuntimeSlot::retain_failed_construction` consumes the exact busy publication ticket and
+    a partial payload into the existing row's non-cloneable pending owner. Admission checks the
+    original unbuilt binding, process generation, reservations and partial TCB before any mutation.
+    Rejection returns ticket and payload intact. The adapter moves the inventory into the original
+    runtime, preserving its identity, holds and any resources already retained there; no replacement
+    runtime, failure-time allocation, backend call or reentrant table access is needed.
+
+    Construction rollback IDs reuse the already reserved publication attempt in a distinct domain
+    from registered-thread rollback IDs. Failure handling therefore cannot exhaust a new attempt
+    counter after acquiring resources. Partial TCB ownership is explicit: None starts cleanup at
+    memory-access revocation, while Some(real cap) preserves checked suspend/delete ordering. Caps
+    zero and one are rejected as real TCBs; an allocated empty slot must remain separate inventory.
+    The ordinary registered-runtime `begin_pending` and public real-TCB rollback preparation remain
+    strict. Partial journal allocation/reconciliation happens only after durable pending retention.
+
+    Native unbuilt-reservation release now consults the actual slot's `releasable` projection before
+    inspecting the payload. All three copied `is_unbuilt_reservation` consumers and that old helper
+    are removed. This closes an activation hazard where a pending owner with no TCB/resources yet
+    could appear empty through a copied runtime and release pool/window reservations or trip a
+    release assertion. Busy, built and unknown-row handling otherwise preserves existing behavior.
+
+    Validation: 13 new tests include allocator-counted success and rejection paths, ownership-preserving
+    moves, ten identity/hold mismatches, wrong/stale tickets, invalid TCBs, vacant/pending destinations,
+    missing reservations, real-TCB collision visibility, exact release eligibility, and pending memory
+    exclusion before journal preparation. Cleanup tests inject failure at every operation for both
+    absent and real TCBs, asserting unchanged holds and no repeated successful operations. A separate
+    regression proves identical numeric attempts in the two rollback domains are not equal. The
+    serialized nine-crate suite passes 1,121 tests, including 194 `nt-user-host` tests; log:
+    `.tmp/test-thread-construction-handoff-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log:
+    `.tmp/build-thread-construction-handoff-20260907.log`. Two read-only agents reviewed host identity
+    and native release boundaries; root alone ran tests followed by the build.
+
+    Review adjustment: the handoff policy is complete, but native activation is not. The constructor
+    still has approximately twenty destructive failure exits and empty failure results. First retain
+    local TEB/TEB2 live-mirror and source-copy caps, raw/minted CNode and TCB allocation progress, and
+    scheduling-context failure ownership. Distinguish an allocated empty slot from a retyped object
+    cap so cleanup never invents an object or loses failed deletion. Then wire the complete payload
+    through the existing publication row before registry reconciliation and checked retry cleanup.
+    The legacy fatal release boundary remains until that backend is complete; merely returning an
+    error from the current void cleanup chain would still drop resources. External-alias journals,
+    mirrored references, checked free-list publication, ordinary termination, handler handoffs, image
+    coherency and user-mode SEH remain open. No QEMU or desktop proof is claimed; the full desktop
+    gate remains blocked by the recorded 33 unresolved win32k imports.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

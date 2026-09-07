@@ -10849,10 +10849,8 @@ impl ExecNtHandler {
         slot: usize,
         tid: u64,
     ) {
-        let releasable = self.thread_runtime.get_by_tid(tid).is_some_and(|runtime| {
-            runtime.pi == pi
-                && runtime.role.worker_window_slot() == Some(slot)
-                && runtime.is_unbuilt_reservation()
+        let releasable = self.thread_runtime.unbuilt_reservation_by_tid(tid).is_some_and(|runtime| {
+            runtime.pi == pi && runtime.role.worker_window_slot() == Some(slot)
         });
         if releasable {
             assert!(self.release_hosted_thread_runtime(tid).is_some());
@@ -15745,9 +15743,8 @@ impl ExecNtHandler {
         &mut self,
         publication: PreparedHostedThreadPublication,
     ) {
-        let retained = self.thread_runtime
-            .get_by_tid(publication.tid())
-            .is_some_and(|runtime| !runtime.is_unbuilt_reservation());
+        let retained = self.thread_runtime.get_by_tid(publication.tid()).is_some()
+            && self.thread_runtime.unbuilt_reservation_by_tid(publication.tid()).is_none();
         if !retained {
             self.release_pool_usage_slot(publication.owner_pi, publication.pool_slot);
         }
@@ -15790,11 +15787,8 @@ impl ExecNtHandler {
         let tid = publication.tid();
         let releasable = publication.owner_pi == pi
             && self.hosted_thread_publication_owns_pool_slot(&publication)
-            && self.thread_runtime.get_by_tid(tid).is_some_and(|runtime| {
-                runtime.pi == pi
-                    && runtime.badge == badge
-                    && runtime.role == role
-                    && runtime.is_unbuilt_reservation()
+            && self.thread_runtime.unbuilt_reservation_by_tid(tid).is_some_and(|runtime| {
+                runtime.pi == pi && runtime.badge == badge && runtime.role == role
             });
         if releasable {
             assert!(self.thread_runtime.release_tid(tid).is_some());
