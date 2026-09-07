@@ -405,7 +405,7 @@ fn rollback_admission_detects_tcb_and_mechanism_collisions_with_registry_only_al
     let identity = ThreadRollbackIdentity {
         pi: 27,
         pid: 90,
-        process_generation: 7,
+        process_generation: crate::process_identity::ProcessGeneration::Hosted(7),
         tid: 301,
     };
     for cap in [33, 34, 43, 44] {

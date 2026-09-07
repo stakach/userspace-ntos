@@ -3639,17 +3639,6 @@ fn empty_process_vspace_caps_vec(
     slots
 }
 
-fn zeroed_temporary_process_slot_vec() -> alloc::vec::Vec<nt_process::ProcessId> {
-    let mut slots = alloc::vec::Vec::new();
-    if slots.try_reserve_exact(MAX_PI).is_err() {
-        panic!("temporary process slot vector allocation failed");
-    }
-    while slots.len() < MAX_PI {
-        slots.push(0);
-    }
-    slots
-}
-
 fn registered_win32_callouts_for_manager(
     pm: &mut nt_process::ProcessManager,
 ) -> Result<nt_process::Win32Callouts, u32> {
@@ -4354,7 +4343,9 @@ impl ExecNtHandler {
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
         write_field!(process_vspace_caps, empty_process_vspace_caps_vec());
-        write_field!(temporary_process_slots, zeroed_temporary_process_slot_vec());
+        write_field!(temporary_process_slots,
+            nt_user_host::process_identity::TemporaryProcessSlots::try_new(MAX_PI)
+                .expect("temporary process slot allocation failed"));
         write_field!(thread_mechanisms, ExecThreadMechanisms::reset());
         write_field!(pool_used, zeroed_process_slot_u64_vec());
         write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
@@ -9599,42 +9590,11 @@ impl ExecNtHandler {
     }
 
     fn temporary_pid_for_pi(&self, pi: usize) -> Option<nt_process::ProcessId> {
-        let pid = *self.temporary_process_slots.get(pi)?;
-        (pid != 0).then_some(pid)
+        self.temporary_process_slots.get(pi).map(|claim| claim.pid())
     }
 
     fn temporary_pi_for_pid(&self, pid: nt_process::ProcessId) -> Option<usize> {
-        (pid != 0).then_some(())?;
-        self.temporary_process_slots
-            .iter()
-            .position(|stored| *stored == pid)
-    }
-
-    fn register_temporary_process_slot(
-        &mut self,
-        pi: usize,
-        pid: nt_process::ProcessId,
-        pml4: u64,
-    ) -> Result<(), u32> {
-        if pi >= MAX_PI
-            || pid == 0
-            || self.pm.process(pid).is_none()
-            || self.process_mechanisms.pid_for_pi(pi).is_some()
-        {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        if self.temporary_process_slots[pi] != 0 && self.temporary_process_slots[pi] != pid {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        if self
-            .temporary_pi_for_pid(pid)
-            .is_some_and(|existing_pi| existing_pi != pi)
-        {
-            return Err(nt_process::STATUS_INVALID_PARAMETER);
-        }
-        self.temporary_process_slots[pi] = pid;
-        self.process_vspaces[pi] = pml4;
-        Ok(())
+        self.temporary_process_slots.pi_for_pid(pid)
     }
 
     pub(crate) fn claim_temporary_process_slot(
@@ -9642,7 +9602,10 @@ impl ExecNtHandler {
         pid: nt_process::ProcessId,
         pml4: u64,
     ) -> Result<TemporaryProcessSlotClaim, u32> {
-        if pid == 0 || self.pm.process(pid).is_none() {
+        if pid == 0 || self.pm.process(pid).is_none()
+            || self.process_mechanisms.pi_for_pid(pid).is_some()
+            || self.temporary_pi_for_pid(pid).is_some()
+        {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         let runtime_table = unsafe { &*self.thread_runtime.table };
@@ -9650,7 +9613,7 @@ impl ExecNtHandler {
             .rev()
             .find(|&pi| {
                 self.process_mechanisms.pid_for_pi(pi).is_none()
-                    && self.temporary_process_slots[pi] == 0
+                    && self.temporary_process_slots.get(pi).is_none()
                     && self.process_vspaces[pi] == 0
                     && client_frame_registry_process_is_empty(pi as u64)
                     && self.thread_mechanisms.main_tid_for_pi(pi).is_none()
@@ -9664,31 +9627,31 @@ impl ExecNtHandler {
                         .any(|runtime| runtime.is_live() && runtime.pi == pi)
             })
             .ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
-        self.register_temporary_process_slot(pi, pid, pml4)?;
-        Ok(TemporaryProcessSlotClaim { pi, pid })
-    }
-
-    fn clear_temporary_process_slot(&mut self, pi: usize) {
-        if pi >= MAX_PI || self.process_mechanisms.pid_for_pi(pi).is_some()
-            || self.thread_runtime.has_process(pi)
-        {
-            return;
-        }
-        self.temporary_process_slots[pi] = 0;
-        self.process_vspaces[pi] = 0;
-        unsafe { process_committed_mapping_reset(pi) };
-        self.clear_hosted_tp_worker_windows(pi);
+        let claim = self.temporary_process_slots.claim(pi, pid).map_err(|error| match error {
+            nt_user_host::process_identity::TemporaryProcessError::InsufficientResources => {
+                nt_process::STATUS_INSUFFICIENT_RESOURCES
+            }
+            _ => nt_process::STATUS_INVALID_PARAMETER,
+        })?;
+        self.process_vspaces[pi] = pml4;
+        Ok(claim)
     }
 
     pub(crate) fn release_temporary_process_slot(
         &mut self,
         claim: TemporaryProcessSlotClaim,
     ) -> bool {
-        if claim.pi >= MAX_PI || self.temporary_process_slots[claim.pi] != claim.pid {
+        let pi = claim.pi();
+        if self.process_mechanisms.pid_for_pi(pi).is_some()
+            || self.thread_runtime.has_process(pi)
+            || self.temporary_process_slots.release_exact(claim).is_err()
+        {
             return false;
         }
-        self.clear_temporary_process_slot(claim.pi);
-        self.temporary_process_slots[claim.pi] == 0
+        self.process_vspaces[pi] = 0;
+        unsafe { process_committed_mapping_reset(pi) };
+        self.clear_hosted_tp_worker_windows(pi);
+        true
     }
 
     pub(crate) fn register_temporary_pool_thread_slot(
@@ -9739,9 +9702,12 @@ impl ExecNtHandler {
         badge: u64,
         role: HostedThreadRole,
     ) -> bool {
+        let Some(process) = self.capture_thread_process_identity(pi, tid) else {
+            return false;
+        };
         if self
             .thread_runtime
-            .register(pi, tid, tcb, badge, role)
+            .register(pi, process, tid, tcb, badge, role)
             .is_some()
         {
             publish_hosted_thread_runtime_gate(pi, role);
@@ -9758,6 +9724,8 @@ impl ExecNtHandler {
         badge: u64,
         role: HostedThreadRole,
     ) -> Result<PreparedHostedThreadRuntime, u32> {
+        let process = self.capture_thread_process_identity(pi, tid)
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let reservations = self.capture_hosted_thread_reservations(pi, tid, badge, role)
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         if reservations.window_slot.is_some_and(|slot| {
@@ -9766,7 +9734,7 @@ impl ExecNtHandler {
         }) {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
-        self.thread_runtime.prepare_spawn(pi, tid, badge, role, reservations)
+        self.thread_runtime.prepare_spawn(pi, process, tid, badge, role, reservations)
     }
 
     pub(crate) fn cancel_hosted_thread_runtime_publication(
@@ -9798,10 +9766,32 @@ impl ExecNtHandler {
         badge: u64,
         role: HostedThreadRole,
     ) -> bool {
+        let Some(process) = self.capture_thread_process_identity(pi, tid) else {
+            return false;
+        };
         let Some(reservations) = self.capture_hosted_thread_reservations(pi, tid, badge, role) else {
             return false;
         };
-        self.thread_runtime.reserve(pi, tid, badge, role, reservations).is_some()
+        self.thread_runtime.reserve(pi, process, tid, badge, role, reservations).is_some()
+    }
+
+    fn capture_thread_process_identity(
+        &self,
+        pi: usize,
+        tid: u64,
+    ) -> Option<nt_user_host::process_identity::ProcessIdentity> {
+        let tid = u32::try_from(tid).ok()?;
+        if tid == 0 {
+            return None;
+        }
+        let process = nt_user_host::process_identity::resolve_thread_process_identity(
+            pi,
+            self.pm.thread(tid)?.process_id,
+            self.process_mechanisms.get(pi),
+            self.temporary_process_slots.get(pi),
+        )?;
+        self.pm.process(process.pid)?;
+        Some(process)
     }
 
     fn capture_hosted_thread_reservations(
@@ -9838,11 +9828,15 @@ impl ExecNtHandler {
         spawn: img_spawn::SecImageSpawn,
     ) {
         if let Some(tid) = self.pm_main_tid_for_pi(pi) {
+            let Some(process) = self.capture_thread_process_identity(pi, u64::from(tid)) else {
+                return;
+            };
             let badge = self.hosted_process_top_badge(pi).unwrap_or(0);
             if self
                 .thread_runtime
                 .register_main(
                     pi,
+                    process,
                     u64::from(tid),
                     spawn.main_tcb,
                     badge,
@@ -17979,6 +17973,9 @@ impl ExecNtHandler {
         let runtime = self.thread_runtime.get_by_tid(tid as u64)
             .filter(|runtime| runtime.pi == mechanism.pi && !runtime.publication.is_busy())
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if self.capture_thread_process_identity(mechanism.pi, tid as u64) != Some(runtime.process) {
+            return Err(nt_process::STATUS_INVALID_HANDLE);
+        }
         let tcb = self.hosted_thread_tcb(tid as u64)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
         debug_assert_eq!(runtime.tcb, tcb);

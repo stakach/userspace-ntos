@@ -1,4 +1,5 @@
 //! Checked ownership for a registered thread whose Ps/handle publication never committed.
+use crate::process_identity::ProcessGeneration;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,7 +9,7 @@ static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 pub struct ThreadRollbackIdentity {
     pub pi: usize,
     pub pid: u32,
-    pub process_generation: u64,
+    pub process_generation: ProcessGeneration,
     pub tid: u64,
 }
 
@@ -28,7 +29,7 @@ impl ThreadRollbackId {
 pub(crate) fn new_rollback_id(
     identity: ThreadRollbackIdentity,
 ) -> Result<ThreadRollbackId, ThreadRollbackError> {
-    if identity.pid == 0 || identity.tid == 0 || identity.process_generation == 0 {
+    if identity.pid == 0 || identity.tid == 0 || !identity.process_generation.is_valid() {
         return Err(ThreadRollbackError::InvalidIdentity);
     }
     Ok(ThreadRollbackId {

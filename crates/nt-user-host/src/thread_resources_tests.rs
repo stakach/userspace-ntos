@@ -157,7 +157,7 @@ fn complete_inventory_has_exactly_one_physical_owner_per_page_including_ipc() {
         ThreadRollbackIdentity {
             pi: 27,
             pid: 90,
-            process_generation: 7,
+            process_generation: crate::process_identity::ProcessGeneration::Hosted(7),
             tid: 301,
         },
         1000,

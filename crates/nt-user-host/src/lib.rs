@@ -13,6 +13,7 @@ extern crate alloc;
 mod mechanism;
 mod ntdll;
 mod profile;
+pub mod process_identity;
 mod services;
 pub mod thread_binding;
 pub mod thread_publication;

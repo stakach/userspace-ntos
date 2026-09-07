@@ -1,5 +1,6 @@
 //! Admission for the executive's serialized thread-to-mechanism binding table.
 //! This checks routing identity, not ownership transfer or Ps thread activation.
+use crate::process_identity::ProcessIdentity;
 
 /// Captured holds, not lookups through a possibly reused current TID or badge mapping.
 /// The native adapter validates slot bounds and ownership before admission.
@@ -13,6 +14,7 @@ pub struct ThreadRuntimeReservations {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadBinding<R> {
     pub pi: usize,
+    pub process: ProcessIdentity,
     pub tid: u64,
     pub badge: u64,
     pub role: R,
@@ -55,6 +57,7 @@ pub enum ThreadBindingError {
     TcbConflict,
     DuplicateOwner,
     ReservationConflict,
+    ProcessConflict,
 }
 
 /// Plan without mutation or allocation. The caller must commit against the unchanged, exclusively
@@ -66,6 +69,7 @@ pub fn admit_thread_binding<R: Copy + Eq>(
 ) -> Result<ThreadBindingAdmission, ThreadBindingError> {
     if requested.tid == 0
         || requested.tcb == 0
+        || !requested.process.is_valid()
         || requested
             .reservations
             .is_some_and(|holds| holds.badge != requested.badge)
@@ -79,6 +83,7 @@ pub fn admit_thread_binding<R: Copy + Eq>(
                 return Err(ThreadBindingError::DuplicateOwner);
             }
             if owner.pi != requested.pi
+                || owner.process != requested.process
                 || owner.badge != requested.badge
                 || owner.role != requested.role
                 || owner.reservations != requested.reservations
@@ -93,6 +98,9 @@ pub fn admit_thread_binding<R: Copy + Eq>(
                 return Err(ThreadBindingError::TcbConflict);
             });
         } else {
+            if owner.pi == requested.pi && owner.process != requested.process {
+                return Err(ThreadBindingError::ProcessConflict);
+            }
             if owner.badge == requested.badge {
                 return Err(ThreadBindingError::BadgeConflict);
             }

@@ -133,6 +133,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Capture pool/window holds in native runtime bindings before construction, reject conflicting
   reservations, and guard allocation/release/temporary identity clearing using retained ownership
   instead of current routing lookups (tranche 60, host/build; native pending-owner activation still open).
+- [x] Give temporary process slots exact monotonic claims and retain tagged PID/generation
+  provenance in native runtime bindings before worker construction (tranche 61, host/build;
+  pending-owner activation remains open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next integrate the retained pending owner into
   native runtime/pool/window tables with process-generation validation, then wire registered-resume
@@ -26740,6 +26743,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     contains unchecked resource releases; this slice fixes reservation identity, not retry-safe
     physical cleanup. Early construction/main-process cleanup and handler-owned handoffs remain open.
     The complete win32k import gate still has 33 unresolved code imports; no desktop proof is claimed.
+
+    B3 process-runtime provenance tranche 61 (2026-09-07, host/build green):
+    `nt-user-host::process_identity` replaces the native temporary PID vector with preallocated,
+    exact temporary-process claims. Claim/release allocate no memory. A checked global counter
+    gives each claim a nonzero generation that is not restarted by slot release or table recreation;
+    invalid admission, occupied slots, duplicate PIDs and exhaustion leave ownership unchanged.
+    Exact release compares process index, PID and generation before native VSpace/commitment/window
+    bookkeeping, so a stale copied claim cannot clear a same-PID replacement. The old PID-only claim
+    type, vector constructor and unchecked registration/clearing helpers are removed.
+
+    Runtime provenance explicitly distinguishes hosted mechanism generations from temporary claim
+    generations. Equal numeric counters from different authorities are not equal identities. A
+    shared host-tested resolver requires exactly one authority at the requested process index and
+    checks the ETHREAD owner PID. The native adapter also verifies the real PM thread/process exist.
+    Main, external-debuggee and worker runtime admission all retain this provenance. Worker
+    preparation recaptures it and compares the complete reserved binding; publication tickets carry
+    it through infallible commit. Replay/promotion cannot replace PID, generation or authority, and
+    another TID cannot introduce a different lifetime into an already-owned process-index slot.
+    Suspend/resume revalidate current provenance before mutating Ps counts. Rollback identities keep
+    the generation tag as well, so future pending cleanup cannot discard the source distinction.
+
+    `hosted_process_generation` is deliberately unchanged and still resolves only the published
+    hosted mechanism. Temporary generations do not silently enable GUI queues, provider continuations
+    or win32k lifecycle admission. Captured pool/window ownership remains inclusive of all retained
+    runtime rows independently of generation, preventing stale rows from making reservations reusable.
+
+    Validation: twenty new host tests cover temporary claim/release, invalid and duplicate admission,
+    same-PID slot reuse, table recreation, changed exact claims, generation exhaustion, allocation
+    overflow, domain separation, unique authority selection, thread PID/slot mismatches, binding
+    replay/promotion, mixed-lifetime process slots, publication ticket retention and tagged rollback
+    rejection. The serialized nine-crate suite passes 1,019 tests, including 126 `nt-user-host`
+    unit/integration tests; log: `.tmp/test-process-provenance-20260907.log`. The executive build
+    passes at the unchanged 262-warning baseline and stages rootserver/hive;
+    log: `.tmp/build-process-provenance-20260907.log`. Two read-only agents reviewed the host policy
+    and native call sites; root alone ran tests/builds. Native ordering is code-reviewed/build-tested,
+    not live failure-injection proof.
+
+    Review adjustment: process provenance and reservation capture are now native. Next store the
+    pending owner in the already-allocated runtime row and separate ownership-inclusive lookup from
+    execution admission; do not add a fallible pending-table push after removing ownership. Preserve
+    exact caller cancellation, retained external-alias journals and all fault/copy/mirror/VM/pageout
+    exclusions before activating checked registered-resume cleanup. Main/early construction cleanup,
+    ordinary termination resource-release failures and handler-owned handoffs remain open. The full
+    win32k import gate still has 33 unresolved code imports; this is not desktop or live failure proof.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

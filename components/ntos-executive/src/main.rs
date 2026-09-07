@@ -24068,17 +24068,7 @@ struct CmSystemKeyTarget {
     physical_path: alloc::string::String,
 }
 
-#[derive(Clone, Copy)]
-struct TemporaryProcessSlotClaim {
-    pi: usize,
-    pid: nt_process::ProcessId,
-}
-
-impl TemporaryProcessSlotClaim {
-    fn pi(self) -> usize {
-        self.pi
-    }
-}
+type TemporaryProcessSlotClaim = nt_user_host::process_identity::TemporaryProcessClaim;
 
 struct ExecNtHandler {
     /// The REAL ReactOS **SECURITY** hive (root = `\Registry\Machine\SECURITY`) — the LSA policy
@@ -24412,7 +24402,7 @@ struct ExecNtHandler {
     process_vspace_caps: alloc::vec::Vec<Option<img_spawn::HostedProcessVspaceCaps>>,
     /// Non-hosted throwaway processes used by post-quiesce self-tests. These slots deliberately do
     /// not enter `process_mechanisms`: they have no fault badge and are not launch topology.
-    temporary_process_slots: alloc::vec::Vec<nt_process::ProcessId>,
+    temporary_process_slots: nt_user_host::process_identity::TemporaryProcessSlots,
     /// Allocation-free hosted main/pool ETHREAD identities. Backed by BSS to keep handler
     /// construction independent of table size.
     thread_mechanisms: ExecThreadMechanisms,
@@ -25764,6 +25754,7 @@ impl HostedThreadSpawnResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HostedThreadRuntime {
     pi: usize,
+    process: nt_user_host::process_identity::ProcessIdentity,
     tid: u64,
     tcb: u64,
     badge: u64,
@@ -25791,6 +25782,7 @@ impl HostedThreadRuntime {
     const fn empty() -> Self {
         Self {
             pi: 0,
+            process: nt_user_host::process_identity::ProcessIdentity::empty(),
             tid: 0,
             tcb: 0,
             badge: 0,
@@ -25814,6 +25806,7 @@ impl HostedThreadRuntime {
     fn binding(&self) -> nt_user_host::thread_binding::ThreadBinding<HostedThreadRole> {
         nt_user_host::thread_binding::ThreadBinding {
             pi: self.pi,
+            process: self.process,
             tid: self.tid,
             tcb: self.tcb,
             badge: self.badge,
@@ -25875,6 +25868,7 @@ impl HostedThreadRuntimeTable {
     fn register(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         tcb: u64,
         badge: u64,
@@ -25883,12 +25877,13 @@ impl HostedThreadRuntimeTable {
         if tcb <= 1 {
             return None;
         }
-        self.store(pi, tid, tcb, badge, role, None)
+        self.store(pi, process, tid, tcb, badge, role, None)
     }
 
     fn register_main(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         tcb: u64,
         badge: u64,
@@ -25907,7 +25902,7 @@ impl HostedThreadRuntimeTable {
         ) {
             return None;
         }
-        let runtime = self.store(pi, tid, tcb, badge, HostedThreadRole::Main, None)?;
+        let runtime = self.store(pi, process, tid, tcb, badge, HostedThreadRole::Main, None)?;
         let entry = self
             .entries
             .iter_mut()
@@ -25922,6 +25917,7 @@ impl HostedThreadRuntimeTable {
     fn prepare_spawn(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
@@ -25930,7 +25926,7 @@ impl HostedThreadRuntimeTable {
         use nt_user_host::thread_binding::{
             admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
         };
-        let key = ThreadBinding { pi, tid, badge, role, tcb: 1, reservations: Some(reservations) };
+        let key = ThreadBinding { pi, process, tid, badge, role, tcb: 1, reservations: Some(reservations) };
         let admission = admit_thread_binding(
             key,
             self.entries
@@ -25981,17 +25977,19 @@ impl HostedThreadRuntimeTable {
     fn reserve(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
         reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Option<HostedThreadRuntime> {
-        self.store(pi, tid, 1, badge, role, Some(reservations))
+        self.store(pi, process, tid, 1, badge, role, Some(reservations))
     }
 
     fn store(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         tcb: u64,
         badge: u64,
@@ -26002,7 +26000,7 @@ impl HostedThreadRuntimeTable {
             admit_thread_binding, ThreadBinding, ThreadBindingAdmission,
         };
         let admission = admit_thread_binding(
-            ThreadBinding { pi, tid, tcb, badge, role, reservations },
+            ThreadBinding { pi, process, tid, tcb, badge, role, reservations },
             self.entries
                 .iter()
                 .enumerate()
@@ -26030,6 +26028,7 @@ impl HostedThreadRuntimeTable {
         }
         let runtime = HostedThreadRuntime {
             pi,
+            process,
             tid,
             tcb,
             badge,
@@ -26204,35 +26203,38 @@ impl HostedThreadRuntimes {
     fn register(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         tcb: u64,
         badge: u64,
         role: HostedThreadRole,
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).register(pi, tid, tcb, badge, role) }
+        unsafe { (&mut *self.table).register(pi, process, tid, tcb, badge, role) }
     }
 
     fn register_main(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         tcb: u64,
         badge: u64,
         mechanism: HostedThreadMechanismCaps,
     ) -> Option<HostedThreadRuntime> {
-        unsafe { (&mut *self.table).register_main(pi, tid, tcb, badge, mechanism) }
+        unsafe { (&mut *self.table).register_main(pi, process, tid, tcb, badge, mechanism) }
     }
 
     fn prepare_spawn(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
         reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Result<PreparedHostedThreadRuntime, u32> {
-        unsafe { (&mut *self.table).prepare_spawn(pi, tid, badge, role, reservations) }
+        unsafe { (&mut *self.table).prepare_spawn(pi, process, tid, badge, role, reservations) }
     }
 
     fn cancel_spawn(&mut self, prepared: PreparedHostedThreadRuntime) {
@@ -26246,13 +26248,14 @@ impl HostedThreadRuntimes {
     fn reserve(
         &mut self,
         pi: usize,
+        process: nt_user_host::process_identity::ProcessIdentity,
         tid: u64,
         badge: u64,
         role: HostedThreadRole,
         reservations: nt_user_host::thread_binding::ThreadRuntimeReservations,
     ) -> Option<HostedThreadRuntime> {
         // SAFETY: this wrapper is the sole owner while its handler is live.
-        unsafe { (&mut *self.table).reserve(pi, tid, badge, role, reservations) }
+        unsafe { (&mut *self.table).reserve(pi, process, tid, badge, role, reservations) }
     }
 
     fn set_lpc_server_context(&mut self, badge: u64, port: u64, process: u32) -> bool {

@@ -3,6 +3,10 @@ use super::*;
 fn binding() -> ThreadBinding<u32> {
     ThreadBinding {
         pi: 27,
+        process: ProcessIdentity {
+            pid: 90,
+            generation: crate::process_identity::ProcessGeneration::Hosted(7),
+        },
         tid: 301,
         badge: 90,
         role: 3,
@@ -107,6 +111,7 @@ fn same_tid_cannot_move_process_role_or_badge() {
 fn another_tid_cannot_claim_a_live_routing_or_mechanism_identity() {
     let other = ThreadBinding {
         pi: 28,
+        process: binding().process,
         tid: 302,
         badge: 91,
         role: 4,
@@ -528,4 +533,150 @@ fn publication_ticket_retains_exact_reservations_through_failed_finish() {
     }
     assert_eq!(slot.finish(ticket, &owner).unwrap(), owner);
     assert!(!slot.is_busy());
+}
+
+fn changed_processes() -> [ProcessIdentity; 3] {
+    use crate::process_identity::ProcessGeneration;
+    [
+        ProcessIdentity {
+            pid: 91,
+            ..binding().process
+        },
+        ProcessIdentity {
+            generation: ProcessGeneration::Hosted(8),
+            ..binding().process
+        },
+        ProcessIdentity {
+            generation: ProcessGeneration::Temporary(7),
+            ..binding().process
+        },
+    ]
+}
+
+#[test]
+fn replay_and_promotion_require_exact_pid_generation_and_domain() {
+    for process in changed_processes() {
+        for tcb in [1, 100] {
+            let owner = ThreadBinding { tcb, ..pooled() };
+            assert_eq!(
+                plan(ThreadBinding { process, ..owner }, owner),
+                Err(ThreadBindingError::IdentityConflict)
+            );
+            assert_eq!(
+                plan(
+                    ThreadBinding {
+                        tcb: 100,
+                        process,
+                        ..owner
+                    },
+                    owner
+                ),
+                Err(ThreadBindingError::IdentityConflict)
+            );
+        }
+    }
+}
+
+#[test]
+fn distinct_threads_cannot_mix_process_lifetimes_in_one_vspace_slot() {
+    let owner = pooled();
+    for process in changed_processes() {
+        let requested = ThreadBinding {
+            process,
+            ..other_pooled(5, Some(20))
+        };
+        assert_eq!(
+            plan(requested, owner),
+            Err(ThreadBindingError::ProcessConflict)
+        );
+        for rows in [[(7, requested), (9, owner)], [(9, owner), (7, requested)]] {
+            assert_eq!(
+                admit_thread_binding(requested, rows),
+                Err(ThreadBindingError::ProcessConflict)
+            );
+        }
+        assert_eq!(
+            plan(
+                ThreadBinding {
+                    pi: 28,
+                    ..requested
+                },
+                owner
+            ),
+            Ok(ThreadBindingAdmission::Insert)
+        );
+    }
+}
+
+#[test]
+fn invalid_process_lifetimes_cannot_enter_the_runtime_table() {
+    use crate::process_identity::ProcessGeneration;
+    for process in [
+        ProcessIdentity {
+            pid: 0,
+            ..binding().process
+        },
+        ProcessIdentity {
+            generation: ProcessGeneration::Hosted(0),
+            ..binding().process
+        },
+        ProcessIdentity {
+            generation: ProcessGeneration::Temporary(0),
+            ..binding().process
+        },
+    ] {
+        assert_eq!(
+            admit_thread_binding(
+                ThreadBinding {
+                    process,
+                    ..binding()
+                },
+                []
+            ),
+            Err(ThreadBindingError::InvalidIdentity)
+        );
+    }
+}
+
+#[test]
+fn temporary_lifetimes_support_exact_replay_and_promotion() {
+    let owner = ThreadBinding {
+        process: ProcessIdentity {
+            generation: crate::process_identity::ProcessGeneration::Temporary(7),
+            ..binding().process
+        },
+        tcb: 1,
+        ..pooled()
+    };
+    assert_eq!(
+        admit_thread_binding(owner, []),
+        Ok(ThreadBindingAdmission::Insert)
+    );
+    assert_eq!(
+        plan(owner, owner),
+        Ok(ThreadBindingAdmission::Replay { index: 7 })
+    );
+    assert_eq!(
+        plan(ThreadBinding { tcb: 100, ..owner }, owner),
+        Ok(ThreadBindingAdmission::Promote { index: 7 })
+    );
+}
+
+#[test]
+fn publication_ticket_preserves_process_provenance_on_rejection() {
+    use crate::thread_publication::{PublicationError, ThreadPublicationSlot};
+    let owner = ThreadBinding { tcb: 1, ..pooled() };
+    let mut slot = ThreadPublicationSlot::empty();
+    let mut ticket = slot.prepare(owner).unwrap();
+    for process in changed_processes() {
+        let (error, retained) = slot
+            .finish(ticket, &ThreadBinding { process, ..owner })
+            .err()
+            .unwrap();
+        assert_eq!(error, PublicationError::OwnerChanged);
+        assert!(slot.is_busy());
+        assert_eq!(retained.owner(), &owner);
+        ticket = retained;
+    }
+    assert_eq!(slot.finish(ticket, &owner).unwrap(), owner);
 }

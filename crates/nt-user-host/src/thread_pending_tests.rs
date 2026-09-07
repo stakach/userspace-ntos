@@ -7,7 +7,7 @@ fn identity() -> ThreadRollbackIdentity {
     ThreadRollbackIdentity {
         pi: 27,
         pid: 90,
-        process_generation: 7,
+        process_generation: crate::process_identity::ProcessGeneration::Hosted(7),
         tid: 301,
     }
 }
@@ -160,7 +160,7 @@ fn invalid_identity_returns_original_payload() {
             ..identity()
         },
         ThreadRollbackIdentity {
-            process_generation: 0,
+            process_generation: crate::process_identity::ProcessGeneration::Hosted(0),
             ..identity()
         },
     ] {

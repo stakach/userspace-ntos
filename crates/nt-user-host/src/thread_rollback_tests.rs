@@ -1,11 +1,48 @@
 use super::*;
 use alloc::vec;
 
+#[test]
+fn temporary_generation_zero_is_not_a_cleanup_identity() {
+    assert!(matches!(
+        ThreadRollback::prepare(
+            ThreadRollbackIdentity {
+                process_generation: ProcessGeneration::Temporary(0),
+                ..identity()
+            },
+            10,
+            &[]
+        ),
+        Err(ThreadRollbackError::InvalidIdentity)
+    ));
+}
+
+#[test]
+fn cleanup_identity_retains_process_generation_domain() {
+    let mut rollback = ThreadRollback::prepare(
+        ThreadRollbackIdentity {
+            process_generation: ProcessGeneration::Temporary(7),
+            ..identity()
+        },
+        10,
+        &resources(),
+    )
+    .unwrap();
+    let mut io = Backend::new(rollback.id());
+    io.current.identity.process_generation = ProcessGeneration::Hosted(7);
+    assert_eq!(
+        rollback.advance(&mut io),
+        Err(ThreadRollbackError::StaleOwner)
+    );
+    assert!(io.calls.is_empty());
+    io.current = rollback.id();
+    rollback.advance(&mut io).unwrap();
+}
+
 fn identity() -> ThreadRollbackIdentity {
     ThreadRollbackIdentity {
         pi: 27,
         pid: 90,
-        process_generation: 7,
+        process_generation: ProcessGeneration::Hosted(7),
         tid: 301,
     }
 }
@@ -172,7 +209,7 @@ fn cleanup_is_stage_ordered_and_commits_target_ownership_once() {
     assert!(!io.pool_held && !io.window_held);
     assert_eq!((io.charge, io.commits), (0, 1));
     let calls = io.calls.clone();
-    io.current.identity.process_generation += 1;
+    io.current.identity.process_generation = ProcessGeneration::Hosted(8);
     owner.advance(&mut io).unwrap();
     assert_eq!(io.calls, calls);
     assert_eq!(io.commits, 1);
@@ -236,7 +273,7 @@ fn stale_identity_refuses_all_effects_at_every_retry_stage() {
                 ..identity()
             },
             ThreadRollbackIdentity {
-                process_generation: 8,
+                process_generation: ProcessGeneration::Hosted(8),
                 ..identity()
             },
             ThreadRollbackIdentity {
@@ -317,7 +354,7 @@ fn invalid_identities_and_tcb_sentinels_cannot_own_rollback() {
             ..identity()
         },
         ThreadRollbackIdentity {
-            process_generation: 0,
+            process_generation: ProcessGeneration::Hosted(0),
             ..identity()
         },
     ] {
