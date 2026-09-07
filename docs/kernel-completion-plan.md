@@ -283,6 +283,8 @@ below are historical baselines, not acceptance of the current provider cutover.
   Pointer bindings alone are not references; protect both normal and raw device/driver removal.
 - [x] Fence physical-lane dispatch lifetimes with checked job identities (tranche 112; host core). Preserve
   ownership across suspension, invalidate on completion, and reject stale transfer consumption.
+- [~] Move device-property snapshot collection into the testable I/O core (tranche 113). Validate
+  complete replies and explicit scratch ownership before publishing any native caller-buffer bytes.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28912,6 +28914,23 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     transport integration remain in tranche 110. Review additionally requires globally unique wire
     property tokens: independent per-lane counters could otherwise accept another lane's token with
     the same numeric value despite exact dispatch authentication.
+
+    Property tokens are now globally issued across every table with checked nonwrapping allocation.
+    Existing public begin/pull/abort semantics and owner checks remain intact. Four new regressions
+    cover sibling/replacement-table replay, exhaustion with live transfers and failure atomicity.
+    Five-crate validation passes 473 tests including the device-reference compile-fail test in
+    `.tmp/test-property-dispatch-ownership-20260908.log`. The first tranche 110 native release
+    build passes in `.tmp/build-win32k-device-properties-20260908.log`; client extraction and
+    final completion-cleanup validation remain outstanding before that integration checkpoint.
+
+    B3 property snapshot client tranche 113 (2026-09-08, in progress):
+
+    Extract transport-independent collection into nt-io-manager with owned private reply bytes,
+    typed begin/pull/abort requests and explicit allocator/scratch ownership. Native adapters retain
+    only ABI pointer checks, actual transport, pool allocation/release and final complete-buffer
+    publication. Test allocation failure, malformed/changed lengths and tokens, interrupted pulls,
+    abort handling and zero-progress rejection. No partial caller output and no reply-bank borrow
+    may survive an allocator IPC.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

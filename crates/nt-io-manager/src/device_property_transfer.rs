@@ -1,8 +1,11 @@
 //! Authenticated, monotonic bank transfer for one immutable hosted-device property snapshot.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{BankedTransferCursor, DeviceId, HostedDomainIdentity};
+
+static LAST_TRANSFER_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostedDevicePropertyOwner {
@@ -37,10 +40,9 @@ struct Transfer {
     cursor: BankedTransferCursor,
 }
 
-/// Generation-independent tokens are never reused during one boot. A completed, aborted, or
-/// owner-torn-down transfer therefore cannot alias a later property snapshot.
+/// Tokens are globally issued across all tables and never reused during one boot. Neither a
+/// sibling lane's transfer nor a completed, aborted, or torn-down snapshot can alias a new one.
 pub struct HostedDevicePropertyTransferTable {
-    next_token: u64,
     entries: Vec<Option<Transfer>>,
 }
 
@@ -53,7 +55,6 @@ impl Default for HostedDevicePropertyTransferTable {
 impl HostedDevicePropertyTransferTable {
     pub const fn new() -> Self {
         Self {
-            next_token: 1,
             entries: Vec::new(),
         }
     }
@@ -65,20 +66,21 @@ impl HostedDevicePropertyTransferTable {
             && owner.pdo_address != 0
     }
 
-    fn allocate_token(&mut self) -> Result<u64, HostedDevicePropertyTransferError> {
-        let token = self.next_token;
-        if token == 0 {
-            return Err(HostedDevicePropertyTransferError::InsufficientResources);
-        }
-        self.next_token = token.checked_add(1).unwrap_or(0);
-        Ok(token)
-    }
-
     pub fn begin(
         &mut self,
         owner: HostedDevicePropertyOwner,
         value: Vec<u8>,
         bank: &mut [u8],
+    ) -> Result<HostedDevicePropertyPull, HostedDevicePropertyTransferError> {
+        self.begin_with_counter(owner, value, bank, &LAST_TRANSFER_TOKEN)
+    }
+
+    fn begin_with_counter(
+        &mut self,
+        owner: HostedDevicePropertyOwner,
+        value: Vec<u8>,
+        bank: &mut [u8],
+        counter: &AtomicU64,
     ) -> Result<HostedDevicePropertyPull, HostedDevicePropertyTransferError> {
         if !Self::valid_owner(owner) {
             return Err(HostedDevicePropertyTransferError::InvalidOwner);
@@ -116,7 +118,12 @@ impl HostedDevicePropertyTransferTable {
                 .try_reserve(1)
                 .map_err(|_| HostedDevicePropertyTransferError::InsufficientResources)?;
         }
-        let token = self.allocate_token()?;
+        let previous = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                last.checked_add(1)
+            })
+            .map_err(|_| HostedDevicePropertyTransferError::InsufficientResources)?;
+        let token = previous + 1;
         let transfer = Transfer {
             token,
             owner,
@@ -366,17 +373,144 @@ mod tests {
     #[test]
     fn tokens_exhaust_without_reuse() {
         let mut table = HostedDevicePropertyTransferTable::new();
-        table.next_token = u64::MAX;
+        let counter = AtomicU64::new(u64::MAX - 1);
         let mut bank = [0u8; 1];
         let last = table
-            .begin(owner(7, 0x1000), vec![1, 2], &mut bank)
+            .begin_with_counter(owner(7, 0x1000), vec![1, 2], &mut bank, &counter)
             .unwrap();
         assert_eq!(last.token, u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         assert!(table.abort(owner(7, 0x1000), last.token));
+        bank.fill(0xa5);
         assert_eq!(
-            table.begin(owner(7, 0x1000), vec![1, 2], &mut bank),
+            table.begin_with_counter(owner(7, 0x1000), vec![1, 2], &mut bank, &counter),
             Err(HostedDevicePropertyTransferError::InsufficientResources)
         );
+        assert_eq!(bank, [0xa5]);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn sibling_tables_with_same_owner_cannot_pull_or_abort_each_others_snapshot() {
+        let mut first = HostedDevicePropertyTransferTable::new();
+        let mut second = HostedDevicePropertyTransferTable::default();
+        let owner = owner(7, 0x1000);
+        let mut bank = [0u8; 2];
+        let a = first.begin(owner, vec![1, 2, 3, 4], &mut bank).unwrap();
+        let b = second.begin(owner, vec![5, 6, 7, 8], &mut bank).unwrap();
+        assert_ne!(a.token, b.token);
+        bank.fill(0xa5);
+        assert_eq!(
+            first.pull(owner, b.token, 2, &mut bank),
+            Err(HostedDevicePropertyTransferError::UnknownTransfer)
+        );
+        assert_eq!(
+            second.pull(owner, a.token, 2, &mut bank),
+            Err(HostedDevicePropertyTransferError::UnknownTransfer)
+        );
+        assert_eq!(bank, [0xa5; 2]);
+        assert!(!first.abort(owner, b.token));
+        assert!(!second.abort(owner, a.token));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(first.pull(owner, a.token, 2, &mut bank).unwrap().complete);
+        assert_eq!(bank, [3, 4]);
+        assert!(second.pull(owner, b.token, 2, &mut bank).unwrap().complete);
+        assert_eq!(bank, [7, 8]);
+    }
+
+    #[test]
+    fn replacement_tables_cannot_reissue_retired_tokens() {
+        let owner = owner(7, 0x1000);
+        let mut bank = [0u8; 1];
+        let old = {
+            let mut table = HostedDevicePropertyTransferTable::new();
+            table.begin(owner, vec![1, 2], &mut bank).unwrap().token
+        };
+        let mut replacement = HostedDevicePropertyTransferTable::new();
+        let new = replacement.begin(owner, vec![3, 4], &mut bank).unwrap();
+        assert!(new.token > old);
+        assert!(!replacement.abort(owner, old));
+        assert_eq!(
+            replacement.pull(owner, old, 1, &mut bank),
+            Err(HostedDevicePropertyTransferError::UnknownTransfer)
+        );
+        assert_eq!(bank, [3]);
+        assert!(
+            replacement
+                .pull(owner, new.token, 1, &mut bank)
+                .unwrap()
+                .complete
+        );
+        assert_eq!(bank, [4]);
+    }
+
+    #[test]
+    fn exhaustion_preserves_other_snapshot_and_new_table_cannot_reset_counter() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let mut table = HostedDevicePropertyTransferTable::new();
+        let mut bank = [0u8; 1];
+        let last = table
+            .begin_with_counter(owner(7, 0x1000), vec![1, 2], &mut bank, &counter)
+            .unwrap();
+        bank.fill(0xa5);
+        assert_eq!(
+            table.begin_with_counter(owner(8, 0x2000), vec![3, 4], &mut bank, &counter),
+            Err(HostedDevicePropertyTransferError::InsufficientResources)
+        );
+        assert_eq!(table.len(), 1);
+        assert!(table.domain_busy(owner(7, 0x1000).domain));
+        assert!(!table.domain_busy(owner(8, 0x2000).domain));
+        assert_eq!(bank, [0xa5]);
+        let mut fresh = HostedDevicePropertyTransferTable::default();
+        assert_eq!(
+            fresh.begin_with_counter(owner(7, 0x1000), vec![3, 4], &mut bank, &counter),
+            Err(HostedDevicePropertyTransferError::InsufficientResources)
+        );
+        assert!(fresh.is_empty());
+        assert_eq!(bank, [0xa5]);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(
+            table
+                .pull(owner(7, 0x1000), last.token, 1, &mut bank)
+                .unwrap()
+                .complete
+        );
+        assert_eq!(bank, [2]);
+    }
+
+    #[test]
+    fn failed_preflight_and_single_bank_results_do_not_issue_tokens() {
+        let counter = AtomicU64::new(0);
+        let mut table = HostedDevicePropertyTransferTable::new();
+        let mut bank = [0xa5; 1];
+        assert_eq!(
+            table.begin_with_counter(owner(0, 0x1000), vec![1, 2], &mut bank, &counter),
+            Err(HostedDevicePropertyTransferError::InvalidOwner)
+        );
+        assert_eq!(
+            table.begin_with_counter(owner(7, 0x1000), vec![1, 2], &mut [], &counter),
+            Err(HostedDevicePropertyTransferError::EmptyBank)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(bank, [0xa5]);
+        let single = table
+            .begin_with_counter(owner(7, 0x1000), vec![1], &mut bank, &counter)
+            .unwrap();
+        assert_eq!(single.token, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let held = table
+            .begin_with_counter(owner(7, 0x1000), vec![2, 3], &mut bank, &counter)
+            .unwrap();
+        assert_eq!(held.token, 1);
+        bank.fill(0xa5);
+        assert_eq!(
+            table.begin_with_counter(owner(7, 0x2000), vec![4, 5], &mut bank, &counter),
+            Err(HostedDevicePropertyTransferError::Busy)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(bank, [0xa5]);
+        assert_eq!(table.len(), 1);
     }
 }
