@@ -53,6 +53,8 @@ pub(crate) use hosted_loaded_images::*;
 mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
+mod ps_bootstrap;
+mod sec_image_diagnostic;
 use process_vm_retirement::reclaim_final_process_vm;
 mod hosted_driver_projection;
 mod rendezvous;
@@ -16447,32 +16449,7 @@ unsafe fn reply_recv_badge(
     r3: u64,
 ) -> (u64, u64, u64, u64, u64, u64) {
     let reply_cptr = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-    if reply_cptr == 0 {
-        // Pre-retype (the demo/no-ntdll path reaches the loop before the reply objects exist):
-        // fall back to the legacy `reply_to` reply. No component can have run yet, so `reply_to`
-        // still names this caller.
-        let badge: u64;
-        let msginfo: u64;
-        let mr0: u64;
-        let mr1: u64;
-        let mr2: u64;
-        let mr3: u64;
-        core::arch::asm!(
-            "syscall",
-            in("rdx") SYS_REPLY_RECV as u64,
-            inout("rdi") recv_ep => badge,
-            inout("rsi") reply_len => msginfo,
-            inout("r10") r0 => mr0,
-            inout("r8") r1 => mr1,
-            inout("r9") r2 => mr2,
-            inout("r15") r3 => mr3,
-            in("r12") 0u64,
-            in("r13") 0u64,
-            lateout("rax") _, lateout("rcx") _, lateout("r11") _,
-            options(nostack),
-        );
-        return (badge, msginfo, mr0, mr1, mr2, mr3);
-    }
+    assert_ne!(reply_cptr, 0, "live fault replies require their bound Reply object");
     client_reply_recv_badge(recv_ep, reply_cptr, reply_len, r0, r1, r2, r3)
 }
 
@@ -24515,25 +24492,26 @@ struct PendingPnpOperation {
 
 static mut EXEC_NT_HANDLER_WORK: core::mem::MaybeUninit<ExecNtHandler> =
     core::mem::MaybeUninit::uninit();
+static EXEC_NT_HANDLER_INITIALIZED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 #[inline(never)]
-unsafe fn reset_exec_nt_handler(
+unsafe fn initialize_exec_nt_handler_once(
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     driver_starts: DriverStartBootstrap,
-    require_boot_system: bool,
     bootstrap_system_journal_records: u32,
     provider_local_events: Vec<exec_handler::ProviderLocalEventTransfer>,
     provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
 ) -> &'static mut ExecNtHandler {
+    assert!(!EXEC_NT_HANDLER_INITIALIZED.swap(true, Ordering::AcqRel),
+        "the live executive handler has one owner and cannot be reinitialized");
     let slot = core::ptr::addr_of_mut!(EXEC_NT_HANDLER_WORK) as *mut ExecNtHandler;
-    // SAFETY: `service_sec_image` is serialized and owns the returned exclusive borrow until the
-    // service loop exits. Reinitializing this slot intentionally leaks the previous bump-heap-backed
-    // contents, matching the rest of the rootserver bootstrap allocator model.
+    // SAFETY: one-time initialization above claims the slot. The live service owns the returned
+    // exclusive borrow for the rest of its lifetime; diagnostic loops never instantiate it.
     ExecNtHandler::initialize_in(
         slot,
         hosted_images,
         driver_starts,
-        require_boot_system,
         bootstrap_system_journal_records,
         provider_local_events,
         provider_timers,
@@ -26933,9 +26911,10 @@ static CSR_AUTHENTIC_ACCEPT_MASK: AtomicU64 = AtomicU64::new(0);
 // have not yet moved behind owned records.
 /// How many hosted EPROCESS objects the live ProcessManager holds once the boot frontier is reached.
 static PM_PROC_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Total EPROCESS objects owned by ProcessManager. At quiescence this must match the hosted
-/// mechanism table exactly; an unmatched object is a leaked or unpublished process identity.
+/// Total EPROCESS objects owned by ProcessManager. At quiescence every object must belong to the
+/// hosted mechanism table or the explicitly retained initial System identity.
 static PM_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PM_INITIAL_SYSTEM_OBJECT_PRESENT: AtomicU64 = AtomicU64::new(0);
 /// Hosted EPROCESS allocations performed by real `NtCreateProcess[Ex]` calls after the SMSS
 /// bootstrap trio.
 static PM_DYNAMIC_PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -28555,6 +28534,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
 
     // The executive front-end allocates (ObjectClient etc.), so give it its own heap.
     map_own_heap();
+    ps_bootstrap::initialize(_start as *const () as u64, bootinfo as u64)
+        .expect("initialize canonical Ps and token ownership before provider activation");
     register_boot_persistent_clock(bi);
     if !client_frame_registry_reserve_initial() {
         panic!("client frame registry allocation failed");
@@ -29159,27 +29140,22 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             0,
             0,
         );
-        let _ = tcb_resume(spawn.main_tcb);
         if ensure_executive_paging(BOOT_SEC_IMAGE_SCRATCH_BASE) {
-            let (v, f, _, _, _, _, _, _, _, _) = service_sec_image(
+            let (v, f) = sec_image_diagnostic::run(
                 si_fault,
                 spawn,
                 sec_image_test_image,
                 &pe,
                 BOOT_SEC_IMAGE_SCRATCH_BASE,
-                None,
-                DriverStartBootstrap::with_capacity(PENDING_DRIVER_LOAD_INITIAL_CAPACITY),
-                0,
             );
-            assert!(release_unpublished_sec_image_spawn(
-                SEC_IMAGE_SELFTEST_PI,
-                spawn,
-            ));
             si_verdict = v;
             si_faults = f;
         } else {
             print_str(b"[ntos-exec] SEC_IMAGE scratch paging unavailable\n");
         }
+        assert!(release_unpublished_sec_image_spawn(SEC_IMAGE_SELFTEST_PI, spawn));
+        assert_eq!(cnode_delete_recycle_r(si_fault_c), 0);
+        assert_eq!(cnode_delete_recycle_r(si_fault), 0);
     }
     print_str(b"[ntos-exec] SEC_IMAGE: PE ran demand-paged, read .rdata magic=0x");
     print_hex((si_verdict >> 32) as u32);
@@ -32517,6 +32493,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     register_hosted_process_runtime_for_image(smss_image)
                         .expect("SMSS runtime layout must register before live SEC_IMAGE spawn");
                     let smss_fault_c = mint_badged(si_fault, smss_image.top_badge);
+                    let smss_client_id = ps_bootstrap::hosted_main_client_id(smss_image.pi)
+                        .expect("SMSS must own its canonical ClientId before spawn");
                     let spawn = spawn_hosted_sec_image_for_image(
                         smss_image,
                         &pe,
@@ -32525,8 +32503,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         true,
                         false,
                         smss_ldrp_rva,
-                        0,
-                        0,
+                        u64::from(smss_client_id.unique_process),
+                        u64::from(smss_client_id.unique_thread),
                     );
                     print_str(b"[diag-smss] spawn returned pml4=0x");
                     print_hex((spawn.pml4 >> 32) as u32);
@@ -32547,7 +32525,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     // from OUR DLL's bytes; otherwise the real ntdll (fallback).
                     print_str(b"[diag-smss] entering service loop\n");
                     let (
-                        heap_verdict,
                         sfaults,
                         sfirst,
                         sstop,
@@ -32563,7 +32540,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         smss_image,
                         &pe,
                         SCRATCH_BASE,
-                        Some((NTDLL_BASE, smss_ntdll_pe)),
+                        (NTDLL_BASE, smss_ntdll_pe),
                         driver_start_bootstrap,
                         installed_state.journal_records,
                     );
@@ -32625,11 +32602,8 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     print_hex(sstop as u32);
                     print_str(b" ntalloc_serviced=");
                     print_u64(NTALLOC_SERVICED.load(Ordering::Relaxed));
-                    print_str(b" rtlcreateheap=0x");
-                    print_hex((heap_verdict >> 32) as u32);
-                    print_hex(heap_verdict as u32);
                     print_str(b"\n");
-                    let _ = (sfirst, sssn, heap_verdict);
+                    let _ = sssn;
                     let kuser_alias = kuser_page_alias_get(0);
                     let kuser_initial_tick =
                         KUSER_CLOCK_INITIAL_TICK.load(Ordering::Acquire) as u32;
@@ -32842,14 +32816,17 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                         &mut passed,
                     );
                     // nt-process convergence: the live hosted mechanism table and ProcessManager
-                    // must describe the same object set. Executable-catalog admissions are
+                    // plus the retained initial System identity must describe the same object set.
+                    // Executable-catalog admissions are
                     // historical and may outlive a short-lived process, so they are not process
                     // lifecycle authority.
                     let hosted_process_count = PM_PROC_COUNT.load(Ordering::Relaxed);
                     check(
                         b"exec_process_manager_up",
                         hosted_process_count != 0
-                            && PM_OBJECT_COUNT.load(Ordering::Relaxed) == hosted_process_count,
+                            && PM_INITIAL_SYSTEM_OBJECT_PRESENT.load(Ordering::Relaxed) == 1
+                            && PM_OBJECT_COUNT.load(Ordering::Relaxed)
+                                == hosted_process_count + PM_INITIAL_SYSTEM_OBJECT_PRESENT.load(Ordering::Relaxed),
                         &mut passed,
                     );
                     check(

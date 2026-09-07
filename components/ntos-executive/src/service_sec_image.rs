@@ -4884,65 +4884,48 @@ pub(crate) unsafe fn watchdog_defer_if_hosted_work_can_run(site: &[u8]) -> bool 
 unsafe fn load_hosted_bootstrap_image(
     catalog: &mut nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
     loaded_images: &mut HostedLoadedImageTable,
-    enabled: bool,
     index: usize,
     spec: HostedBootstrapLoadSpec,
 ) {
-    if enabled {
+    print_str(b"[sec-init] bootstrap-image item=");
+    print_u64(index as u64);
+    print_str(b" pi=");
+    print_u64(spec.image.pi as u64);
+    print_str(b" stem=");
+    print_str(spec.stem);
+    print_str(b" load-begin\n");
+    let (pe, va) = load_dll_from_fs(spec.disk_path, spec.stem);
+    if let Some(ref image_pe) = pe {
         print_str(b"[sec-init] bootstrap-image item=");
         print_u64(index as u64);
-        print_str(b" pi=");
-        print_u64(spec.image.pi as u64);
-        print_str(b" stem=");
-        print_str(spec.stem);
-        print_str(b" load-begin\n");
-    }
-    let (pe, va) = if enabled {
-        load_dll_from_fs(spec.disk_path, spec.stem)
-    } else {
-        (None, 0)
-    };
-    if let Some(ref image_pe) = pe {
-        if enabled {
-            print_str(b"[sec-init] bootstrap-image item=");
-            print_u64(index as u64);
-            print_str(b" relocate-begin\n");
-        }
+        print_str(b" relocate-begin\n");
         apply_relocations_to_buf(image_pe, va, PE_LOAD_BASE);
         let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
         core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, PE_LOAD_BASE);
-        if enabled {
-            print_str(b"[sec-init] bootstrap-image item=");
-            print_u64(index as u64);
-            print_str(b" relocate-end\n");
-        }
+        print_str(b"[sec-init] bootstrap-image item=");
+        print_u64(index as u64);
+        print_str(b" relocate-end\n");
     }
     let loaded = pe.is_some();
-    if enabled {
-        print_str(b"[sec-init] bootstrap-image item=");
-        print_u64(index as u64);
-        print_str(b" catalog-begin loaded=");
-        print_u64(loaded as u64);
-        print_str(b" va=0x");
-        print_hex((va >> 32) as u32);
-        print_hex(va as u32);
-        print_str(b"\n");
-    }
+    print_str(b"[sec-init] bootstrap-image item=");
+    print_u64(index as u64);
+    print_str(b" catalog-begin loaded=");
+    print_u64(loaded as u64);
+    print_str(b" va=0x");
+    print_hex((va >> 32) as u32);
+    print_hex(va as u32);
+    print_str(b"\n");
     register_loaded_hosted_image(catalog, spec.image, loaded)
         .expect("hosted bootstrap image metadata must register once when loaded");
-    if enabled {
-        print_str(b"[sec-init] bootstrap-image item=");
-        print_u64(index as u64);
-        print_str(b" loaded-table-begin\n");
-    }
+    print_str(b"[sec-init] bootstrap-image item=");
+    print_u64(index as u64);
+    print_str(b" loaded-table-begin\n");
     loaded_images
         .register_if_loaded(spec.image, pe, va)
         .expect("loaded hosted executable PE metadata must register once");
-    if enabled {
-        print_str(b"[sec-init] bootstrap-image item=");
-        print_u64(index as u64);
-        print_str(b" end\n");
-    }
+    print_str(b"[sec-init] bootstrap-image item=");
+    print_u64(index as u64);
+    print_str(b" end\n");
 }
 
 #[derive(Clone, Copy)]
@@ -5567,7 +5550,7 @@ unsafe fn dump_shell_launch_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -5675,7 +5658,7 @@ unsafe fn dump_lsa_readiness_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -5774,7 +5757,7 @@ unsafe fn dump_services_start_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -5830,7 +5813,7 @@ unsafe fn dump_interactive_shell_frontier_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -5955,7 +5938,7 @@ fn hosted_exe_spawn_for<'a>(
 unsafe fn spawn_requested_hosted_exe(
     request: nt_exe_image::SpawnRequest,
     spec: HostedExeSpawn<'_>,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     fault_ep: u64,
     procs: &mut [ProcExec],
     nt_handler: &mut ExecNtHandler,
@@ -5975,7 +5958,7 @@ unsafe fn spawn_requested_hosted_exe(
         spec.image,
         spec.pe,
         mint_badged(fault_ep, spec.image.top_badge),
-        ntdll,
+        Some(ntdll),
         true,
         false,
         0,
@@ -6499,8 +6482,6 @@ unsafe fn observe_completed_dialog_modal_dispatch(
     let _ = winlogon_dialog_modal_observe(dispatch.ssn, dispatch.status, hwnd, message);
 }
 
-/// Service a SEC_IMAGE process: on each VMFault, fault the faulting image page in BY RVA from
-/// the PE file (scratch frames rotate from `scratch_base`); on SSN_DONE, capture the verdict.
 /// Capture region inside the shared win32k ARG frame (4 pages, mapped in BOTH the executive and
 /// win32k). SSN 0x10FA (`NtUserProcessConnect`) uses the frame from offset 0, so captures live in the
 /// upper pages. Slots are handed out ROUND-ROBIN: window creation re-enters win32k through user-mode
@@ -7962,21 +7943,18 @@ unsafe fn capture_builtin_class_key(
     BuiltinClassKey::decode(&wnd, class_name, class_version, menu_name, fn_id, flags)
 }
 
-/// Faults are routed to the main image (at PE_LOAD_BASE) or, if present, a second image `ntdll`
-/// at `(base, pe)` — so smss's resolved ntdll calls fault ntdll's pages in and EXECUTE. SAFE
-/// STOP: halt (don't loop) on a fault outside BOTH images (a null deref / bad address), a
-/// non-VMFault (#GP), or a fault cap. Returns (verdict, faults, first, stop, ntdll_faults).
+/// Initialize the live executive once and service its hosted processes, starting with the primary
+/// image and its ntdll. Generated SEC_IMAGE probes use `sec_image_diagnostic` instead.
 pub(crate) unsafe fn service_sec_image(
     fault_ep: u64,
     primary_spawn: img_spawn::SecImageSpawn,
     primary_image: nt_exe_image::HostedProcessImageRef<'static>,
     pe: &nt_pe_loader::PeFile,
     scratch_base: u64,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     driver_starts: DriverStartBootstrap,
     bootstrap_system_journal_records: u32,
 ) -> (
-    u64,
     u64,
     u64,
     u64,
@@ -7989,15 +7967,11 @@ pub(crate) unsafe fn service_sec_image(
 ) {
     let pml4 = primary_spawn.pml4;
     let main_tcb = primary_spawn.main_tcb;
-    let live_service = ntdll.is_some();
     loader_trace_clear();
     reset_deferred_user_callback_returns();
     let img_end = PE_LOAD_BASE + image_extent(pe);
-    let (nt_base, nt_end) = match ntdll {
-        Some((b, npe)) => (b, b + image_extent(npe)),
-        None => (0, 0),
-    };
-    let mut verdict = 0u64;
+    let nt_base = ntdll.0;
+    let nt_end = nt_base + image_extent(ntdll.1);
     let mut faults: u64;
     // Per-process demand-fault backstop (see the use sites). BATCH-22: raised from 2000 now that the
     // persistent scratch VA is decoupled from this count (bounded ≤256 slots) — it's a frame-budget /
@@ -8008,7 +7982,7 @@ pub(crate) unsafe fn service_sec_image(
     // process's whole DLL tree, so raised 6000→15000 (headroom under 16384) to let lsass's full
     // LSA-init tree page in eagerly without hitting the cap. Runaway/frame-pool guard only.
     let mut first: u64;
-    let mut stop = 0u64;
+    let mut stop: u64;
     let mut ntfaults: u64;
     let mut stop_ssn = 0u64;
     let mut iters = 0u64;
@@ -8055,8 +8029,7 @@ pub(crate) unsafe fn service_sec_image(
     // stack maps during a DllMain. NtOpenSection records the handle; NtMapViewOfSection maps the
     // staged c_20127.nls frames into csrss.
     let mut nls_section_handle = 0u64;
-    // Only the LIVE smss run (ntdll present) launches hosted child EXEs; the earlier demo SEC_IMAGE
-    // call has no FS/pool, so skip the reads there. The bootstrap manifest supplies disk paths,
+    // The bootstrap manifest supplies disk paths,
     // image identity, and runtime layout; each loaded PE is relocated to PE_LOAD_BASE and published
     // into the loaded-image registry below.
     let mut csrss_pi = usize::MAX;
@@ -8081,22 +8054,17 @@ pub(crate) unsafe fn service_sec_image(
         .register_if_loaded(primary_image, Some(primary_pe), primary_bytes.as_ptr() as u64)
         .expect("primary executable backing must register once");
     let hosted_loaded_images_ptr = hosted_loaded_images as *mut HostedLoadedImageTable;
-    if live_service {
-        print_str(b"[sec-init] bootstrap-image-load begin\n");
-    }
+    print_str(b"[sec-init] bootstrap-image-load begin\n");
     for index in 0..HOSTED_BOOTSTRAP_LOAD_COUNT {
         let spec = hosted_bootstrap_load_spec(index).expect("bootstrap load spec index is bounded");
         load_hosted_bootstrap_image(
             exe_image_catalog,
             hosted_loaded_images,
-            live_service,
             index,
             spec,
         );
     }
-    if live_service {
-        print_str(b"[sec-init] bootstrap-image-load end\n");
-    }
+    print_str(b"[sec-init] bootstrap-image-load end\n");
     // Generic DLL registry: the loadable DLLs each hosted process's ntdll loader resolves +
     // demand-pages — csrss's static import csrsrv.dll + its CsrLoadServerDll ServerDlls
     // basesrv/winsrv, the shared Win32 client stack (kernel32/user32/gdi32/rpcrt4/…), winlogon's
@@ -8136,56 +8104,47 @@ pub(crate) unsafe fn service_sec_image(
     ];
     // Parsed-PE storage lives for the whole service loop. `ExecLoopCtx::dll_pes()` derives a slice
     // from this vector each dispatch, so demand-load slot growth cannot leave a stale parallel ref
-    // table behind. Only the LIVE run (ntdll present) mounts the pool/FS + demand-loads; the demo
-    // SEC_IMAGE call leaves every slot None.
+    // table behind.
     let dll_pe_store = reset_service_dll_pe_store_work();
     let mut reg = nt_dll_registry::Registry::new(DLL_ARENA_START, DLL_ARENA_END);
-    if live_service {
-        print_str(b"[sec-init] pinned-dll-load begin\n");
-        // (1) Load + register + relocate the pinned csrsrv at slot 0 (base 0x8000_0000, delta 0).
-        for (i, &(stem, path)) in DLL_PINS.iter().enumerate() {
-            print_str(b"[sec-init] pinned-dll-load item=");
-            print_u64(i as u64);
-            print_str(b" stem=");
-            print_str(stem);
-            print_str(b"\n");
-            let (pe, va) = load_dll_from_fs(path, stem);
-            let (sz, ent) = pe
-                .as_ref()
-                .map(|p| (image_extent(p), p.entry_point_rva()))
-                .unwrap_or((0, 0));
-            let slot = reg.register(stem, sz, ent);
-            if let Some(ref p) = pe {
-                let base = reg.base(slot);
-                apply_relocations_to_buf(p, va, base);
-                let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
-                core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
-            }
-            if dll_pe_store.set(slot, pe).is_err() {
-                print_str(b"[sec-init] dll-pe-store pin allocation failed slot=");
-                print_u64(slot as u64);
-                print_str(b"\n");
-            }
+    print_str(b"[sec-init] pinned-dll-load begin\n");
+    // (1) Load + register + relocate the pinned csrsrv at slot 0 (base 0x8000_0000, delta 0).
+    for (i, &(stem, path)) in DLL_PINS.iter().enumerate() {
+        print_str(b"[sec-init] pinned-dll-load item=");
+        print_u64(i as u64);
+        print_str(b" stem=");
+        print_str(stem);
+        print_str(b"\n");
+        let (pe, va) = load_dll_from_fs(path, stem);
+        let (sz, ent) = pe
+            .as_ref()
+            .map(|p| (image_extent(p), p.entry_point_rva()))
+            .unwrap_or((0, 0));
+        let slot = reg.register(stem, sz, ent);
+        if let Some(ref p) = pe {
+            let base = reg.base(slot);
+            apply_relocations_to_buf(p, va, base);
+            let e_lfanew = core::ptr::read_volatile((va + 0x3c) as *const u32) as u64;
+            core::ptr::write_volatile((va + e_lfanew + 0x30) as *mut u64, base);
         }
-        print_str(b"[sec-init] pinned-dll-load end\n");
+        if dll_pe_store.set(slot, pe).is_err() {
+            print_str(b"[sec-init] dll-pe-store pin allocation failed slot=");
+            print_u64(slot as u64);
+            print_str(b"\n");
+        }
     }
+    print_str(b"[sec-init] pinned-dll-load end\n");
     // (2) Reserve empty metadata slots from the live System32 cache. VA is consumed only when a real
     // image activates one; this is a performance/persistence reserve, not a hard ceiling.
-    let dll_slot_reserve = if live_service {
-        match exec_fs().and_then(|fs| system32_cache_slot_reserve_hint(&fs)) {
-            Some(count) => count.max(DLL_PIN_COUNT),
-            None => DLL_PIN_COUNT,
-        }
-    } else {
-        0
+    let dll_slot_reserve = match exec_fs().and_then(|fs| system32_cache_slot_reserve_hint(&fs)) {
+        Some(count) => count.max(DLL_PIN_COUNT),
+        None => DLL_PIN_COUNT,
     };
-    if live_service {
-        print_str(b"[sec-init] dll-reserve begin\n");
-        print_str(b"[sec-init] dll-reserve target=");
-        print_u64(dll_slot_reserve as u64);
-        print_str(b"\n");
-    }
-    while live_service && reg.len() < dll_slot_reserve {
+    print_str(b"[sec-init] dll-reserve begin\n");
+    print_str(b"[sec-init] dll-reserve target=");
+    print_u64(dll_slot_reserve as u64);
+    print_str(b"\n");
+    while reg.len() < dll_slot_reserve {
         match reg.try_reserve_slot() {
             Ok(slot) => {
                 if dll_pe_store.ensure_slot(slot).is_err() {
@@ -8203,31 +8162,19 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
     }
-    if live_service {
-        print_str(b"[sec-init] dll-reserve end\n");
-    }
+    print_str(b"[sec-init] dll-reserve end\n");
     // The real NT syscall path (seam): dispatch SSNs the handler implements; the remaining legacy
     // broker-owned SSNs continue through the broker match below.
     let nt_dispatcher = NativeSyscallDispatcher::new(build_nt_table());
-    let provider_dispatcher = if live_service {
-        take_provider_dispatcher_transfer()
-    } else {
-        ProviderDispatcherTransfer {
-            local_events: Vec::new(),
-            timers: None,
-        }
-    };
-    let mut nt_handler = reset_exec_nt_handler(
+    let provider_dispatcher = take_provider_dispatcher_transfer();
+    let mut nt_handler = initialize_exec_nt_handler_once(
         exe_image_catalog as *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts,
-        live_service,
         bootstrap_system_journal_records,
         provider_dispatcher.local_events,
         provider_dispatcher.timers,
     );
-    if live_service {
-        print_str(b"[sec-init] handler-ready\n");
-    }
+    print_str(b"[sec-init] handler-ready\n");
     nt_handler.register_main_thread_spawn(primary_pi, primary_spawn);
     let delay_queue = reset_service_delay_queue_work().expect("delay wait queue allocation failed");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
@@ -8235,17 +8182,15 @@ pub(crate) unsafe fn service_sec_image(
     // delay queue. Registration is the first point at which those deadlines can
     // be armed on HPET, so do not wait for an unrelated later timer operation.
     let _ = rearm_registered_delay_timer();
-    if ntdll.is_some() {
-        publish_kuser_clocks();
-        let alias = kuser_page_alias_get(0);
-        if alias != 0 {
-            KUSER_CLOCK_INITIAL_TICK.store(
-                u64::from(nt_ntdll_layout::kuser::read_tick_count(alias as *const u8)),
-                Ordering::Release,
-            );
-        }
-        KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
+    publish_kuser_clocks();
+    let alias = kuser_page_alias_get(0);
+    if alias != 0 {
+        KUSER_CLOCK_INITIAL_TICK.store(
+            u64::from(nt_ntdll_layout::kuser::read_tick_count(alias as *const u8)),
+            Ordering::Release,
+        );
     }
+    KUSER_CLOCK_INIT_OK.store(true, Ordering::Release);
     // Per-hosted-process state, indexed by fault badge (0 = smss, 1 = csrss). The SINGLE service
     // loop multiplexes both: each thread faults through a fault-EP cap minted with its badge, so the
     // recv badge selects whose VSpace / image / scratch / fault-bookkeeping to use. Slot 1 (csrss)
@@ -8254,17 +8199,13 @@ pub(crate) unsafe fn service_sec_image(
     // are LOADED from these at the top of each iteration and SAVED back before each recv, so the
     // ~30 body references stay unchanged.
     // Primary PE (the function param `pe` is shadowed per-iteration to the active process's image).
-    // Live SMSS is still the usual primary process, while early SEC_IMAGE diagnostics use their own
-    // dynamic process identity so their address-space bookkeeping cannot bleed into process 0.
+    // The generated SEC_IMAGE diagnostic uses its own fault loop, never this live service state.
     let primary_pe: &nt_pe_loader::PeFile = pe;
-    // Bind the pre-created main ETHREAD to the primary image entry. Only on the LIVE run
-    // (ntdll present); the early demo path has no process-manager thread object.
-    if ntdll.is_some() {
-        nt_handler.bind_main_thread_entry(
-            primary_pi,
-            PE_LOAD_BASE + primary_pe.entry_point_rva() as u64,
-        );
-    }
+    // Bind the pre-created main ETHREAD to the primary image entry.
+    nt_handler.bind_main_thread_entry(
+        primary_pi,
+        PE_LOAD_BASE + primary_pe.entry_point_rva() as u64,
+    );
     // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
     // the initial recv; later hosted processes claim their pid on the native create-process path and
     // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.
@@ -8277,11 +8218,9 @@ pub(crate) unsafe fn service_sec_image(
             .unwrap_or(0);
     }
     procs[primary_pi].pml4 = pml4;
-    if nt_handler.pm_pid_for_pi(primary_pi).is_some() {
-        nt_handler
-            .publish_hosted_process_vspace(primary_pi, primary_spawn.vspace_caps)
-            .expect("primary VSpace publication requires a registered bootstrap process");
-    }
+    nt_handler
+        .publish_hosted_process_vspace(primary_pi, primary_spawn.vspace_caps)
+        .expect("primary VSpace publication requires a registered bootstrap process");
     procs[primary_pi].scratch_base = scratch_base;
     procs[primary_pi].img_end = img_end;
     // Per-process demand-fill bookkeeping is kept out of the bounded rootserver stack. It is now a
@@ -8333,7 +8272,7 @@ pub(crate) unsafe fn service_sec_image(
     if pending_driver_start_redrive_needed(&nt_handler) {
         let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
     }
-    if live_service {
+    {
         let resume_error = tcb_resume_r(main_tcb);
         if resume_error != 0 {
             print_str(b"[thread-life] primary resume after service init failed pi=");
@@ -8638,11 +8577,8 @@ pub(crate) unsafe fn service_sec_image(
         filled_pages: &mut pfilled[primary_pi] as *mut [u64; 512],
         faults: &mut procs[primary_pi].faults as *mut u64,
         scratch_base,
-        ntdll_pe: match ntdll {
-            Some((_, npe)) => npe as *const nt_pe_loader::PeFile as *const ()
-                as *const nt_pe_loader::PeFile<'static>,
-            None => core::ptr::null(),
-        },
+        ntdll_pe: ntdll.1 as *const nt_pe_loader::PeFile as *const ()
+            as *const nt_pe_loader::PeFile<'static>,
         img_end,
         nt_base,
         nt_end,
@@ -8726,7 +8662,7 @@ pub(crate) unsafe fn service_sec_image(
         {
             let _ = pump_hosted_io_and_redrive_driver_starts(&mut nt_handler);
         }
-        if ntdll.is_some() {
+        {
             let started = crate::disk_census_ticks();
             publish_kuser_clocks();
             crate::LOOP_KUSER_TICKS.fetch_add(
@@ -9273,7 +9209,8 @@ pub(crate) unsafe fn service_sec_image(
             // reply sets IP/SP/FLAGS (length 3); the general registers are preserved.
             let fip = m0;
             let mut skipped = false;
-            if let Some((nb, npe)) = ntdll {
+            {
+                let (nb, npe) = ntdll;
                 if fip >= nb && fip < nb + image_extent(npe) {
                     if pe_byte_at_rva(npe, (fip - nb) as u32) == Some(0xCD) {
                         // Skip `int 0x2d; int3` (3 bytes) — the no-op DebugService.
@@ -9338,7 +9275,7 @@ pub(crate) unsafe fn service_sec_image(
                     crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
                 }
                 let (rip, rsp, rax, rcx, rdx) = (regs[0], regs[1], regs[3], regs[5], regs[6]);
-                let ntdll_base = ntdll.map(|(nb, _)| nb).unwrap_or(0);
+                let ntdll_base = ntdll.0;
                 print_str(b"[cs-diag] label=3 exc#=");
                 print_u64(m3);
                 print_str(b" code=0x");
@@ -9454,7 +9391,8 @@ pub(crate) unsafe fn service_sec_image(
                 let mut shown = 0;
                 for i in 0..96u64 {
                     if let Some(v) = read_wl(rsp + i * 8) {
-                        if let Some((nb, npe)) = ntdll {
+                        {
+                            let (nb, npe) = ntdll;
                             if v >= nb && v < nb + image_extent(npe) {
                                 print_str(b" n+0x");
                                 print_hex((v - nb) as u32);
@@ -9542,17 +9480,13 @@ pub(crate) unsafe fn service_sec_image(
             let debug_ip = m0;
             let debug_reason = m1;
             let tcb = event_runtime.tcb;
-            if tcb != 0 && ntdll.is_some() {
+            if tcb != 0 {
                 let mut regs = [0u64; 20];
                 crate::win32k_glue::tcb_read_regs20(tcb, &mut regs);
                 let rip = regs[0];
                 let rcx = regs[5];
                 let rsp = regs[1];
-                let raise_rva = if let Some((nb, _)) = ntdll {
-                    rip.wrapping_sub(nb)
-                } else {
-                    rip
-                };
+                let raise_rva = rip.wrapping_sub(ntdll.0);
                 print_str(b"[bp-diag] int3 rva=0x");
                 print_hex(raise_rva as u32);
                 print_str(b" rcx(record*)=0x");
@@ -9661,7 +9595,8 @@ pub(crate) unsafe fn service_sec_image(
                 let mut shown = 0;
                 for i in 0..96u64 {
                     if let Some(v) = read_wl(rsp + i * 8) {
-                        if let Some((nb, npe)) = ntdll {
+                        {
+                            let (nb, npe) = ntdll;
                             if v >= nb && v < nb + image_extent(npe) {
                                 print_str(b" n+0x");
                                 print_hex((v - nb) as u32);
@@ -10435,7 +10370,7 @@ pub(crate) unsafe fn service_sec_image(
                     pe
                 } else if nt_base != 0 && base == nt_base {
                     ntfaults += 1;
-                    ntdll.unwrap().1
+                    ntdll.1
                 } else if let Some((i, _)) = if pi >= 1 {
                     reg.dll_for_page(pi, base)
                 } else {
@@ -11044,8 +10979,7 @@ pub(crate) unsafe fn service_sec_image(
             }
         }
         if (mi >> 12) == 2 {
-            // A native `syscall` from the process (via ntdll's Nt* stub). SSN_DONE is our test
-            // sentinel; otherwise it's a REAL Nt* system call to service.
+            // A native `syscall` from the process (via ntdll's Nt* stub).
             let authoritative_syscall_context = if native_call_transport {
                 None
             } else {
@@ -11053,10 +10987,6 @@ pub(crate) unsafe fn service_sec_image(
             };
             if let Some((ctx, _)) = authoritative_syscall_context.as_ref() {
                 trace_unknown_syscall_tcb_restage(m0, badge, pi, ctx);
-            }
-            if m0 == SSN_DONE {
-                verdict = get_recv_mr(9); // R10 = arg1
-                break;
             }
             ssn_ring[ssn_ri % 32] = m0 as u16;
             ssn_ring_badge[ssn_ri % 32] = badge as u8;
@@ -18370,7 +18300,7 @@ pub(crate) unsafe fn service_sec_image(
     // === Path 2 lifecycle self-test (POST-LOOP: no more per-syscall heap reset follows, so these
     // durable pm allocations are safe). Proves NtOpenProcess + NtTerminateProcess route through pm.
     // The 3 HOSTED EPROCESSes are left untouched — terminate runs on a THROWAWAY process. ===
-    if ntdll.is_some() {
+    {
         // NtOpenProcess: smss (pi 0) opens csrss by pid → a real Process(csrss_pid) handle in smss's
         // EPROCESS table.
         nt_handler.pi = 0;
@@ -22275,7 +22205,7 @@ pub(crate) unsafe fn service_sec_image(
         }
     }
     print_str(b"\n");
-    if ntdll.is_some() {
+    {
         loader_trace_dump(&reg);
     }
     if let Some(winlogon_pi) = live_hosted_pi_for_role(
@@ -22339,14 +22269,12 @@ pub(crate) unsafe fn service_sec_image(
     }
     PM_EXEC_LINK_OK.store(link_ok, Ordering::Relaxed);
     // Report the primary process's own fault stats regardless of which process stopped the loop.
-    // The live path's primary is SMSS; the early SEC_IMAGE proof uses a dynamic diagnostic process.
     let boot_driver_start_reports = pending_driver_start_reports_snapshot(&nt_handler);
     let native_driver_load_report = nt_handler.native_driver_load_report;
     let live_device_action_report = print_live_device_action_report(&nt_handler);
     let start_device_call_report = print_start_device_call_report(&nt_handler);
     nt_handler.loop_ctx = None;
     (
-        verdict,
         procs[primary_pi].faults,
         procs[primary_pi].first,
         stop,
@@ -22490,7 +22418,7 @@ unsafe fn dump_interactive_logon_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -22517,7 +22445,7 @@ unsafe fn dump_hot_hosted_thread_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -22676,7 +22604,7 @@ unsafe fn dump_hosted_main_thread_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -22715,7 +22643,7 @@ unsafe fn dump_hosted_thread_quiesce(
     nt_handler: &ExecNtHandler,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) {
@@ -22924,7 +22852,7 @@ unsafe fn print_quiesce_iat_call_site(
     pi: usize,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
     procs: &[ProcExec],
     pfilled: &[[u64; 512]],
 ) -> bool {
@@ -22975,17 +22903,16 @@ unsafe fn quiesce_addr_is_known(
     pi: usize,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
 ) -> bool {
     if let Some(pe) = loaded_images.pe_by_pi(pi) {
         if address >= PE_LOAD_BASE && address < PE_LOAD_BASE + image_extent(pe) {
             return true;
         }
     }
-    if let Some((base, pe)) = ntdll {
-        if address >= base && address < base + image_extent(pe) {
-            return true;
-        }
+    let (base, pe) = ntdll;
+    if address >= base && address < base + image_extent(pe) {
+        return true;
     }
     reg.dll_for_page(pi, address).is_some()
 }
@@ -22996,7 +22923,7 @@ unsafe fn print_quiesce_addr(
     pi: usize,
     loaded_images: &HostedLoadedImageTable,
     reg: &nt_dll_registry::Registry,
-    ntdll: Option<(u64, &nt_pe_loader::PeFile)>,
+    ntdll: (u64, &nt_pe_loader::PeFile),
 ) {
     print_str(b"0x");
     print_hex_u64(address);
@@ -23013,13 +22940,12 @@ unsafe fn print_quiesce_addr(
             return;
         }
     }
-    if let Some((base, pe)) = ntdll {
-        if address >= base && address < base + image_extent(pe) {
-            print_str(b"ntdll+0x");
-            print_hex((address - base) as u32);
-            print_str(b")");
-            return;
-        }
+    let (base, pe) = ntdll;
+    if address >= base && address < base + image_extent(pe) {
+        print_str(b"ntdll+0x");
+        print_hex((address - base) as u32);
+        print_str(b")");
+        return;
     }
     if let Some((i, rva)) = reg.dll_for_page(pi, address) {
         let name = reg.name(i);

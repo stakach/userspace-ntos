@@ -22,6 +22,9 @@ use nt_security::TokenId;
 pub mod dbgk;
 pub mod job;
 pub mod job_abi;
+mod initial_system;
+
+pub use initial_system::InitialSystemIdentity;
 
 use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 
@@ -1074,6 +1077,8 @@ pub struct ProcessManager {
     dbgk: DebugObjectStore,
     /// Ps job objects and their exact process membership, accounting, and limit policy.
     jobs: job::JobStore,
+    /// One-time bootstrap designation with counted process/thread reference ownership.
+    initial_system: Option<initial_system::InitialSystemRoot>,
     /// The IMAGE views mapped into each process — the modelled `PEB->Ldr` module list. A `pid` of
     /// `0` marks a free slot, so an unmap never shifts the table (and never reallocates).
     ///
@@ -1090,7 +1095,7 @@ pub struct ProcessManager {
 impl ProcessManager {
     pub fn new() -> Self {
         ProcessManager {
-            next_cid: FIRST_CLIENT_ID, // cid 0 is reserved; 4 is System by convention.
+            next_cid: FIRST_CLIENT_ID, // cid 0 is reserved; allocation does not designate System.
             next_asid: 1,
             module_limit: DEFAULT_TRACKED_MODULES,
             ..Default::default()
@@ -2121,9 +2126,18 @@ impl ProcessManager {
     // what the owning boundary hands it and returns it verbatim.
 
     /// Publish the stable `EPROCESS` body pointer on `pid` exactly once. Re-publishing the same
-    /// pointer is idempotent; zero, an unknown process, or replacement is rejected.
+    /// pointer is idempotent; zero, an unknown process, replacement, or an address already owned
+    /// by another process or thread is rejected without mutation.
     pub fn publish_process_kernel_object(&mut self, pid: ProcessId, eprocess: u64) -> bool {
-        if eprocess == 0 {
+        if eprocess == 0
+            || self.processes.iter().any(|(&owner, process)| {
+                owner != pid && process.kernel_process_object == Some(eprocess)
+            })
+            || self
+                .threads
+                .values()
+                .any(|thread| thread.kernel_thread_object == Some(eprocess))
+        {
             return false;
         }
         match self.processes.get_mut(&pid) {
@@ -2250,9 +2264,18 @@ impl ProcessManager {
     }
 
     /// Publish the stable `ETHREAD` body pointer on `tid` exactly once. Re-publishing the same
-    /// pointer is idempotent; zero, an unknown thread, or replacement is rejected.
+    /// pointer is idempotent; zero, an unknown thread, replacement, or an address already owned
+    /// by another thread or process is rejected without mutation.
     pub fn publish_thread_kernel_object(&mut self, tid: ThreadId, ethread: u64) -> bool {
-        if ethread == 0 {
+        if ethread == 0
+            || self.threads.iter().any(|(&owner, thread)| {
+                owner != tid && thread.kernel_thread_object == Some(ethread)
+            })
+            || self
+                .processes
+                .values()
+                .any(|process| process.kernel_process_object == Some(ethread))
+        {
             return false;
         }
         match self.threads.get_mut(&tid) {
@@ -2330,25 +2353,27 @@ impl ProcessManager {
     /// Release one Ps/Ob pointer reference from a known EPROCESS or ETHREAD projection.
     pub fn release_kernel_object_pointer(&mut self, object: u64) -> Result<u32, u32> {
         if let Some(pid) = self.pid_for_kernel_process_object(object) {
+            let floor = self.initial_system_process_reference_floor(pid);
             let process = self
                 .processes
                 .get_mut(&pid)
                 .ok_or(STATUS_INVALID_HANDLE)?;
-            process.kernel_pointer_references = process
-                .kernel_pointer_references
-                .checked_sub(1)
-                .ok_or(STATUS_INVALID_PARAMETER)?;
+            if process.kernel_pointer_references <= floor {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            process.kernel_pointer_references -= 1;
             return Ok(process.kernel_pointer_references);
         }
         if let Some(tid) = self.tid_for_kernel_thread_object(object) {
+            let floor = self.initial_system_thread_reference_floor(tid);
             let thread = self
                 .threads
                 .get_mut(&tid)
                 .ok_or(STATUS_INVALID_HANDLE)?;
-            thread.kernel_pointer_references = thread
-                .kernel_pointer_references
-                .checked_sub(1)
-                .ok_or(STATUS_INVALID_PARAMETER)?;
+            if thread.kernel_pointer_references <= floor {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            thread.kernel_pointer_references -= 1;
             return Ok(thread.kernel_pointer_references);
         }
         Err(STATUS_INVALID_HANDLE)
@@ -5126,3 +5151,6 @@ mod tests;
 
 #[cfg(test)]
 mod thread_lifetime_tests;
+
+#[cfg(test)]
+mod kernel_object_publication_tests;

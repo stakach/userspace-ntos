@@ -3324,83 +3324,6 @@ fn build_initial_object_namespace() -> alloc::vec::Vec<ObjEntry> {
     v
 }
 
-struct BootstrapProcessManagerSeed {
-    pm: nt_process::ProcessManager,
-    pids: [nt_process::ProcessId; HOSTED_PROCESS_MANAGER_SEED_COUNT],
-    main_tids: [nt_process::ThreadId; HOSTED_PROCESS_MANAGER_SEED_COUNT],
-    pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT],
-}
-
-#[inline(never)]
-fn seed_bootstrap_process_manager() -> BootstrapProcessManagerSeed {
-    let mut pm = nt_process::ProcessManager::new();
-    let mut bootstrap_pids: [nt_process::ProcessId; HOSTED_PROCESS_MANAGER_SEED_COUNT] =
-        [0; HOSTED_PROCESS_MANAGER_SEED_COUNT];
-    let mut bootstrap_main_tids: [nt_process::ThreadId; HOSTED_PROCESS_MANAGER_SEED_COUNT] =
-        [0; HOSTED_PROCESS_MANAGER_SEED_COUNT];
-    let mut bootstrap_pool_tids: [[nt_process::ThreadId; PM_RUNTIME_THREAD_SLOTS];
-        HOSTED_PROCESS_MANAGER_SEED_COUNT] =
-        [[0; PM_RUNTIME_THREAD_SLOTS]; HOSTED_PROCESS_MANAGER_SEED_COUNT];
-
-    pm.reserve_modules(64);
-    pm.reserve_process_capacity(MAX_PI);
-    pm.reserve_thread_capacity(MAX_PI * (1 + PM_RUNTIME_THREAD_SLOTS));
-    pm.reserve_debug_objects(PM_DEBUG_OBJECT_SLOTS, PM_DEBUG_EVENTS_PER_OBJECT)
-        .expect("reserve bootstrap Dbgk object/event storage");
-    PM_PROC_COUNT.store(0, Ordering::Relaxed);
-    PM_OBJECT_COUNT.store(0, Ordering::Relaxed);
-    PM_DYNAMIC_PROCESS_ALLOCATIONS.store(0, Ordering::Relaxed);
-    PM_PROCESS_SPAWNED_OK.store(0, Ordering::Relaxed);
-    PM_IDENTITY_OK.store(0, Ordering::Relaxed);
-    PM_VSPACE_PUBLISHED_OK.store(0, Ordering::Relaxed);
-    reset_hosted_gate_metadata();
-    PM_RUNNING_PROCESS_MASK.store(0, Ordering::Relaxed);
-    PM_MAIN_THREADS_OK.store(0, Ordering::Relaxed);
-    HOSTED_THREAD_RUNTIME_OK.store(0, Ordering::Relaxed);
-    PM_HANDLE_CAP_BOOT.store(0, Ordering::Relaxed);
-    PM_HANDLE_CAP_MAX.store(0, Ordering::Relaxed);
-    PM_HANDLE_CAP_GROWTHS.store(0, Ordering::Relaxed);
-
-    for pi in 0..HOSTED_PROCESS_MANAGER_SEED_COUNT {
-        let image =
-            hosted_process_manager_seed_image(pi).expect("bootstrap PM seed index is bounded");
-        let parent = if pi == 0 {
-            None
-        } else {
-            Some(bootstrap_pids[0])
-        };
-        bootstrap_pids[pi] = pm.create_process(image.process_name, parent, None);
-    }
-    for &pid in &bootstrap_pids {
-        pm.reserve_process_threads(pid, 1 + PM_RUNTIME_THREAD_SLOTS);
-    }
-    for &pid in &bootstrap_pids {
-        let _ = pm.set_peb_base(pid, SMSS_PEB_VA);
-    }
-    for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-        if let Ok(tid) = pm.create_thread(pid, 0, 0, false) {
-            bootstrap_main_tids[pi] = tid;
-        }
-    }
-    for (pi, &pid) in bootstrap_pids.iter().enumerate() {
-        for slot in 0..PM_RUNTIME_THREAD_SLOTS {
-            if let Ok(tid) = pm.create_dormant_thread(pid) {
-                bootstrap_pool_tids[pi][slot] = tid;
-            }
-        }
-    }
-    for &pid in &bootstrap_pids {
-        pm.reserve_handles(pid, PM_HANDLE_RESERVE);
-    }
-
-    BootstrapProcessManagerSeed {
-        pm,
-        pids: bootstrap_pids,
-        main_tids: bootstrap_main_tids,
-        pool_tids: bootstrap_pool_tids,
-    }
-}
-
 fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len()
         && a.iter()
@@ -4022,7 +3945,6 @@ impl ExecNtHandler {
         slot: *mut ExecNtHandler,
         hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,
         driver_starts: DriverStartBootstrap,
-        require_boot_system: bool,
         bootstrap_system_journal_records: u32,
         provider_local_events: Vec<ProviderLocalEventTransfer>,
         provider_timers: Option<nt_provider_wait::ProviderTimerTable>,
@@ -4058,20 +3980,12 @@ impl ExecNtHandler {
             }
         };
         let mut mutable_hives = nt_hive_core::MutableHiveSet::new();
-        let owned_boot_system_image = if require_boot_system {
-            unsafe { take_boot_system_hive_image() }
-        } else {
-            None
-        };
-        if require_boot_system && owned_boot_system_image.is_none() {
-            panic!("live hosted-process service requires the composed boot SYSTEM image");
-        }
-        if let Some(image) = owned_boot_system_image {
-            print_str(b"[cm-hive] released composed SYSTEM transport bytes=");
-            print_u64(image.len() as u64);
-            print_str(b"\n");
-            drop(image);
-        }
+        let owned_boot_system_image = take_boot_system_hive_image()
+            .expect("live hosted-process service requires the composed boot SYSTEM image");
+        print_str(b"[cm-hive] released composed SYSTEM transport bytes=");
+        print_u64(owned_boot_system_image.len() as u64);
+        print_str(b"\n");
+        drop(owned_boot_system_image);
         if let Some(ref regf) = software_hive {
             mount_mutable_regf_hive(
                 &mut mutable_hives,
@@ -4175,12 +4089,15 @@ impl ExecNtHandler {
         let time_configuration = SystemTimeConfiguration::default();
         let time_zone_information = time_configuration.information;
         let real_time_is_universal = time_configuration.real_time_is_universal;
-        let BootstrapProcessManagerSeed {
-            pm,
+        let crate::ps_bootstrap::PsBootstrapSeed {
+            ps,
             pids: bootstrap_pids,
             main_tids: bootstrap_main_tids,
             pool_tids: bootstrap_pool_tids,
-        } = seed_bootstrap_process_manager();
+        } = crate::ps_bootstrap::take();
+        let nt_user_host::ps_bootstrap::PsBootstrapParts {
+            pm, token_store, anonymous_logon_tokens,
+        } = ps.into_parts();
         macro_rules! write_field {
             ($field:ident, $value:expr) => {
                 unsafe {
@@ -4351,8 +4268,6 @@ impl ExecNtHandler {
         write_field!(tp_worker_window_used, zeroed_process_slot_u64_vec());
         write_field!(thread_runtime, HostedThreadRuntimes::reset());
         write_field!(win32k_session, Win32kSessionRuntime::reset());
-        let mut token_store = nt_security::TokenStore::with_capacity(64);
-        let anonymous_logon_tokens = token_store.insert_anonymous_logon_tokens();
         write_field!(token_store, token_store);
         write_field!(job_token_policies, nt_security::JobTokenPolicyStore::new());
         write_field!(anonymous_logon_tokens, anonymous_logon_tokens);
@@ -4387,14 +4302,6 @@ impl ExecNtHandler {
                 }
             }
         }
-        for pi in 0..MAX_PI {
-            if let Some(pid) = handler.pm_pid_for_pi(pi) {
-                let token = handler
-                    .token_store
-                    .insert(nt_security::AccessToken::system());
-                let _ = handler.pm.replace_process_primary_token(pid, Some(token));
-            }
-        }
         if crate::writable_fs::snapshot_restore_seen() {
             handler.refresh_boot_hive_checkpoints_from_writable_config();
         }
@@ -4403,11 +4310,7 @@ impl ExecNtHandler {
         trace_setup_provision_phase(b"srm-begin", 0);
         handler.provision_kernel_srm_objects();
         trace_setup_provision_phase(b"srm-end", 0);
-        if require_boot_system {
-            handler.activate_live_boot_policy();
-        } else {
-            unsafe { publish_time_zone(&handler.time_zone_information, nt_system_time_100ns()) };
-        }
+        handler.activate_live_boot_policy();
         handler
     }
 
@@ -11230,6 +11133,21 @@ impl ExecNtHandler {
         }
         PM_PROC_COUNT.store(process_count, Ordering::Relaxed);
         PM_OBJECT_COUNT.store(self.pm.process_count() as u64, Ordering::Relaxed);
+        let initial_system_present = self.pm.initial_system_identity().is_some_and(|system| {
+            self.pm.initial_system_references_held()
+                && (0..MAX_PI).all(|pi| self.pm_pid_for_pi(pi) != Some(system.process_id()))
+                && self.pm.process(system.process_id()).is_some_and(|process| {
+                    process.state == nt_process::ProcessState::Running
+                })
+                && self.pm.query_process_basic(system.process_id(), u64::MAX)
+                    .is_ok_and(|process| process.peb_base_address == 0)
+                && self.pm.thread(system.thread_id()).is_some_and(|thread| {
+                    thread.is_system_thread && thread.teb_base == 0 && thread.exit_status.is_none()
+                })
+                && self.pm.process_primary_token(system.process_id())
+                    .is_some_and(|token| self.token_store.reference_count(token).is_some_and(|count| count != 0))
+        });
+        PM_INITIAL_SYSTEM_OBJECT_PRESENT.store(u64::from(initial_system_present), Ordering::Relaxed);
         PM_IDENTITY_OK.store(identity_ok, Ordering::Relaxed);
         PM_RUNNING_PROCESS_MASK.store(running_process_mask, Ordering::Relaxed);
         PM_MAIN_THREADS_OK.store(main_threads_ok, Ordering::Relaxed);

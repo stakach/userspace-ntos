@@ -248,11 +248,15 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain a generation-exact logical caller through hosted win32k dispatch, callback and wait resumes
   (tranche 99). Validate the actual runtime binding and PM thread activation before capturing tokens;
   neither ambient current-thread state nor a physical executor TCB is client authority.
-- [ ] Move real Ps/token bootstrap ownership ahead of provider DriverEntry, retaining one initial
-  System process and thread through handler initialization. Replace fake initialization identities
-  and bind PsIsSystemProcess only against the retained canonical System EPROCESS.
+- [x] Move real Ps/token bootstrap ownership ahead of provider DriverEntry, retaining one initial
+  System process and thread through handler initialization (tranche 100). Bind PsIsSystemProcess
+  only against its pinned canonical EPROCESS, separate from provider GUI initialization.
+- [~] Add provider-domain-bound subject leases over authenticated hosted or initial-System callers
+  (tranche 101; host core). Retain actual primary/client references through publication, replacement
+  and rundown. Never interpret a missing hosted caller as System authority.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
-  through retained token leases. Complete shared Nt/Zw namespace migration and descriptor admission.
+  through retained token leases. Replace fake provider-initialization identities with authenticated
+  kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28490,8 +28494,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and rejection before continuation mutation. No desktop acceptance is claimed: remaining real
     provider imports and initialization authority still block the desktop push.
 
-    Review adjustment: the current PM/TokenStore are created after win32k DriverEntry, PID 4 is
-    presently allocated to SMSS, and the temporary provider process body is later re-keyed to CSRSS.
+    B3 early Ps/token ownership tranche 100 (2026-09-08):
+
+    Designate normally allocated initial System objects explicitly with counted process/thread
+    references and an exact manager-scoped identity. Move the original PM, TokenStore, anonymous
+    token owners and hosted seed identities from early root bootstrap into ExecNtHandler exactly
+    once. Remove late replacement stores and primary-token re-seeding. The initial System process
+    is outside hosted PI allocation; SMSS is its ordinary child. Preserve the distinction between
+    this actual Ps ownership and still-unconverted provider initialization projections/authority.
+
+    Neutral ReactOS x64 Ps projection builders must initialize real IDs, process links and dispatcher
+    list heads without manufacturing a PEB, TEB or GUI state. The full ReactOS ETHREAD extends past
+    the old 0x400 allocation: CrossThreadFlags (including SystemThread) is at 0x41c and the structure
+    extends through 0x438. Two dedicated page-aligned executive-image objects now back the exact
+    canonical initial process/thread identities; neither has a PEB, TEB or GUI context. Their image
+    frame lifetime supports the existing provider alias mechanism. PsIsSystemProcess compares that
+    retained EPROCESS, and PsGetProcessId/PsGetThreadProcess read actual object fields without
+    requiring GUI registration. Process/thread body publication rejects aliases across all owners.
+    Authenticated kernel-caller registration remains required for initialization-time Se capture.
+
+    The generated SEC_IMAGE diagnostic now has a focused fault loop with its own bound Reply and
+    retained real image mappings. It no longer consumes or resets executive Ps/provider state.
+    The live handler initializes exactly once; diagnostic-only setup branches, replacement-store
+    machinery and legacy zero-Reply fallback are removed. SMSS receives its actual early-allocated
+    ClientId before its TEB is constructed, rather than zero placeholders.
+
+    Validation: 12 kernel-ABI tests, 174 process tests, 320 user-host tests and 43 integrations pass
+    (549 total). The eighteen-crate regression passes 2,180 tests. The executive release build passes
+    with the unchanged 262 warnings. Logs: `.tmp/test-early-ps-bootstrap-final-20260908.log`,
+    `.tmp/test-early-ps-bootstrap-regression-20260908.log`,
+    `.tmp/build-early-ps-bootstrap-final-20260908.log`. Independent reviews covered the original
+    diagnostic/live double-consumption defect, exact object references and address publication,
+    provider-visible backing, ABI layout, and actual SMSS ClientId admission. Root serialized all
+    validation. Desktop acceptance still requires the remaining real imports and provider authority.
+
+    Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
+    win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
+    still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.
     None identifies the initial System process. Introduce early root-owned Ps/token bootstrap state
     and move those same stores into ExecNtHandler later; allocate and retain a separate canonical
     System EPROCESS and actual bootstrap system thread before provider activation. Do not infer

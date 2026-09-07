@@ -117,6 +117,7 @@ nt-fs = { path = "../../crates/nt-fs" }
 # Kernel-exec runtime — the real KEVENT EventStore backs the sync-object syscalls; its
 # session_section primitive backs win32k's MmCreateSection/MmMapView*.
 nt-kernel-exec = { path = "../../crates/nt-kernel-exec" }
+nt-kernel-abi = { path = "../../crates/nt-kernel-abi" }
 # Security Reference Monitor — its heap-free se_exports primitive backs win32k's SeExports data
 # export (well-known SIDs / privilege LUIDs) + SeQueryAuthenticationIdToken (SYSTEM auth LUID).
 nt-security = { path = "../../crates/nt-security" }

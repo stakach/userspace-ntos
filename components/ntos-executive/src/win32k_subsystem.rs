@@ -2775,12 +2775,17 @@ extern "win64" fn s_current_process() -> u64 {
 extern "win64" fn s_current_thread() -> u64 {
     unsafe { current_ethread() }
 }
-/// `HANDLE PsGetProcessId(PEPROCESS Process)` — resolve a process body back to its selected PID.
+/// `BOOLEAN PsIsSystemProcess(PEPROCESS Process)` compares the canonical initial object.
+extern "win64" fn s_ps_is_system_process(process: u64) -> u8 {
+    u8::from(crate::ps_bootstrap::is_initial_system_process(process))
+}
+
+/// `HANDLE PsGetProcessId(PEPROCESS Process)` reads the referenced native object, including
+/// processes which have never acquired GUI state.
 extern "win64" fn s_ps_get_process_id(process: u64) -> u64 {
     unsafe {
-        process_context_index_for_eprocess(process)
-            .map(|index| process_ctx_pid(index))
-            .unwrap_or(0)
+        read_volatile((process + nt_kernel_abi::ps_reactos_x64::EPROCESS_UNIQUE_PROCESS_ID as u64)
+            as *const u64)
     }
 }
 
@@ -2817,22 +2822,9 @@ extern "win64" fn s_ps_get_thread_process_id(thread: u64) -> u64 {
     }
 }
 
-/// `PEPROCESS PsGetThreadProcess(PETHREAD Thread)` — return the owning process object for a known
-/// ETHREAD. Unknown thread objects return NULL rather than the current process.
+/// `PEPROCESS PsGetThreadProcess(PETHREAD Thread)` reads the referenced native thread's owner.
 extern "win64" fn s_ps_get_thread_process(thread: u64) -> u64 {
-    unsafe {
-        if let Some(index) = thread_context_index_for_ethread(thread) {
-            let pid = thread_ctx_pid(index);
-            return eprocess_for_pid(pid);
-        }
-        if thread != 0 {
-            let process = read_volatile((thread + ETHREAD_THREADS_PROCESS_OFF) as *const u64);
-            if process_context_index_for_eprocess(process).is_some() {
-                return process;
-            }
-        }
-        0
-    }
+    unsafe { read_volatile((thread + ETHREAD_THREADS_PROCESS_OFF) as *const u64) }
 }
 
 unsafe fn win32k_ps_broker_call(op: u64, object: u64, value: u64) -> (i32, u64, u64, u64) {
@@ -14628,6 +14620,7 @@ fn register_trampolines() -> bool {
         s_current_process_id as usize as u64,
     );
     reg.bind("PsGetProcessId", s_ps_get_process_id as usize as u64);
+    reg.bind("PsIsSystemProcess", s_ps_is_system_process as *const () as usize as u64);
     reg.bind(
         "PsGetCurrentThreadId",
         s_ps_get_current_thread_id as usize as u64,

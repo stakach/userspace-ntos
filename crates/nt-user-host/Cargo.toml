@@ -12,6 +12,7 @@ nt-syscall = { workspace = true }
 nt-ntdll-layout = { workspace = true }
 nt-pe-loader = { workspace = true }
 nt-process = { workspace = true }
+nt-security = { workspace = true }
 nt-config-manager = { workspace = true }
 nt-fs = { workspace = true }
 nt-cache-manager = { workspace = true }
