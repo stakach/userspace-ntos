@@ -175,22 +175,24 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Remove intermediate root fault-endpoint mints, install borrowed/badged sources directly into
   the thread-owned CNode, and replace TCB-zero constructor outcomes with exhaustive success/failure
   results and success-only publication (tranche 74, host/build; retained native rollback remains open).
+- [x] Connect native hosted-thread constructor failures to exact-ticket pending ownership; retain
+  checked memory-copy/retype empty slots, mechanism phases and registry publication coverage before
+  cancelling caller publication (tranche 75; native retirement/retry activation remains open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next make native thread-constructor failures return
-  complete ownership, including allocated empty slots, raw/minted CNodes and optional real TCB.
-  Thread fault-endpoint copies now belong directly to the CNode; wrapper-owned root intermediates
-  have been removed. Explicit results and success-only publication are in place, but the error still
-  marks legacy unretained cleanup until the full partial payload is connected. Failed SC
+  emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
+  its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
+  holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Next reconcile
+  the retained registry publication coverage and complete external-alias journal before transferring
+  registry ownership or driving cleanup. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
-  Retain the complete partial payload through the tested exact-ticket handoff
-  before fallible reconciliation, preserving process/pool/window holds. Replace destructive failure exits
-  and legacy unretained errors with ownership-returning failures, then replace
-  the legacy fatal release boundary with a checked retry backend. Close remaining non-ingress routing
+  The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
+  longer invokes the destructive legacy release chain. Implement the checked retry backend and
+  checked empty-slot/frame free-list publication before attempting native retirement. Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
-  follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
-  failures and handler-owned handoffs; validate retained cleanup with live failures.
+  follow complete journal retention and exclusion publication. Then cover other launch families
+  and handler-owned handoffs; validate retained cleanup with live failures.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
   cleanup is incomplete; retain private COW backing and exact failed capabilities.
 - [ ] Bind parsed-image caches, every SEC_IMAGE section reference, mapped view, and process image
@@ -27399,6 +27401,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     abort. Checked GS/priority/hosted-syscall setup, destructive legacy failure exits, first-resume
     failure, normal termination and checked retry cleanup remain open. No QEMU or desktop proof is
     claimed; the recorded 33 unresolved win32k imports still block the full desktop gate.
+
+    B3 native construction retention tranche 75 (2026-09-07):
+    `spawn_hosted_thread` captures the original publishing binding before mechanism work. Every
+    failure after construction starts returns a non-cloneable `FailedHostedThreadConstruction`
+    containing memory, mechanism slot phases, registry publication coverage and optional TEB alias.
+    `RuntimeConstruction` moves it allocation-free through the original runtime-publication ticket
+    into protected pending state. All five callers use one exhaustive failure boundary before caller
+    publication abort. Only `Unstarted` can cancel the runtime reservation. `LegacyUnretained` and
+    the separate public runtime-cancellation wrapper are removed.
+
+    Frames and copied aliases are recorded before the next fallible operation. Checked allocation
+    and the constructor-local checked copy helper return failed empty slots without recycling them;
+    `MemoryConstructionProgress` retains the first such slot separately from live frame caps.
+    General `copy_cap_r` recycled failed slots internally and was therefore not suitable here.
+    Stack and both TEB registration successes are recorded as they occur, rather than reconstructed
+    later from surviving registry rows. Protected-tail metadata registration is recorded separately
+    and failure is no longer log-only. Successful TEB source/mirror publication still transfers
+    those copies to the registry, whose records remain intact while pending.
+
+    Raw/guarded CNodes and TCB slots are adopted before retype/mint and marked live only after checked
+    success. All map/copy operations and TCB space/IPC/register/GS/priority/hosted-syscall setup are
+    checked. No constructor failure deletes a cap, unmaps memory, releases a registry row or returns
+    backing to a free list. Failed SC attachment retains its separate unbound owner; successful
+    construction consumes a fully live mechanism inventory into the existing published runtime
+    representation. Pending failure rows keep legacy mechanism metadata empty, so failed mechanism
+    ownership cannot be routed into ordinary release through a copied descriptor.
+
+    Validation: four new host tests cover memory-slot/registration progress and complete versus
+    incomplete mechanism ownership transfer. Two allocator-counted handoff tests cover retained
+    failed memory slots, partial registry coverage, absent/real TCBs and rejected-ticket retry.
+    The serialized nine-crate suite passes 1,157 tests (230 in `nt-user-host`: 211 unit, 3 existing
+    integration and 16 construction integration). The subsequent executive build passes with the
+    unchanged 262-warning baseline.
+    Logs: `.tmp/test-native-construction-retention-20260907.log` and
+    `.tmp/build-native-construction-retention-20260907.log`. Two read-only agents reviewed native
+    ownership sequencing and all publication callers; only root ran tests/builds.
+
+    Review adjustment: this activates retained failure ownership and exclusions, not retirement.
+    Failed constructions remain pending with reservations held until the native checked cleanup
+    backend is implemented. Next reconcile the exact expected registry coverage, retain external
+    win32k alias journals, and publish registry transfer only after complete exclusion/journal
+    retention. Add checked root-slot recycling and retained frame-free-list admission rather than
+    using void recycling or ignored-delete helpers. Protected-tail metadata is shared by VA, so
+    retirement must reconcile its shared registration rather than blindly deleting it. First-resume
+    failure, ordinary termination, other launch families and handler-owned handoffs still use legacy
+    lifetime paths. No QEMU/fault-injection/desktop proof is claimed; 33 recorded unresolved win32k
+    imports still block the full desktop gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

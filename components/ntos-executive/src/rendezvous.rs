@@ -45,10 +45,10 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
                 WINLOGON_WORKER3_STACK_MIRROR_VA,
                 WINLOGON_WORKER3_BADGE,
             ),
-            _ => return Err(HostedThreadSpawnFailure::LegacyUnretained),
+            _ => return Err(HostedThreadSpawnFailure::Unstarted),
         };
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
         handler,
@@ -105,10 +105,10 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     if pi >= MAX_PI || worker_slot >= TP_WORKER_SLOT_COUNT {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     }
     if img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed) == 0 {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     }
     spawn_slot_thread(
         handler,
@@ -186,12 +186,12 @@ pub(crate) unsafe fn spawn_slot_thread(
         native,
     } = *spawn;
     if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || !fault_ep.is_valid() {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     }
     let loader_context = if use_loader {
         let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
         if loader_rva == 0 {
-            return Err(HostedThreadSpawnFailure::LegacyUnretained);
+            return Err(HostedThreadSpawnFailure::Unstarted);
         }
         // The caller-supplied stack allocation is not mapped into this userspace kernel, so
         // normalize both INITIAL_TEB and CONTEXT.Rsp to the fixed 16-page slot stack before entering
@@ -250,7 +250,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
         handler,
@@ -295,7 +295,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
         handler,
@@ -340,7 +340,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
         handler,
@@ -384,7 +384,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
     let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
-        return Err(HostedThreadSpawnFailure::LegacyUnretained);
+        return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
         handler,

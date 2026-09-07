@@ -21780,8 +21780,8 @@ pub(crate) unsafe fn service_sec_image(
                                 spawned_breakin_tid = request.cid_thread;
                                 PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
                             }
-                            Err(HostedThreadSpawnFailure::LegacyUnretained) => {
-                                nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+                            Err(failure) => {
+                                nt_handler.fail_hosted_thread_runtime_publication(runtime_publication, failure);
                                 nt_handler.abort_unbuilt_hosted_thread_publication(
                                     request.publication, test_pi, tp_worker_badge(test_pi, request.slot),
                                     HostedThreadRole::TpWorker { slot: request.slot },
@@ -22438,8 +22438,8 @@ unsafe fn spawn_requested_multiplexed_thread(
     };
     let spawned = match spawned {
         Ok(spawned) => spawned,
-        Err(HostedThreadSpawnFailure::LegacyUnretained) => {
-            nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+        Err(failure) => {
+            nt_handler.fail_hosted_thread_runtime_publication(runtime_publication, failure);
             nt_handler.abort_unbuilt_hosted_thread_publication(publication, owner_pi, spec.badge, spec.role);
             return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -23132,8 +23132,8 @@ unsafe fn spawn_requested_local_thread(
             );
             let spawned = match spawned {
                 Ok(spawned) => spawned,
-                Err(HostedThreadSpawnFailure::LegacyUnretained) => {
-                    nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+                Err(failure) => {
+                    nt_handler.fail_hosted_thread_runtime_publication(runtime_publication, failure);
                     nt_handler.abort_unbuilt_hosted_thread_publication(publication, wl_pi, badge, role);
                     return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
                 }
@@ -23256,8 +23256,8 @@ unsafe fn spawn_requested_tp_worker(
     );
     let spawned = match spawned {
         Ok(spawned) => spawned,
-        Err(HostedThreadSpawnFailure::LegacyUnretained) => {
-            nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+        Err(failure) => {
+            nt_handler.fail_hosted_thread_runtime_publication(runtime_publication, failure);
             nt_handler.abort_unbuilt_hosted_thread_publication(publication, pi, badge, role);
             return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
         }
@@ -23348,8 +23348,8 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     );
     let spawned = match spawned {
         Ok(spawned) => spawned,
-        Err(HostedThreadSpawnFailure::LegacyUnretained) => {
-            nt_handler.cancel_hosted_thread_runtime_publication(runtime_publication);
+        Err(failure) => {
+            nt_handler.fail_hosted_thread_runtime_publication(runtime_publication, failure);
             nt_handler.abort_unbuilt_hosted_thread_publication(request.publication, request.target_pi, badge, role);
             return Err(nt_process::STATUS_INSUFFICIENT_RESOURCES);
         }

@@ -76,6 +76,7 @@ struct Partial {
     memory: ThreadMemoryResources<2>,
     mechanisms: Vec<ThreadRollbackResource>,
     inventory: ThreadConstructionInventory,
+    memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress<2>,
     drops: Rc<Cell<usize>>,
 }
 
@@ -177,6 +178,7 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
         },
         drops: drops.clone(),
         inventory: ThreadConstructionInventory::empty(),
+        memory_progress: nt_user_host::thread_construction::MemoryConstructionProgress::empty(),
     };
     (slot, ticket, partial, drops)
 }
@@ -195,6 +197,41 @@ fn assert_protected(slot: &mut Slot, id: ThreadRollbackId) {
         ThreadIngressError::Pending
     );
     assert!(binding.holds_pool_slot(2, 3) && binding.holds_window_slot(2, 5));
+}
+
+#[test]
+fn memory_failure_and_registry_coverage_move_with_original_reservations() {
+    for tcb in [None, Some(400)] {
+        let (mut slot, ticket, mut partial, drops) = fixture(tcb, true);
+        partial.memory_progress.retain_empty_slot(601).unwrap();
+        partial.memory_progress.record_stack(0);
+        partial.memory_progress.record_teb(1);
+        let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+        assert_protected(&mut slot, id);
+        let partial = slot.owner().unwrap().partial.as_ref().unwrap();
+        assert_eq!(partial.memory_progress.empty_slot(), Some(601));
+        assert!(partial.memory_progress.stack_registered(0));
+        assert!(!partial.memory_progress.stack_registered(1));
+        assert!(!partial.memory_progress.teb_registered(0));
+        assert!(partial.memory_progress.teb_registered(1));
+        assert_eq!(partial.memory.stack_owner[0], 200);
+        assert_eq!(drops.get(), 0);
+    }
+}
+
+#[test]
+fn rejected_handoff_does_not_drop_failed_memory_slot_or_publication_coverage() {
+    let (mut slot, ticket, mut partial, drops) = fixture(None, true);
+    partial.memory_progress.retain_empty_slot(601).unwrap();
+    partial.memory_progress.record_stack(1);
+    let (mut wrong, _, _, _) = fixture(None, false);
+    let (_, ticket, partial) = without_allocation(|| wrong.retain_failed_construction(ticket, partial)).unwrap_err();
+    assert_eq!(partial.memory_progress.empty_slot(), Some(601));
+    assert!(partial.memory_progress.stack_registered(1));
+    assert_eq!(drops.get(), 0);
+    let id = without_allocation(|| slot.retain_failed_construction(ticket, partial)).unwrap();
+    assert_protected(&mut slot, id);
+    assert_eq!(drops.get(), 0);
 }
 
 #[test]

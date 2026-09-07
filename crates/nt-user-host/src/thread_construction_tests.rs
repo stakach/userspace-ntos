@@ -2,6 +2,84 @@ use super::*;
 use alloc::vec::Vec;
 
 #[test]
+fn memory_progress_retains_failed_empty_slots_without_claiming_live_backing() {
+    let mut progress = MemoryConstructionProgress::<2>::empty();
+    assert!(progress.is_empty());
+    for slot in [0, 1] {
+        assert_eq!(
+            progress.retain_empty_slot(slot),
+            Err(InventoryError::InvalidSlot)
+        );
+    }
+    progress.retain_empty_slot(42).unwrap();
+    assert_eq!(progress.empty_slot(), Some(42));
+    assert!(!progress.is_empty());
+    assert_eq!(
+        progress.retain_empty_slot(43),
+        Err(InventoryError::Occupied)
+    );
+    assert_eq!(progress.empty_slot(), Some(42));
+}
+
+#[test]
+fn registry_publication_coverage_is_independent_of_remaining_registry_rows() {
+    let mut progress = MemoryConstructionProgress::<4>::empty();
+    progress.record_stack(0);
+    progress.record_stack(2);
+    progress.record_teb(1);
+    progress.record_protected_tail();
+    assert!(!progress.is_empty());
+    for index in 0..4 {
+        assert_eq!(progress.stack_registered(index), index == 0 || index == 2);
+    }
+    assert!(!progress.teb_registered(0));
+    assert!(progress.teb_registered(1));
+    assert!(progress.protected_tail_registered());
+    assert_eq!(progress.empty_slot(), None);
+}
+
+#[test]
+fn completed_mechanism_inventory_transfers_every_live_slot() {
+    let mut inventory = ThreadConstructionInventory::empty();
+    for (index, role) in ROLES.into_iter().enumerate() {
+        inventory.adopt_object(role, 100 + index as u64).unwrap();
+    }
+    assert_eq!(inventory.into_live_slots().unwrap(), [100, 101, 102, 103]);
+}
+
+#[test]
+fn incomplete_mechanism_transfer_returns_ownership_unchanged() {
+    for phase in [
+        SlotState::Absent,
+        SlotState::AllocatedEmpty(102),
+        SlotState::DeleteAcknowledged(102),
+    ] {
+        let mut inventory = ThreadConstructionInventory::empty();
+        inventory.adopt_object(Role::RawCnode, 100).unwrap();
+        inventory.adopt_object(Role::GuardedCnode, 101).unwrap();
+        inventory.adopt_object(Role::SchedContext, 103).unwrap();
+        if phase != SlotState::Absent {
+            inventory.adopt_empty(Role::Tcb, 102).unwrap();
+            if phase == SlotState::DeleteAcknowledged(102) {
+                inventory.acknowledge_object(Role::Tcb, 102).unwrap();
+                inventory.acknowledge_delete(Role::Tcb, 102).unwrap();
+            }
+        }
+        let retained = inventory.into_live_slots().unwrap_err();
+        assert_eq!(retained.state(Role::Tcb), phase);
+        assert_eq!(retained.state(Role::RawCnode), SlotState::LiveObject(100));
+        assert_eq!(
+            retained.state(Role::GuardedCnode),
+            SlotState::LiveObject(101)
+        );
+        assert_eq!(
+            retained.state(Role::SchedContext),
+            SlotState::LiveObject(103)
+        );
+    }
+}
+
+#[test]
 fn admission_starts_without_fabricated_tcbs_or_slots() {
     let inventory = ThreadConstructionInventory::empty();
     assert!(inventory.is_empty());

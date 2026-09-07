@@ -6,12 +6,11 @@ use nt_user_host::thread_endpoint::{EndpointInstallError, ThreadEndpointBackend}
 
 pub(crate) type HostedThreadSpawnResult = Result<HostedThreadSpawn, HostedThreadSpawnFailure>;
 
-/// A separate error type forces every publication caller to handle construction failure. When
-/// retained native failures are added, those callers must hand off ownership before public abort.
+/// Only pre-construction rejection permits cancellation of the runtime reservation. A partial
+/// construction must enter protected ownership through the original ticket before public abort.
 pub(crate) enum HostedThreadSpawnFailure {
-    /// The legacy constructor retained no payload. This does not certify checked retirement;
-    /// its destructive rollback remains to be replaced by exact-ticket ownership handoff.
-    LegacyUnretained,
+    Unstarted,
+    Retained(FailedHostedThreadConstruction),
 }
 
 /// Successful construction only. A failed construction can own a real TCB, so no failure

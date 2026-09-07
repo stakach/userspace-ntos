@@ -57,11 +57,93 @@ pub struct ThreadConstructionInventory {
     slots: [SlotState; 4],
 }
 
+/// Constructor publication coverage must survive failure even if registry rows subsequently
+/// disappear. Stop on the first failed allocation/copy, retaining its empty root slot separately
+/// from live frame caps. This state moves with the memory bundle, never independently.
+#[derive(Debug)]
+pub struct MemoryConstructionProgress<const STACK: usize> {
+    empty_slot: Option<u64>,
+    stack_registered: [bool; STACK],
+    teb_registered: [bool; 2],
+    protected_tail_registered: bool,
+}
+
+impl<const STACK: usize> MemoryConstructionProgress<STACK> {
+    pub const fn empty() -> Self {
+        Self {
+            empty_slot: None,
+            stack_registered: [false; STACK],
+            teb_registered: [false; 2],
+            protected_tail_registered: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.empty_slot.is_none()
+            && !self.stack_registered.iter().any(|&registered| registered)
+            && !self.teb_registered.iter().any(|&registered| registered)
+            && !self.protected_tail_registered
+    }
+
+    pub fn retain_empty_slot(&mut self, slot: u64) -> Result<(), InventoryError> {
+        if slot <= 1 {
+            return Err(InventoryError::InvalidSlot);
+        }
+        if self.empty_slot.is_some() {
+            return Err(InventoryError::Occupied);
+        }
+        self.empty_slot = Some(slot);
+        Ok(())
+    }
+
+    pub const fn empty_slot(&self) -> Option<u64> {
+        self.empty_slot
+    }
+
+    pub fn record_stack(&mut self, index: usize) {
+        assert!(!self.stack_registered[index]);
+        self.stack_registered[index] = true;
+    }
+
+    pub fn record_teb(&mut self, index: usize) {
+        assert!(!self.teb_registered[index]);
+        self.teb_registered[index] = true;
+    }
+
+    pub fn stack_registered(&self, index: usize) -> bool {
+        self.stack_registered[index]
+    }
+    pub fn teb_registered(&self, index: usize) -> bool {
+        self.teb_registered[index]
+    }
+
+    /// Records successful metadata registration, not exclusive ownership of a shared VA entry.
+    pub fn record_protected_tail(&mut self) {
+        self.protected_tail_registered = true;
+    }
+    pub fn protected_tail_registered(&self) -> bool {
+        self.protected_tail_registered
+    }
+}
+
 impl ThreadConstructionInventory {
     pub const fn empty() -> Self {
         Self {
             slots: [SlotState::Absent; 4],
         }
+    }
+
+    /// Transfer fully constructed mechanism ownership to the published runtime representation.
+    /// Incomplete/deleted inventories are returned intact; this is never a rollback operation.
+    pub fn into_live_slots(self) -> Result<[u64; 4], Self> {
+        let mut caps = [0; 4];
+        for (index, state) in self.slots.iter().enumerate() {
+            let SlotState::LiveObject(cap) = *state else {
+                return Err(self);
+            };
+            caps[index] = cap;
+        }
+        Ok(caps)
     }
 
     pub fn state(&self, role: Role) -> SlotState {

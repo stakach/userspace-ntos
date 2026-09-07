@@ -9738,11 +9738,17 @@ impl ExecNtHandler {
         self.thread_runtime.prepare_spawn(pi, process, tid, badge, role, reservations)
     }
 
-    pub(crate) fn cancel_hosted_thread_runtime_publication(
+    pub(crate) fn fail_hosted_thread_runtime_publication(
         &mut self,
         prepared: PreparedHostedThreadRuntime,
+        failure: HostedThreadSpawnFailure,
     ) {
-        self.thread_runtime.cancel_spawn(prepared);
+        match failure {
+            HostedThreadSpawnFailure::Unstarted => self.thread_runtime.cancel_spawn(prepared),
+            HostedThreadSpawnFailure::Retained(partial) => {
+                self.thread_runtime.retain_failed_spawn(prepared, partial);
+            }
+        }
     }
 
     pub(crate) fn commit_hosted_thread_runtime_publication(
