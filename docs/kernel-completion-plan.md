@@ -163,10 +163,14 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add allocation-free, exact-ticket failed-construction handoff into the pre-reserved runtime
   slot, with explicit absent TCB cleanup and slot-aware native unbuilt-reservation release checks
   (tranche 70, host/build; native constructor inventory and handoff activation remain open).
+- [x] Inventory constructor-owned TEB mirror/source aliases through registry publication, remove
+  untracked constructor probes, and require successful scratch mapping before TEB2/ACS initialization
+  (tranche 71, host/build; mechanism/empty-slot ownership and native retry cleanup remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Next make native constructor and scheduling-context
-  failures return complete ownership, including allocated empty slots, raw/minted CNodes, optional real
-  TCB, and local/registry TEB aliases. Retain that partial payload through the tested exact-ticket handoff
+  failures return complete ownership, including allocated empty slots, raw/minted CNodes and optional
+  real TCB. TEB mirror/source inventory now transfers explicitly to registry ownership on publication.
+  Retain the complete partial payload through the tested exact-ticket handoff
   before fallible reconciliation, preserving process/pool/window holds. Replace destructive failure exits
   and empty failed-spawn results with ownership-returning failures, then replace
   the legacy fatal release boundary with a checked retry backend. Close remaining non-ingress routing
@@ -27219,6 +27223,42 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     mirrored references, checked free-list publication, ordinary termination, handler handoffs, image
     coherency and user-mode SEH remain open. No QEMU or desktop proof is claimed; the full desktop
     gate remains blocked by the recorded 33 unresolved win32k imports.
+
+    B3 TEB construction inventory tranche 71 (2026-09-07, host/build green):
+    `ThreadMemoryResources` now records constructor-local live-mirror and source-copy capabilities
+    for both TEB pages. Native construction records these before mapping/registry publication and
+    clears them only when the exact client-frame insertion succeeds. Published aliases remain with
+    the existing registry owner; failed insertion leaves the copies in the thread resource bundle.
+    The legacy release path consumes only still-local copies, removing duplicated per-branch manual
+    deletion. Host rollback and registry snapshots include all four fields, preserving same-page
+    deduplication, exact physical owners, stale-resource detection and foreign-row conflict checks.
+
+    Construction no longer allocates live-mirror copies when there is no mirror VA. The two
+    constructor source probes, their unused helper and counters are removed: they created extra diagnostic copies and ignored failed
+    deletion, outside any resource inventory. Target/scratch mappings and functional registration
+    remain unchanged. TEB2 DeallocationStack and activation-context-stack initialization now occur
+    only after their mapping-error checks; previously failed scratch mapping could lead to writes
+    through an absent or unrelated executive alias before cleanup was reached.
+
+    Validation: seven new host tests cover exact local alias classification, orphan/unlocated caps,
+    cross-page conflicts, same-page references, before/after registry transfer equivalence, foreign
+    registry sharing and snapshot invalidation. The serialized nine-crate suite passes 1,128 tests,
+    including 201 `nt-user-host` tests; log: `.tmp/test-thread-teb-inventory-20260907.log`. The executive
+    build passes at the unchanged 262-warning baseline and stages rootserver/hive; log:
+    `.tmp/build-thread-teb-inventory-20260907.log`. Read-only research covered both TEB inventory and
+    scheduling-context lifetime; TEB/native review found no blocking issues. Root alone ran tests
+    followed by the build. Native map-failure behavior was inspected, not fault-injected in QEMU.
+
+    Review adjustment: next preserve scheduling-context construction through allocated-empty,
+    retyped, failed-delete and failed-recycle states, then finish raw/minted CNode and TCB inventory
+    before activating native failure handoff. The microkernel SC bind path validates before mutation,
+    so a failed attachment remains unbound; any retained cleanup must be retirement-only and never
+    retry binding through a TCB slot the caller may have reused. The current root-slot recycler can
+    silently drop slots when its fixed free list is full, requiring a checked publication boundary.
+    This tranche inventories TEB copies but does not make legacy unmap/delete/frame recycling checked
+    or retry-complete. Constructor failure returns, native pending activation, external-alias journals,
+    mirrored-reference clearing, ordinary termination and user-mode SEH remain open. No desktop proof
+    is claimed; 33 recorded unresolved win32k imports still block the full gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

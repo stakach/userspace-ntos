@@ -11,6 +11,76 @@ fn partial() -> ThreadMemoryResources<3> {
 }
 
 #[test]
+fn partial_teb_alias_inventory_survives_exact_registry_publication() {
+    let mut resources = partial();
+    resources.teb_owner = 30;
+    resources.teb_target = 31;
+    resources.teb_scratch = 32;
+    resources.teb_local_mirror = 33;
+    resources.teb_local_source = 34;
+    resources.teb2_owner = 40;
+    resources.teb2_target = 41;
+    resources.teb2_scratch = 42;
+    resources.teb2_local_mirror = 43;
+    resources.teb2_local_source = 44;
+    let mut registry = ClientFrameRegistry::new();
+    let before = ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[]).unwrap();
+    assert_eq!(before.rollback_resources().len(), 10);
+    registry
+        .insert(27, 0x13000, 31, 0x100000, 33, 34, true)
+        .unwrap();
+    registry
+        .insert(27, 0x14000, 41, 0x101000, 43, 44, true)
+        .unwrap();
+    // Registry insertion acknowledges ownership of these two copies per page.
+    resources.teb_local_mirror = 0;
+    resources.teb_local_source = 0;
+    resources.teb2_local_mirror = 0;
+    resources.teb2_local_source = 0;
+    let after = ThreadRegistrySnapshot::capture_partial(&resources, &registry, &[0x13000, 0x14000])
+        .unwrap();
+    assert_eq!(after.rollback_resources(), before.rollback_resources());
+    assert_eq!(
+        before.revalidate(&resources, &registry),
+        Err(ThreadRegistryError::StaleResources)
+    );
+    let transfer = after
+        .prepare_transfer(&resources, &mut registry)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfer.records().len(), 2);
+}
+
+#[test]
+fn unpublished_teb_caps_cannot_be_shared_with_an_unselected_registry_row() {
+    for cap in [33, 34, 43, 44] {
+        let mut resources = resources(27);
+        resources.teb_local_mirror = 33;
+        resources.teb_local_source = 34;
+        resources.teb2_local_mirror = 43;
+        resources.teb2_local_source = 44;
+        let mut registry = ClientFrameRegistry::new();
+        registry.insert(28, 0x20000, 100, 0, 0, cap, false).unwrap();
+        assert!(
+            matches!(ThreadRegistrySnapshot::capture(&resources, &registry, &[]),
+            Err(ThreadRegistryError::SharedCapability { cap: found }) if found == cap)
+        );
+    }
+}
+
+#[test]
+fn newly_created_teb_alias_invalidates_an_earlier_cleanup_snapshot() {
+    let mut resources = resources(27);
+    let registry = ClientFrameRegistry::new();
+    let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &[]).unwrap();
+    resources.teb_local_source = 34;
+    assert_eq!(
+        snapshot.revalidate(&resources, &registry),
+        Err(ThreadRegistryError::StaleResources)
+    );
+}
+
+#[test]
 fn empty_construction_retains_geometry_without_fabricated_frame_owners() {
     let resources = partial();
     let mut registry = ClientFrameRegistry::new();

@@ -119,6 +119,8 @@ impl<const STACK: usize> ThreadRegistrySnapshot<STACK> {
                 &[
                     aliases[0],
                     aliases[1],
+                    aliases[2],
+                    aliases[3],
                     extra_aliases[0],
                     extra_aliases[1],
                     extra_aliases[2],

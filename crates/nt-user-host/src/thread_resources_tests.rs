@@ -237,3 +237,84 @@ fn caps_outside_the_retained_layout_are_rejected() {
         Err(ThreadRollbackError::InvalidIdentity)
     );
 }
+
+#[test]
+fn unpublished_teb_copies_are_aliases_of_their_exact_backing_pages() {
+    let mut resources = resources();
+    resources.teb_local_mirror = 33;
+    resources.teb_local_source = 34;
+    resources.teb2_local_mirror = 43;
+    resources.teb2_local_source = 44;
+    let inventory = resources.rollback_resources().unwrap();
+    for cap in [33, 34, 43, 44] {
+        assert_eq!(inventory.iter().filter(|entry| entry.cap == cap).count(), 1);
+        assert_eq!(
+            inventory
+                .iter()
+                .find(|entry| entry.cap == cap)
+                .unwrap()
+                .kind,
+            ThreadRollbackResourceKind::Alias
+        );
+    }
+    let pages: Vec<_> = resources.backing_pages().collect();
+    assert_eq!(pages[2], (0x13000, 30, [31, 32, 33, 34]));
+    assert_eq!(pages[3], (0x14000, 40, [41, 42, 43, 44]));
+    assert_eq!(inventory.len(), 21);
+}
+
+#[test]
+fn each_unpublished_teb_cap_requires_a_located_physical_owner() {
+    for field in 0..4 {
+        let mut empty = ThreadMemoryResources::<3>::empty();
+        let cap = match field {
+            0 => &mut empty.teb_local_mirror,
+            1 => &mut empty.teb_local_source,
+            2 => &mut empty.teb2_local_mirror,
+            _ => &mut empty.teb2_local_source,
+        };
+        *cap = 100;
+        assert!(empty.has_capabilities());
+        assert!(empty.has_unlocated_capabilities());
+        assert_eq!(
+            empty.rollback_resources(),
+            Err(ThreadRollbackError::ConflictingOwnership)
+        );
+        empty.layout = Some(layout());
+        assert_eq!(
+            empty.rollback_resources(),
+            Err(ThreadRollbackError::ConflictingOwnership)
+        );
+    }
+}
+
+#[test]
+fn unpublished_teb_aliases_reject_cross_page_cap_reuse() {
+    for field in 0..4 {
+        let mut resources = resources();
+        let cap = match field {
+            0 => &mut resources.teb_local_mirror,
+            1 => &mut resources.teb_local_source,
+            2 => &mut resources.teb2_local_mirror,
+            _ => &mut resources.teb2_local_source,
+        };
+        *cap = 11;
+        assert_eq!(
+            resources.rollback_resources(),
+            Err(ThreadRollbackError::ConflictingOwnership)
+        );
+    }
+}
+
+#[test]
+fn duplicate_teb_references_never_create_a_second_release_owner() {
+    let mut resources = resources();
+    resources.teb_local_mirror = resources.teb_target;
+    resources.teb_local_source = resources.teb_owner;
+    resources.teb2_local_mirror = resources.teb2_scratch;
+    resources.teb2_local_source = resources.teb2_scratch;
+    let inventory = resources.rollback_resources().unwrap();
+    for cap in [30, 31, 42] {
+        assert_eq!(inventory.iter().filter(|entry| entry.cap == cap).count(), 1);
+    }
+}

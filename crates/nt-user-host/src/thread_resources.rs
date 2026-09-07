@@ -127,9 +127,14 @@ pub struct ThreadMemoryResources<const STACK: usize> {
     pub teb_owner: u64,
     pub teb_target: u64,
     pub teb_scratch: u64,
+    /// Constructor-owned copies, cleared only after exact client-frame registry publication.
+    pub teb_local_mirror: u64,
+    pub teb_local_source: u64,
     pub teb2_owner: u64,
     pub teb2_target: u64,
     pub teb2_scratch: u64,
+    pub teb2_local_mirror: u64,
+    pub teb2_local_source: u64,
     pub acs_owner: u64,
     pub acs_target: u64,
     /// Directly allocated physical backing, mapped into the target, not a copied target alias.
@@ -149,9 +154,13 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
             teb_owner: 0,
             teb_target: 0,
             teb_scratch: 0,
+            teb_local_mirror: 0,
+            teb_local_source: 0,
             teb2_owner: 0,
             teb2_target: 0,
             teb2_scratch: 0,
+            teb2_local_mirror: 0,
+            teb2_local_source: 0,
             acs_owner: 0,
             acs_target: 0,
             ipc_owner: 0,
@@ -184,9 +193,13 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
                 self.teb_owner,
                 self.teb_target,
                 self.teb_scratch,
+                self.teb_local_mirror,
+                self.teb_local_source,
                 self.teb2_owner,
                 self.teb2_target,
                 self.teb2_scratch,
+                self.teb2_local_mirror,
+                self.teb2_local_source,
                 self.acs_owner,
                 self.acs_target,
                 self.ipc_owner,
@@ -231,12 +244,12 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
         }
     }
 
-    pub(crate) fn backing_pages(&self) -> impl Iterator<Item = (u64, u64, [u64; 2])> + '_ {
+    pub(crate) fn backing_pages(&self) -> impl Iterator<Item = (u64, u64, [u64; 4])> + '_ {
         let stack = (0..self.stack_frames() as usize).map(|index| {
             (
                 self.stack_base() + index as u64 * PAGE_SIZE,
                 self.stack_owner[index],
-                [self.stack_target[index], self.stack_mirror[index]],
+                [self.stack_target[index], self.stack_mirror[index], 0, 0],
             )
         });
         let other = self.layout.into_iter().flat_map(|layout| {
@@ -244,23 +257,33 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
                 (
                     layout.teb.base,
                     self.teb_owner,
-                    [self.teb_target, self.teb_scratch],
+                    [
+                        self.teb_target,
+                        self.teb_scratch,
+                        self.teb_local_mirror,
+                        self.teb_local_source,
+                    ],
                 ),
                 (
                     layout.teb.base + PAGE_SIZE,
                     self.teb2_owner,
-                    [self.teb2_target, self.teb2_scratch],
+                    [
+                        self.teb2_target,
+                        self.teb2_scratch,
+                        self.teb2_local_mirror,
+                        self.teb2_local_source,
+                    ],
                 ),
                 (
                     layout.teb.base + 2 * PAGE_SIZE,
                     self.acs_owner,
-                    [self.acs_target, 0],
+                    [self.acs_target, 0, 0, 0],
                 ),
-                (layout.ipc.base, self.ipc_owner, [0, 0]),
+                (layout.ipc.base, self.ipc_owner, [0, 0, 0, 0]),
                 (
                     layout.trampoline.base,
                     self.tramp_owner,
-                    [self.tramp_target, 0],
+                    [self.tramp_target, 0, 0, 0],
                 ),
             ]
         });
@@ -274,7 +297,7 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
         let mut result = Vec::new();
         let capacity = STACK
             .checked_mul(3)
-            .and_then(|n| n.checked_add(11))
+            .and_then(|n| n.checked_add(15))
             .ok_or(ThreadRollbackError::InsufficientResources)?;
         result
             .try_reserve(capacity)
@@ -288,11 +311,27 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
             append_frame(&mut result, owner, &aliases)?;
         }
         for (owner, aliases) in [
-            (self.teb_owner, [self.teb_target, self.teb_scratch]),
-            (self.teb2_owner, [self.teb2_target, self.teb2_scratch]),
-            (self.acs_owner, [self.acs_target, 0]),
-            (self.ipc_owner, [0, 0]),
-            (self.tramp_owner, [self.tramp_target, 0]),
+            (
+                self.teb_owner,
+                [
+                    self.teb_target,
+                    self.teb_scratch,
+                    self.teb_local_mirror,
+                    self.teb_local_source,
+                ],
+            ),
+            (
+                self.teb2_owner,
+                [
+                    self.teb2_target,
+                    self.teb2_scratch,
+                    self.teb2_local_mirror,
+                    self.teb2_local_source,
+                ],
+            ),
+            (self.acs_owner, [self.acs_target, 0, 0, 0]),
+            (self.ipc_owner, [0, 0, 0, 0]),
+            (self.tramp_owner, [self.tramp_target, 0, 0, 0]),
         ] {
             append_frame(&mut result, owner, &aliases)?;
         }

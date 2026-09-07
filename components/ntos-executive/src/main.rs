@@ -616,6 +616,8 @@ unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
     }
 
     take_registered_thread_page(resources.client_pi, resources.teb_va(), resources.teb_owner);
+    recycle_mapped_cap(resources.teb_local_mirror);
+    recycle_plain_cap(resources.teb_local_source);
     recycle_mapped_cap(resources.teb_target);
     recycle_mapped_cap(resources.teb_scratch);
     release_unmapped_owned_thread_frame(resources.teb_owner);
@@ -625,6 +627,8 @@ unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
         resources.teb_va() + 0x1000,
         resources.teb2_owner,
     );
+    recycle_mapped_cap(resources.teb2_local_mirror);
+    recycle_plain_cap(resources.teb2_local_source);
     recycle_mapped_cap(resources.teb2_target);
     recycle_mapped_cap(resources.teb2_scratch);
     release_unmapped_owned_thread_frame(resources.teb2_owner);
@@ -8875,46 +8879,6 @@ pub(crate) unsafe fn csrss_frame_create_source_copy(
     print_u64(error);
     print_str(b"\n");
     0
-}
-
-static FRAME_SOURCE_PROBE_OK_LOGS: AtomicU64 = AtomicU64::new(0);
-static FRAME_SOURCE_PROBE_FAIL_LOGS: AtomicU64 = AtomicU64::new(0);
-
-unsafe fn csrss_frame_probe_source_copy(pi: u64, page: u64, source_cap: u64, what: &[u8]) {
-    if source_cap == 0 {
-        return;
-    }
-    let (probe, error) = copy_cap_r(source_cap);
-    if error == 0 {
-        let _ = cnode_delete_recycle_r(probe);
-        if FRAME_SOURCE_PROBE_OK_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
-            print_str(b"[frame-source] ");
-            print_str(what);
-            print_str(b" probe ok pi=");
-            print_u64(pi);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" source=0x");
-            print_hex(source_cap as u32);
-            print_str(b"\n");
-        }
-        return;
-    }
-    if FRAME_SOURCE_PROBE_FAIL_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
-        print_str(b"[frame-source] ");
-        print_str(what);
-        print_str(b" probe failed pi=");
-        print_u64(pi);
-        print_str(b" page=0x");
-        print_hex((page >> 32) as u32);
-        print_hex(page as u32);
-        print_str(b" source=0x");
-        print_hex(source_cap as u32);
-        print_str(b" error=");
-        print_u64(error);
-        print_str(b"\n");
-    }
 }
 
 unsafe fn client_copy_temp_cap() -> u64 {
@@ -26626,17 +26590,21 @@ unsafe fn spawn_hosted_thread_mechanism(
         }
     }
     // TEB page 1: self@0x30, ClientId@0x40/0x48, PEB@0x60 (shared), StackBase@0x08/StackLimit@0x10,
-    // ActivationContextStackPointer@0x2C8 → an empty ACS in the 2nd TEB page.
+    // ActivationContextStackPointer@0x2C8 points to the private ACS page after both TEB pages.
     let teb = alloc_frame();
     let teb_client = copy_cap(teb);
     let teb_scratch = copy_cap(teb);
-    let teb_live_mirror = copy_cap(teb);
-    let teb_target_map = page_map(teb_client, t.teb_va, RW_NX, t.pml4);
     let teb_live_alias = if t.client_pi != 0 && t.stack_mirror_va != 0 {
         t.stack_mirror_va + t.stack_frames * 0x1000
     } else {
         0
     };
+    let teb_live_mirror = if teb_live_alias != 0 { copy_cap(teb) } else { 0 };
+    resources.teb_owner = teb;
+    resources.teb_target = teb_client;
+    resources.teb_scratch = teb_scratch;
+    resources.teb_local_mirror = teb_live_mirror;
+    let teb_target_map = page_map(teb_client, t.teb_va, RW_NX, t.pml4);
     let teb_scratch_map = page_map(teb_scratch, scr, RW_NX, CAP_INIT_THREAD_VSPACE);
     let teb_live_map = if teb_live_alias != 0 {
         page_map(
@@ -26648,15 +26616,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     } else {
         0
     };
-    resources.teb_owner = teb;
-    resources.teb_target = teb_client;
-    resources.teb_scratch = teb_scratch;
     if teb_target_map != 0 || teb_scratch_map != 0 || teb_live_map != 0 {
-        if teb_live_alias != 0 && teb_live_map == 0 {
-            recycle_mapped_cap(teb_live_mirror);
-        } else {
-            recycle_plain_cap(teb_live_mirror);
-        }
         print_str(b"[thread-life] TEB map failure target/scratch/live=");
         print_u64(teb_target_map);
         print_str(b"/");
@@ -26670,32 +26630,20 @@ unsafe fn spawn_hosted_thread_mechanism(
     if t.client_pi != 0 {
         let source_cap =
             csrss_frame_create_source_copy(teb_client, t.client_pi, t.teb_va, b"thread-teb");
-        let alias = if teb_live_map == 0 { teb_live_alias } else { 0 };
-        let alias_cap = if teb_live_map == 0 {
-            teb_live_mirror
-        } else {
-            0
-        };
+        resources.teb_local_source = source_cap;
         let registered = source_cap != 0
             && csrss_frame_put_at_cap_source(
                 t.client_pi,
                 t.teb_va,
                 teb_client,
-                alias,
-                alias_cap,
+                teb_live_alias,
+                teb_live_mirror,
                 source_cap,
             );
         if registered {
-            csrss_frame_probe_source_copy(t.client_pi, t.teb_va, source_cap, b"thread-teb");
+            resources.teb_local_mirror = 0;
+            resources.teb_local_source = 0;
         } else {
-            if source_cap != 0 {
-                let _ = cnode_delete_recycle_r(source_cap);
-            }
-            if teb_live_alias != 0 && teb_live_map == 0 {
-                recycle_mapped_cap(teb_live_mirror);
-            } else {
-                recycle_plain_cap(teb_live_mirror);
-            }
             print_str(b"[thread-life] failed to register thread TEB client frame pi=");
             print_u64(t.client_pi);
             print_str(b" page=0x");
@@ -26705,8 +26653,6 @@ unsafe fn spawn_hosted_thread_mechanism(
             release_hosted_thread_resources(resources);
             return HostedThreadSpawnResult::failed();
         }
-    } else {
-        recycle_plain_cap(teb_live_mirror);
     }
     core::ptr::write_volatile((scr + 0x30) as *mut u64, t.teb_va);
     core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
@@ -26739,16 +26685,18 @@ unsafe fn spawn_hosted_thread_mechanism(
     let teb2 = alloc_frame();
     let teb2_client = copy_cap(teb2);
     let teb2_scratch = copy_cap(teb2);
-    let teb2_live_mirror = copy_cap(teb2);
-    let teb2_target_map = page_map(teb2_client, t.teb_va + 0x1000, RW_NX, t.pml4);
     let teb2_live_alias = if t.client_pi != 0 && t.stack_mirror_va != 0 {
         t.stack_mirror_va + (t.stack_frames + 1) * 0x1000
     } else {
         0
     };
+    let teb2_live_mirror = if teb2_live_alias != 0 { copy_cap(teb2) } else { 0 };
+    resources.teb2_owner = teb2;
+    resources.teb2_target = teb2_client;
+    resources.teb2_scratch = teb2_scratch;
+    resources.teb2_local_mirror = teb2_live_mirror;
+    let teb2_target_map = page_map(teb2_client, t.teb_va + 0x1000, RW_NX, t.pml4);
     let teb2_scratch_map = page_map(teb2_scratch, scr + 0x1000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    // DeallocationStack is in TEB page 2; populate it only after its scratch alias is mapped.
-    core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
     let teb2_live_map = if teb2_live_alias != 0 {
         page_map(
             teb2_live_mirror,
@@ -26759,15 +26707,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     } else {
         0
     };
-    resources.teb2_owner = teb2;
-    resources.teb2_target = teb2_client;
-    resources.teb2_scratch = teb2_scratch;
     if teb2_target_map != 0 || teb2_scratch_map != 0 || teb2_live_map != 0 {
-        if teb2_live_alias != 0 && teb2_live_map == 0 {
-            recycle_mapped_cap(teb2_live_mirror);
-        } else {
-            recycle_plain_cap(teb2_live_mirror);
-        }
         print_str(b"[thread-life] TEB tail map failure target/scratch/live=");
         print_u64(teb2_target_map);
         print_str(b"/");
@@ -26778,6 +26718,8 @@ unsafe fn spawn_hosted_thread_mechanism(
         release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
+    // DeallocationStack is in TEB page 2; write only after scratch mapping succeeded.
+    core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
     if t.client_pi != 0 {
         let source_cap = csrss_frame_create_source_copy(
             teb2_client,
@@ -26785,41 +26727,20 @@ unsafe fn spawn_hosted_thread_mechanism(
             t.teb_va + 0x1000,
             b"thread-teb-tail",
         );
-        let alias = if teb2_live_map == 0 {
-            teb2_live_alias
-        } else {
-            0
-        };
-        let alias_cap = if teb2_live_map == 0 {
-            teb2_live_mirror
-        } else {
-            0
-        };
+        resources.teb2_local_source = source_cap;
         let registered = source_cap != 0
             && csrss_frame_put_at_cap_source(
                 t.client_pi,
                 t.teb_va + 0x1000,
                 teb2_client,
-                alias,
-                alias_cap,
+                teb2_live_alias,
+                teb2_live_mirror,
                 source_cap,
             );
         if registered {
-            csrss_frame_probe_source_copy(
-                t.client_pi,
-                t.teb_va + 0x1000,
-                source_cap,
-                b"thread-teb-tail",
-            );
+            resources.teb2_local_mirror = 0;
+            resources.teb2_local_source = 0;
         } else {
-            if source_cap != 0 {
-                let _ = cnode_delete_recycle_r(source_cap);
-            }
-            if teb2_live_alias != 0 && teb2_live_map == 0 {
-                recycle_mapped_cap(teb2_live_mirror);
-            } else {
-                recycle_plain_cap(teb2_live_mirror);
-            }
             print_str(b"[thread-life] failed to register thread TEB tail client frame pi=");
             print_u64(t.client_pi);
             print_str(b" page=0x");
@@ -26840,22 +26761,13 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_hex(tail_page as u32);
             print_str(b"\n");
         }
-    } else {
-        recycle_plain_cap(teb2_live_mirror);
     }
-    // The private ACS page: written through its own scratch alias, then mapped at `acs_va` in the
-    // target VSpace. Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a
+    // The private ACS page is initialized only after scratch and target mappings are checked.
+    // Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a
     // thread's activation-context stack, and not registering it means a win32k fault at that VA can
     // never be answered with this page.
     let acs_frame = alloc_frame();
     let acs_scratch_map = page_map(acs_frame, scr + 0x4000, RW_NX, CAP_INIT_THREAD_VSPACE);
-    let acs = scr + 0x4000;
-    core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
-    core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
-    core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08);
-    core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
-    core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
-    core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
     let acs_target_cap = copy_cap(acs_frame);
     let acs_target_map = page_map(acs_target_cap, acs_va, RW_NX, t.pml4);
     resources.acs_owner = acs_frame;
@@ -26869,6 +26781,13 @@ unsafe fn spawn_hosted_thread_mechanism(
         release_hosted_thread_resources(resources);
         return HostedThreadSpawnResult::failed();
     }
+    let acs = scr + 0x4000;
+    core::ptr::write_volatile((acs + 0x00) as *mut u64, 0);
+    core::ptr::write_volatile((acs + 0x08) as *mut u64, acs_va + 0x08);
+    core::ptr::write_volatile((acs + 0x10) as *mut u64, acs_va + 0x08);
+    core::ptr::write_volatile((acs + 0x18) as *mut u32, 0);
+    core::ptr::write_volatile((acs + 0x1c) as *mut u32, 1);
+    core::ptr::write_volatile((acs + 0x20) as *mut u32, 1);
     core::ptr::write_volatile((scr + 0x1000 + 0x25a) as *mut u16, 522); // StaticUnicodeString.MaximumLength
     core::ptr::write_volatile((scr + 0x1000 + 0x260) as *mut u64, t.teb_va + 0x1268); // .Buffer
     seed_teb_tail_canary(scr + 0x1000);
