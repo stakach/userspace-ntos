@@ -271,6 +271,11 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain exact invisible Ps handle publications across asynchronous output delivery (tranche 107;
   host core plus native thread-creation ownership integration).
   Publish or abort the owned reservation, never compensate by closing a possibly reused raw handle.
+- [x] Move exception records through handler continuations without per-handler allocation and
+  validate the catalog against real staged desktop binaries (tranche 108). Native entry records,
+  collision linkage and low-memory delivery still require their physical-lane implementation.
+- [~] Add canonical native Ps close semantics over the shared table scopes (tranche 109). Preserve
+  protected-handle status/bugcheck behavior; do not probe alternate object tables after failure.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28780,6 +28785,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     validation passes 761 tests; the twenty-one-crate regression passes 2,471 and the native release
     build passes (262 warnings), in the same final logs as tranche 105. Provider IPC ACK journals and
     full Ps/Se/USER native handle cutover remain open; no desktop acceptance is claimed.
+
+    B3 exception record ownership and staged-image validation tranche 108 (2026-09-08):
+
+    ExceptionWalk now separates its private walk state from the owned ExceptionRecord. Handler
+    invocation moves the real record out and consuming return moves it back, without cloning its
+    parameter Vec or installing a placeholder record. Three ownership tests retain the same populated
+    buffer/capacity across multiple search and unwind handlers and verify actual replacement records.
+    Native entry still needs fixed-capacity records and pre-reserved physical-lane activation slots;
+    this removes per-handler allocation, not all native exception-entry allocation requirements.
+
+    Added the read-only `nt-unwind` example `check_exception_images` to map supplied real PE files
+    through nt-pe-loader and run the unchanged admission API. Its first run found one rejected row
+    each in win32k and Explorer: their real stack-probe assembly describes PUSH RAX/PUSH RCX with
+    UWOP_PUSH_NONVOL. The interpreter and NT5 support the encoded register; the catalog's
+    nonvolatile-only operand check was too restrictive. Corrected explicit PUSH/SAVE/SAVE_FAR GPR
+    admission, preserving frame-pointer, opcode, metadata and stack bounds checks. New regressions
+    use the exact eight-byte metadata and all sixteen GPR ordinals for all three operations.
+
+    The final real-image probe passes win32k (2,863 functions), user32 (2,230), gdi32 (1,541), Explorer
+    (995), and our ntdll (2,168), covering 9,797 admitted runtime rows. Log:
+    `.tmp/check-staged-exception-images-final-20260908.log`. The twenty-one-crate regression passes
+    2,471 tests, including 156 unwind unit tests and two compile-fail ownership checks. This is
+    metadata compatibility evidence only: none of the supplied images was executed by the validator,
+    and native desktop rendering/import closure remains unverified.
+
+    B3 canonical native Ps close tranche 109 (2026-09-08, in progress):
+
+    Resolve one full-width native scope and one canonical Process/Thread table entry before mutation.
+    Preserve UserMode protection failures and the genuine KernelMode protected-close bugcheck outcome;
+    do not add a public rundown bypass. Reserved/bound handles remain invisible. The close result
+    reports the removed table reference for real deletion reconsideration, not a fabricated pointer
+    reference or eager object deletion. Native debug/exception policy and Ps/Se/USER routing remain
+    part of the later whole-family cutover.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

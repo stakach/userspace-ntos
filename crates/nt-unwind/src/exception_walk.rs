@@ -189,8 +189,15 @@ pub enum WalkStep {
 /// Clone: a handler cannot advance the same walk or return twice through this API.
 #[derive(Debug)]
 pub struct ExceptionWalk {
-    mode: WalkMode,
     exception: ExceptionRecord,
+    state: WalkState,
+}
+
+/// Control state has no exception-record owner. Suspending a handler moves the real record into
+/// its invocation instead of cloning a parameter buffer or manufacturing an empty replacement.
+#[derive(Debug)]
+struct WalkState {
+    mode: WalkMode,
     original: Context,
     current: Context,
     control_pc: u64,
@@ -204,7 +211,7 @@ pub struct ExceptionWalk {
 
 #[derive(Debug)]
 struct HandlerContinuation {
-    walk: ExceptionWalk,
+    state: WalkState,
     previous: Context,
     establisher_frame: u64,
 }
@@ -254,17 +261,19 @@ impl ExceptionWalk {
             context.rip
         };
         Ok(Self {
-            mode,
             exception,
-            original: context,
-            current: context,
-            control_pc,
-            control_rsp: context.rsp(),
-            low: stack_low,
-            high: stack_high,
-            frames_left: frame_limit,
-            flags,
-            nested_frame: None,
+            state: WalkState {
+                mode,
+                original: context,
+                current: context,
+                control_pc,
+                control_rsp: context.rsp(),
+                low: stack_low,
+                high: stack_high,
+                frames_left: frame_limit,
+                flags,
+                nested_frame: None,
+            },
         })
     }
 
@@ -274,26 +283,26 @@ impl ExceptionWalk {
         image: &dyn ExceptionImageReader,
         stack: &dyn StackReader,
     ) -> Result<WalkStep, WalkError> {
-        self.validate_context(self.current)?;
-        if self.current.rsp() == self.high {
+        self.validate_context(self.state.current)?;
+        if self.state.current.rsp() == self.state.high {
             return Ok(self.end());
         }
-        if self.frames_left == 0 {
+        if self.state.frames_left == 0 {
             return Err(WalkError::FrameLimit);
         }
-        self.frames_left -= 1;
-        let bounded = BoundedStack::new(stack, self.low, self.high)
+        self.state.frames_left -= 1;
+        let bounded = BoundedStack::new(stack, self.state.low, self.state.high)
             .map_err(|_| WalkError::InvalidStackBounds)?;
-        let mut previous = self.current;
+        let mut previous = self.state.current;
         match image
-            .lookup_exception_function(self.control_pc)
+            .lookup_exception_function(self.state.control_pc)
             .map_err(WalkError::ImageLookup)?
         {
             ExceptionFunction::Function {
                 image_base,
                 function,
             } => {
-                let handler_type = if self.mode == WalkMode::Search {
+                let handler_type = if self.state.mode == WalkMode::Search {
                     unw_flag::EHANDLER
                 } else {
                     unw_flag::UHANDLER
@@ -301,7 +310,7 @@ impl ExceptionWalk {
                 let result = virtual_unwind(
                     handler_type,
                     image_base,
-                    self.control_pc,
+                    self.state.control_pc,
                     function,
                     &mut previous,
                     image,
@@ -313,7 +322,7 @@ impl ExceptionWalk {
                 if let WalkMode::Unwind {
                     target_frame: Some(target),
                     ..
-                } = self.mode
+                } = self.state.mode
                 {
                     if target < result.establisher_frame {
                         return Err(WalkError::BadStack);
@@ -328,10 +337,10 @@ impl ExceptionWalk {
                         .image_base
                         .checked_add(u64::from(result.handler_data_rva))
                         .ok_or(WalkError::UnwindData)?;
-                    let (contexts, target_ip) = match self.mode {
+                    let (contexts, target_ip) = match self.state.mode {
                         WalkMode::Search => (
                             HandlerContexts::Search {
-                                exception: self.original,
+                                exception: self.state.original,
                                 unwound: previous,
                             },
                             0,
@@ -341,22 +350,22 @@ impl ExceptionWalk {
                             target_ip,
                             return_value,
                         } => {
-                            self.current.gpr[REG_RAX] = return_value;
+                            self.state.current.gpr[REG_RAX] = return_value;
                             if target_frame == Some(result.establisher_frame) {
-                                self.flags |= EXCEPTION_TARGET_UNWIND;
+                                self.state.flags |= EXCEPTION_TARGET_UNWIND;
                             }
                             (
                                 HandlerContexts::Unwind {
-                                    current: self.current,
+                                    current: self.state.current,
                                 },
                                 target_ip,
                             )
                         }
                     };
-                    self.exception.flags = self.flags;
+                    self.exception.flags = self.state.flags;
                     let invocation = HandlerInvocation {
-                        exception: self.exception.clone(),
-                        control_pc: self.control_pc,
+                        exception: self.exception,
+                        control_pc: self.state.control_pc,
                         image_base,
                         function,
                         establisher_frame: result.establisher_frame,
@@ -366,7 +375,7 @@ impl ExceptionWalk {
                         scope_index: 0,
                         contexts,
                         continuation: HandlerContinuation {
-                            walk: self,
+                            state: self.state,
                             previous,
                             establisher_frame: result.establisher_frame,
                         },
@@ -386,7 +395,7 @@ impl ExceptionWalk {
     }
 
     fn validate_frame(&self, frame: u64) -> Result<(), WalkError> {
-        if frame < self.low || frame > self.high || frame & 15 != 0 {
+        if frame < self.state.low || frame > self.state.high || frame & 15 != 0 {
             Err(WalkError::BadStack)
         } else {
             Ok(())
@@ -394,7 +403,10 @@ impl ExceptionWalk {
     }
 
     fn validate_context(&self, context: Context) -> Result<(), WalkError> {
-        if context.rsp() < self.low || context.rsp() > self.high || context.rsp() & 7 != 0 {
+        if context.rsp() < self.state.low
+            || context.rsp() > self.state.high
+            || context.rsp() & 7 != 0
+        {
             Err(WalkError::BadStack)
         } else {
             Ok(())
@@ -410,41 +422,41 @@ impl ExceptionWalk {
             target_frame: Some(target),
             target_ip,
             return_value,
-        } = self.mode
+        } = self.state.mode
         {
             if establisher == Some(target) {
                 if self.exception.code == 0x8000_0029 {
                     return Err(WalkError::UnsupportedUnwindConsolidate);
                 }
-                self.validate_context(self.current)?;
-                self.current.rip = target_ip;
-                self.current.gpr[REG_RAX] = return_value;
+                self.validate_context(self.state.current)?;
+                self.state.current.rip = target_ip;
+                self.state.current.gpr[REG_RAX] = return_value;
                 return Ok(WalkStep::Complete(WalkOutcome::TargetReached {
                     exception: self.exception,
-                    context: self.current,
+                    context: self.state.current,
                 }));
             }
         }
         self.validate_context(previous)?;
-        if previous.rip == self.control_pc && previous.rsp() == self.control_rsp {
+        if previous.rip == self.state.control_pc && previous.rsp() == self.state.control_rsp {
             return Err(WalkError::BadFunctionTable);
         }
-        self.current = previous;
-        self.control_pc = previous.rip;
-        self.control_rsp = previous.rsp();
+        self.state.current = previous;
+        self.state.control_pc = previous.rip;
+        self.state.control_rsp = previous.rsp();
         Ok(WalkStep::Continue(self))
     }
 
     fn end(mut self) -> WalkStep {
-        self.exception.flags = self.flags;
-        WalkStep::Complete(match self.mode {
+        self.exception.flags = self.state.flags;
+        WalkStep::Complete(match self.state.mode {
             WalkMode::Search => WalkOutcome::Unhandled {
                 exception: self.exception,
-                context: self.original,
+                context: self.state.original,
             },
             WalkMode::Unwind { target_frame, .. } => WalkOutcome::SecondChance {
                 exception: self.exception,
-                context: self.current,
+                context: self.state.current,
                 reason: if target_frame.is_none() {
                     SecondChanceReason::ExitUnwind
                 } else {
@@ -458,41 +470,49 @@ impl ExceptionWalk {
 impl HandlerContinuation {
     /// Complete one real handler call. Unknown dispositions and incomplete collided-unwind support
     /// are errors, never `ContinueSearch`. A native caller must not translate these into success.
-    fn resume(mut self, response: HandlerResponse) -> Result<WalkStep, WalkError> {
+    fn resume(self, response: HandlerResponse) -> Result<WalkStep, WalkError> {
         if response.disposition == 3 {
             return Err(WalkError::UnsupportedCollidedUnwind);
         }
-        self.walk.exception = response.exception;
-        match (self.walk.mode, response.contexts) {
+        let HandlerContinuation {
+            state,
+            mut previous,
+            establisher_frame,
+        } = self;
+        let mut walk = ExceptionWalk {
+            state,
+            exception: response.exception,
+        };
+        match (walk.state.mode, response.contexts) {
             (WalkMode::Search, HandlerContexts::Search { exception, unwound }) => {
-                self.walk.original = exception;
-                self.previous = unwound;
-                self.walk.flags |= self.walk.exception.flags & EXCEPTION_NONCONTINUABLE;
-                if self.walk.nested_frame == Some(self.establisher_frame) {
-                    self.walk.nested_frame = None;
-                    self.walk.flags &= !EXCEPTION_NESTED_CALL;
+                walk.state.original = exception;
+                previous = unwound;
+                walk.state.flags |= walk.exception.flags & EXCEPTION_NONCONTINUABLE;
+                if walk.state.nested_frame == Some(establisher_frame) {
+                    walk.state.nested_frame = None;
+                    walk.state.flags &= !EXCEPTION_NESTED_CALL;
                 }
                 match response.disposition {
                     0 => {
-                        if self.walk.flags & EXCEPTION_NONCONTINUABLE != 0 {
+                        if walk.state.flags & EXCEPTION_NONCONTINUABLE != 0 {
                             return Err(WalkError::NoncontinuableException);
                         }
-                        self.walk.exception.flags = self.walk.flags;
+                        walk.exception.flags = walk.state.flags;
                         return Ok(WalkStep::Complete(WalkOutcome::Handled {
-                            exception: self.walk.exception,
-                            context: self.walk.original,
+                            exception: walk.exception,
+                            context: walk.state.original,
                         }));
                     }
                     1 => {}
                     2 => {
                         let frame = response.dispatcher_establisher_frame;
-                        self.walk.validate_frame(frame)?;
-                        if frame < self.establisher_frame {
+                        walk.validate_frame(frame)?;
+                        if frame < establisher_frame {
                             return Err(WalkError::BadStack);
                         }
-                        self.walk.flags |= EXCEPTION_NESTED_CALL;
-                        self.walk.nested_frame =
-                            Some(self.walk.nested_frame.map_or(frame, |old| old.max(frame)));
+                        walk.state.flags |= EXCEPTION_NESTED_CALL;
+                        walk.state.nested_frame =
+                            Some(walk.state.nested_frame.map_or(frame, |old| old.max(frame)));
                     }
                     raw => return Err(WalkError::InvalidDisposition(raw)),
                 }
@@ -501,13 +521,12 @@ impl HandlerContinuation {
                 if response.disposition != 1 {
                     return Err(WalkError::InvalidDisposition(response.disposition));
                 }
-                self.walk.current = current;
-                self.walk.flags &= !EXCEPTION_TARGET_UNWIND;
+                walk.state.current = current;
+                walk.state.flags &= !EXCEPTION_TARGET_UNWIND;
             }
             _ => return Err(WalkError::InvalidHandlerContexts),
         }
-        self.walk
-            .advance(self.previous, Some(self.establisher_frame))
+        walk.advance(previous, Some(establisher_frame))
     }
 }
 

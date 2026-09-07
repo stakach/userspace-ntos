@@ -402,8 +402,8 @@ fn contradictory_frame_pointer_metadata_is_rejected() {
 }
 
 #[test]
-fn unwind_operations_cannot_name_volatile_registers() {
-    for code in [0, 0x10, 0x40, 0x04, 0x05, 0x08, 0x09] {
+fn xmm_save_admission_keeps_its_nonvolatile_register_constraint() {
+    for code in [0x08, 0x09] {
         let mut bytes = mapped_pe();
         bytes[0x3001] = 1;
         bytes[0x3002] = 3;
@@ -414,6 +414,118 @@ fn unwind_operations_cannot_name_volatile_registers() {
             ImageAdmissionError::UnwindMetadata
         );
     }
+}
+
+struct StackWords<'a>(&'a [(u64, u64)]);
+
+impl StackReader for StackWords<'_> {
+    fn read_u64(&self, address: u64) -> Option<u64> {
+        self.0
+            .iter()
+            .find_map(|&(at, value)| (at == address).then_some(value))
+    }
+}
+
+#[test]
+fn actual_stack_probe_xdata_preserves_volatile_pushes() {
+    // Identical xdata occurs in staged win32k [0x1d5690,0x1d56c0) and explorer
+    // [0x38c80,0x38cb0): push RCX; push RAX; ...; pop RAX; pop RCX; ret.
+    let mut bytes = mapped_pe();
+    bytes[0x3000..0x3008].copy_from_slice(&[1, 2, 2, 0, 2, 0, 1, 0x10]);
+    let catalog = catalog(bytes).unwrap();
+    let mut context = Context::default();
+    context.rip = BASE + 0x1010;
+    context.set_rsp(0x8000);
+    let (_, function) = catalog.lookup_function(context.rip).unwrap();
+    let words = [(0x8000, 0x42), (0x8008, 0x43), (0x8010, BASE + 0x1110)];
+    crate::virtual_unwind(
+        0,
+        BASE,
+        context.rip,
+        function,
+        &mut context,
+        &catalog,
+        &StackWords(&words),
+    )
+    .unwrap();
+    assert_eq!(context.gpr[0], 0x42);
+    assert_eq!(context.gpr[1], 0x43);
+    assert_eq!(context.rsp(), 0x8018);
+    assert_eq!(context.rip, BASE + 0x1110);
+}
+
+#[test]
+fn explicit_push_and_save_operations_use_all_sixteen_gpr_ordinals() {
+    for op in [uwop::PUSH_NONVOL, uwop::SAVE_NONVOL, uwop::SAVE_NONVOL_FAR] {
+        for register in 0..16 {
+            let mut bytes = mapped_pe();
+            let count = match op {
+                uwop::PUSH_NONVOL => 1,
+                uwop::SAVE_NONVOL => 2,
+                _ => 3,
+            };
+            bytes[0x3000..0x3006].copy_from_slice(&[1, 1, count, 0, 1, register << 4 | op]);
+            if op == uwop::SAVE_NONVOL {
+                put16(&mut bytes, 0x3006, 2);
+            } else if op == uwop::SAVE_NONVOL_FAR {
+                put32(&mut bytes, 0x3006, 16);
+            }
+            let catalog = catalog(bytes).unwrap();
+            let mut context = Context::default();
+            context.rip = BASE + 0x1010;
+            context.set_rsp(0x8000);
+            let (_, function) = catalog.lookup_function(context.rip).unwrap();
+            let push = op == uwop::PUSH_NONVOL;
+            let saved_at = if push { 0x8000 } else { 0x8010 };
+            // NT5 writes the encoded register before incrementing RSP for PUSH_NONVOL.
+            // An explicitly saved RSP therefore controls the subsequent checked return read.
+            let return_at = if register == 4 {
+                0x8040 + if push { 8 } else { 0 }
+            } else {
+                0x8000 + if push { 8 } else { 0 }
+            };
+            let words = [(saved_at, 0x8040), (return_at, BASE + 0x1110)];
+            crate::virtual_unwind(
+                0,
+                BASE,
+                context.rip,
+                function,
+                &mut context,
+                &catalog,
+                &StackWords(&words),
+            )
+            .unwrap();
+            if register != 4 {
+                assert_eq!(context.gpr[register as usize], 0x8040);
+            }
+            assert_eq!(context.rsp(), return_at + 8);
+            assert_eq!(context.rip, BASE + 0x1110);
+        }
+    }
+}
+
+#[test]
+fn explicit_rsp_restore_does_not_bypass_checked_stack_reads() {
+    let mut bytes = mapped_pe();
+    bytes[0x3000..0x3006].copy_from_slice(&[1, 1, 1, 0, 1, 0x40]);
+    let catalog = catalog(bytes).unwrap();
+    let mut context = Context::default();
+    context.rip = BASE + 0x1010;
+    context.set_rsp(0x8000);
+    let original = context;
+    let (_, function) = catalog.lookup_function(context.rip).unwrap();
+    let words = [(0x8000, 0xffff_ffff_ffff_f000)];
+    assert!(crate::virtual_unwind(
+        0,
+        BASE,
+        context.rip,
+        function,
+        &mut context,
+        &catalog,
+        &StackWords(&words)
+    )
+    .is_none());
+    assert_eq!(context, original);
 }
 
 #[test]

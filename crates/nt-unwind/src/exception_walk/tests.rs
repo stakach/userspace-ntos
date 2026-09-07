@@ -500,8 +500,8 @@ fn leaf_frames_are_bounded_and_do_not_invent_a_target_handler_frame() {
             .step(&fixture, &fixture)
             .unwrap(),
     );
-    assert_eq!(walk.current.rsp(), LOW + 8);
-    assert_eq!(walk.current.rip, BASE + 0x500);
+    assert_eq!(walk.state.current.rsp(), LOW + 8);
+    assert_eq!(walk.state.current.rip, BASE + 0x500);
 }
 
 #[test]
@@ -803,4 +803,87 @@ fn search_uses_exception_address_as_first_control_pc() {
     let walk = ExceptionWalk::new(WalkMode::Search, record(), initial, LOW, HIGH, 8).unwrap();
     let invocation = invoke(walk.step(&fixture, &fixture).unwrap());
     assert_eq!(invocation.control_pc, BASE + 0x110);
+}
+
+#[test]
+fn search_moves_populated_parameter_allocation_through_handlers_and_completion() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let mut exception = record();
+    exception.information = Vec::with_capacity(15);
+    exception.information.extend_from_slice(&[1, 2, 3]);
+    let pointer = exception.information.as_ptr();
+    let capacity = exception.information.capacity();
+    let walk = ExceptionWalk::new(WalkMode::Search, exception, context(), LOW, HIGH, 8).unwrap();
+    let mut first = invoke(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(first.exception.information.as_ptr(), pointer);
+    assert_eq!(first.exception.information.capacity(), capacity);
+    first.exception.information.push(4);
+    let walk = continued(first.returned(1).unwrap());
+    let mut second = invoke(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(second.exception.information.as_ptr(), pointer);
+    assert_eq!(second.exception.information.capacity(), capacity);
+    assert_eq!(second.exception.information, [1, 2, 3, 4]);
+    second.exception.information.push(5);
+    match second.returned(0).unwrap() {
+        WalkStep::Complete(WalkOutcome::Handled { exception, .. }) => {
+            assert_eq!(exception.information.as_ptr(), pointer);
+            assert_eq!(exception.information.capacity(), capacity);
+            assert_eq!(exception.information, [1, 2, 3, 4, 5]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn unwind_moves_populated_parameter_allocation_through_target_handler() {
+    let fixture = Fixture::new(unw_flag::UHANDLER);
+    let mut exception = record();
+    exception.information = Vec::with_capacity(15);
+    exception.information.extend_from_slice(&[7, 8, 9]);
+    let pointer = exception.information.as_ptr();
+    let capacity = exception.information.capacity();
+    let walk =
+        ExceptionWalk::new(unwind(Some(LOW + 0x20)), exception, context(), LOW, HIGH, 8).unwrap();
+    let first = invoke(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(first.exception.information.as_ptr(), pointer);
+    let walk = continued(first.returned(1).unwrap());
+    let mut second = invoke(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(second.exception.information.as_ptr(), pointer);
+    second.exception.information[1] = 88;
+    match second.returned(1).unwrap() {
+        WalkStep::Complete(WalkOutcome::TargetReached { exception, .. }) => {
+            assert_eq!(exception.information.as_ptr(), pointer);
+            assert_eq!(exception.information.capacity(), capacity);
+            assert_eq!(exception.information, [7, 88, 9]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn handler_replaced_record_becomes_the_only_record_owner() {
+    let fixture = Fixture::new(unw_flag::EHANDLER);
+    let mut first = invoke(
+        fixture
+            .walk(WalkMode::Search)
+            .step(&fixture, &fixture)
+            .unwrap(),
+    );
+    let mut replacement = record();
+    replacement.code = 0xe123_4567;
+    replacement.information.extend_from_slice(&[101, 202]);
+    let pointer = replacement.information.as_ptr();
+    first.exception = replacement;
+    let walk = continued(first.returned(1).unwrap());
+    let second = invoke(walk.step(&fixture, &fixture).unwrap());
+    assert_eq!(second.exception.code, 0xe123_4567);
+    assert_eq!(second.exception.information.as_ptr(), pointer);
+    match second.returned(0).unwrap() {
+        WalkStep::Complete(WalkOutcome::Handled { exception, .. }) => {
+            assert_eq!(exception.code, 0xe123_4567);
+            assert_eq!(exception.information.as_ptr(), pointer);
+            assert_eq!(exception.information, [101, 202]);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
 }

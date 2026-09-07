@@ -338,11 +338,9 @@ fn validate_metadata(
                 return Err(invalid);
             }
             let info = encoded >> 4;
+            // PUSH/SAVE_NONVOL encode any GPR ordinal despite their names. Real stack-probe
+            // assembly saves RAX/RCX this way; only the separate frame-register role is restricted.
             if (op == uwop::SET_FPREG && (info != 0 || header.frame_register == 0))
-                || (matches!(
-                    op,
-                    uwop::PUSH_NONVOL | uwop::SAVE_NONVOL | uwop::SAVE_NONVOL_FAR
-                ) && !nonvolatile_gpr(info))
                 || (matches!(op, uwop::SAVE_XMM128 | uwop::SAVE_XMM128_FAR) && info < 6)
             {
                 return Err(invalid);
