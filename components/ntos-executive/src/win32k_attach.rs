@@ -37,7 +37,14 @@ impl AliasRetirementIo for Backend {
         checked(unsafe { page_unmap_r(cap) })
     }
     fn delete(&mut self, cap: u64) -> Result<(), u32> {
-        checked(unsafe { cnode_delete_recycle_r(cap) })
+        checked(unsafe { cnode_delete_r(cap) })
+    }
+    fn recycle_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.recycle_unretyped_slot(slot)
+    }
+    fn recycle_unretyped_slot(&mut self, slot: u64) -> Result<(), u32> {
+        unsafe { root_slot_recycle::publish_unretyped(slot) }
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
 
@@ -46,7 +53,10 @@ impl AliasTransitionIo for Backend {
         if self.source == 0 {
             return (0, nt_fs::STATUS_INVALID_HANDLE);
         }
-        let (cap, label) = unsafe { copy_cap_r(self.source) };
+        let Some(cap) = try_alloc_slot() else {
+            return (0, nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let label = unsafe { copy_cap_into_r(self.source, cap) };
         (cap, checked(label).err().unwrap_or(0))
     }
     fn map(&mut self, cap: u64, rights: u64) -> Result<(), u32> {

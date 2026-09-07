@@ -33,8 +33,8 @@ pub struct PrefetchProcess {
 }
 
 pub trait PrefetchIo: AliasRetirementIo {
-    /// Transfer a fresh cap/slot even on allocation failure. A nonzero returned slot is owned
-    /// by the registry and must be deletable, including a known-empty slot after failed retype.
+    /// Transfer a fresh cap/slot even on allocation failure. Nonzero status leaves any returned
+    /// slot empty (recycle only); zero status transfers the newly retyped frame capability.
     fn allocate(&mut self) -> (u64, u32);
     /// Failure must leave the cap unmapped.
     fn map(&mut self, cap: u64, alias: u64) -> Result<(), u32>;
@@ -52,6 +52,8 @@ enum State {
 enum Backing {
     Empty,
     Unmapped(u64),
+    AllocatedEmpty(u64),
+    Recycle(u64),
     Mapped(RetainedAlias),
 }
 
@@ -192,7 +194,11 @@ impl PrefetchFrames {
         entry.state = State::Building;
         let (cap, status) = io.allocate();
         if cap != 0 {
-            entry.backing = Backing::Unmapped(cap);
+            entry.backing = if status == 0 {
+                Backing::Unmapped(cap)
+            } else {
+                Backing::AllocatedEmpty(cap)
+            };
         }
         let result = if status != 0 {
             Err(status)
@@ -223,9 +229,15 @@ impl PrefetchFrames {
     ) -> Result<(), u32> {
         let entry = self.exact(reservation)?;
         entry.state = State::Retiring;
+        if let Backing::Unmapped(cap) = entry.backing {
+            io.delete(cap)?;
+            entry.backing = Backing::Recycle(cap);
+        }
         match &mut entry.backing {
             Backing::Empty => {}
-            Backing::Unmapped(cap) => io.delete(*cap)?,
+            Backing::Recycle(cap) => io.recycle_slot(*cap)?,
+            Backing::AllocatedEmpty(cap) => io.recycle_unretyped_slot(*cap)?,
+            Backing::Unmapped(_) => unreachable!("unmapped deletion acknowledged above"),
             Backing::Mapped(alias) => alias.retire(io)?,
         }
         self.entries[reservation.index] = None;

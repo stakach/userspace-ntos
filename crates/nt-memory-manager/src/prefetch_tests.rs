@@ -7,6 +7,53 @@ const PROCESS: PrefetchProcess = PrefetchProcess {
 };
 
 #[test]
+fn mapped_frame_recycle_failure_holds_row_and_alias_until_publication() {
+    let mut table = PrefetchFrames::new();
+    let ticket = reserve(&mut table, 0x1000);
+    let mut io = Io::default();
+    table.build(ticket, &mut io).unwrap();
+    io.fail_recycle = true;
+    for _ in 0..3 {
+        assert_eq!(table.retire(ticket, &mut io), Err(6));
+        assert!(table.contains(2, 0x1000));
+        assert_eq!(table.lookup(PROCESS, 0x1000), Err(RESOURCES));
+        assert!(table.reserve(PROCESS, 0x2000, |_| Some(0x100000)).is_err());
+    }
+    assert_eq!(io.calls.iter().filter(|(op, _)| *op == "unmap").count(), 1);
+    assert_eq!(io.calls.iter().filter(|(op, _)| *op == "delete").count(), 1);
+    io.fail_recycle = false;
+    table.retry_retirement(PROCESS, 0x1000, &mut io).unwrap();
+    assert!(table.process_is_empty(2));
+    assert_eq!(io.calls.last(), Some(&("recycle", 42)));
+    assert!(table.reserve(PROCESS, 0x2000, |_| Some(0x100000)).is_ok());
+}
+
+#[test]
+fn unmapped_frame_recycle_failure_does_not_repeat_deletion() {
+    let mut table = PrefetchFrames::new();
+    let ticket = reserve(&mut table, 0x1000);
+    let mut io = Io {
+        fail_map: true,
+        fail_recycle: true,
+        ..Io::default()
+    };
+    assert_eq!(table.build(ticket, &mut io), Err(2));
+    for _ in 0..3 {
+        assert_eq!(table.retry_retirement(PROCESS, 0x1000, &mut io), Err(6));
+        assert_eq!(table.lookup(PROCESS, 0x1000), Err(RESOURCES));
+    }
+    assert_eq!(io.calls.iter().filter(|(op, _)| *op == "delete").count(), 1);
+    assert!(!io
+        .calls
+        .iter()
+        .any(|(op, _)| matches!(*op, "unmap" | "fill" | "recycle-empty")));
+    io.fail_recycle = false;
+    table.retry_retirement(PROCESS, 0x1000, &mut io).unwrap();
+    assert!(table.process_is_empty(2));
+    assert_eq!(io.calls.last(), Some(&("recycle", 42)));
+}
+
+#[test]
 fn reservation_identity_exhaustion_never_wraps_or_reuses_an_id() {
     let counter = AtomicU64::new(u64::MAX - 1);
     assert_eq!(allocate_id(&counter), Ok(u64::MAX - 1));
@@ -22,6 +69,7 @@ struct Io {
     fail_fill: bool,
     fail_unmap: bool,
     fail_delete: bool,
+    fail_recycle: bool,
     calls: Vec<(&'static str, u64)>,
 }
 
@@ -34,6 +82,7 @@ impl Default for Io {
             fail_fill: false,
             fail_unmap: false,
             fail_delete: false,
+            fail_recycle: false,
             calls: Vec::new(),
         }
     }
@@ -52,6 +101,22 @@ impl AliasRetirementIo for Io {
         self.calls.push(("delete", cap));
         if self.fail_delete {
             Err(5)
+        } else {
+            Ok(())
+        }
+    }
+    fn recycle_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.calls.push(("recycle", slot));
+        if self.fail_recycle {
+            Err(6)
+        } else {
+            Ok(())
+        }
+    }
+    fn recycle_unretyped_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.calls.push(("recycle-empty", slot));
+        if self.fail_recycle {
+            Err(6)
         } else {
             Ok(())
         }
@@ -178,22 +243,22 @@ fn allocation_failure_without_slot_retires_reservation_without_backend_delete() 
 }
 
 #[test]
-fn failed_retype_retains_its_empty_root_slot_until_checked_deletion() {
+fn failed_retype_retains_its_empty_root_slot_until_checked_recycling() {
     let mut table = PrefetchFrames::new();
     let ticket = reserve(&mut table, 0x1000);
     let mut io = Io {
         alloc_status: 1,
-        fail_delete: true,
+        fail_recycle: true,
         ..Io::default()
     };
     assert_eq!(table.build(ticket, &mut io), Err(1));
-    assert_eq!(io.calls, vec![("allocate", 42), ("delete", 42)]);
+    assert_eq!(io.calls, vec![("allocate", 42), ("recycle-empty", 42)]);
     assert_eq!(table.lookup(PROCESS, 0x1000), Err(RESOURCES));
     assert!(!table.process_is_empty(2));
-    io.fail_delete = false;
+    io.fail_recycle = false;
     table.retry_retirement(PROCESS, 0x1000, &mut io).unwrap();
     assert!(table.process_is_empty(2));
-    assert_eq!(io.calls.last(), Some(&("delete", 42)));
+    assert_eq!(io.calls.last(), Some(&("recycle-empty", 42)));
 }
 
 #[test]
@@ -216,7 +281,8 @@ fn map_failure_retains_unmapped_cap_without_filling_or_unmapping_it() {
             ("map-cap", 42),
             ("map-address", 0x100000),
             ("delete", 42),
-            ("delete", 42)
+            ("delete", 42),
+            ("recycle", 42)
         ]
     );
 }
@@ -236,8 +302,8 @@ fn fill_failure_retains_mapping_and_retries_unmap_before_delete() {
     io.fail_unmap = false;
     table.retire(ticket, &mut io).unwrap();
     assert_eq!(
-        &io.calls[io.calls.len() - 2..],
-        &[("unmap", 42), ("delete", 42)]
+        &io.calls[io.calls.len() - 3..],
+        &[("unmap", 42), ("delete", 42), ("recycle", 42)]
     );
 }
 

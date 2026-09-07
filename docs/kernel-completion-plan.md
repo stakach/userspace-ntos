@@ -189,21 +189,25 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Split failed-memory-slot ownership from immutable coverage and move it into sealed retirement;
   retain recycling failures and make reconciliation phase-aware without cleanup replay
   (tranche 79, host/build; native retirement remains disabled).
+- [x] Separate alias deletion from checked recycling, retain failed-copy/failed-retype empty slots,
+  and migrate win32k attachment and prefetch backends off combined delete/recycle operations
+  (tranche 80, host/build; pending-thread journal activation remains open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
   holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Exact registry
   coverage and full external alias state are now captured without transferring ownership. Checked
-  root-slot publication is available and used by retained SC cleanup. Failed-memory-slot ownership
-  now moves into the sealed actor independently of immutable coverage. Next retain complete
-  external-alias cleanup journals and implement
-  checked native frame recycling
+  root-slot publication is available for retained SC cleanup and alias/prefetch retirement, including
+  a strict zero-retype-accounting path for copied/failed slots. Failed-memory-slot ownership now
+  moves into the sealed actor independently of immutable coverage. External aliases retain distinct
+  deletion/recycle phases. Next bind their complete cleanup journals to the pending attempt and
+  implement checked native frame recycling
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
-  longer invokes the destructive legacy release chain. Implement the checked retry backend and
-  failed-memory-slot backend and checked frame free-list publication before attempting native
+  longer invokes the destructive legacy release chain. Connect the checked thread retry backend
+  and failed-memory-slot primitive, and implement checked frame free-list publication before native
   retirement. Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
@@ -27656,6 +27660,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retained owner; ordinary termination, first-resume failure, other launch families and live
     failure validation remain open. No QEMU/desktop proof is claimed; the recorded 33 unresolved
     win32k imports remain the full desktop-gate blocker.
+
+    B3 checked alias recycling tranche 80 (2026-09-07):
+    AliasRetirementIo now separates checked deletion from slot publication. RetainedAlias retains
+    a post-delete phase and its exact slot until recycling succeeds; retries do not repeat unmap
+    or delete. AliasTransition separately tracks whether each old/candidate slot contains a live
+    capability. Copy failure with a nonzero empty destination recycles only; successful copy plus
+    map failure deletes then recycles. Commit/rollback retain both slots and hide ordinary live
+    projection while recycling is incomplete. Read-only snapshots include populated/deleted state,
+    so deletion acknowledgement cannot masquerade as an unchanged live alias.
+
+    Native win32k attachment now reserves a destination and invokes checked copy-into directly,
+    retaining empty copy-failure slots instead of using copy_cap_r's hidden recycling. Its deletion
+    backend calls cnode_delete_r; slot publication uses the strict unretyped recycler. The shared
+    root-slot primitive rejects nonzero per-slot retype accounting before mutation on this path,
+    leaving aggregate live/released bytes untouched. This primitive is also suitable for failed
+    thread memory slots, but does not activate their pending-thread retirement driver by itself.
+
+    The shared trait change also covers prefetch ownership. Failed allocation is AllocatedEmpty,
+    successful unmapped allocation is a frame awaiting deletion, and acknowledged deletion retains
+    a Recycle phase. The native prefetch backend uses strict publication for failed retype slots
+    and normal checked post-delete accounting for owned frames. Mapped prefetch retirement uses
+    RetainedAlias's new phase. Row, process key and scratch VA remain reserved through every retry;
+    no failed recycler can discard the row or expose a deleted frame via lookup. Combined
+    delete/recycle calls are removed from both migrated native backends.
+
+    Validation: eight new tests cover RetainedAlias recycle refusal, transition commit/rollback
+    recycle retries, teardown cancelling either recovery direction, mapped/unmapped prefetch row
+    retention, and strict accounting rejection/publication. Existing failed-copy and failed-retype
+    tests now require recycle-only cleanup rather than deletion of an empty slot. Alias mocks track
+    populated capabilities and reject wrong recycler routing; snapshots distinguish acknowledged
+    deletion with unchanged numeric slots. The serialized nine-crate suite passes 1,200 tests
+    (286 in nt-memory-manager; 265 in nt-user-host: 232 unit, 3 existing integration and 30
+    construction integration). The subsequent executive build passes with the unchanged
+    262-warning baseline. Logs: `.tmp/test-alias-recycling-20260907.log` and
+    `.tmp/build-alias-recycling-20260907.log`. A read-only agent reviewed the transitive
+    alias/prefetch contracts; only root ran serialized checks.
+
+    Review adjustment: this activates corrected alias/prefetch backends, not pending-thread cleanup.
+    Next bind disjoint external alias journals to exact pending attempts, reconcile their ownership
+    and exclusions before effects, and drive them without duplicating release authority in the
+    generic memory journal. Clear stale mutable native references before slot reuse and provide
+    checked frame free-list admission before terminal registry transfer/final commit. The strict
+    failed-memory-slot primitive must be connected through that complete retained backend, not
+    invoked independently. Ordinary termination, first-resume failure, other launch families and
+    live failure validation remain open. Legacy combined helpers still serve unmigrated callers;
+    migrate their phase ownership before changing those helpers globally. No QEMU/desktop proof is
+    claimed; the recorded 33 unresolved win32k imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -5,7 +5,8 @@ const INVALID: u32 = crate::STATUS_INVALID_HANDLE;
 const RESOURCES: u32 = 0xc000_009a;
 
 pub trait AliasTransitionIo: AliasRetirementIo {
-    /// Transfer every allocated destination slot, including an empty slot on copy failure.
+    /// Transfer every allocated destination slot. Nonzero status means the returned slot is
+    /// empty and must only be recycled; zero status means a successful owned capability copy.
     fn copy(&mut self) -> (u64, u32);
     /// Map at the owner's fixed VA. Failure must leave the cap unmapped.
     fn map(&mut self, cap: u64, rights: u64) -> Result<(), u32>;
@@ -15,6 +16,7 @@ pub trait AliasTransitionIo: AliasRetirementIo {
 struct Cap {
     slot: u64,
     mapped: bool,
+    populated: bool,
 }
 
 impl Cap {
@@ -29,7 +31,11 @@ impl Cap {
     fn release(&mut self, io: &mut impl AliasRetirementIo) -> Result<(), u32> {
         self.unmap(io)?;
         if self.slot != 0 {
-            io.delete(self.slot)?;
+            if self.populated {
+                io.delete(self.slot)?;
+                self.populated = false;
+            }
+            io.recycle_unretyped_slot(self.slot)?;
             self.slot = 0;
         }
         Ok(())
@@ -81,10 +87,12 @@ impl AliasTransition {
             old: Cap {
                 slot: 0,
                 mapped: false,
+                populated: false,
             },
             new: Cap {
                 slot: 0,
                 mapped: false,
+                populated: false,
             },
             rights: 0,
             new_rights: 0,
@@ -120,6 +128,7 @@ impl AliasTransition {
         self.new_rights = rights;
         let (cap, status) = io.copy();
         self.new.slot = cap;
+        self.new.populated = cap != 0 && status == 0;
         let result = if status != 0 {
             Err(status)
         } else if cap == 0 {

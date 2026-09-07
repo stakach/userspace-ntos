@@ -55,7 +55,15 @@ impl AliasRetirementIo for Cleanup {
         checked(unsafe { page_unmap_r(cap) })
     }
     fn delete(&mut self, cap: u64) -> Result<(), u32> {
-        checked(unsafe { cnode_delete_recycle_r(cap) })
+        checked(unsafe { cnode_delete_r(cap) })
+    }
+    fn recycle_slot(&mut self, slot: u64) -> Result<(), u32> {
+        unsafe { root_slot_recycle::publish_empty(slot) }
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
+    }
+    fn recycle_unretyped_slot(&mut self, slot: u64) -> Result<(), u32> {
+        unsafe { root_slot_recycle::publish_unretyped(slot) }
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
 
@@ -70,6 +78,12 @@ impl AliasRetirementIo for Fill<'_> {
     }
     fn delete(&mut self, cap: u64) -> Result<(), u32> {
         Cleanup.delete(cap)
+    }
+    fn recycle_slot(&mut self, slot: u64) -> Result<(), u32> {
+        Cleanup.recycle_slot(slot)
+    }
+    fn recycle_unretyped_slot(&mut self, slot: u64) -> Result<(), u32> {
+        Cleanup.recycle_unretyped_slot(slot)
     }
 }
 

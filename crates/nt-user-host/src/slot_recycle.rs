@@ -11,6 +11,7 @@ pub enum RecycleError {
     AlreadyPublished,
     AccountingUnderflow,
     AccountingOverflow,
+    UnexpectedRetypeAccounting,
 }
 
 /// A serialized, allocation-free view of the allocator's existing storage, not a second owner.
@@ -33,6 +34,16 @@ impl SlotRecycleState<'_> {
     /// All rejection precedes mutation. Success acknowledges allocator publication only, not
     /// deletion, revocation, physical-frame release or completion of the containing thread owner.
     pub fn publish_empty(&mut self, slot: u64) -> Result<(), RecycleError> {
+        self.publish(slot, false)
+    }
+
+    /// Failed retype/copy destinations and copied alias slots own no retype accounting. Reject
+    /// contradictory accounting rather than releasing bytes belonging to an unexpected object.
+    pub fn publish_unretyped(&mut self, slot: u64) -> Result<(), RecycleError> {
+        self.publish(slot, true)
+    }
+
+    fn publish(&mut self, slot: u64, unretyped: bool) -> Result<(), RecycleError> {
         if slot <= 1 || slot < self.start || slot >= self.end {
             return Err(RecycleError::InvalidSlot);
         }
@@ -45,6 +56,9 @@ impl SlotRecycleState<'_> {
             .retype_bytes
             .get(index)
             .ok_or(RecycleError::UntrackedSlot)? as u64;
+        if unretyped && bytes != 0 {
+            return Err(RecycleError::UnexpectedRetypeAccounting);
+        }
         if pinned & bit != 0 {
             return Err(RecycleError::Pinned);
         }

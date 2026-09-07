@@ -40,6 +40,10 @@ impl Storage {
     }
 
     fn publish(&mut self, slot: u64) -> Result<(), RecycleError> {
+        self.publish_with(slot, false)
+    }
+
+    fn publish_with(&mut self, slot: u64, unretyped: bool) -> Result<(), RecycleError> {
         let mut view = SlotRecycleState {
             start: self.start,
             end: self.end,
@@ -51,7 +55,11 @@ impl Storage {
             live_bytes: self.live_bytes,
             released_bytes: self.released_bytes,
         };
-        let result = view.publish_empty(slot);
+        let result = if unretyped {
+            view.publish_unretyped(slot)
+        } else {
+            view.publish_empty(slot)
+        };
         self.count = view.count;
         self.live_bytes = view.live_bytes;
         self.released_bytes = view.released_bytes;
@@ -65,6 +73,32 @@ impl Storage {
             assert_eq!(*self, before);
         }
     }
+}
+
+#[test]
+fn unretyped_slot_rejects_byte_ownership_without_mutation() {
+    let mut storage = Storage::new();
+    let before = storage.clone();
+    for _ in 0..3 {
+        assert_eq!(
+            storage.publish_with(70, true),
+            Err(RecycleError::UnexpectedRetypeAccounting)
+        );
+        assert_eq!(storage, before);
+    }
+}
+
+#[test]
+fn unretyped_slot_publication_never_releases_aggregate_bytes() {
+    let mut storage = Storage::new();
+    storage.bytes[6] = 0;
+    storage.released_bytes = u64::MAX;
+    storage.publish_with(70, true).unwrap();
+    assert_eq!(storage.live_bytes, 4096);
+    assert_eq!(storage.released_bytes, u64::MAX);
+    assert_eq!(storage.count, 2);
+    assert_eq!(storage.free, [65, 70, 0]);
+    assert_eq!(storage.live[0], 0);
 }
 
 #[test]
