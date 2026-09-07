@@ -515,7 +515,9 @@ fn reclaiming_or_already_transferred_records_cannot_be_captured() {
     registry.finish_transfer(transfer).unwrap();
     registry.insert(27, 0x13000, 31, 0, 0, 0, true).unwrap();
     let row = registry.get(27, 0x13000).unwrap();
-    registry.begin_reclaim_exact(row).unwrap();
+    registry
+        .begin_reclaim_exact(row, nt_memory_manager::ClientFrameReclaimIntent::Release)
+        .unwrap();
     assert!(matches!(
         ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED),
         Err(ThreadRegistryError::UnavailableRecord { page: 0x13000 })

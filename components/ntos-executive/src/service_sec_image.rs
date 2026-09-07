@@ -4013,7 +4013,7 @@ pub(crate) unsafe fn service_image_page_residency(
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
     } else if private_source_cap != 0 {
-        if !csrss_frame_put_at_cap_source_owned(
+        if !csrss_frame_put_at_cap_source_backing(
             pi as u64,
             page,
             map_cap,
@@ -4021,6 +4021,7 @@ pub(crate) unsafe fn service_image_page_residency(
             private_source_cap,
             private_source_cap,
             fault_plan.requires_private_backing(),
+            if fault_plan.requires_private_backing() { private_source_cap } else { 0 },
         ) {
             let _ = page_unmap_r(map_cap);
             let _ = cnode_delete_recycle_r(map_cap);
@@ -8649,6 +8650,7 @@ pub(crate) unsafe fn service_sec_image(
             print_hex(status);
             print_str(b"\n");
         }
+        crate::client_frame_cleanup::retry_pending();
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {
@@ -10169,10 +10171,7 @@ pub(crate) unsafe fn service_sec_image(
                         retype_error
                     };
                     if retype_error == 0 && map_error == 0 {
-                        let source_cap =
-                            csrss_frame_create_source_copy(map_cap, 2, page, b"wl-stack");
-                        let registered = source_cap != 0
-                            && csrss_frame_put_with_source(2, page, map_cap, source_cap);
+                        let registered = csrss_frame_put_with_source(2, page, map_cap, frame);
                         if registered && csrss_frame_get_exact(2, page).0 == map_cap {
                             let teb_alias =
                                 WINLOGON_WORKER_STACK_MIRROR_VA + WL_LISTENER_STACK_FRAMES * 0x1000;
@@ -10203,9 +10202,6 @@ pub(crate) unsafe fn service_sec_image(
                             m2 = nm2;
                             m3 = nm3;
                             continue;
-                        }
-                        if source_cap != 0 {
-                            let _ = cnode_delete_recycle_r(source_cap);
                         }
                     }
                     if frame != 0 {
@@ -10251,7 +10247,6 @@ pub(crate) unsafe fn service_sec_image(
                         let f = alloc_frame();
                         let mut registered = false;
                         let mut map_cap = 0;
-                        let mut source_cap = 0;
                         if pi == 0 {
                             let map_error = page_map_r(f, page, RW_NX, pml4);
                             if map_error == 0 {
@@ -10262,26 +10257,14 @@ pub(crate) unsafe fn service_sec_image(
                             map_cap = copy_cap(f);
                             let map_error = page_map_r(map_cap, page, RW_NX, pml4);
                             if map_error == 0 {
-                                source_cap = csrss_frame_create_source_copy(
-                                    map_cap,
-                                    pi as u64,
-                                    page,
-                                    b"stack-growth",
-                                );
                                 // Preserve the mapped frame cap so stack-based syscall arguments
                                 // remain reachable after the stack grows below its fixed executive
                                 // mirror. GUI clients also keep an unmapped source cap for
                                 // win32k/client temporary aliases.
-                                registered = source_cap != 0
-                                    && csrss_frame_put_with_source(
-                                        pi as u64, page, map_cap, source_cap,
-                                    );
+                                registered = csrss_frame_put_with_source(pi as u64, page, map_cap, f);
                             }
                         }
                         if registered {
-                            if pi != 0 && f != 0 {
-                                let _ = cnode_delete_recycle_r(f);
-                            }
                             if matches!(role, HostedThreadRole::Main) {
                                 let _ = smss_copyout(SMSS_TEB_VA + 0x10, &page.to_le_bytes());
                             }
@@ -10311,9 +10294,6 @@ pub(crate) unsafe fn service_sec_image(
                             m2 = nm2;
                             m3 = nm3;
                             continue;
-                        }
-                        if source_cap != 0 {
-                            let _ = cnode_delete_recycle_r(source_cap);
                         }
                         if map_cap != 0 {
                             let _ = cnode_delete_recycle_r(map_cap);

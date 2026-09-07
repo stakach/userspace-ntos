@@ -65,7 +65,7 @@ impl FrameAcquisitionIo for Io {
 
     fn unmap_cached(&mut self, frame: u64) -> Result<(), u32> {
         unsafe {
-            frame_recycle::validate_acquisition(frame)?;
+            frame_recycle::validate_owned_backing(frame)?;
         }
         if unsafe { page_unmap_r(frame) } == 0 {
             Ok(())

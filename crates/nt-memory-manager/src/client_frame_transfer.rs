@@ -91,10 +91,10 @@ impl ClientFrameRegistry {
         // No fallible allocation or lookup remains after the first ownership change.
         for &record in expected {
             let row = self.exact_mut(record).expect("prevalidated transfer row");
-            row.reclaim_started = true;
             row.transfer_id = Some(id);
             records.push(*row);
         }
+        self.reclaiming += expected.len();
         Ok(ClientFrameTransfer { id, records })
     }
 
@@ -117,6 +117,7 @@ impl ClientFrameRegistry {
                 .expect("prevalidated transfer row");
             self.records.swap_remove(index);
         }
+        self.reclaiming -= transfer.records.len();
         Ok(())
     }
 }

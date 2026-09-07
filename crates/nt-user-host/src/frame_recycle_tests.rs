@@ -160,6 +160,22 @@ fn publication_revalidates_allocator_changes_after_preflight() {
 
 #[test]
 fn registry_owner_survives_publication_failure_with_unmap_acknowledged() {
+    struct Cleanup;
+    impl nt_memory_manager::ClientFrameReclaimIo for Cleanup {
+        fn unmap(&mut self, _: u64) -> Result<(), u32> {
+            Ok(())
+        }
+        fn revoke(&mut self, _: u64) -> Result<(), u32> {
+            Ok(())
+        }
+        fn delete(&mut self, _: u64) -> Result<(), u32> {
+            panic!("canonical owner must survive")
+        }
+        fn recycle_empty(&mut self, _: u64) -> Result<(), u32> {
+            panic!("canonical owner must survive")
+        }
+    }
+    let intent = nt_memory_manager::ClientFrameReclaimIntent::Release;
     let mut storage = Storage::new();
     let mut pool = RecycledFramePool::new();
     assert!(pool.reserve(1));
@@ -167,21 +183,37 @@ fn registry_owner_survives_publication_failure_with_unmap_acknowledged() {
     registry.insert(2, 0x1000, 70, 0, 0, 0, true).unwrap();
     storage.view().check_reserved(70, &pool).unwrap();
     let record = registry.get(2, 0x1000).unwrap();
-    let record = registry.begin_reclaim_exact(record).unwrap();
-    let record = registry.mark_frame_unmapped_exact(record).unwrap();
-    storage.pinned[0] = 1 << 6;
-    assert_eq!(
-        storage.view().publish_reserved(record.frame, &mut pool),
-        Err(FrameRecycleError::Pinned)
-    );
-    assert_eq!(registry.get(2, 0x1000), Some(record));
-    assert!(record.frame_unmapped);
-    storage.pinned[0] = 0;
-    storage
-        .view()
-        .publish_reserved(record.frame, &mut pool)
+    let record = registry.begin_reclaim_exact(record, intent).unwrap();
+    let record = registry
+        .cleanup_reclaim_exact(record, intent, &mut Cleanup)
         .unwrap();
-    assert_eq!(registry.take_exact(record), Some(record));
+    storage.pinned[0] = 1 << 6;
+    let mut refusal = None;
+    assert_eq!(
+        registry.commit_reclaim_exact(record, intent, |record| {
+            storage
+                .view()
+                .publish_reserved(record.frame, &mut pool)
+                .map_err(|error| {
+                    refusal = Some(error);
+                    17
+                })
+        }),
+        Err(nt_memory_manager::ClientFrameReclaimError::Backend(17))
+    );
+    assert_eq!(refusal, Some(FrameRecycleError::Pinned));
+    assert_eq!(registry.get(2, 0x1000), Some(record));
+    assert!(record.cleanup_complete());
+    storage.pinned[0] = 0;
+    assert_eq!(
+        registry.commit_reclaim_exact(record, intent, |record| {
+            storage
+                .view()
+                .publish_reserved(record.frame, &mut pool)
+                .map_err(|_| 17)
+        }),
+        Ok(record)
+    );
     assert!(registry.get(2, 0x1000).is_none());
     assert_eq!(pool.acquire(), Some(70));
 }

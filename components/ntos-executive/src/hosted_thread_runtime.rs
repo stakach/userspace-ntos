@@ -716,6 +716,16 @@ static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable = HostedThreadRu
 /// No allocation, IPC or callbacks may occur during this short table borrow. Cleanup backends
 /// holding a mutable slot must use retained capabilities directly, never recurse through here.
 pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
+    hosted_thread_memory_retirement_access(pi, base, size)?;
+    if !unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).memory_available(pi, base, size) } {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
+    Ok(())
+}
+
+/// Retained VM cleanup uses exact registry rows, but must still respect pending thread owners
+/// and live scratch aliases. Ordinary reads, mappings and writes use the stricter entry above.
+pub(crate) fn hosted_thread_memory_retirement_access(pi: u64, base: u64, size: u64) -> Result<(), u32> {
     use nt_user_host::thread_memory_access::{check_pending_thread_memory, PendingThreadMemory};
     if !crate::temporary_frame_alias::memory_available(pi, base, size) {
         return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
@@ -738,6 +748,15 @@ pub(crate) fn hosted_thread_memory_access(pi: u64, base: u64, size: u64) -> Resu
         }),
     )
     .map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)
+}
+
+/// Live transport mappings have their own target/mirror journals. A residency row cannot revoke
+/// their canonical backing; the thread owner must retire or transfer those journals first.
+pub(crate) fn hosted_thread_retains_page_backing(pi: u64, page: u64) -> bool {
+    let table = unsafe { &*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK) };
+    table.entries.iter().filter_map(RuntimeSlot::owner).any(|owner| {
+        owner.pi as u64 == pi && owner.resources.retains_page_backing(page)
+    })
 }
 
 /// Exclusive pointer to the serialized executive's hosted TID -> seL4 TCB table.

@@ -25,6 +25,39 @@ fn resources() -> ThreadMemoryResources<3> {
 }
 
 #[test]
+fn backing_retirement_excludes_every_retained_transport_page_but_not_neighbors() {
+    let resources = resources();
+    for page in (0x10000..0x17000).step_by(0x1000) {
+        assert!(resources.retains_page_backing(page));
+        assert!(resources.retains_page_backing(page + 4095));
+    }
+    assert!(!resources.retains_page_backing(0xf000));
+    assert!(!resources.retains_page_backing(0x17000));
+}
+
+#[test]
+fn empty_geometry_does_not_claim_backing_but_alias_only_ownership_does() {
+    let mut resources = ThreadMemoryResources::<3>::new(27, layout()).unwrap();
+    assert!(!resources.retains_page_backing(0x10000));
+    resources.stack_mirror[0] = 12;
+    assert!(resources.retains_page_backing(0x10000));
+    assert!(!resources.retains_page_backing(0x11000));
+    resources.stack_mirror[0] = 0;
+    assert!(!resources.retains_page_backing(0x10000));
+}
+
+#[test]
+fn unlocated_transport_caps_exclude_all_backing_retirement() {
+    let mut unlocated = ThreadMemoryResources::<3>::empty();
+    assert!(!unlocated.retains_page_backing(0x10000));
+    unlocated.teb_owner = 30;
+    assert!(unlocated.retains_page_backing(0x90000));
+    let mut resources = resources();
+    resources.stack_owner[2] = 99;
+    assert!(resources.retains_page_backing(0x90000));
+}
+
+#[test]
 fn layout_retains_every_target_range_and_accepts_adjacent_pages() {
     let layout = layout();
     assert_eq!(

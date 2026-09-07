@@ -217,8 +217,8 @@ unsafe fn checked_spawn_frame_put_at(
     source_cap: u64,
     stage: &[u8],
 ) {
-    if !csrss_frame_put_at_cap_source_owned(
-        pi, page, mapped_cap, alias, alias_cap, source_cap, true,
+    if !csrss_frame_put_at_cap_source_backing(
+        pi, page, mapped_cap, alias, alias_cap, source_cap, true, source_cap,
     ) {
         print_str(b"[spawn-frame] register ");
         print_str(stage);

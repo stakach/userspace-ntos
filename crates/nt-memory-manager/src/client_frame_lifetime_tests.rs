@@ -1,4 +1,5 @@
 use super::*;
+const RELEASE: ClientFrameReclaimIntent = ClientFrameReclaimIntent::Release;
 
 fn populated() -> (ClientFrameRegistry, ClientFrameRecord) {
     let mut registry = ClientFrameRegistry::new();
@@ -107,7 +108,7 @@ fn refused_registration_does_not_advance_working_set_age() {
 #[test]
 fn reclaim_begin_is_terminal_even_when_no_capability_operation_succeeds() {
     let (mut registry, before) = populated();
-    let retiring = registry.begin_reclaim_exact(before).unwrap();
+    let retiring = registry.begin_reclaim_exact(before, RELEASE).unwrap();
     assert!(retiring.is_reclaiming());
     assert!(!retiring.is_resident());
     assert_eq!(retiring.mapped_alias(), None);
@@ -115,8 +116,14 @@ fn reclaim_begin_is_terminal_even_when_no_capability_operation_succeeds() {
     assert_eq!(retiring.frame, before.frame);
     assert_eq!(retiring.alias_cap, before.alias_cap);
     assert_eq!(retiring.source_cap, before.source_cap);
-    assert_eq!(registry.begin_reclaim_exact(before), None);
-    assert_eq!(registry.begin_reclaim_exact(retiring), Some(retiring));
+    assert_eq!(
+        registry.begin_reclaim_exact(before, RELEASE),
+        Err(ClientFrameReclaimError::StaleRecord)
+    );
+    assert_eq!(
+        registry.begin_reclaim_exact(retiring, RELEASE),
+        Ok(retiring)
+    );
     assert!(!registry.touch(7, 0x1000));
     assert_eq!(registry.get(7, 0x1000), Some(retiring));
 }
@@ -124,7 +131,7 @@ fn reclaim_begin_is_terminal_even_when_no_capability_operation_succeeds() {
 #[test]
 fn retiring_rows_refuse_replay_enrichment_and_replacement() {
     let (mut registry, before) = populated();
-    let retiring = registry.begin_reclaim_exact(before).unwrap();
+    let retiring = registry.begin_reclaim_exact(before, RELEASE).unwrap();
     for (frame, alias, cap, source, owned) in [
         (11, 0x2000, 12, 13, false),
         (11, 0, 0, 0, false),
@@ -141,13 +148,16 @@ fn retiring_rows_refuse_replay_enrichment_and_replacement() {
 }
 
 #[test]
-fn alias_first_reclamation_cannot_resurrect_after_clearing_unmap_progress() {
+fn completed_cleanup_cannot_resurrect_after_clearing_capability_progress() {
     let (mut registry, before) = populated();
-    let unmapped = registry.mark_alias_unmapped_exact(before).unwrap();
-    let cleared = registry.clear_alias_cap_exact(unmapped).unwrap();
-    assert!(!cleared.alias_unmapped);
-    assert!(!cleared.frame_unmapped);
-    assert_eq!(cleared.frame, 11);
+    let retiring = registry.begin_reclaim_exact(before, RELEASE).unwrap();
+    let cleared = registry
+        .cleanup_reclaim_exact(retiring, RELEASE, &mut SuccessfulCleanup)
+        .unwrap();
+    assert!(cleared.cleanup_complete());
+    assert_eq!(cleared.frame, 0);
+    assert_eq!(cleared.alias_cap, 0);
+    assert_eq!(cleared.source_cap, 0);
     assert!(cleared.is_reclaiming());
     assert!(!cleared.is_resident());
     assert_eq!(cleared.clone_source_cap(), None);
@@ -158,13 +168,17 @@ fn alias_first_reclamation_cannot_resurrect_after_clearing_unmap_progress() {
 }
 
 #[test]
-fn source_first_reclamation_also_closes_resident_access() {
+fn reclamation_closes_source_access_before_source_cleanup() {
     let (mut registry, before) = populated();
-    let cleared = registry.clear_source_cap_exact(before).unwrap();
+    let cleared = registry.begin_reclaim_exact(before, RELEASE).unwrap();
+    assert_eq!(cleared.source_cap, 13);
     assert!(cleared.is_reclaiming());
     assert_eq!(cleared.mapped_alias(), None);
     assert_eq!(cleared.clone_source_cap(), None);
-    assert_eq!(registry.clear_source_cap_exact(before), None);
+    assert_eq!(
+        registry.cleanup_reclaim_exact(before, RELEASE, &mut SuccessfulCleanup),
+        Err(ClientFrameReclaimError::StaleRecord)
+    );
 }
 
 #[test]
@@ -176,10 +190,14 @@ fn identical_key_caps_and_age_reuse_cannot_accept_an_old_snapshot() {
         .unwrap();
     let new = registry.get(7, 0x1000).unwrap();
     assert_ne!(new.record_id, old.record_id);
-    assert_eq!(registry.begin_reclaim_exact(old), None);
-    assert_eq!(registry.mark_frame_unmapped_exact(old), None);
-    assert_eq!(registry.mark_alias_unmapped_exact(old), None);
-    assert_eq!(registry.clear_source_cap_exact(old), None);
+    assert_eq!(
+        registry.begin_reclaim_exact(old, RELEASE),
+        Err(ClientFrameReclaimError::StaleRecord)
+    );
+    assert_eq!(
+        registry.cleanup_reclaim_exact(old, RELEASE, &mut SuccessfulCleanup),
+        Err(ClientFrameReclaimError::StaleRecord)
+    );
     assert_eq!(registry.take_exact(old), None);
     assert_eq!(registry.get(7, 0x1000), Some(new));
 }
@@ -187,8 +205,15 @@ fn identical_key_caps_and_age_reuse_cannot_accept_an_old_snapshot() {
 #[test]
 fn replacement_after_retirement_has_a_fresh_live_identity() {
     let (mut registry, before) = populated();
-    let retiring = registry.begin_reclaim_exact(before).unwrap();
-    assert_eq!(registry.take_exact(retiring), Some(retiring));
+    let retiring = registry.begin_reclaim_exact(before, RELEASE).unwrap();
+    let ready = registry
+        .cleanup_reclaim_exact(retiring, RELEASE, &mut SuccessfulCleanup)
+        .unwrap();
+    assert_eq!(registry.take_exact(ready), None);
+    assert_eq!(
+        registry.commit_reclaim_exact(ready, RELEASE, |_| Ok(())),
+        Ok(ready)
+    );
     registry
         .insert_at_age(7, 0x1000, 11, 0x2000, 12, 13, false, 40)
         .unwrap();
@@ -204,7 +229,10 @@ fn snapshots_are_not_interchangeable_between_registries() {
     let (_, old) = populated();
     let (mut registry, own) = populated();
     assert_ne!(old.record_id, own.record_id);
-    assert_eq!(registry.begin_reclaim_exact(old), None);
+    assert_eq!(
+        registry.begin_reclaim_exact(old, RELEASE),
+        Err(ClientFrameReclaimError::StaleRecord)
+    );
     assert_eq!(registry.take_exact(old), None);
     assert_eq!(registry.get(7, 0x1000), Some(own));
 }

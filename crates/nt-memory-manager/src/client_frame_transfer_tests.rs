@@ -79,7 +79,9 @@ fn stale_or_missing_members_refuse_the_entire_selection() {
 #[test]
 fn existing_reclamation_refuses_handoff_without_claiming_other_rows() {
     let (mut registry, records) = fixture();
-    let reclaiming = registry.begin_reclaim_exact(records[1]).unwrap();
+    let reclaiming = registry
+        .begin_reclaim_exact(records[1], crate::ClientFrameReclaimIntent::Release)
+        .unwrap();
     assert!(matches!(
         registry.prepare_transfer_exact(&[records[0], reclaiming]),
         Err(ClientFrameTransferError::Reclaiming)
@@ -130,12 +132,18 @@ fn ordinary_removal_and_exact_mutation_cannot_steal_transferred_rows() {
     for &held in transfer.records() {
         assert_eq!(registry.take(held.pi, held.page), None);
         assert_eq!(registry.take_exact(held), None);
-        assert_eq!(registry.begin_reclaim_exact(held), None);
-        assert_eq!(registry.mark_frame_unmapped_exact(held), None);
-        assert_eq!(registry.mark_alias_unmapped_exact(held), None);
-        assert_eq!(registry.clear_frame_cap_exact(held), None);
-        assert_eq!(registry.clear_alias_cap_exact(held), None);
-        assert_eq!(registry.clear_source_cap_exact(held), None);
+        let intent = crate::ClientFrameReclaimIntent::Release;
+        let error = Err(crate::ClientFrameReclaimError::InvalidState);
+        assert_eq!(registry.begin_reclaim_exact(held, intent), error);
+        assert_eq!(
+            registry.cleanup_reclaim_exact(held, intent, &mut super::super::SuccessfulCleanup),
+            error
+        );
+        assert_eq!(
+            registry.commit_reclaim_exact(held, intent, |_| panic!("transfer owns publication")),
+            error
+        );
+        assert_eq!(registry.cancel_pageout_to_release_exact(held), error);
         assert_eq!(registry.get(held.pi, held.page), Some(held));
     }
     registry.finish_transfer(transfer).unwrap();

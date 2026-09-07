@@ -213,6 +213,16 @@ impl<const STACK: usize> ThreadMemoryResources<STACK> {
         self.layout
     }
 
+    /// Ordinary VM reclamation cannot revoke backing still owned by the thread transport.
+    /// Unlocated capabilities conservatively exclude every page until their geometry is known.
+    pub fn retains_page_backing(&self, page: u64) -> bool {
+        self.has_unlocated_capabilities()
+            || self.backing_pages().any(|(owned_page, owner, aliases)| {
+                owned_page == (page & !(PAGE_SIZE - 1))
+                    && (owner != 0 || aliases.iter().any(|&cap| cap != 0))
+            })
+    }
+
     /// Capability slots outside retained target geometry cannot justify a disjoint access.
     pub fn has_unlocated_capabilities(&self) -> bool {
         if self.layout.is_none() {

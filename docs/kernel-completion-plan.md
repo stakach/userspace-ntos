@@ -220,6 +220,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain recycled frame acquisition through checked owner unmap and scratch zeroing, and
   retain failed fresh retype slots through strict recycling before selecting another frame
   (tranche 90; broader release and pagefile transition ownership remain open).
+- [x] Retain exact resident-frame release/pageout intent, explicit backing-cap provenance and
+  independent unmap/delete/recycle/revoke acknowledgements; wire common cleanup and retry before
+  ordinary memory admission (tranche 91; pagefile retirement/restore remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28175,6 +28178,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before publishing a frame-only transition record. Then close pagefile discard/restore and the
     remaining void release handoffs. Native destructive thread cleanup and desktop acceptance remain
     open; the 33 unresolved real win32k imports are still a separate boot barrier.
+
+    B3 retained resident-frame cleanup tranche 91 (2026-09-08):
+
+    ClientFrameRegistry now retains distinct terminal Release and Pageout intents, with the original
+    protection preserved across pageout retries. Exact record identity and complete snapshots
+    authorize each phase. Ordinary take, registration, transfer and resident access cannot steal
+    cleanup rows. A shared allocation-free core acknowledges unmap, deletion, strict slot recycling
+    and canonical backing revocation separately, normalizes equal role capabilities, and calls the
+    terminal publication closure only after all cleanup completes. Callback failure retains the
+    ready row; success removes it without allocation, IPC or another fallible step. Explicit final
+    VM retirement can cancel pageout into release without resetting progress.
+
+    Native review found that the frame role frequently names a copied client mapping, not the
+    owning allocation. Added explicit owned_backing_cap provenance to registry publication, with
+    membership in a retained role required and contradictory updates refused. Initial spawn
+    stacks/TEB/PEB/parameters, private image backing and late TEBs now name their actual allocated
+    owner. Dynamic stack growth retains its original frame as the source instead of deleting the
+    original and relying on copies. Removed the now-unnecessary additional TEB/stack source copies.
+    Strict recycling uses acknowledged deletion and full checked slot accounting: non-owned image
+    rows may legitimately retain an original allocation in an alias/source role.
+
+    The focused native module replaces duplicate resident reclaim, pageout, private unmap and
+    borrowed-resident working-set cleanup loops. Pageout publishes only the canonical backing after
+    every alias acknowledgement. NtFreeVirtualMemory and shared-image range unmap propagate
+    incomplete cleanup before reporting success or committing the VAD/charge removal. User-stack
+    VAD teardown records failure without pretending the VAD was released. Event-boundary retry
+    handles Release and Pageout rows; bounded diagnostics report genuine retained failures.
+
+    Ordinary user-memory admission excludes terminal registry ranges with an O(1) fast path when
+    no cleanup/transfer exists. Exact retirement has a separate pending-thread/scratch check so
+    retries do not reject their own rows. Backing still owned by a live thread transport cannot be
+    reclaimed through residency alone: target/mirror journals must retire first. Legacy whole-thread
+    release preflights the complete resource bundle against retained registry cleanup before any
+    destructive effect; it does not reinterpret a refused take as an absent owner.
+
+    Validation: 57 focused client-frame tests pass; 20 new cleanup tests cover phase failures,
+    publication retry, cap-role permutations, explicit backing provenance, stale identities,
+    intent exclusion/conversion, transfer protection and range admission. Three additional thread
+    resource tests cover owned and alias-only transport backing, neighboring pages and unlocated
+    capabilities. The serialized nine-crate suite passes 1,353 tests (355 memory-manager; 347
+    user-host including integration tests). The executive release build passes with the unchanged
+    262 warnings. Logs: `.tmp/test-client-frame-cleanup-focused-20260908.log`,
+    `.tmp/test-client-frame-cleanup-20260908.log`, `.tmp/build-client-frame-cleanup-20260908.log`.
+    Agents implemented the host core and independently audited native callers/provenance; root
+    alone runs the serialized build/test lane.
+
+    Review adjustment: this closes resident cleanup and pageout alias handoff, not the entire
+    pagefile lifecycle. Pagefile discard/rundown still takes the transition before legacy void
+    release, and restore still needs retained mapping rollback before re-publishing a failed
+    transition. Next close those exact handoffs, then migrate remaining unpublished COW/constructor
+    release bundles and user-stack VAD retirement retry. Shared-image cap-bank range retirement and
+    generic pending-thread destructive activation remain open. Desktop acceptance still requires
+    implementing the 33 missing real provider imports; no fallback or synthetic paint is introduced.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

@@ -133,7 +133,7 @@ pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(
     if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
         return Ok(());
     }
-    hosted_thread_memory_access(pi, page, 4096)?;
+    hosted_thread_memory_retirement_access(pi, page, 4096)?;
     let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
     let Some(index) = mappings.iter().position(|mapping| mapping.page() == page) else {
         return Ok(());

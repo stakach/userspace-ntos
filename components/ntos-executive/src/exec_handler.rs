@@ -10678,7 +10678,7 @@ impl ExecNtHandler {
             USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if hosted_thread_memory_access(runtime.pi as u64, ownership_base, ownership_size).is_err() {
+        if hosted_thread_memory_retirement_access(runtime.pi as u64, ownership_base, ownership_size).is_err() {
             USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -10694,7 +10694,10 @@ impl ExecNtHandler {
                 && new
                     .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
             {
-                vm_unmap_private_page(runtime.pi, page);
+                if !vm_unmap_private_page(runtime.pi, page) {
+                    USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
             page += nt_address_space::PAGE_SIZE;
         }
@@ -17629,42 +17632,12 @@ impl ExecNtHandler {
         page: u64,
         protection: u32,
     ) -> Result<bool, u32> {
-        hosted_thread_memory_access(pi as u64, page, 0x1000)
+        hosted_thread_memory_retirement_access(pi as u64, page, 0x1000)
             .map_err(|_| nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT)?;
         if vm_page_lock_is_locked(pi as u64, page) {
             return Err(nt_memory_manager::STATUS_BAD_WORKING_SET_LIMIT);
         }
-        let Some(record) = csrss_frame_get_exact_record(pi as u64, page) else {
-            return Ok(false);
-        };
-        if !record.owns_frame {
-            return Ok(false);
-        }
-        let pagefile = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
-        let publish = pagefile.prepare_publish(nt_memory_manager::PagefilePage {
-            owner: pi as u64,
-            page,
-            protection,
-            backing: record.frame,
-        })?;
-        win32k_glue::detach_attached_client_page(pi as u64, page)?;
-        if page_unmap_r(record.frame) != 0 {
-            return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-        }
-        recycle_mapped_cap(record.alias_cap);
-        if record.source_cap != 0
-            && record.source_cap != record.frame
-            && record.source_cap != record.alias_cap
-        {
-            recycle_plain_cap(record.source_cap);
-        }
-        let removed = csrss_frame_take(pi as u64, page)
-            .expect("serialized pageout retains its exact resident-frame record");
-        debug_assert_eq!(removed.0, record.frame);
-        pagefile
-            .commit_publish(publish)
-            .expect("prepared transition slot commits without allocation");
-        Ok(true)
+        client_frame_cleanup::pageout(pi as u64, page, protection)
     }
 
     unsafe fn prepare_process_working_set_policy(
@@ -19564,7 +19537,7 @@ impl ExecNtHandler {
         let Some((ownership_base, ownership_size)) = plan.ownership_range(before) else {
             return nt_address_space::STATUS_UNABLE_TO_FREE_VM;
         };
-        if let Err(status) = hosted_thread_memory_access(target_pi as u64, ownership_base, ownership_size) {
+        if let Err(status) = hosted_thread_memory_retirement_access(target_pi as u64, ownership_base, ownership_size) {
             return status;
         }
         if !self.secured_virtual_memory.permits_free(u64::from(target_pid), before, plan) {
@@ -19588,7 +19561,9 @@ impl ExecNtHandler {
                 && new
                     .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
             {
-                vm_unmap_private_page(target_pi, page);
+                if !vm_unmap_private_page(target_pi, page) {
+                    return nt_address_space::STATUS_INSUFFICIENT_RESOURCES;
+                }
             }
             page += 0x1000;
         }

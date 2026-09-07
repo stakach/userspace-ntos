@@ -15,9 +15,9 @@ unsafe fn state() -> FrameRecycleState<'static> {
     }
 }
 
-/// A popped owner remains live and must not still occur in the free pool. Pool capacity is not
-/// needed for acquisition: another retirement may fill the free vector between retries.
-pub(super) unsafe fn validate_acquisition(frame: u64) -> Result<(), u32> {
+/// A retained owner remains live and must not also occur in the free pool. Pool capacity is not
+/// needed for this check: another retirement may fill the free vector between retries.
+pub(super) unsafe fn validate_owned_backing(frame: u64) -> Result<(), u32> {
     state().validate_owner(frame)
         .map_err(|_| nt_address_space::STATUS_INVALID_PARAMETER)?;
     match (&*core::ptr::addr_of!(VM_FREE_FRAMES)).check_reserved(frame) {

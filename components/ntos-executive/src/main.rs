@@ -610,6 +610,14 @@ unsafe fn release_hosted_thread_resources(resources: HostedThreadResources) {
         return;
     }
 
+    assert!(
+        !(&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).records().iter().any(|record| {
+            record.pi == resources.client_pi as u64 && record.is_reclaiming()
+                && resources.retains_page_backing(record.page)
+        }),
+        "legacy thread release cannot bypass retained registry cleanup",
+    );
+
     for index in 0..resources.stack_frames() as usize {
         let page = resources.stack_base() + index as u64 * 0x1000;
         take_registered_thread_page(resources.client_pi, page, resources.stack_owner[index]);
@@ -8608,7 +8616,7 @@ pub(crate) unsafe fn csrss_frame_put_with_source(
     fr: u64,
     source_cap: u64,
 ) -> bool {
-    csrss_frame_put_at_cap_source(pi, page, fr, 0, 0, source_cap)
+    csrss_frame_put_at_cap_source_backing(pi, page, fr, 0, 0, source_cap, true, source_cap)
 }
 /// Record a client frame and, for image pages, its permanent executive scratch alias. Keeping the
 /// alias alongside the cap avoids remapping a copied cap merely to inspect live client data.
@@ -8644,6 +8652,22 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
     source_cap: u64,
     owns_frame: bool,
 ) -> bool {
+    csrss_frame_put_at_cap_source_backing(
+        pi, page, fr, alias, alias_cap, source_cap, owns_frame,
+        if owns_frame { fr } else { 0 },
+    )
+}
+
+pub(crate) unsafe fn csrss_frame_put_at_cap_source_backing(
+    pi: u64,
+    page: u64,
+    fr: u64,
+    alias: u64,
+    alias_cap: u64,
+    source_cap: u64,
+    owns_frame: bool,
+    owned_backing_cap: u64,
+) -> bool {
     if [fr, alias_cap, source_cap].into_iter().any(frame_acquisition::owns_root_cap) {
         return false;
     }
@@ -8651,7 +8675,7 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
         return false;
     }
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
-    match registry.insert_at_age(
+    match registry.insert_at_age_with_backing(
         pi,
         page,
         fr,
@@ -8660,6 +8684,7 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_owned(
         source_cap,
         owns_frame,
         next_working_set_age(),
+        owned_backing_cap,
     ) {
         Ok(ClientFrameInsert::Inserted { .. }) => true,
         Ok(ClientFrameInsert::Updated) => true,
@@ -8699,88 +8724,7 @@ unsafe fn csrss_frame_take(pi: u64, page: u64) -> Option<(u64, u64, u64, bool)> 
 }
 
 unsafe fn csrss_frame_reclaim_exact(pi: u64, page: u64) -> bool {
-    if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
-        return false;
-    }
-    let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
-    let Some(mut record) = registry.get(pi, page) else {
-        return true;
-    };
-    if record.owns_frame && frame_recycle::prepare(record.frame).is_err() {
-        return false;
-    }
-    let Some(retiring) = registry.begin_reclaim_exact(record) else {
-        return false;
-    };
-    record = retiring;
-
-    if record.frame != 0 && !record.frame_unmapped {
-        if page_unmap_r(record.frame) != 0 {
-            return false;
-        }
-        record = registry
-            .mark_frame_unmapped_exact(record)
-            .expect("serialized frame reclaim must retain its exact row");
-    }
-    if record.frame != 0 && !record.owns_frame {
-        if cnode_delete_recycle_r(record.frame) != 0 {
-            return false;
-        }
-        record = registry
-            .clear_frame_cap_exact(record)
-            .expect("deleted borrowed frame cap must clear from its exact row");
-    }
-
-    if record.alias_cap != 0 {
-        if record.owns_frame && record.alias_cap == record.frame {
-            record = registry
-                .mark_alias_unmapped_exact(record)
-                .expect("owned frame alias must retain its exact row");
-            record = registry
-                .clear_alias_cap_exact(record)
-                .expect("owned frame alias must clear from its exact row");
-        } else {
-        if !record.alias_unmapped {
-            if page_unmap_r(record.alias_cap) != 0 {
-                return false;
-            }
-            record = registry
-                .mark_alias_unmapped_exact(record)
-                .expect("serialized alias reclaim must retain its exact row");
-        }
-        if cnode_delete_recycle_r(record.alias_cap) != 0 {
-            return false;
-        }
-        record = registry
-            .clear_alias_cap_exact(record)
-            .expect("deleted alias cap must clear from its exact row");
-        }
-    }
-
-    if record.source_cap != 0 {
-        if record.owns_frame && record.source_cap == record.frame {
-            record = registry
-                .clear_source_cap_exact(record)
-                .expect("owned frame alias must clear from its exact row");
-        } else {
-            if cnode_delete_recycle_r(record.source_cap) != 0 {
-                return false;
-            }
-            record = registry
-                .clear_source_cap_exact(record)
-                .expect("deleted source cap must clear from its exact row");
-        }
-    }
-
-    // Publish before removing the authoritative row. Rejection retains its completed alias
-    // phases and exact frame owner; success and row removal cannot yield to allocator reuse.
-    if record.owns_frame && frame_recycle::publish(record.frame).is_err() {
-        return false;
-    }
-    let _removed = registry
-        .take_exact(record)
-        .expect("fully reclaimed client frame must retire its exact row");
-    true
+    client_frame_cleanup::release(pi, page).is_ok()
 }
 
 pub(crate) unsafe fn csrss_frame_drop_process_range(pi: u64, base: u64, size: u64) -> u64 {
@@ -9760,25 +9704,12 @@ unsafe fn process_working_set_pageout_mapping(pi: usize, page: u64) -> bool {
     if vm_page_lock_is_locked(pi as u64, page) {
         return false;
     }
-    if (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY))
-        .get(pi as u64, page)
-        .is_some_and(|record| record.owns_frame)
-    {
-        return false;
+    if let Some(record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(pi as u64, page) {
+        return !record.owns_frame
+            && client_frame_cleanup::release(pi as u64, page).is_ok_and(|released| released);
     }
     if win32k_glue::detach_attached_client_page(pi as u64, page).is_err() {
         return false;
-    }
-    if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
-        debug_assert!(!owns_frame);
-        recycle_mapped_cap(frame);
-        if alias_cap != frame {
-            recycle_mapped_cap(alias_cap);
-        }
-        if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
-            recycle_plain_cap(source_cap);
-        }
-        return true;
     }
     if let Some(map_cap) = shared_image_mapping_take(pi as u64, page) {
         recycle_mapped_cap(map_cap);
@@ -13107,7 +13038,7 @@ fn vm_watch(what: &[u8], pi: usize, page: u64, frame: u64) {
 }
 
 unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
-    if hosted_thread_memory_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
+    if hosted_thread_memory_retirement_access(pi as u64, page, nt_address_space::PAGE_SIZE).is_err() {
         return false;
     }
     if vm_page_lock_is_locked(pi as u64, page) {
@@ -13115,25 +13046,13 @@ unsafe fn vm_unmap_private_page(pi: usize, page: u64) -> bool {
         return false;
     }
     process_pagefile_discard(pi as u64, page);
-    if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
-        vm_watch(b"unmap", pi, page, frame);
-        if owns_frame {
-            vm_frame_release(frame, alias_cap);
-        } else {
-            let _ = page_unmap_r(frame);
-            let _ = cnode_delete_recycle_r(frame);
-            if alias_cap != 0 {
-                let _ = page_unmap_r(alias_cap);
-                let _ = cnode_delete_recycle_r(alias_cap);
-            }
-        }
-        if source_cap != 0 && source_cap != frame && source_cap != alias_cap {
-            let _ = cnode_delete_recycle_r(source_cap);
-        }
+    if let Some(record) = csrss_frame_get_exact_record(pi as u64, page) {
+        vm_watch(b"unmap", pi, page, record.frame);
+        csrss_frame_reclaim_exact(pi as u64, page)
     } else {
         vm_watch(b"unmap-miss", pi, page, 0);
+        true
     }
-    true
 }
 
 unsafe fn vm_reprotect_private_page(
@@ -13223,7 +13142,7 @@ unsafe fn recycle_unmapped_frame_record_caps(
 
 unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) -> bool {
     let Some(size) = end.checked_sub(base) else { return false; };
-    if hosted_thread_memory_access(pi as u64, base, size).is_err() {
+    if hosted_thread_memory_retirement_access(pi as u64, base, size).is_err() {
         return false;
     }
     if vm_page_lock_range_is_locked(pi as u64, base, end) {
@@ -13232,7 +13151,9 @@ unsafe fn vm_unmap_shared_image_mapping_range(pi: usize, base: u64, end: u64) ->
     }
     let mut page = base;
     while page < end {
-        let _ = vm_unmap_private_page(pi, page);
+        if !vm_unmap_private_page(pi, page) {
+            return false;
+        }
         page += 0x1000;
     }
     shared_image_mapping_unmap_range(pi as u64, base, end);
@@ -15045,6 +14966,7 @@ mod thread_sched_context;
 mod root_slot_recycle;
 mod frame_acquisition;
 mod frame_recycle;
+mod client_frame_cleanup;
 use thread_sched_context::attach_sched_context;
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
@@ -26476,16 +26398,15 @@ unsafe fn spawn_hosted_thread_mechanism(
         return failed!();
     }
     if t.client_pi != 0 {
-        let source_cap = memory_cap!(copy_thread_construction_cap(teb_client));
-        resources.teb_local_source = source_cap;
-        let registered = source_cap != 0
-            && csrss_frame_put_at_cap_source(
+        let registered = csrss_frame_put_at_cap_source_backing(
                 t.client_pi,
                 t.teb_va,
                 teb_client,
                 teb_live_alias,
                 teb_live_mirror,
-                source_cap,
+                teb,
+                true,
+                teb,
             );
         if registered {
             memory_progress.record_teb(0);
@@ -26570,16 +26491,15 @@ unsafe fn spawn_hosted_thread_mechanism(
     // DeallocationStack is in TEB page 2; write only after scratch mapping succeeded.
     core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
     if t.client_pi != 0 {
-        let source_cap = memory_cap!(copy_thread_construction_cap(teb2_client));
-        resources.teb2_local_source = source_cap;
-        let registered = source_cap != 0
-            && csrss_frame_put_at_cap_source(
+        let registered = csrss_frame_put_at_cap_source_backing(
                 t.client_pi,
                 t.teb_va + 0x1000,
                 teb2_client,
                 teb2_live_alias,
                 teb2_live_mirror,
-                source_cap,
+                teb2,
+                true,
+                teb2,
             );
         if registered {
             memory_progress.record_teb(1);

@@ -5,6 +5,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[path = "client_frame_transfer.rs"]
 mod transfer;
 pub use transfer::{ClientFrameTransfer, ClientFrameTransferError};
+#[path = "client_frame_reclaim.rs"]
+mod reclaim;
+pub use reclaim::{ClientFrameReclaimError, ClientFrameReclaimIntent, ClientFrameReclaimIo};
 
 static NEXT_RECORD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -27,21 +30,22 @@ pub struct ClientFrameRecord {
     pub alias_cap: u64,
     pub source_cap: u64,
     pub owns_frame: bool,
+    /// Exact canonical capability owned by this row, or zero for aliases without backing ownership.
+    /// It must name one of frame/alias_cap/source_cap; frame itself may be only a copied mapping.
+    pub owned_backing_cap: u64,
     pub age: u64,
-    pub frame_unmapped: bool,
-    pub alias_unmapped: bool,
-    reclaim_started: bool,
+    cleanup: Option<reclaim::ReclaimState>,
     transfer_id: Option<NonZeroU64>,
 }
 
 impl ClientFrameRecord {
     /// Reclamation is terminal for access, even while some capabilities remain live.
     pub const fn is_resident(self) -> bool {
-        self.frame != 0 && !self.reclaim_started && !self.frame_unmapped && !self.alias_unmapped
+        self.frame != 0 && !self.is_reclaiming()
     }
 
     pub const fn is_reclaiming(self) -> bool {
-        self.reclaim_started
+        self.cleanup.is_some() || self.transfer_id.is_some()
     }
 
     pub fn mapped_alias(self) -> Option<u64> {
@@ -78,6 +82,7 @@ pub enum ClientFrameInsertError {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClientFrameRegistryStats {
     pub records: usize,
+    pub reclaiming_records: usize,
     pub capacity: usize,
     pub high_water: usize,
     pub growths: u64,
@@ -93,6 +98,7 @@ pub struct ClientFrameRegistryStats {
 
 pub struct ClientFrameRegistry {
     records: Vec<ClientFrameRecord>,
+    reclaiming: usize,
     next_age: u64,
     high_water: usize,
     growths: u64,
@@ -110,6 +116,7 @@ impl ClientFrameRegistry {
     pub const fn new() -> Self {
         Self {
             records: Vec::new(),
+            reclaiming: 0,
             next_age: 1,
             high_water: 0,
             growths: 0,
@@ -156,6 +163,31 @@ impl ClientFrameRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_backing(
+        &mut self,
+        pi: u64,
+        page: u64,
+        frame: u64,
+        alias: u64,
+        alias_cap: u64,
+        source_cap: u64,
+        owns_frame: bool,
+        owned_backing_cap: u64,
+    ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
+        self.insert_at_age_with_backing(
+            pi,
+            page,
+            frame,
+            alias,
+            alias_cap,
+            source_cap,
+            owns_frame,
+            self.next_age,
+            owned_backing_cap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_at_age(
         &mut self,
         pi: u64,
@@ -167,7 +199,33 @@ impl ClientFrameRegistry {
         owns_frame: bool,
         age: u64,
     ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
-        if frame == 0 || (alias != 0 && alias_cap == 0) {
+        self.insert_at_age_with_backing(
+            pi,
+            page,
+            frame,
+            alias,
+            alias_cap,
+            source_cap,
+            owns_frame,
+            age,
+            if owns_frame { frame } else { 0 },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_at_age_with_backing(
+        &mut self,
+        pi: u64,
+        page: u64,
+        frame: u64,
+        alias: u64,
+        alias_cap: u64,
+        source_cap: u64,
+        owns_frame: bool,
+        age: u64,
+        owned_backing_cap: u64,
+    ) -> Result<ClientFrameInsert, ClientFrameInsertError> {
+        if frame == 0 || (alias != 0 && alias_cap == 0) || owns_frame != (owned_backing_cap != 0) {
             self.invalid_records = self.invalid_records.saturating_add(1);
             return Err(ClientFrameInsertError::InvalidRecord);
         }
@@ -181,7 +239,7 @@ impl ClientFrameRegistry {
                 self.frame_conflicts = self.frame_conflicts.saturating_add(1);
                 return Err(ClientFrameInsertError::ConflictingFrame);
             }
-            if record.owns_frame != owns_frame {
+            if record.owns_frame != owns_frame || record.owned_backing_cap != owned_backing_cap {
                 self.ownership_conflicts = self.ownership_conflicts.saturating_add(1);
                 return Err(ClientFrameInsertError::ConflictingOwnership);
             }
@@ -212,6 +270,10 @@ impl ClientFrameRegistry {
             return Ok(ClientFrameInsert::Updated);
         }
 
+        if owns_frame && ![frame, alias_cap, source_cap].contains(&owned_backing_cap) {
+            self.invalid_records = self.invalid_records.saturating_add(1);
+            return Err(ClientFrameInsertError::InvalidRecord);
+        }
         let old_capacity = self.records.capacity();
         if self.records.try_reserve(1).is_err() {
             self.allocation_failures = self.allocation_failures.saturating_add(1);
@@ -234,10 +296,9 @@ impl ClientFrameRegistry {
             alias_cap,
             source_cap,
             owns_frame,
+            owned_backing_cap,
             age,
-            frame_unmapped: false,
-            alias_unmapped: false,
-            reclaim_started: false,
+            cleanup: None,
             transfer_id: None,
         });
         self.next_age = self.next_age.max(age.saturating_add(1));
@@ -268,104 +329,15 @@ impl ClientFrameRegistry {
 
     pub fn take(&mut self, pi: u64, page: u64) -> Option<ClientFrameRecord> {
         let index = self.index_for(pi, page)?;
-        if self.records[index].transfer_id.is_some() {
+        if self.records[index].is_reclaiming() {
             return None;
         }
         Some(self.records.swap_remove(index))
     }
 
-    pub fn mark_frame_unmapped_exact(
-        &mut self,
-        expected: ClientFrameRecord,
-    ) -> Option<ClientFrameRecord> {
-        let record = self.exact_mut(expected)?;
-        if record.frame == 0 || record.frame_unmapped {
-            return None;
-        }
-        record.frame_unmapped = true;
-        record.reclaim_started = true;
-        Some(*record)
-    }
-
-    pub fn mark_alias_unmapped_exact(
-        &mut self,
-        expected: ClientFrameRecord,
-    ) -> Option<ClientFrameRecord> {
-        let record = self.exact_mut(expected)?;
-        if record.alias_cap == 0 || record.alias_unmapped {
-            return None;
-        }
-        record.alias_unmapped = true;
-        record.reclaim_started = true;
-        Some(*record)
-    }
-
-    pub fn clear_frame_cap_exact(
-        &mut self,
-        expected: ClientFrameRecord,
-    ) -> Option<ClientFrameRecord> {
-        let record = self.exact_mut(expected)?;
-        if record.frame == 0 || !record.frame_unmapped || record.owns_frame {
-            return None;
-        }
-        let frame = record.frame;
-        record.reclaim_started = true;
-        record.frame = 0;
-        if record.alias_cap == frame {
-            record.alias_cap = 0;
-            record.alias_unmapped = false;
-        }
-        if record.source_cap == frame {
-            record.source_cap = 0;
-        }
-        Some(*record)
-    }
-
-    pub fn clear_alias_cap_exact(
-        &mut self,
-        expected: ClientFrameRecord,
-    ) -> Option<ClientFrameRecord> {
-        let record = self.exact_mut(expected)?;
-        if record.alias_cap == 0 || !record.alias_unmapped {
-            return None;
-        }
-        let alias = record.alias_cap;
-        record.reclaim_started = true;
-        record.alias_cap = 0;
-        record.alias_unmapped = false;
-        if record.source_cap == alias {
-            record.source_cap = 0;
-        }
-        Some(*record)
-    }
-
-    pub fn clear_source_cap_exact(
-        &mut self,
-        expected: ClientFrameRecord,
-    ) -> Option<ClientFrameRecord> {
-        let record = self.exact_mut(expected)?;
-        if record.source_cap == 0 {
-            return None;
-        }
-        record.reclaim_started = true;
-        record.source_cap = 0;
-        Some(*record)
-    }
-
-    /// Close registration and resident access before the first destructive backend operation.
-    /// A failed unmap/delete retains this terminal state and its exact capabilities for retry.
-    pub fn begin_reclaim_exact(
-        &mut self,
-        expected: ClientFrameRecord,
-    ) -> Option<ClientFrameRecord> {
-        let record = self.exact_mut(expected)?;
-        record.reclaim_started = true;
-        Some(*record)
-    }
-
     pub fn take_exact(&mut self, expected: ClientFrameRecord) -> Option<ClientFrameRecord> {
         let index = self.index_for(expected.pi, expected.page)?;
-        if self.records[index] != expected || self.records[index].transfer_id.is_some() {
+        if self.records[index] != expected || self.records[index].is_reclaiming() {
             return None;
         }
         Some(self.records.swap_remove(index))
@@ -402,9 +374,35 @@ impl ClientFrameRegistry {
         &self.records
     }
 
+    pub fn reclaiming_count(&self) -> usize {
+        self.reclaiming
+    }
+
+    /// Deny-only terminal-row exclusion. The ordinary no-reclamation path is constant time.
+    pub fn memory_available(&self, pi: u64, base: u64, size: u64) -> bool {
+        if size == 0 {
+            return true;
+        }
+        let Some(end) = base.checked_add(size) else {
+            return false;
+        };
+        if self.reclaiming == 0 {
+            return true;
+        }
+        self.records
+            .iter()
+            .filter(|row| row.pi == pi && row.is_reclaiming())
+            .all(|row| {
+                row.page
+                    .checked_add(4096)
+                    .is_some_and(|page_end| base >= page_end || end <= row.page)
+            })
+    }
+
     pub fn stats(&self) -> ClientFrameRegistryStats {
         ClientFrameRegistryStats {
             records: self.records.len(),
+            reclaiming_records: self.reclaiming,
             capacity: self.records.capacity(),
             high_water: self.high_water,
             growths: self.growths,
@@ -423,6 +421,24 @@ impl ClientFrameRegistry {
 impl Default for ClientFrameRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+struct SuccessfulCleanup;
+#[cfg(test)]
+impl ClientFrameReclaimIo for SuccessfulCleanup {
+    fn unmap(&mut self, _: u64) -> Result<(), u32> {
+        Ok(())
+    }
+    fn delete(&mut self, _: u64) -> Result<(), u32> {
+        Ok(())
+    }
+    fn recycle_empty(&mut self, _: u64) -> Result<(), u32> {
+        Ok(())
+    }
+    fn revoke(&mut self, _: u64) -> Result<(), u32> {
+        Ok(())
     }
 }
 
@@ -527,24 +543,25 @@ mod tests {
             .insert(7, 0x1000, 11, 0x2000, 12, 13, false)
             .unwrap();
         let initial = registry.get(7, 0x1000).unwrap();
-        let frame_unmapped = registry.mark_frame_unmapped_exact(initial).unwrap();
-        assert!(registry.mark_frame_unmapped_exact(initial).is_none());
-        let frame_released = registry.clear_frame_cap_exact(frame_unmapped).unwrap();
-        let alias_unmapped = registry.mark_alias_unmapped_exact(frame_released).unwrap();
-        let alias_released = registry.clear_alias_cap_exact(alias_unmapped).unwrap();
-        let source_released = registry.clear_source_cap_exact(alias_released).unwrap();
-        for record in [
-            frame_unmapped,
-            frame_released,
-            alias_unmapped,
-            alias_released,
-            source_released,
-        ] {
+        let intent = ClientFrameReclaimIntent::Release;
+        let started = registry.begin_reclaim_exact(initial, intent).unwrap();
+        assert_eq!(
+            registry.cleanup_reclaim_exact(initial, intent, &mut SuccessfulCleanup),
+            Err(ClientFrameReclaimError::StaleRecord)
+        );
+        let ready = registry
+            .cleanup_reclaim_exact(started, intent, &mut SuccessfulCleanup)
+            .unwrap();
+        for record in [started, ready] {
             assert!(!record.is_resident());
             assert_eq!(record.mapped_alias(), None);
             assert_eq!(record.clone_source_cap(), None);
         }
-        assert_eq!(registry.take_exact(source_released), Some(source_released));
+        assert_eq!(registry.take_exact(ready), None);
+        assert_eq!(
+            registry.commit_reclaim_exact(ready, intent, |_| Ok(())),
+            Ok(ready)
+        );
         assert!(registry.is_process_empty(7));
     }
 
@@ -571,17 +588,10 @@ mod tests {
             .clone_source_cap(),
             Some(11)
         );
-        for unavailable in [
-            ClientFrameRecord { frame: 0, ..record },
-            ClientFrameRecord {
-                alias_unmapped: true,
-                ..record
-            },
-            ClientFrameRecord {
-                frame_unmapped: true,
-                ..record
-            },
-        ] {
+        let retiring = registry
+            .begin_reclaim_exact(record, ClientFrameReclaimIntent::Release)
+            .unwrap();
+        for unavailable in [ClientFrameRecord { frame: 0, ..record }, retiring] {
             assert_eq!(unavailable.mapped_alias(), None);
             assert_eq!(unavailable.clone_source_cap(), None);
         }
