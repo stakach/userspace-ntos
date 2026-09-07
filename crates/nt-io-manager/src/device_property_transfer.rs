@@ -39,10 +39,15 @@ struct Transfer {
 
 /// Generation-independent tokens are never reused during one boot. A completed, aborted, or
 /// owner-torn-down transfer therefore cannot alias a later property snapshot.
-#[derive(Default)]
 pub struct HostedDevicePropertyTransferTable {
     next_token: u64,
     entries: Vec<Option<Transfer>>,
+}
+
+impl Default for HostedDevicePropertyTransferTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HostedDevicePropertyTransferTable {
@@ -244,6 +249,23 @@ mod tests {
             pdo_device_id: DeviceId::new(3, 4),
             pdo_address: pdo,
         }
+    }
+
+    #[test]
+    fn default_constructor_can_retain_and_complete_a_transfer() {
+        let mut table = HostedDevicePropertyTransferTable::default();
+        let mut bank = [0u8; 2];
+        let first = table
+            .begin(owner(7, 0x1000), vec![1, 2, 3], &mut bank)
+            .unwrap();
+        assert_ne!(first.token, 0);
+        assert_eq!(bank, [1, 2]);
+        let last = table
+            .pull(owner(7, 0x1000), first.token, 2, &mut bank)
+            .unwrap();
+        assert!(last.complete);
+        assert_eq!(bank[0], 3);
+        assert!(table.is_empty());
     }
 
     #[test]

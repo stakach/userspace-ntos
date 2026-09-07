@@ -281,6 +281,8 @@ below are historical baselines, not acceptance of the current provider cutover.
   buffers or driver authority; retain each physical lane's reply/publication ownership.
 - [x] Add counted canonical Device references for retained consumer projections (tranche 111).
   Pointer bindings alone are not references; protect both normal and raw device/driver removal.
+- [~] Fence physical-lane dispatch lifetimes with checked job identities (tranche 112). Preserve
+  ownership across suspension, invalidate on completion, and reject stale transfer consumption.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28883,6 +28885,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The rebuilt ntdll and complete DLL verifier also pass in
     `.tmp/build-ntdll-exception-ownership-20260908.log`. The DLL has not yet been used in a new
     desktop boot; strict native import completion remains a prerequisite.
+
+    Follow-up review fixed HostedDevicePropertyTransferTable::default initializing its token to
+    zero instead of using the checked constructor. The new retained-transfer regression and the
+    six-crate I/O/PnP/configuration/executive/user-host regression pass 1,065 tests, including the
+    compile-fail ownership test, in `.tmp/test-device-reference-regression-20260908.log`. The
+    rebuilt DLL also passes immutable exception-image admission with 2,202 function rows; all five
+    staged desktop images pass in `.tmp/check-rebuilt-exception-images-20260908.log`.
+
+    B3 physical dispatch ownership tranche 112 (2026-09-08, in progress):
+
+    A physical lane generation identifies its executor but not successive jobs on that executor.
+    Add an opaque checked dispatch epoch, preserved through every suspension/resume and invalidated
+    on each transition to Idle. Retained property transfers must fence both lane and job while
+    preserving token uniqueness across jobs. Register and admit the real primary DriverEntry lane
+    before pumping requests; publish steady-state readiness only after its completion sentinel.
+    Provider teardown must check all registered lanes, not only property-using lanes, and still
+    requires separate retirement of every published pointer/mapping. Wall/bugcheck flags are not
+    successful resource-retirement proofs.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
