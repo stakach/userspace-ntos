@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use nt_cache_manager::{CachedStreamBacking, SharedCacheMap};
 
 mod client_frame;
+pub mod alias_transition;
 mod commit;
 mod copy_context;
 pub mod data_section;

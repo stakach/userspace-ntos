@@ -154,9 +154,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Replace independent prefetch prepare/put selection with exact reserved/published/retiring
   ownership, generation-checked publication and checked slot/alias cleanup; remove temporary
   remapping of unavailable prefetch frames (tranche 67, host/build; native pending cleanup open).
+- [x] Retain win32k attachment construction, rights remap and backing replacement in-place through
+  rollback/commit failures; remove raw record/take machinery and require checked pageout detach
+  (tranche 68, host/build; legacy thread-release failure still stops execution, not retry-complete).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next close attachment construction/remap,
-  legacy release failure propagation and remaining non-ingress routing bypasses, retain complete
+  emptiness as a complete execution-quiescence proof. Next replace the legacy fatal release boundary
+  with retained resource-bundle failure propagation and close remaining non-ingress routing bypasses; retain complete
   external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
@@ -27068,6 +27071,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     backing rather than claiming this tranche removes all raw-image/scratch sources. Main/early
     spawn, ordinary termination, handler-owned handoffs, user-mode SEH and live cleanup validation
     remain open. No desktop proof is claimed; 33 unresolved win32k imports still block the full gate.
+
+    B3 attachment transaction tranche 68 (2026-09-07, host/build green):
+    `nt-memory-manager::alias_transition` provides a non-cloneable, allocation-free transaction
+    within an already retained attachment row. It owns old and candidate capabilities, their actual
+    mapped states and old/requested rights. Construction adopts the returned copy slot even on
+    failure. Replacement acquires that candidate before unmapping the old cap; successful new mapping
+    enters commit, where only old-cap deletion remains before publication. Failed deletion retains
+    both owners, and retry does not repeat copy/map. Earlier failure enters rollback, retaining
+    failed candidate deletion and old-rights restoration. Successful rollback still returns the
+    original operation failure. Rights-only remap uses the existing cap without another copy.
+
+    Native attachment code moved into focused `win32k_attach.rs`. A row is reserved before the
+    first copy; mapping and publication do not allocate registry metadata. Admission and exact
+    registered-source selection precede the mutable row borrow. The backend uses direct capability
+    operations and independent paging metadata, without reentering attachment admission. Missing
+    paging hierarchy recovery remaps the same retained copy cap instead of deleting/re-copying it.
+    Same-client attach recovers pending commit/rollback/retirement stages before reuse; ordinary
+    lookup refuses unavailable rows. Process detach can cancel either transaction direction but
+    removes a row only after all owned caps have been deleted successfully.
+
+    The old map-before-record, remove-before-remap, replace/record/remove and untracked-cleanup
+    helpers are removed. Exact-source copying no longer routes through a helper that hid failed
+    allocated slots. Its obsolete source-failure diagnostic probes and unused copy helper are also
+    deleted. Both working-set pageout callers now propagate checked attachment detach failure before
+    registry removal or backing release. Review caught the remaining void-return legacy thread
+    release chain: it previously treated unavailable attachment extraction as cap zero and proceeded
+    to reuse backing. Raw-cap extraction is now gone; this chain requires checked detach and stops
+    execution on failure before backing reclamation. This is a fail-closed safety boundary, not
+    retry-complete resource cleanup, and remains an explicit next implementation item.
+
+    Validation: 16 new host tests cover initial construction, empty/failed copy slots, failed mapping,
+    copy-before-unmap order, failed old unmap, candidate deletion and restoration failures, original
+    error propagation after rollback, commit-only deletion retry, same-cap rights remap, unavailable
+    operation refusal and explicit teardown during pending commit. The fake backend enforces one
+    mapped cap per alias VA and refuses deletion of mapped caps. The serialized nine-crate suite
+    passes 1,098 tests, including 278 `nt-memory-manager` tests; log:
+    `.tmp/test-win32k-alias-transition-20260907.log`. The executive build passes at the unchanged
+    262-warning baseline and stages rootserver/hive; log:
+    `.tmp/build-win32k-alias-transition-20260907.log`. Two read-only agents reviewed transaction
+    recovery, native borrow/caller boundaries and legacy extraction removal; root alone ran tests
+    and then the build.
+
+    Review adjustment: retain the full legacy thread resource bundle before fallible release and
+    propagate cleanup failure through its caller ownership rather than leaving the fatal boundary
+    as the final design. The separate TEB-shadow allocator and paging-hierarchy construction also
+    retain historical cleanup debt; this transaction owns attachment copies, not every source or
+    page-table allocator. Reconcile these owners with external-alias journals and mirrored-reference
+    clearing before native pending cleanup activation. Image snapshot coherency, main/early spawn,
+    ordinary termination, handler handoffs, user-mode SEH and live failure validation remain open.
+    No desktop proof is claimed; 33 unresolved win32k imports still block the full gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

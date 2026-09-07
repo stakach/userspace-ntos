@@ -574,11 +574,10 @@ unsafe fn recycle_plain_cap(cap: u64) {
 }
 
 unsafe fn detach_win32k_attached_page_for_thread_release(pi: usize, page: u64) {
-    if W32_ATTACHED_PI.load(Ordering::Relaxed) != pi as u64 {
-        return;
-    }
-    let (cap, _, _) = w32_attach_replace_mapping(page, 0, 0);
-    recycle_mapped_cap(cap);
+    // This legacy void-return release chain cannot yet retain a failed caller-owned resource
+    // bundle. Never continue to backing reuse while a service alias still owns the old frame.
+    win32k_glue::detach_attached_client_page(pi as u64, page)
+        .expect("legacy thread backing release requires completed win32k alias retirement");
 }
 
 unsafe fn take_registered_thread_page(pi: usize, page: u64, owner: u64) {
@@ -8839,19 +8838,6 @@ unsafe fn csrss_frame_alias_get(pi: u64, page: u64) -> u64 {
         .and_then(ClientFrameRecord::mapped_alias)
         .unwrap_or(0)
 }
-unsafe fn copy_registered_frame_cap(source: u64) -> (u64, u64) {
-    if source == 0 {
-        return (0, 3);
-    }
-    let (copied, error) = copy_cap_r(source);
-    if error == 0 {
-        return (copied, 0);
-    }
-    if copied != 0 {
-        let _ = cnode_delete_recycle_r(copied);
-    }
-    (0, error)
-}
 pub(crate) unsafe fn csrss_frame_create_source_copy(
     parent: u64,
     pi: u64,
@@ -8893,7 +8879,6 @@ pub(crate) unsafe fn csrss_frame_create_source_copy(
 
 static FRAME_SOURCE_PROBE_OK_LOGS: AtomicU64 = AtomicU64::new(0);
 static FRAME_SOURCE_PROBE_FAIL_LOGS: AtomicU64 = AtomicU64::new(0);
-static FRAME_SOURCE_REMAP_FAIL_PROBES: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn csrss_frame_probe_source_copy(pi: u64, page: u64, source_cap: u64, what: &[u8]) {
     if source_cap == 0 {
@@ -8932,65 +8917,6 @@ unsafe fn csrss_frame_probe_source_copy(pi: u64, page: u64, source_cap: u64, wha
     }
 }
 
-unsafe fn csrss_frame_probe_primary_after_source_failure(
-    pi: u64,
-    page: u64,
-    frame: u64,
-    source_cap: u64,
-    source_error: u64,
-) {
-    if FRAME_SOURCE_REMAP_FAIL_PROBES.fetch_add(1, Ordering::Relaxed) >= 16 {
-        return;
-    }
-    let (root_cnode_probe, root_cnode_error) = copy_cap_r(CAP_INIT_THREAD_CNODE);
-    if root_cnode_error == 0 {
-        let _ = cnode_delete_recycle_r(root_cnode_probe);
-    }
-    let (root_vspace_probe, root_vspace_error) = copy_cap_r(CAP_INIT_THREAD_VSPACE);
-    if root_vspace_error == 0 {
-        let _ = cnode_delete_recycle_r(root_vspace_probe);
-    }
-    let (primary_probe, primary_error) = copy_cap_r(frame);
-    if primary_error == 0 {
-        let _ = cnode_delete_recycle_r(primary_probe);
-    }
-    print_str(b"[frame-source] remap source copy failed pi=");
-    print_u64(pi);
-    print_str(b" page=0x");
-    print_hex((page >> 32) as u32);
-    print_hex(page as u32);
-    print_str(b" source=0x");
-    print_hex(source_cap as u32);
-    print_str(b" source-error=");
-    print_u64(source_error);
-    print_str(b" primary=0x");
-    print_hex(frame as u32);
-    print_str(b" primary-probe-error=");
-    print_u64(primary_error);
-    print_str(b" root-cnode-probe-error=");
-    print_u64(root_cnode_error);
-    print_str(b" root-vspace-probe-error=");
-    print_u64(root_vspace_error);
-    print_str(b"\n");
-}
-
-/// Copy the registered per-client frame cap for a win32k attach/remap. Records that have a separate
-/// derivation source must copy from that source; source-less records copy their primary cap. Executive
-/// scratch aliases are intentionally not consulted here, because a missing/invalid source is a real
-/// frame-registration bug that should stay visible.
-pub(crate) unsafe fn csrss_frame_copy_exact_for_win32k(pi: u64, page: u64) -> (u64, u64, u64) {
-    let Some(record) = csrss_frame_get_exact_record(pi, page) else {
-        return (0, 0, 3);
-    };
-    let Some(source_cap) = record.clone_source_cap() else {
-        return (0, 0, 3);
-    };
-    let (copied, error) = copy_registered_frame_cap(source_cap);
-    if error != 0 && record.source_cap != 0 {
-        csrss_frame_probe_primary_after_source_failure(pi, page, record.frame, source_cap, error);
-    }
-    (copied, source_cap, error)
-}
 unsafe fn client_copy_temp_cap() -> u64 {
     let cap = CLIENT_COPY_TEMP_CAP.load(Ordering::Relaxed);
     if cap != 0 {
@@ -9871,7 +9797,9 @@ unsafe fn process_working_set_pageout_mapping(pi: usize, page: u64) -> bool {
     {
         return false;
     }
-    detach_win32k_attached_page_for_thread_release(pi, page);
+    if win32k_glue::detach_attached_client_page(pi as u64, page).is_err() {
+        return false;
+    }
     if let Some((frame, alias_cap, source_cap, owns_frame)) = csrss_frame_take(pi as u64, page) {
         debug_assert!(!owns_frame);
         recycle_mapped_cap(frame);

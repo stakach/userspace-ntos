@@ -17625,7 +17625,7 @@ impl ExecNtHandler {
             protection,
             backing: record.frame,
         })?;
-        detach_win32k_attached_page_for_thread_release(pi, page);
+        win32k_glue::detach_attached_client_page(pi as u64, page)?;
         if page_unmap_r(record.frame) != 0 {
             return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
         }
