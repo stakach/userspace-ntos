@@ -822,3 +822,256 @@ fn terminated_creation_handle_owner_cannot_authorize_activation() {
     pm.cancel_bound_handle(reservation).unwrap();
     pm.commit_thread_activation(plan).unwrap();
 }
+
+#[test]
+fn native_ps_close_releases_one_visible_table_reference_and_returns_real_completion() {
+    let (mut pm, user, _, pid, tid) = fixture();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Thread(tid), 0x400)
+        .unwrap();
+    pm.set_handle_flags(
+        pid,
+        handle,
+        HandleFlags {
+            inherit: true,
+            protect_from_close: false,
+        },
+    )
+    .unwrap();
+    let mut pointer = pm
+        .reference_native_ps_handle(user, u64::from(handle), None, 0)
+        .unwrap();
+    let completion = pm
+        .close_native_ps_handle(user, u64::from(handle) | 3)
+        .unwrap();
+    assert_eq!(completion.table_owner(), pid);
+    assert_eq!(completion.object(), HandleObject::Thread(tid));
+    assert_eq!(completion.target_process(), pid);
+    assert_eq!(
+        completion.information(),
+        NativeHandleInformation {
+            attributes: OBJ_INHERIT,
+            granted_access: Some(0x400)
+        }
+    );
+    assert_eq!(completion.into_object(), HandleObject::Thread(tid));
+    assert_eq!(pm.handle_count(pid), 0);
+    assert_eq!(counts(&pm, pid, tid), (0, 1));
+    assert_eq!(
+        pm.close_native_ps_handle(user, u64::from(handle))
+            .unwrap_err(),
+        NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    pointer.release(&mut pm).unwrap();
+    assert_eq!(counts(&pm, pid, tid), (0, 0));
+}
+
+#[test]
+fn close_protection_returns_user_status_or_explicit_kernel_bugcheck_without_mutation() {
+    let (mut pm, user, kernel, pid, tid) = fixture();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Process(pid), 0)
+        .unwrap();
+    pm.set_handle_flags(
+        pid,
+        handle,
+        HandleFlags {
+            inherit: false,
+            protect_from_close: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.close_native_ps_handle(user, u64::from(handle))
+            .unwrap_err(),
+        NativePsCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE)
+    );
+    assert_eq!(
+        pm.close_native_ps_handle(kernel, u64::from(handle) | 1)
+            .unwrap_err(),
+        NativePsCloseError::BugCheck {
+            code: INVALID_KERNEL_HANDLE_BUGCHECK,
+            parameters: [u64::from(handle) | 1, 0, 0, 0]
+        }
+    );
+    assert_eq!(
+        pm.lookup_handle(pid, handle),
+        Some(HandleObject::Process(pid))
+    );
+    assert!(pm.handle_flags(pid, handle).unwrap().protect_from_close);
+    assert_eq!(counts(&pm, pid, tid), (0, 0));
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let kernel_handle = pm
+        .insert_handle(system, HandleObject::Thread(tid), 0)
+        .unwrap();
+    pm.set_handle_flags(
+        system,
+        kernel_handle,
+        HandleFlags {
+            inherit: false,
+            protect_from_close: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pm.close_native_ps_handle(kernel, KERNEL_HANDLE_TAG | u64::from(kernel_handle) | 2)
+            .unwrap_err(),
+        NativePsCloseError::BugCheck {
+            code: INVALID_KERNEL_HANDLE_BUGCHECK,
+            parameters: [u64::from(kernel_handle) | 2, 0, 0, 0]
+        }
+    );
+    assert_eq!(
+        pm.lookup_handle(system, kernel_handle),
+        Some(HandleObject::Thread(tid))
+    );
+}
+
+#[test]
+fn native_close_resolves_only_one_process_or_system_table_even_for_colliding_values() {
+    let (mut pm, user, kernel, pid, tid) = fixture();
+    let system = pm.initial_system_identity().unwrap().process_id();
+    let local = pm.insert_handle(pid, HandleObject::Thread(tid), 0).unwrap();
+    let global = pm
+        .insert_handle(system, HandleObject::Process(pid), 0)
+        .unwrap();
+    assert_eq!(local, global);
+    let tagged = KERNEL_HANDLE_TAG | u64::from(global);
+    assert_eq!(
+        pm.close_native_ps_handle(user, tagged).unwrap_err(),
+        NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    let completion = pm.close_native_ps_handle(kernel, tagged).unwrap();
+    assert_eq!(completion.table_owner(), system);
+    assert_eq!(completion.object(), HandleObject::Process(pid));
+    assert_eq!(
+        pm.lookup_handle(pid, local),
+        Some(HandleObject::Thread(tid))
+    );
+    assert_eq!(
+        pm.close_native_ps_handle(kernel, tagged).unwrap_err(),
+        NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        pm.lookup_handle(pid, local),
+        Some(HandleObject::Thread(tid))
+    );
+    let completion = pm.close_native_ps_handle(kernel, u64::from(local)).unwrap();
+    assert_eq!(completion.table_owner(), pid);
+    assert_eq!(completion.object(), HandleObject::Thread(tid));
+}
+
+#[test]
+fn native_ps_close_never_claims_other_object_families_or_pseudo_handles() {
+    let (mut pm, user, kernel, pid, _) = fixture();
+    for object in [
+        HandleObject::Opaque(0x7ff0_0000),
+        HandleObject::Token(pid),
+        HandleObject::Event(nt_types::ObjectId(7)),
+    ] {
+        let handle = pm.insert_handle(pid, object, 0).unwrap();
+        for caller in [user, kernel] {
+            assert_eq!(
+                pm.close_native_ps_handle(caller, u64::from(handle))
+                    .unwrap_err(),
+                NativePsCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH)
+            );
+        }
+        assert_eq!(pm.lookup_handle(pid, handle), Some(object));
+    }
+    let before = pm.handle_count(pid);
+    for value in [u64::MAX, u64::MAX - 1, 0, 0x1_0000_0004, 0x8000_0004] {
+        for caller in [user, kernel] {
+            assert_eq!(
+                pm.close_native_ps_handle(caller, value).unwrap_err(),
+                NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+            );
+        }
+    }
+    assert_eq!(pm.handle_count(pid), before);
+}
+
+#[test]
+fn native_close_cannot_take_reserved_or_bound_publication_ownership() {
+    let (mut pm, user, _, pid, _) = fixture();
+    let reservation = pm.try_reserve_handle_slot(pid).unwrap();
+    assert_eq!(
+        pm.close_native_ps_handle(user, u64::from(reservation.handle))
+            .unwrap_err(),
+        NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(pm.handle_reservation_count(pid), 1);
+    pm.cancel_reserved_handle(reservation).unwrap();
+    let mut pointer = pm
+        .reference_native_ps_handle(user, u64::MAX, None, 0)
+        .unwrap();
+    let mut publication = pm
+        .prepare_authorized_native_ps_handle(user, &pointer, 0, 0)
+        .unwrap();
+    pointer.release(&mut pm).unwrap();
+    assert_eq!(
+        pm.close_native_ps_handle(user, publication.value())
+            .unwrap_err(),
+        NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(publication.phase(), NativePsHandlePublicationPhase::Bound);
+    assert_eq!(
+        pm.handle_object_reference_count(HandleObject::Process(pid)),
+        1
+    );
+    publication.abort(&mut pm).unwrap();
+}
+
+#[test]
+fn close_rejects_stale_or_exited_callers_and_preserves_remaining_table_ownership() {
+    let (mut pm, user, kernel, pid, tid) = fixture();
+    let (mut replacement, _, _, _, _) = fixture();
+    let handle = pm
+        .insert_handle(pid, HandleObject::Process(pid), 0)
+        .unwrap();
+    let other = replacement
+        .insert_handle(pid, HandleObject::Process(pid), 0)
+        .unwrap();
+    assert_eq!(handle, other);
+    assert_eq!(
+        replacement
+            .close_native_ps_handle(user, u64::from(handle))
+            .unwrap_err(),
+        NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+    );
+    assert_eq!(
+        replacement.lookup_handle(pid, other),
+        Some(HandleObject::Process(pid))
+    );
+    pm.terminate_thread(tid, 0).unwrap();
+    for caller in [user, kernel] {
+        assert_eq!(
+            pm.close_native_ps_handle(caller, u64::from(handle))
+                .unwrap_err(),
+            NativePsCloseError::Status(STATUS_INVALID_HANDLE)
+        );
+    }
+    assert_eq!(
+        pm.lookup_handle(pid, handle),
+        Some(HandleObject::Process(pid))
+    );
+    assert_eq!(pm.take_any_handle(pid), Some(HandleObject::Process(pid)));
+}
+
+#[test]
+fn closing_terminated_target_releases_handle_without_faking_object_retirement() {
+    let (mut pm, user, _, owner, _) = fixture();
+    let pid = pm.create_process("target", None, None);
+    let tid = pm.create_thread(pid, 0x7000, 0, false).unwrap();
+    let handle = pm
+        .insert_handle(owner, HandleObject::Process(pid), 0)
+        .unwrap();
+    pm.terminate_process(pid, 0).unwrap();
+    assert!(!pm.process_object_delete_ready(pid));
+    let completion = pm.close_native_ps_handle(user, u64::from(handle)).unwrap();
+    assert_eq!(completion.target_process(), pid);
+    assert!(pm.process(pid).is_some());
+    assert!(pm.thread(tid).is_some());
+    assert!(pm.process_object_delete_ready(pid));
+    assert!(pm.delete_process_object_if_unreferenced(pid).is_some());
+}

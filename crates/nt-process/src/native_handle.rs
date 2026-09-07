@@ -15,6 +15,7 @@ pub const KERNEL_HANDLE_TAG: u64 = 0xffff_ffff_8000_0000;
 pub const OBJ_KERNEL_HANDLE: u32 = 0x200;
 pub const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xc000_0024;
 pub const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
+pub const INVALID_KERNEL_HANDLE_BUGCHECK: u32 = 0x93;
 const OBJ_INHERIT: u32 = 2;
 const OBJ_PROTECT_CLOSE: u32 = 1;
 const MAX_RAW_HANDLE: u64 = 0x7fff_fffc;
@@ -64,6 +65,47 @@ pub struct NativeHandleInformation {
     /// None only for pseudo handles: canonical creation-time self grants are not yet stored.
     /// A native adapter requesting full OBJECT_HANDLE_INFORMATION must not substitute a mask.
     pub granted_access: Option<u32>,
+}
+
+/// A protected kernel-mode close is a kernel contract violation, not a successful close or a
+/// recoverable STATUS_HANDLE_NOT_CLOSABLE. Native adapters must propagate this terminal action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativePsCloseError {
+    Status(u32),
+    BugCheck { code: u32, parameters: [u64; 4] },
+}
+
+/// Completion of one removed Ps handle-table reference. This owns the close completion, not a
+/// new pointer reference: the table reference has already been released. The native host must
+/// reconsider the target process's deletion dependencies using its existing lifecycle owner.
+/// No object body, thread, process, or backing resource is implicitly retired here.
+#[must_use = "reconsider canonical Ps object deletion after releasing this handle"]
+#[derive(Debug)]
+pub struct ClosedNativePsHandle {
+    table_owner: ProcessId,
+    object: HandleObject,
+    target_process: ProcessId,
+    information: NativeHandleInformation,
+}
+
+impl ClosedNativePsHandle {
+    pub const fn table_owner(&self) -> ProcessId {
+        self.table_owner
+    }
+    pub const fn object(&self) -> HandleObject {
+        self.object
+    }
+    pub const fn target_process(&self) -> ProcessId {
+        self.target_process
+    }
+    pub const fn information(&self) -> NativeHandleInformation {
+        self.information
+    }
+
+    /// Hand the completed reference release to the host's existing Process/Thread close tail.
+    pub fn into_object(self) -> HandleObject {
+        self.object
+    }
 }
 
 /// One acquired pointer reference, independent of the source handle and caller lifetime.
@@ -234,6 +276,83 @@ impl NativePsHandlePublication {
 }
 
 impl ProcessManager {
+    /// Close only a Process/Thread handle in its single canonical native scope. Reserved and
+    /// Bound entries are never visible to this operation; exact publication abort owns them.
+    /// Caller admission is required even in KernelMode, so this is not a teardown bypass.
+    ///
+    /// This implements ObCloseHandle's status/terminal-action boundary. NtClose's optional user
+    /// exception delivery and invalid-handle debugger diagnostics belong to the native adapter.
+    /// Neither KernelMode nor an attached process grants permission to ignore protect-close.
+    pub fn close_native_ps_handle(
+        &mut self,
+        caller: NativeHandleCaller,
+        value: u64,
+    ) -> Result<ClosedNativePsHandle, NativePsCloseError> {
+        let scope = self
+            .decode_native_handle(caller, value)
+            .map_err(NativePsCloseError::Status)?;
+        let NativeHandleScope::Table {
+            owner,
+            handle,
+            kernel,
+        } = scope
+        else {
+            return Err(NativePsCloseError::Status(STATUS_INVALID_HANDLE));
+        };
+        let slot = crate::handle_to_slot(handle)
+            .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
+        let entry = self
+            .process(owner)
+            .and_then(|process| process.handles.get(slot))
+            .and_then(crate::HandleSlot::entry)
+            .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
+        let object = entry.object;
+        let target_process = match object {
+            HandleObject::Process(pid) => self.process(pid).map(|_| pid),
+            HandleObject::Thread(tid) => self
+                .thread(tid)
+                .and_then(|thread| self.process(thread.process_id).map(|_| thread.process_id)),
+            _ => return Err(NativePsCloseError::Status(STATUS_OBJECT_TYPE_MISMATCH)),
+        }
+        .ok_or(NativePsCloseError::Status(STATUS_INVALID_HANDLE))?;
+        if entry.flags.protect_from_close {
+            return Err(if caller.mode == AccessMode::KernelMode {
+                // NT decodes the kernel-table flag before ObpCloseHandleTableEntry, but preserves
+                // the caller's application tag bits when reporting a protected handle.
+                NativePsCloseError::BugCheck {
+                    code: INVALID_KERNEL_HANDLE_BUGCHECK,
+                    parameters: [
+                        if kernel {
+                            value & !KERNEL_HANDLE_TAG
+                        } else {
+                            value
+                        },
+                        0,
+                        0,
+                        0,
+                    ],
+                }
+            } else {
+                NativePsCloseError::Status(crate::STATUS_HANDLE_NOT_CLOSABLE)
+            });
+        }
+        let information = NativeHandleInformation {
+            attributes: u32::from(entry.flags.inherit) * OBJ_INHERIT,
+            granted_access: Some(entry.granted_access),
+        };
+        // No callback or IPC separates the validated snapshot from this one removal.
+        let removed = self
+            .take_handle(owner, handle)
+            .map_err(NativePsCloseError::Status)?;
+        debug_assert_eq!(removed, object);
+        Ok(ClosedNativePsHandle {
+            table_owner: owner,
+            object,
+            target_process,
+            information,
+        })
+    }
+
     /// Capture an unattached caller after the native adapter has authenticated its live runtime.
     /// A caller from the initial System thread additionally requires its retained bootstrap root.
     pub fn capture_native_handle_caller(

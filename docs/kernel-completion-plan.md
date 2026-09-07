@@ -274,7 +274,7 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Move exception records through handler continuations without per-handler allocation and
   validate the catalog against real staged desktop binaries (tranche 108). Native entry records,
   collision linkage and low-memory delivery still require their physical-lane implementation.
-- [~] Add canonical native Ps close semantics over the shared table scopes (tranche 109). Preserve
+- [x] Add canonical native Ps close semantics over the shared table scopes (tranche 109; host core). Preserve
   protected-handle status/bugcheck behavior; do not probe alternate object tables after failure.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
@@ -28810,7 +28810,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     metadata compatibility evidence only: none of the supplied images was executed by the validator,
     and native desktop rendering/import closure remains unverified.
 
-    B3 canonical native Ps close tranche 109 (2026-09-08, in progress):
+    B3 canonical native Ps close tranche 109 (2026-09-08, host core complete):
 
     Resolve one full-width native scope and one canonical Process/Thread table entry before mutation.
     Preserve UserMode protection failures and the genuine KernelMode protected-close bugcheck outcome;
@@ -28818,6 +28818,20 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reports the removed table reference for real deletion reconsideration, not a fabricated pointer
     reference or eager object deletion. Native debug/exception policy and Ps/Se/USER routing remain
     part of the later whole-family cutover.
+
+    Implemented close_native_ps_handle over the same authenticated native caller and x64 scope
+    decoder. It resolves and type-checks one visible Process/Thread entry, validates the target and
+    close-protection state, and removes exactly that table reference. Pseudo handles, non-Ps objects,
+    malformed values and reserved/bound entries are rejected without mutation. UserMode protection
+    returns STATUS_HANDLE_NOT_CLOSABLE; KernelMode protection returns an explicit terminal
+    INVALID_KERNEL_HANDLE bugcheck action, never a successful or silently ignored close. The owned
+    completion identifies the removed reference for normal lifecycle reconsideration without adding
+    a pointer reference or deleting backing resources itself.
+
+    Seven new tests cover real reference ownership, both protection modes, colliding process/System
+    tables, non-Ps/pseudo/malformed inputs, invisible publications, stale/dead callers and terminated
+    targets. PM tests pass 210/210 in `.tmp/test-native-ps-close-20260908.log`. Existing native Nt/Zw
+    close wrappers are not switched independently of the whole Ps/Se/USER handle migration.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
