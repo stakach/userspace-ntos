@@ -48,6 +48,20 @@ pub struct NativeAcl {
 impl NativeAcl {
     /// Validate and capture the native ACL prefix identified by `AclSize`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeAclError> {
+        let bytes = Self::validated_prefix(bytes)?;
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    /// Adopt a prepared allocation after validation without allocating another copy.
+    pub(crate) fn from_owned_bytes(mut bytes: Vec<u8>) -> Result<Self, NativeAclError> {
+        let length = Self::validated_prefix(&bytes)?.len();
+        bytes.truncate(length);
+        Ok(Self { bytes })
+    }
+
+    fn validated_prefix(bytes: &[u8]) -> Result<&[u8], NativeAclError> {
         if bytes.len() < ACL_HEADER_SIZE {
             return Err(NativeAclError::TruncatedHeader);
         }
@@ -117,9 +131,7 @@ impl NativeAcl {
             offset = ace_end;
         }
 
-        Ok(Self {
-            bytes: bytes.to_vec(),
-        })
+        Ok(bytes)
     }
 
     /// Return the complete native ACL bytes, including unused trailing space.

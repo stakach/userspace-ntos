@@ -15,6 +15,7 @@ mod access;
 pub mod create_token;
 mod job_token;
 mod native_acl;
+pub mod native_acl_inheritance;
 mod native_sd;
 mod port;
 pub mod se_exports;
@@ -48,6 +49,7 @@ pub use job_token::{
     JOB_OBJECT_SECURITY_VALID_FLAGS, JOB_SECURITY_LIMIT_INFORMATION_SIZE,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
+pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
     capture_object_type_list, capture_security_descriptor, capture_security_descriptor_bytes,
     native_acl_to_acl, query_security_descriptor_bytes, set_security_descriptor_bytes,

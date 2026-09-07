@@ -233,6 +233,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Give KeBugCheck/KeBugCheckEx a pointer-free terminal provider report, preserve first-failure
   evidence and stop without replying or re-entering damaged callbacks; make the run harness fail
   fast on the terminal marker (tranche 94; native destructive validation remains open).
+- [x] Add shared lossless native ACE inheritance for security assignment, including creator SID
+  substitution, generic mapping and object/compound ACE propagation (tranche 95). Descriptor
+  selection, subject authorization and publication remain separate.
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28338,6 +28341,35 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review adjustment: the old FSD-only guarded bugcheck recovery remains separate legacy debt;
     it is not called by these new win32k bindings. Finish shared ACL inheritance and actual security
     assignment, then close remaining real provider import families before the desktop run.
+
+    B3 native ACL inheritance tranche 95 (2026-09-08):
+
+    nt-security now has a pure parent-ACE inheritance materializer shared by future ObAssignSecurity
+    and ntdll security-object creation. It preserves native bytes rather than projecting through
+    the access-check ACL model. Basic allow/deny/audit/alarm, compound server/client SIDs and all
+    four object ACE forms are supported. Creator owner/group/server substitution, generic mask
+    mapping, object/container/inherit-only/no-propagate behavior, GUID filtering/removal and
+    effective-versus-propagation splitting follow the NT5 routines. Automatic inherited marking
+    is explicit. Unsupported callback/unknown ACEs and unsupported encodings return real errors.
+    Output is a concrete ACL; it never substitutes null for an empty inheritance result.
+
+    All output reservations are checked and native ACL adoption validates the prepared buffer
+    without an extra allocation. Validation: all 111 security tests pass, including 21 new tests
+    with the 512-case basic ACE inheritance matrix. The twelve-crate regression suite passes
+    1,824 tests. Executive release build passes with 262 warnings. Logs:
+    `.tmp/test-native-acl-inheritance-20260908.log`,
+    `.tmp/test-native-acl-inheritance-regression-20260908.log`,
+    `.tmp/build-native-acl-inheritance-20260908.log`. An accidentally overlapping build was stopped;
+    the final build and full regression run were repeated sequentially. Root ran all validation.
+    Independent NT5 review found no supported-ACE correctness blocker. For invalid generic
+    mappings containing undefined rights, the core conservatively keeps a separate propagation
+    ACE when final rights stripping changes the effective mask rather than merging it away.
+
+    Review adjustment: this does not select parent versus creator versus token ACLs, authorize
+    owner/SACL assignment, capture ACCESS_STATE or publish an object descriptor. Those remain
+    required before binding ObAssignSecurity or replacing ntdll's existing security-object creation
+    scaffolding. Directory-provider imports also require one canonical namespace shared with Nt
+    callers; adding a separate provider directory universe would not close that contract.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
