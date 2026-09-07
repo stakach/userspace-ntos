@@ -9,6 +9,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SuspensionKind {
@@ -209,6 +212,25 @@ impl LaneHandle {
     }
 }
 
+/// One admitted job on one exact physical lane generation. This identity survives every suspension
+/// and resume in that job but becomes invalid when the lane becomes idle. Epochs are checked and
+/// globally issued so separate or replacement lane tables cannot alias an earlier job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaneDispatchIdentity {
+    lane: LaneHandle,
+    epoch: u64,
+}
+
+impl LaneDispatchIdentity {
+    pub const fn lane(self) -> LaneHandle {
+        self.lane
+    }
+
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LaneBinding {
     pub executor_id: u64,
@@ -287,6 +309,7 @@ pub enum LaneError {
 struct Lane<C, R> {
     binding: LaneBinding,
     phase: LanePhase,
+    dispatch: Option<LaneDispatchIdentity>,
     external_tokens: Vec<u64>,
     suspensions: ComponentSuspensionStack<C, R>,
 }
@@ -594,6 +617,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         self.slots.iter().enumerate().find_map(|(index, slot)| {
             let lane = slot.lane.as_ref()?;
             (lane.phase == LanePhase::Idle
+                && lane.dispatch.is_none()
                 && lane.external_tokens.is_empty()
                 && lane.suspensions.is_empty())
             .then_some((
@@ -639,6 +663,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
             slot.lane = Some(Lane {
                 binding,
                 phase: LanePhase::Idle,
+                dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
             });
@@ -663,6 +688,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
             lane: Some(Lane {
                 binding,
                 phase: LanePhase::Idle,
+                dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
             }),
@@ -679,6 +705,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         let slot = &mut self.slots[handle.index as usize];
         let lane = slot.lane.as_ref().ok_or(LaneError::NotFound)?;
         if lane.phase != LanePhase::Idle
+            || lane.dispatch.is_some()
             || !lane.external_tokens.is_empty()
             || !lane.suspensions.is_empty()
         {
@@ -693,6 +720,23 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
 
     pub fn phase(&self, handle: LaneHandle) -> Result<LanePhase, LaneError> {
         Ok(self.lane(handle)?.phase)
+    }
+
+    /// Return the current job in either its running or suspended phase. Idle lanes have no job;
+    /// stale lane generations never recover the identity of a replacement lane.
+    pub fn active_dispatch_identity(
+        &self,
+        handle: LaneHandle,
+    ) -> Result<Option<LaneDispatchIdentity>, LaneError> {
+        let lane = self.lane(handle)?;
+        if lane.phase == LanePhase::Idle {
+            return Ok(None);
+        }
+        lane.dispatch.map(Some).ok_or(LaneError::InvalidPhase)
+    }
+
+    pub fn is_dispatch_identity_active(&self, identity: LaneDispatchIdentity) -> bool {
+        self.active_dispatch_identity(identity.lane) == Ok(Some(identity))
     }
 
     pub fn suspension_count(&self, handle: LaneHandle) -> Result<usize, LaneError> {
@@ -764,17 +808,40 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         handle: LaneHandle,
         reply_object: u64,
     ) -> Result<(), LaneError> {
+        self.begin_dispatch_with_counter(handle, reply_object, &NEXT_DISPATCH_EPOCH)
+    }
+
+    fn begin_dispatch_with_counter(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        counter: &AtomicU64,
+    ) -> Result<(), LaneError> {
         if self.running.is_some() {
             return Err(LaneError::Busy);
         }
         self.validate(handle, reply_object)?;
         let lane = self.lane_mut(handle)?;
         if lane.phase != LanePhase::Idle
+            || lane.dispatch.is_some()
             || !lane.external_tokens.is_empty()
             || !lane.suspensions.is_empty()
         {
             return Err(LaneError::InvalidPhase);
         }
+        let epoch = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                if next == 0 {
+                    None
+                } else {
+                    next.checked_add(1)
+                }
+            })
+            .map_err(|_| LaneError::NoCapacity)?;
+        lane.dispatch = Some(LaneDispatchIdentity {
+            lane: handle,
+            epoch,
+        });
         lane.phase = LanePhase::Running;
         self.running = Some(handle);
         Ok(())
@@ -791,6 +858,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
             return Err(LaneError::InvalidPhase);
         }
         lane.phase = LanePhase::Idle;
+        lane.dispatch = None;
         self.running = None;
         Ok(())
     }
@@ -874,6 +942,9 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         } else {
             LanePhase::Suspended
         };
+        if lane.phase == LanePhase::Idle {
+            lane.dispatch = None;
+        }
         self.running = None;
         Ok(())
     }
@@ -1239,6 +1310,9 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         } else {
             LanePhase::Suspended
         };
+        if lane.phase == LanePhase::Idle {
+            lane.dispatch = None;
+        }
         self.running = None;
         Ok(completed)
     }
@@ -1292,10 +1366,16 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         } else {
             LanePhase::Suspended
         };
+        if lane.phase == LanePhase::Idle {
+            lane.dispatch = None;
+        }
         self.running = None;
         Ok(completed)
     }
 }
+
+#[cfg(test)]
+mod dispatch_identity_tests;
 
 #[cfg(test)]
 mod tests {
