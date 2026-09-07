@@ -27,6 +27,7 @@ pub mod data_section;
 pub mod image_section;
 pub mod process_retirement;
 mod private_backing;
+pub mod retained_alias;
 mod runtime_section;
 pub mod section_scratch;
 mod working_set;

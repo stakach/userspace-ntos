@@ -130,6 +130,7 @@ pub(super) fn rearm_section_alias(
     context: Option<ExecLoopCtx>,
 ) -> Result<(), u32> {
     unsafe {
+        crate::hosted_thread_memory_access(alias.pi as u64, alias.page, 4096)?;
         // An attachment can outlive client residency (or retain the pre-COW frame).
         crate::win32k_glue::detach_attached_client_page(alias.pi as u64, alias.page)?;
         let Some(record) = csrss_frame_get_exact_record(alias.pi as u64, alias.page) else {

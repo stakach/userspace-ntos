@@ -9,6 +9,9 @@ use crate::thread_slot::{RuntimeIdentity, ThreadRuntimeSlot};
 #[path = "thread_memory_mutation_tests.rs"]
 mod mutations;
 
+#[path = "thread_memory_writeback_tests.rs"]
+mod writeback;
+
 struct Runtime {
     binding: ThreadBinding<()>,
     publication: ThreadPublicationSlot,

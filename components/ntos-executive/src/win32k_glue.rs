@@ -5253,12 +5253,16 @@ pub(crate) unsafe fn ensure_w32_client_paging(page: u64, w_pml4: u64) -> bool {
 }
 
 unsafe fn w32_map_frame_copy_checked(
+    pi: u64,
     frame: u64,
     page: u64,
     rights: u64,
     w_pml4: u64,
     what: &[u8],
 ) -> u64 {
+    if w32_admit_client_page(pi, page).is_err() {
+        return 0;
+    }
     if !ensure_w32_client_paging(page, w_pml4) {
         return 0;
     }
@@ -5353,6 +5357,9 @@ unsafe fn w32_map_registered_client_frame_copy_checked(
     w_pml4: u64,
     what: &[u8],
 ) -> u64 {
+    if w32_admit_client_page(pi, page).is_err() {
+        return 0;
+    }
     if !ensure_w32_client_paging(page, w_pml4) {
         return 0;
     }
@@ -5458,10 +5465,9 @@ pub(crate) static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(0xFFFF_FFFF);
 /// every later forward arm replaces it with the exact routed client identity.
 pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 
-#[derive(Clone, Copy)]
 struct W32AttachMapping {
     page: u64,
-    slot: u64,
+    alias: nt_memory_manager::retained_alias::RetainedAlias,
     rights: u64,
 }
 
@@ -5482,8 +5488,22 @@ pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
         .is_some_and(|mappings| {
             mappings
                 .iter()
-                .any(|mapping| mapping.page == page && mapping.slot != 0)
+                .any(|mapping| mapping.page == page && mapping.alias.is_live())
         })
+}
+
+/// Ordinary attachment admission is separate from exact-owner cleanup authority.
+unsafe fn w32_admit_client_page(pi: u64, page: u64) -> Result<(), u32> {
+    if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
+        return Err(nt_fs::STATUS_INVALID_HANDLE);
+    }
+    crate::hosted_thread_memory_access(pi, page, 4096)?;
+    if (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS)).as_ref().is_some_and(|mappings| {
+        mappings.iter().any(|mapping| mapping.page == page && !mapping.alias.is_live())
+    }) {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
+    Ok(())
 }
 
 /// Re-point `page`'s attach record at a NEW copy-cap `slot` with `rights` (the copy-on-write and
@@ -5498,12 +5518,15 @@ pub(crate) unsafe fn w32_attach_replace_mapping(
     let mut i = 0usize;
     while i < mappings.len() {
         if mappings[i].page == page {
-            let old = mappings[i].slot;
+            if !mappings[i].alias.is_live() {
+                return (0, 0, false);
+            }
+            let old = mappings[i].alias.cap();
             let old_rights = mappings[i].rights;
             if slot == 0 {
                 mappings.swap_remove(i);
             } else {
-                mappings[i].slot = slot;
+                mappings[i].alias = nt_memory_manager::retained_alias::RetainedAlias::new(slot).unwrap();
                 mappings[i].rights = rights;
             }
             return (old, old_rights, true);
@@ -5537,6 +5560,9 @@ pub(crate) unsafe fn w32_attach_remove(page: u64) -> bool {
     let mut i = 0usize;
     while i < mappings.len() {
         if mappings[i].page == page {
+            if !mappings[i].alias.is_live() {
+                return false;
+            }
             mappings.swap_remove(i);
             return true;
         }
@@ -5545,20 +5571,28 @@ pub(crate) unsafe fn w32_attach_remove(page: u64) -> bool {
     false
 }
 
+struct W32AliasRetirementIo;
+
+impl nt_memory_manager::retained_alias::AliasRetirementIo for W32AliasRetirementIo {
+    fn unmap(&mut self, cap: u64) -> Result<(), u32> {
+        if unsafe { page_unmap_r(cap) } == 0 { Ok(()) }
+        else { Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES) }
+    }
+
+    fn delete(&mut self, cap: u64) -> Result<(), u32> {
+        if unsafe { cnode_delete_recycle_r(cap) } == 0 { Ok(()) }
+        else { Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES) }
+    }
+}
+
 /// Revoke only the selected process's attachment. A writeback or COW transition must not leave
 /// win32k holding write access to the old shared frame, or detach another process's colliding VA.
 pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(), u32> {
     if W32_ATTACHED_PI.load(Ordering::Acquire) != pi { return Ok(()); }
-    let mapping = (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS)).as_ref()
-        .and_then(|mappings| mappings.iter().find(|mapping| mapping.page == page)).copied();
-    let Some(mapping) = mapping else { return Ok(()); };
-    if page_unmap_r(mapping.slot) != 0 {
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    if cnode_delete_recycle_r(mapping.slot) != 0 {
-        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
-    }
-    let _ = w32_attach_remove(page);
+    let mappings = w32_attach_mappings_mut();
+    let Some(index) = mappings.iter().position(|mapping| mapping.page == page) else { return Ok(()); };
+    mappings[index].alias.retire(&mut W32AliasRetirementIo)?;
+    mappings.swap_remove(index);
     Ok(())
 }
 
@@ -5589,6 +5623,9 @@ pub(crate) unsafe fn detach_attached_client_process(pi: u64) -> Result<(), u32> 
 /// The first few are reported with the faulting IP and its win32k RVA plus a stack backtrace: that
 /// is the measurement which names the writer, and it is why this is a diagnosis rather than a guess.
 pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) -> bool {
+    if w32_admit_client_page(pi, page).is_err() {
+        return false;
+    }
     let seen = crate::W32_TEB_TAIL_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
     let rva = ip.wrapping_sub(win32k_subsystem::WIN32K_CODE_VA);
     let _ = crate::W32_TEB_TAIL_FIRST_WRITER_RVA.compare_exchange(
@@ -5620,7 +5657,7 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
             return false;
         }
     }
-    let cc = w32_map_frame_copy_checked(shadow, page, RW_NX, w_pml4, b"teb-tail COW");
+    let cc = w32_map_frame_copy_checked(pi, shadow, page, RW_NX, w_pml4, b"teb-tail COW");
     if cc == 0 {
         if old != 0 {
             let restore = page_map_r(old, page, old_rights, w_pml4);
@@ -5671,13 +5708,15 @@ pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, w_pml4: u64, ip: u64) 
 /// Record that `page` is now mapped into win32k via copy-cap `slot` (for a later detach Unmap).
 pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64, rights: u64) -> bool {
     if slot == 0 {
-        let _ = w32_attach_remove(page);
-        return true;
+        return w32_attach_remove(page);
     }
     let mappings = w32_attach_mappings_mut();
     for mapping in mappings.iter_mut() {
         if mapping.page == page {
-            mapping.slot = slot;
+            if !mapping.alias.is_live() {
+                return false;
+            }
+            mapping.alias = nt_memory_manager::retained_alias::RetainedAlias::new(slot).unwrap();
             mapping.rights = rights;
             return true;
         }
@@ -5689,7 +5728,11 @@ pub(crate) unsafe fn w32_attach_record(page: u64, slot: u64, rights: u64) -> boo
         print_str(b"\n");
         return false;
     }
-    mappings.push(W32AttachMapping { page, slot, rights });
+    mappings.push(W32AttachMapping {
+        page,
+        alias: nt_memory_manager::retained_alias::RetainedAlias::new(slot).unwrap(),
+        rights,
+    });
     true
 }
 
@@ -5707,6 +5750,9 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
     pi: u64,
     rights: u64,
 ) -> bool {
+    if w32_admit_client_page(pi, page).is_err() {
+        return false;
+    }
     let w_pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
     if w_pml4 == 0 {
         return false;
@@ -5799,30 +5845,30 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
 /// client is currently attached, DETACH it: Unmap all its leaf client pages from win32k so the new
 /// client's colliding VAs re-fault to THIS client's frames. Idempotent when `pi` is already attached.
 pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
-    let prev = W32_ATTACHED_PI.load(Ordering::Relaxed);
+    let prev = W32_ATTACHED_PI.load(Ordering::Acquire);
+    // Check the entire old window before reuse or the first destructive detach. An excluded
+    // alias may otherwise remain accessible without a new page fault.
+    let mappings = (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS)).as_ref();
+    if mappings.is_some_and(|mappings| mappings.iter().any(|mapping| {
+        crate::hosted_thread_memory_access(prev, mapping.page, 4096).is_err()
+    })) {
+        return false;
+    }
+    let detached = mappings.map_or(0, |mappings| mappings.len());
     if prev == pi {
+        loop {
+            let retiring = (&*core::ptr::addr_of!(W32_ATTACH_MAPPINGS)).as_ref()
+                .and_then(|mappings| mappings.iter().find(|mapping| !mapping.alias.is_live()))
+                .map(|mapping| mapping.page);
+            let Some(page) = retiring else { break; };
+            if detach_attached_client_page(pi, page).is_err() {
+                return false;
+            }
+        }
         return true;
     }
-    let mappings = w32_attach_mappings_mut();
-    let mut detached = 0usize;
-    while !mappings.is_empty() {
-        // Unmap win32k's mapping of the previous client's page (arch Unmap uses this cap's win32k
-        // asid → csrss/winlogon's own VSpace mapping is untouched), then delete the transient copy
-        // cap so the executive's root-slot allocator can recycle it.
-        let mapping = mappings[mappings.len() - 1];
-        let error = page_unmap_r(mapping.slot);
-        if error != 0 {
-            print_str(b"[w32attach] page_unmap failed page=0x");
-            print_hex((mapping.page >> 32) as u32);
-            print_hex(mapping.page as u32);
-            print_str(b" error=");
-            print_u64(error);
-            print_str(b"\n");
-            return false;
-        }
-        let _ = cnode_delete_recycle_r(mapping.slot);
-        let _ = mappings.pop();
-        detached += 1;
+    if detach_attached_client_process(prev).is_err() {
+        return false;
     }
     print_str(b"[w32attach] client ");
     print_u64(prev);
@@ -5831,7 +5877,7 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
     print_str(b" (detached ");
     print_u64(detached as u64);
     print_str(b" client pages)\n");
-    W32_ATTACHED_PI.store(pi, Ordering::Relaxed);
+    W32_ATTACHED_PI.store(pi, Ordering::Release);
     true
 }
 /// Share GUI client `pi`'s frame for `page` into win32k's VSpace at the SAME VA (identity) so
@@ -5845,12 +5891,10 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(
     w_pml4: u64,
     write: bool,
 ) -> Result<bool, u32> {
+    w32_admit_client_page(pi, page)?;
     if crate::process_committed_mapping_basic_information(pi, page)
         .is_some_and(|info| info.type_ == nt_address_space::MEM_MAPPED)
     {
-        if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
-            return Err(nt_fs::STATUS_INVALID_HANDLE);
-        }
         // Admission can promote COW. Never reuse the old attachment's copy cap afterward.
         detach_attached_client_page(pi, page)?;
         let rights = crate::service_sec_image::service_admit_section_alias(pi, page, write, Some(generation))?
@@ -5885,7 +5929,7 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(
         if fr == 0 {
             return Ok(false);
         }
-        w32_map_frame_copy_checked(fr, page, rights, w_pml4, b"attach")
+        w32_map_frame_copy_checked(pi, fr, page, rights, w_pml4, b"attach")
     };
     if cc == 0 {
         return Ok(false);

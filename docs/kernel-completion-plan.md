@@ -148,8 +148,12 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Guard direct fault/stack-growth/guard/prefill dispatch and effective native VM mutation ranges,
   including whole-allocation identity changes on partial release and exact debugger reporter TIDs
   (tranche 65, host/build; attachment/journal completion and user-mode SEH delivery remain open).
+- [x] Guard win32k client-window reuse/publication and section writeback aliases; retain checked
+  detach progress through unmap/delete failures and reuse it for client switches
+  (tranche 66, host/build; construction/remap/prefetch ownership and native cleanup remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Next close attachment/publication and remaining
+  emptiness as a complete execution-quiescence proof. Next close attachment construction/remap,
+  prefetch publication and remaining
   non-ingress routing bypasses, retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover unregistered/early spawn
@@ -26968,6 +26972,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     kernel-completion gap, not a claimed fallback implementation. Main/early spawn, ordinary
     termination resource-release failures and handler-owned handoffs remain open. No live pending
     cleanup or desktop proof is claimed; 33 unresolved win32k code imports still block the full gate.
+
+    B3 attachment and writeback exclusion tranche 66 (2026-09-07, host/build green):
+    Win32k client-page admission now requires the exact attached PI, rejects retained pending-memory
+    geometry and refuses retiring alias records before mapped-page fast success, paging allocation,
+    capability copying, section alias detachment, TEB-tail shadow acquisition or rights remapping.
+    Raw frame-copy publication now receives an explicit PI instead of relying on implicit attachment
+    state. Client attach checks the complete previous window before same-client reuse or the first
+    switch detach; an excluded mapping cannot bypass admission merely by avoiding another fault.
+
+    `nt-memory-manager::retained_alias` adds a non-cloneable mapped-capability retirement owner.
+    Retirement removes ordinary live visibility before its first backend call, retains the exact cap
+    on failure, and remembers successful unmapping so a failed delete retries only deletion. The
+    native attachment table owns these records. Checked page detach removes a row only after final
+    deletion; client switching now uses that same process-detach path instead of its old unchecked
+    delete/pop loop. Failed switches retain the old PI. Same-client attach retries retiring rows
+    before reporting success, and old record/remove/replace helpers cannot overwrite those rows.
+
+    Section writeback alias rearming checks pending-memory admission before attachment detach,
+    frame-registry lookup or early success. The existing shared control-area writeback protocol
+    already rearms all aliases before any file write, so refusal retains the original dirty ticket
+    without introducing another writeback state machine. Cross-layer tests compose real pending
+    runtime slots and `GenericSectionTable`: a later alias in another process refuses view-wide and
+    file-wide flushes after an earlier alias is rearmed; neither writes nor persistence occur, and
+    dirty tickets survive failed and completed-but-not-retired cleanup. Exact owner retirement then
+    allows the same flush to finish. An unrelated pending process does not block writeback.
+
+    Validation: four new alias lifecycle tests and three cross-layer writeback tests pass. The
+    serialized nine-crate suite passes 1,068 tests, including 250 `nt-memory-manager` and 171
+    `nt-user-host` unit/integration tests; log: `.tmp/test-thread-alias-20260907.log`. The executive
+    build passes at the unchanged 262-warning baseline and stages rootserver/hive;
+    log: `.tmp/build-thread-alias-20260907.log`. Two read-only agents reviewed alias ownership,
+    admission ordering and writeback coverage; root alone ran the tests and build.
+
+    Review adjustment: checked detach is not a complete attachment construction transaction.
+    Mapping-before-record-allocation and COW/remap remove-before-fallible-operation paths still need
+    retained ownership and checked rollback. The legacy thread-release helper also ignores failed
+    attachment replacement and can continue toward backing release; propagate failure through a
+    durable resource owner rather than merely logging or returning a dropped local capability.
+    Next replace the prefetch registry's independently selected prepare/put slots and unchecked
+    construction cleanup with one exact reserved/published/retiring owner; retiring frames must not
+    remain available through ordinary frame lookup. Retain complete external-alias journals and
+    checked mirrored-reference clearing before activating native `begin_pending`. Main/early spawn,
+    ordinary termination, handler-owned handoffs and real user-mode SEH remain open. This checkpoint
+    does not claim live pending cleanup or desktop proof; 33 unresolved win32k code imports still
+    block the complete gate.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before
