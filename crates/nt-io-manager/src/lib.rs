@@ -25,6 +25,7 @@ mod close;
 mod complete;
 mod completion_unwind;
 mod device;
+mod device_reference;
 mod device_control;
 mod device_property_transfer;
 mod directory_control;
@@ -71,6 +72,7 @@ pub use completion_unwind::{
     CompletionUnwindFrame,
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
+pub use device_reference::DeviceReference;
 pub use device_property_transfer::{
     HostedDevicePropertyOwner, HostedDevicePropertyPull, HostedDevicePropertyTransferError,
     HostedDevicePropertyTransferTable,
@@ -200,6 +202,7 @@ pub(crate) const fn is_create_major(major: u8) -> bool {
 pub struct IoManager<P> {
     drivers: GenStore<DriverId, DriverRecord>,
     devices: GenStore<DeviceId, DeviceRecord>,
+    device_references: device_reference::DeviceReferenceStore,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
     hosted_domains: GenStore<HostedDomainId, HostedDomainRecord>,
@@ -219,6 +222,7 @@ impl<P> IoManager<P> {
         Self {
             drivers: GenStore::new(),
             devices: GenStore::new(),
+            device_references: device_reference::DeviceReferenceStore::default(),
             files: GenStore::new(),
             irps: GenStore::new(),
             hosted_domains: GenStore::new(),
@@ -264,6 +268,9 @@ impl<P> IoManager<P> {
         self.drivers.get_mut(id)
     }
     pub fn remove_driver(&mut self, id: DriverId) -> Option<DriverRecord> {
+        if self.driver_has_device_references(id) {
+            return None;
+        }
         self.drivers.remove(id)
     }
     pub fn driver_count(&self) -> usize {
@@ -306,6 +313,9 @@ impl<P> IoManager<P> {
         }
         if self.driver_has_live_irp(driver) {
             return Err(NtStatus::DEVICE_BUSY);
+        }
+        if self.driver_has_device_references(driver) {
+            return Err(NtStatus::DELETE_PENDING);
         }
         if self.devices_of(driver).iter().any(|device_id| {
             self.device(*device_id).is_some_and(|device| {
@@ -354,6 +364,9 @@ impl<P> IoManager<P> {
         if self.driver_has_live_irp(driver) {
             return Err(NtStatus::DEVICE_BUSY);
         }
+        if self.driver_has_device_references(driver) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         if self.devices_of(driver).iter().any(|device_id| {
             self.device(*device_id).is_some_and(|device| {
                 device.attached_to.is_some()
@@ -392,7 +405,7 @@ impl<P> IoManager<P> {
         if self.driver_has_live_irp(driver) {
             return Err(NtStatus::DEVICE_BUSY);
         }
-        if !self.devices_of(driver).is_empty() {
+        if !self.devices_of(driver).is_empty() || self.driver_has_device_references(driver) {
             return Err(NtStatus::DELETE_PENDING);
         }
         Ok(())
@@ -436,6 +449,9 @@ impl<P> IoManager<P> {
         self.devices.get_mut(id)
     }
     pub(crate) fn remove_device(&mut self, id: DeviceId) -> Option<DeviceRecord> {
+        if self.device_reference_count(id) != 0 {
+            return None;
+        }
         let record = self.devices.remove(id)?;
         if let Some(driver) = self.drivers.get_mut(record.driver_id) {
             driver.devices.retain(|device| *device != id);
@@ -807,6 +823,7 @@ impl<P> IoManager<P> {
         if self.device_has_live_files(id)
             || self.device_has_live_irps(id)
             || self.has_upper_attachment(id)
+            || self.device_reference_count(id) != 0
         {
             return Err(NtStatus::DELETE_PENDING);
         }

@@ -276,6 +276,11 @@ below are historical baselines, not acceptance of the current provider cutover.
   collision linkage and low-memory delivery still require their physical-lane implementation.
 - [x] Add canonical native Ps close semantics over the shared table scopes (tranche 109; host core). Preserve
   protected-handle status/bugcheck behavior; do not probe alternate object tables after failure.
+- [~] Route win32k IoGetDeviceProperty through canonical PnP/configuration snapshots and an
+  authenticated dynamic I/O consumer domain (tranche 110). Share transport policy, not FSD-private
+  buffers or driver authority; retain each physical lane's reply/publication ownership.
+- [x] Add counted canonical Device references for retained consumer projections (tranche 111).
+  Pointer bindings alone are not references; protect both normal and raw device/driver removal.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
@@ -28832,6 +28837,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     tables, non-Ps/pseudo/malformed inputs, invisible publications, stale/dead callers and terminated
     targets. PM tests pass 210/210 in `.tmp/test-native-ps-close-20260908.log`. Existing native Nt/Zw
     close wrappers are not switched independently of the whole Ps/Se/USER handle migration.
+
+    B3 native win32k device properties tranche 110 (2026-09-08, in progress):
+
+    Reuse the real driver property snapshot/retained-transfer core with explicit caller identity,
+    canonical DeviceId, reply buffer and allocator, instead of copying FSD globals into win32k.
+    Register an independent win32k I/O consumer domain tied to the exact provider catalog identity
+    and generation; authenticate actual physical channel, shared mapping, PML4 and reply owner.
+    Bind each dynamically published device projection in that domain with a real lifetime owner.
+    Configuration properties resolve the canonical devnode's Enum instance, not a root-bus-only
+    lookup fallback. No fake DriverInstance, global address scan or inherited video-driver authority.
+
+    Re-entry review: the existing FSD domain-global reply spin lock cannot be used across win32k
+    IPC. A nested physical lane could hold up the only path that resumes its outer lock owner.
+    Give property transfer state and reply bytes exact physical-lane ownership; DEVICE_NOT_READY
+    from a domain-wide busy test is not a substitute for correct nested calls. Provider retirement
+    must drain transfer owners before removing projections/references and the consumer domain.
+
+    The current video bridge exposes FDO/file projections, not genuine PDO relations. Do not invent
+    a PDO or reinterpret an FDO as one to pass a query: physical properties require the canonical
+    devnode-for-PDO relation. Genuine relation production remains part of the IRP-family cutover.
+    IoBuildSynchronousFsdRequest/IoBuildDeviceIoControlRequest/IofCallDriver must share canonical IRP
+    ownership, cross-provider dispatch and real completion/Event/IOSB delivery. Synchronous PnP
+    invalidation must wait for its exact completed sequence, not return success when merely queued.
+    IoOpenDeviceRegistryKey also needs real key-type/access semantics; the old driver wrapper drops
+    both and is not a reusable completed implementation.
+
+    B3 retained canonical Device references tranche 111 (2026-09-08, host core complete):
+
+    Add a non-Clone reference owner over the actual IoManager DeviceId, with checked count/manager
+    identity and explicit release that retains failures. Keep counts manager-private so replacing
+    a public DeviceRecord cannot reset them. References survive consumer-domain unbinding but block
+    device deletion and driver destruction, including raw removal APIs. Bindings remain identity
+    mappings only; stale bindings cannot mint new references to a removed/reused device.
+
+    Implemented DeviceReference with private checked manager identity and per-device counts. New
+    acquisition rejects pending deletion/unload; checked release survives domain removal, retains
+    ownership on failure and cannot release through another manager or consume another reference.
+    Deletion, raw removal and all driver-unload stages respect retained ownership. Fifteen focused
+    regressions cover these paths, default/new managers, counter exhaustion and public record
+    replacement. All 270 I/O-manager tests and one compile-fail ownership test pass in
+    `.tmp/test-device-reference-20260908.log`. Native projection ownership is the ongoing tranche
+    110 integration; this checkpoint alone does not establish provider retirement or desktop boot.
+
+    The rebuilt ntdll and complete DLL verifier also pass in
+    `.tmp/build-ntdll-exception-ownership-20260908.log`. The DLL has not yet been used in a new
+    desktop boot; strict native import completion remains a prerequisite.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
