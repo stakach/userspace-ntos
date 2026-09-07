@@ -18,6 +18,7 @@ mod services;
 pub mod sched_context;
 pub mod slot_recycle;
 pub mod thread_binding;
+pub mod thread_alias_journal;
 pub mod thread_construction;
 pub mod thread_endpoint;
 pub mod thread_publication;

@@ -192,6 +192,9 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Separate alias deletion from checked recycling, retain failed-copy/failed-retype empty slots,
   and migrate win32k attachment and prefetch backends off combined delete/recycle operations
   (tranche 80, host/build; pending-thread journal activation remains open).
+- [x] Bind external win32k mapping claims to exact pending attempts, block ordinary alias mutation,
+  and host-test phase-preserving journal retirement without duplicating mapping release authority
+  (tranche 81; native claims active, destructive retirement remains disabled).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -200,8 +203,9 @@ below are historical baselines, not acceptance of the current provider cutover.
   root-slot publication is available for retained SC cleanup and alias/prefetch retirement, including
   a strict zero-retype-accounting path for copied/failed slots. Failed-memory-slot ownership now
   moves into the sealed actor independently of immutable coverage. External aliases retain distinct
-  deletion/recycle phases. Next bind their complete cleanup journals to the pending attempt and
-  implement checked native frame recycling
+  deletion/recycle phases. Win32k attachment journals now claim their exact pending attempt after
+  conflict validation; direct detach and attachment switches cannot bypass them. Complete the
+  remaining external journals and implement checked native frame recycling
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
@@ -27707,6 +27711,51 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     live failure validation remain open. Legacy combined helpers still serve unmigrated callers;
     migrate their phase ownership before changing those helpers globally. No QEMU/desktop proof is
     claimed; the recorded 33 unresolved win32k imports remain the full desktop-gate blocker.
+
+    B3 exact-attempt external alias journals tranche 81 (2026-09-07):
+    Added the host-testable ThreadAliasJournal and ThreadAliasMapping contracts in nt-user-host.
+    Mapping rows retain the sole AliasTransition release authority; journals retain immutable
+    original coverage, exact rollback identity and per-page completion only. Preparation allocates
+    before effects and rejects duplicate pages/shared capabilities. Claim validates the full set
+    before publishing any ownership pin. Another attempt, or even a separately prepared journal
+    for the same attempt, cannot steal those pins. Claimed rows expose no ordinary live mapping
+    and reject replacement, remapping, recovery and independent retirement, including empty rows.
+
+    Native failed-construction reconciliation retains this journal in its durable OnceCell and
+    claims it only after private memory, registry and mechanism capability checks succeed. Removed
+    the old independent ThreadAliasSnapshot implementation and native unguarded Mapping fields.
+    Direct page detach now checks pending memory exclusions. Whole-process detach and attachment
+    changes preflight every mapping before any effects, including claims and pending exclusions.
+    Diagnostics distinguish prepared-and-claimed state from completed destructive cleanup.
+
+    The host retirement driver follows the actual mapping's retained unmap/delete/recycle phases.
+    It finds rows by page, not saved Vec indices; successful entries are acknowledged and removed
+    without allocation, while failures preserve their mapping, claim and exact cleanup phase.
+    Retrying after partial completion considers only currently retained capabilities, allowing a
+    recycled numeric slot to be legitimately reused outside the protected geometry. Immutable
+    original capabilities remain provenance, not an alternate release list.
+
+    Validation: 12 unit tests cover all-or-nothing claims, changed coverage/snapshots, duplicate
+    pages, cross-geometry cap collisions, foreign attempts/attachments, same-attempt claim theft,
+    ordinary-operation rejection, each backend failure, swap-remove progress, recycled-slot reuse,
+    pending deleted-slot collisions, empty coverage and failed-copy recycle-only cleanup. Two
+    construction integration tests exercise preparation OOM with retained runtime protection and
+    allocation-free claim/revalidation/retirement. The serialized nine-crate suite passes 1,214
+    tests (286 in nt-memory-manager; 279 in nt-user-host: 244 unit, 3 existing integration and 32
+    construction integration). Log: `.tmp/test-external-alias-journal-20260907.log`.
+    The subsequent executive build passes with the unchanged 262-warning baseline; log:
+    `.tmp/build-external-alias-journal-20260907.log`. A read-only agent reviewed the host/native
+    boundary; only root ran builds and tests, sequentially.
+
+    Review adjustment: native claims are active; native journal retirement is intentionally not.
+    Complete prefetch/provider/temporary external coverage and exclusions, checked frame free-list
+    admission, and clearing of stale native references before allocator reuse. Then connect the
+    sealed retirement actor and registry transfer in their complete retained backend. Do not reuse
+    the current pre-effect native reconciliation unchanged after retirement starts: original cap
+    numbers can have new owners after recycling, so retry checks must use current retained phases.
+    Terminal commit still waits for every owner. Ordinary termination, first-resume failure, other
+    launch families and live failure validation remain open. No QEMU/desktop proof is claimed;
+    the recorded 33 unresolved win32k imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

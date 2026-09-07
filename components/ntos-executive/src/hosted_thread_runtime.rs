@@ -10,7 +10,7 @@ pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
-    alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasSnapshot>,
+    alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasCleanup>,
 }
 
 impl HostedThreadRuntimeOwner {
@@ -288,8 +288,8 @@ impl HostedThreadRuntimeTable {
         }
     }
 
-    /// Read-only preparation is attached through single-assignment cells only after exact pending
-    /// admission. No mutable runtime projection or registry ownership transfer is exposed.
+    /// Prepare immutable coverage after exact pending admission, then claim external aliases only
+    /// after all ownership checks pass. No mutable runtime projection or registry transfer escapes.
     pub(crate) unsafe fn reconcile_failed_spawn(
         &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
     ) -> Result<(), ThreadReconciliationError> {
@@ -318,13 +318,13 @@ impl HostedThreadRuntimeTable {
             Some(aliases) => aliases,
             None => {
                 let layout = owner.resources.layout().ok_or(ThreadReconciliationError::OwnerChanged)?;
-                let aliases = win32k_glue::ThreadAliasSnapshot::capture(owner.pi as u64, layout)
+                let aliases = win32k_glue::ThreadAliasCleanup::prepare(id, layout)
                     .map_err(ThreadReconciliationError::Aliases)?;
                 assert!(owner.alias_preparation.set(aliases).is_ok());
                 owner.alias_preparation.get().expect("retained alias preparation")
             }
         };
-        aliases.revalidate().map_err(ThreadReconciliationError::Aliases)?;
+        aliases.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
         for cap in aliases.capabilities() {
             if snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
                 || owner.memory_coverage.empty_slot() == Some(cap)
@@ -335,7 +335,7 @@ impl HostedThreadRuntimeTable {
                 return Err(ThreadReconciliationError::OwnershipConflict);
             }
         }
-        Ok(())
+        aliases.claim(id).map_err(ThreadReconciliationError::Aliases)
     }
 
     pub(crate) fn commit_spawn(

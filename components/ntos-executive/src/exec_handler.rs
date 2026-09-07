@@ -9752,7 +9752,7 @@ impl ExecNtHandler {
                 print_u64(id.identity().tid);
                 print_str(b" snapshot=");
                 print_str(match &result {
-                    Ok(()) => b"prepared; cleanup remains pending",
+                    Ok(()) => b"prepared, aliases claimed; cleanup remains pending",
                     Err(ThreadReconciliationError::OwnerChanged) => b"owner changed; retained",
                     Err(ThreadReconciliationError::OwnershipConflict) => b"ownership conflict; retained",
                     Err(ThreadReconciliationError::Registry(_)) => b"registry unavailable or changed; retained",

@@ -1,22 +1,18 @@
 //! One shared win32k client window with retained per-page mapping transactions.
 use super::*;
-use nt_memory_manager::alias_transition::{AliasTransition, AliasTransitionIo};
+use nt_memory_manager::alias_transition::AliasTransitionIo;
 use nt_memory_manager::retained_alias::AliasRetirementIo;
+use nt_user_host::thread_alias_journal::ThreadAliasMapping as Mapping;
 
 pub(crate) static W32_CONNECTED_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static W32_ATTACHED_PI: AtomicU64 = AtomicU64::new(u32::MAX as u64);
 pub(crate) static W32_CLIENT_PI: AtomicU64 = AtomicU64::new(u64::MAX);
 
-struct Mapping {
-    page: u64,
-    alias: AliasTransition,
-}
-
 static mut MAPPINGS: Vec<Mapping> = Vec::new();
 
 #[path = "win32k_thread_aliases.rs"]
 mod thread_aliases;
-pub(crate) use thread_aliases::ThreadAliasSnapshot;
+pub(crate) use thread_aliases::ThreadAliasCleanup;
 
 fn checked(label: u64) -> Result<(), u32> {
     if label == 0 {
@@ -86,7 +82,7 @@ impl AliasTransitionIo for Backend {
 pub(crate) unsafe fn w32_attach_mapped(page: u64) -> bool {
     (&*core::ptr::addr_of!(MAPPINGS))
         .iter()
-        .any(|mapping| mapping.page == page && mapping.alias.live().is_some())
+        .any(|mapping| mapping.page() == page && mapping.live().is_some())
 }
 
 unsafe fn admit(pi: u64, page: u64) -> Result<(), u32> {
@@ -96,7 +92,7 @@ unsafe fn admit(pi: u64, page: u64) -> Result<(), u32> {
     hosted_thread_memory_access(pi, page, 4096)?;
     if (&*core::ptr::addr_of!(MAPPINGS))
         .iter()
-        .any(|mapping| mapping.page == page && mapping.alias.live().is_none())
+        .any(|mapping| mapping.page() == page && mapping.live().is_none())
     {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -109,25 +105,20 @@ unsafe fn replace(pi: u64, page: u64, source: u64, rights: u64, pml4: u64) -> Re
         return Err(nt_fs::STATUS_INVALID_HANDLE);
     }
     let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
-    let index = match mappings.iter().position(|mapping| mapping.page == page) {
+    let index = match mappings.iter().position(|mapping| mapping.page() == page) {
         Some(index) => index,
         None => {
             mappings
                 .try_reserve(1)
                 .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)?;
             let index = mappings.len();
-            mappings.push(Mapping {
-                page,
-                alias: AliasTransition::empty(),
-            });
+            mappings.push(Mapping::new(page).ok_or(nt_fs::STATUS_INVALID_HANDLE)?);
             index
         }
     };
     // Admission and source selection precede this borrow; the backend never reenters the table.
-    let result = mappings[index]
-        .alias
-        .replace(rights, &mut Backend { page, pml4, source });
-    if mappings[index].alias.is_empty() {
+    let result = mappings[index].replace(rights, &mut Backend { page, pml4, source });
+    if mappings[index].is_empty() {
         mappings.swap_remove(index);
     }
     result
@@ -137,11 +128,12 @@ pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(
     if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
         return Ok(());
     }
+    hosted_thread_memory_access(pi, page, 4096)?;
     let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
-    let Some(index) = mappings.iter().position(|mapping| mapping.page == page) else {
+    let Some(index) = mappings.iter().position(|mapping| mapping.page() == page) else {
         return Ok(());
     };
-    mappings[index].alias.retire(&mut Backend {
+    mappings[index].retire(&mut Backend {
         page,
         pml4: 0,
         source: 0,
@@ -154,10 +146,16 @@ pub(crate) unsafe fn detach_attached_client_process(pi: u64) -> Result<(), u32> 
     if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
         return Ok(());
     }
+    // Preflight the entire attachment before detaching any unrelated page.
+    if (&*core::ptr::addr_of!(MAPPINGS)).iter().any(|mapping| {
+        mapping.is_claimed() || hosted_thread_memory_access(pi, mapping.page(), 4096).is_err()
+    }) {
+        return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+    }
     loop {
         let page = (&*core::ptr::addr_of!(MAPPINGS))
             .last()
-            .map(|mapping| mapping.page);
+            .map(|mapping| mapping.page());
         let Some(page) = page else {
             break;
         };
@@ -170,10 +168,9 @@ pub(crate) unsafe fn detach_attached_client_process(pi: u64) -> Result<(), u32> 
 pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
     let prev = W32_ATTACHED_PI.load(Ordering::Acquire);
     let mappings = &*core::ptr::addr_of!(MAPPINGS);
-    if mappings
-        .iter()
-        .any(|mapping| hosted_thread_memory_access(prev, mapping.page, 4096).is_err())
-    {
+    if mappings.iter().any(|mapping| {
+        mapping.is_claimed() || hosted_thread_memory_access(prev, mapping.page(), 4096).is_err()
+    }) {
         return false;
     }
     let detached = mappings.len();
@@ -181,9 +178,8 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
         let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
         let mut index = 0;
         while index < mappings.len() {
-            let page = mappings[index].page;
+            let page = mappings[index].page();
             if mappings[index]
-                .alias
                 .recover(&mut Backend {
                     page,
                     pml4: WIN32K_HOST_PML4.load(Ordering::Relaxed),
@@ -193,7 +189,7 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
             {
                 return false;
             }
-            if mappings[index].alias.is_empty() {
+            if mappings[index].is_empty() {
                 mappings.swap_remove(index);
             } else {
                 index += 1;
@@ -229,18 +225,16 @@ pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
     }
     let index = (&*core::ptr::addr_of!(MAPPINGS))
         .iter()
-        .position(|mapping| mapping.page == page);
+        .position(|mapping| mapping.page() == page);
     let result = if let Some(index) = index {
-        (&mut *core::ptr::addr_of_mut!(MAPPINGS))[index]
-            .alias
-            .remap(
-                rights,
-                &mut Backend {
-                    page,
-                    pml4,
-                    source: 0,
-                },
-            )
+        (&mut *core::ptr::addr_of_mut!(MAPPINGS))[index].remap(
+            rights,
+            &mut Backend {
+                page,
+                pml4,
+                source: 0,
+            },
+        )
     } else {
         let Some(source) =
             csrss_frame_get_exact_record(pi, page).and_then(|record| record.clone_source_cap())
