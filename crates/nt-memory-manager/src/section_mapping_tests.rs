@@ -7,19 +7,21 @@ struct Io {
     caps: BTreeMap<u64, Option<u64>>,
     copied: Vec<u64>,
     deleted: Vec<u64>,
+    recycled: Vec<u64>,
     fail_copy: Option<u64>,
     fail_map: Option<u64>,
     fail_delete: Option<u64>,
+    fail_recycle: Option<u64>,
 }
 impl SectionScratchIo for Io {
-    fn copy_frame(&mut self, frame: u64) -> Result<u64, u32> {
+    fn copy_frame(&mut self, frame: u64) -> (u64, u32) {
         self.copied.push(frame);
         if self.fail_copy == Some(frame) {
-            return Err(RESOURCES);
+            return (0, RESOURCES);
         }
         self.next += 1;
         assert!(self.caps.insert(self.next, None).is_none());
-        Ok(self.next)
+        (self.next, 0)
     }
     fn map_alias(&mut self, alias: u64, address: u64, _: SectionAliasAccess) -> Result<(), u32> {
         if self.fail_map == Some(alias) {
@@ -35,6 +37,16 @@ impl SectionScratchIo for Io {
         }
         assert!(self.caps.remove(&alias).is_some());
         self.deleted.push(alias);
+        Ok(())
+    }
+    fn recycle_alias_slot(&mut self, slot: u64) -> Result<(), u32> {
+        assert!(!self.caps.contains_key(&slot));
+        assert!(self.deleted.contains(&slot));
+        assert!(!self.recycled.contains(&slot));
+        if self.fail_recycle == Some(slot) {
+            return Err(RESOURCES);
+        }
+        self.recycled.push(slot);
         Ok(())
     }
 }
@@ -74,6 +86,31 @@ fn batch_maps_all_pages_and_resolves_them_until_finish() {
     owner.finish(&mut io).unwrap();
     assert_eq!(io.deleted, [3, 2, 1]);
     assert!(io.caps.is_empty());
+}
+
+#[test]
+fn partial_recycling_keeps_batch_handles_invalid_and_does_not_repeat_deletion() {
+    let mut owner = SectionScratch::new();
+    let mut io = Io::default();
+    let handles = prepare(&mut owner, &mut io, 3);
+    io.fail_recycle = Some(2);
+    assert_eq!(owner.finish(&mut io), Err(RESOURCES));
+    assert_eq!(io.deleted, [3, 2]);
+    assert_eq!(io.recycled, [3]);
+    assert_eq!(owner.entries.len(), 2);
+    assert!(!owner.entries[1].mapped && !owner.entries[1].populated);
+    for handle in handles {
+        assert!(owner
+            .resolve(handle, 0, 1, SectionAliasAccess::ReadOnly)
+            .is_err());
+    }
+    assert_eq!(owner.begin(&mut io), Err(RESOURCES));
+    assert_eq!(io.deleted, [3, 2]);
+    io.fail_recycle = None;
+    owner.begin(&mut io).unwrap();
+    assert_eq!(io.deleted, [3, 2, 1]);
+    assert_eq!(io.recycled, [3, 2, 1]);
+    owner.finish(&mut io).unwrap();
 }
 
 #[test]

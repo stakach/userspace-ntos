@@ -33,6 +33,9 @@ mod frame_recycle;
 #[path = "thread_construction/prefetch_journal.rs"]
 mod prefetch_journal;
 
+#[path = "thread_construction/section_scratch.rs"]
+mod section_scratch;
+
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };

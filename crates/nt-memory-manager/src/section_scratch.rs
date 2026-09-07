@@ -20,17 +20,21 @@ pub struct SectionAliasHandle {
 }
 
 pub trait SectionScratchIo {
-    /// Copy failure must leave no caller-owned slot behind.
-    fn copy_frame(&mut self, frame: u64) -> Result<u64, u32>;
+    /// Transfer any reserved destination, including an allocated-empty slot on copy failure.
+    /// Nonzero status means the returned slot is empty; zero status means a populated copy.
+    fn copy_frame(&mut self, frame: u64) -> (u64, u32);
     fn map_alias(
         &mut self,
         alias: u64,
         address: u64,
         access: SectionAliasAccess,
     ) -> Result<(), u32>;
-    /// Delete the exact cap and its mapping, recycling only its capability slot. An already-revoked
+    /// Delete the exact cap and its mapping without recycling its slot. An already-revoked
     /// (empty) slot still needs acknowledgement. Failed deletion retains both cap and VA ownership.
     fn delete_alias(&mut self, alias: u64) -> Result<(), u32>;
+    /// Publish only this empty copied-cap slot, rejecting unexpected retype-byte ownership.
+    /// Failure must leave allocator ownership unchanged and must not repeat deletion.
+    fn recycle_alias_slot(&mut self, slot: u64) -> Result<(), u32>;
 }
 
 struct Entry {
@@ -38,6 +42,7 @@ struct Entry {
     address: u64,
     access: SectionAliasAccess,
     mapped: bool,
+    populated: bool,
 }
 
 /// Persistent cleanup owner. Dropping it cannot perform backend deletion; it must outlive all
@@ -97,15 +102,21 @@ impl SectionScratch {
             return Err(INVALID_PARAMETER);
         }
         self.entries.try_reserve(1).map_err(|_| RESOURCES)?;
-        let cap = io.copy_frame(frame)?;
-        assert_ne!(cap, 0, "successful frame copy must publish a capability");
+        let (cap, status) = io.copy_frame(frame);
+        if cap == 0 {
+            return Err(if status == 0 { RESOURCES } else { status });
+        }
         let index = self.entries.len();
         self.entries.push(Entry {
             cap,
             address,
             access,
             mapped: false,
+            populated: status == 0,
         });
+        if status != 0 {
+            return Err(status);
+        }
         io.map_alias(cap, address, access)?;
         self.entries[index].mapped = true;
         Ok(SectionAliasHandle {
@@ -149,8 +160,13 @@ impl SectionScratch {
         if self.active {
             return Err(RESOURCES);
         }
-        while let Some(entry) = self.entries.last() {
-            io.delete_alias(entry.cap)?;
+        while let Some(entry) = self.entries.last_mut() {
+            if entry.populated {
+                io.delete_alias(entry.cap)?;
+                entry.populated = false;
+                entry.mapped = false;
+            }
+            io.recycle_alias_slot(entry.cap)?;
             self.entries.pop();
         }
         Ok(())

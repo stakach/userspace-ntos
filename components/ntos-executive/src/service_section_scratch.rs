@@ -24,14 +24,19 @@ impl Drop for ScratchBorrow {
 struct ScratchIo;
 
 impl SectionScratchIo for ScratchIo {
-    fn copy_frame(&mut self, frame: u64) -> Result<u64, u32> {
-        let (alias, error) = unsafe { copy_cap_r(frame) };
-        if error == 0 {
-            Ok(alias)
-        } else {
-            // copy_cap_r recycles its reserved slot on every failed CNode_Copy.
-            Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
-        }
+    fn copy_frame(&mut self, frame: u64) -> (u64, u32) {
+        let Some(alias) = try_alloc_slot() else {
+            return (0, nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
+        };
+        let error = unsafe { copy_cap_into_r(frame, alias) };
+        (
+            alias,
+            if error == 0 {
+                0
+            } else {
+                nt_address_space::STATUS_INSUFFICIENT_RESOURCES
+            },
+        )
     }
 
     fn map_alias(
@@ -54,11 +59,16 @@ impl SectionScratchIo for ScratchIo {
     fn delete_alias(&mut self, alias: u64) -> Result<(), u32> {
         // CNode_Delete finalizes this alias's mapping and TLB entries before clearing its slot.
         // Unlike PageUnmap, it also accepts a slot already emptied by canonical-owner revoke.
-        if unsafe { cnode_delete_recycle_r(alias) } == 0 {
+        if unsafe { cnode_delete_r(alias) } == 0 {
             Ok(())
         } else {
             Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
         }
+    }
+
+    fn recycle_alias_slot(&mut self, slot: u64) -> Result<(), u32> {
+        unsafe { root_slot_recycle::publish_unretyped(slot) }
+            .map_err(|_| nt_address_space::STATUS_INSUFFICIENT_RESOURCES)
     }
 }
 

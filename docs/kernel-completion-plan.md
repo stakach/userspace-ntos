@@ -201,6 +201,8 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Retain full prefetch phase coverage in exact-attempt claim journals and close process-drop
   exclusion bypasses; cross-check win32k/prefetch/private owners before either journal claims rows
   (tranche 83; native prefetch claims active, destructive thread retirement remains disabled).
+- [x] Retain section scratch copy-failure slots and separate deletion from strict recycling through
+  coherent I/O/writeback and frame-retirement barriers (tranche 84; other temporary aliases remain open).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -27861,6 +27863,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     checked publication. Ordinary thread termination, first-resume failure, other launch families
     and live failure validation remain open. No QEMU/desktop proof is claimed; the recorded 33
     unresolved win32k imports remain the full desktop-gate blocker.
+
+    B3 retained section scratch recycling tranche 84 (2026-09-07):
+    SectionScratchIo now transfers any reserved copy destination, including an allocated-empty
+    slot on failure, and separates mapping-finalizing deletion from strict empty-slot recycling.
+    SectionScratch reserves metadata before copying and adopts every nonzero returned slot before
+    returning failure or attempting a map. Null successful copies are refused without mapping.
+    Successful deletion clears populated/mapped state before the recycler runs; failures retain the
+    exact slot and address, with no repeated deletion. Copy-failure empty slots recycle only.
+    Batch handles are invalidated before cleanup, and no new batch starts until retained cleanup
+    completes. Transfer errors and accepted-byte counts retain their established precedence.
+
+    The native durable SECTION_SCRATCH owner now uses explicit slot allocation plus checked
+    copy_cap_into_r, cnode_delete_r, and root_slot_recycle::publish_unretyped. Removed copy_cap_r's
+    hidden failure recycling and combined delete/recycle from this backend. CNode deletion already
+    finalizes the alias mapping and accepts an externally revoked empty slot; no extra unmap or
+    canonical-frame release is inserted. The same backend covers coherent file read/write/resize,
+    ordinary section writeback and prepared multi-page I/O. Existing ScratchBorrow reentry fencing,
+    durable allocation, flush-before-persist and scratch-before-frame/backing retirement remain intact.
+
+    Validation: eight new memory-manager tests cover allocated-empty copy failure, null success,
+    post-delete recycle failure, blocked reuse, status/byte precedence, dirty-batch preservation,
+    clean/uncached checkpoint barriers, canonical-frame retirement barriers and partial batch
+    recycling with invalidated handles. Three integration tests compose SectionScratch with the
+    actual strict SlotRecycleState, proving allocation-free retry after pinned-slot refusal,
+    rejection of unexpected retype accounting without byte release or deletion, and metadata OOM
+    before capability acquisition. The serialized nine-crate suite passes 1,256 tests (307 in
+    nt-memory-manager; 298 in nt-user-host: 256 unit, 3 existing integration and 39 construction
+    integration). The subsequent executive build passes with the unchanged 262-warning baseline. Logs:
+    `.tmp/test-section-scratch-recycling-20260907.log` and
+    `.tmp/build-section-scratch-recycling-20260907.log`. A read-only agent audited the transitive
+    callers and reviewed the implementation; only root ran tests/builds, sequentially.
+
+    Review adjustment: this completes retained slot phases for the existing section scratch owner,
+    not all native temporary-alias ownership or pending-thread journal activation. Next migrate
+    img_spawn::with_recorded_frame_alias: it reuses a fixed pinned temporary cap and ignores both
+    pre-copy and post-access deletion failures. Its ordinary resident-memory read/write callers
+    need retained mapping/cleanup state and explicit failure reporting before that cap or scratch
+    address can be reused. vm_copy_frame_4k and COW inspection helpers still use unowned temporary
+    copies and ignore cleanup failures; preserve their source/destination lifetimes before migration.
+    Provider capability-bank coverage, stale-reference clearing, legacy frame/pagefile cleanup and
+    complete disjoint journal reconciliation remain prerequisites for native thread destruction,
+    registry transfer and final commit. No QEMU/desktop proof is claimed; the recorded 33 unresolved
+    win32k imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

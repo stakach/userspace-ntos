@@ -4,6 +4,7 @@ use alloc::{vec, vec::Vec};
 const COPY_ERROR: u32 = 0xc000_009a;
 const MAP_ERROR: u32 = 0xc000_0018;
 const DELETE_ERROR: u32 = 0xc000_0001;
+const RECYCLE_ERROR: u32 = 0xc000_0008;
 const WRITE_ERROR: u32 = 0xc000_0185;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,30 +22,43 @@ struct Io {
     events: Vec<Event>,
     reserved: Option<u64>,
     mapped: bool,
+    populated: bool,
     copy_error: bool,
+    null_copy: bool,
+    failed_copy_slot: bool,
     map_error: bool,
     delete_error: bool,
+    recycle_error: bool,
+    recycled: Vec<u64>,
     next_alias: u64,
 }
 
 impl SectionScratchIo for Io {
-    fn copy_frame(&mut self, frame: u64) -> Result<u64, u32> {
+    fn copy_frame(&mut self, frame: u64) -> (u64, u32) {
         self.events.push(Event::Copy(frame));
         assert!(
             self.reserved.is_none(),
             "scratch cannot be reacquired before cleanup"
         );
-        if self.copy_error {
-            return Err(COPY_ERROR);
+        if self.null_copy {
+            return (0, 0);
+        }
+        if self.copy_error && !self.failed_copy_slot {
+            return (0, COPY_ERROR);
         }
         self.next_alias += 1;
         self.reserved = Some(self.next_alias);
-        Ok(self.next_alias)
+        self.populated = !self.copy_error;
+        (
+            self.next_alias,
+            if self.copy_error { COPY_ERROR } else { 0 },
+        )
     }
 
     fn map_alias(&mut self, alias: u64, _: u64, _: SectionAliasAccess) -> Result<(), u32> {
         self.events.push(Event::Map(alias));
         assert_eq!(self.reserved, Some(alias));
+        assert!(self.populated);
         assert!(!self.mapped);
         if self.map_error {
             return Err(MAP_ERROR);
@@ -56,10 +70,22 @@ impl SectionScratchIo for Io {
     fn delete_alias(&mut self, alias: u64) -> Result<(), u32> {
         self.events.push(Event::Delete(alias));
         assert_eq!(self.reserved, Some(alias));
+        assert!(self.populated, "never repeat acknowledged deletion");
         if self.delete_error {
             return Err(DELETE_ERROR);
         }
         self.mapped = false;
+        self.populated = false;
+        Ok(())
+    }
+
+    fn recycle_alias_slot(&mut self, alias: u64) -> Result<(), u32> {
+        assert_eq!(self.reserved, Some(alias));
+        assert!(!self.populated && !self.mapped);
+        self.recycled.push(alias);
+        if self.recycle_error {
+            return Err(RECYCLE_ERROR);
+        }
         self.reserved = None;
         Ok(())
     }
@@ -388,4 +414,200 @@ fn ownership_barrier_retries_copied_alias_before_frames_and_backing() {
         ]
     );
     assert_eq!(table.next_retirement(), None);
+}
+
+#[test]
+fn failed_copy_empty_slot_is_retained_and_recycled_without_delete() {
+    let mut scratch = SectionScratch::new();
+    let mut io = Io {
+        copy_error: true,
+        failed_copy_slot: true,
+        recycle_error: true,
+        ..Io::default()
+    };
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (COPY_ERROR, 0)
+    );
+    assert_eq!(io.reserved, Some(1));
+    assert_eq!(io.events, [Event::Copy(50)]);
+    assert_eq!(scratch.entries.len(), 1);
+    assert!(!scratch.entries[0].populated && !scratch.entries[0].mapped);
+    assert_eq!(scratch.begin(&mut io), Err(RECYCLE_ERROR));
+    assert_eq!(io.events, [Event::Copy(50)]);
+    io.recycle_error = false;
+    scratch.drain(&mut io).unwrap();
+    assert_eq!(io.recycled, [1, 1, 1]);
+    assert!(scratch.entries.is_empty() && io.reserved.is_none());
+}
+
+#[test]
+fn null_successful_copy_is_refused_without_mapping_or_cleanup() {
+    let mut scratch = SectionScratch::new();
+    let mut io = Io {
+        null_copy: true,
+        ..Io::default()
+    };
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (RESOURCES, 0)
+    );
+    assert_eq!(io.events, [Event::Copy(50)]);
+    assert!(io.recycled.is_empty() && scratch.entries.is_empty());
+}
+
+#[test]
+fn successful_transfer_reports_recycle_failure_and_blocks_reuse_without_repeated_delete() {
+    let mut scratch = SectionScratch::new();
+    let mut io = Io {
+        recycle_error: true,
+        ..Io::default()
+    };
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (RECYCLE_ERROR, 4096)
+    );
+    assert_eq!(scratch.entries[0].cap, 1);
+    assert!(!scratch.entries[0].mapped && !scratch.entries[0].populated);
+    let events = io.events.len();
+    assert_eq!(
+        scratch.with_frame(51, 0x1000, &mut io, transfer),
+        (RECYCLE_ERROR, 0)
+    );
+    assert_eq!(io.events.len(), events);
+    io.recycle_error = false;
+    assert_eq!(scratch.with_frame(51, 0x1000, &mut io, transfer), (0, 4096));
+    assert_eq!(
+        io.events
+            .iter()
+            .filter(|event| **event == Event::Delete(1))
+            .count(),
+        1
+    );
+    assert_eq!(io.reserved, None);
+}
+
+#[test]
+fn failed_map_and_transfer_preserve_their_status_and_bytes_over_recycle_failure() {
+    let mut scratch = SectionScratch::new();
+    let mut io = Io {
+        map_error: true,
+        recycle_error: true,
+        ..Io::default()
+    };
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer),
+        (MAP_ERROR, 0)
+    );
+    assert!(!io.populated && !io.mapped);
+    io.recycle_error = false;
+    scratch.drain(&mut io).unwrap();
+    io.map_error = false;
+    io.recycle_error = true;
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, |_| (WRITE_ERROR, 17)),
+        (WRITE_ERROR, 17)
+    );
+    assert_eq!(scratch.drain(&mut io), Err(RECYCLE_ERROR));
+    assert_eq!(
+        io.events
+            .iter()
+            .filter(|event| **event == Event::Delete(2))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn recycle_failure_preserves_dirty_pages_and_blocks_checkpoint_after_successful_write() {
+    let (mut table, backing) = table();
+    let mut io = Writeback {
+        scratch: SectionScratch::new(),
+        io: Io {
+            recycle_error: true,
+            ..Io::default()
+        },
+        checkpoints: 0,
+    };
+    let first = table.writeback_file(backing, &mut io);
+    assert_eq!((first.status, first.bytes_written), (RECYCLE_ERROR, 4096));
+    assert_eq!(io.checkpoints, 0);
+    let second = table.writeback_file(backing, &mut io);
+    assert_eq!((second.status, second.bytes_written), (RECYCLE_ERROR, 0));
+    assert_eq!(
+        io.io
+            .events
+            .iter()
+            .filter(|event| **event == Event::Delete(1))
+            .count(),
+        1
+    );
+    io.io.recycle_error = false;
+    let retry = table.writeback_file(backing, &mut io);
+    assert_eq!(
+        (retry.status, retry.bytes_written, retry.pages_written),
+        (0, 8192, 2)
+    );
+    assert_eq!(io.checkpoints, 1);
+}
+
+#[test]
+fn clean_and_uncached_flush_wait_for_pending_slot_recycling() {
+    let (mut table, backing) = table();
+    let mut io = Writeback {
+        scratch: SectionScratch::new(),
+        io: Io::default(),
+        checkpoints: 0,
+    };
+    assert_eq!(table.writeback_file(backing, &mut io).status, 0);
+    io.io.recycle_error = true;
+    assert_eq!(
+        io.scratch.with_frame(50, 0x1000, &mut io.io, transfer).0,
+        RECYCLE_ERROR
+    );
+    let mut uncached = backing;
+    uncached.file.as_mut().unwrap().file_id += 1;
+    let events = io.io.events.len();
+    for file in [backing, uncached] {
+        assert_eq!(table.writeback_file(file, &mut io).status, RECYCLE_ERROR);
+        assert_eq!(io.checkpoints, 1);
+        assert_eq!(io.io.events.len(), events);
+    }
+    io.io.recycle_error = false;
+    assert_eq!(table.writeback_file(backing, &mut io).status, 0);
+    assert_eq!(io.checkpoints, 2);
+}
+
+#[test]
+fn retained_deleted_slot_still_blocks_canonical_frame_and_backing_release() {
+    let (mut table, _) = table();
+    let mut scratch = SectionScratch::new();
+    let mut io = Io {
+        recycle_error: true,
+        ..Io::default()
+    };
+    assert_eq!(
+        scratch.with_frame(50, 0x1000, &mut io, transfer).0,
+        RECYCLE_ERROR
+    );
+    table.release_handle(0);
+    let first = table.next_retirement().unwrap();
+    io.events.clear();
+    assert_eq!(
+        scratch
+            .drain(&mut io)
+            .and_then(|_| table.drain_retired(&mut io)),
+        Err(RECYCLE_ERROR)
+    );
+    assert_eq!(table.next_retirement(), Some(first));
+    assert!(io.events.is_empty());
+    io.recycle_error = false;
+    scratch
+        .drain(&mut io)
+        .and_then(|_| table.drain_retired(&mut io))
+        .unwrap();
+    assert_eq!(
+        io.events,
+        [Event::Frame(50), Event::Frame(51), Event::Backing]
+    );
 }
