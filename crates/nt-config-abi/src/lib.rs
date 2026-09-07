@@ -45,6 +45,9 @@ pub const CM_HIVE_EXPORT_MAGIC: u32 = 0x5845_4D43; // `CMEX`
 pub const CM_HIVE_EXPORT_VERSION: u16 = 1;
 pub const CM_HIVE_EXPORT_HEADER_BYTES: usize = 24;
 pub const CM_MAX_HIVE_PATH_UNITS: usize = 512;
+pub const CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES: usize = 64;
+pub const CM_HIVE_KEY_OPEN_REPLY_MAX_BYTES: usize =
+    CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES + CM_MAX_HIVE_PATH_UNITS * 4;
 /// Maximum payload carried by one immutable driver launch-plan completion frame.
 pub const CM_LAUNCH_PLAN_CHUNK_BYTES: usize = 4096;
 pub const CM_LAUNCH_PLAN_SNAPSHOT_MAGIC: u32 = 0x504C_4D43; // `CMLP`
@@ -123,6 +126,21 @@ pub mod opcode {
     pub const CM_OP_DEVICE_ACTION: u16 = 0x215c;
     /// Release an exact SYSTEM key lease through a retained receipt, then acknowledge its receipt.
     pub const CM_OP_SYSTEM_HIVE_KEY_CLOSE: u16 = 0x215d;
+    /// Query retained-OPEN authority, acquire/replay one exact open attempt, or acknowledge it.
+    pub const CM_OP_SYSTEM_HIVE_KEY_OPEN: u16 = 0x215e;
+}
+
+pub mod hive_key_open_operation {
+    pub const QUERY: u16 = 1;
+    pub const BEGIN: u16 = 2;
+    pub const ACKNOWLEDGE: u16 = 3;
+}
+
+pub mod hive_key_open_disposition {
+    pub const AUTHORITY: u16 = 1;
+    pub const OUTCOME: u16 = 2;
+    pub const ACKNOWLEDGED: u16 = 3;
+    pub const ALREADY_ACKNOWLEDGED: u16 = 4;
 }
 
 pub mod hive_key_close_operation {
@@ -529,6 +547,44 @@ pub struct CmHiveKeyCloseReply {
     pub receipt_generation: u64,
 }
 
+/// QUERY has no identity or path. BEGIN carries an immutable UTF-16LE path after this header.
+/// ACKNOWLEDGE identifies only the already-held outcome. Request generations advance sequentially
+/// within each requester slot, and only after acknowledgement.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveKeyOpenRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub server_nonce: u64,
+    pub requester_nonce: u64,
+    pub request_slot: u64,
+    pub request_generation: u64,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+}
+
+/// Protocol SUCCESS delivers this envelope, not necessarily a successful OPEN. OUTCOME contains
+/// the actual `outcome_status` and, only on success, the acquired lease and appended UTF-8 physical
+/// path. QUERY and ACK replies have no outcome payload. Every reply echoes its exact identity.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveKeyOpenReply {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub disposition: u16,
+    pub reserved: u16,
+    pub server_nonce: u64,
+    pub requester_nonce: u64,
+    pub request_slot: u64,
+    pub request_generation: u64,
+    pub outcome_status: i32,
+    pub path_len_bytes: u32,
+    pub lease_token: u64,
+    pub opened_generation: u64,
+}
+
 /// `query_leased_hive_key`: an immutable snapshot-bank cursor addressed by a previously acquired
 /// key lease. The key lease and snapshot-transfer token have independent lifetimes.
 #[repr(C)]
@@ -729,6 +785,8 @@ wire!(CmHiveKeyRequest);
 wire!(CmHiveKeyLeaseRequest);
 wire!(CmHiveKeyCloseRequest);
 wire!(CmHiveKeyCloseReply);
+wire!(CmHiveKeyOpenRequest);
+wire!(CmHiveKeyOpenReply);
 wire!(CmLeasedHiveKeyRequest);
 wire!(CmHiveExportHeader);
 wire!(CmLeasedHiveRecordRequest);
@@ -839,6 +897,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<CmHiveKeyLeaseRequest>(), 24);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseReply>(), 40);
+        assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 48);
+        assert_eq!(core::mem::size_of::<CmHiveKeyOpenReply>(), CM_HIVE_KEY_OPEN_REPLY_HEADER_BYTES);
         assert_eq!(core::mem::size_of::<CmLeasedHiveKeyRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmLeasedHiveRecordRequest>(), 48);
         assert_eq!(core::mem::size_of::<CmHiveCheckpointRequest>(), 32);

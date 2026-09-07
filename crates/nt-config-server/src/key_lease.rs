@@ -1,18 +1,12 @@
+use crate::CmIdentitySource;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use nt_hive_core::CellId;
 
-static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
-static NEXT_RECEIPT_BANK: AtomicU64 = AtomicU64::new(1);
-
-fn take_identity(counter: &AtomicU64) -> Result<u64, SystemKeyLeaseError> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            (next != 0).then(|| next.checked_add(1)).flatten()
-        })
-        .map_err(|_| SystemKeyLeaseError::Exhausted)
+fn take_identity(source: &CmIdentitySource) -> Result<u64, SystemKeyLeaseError> {
+    source.take().ok_or(SystemKeyLeaseError::Exhausted)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +31,7 @@ pub(crate) enum SystemKeyLeaseError {
 pub(crate) struct SystemKeyLeaseBank {
     leases: Vec<Option<SystemKeyLease>>,
     receipts: CloseReceiptBank,
+    identities: Rc<CmIdentitySource>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +77,7 @@ impl CloseReceiptBank {
         &mut self,
         lease_token: u64,
         slot_limit: usize,
-        counter: &AtomicU64,
+        counter: &CmIdentitySource,
     ) -> Result<CloseReceipt, SystemKeyLeaseError> {
         let vacant = self
             .slots
@@ -147,10 +142,11 @@ impl CloseReceiptBank {
 }
 
 impl SystemKeyLeaseBank {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new(identities: Rc<CmIdentitySource>) -> Self {
         Self {
             leases: Vec::new(),
             receipts: CloseReceiptBank::new(),
+            identities,
         }
     }
 
@@ -165,7 +161,7 @@ impl SystemKeyLeaseBank {
                 .try_reserve_exact(1)
                 .map_err(|_| SystemKeyLeaseError::Exhausted)?;
         }
-        let token = take_identity(&NEXT_LEASE_TOKEN)?;
+        let token = take_identity(&self.identities)?;
         let lease = SystemKeyLease {
             token,
             key,
@@ -212,18 +208,22 @@ impl SystemKeyLeaseBank {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn outstanding_count(&self) -> usize {
+        self.leases.iter().flatten().count()
+    }
+
     pub(crate) fn prepare_close(
         &mut self,
         token: u64,
     ) -> Result<CloseReceipt, SystemKeyLeaseError> {
-        self.prepare_close_with_resources(token, usize::MAX, &NEXT_RECEIPT_BANK)
+        self.prepare_close_with_limit(token, usize::MAX)
     }
 
-    fn prepare_close_with_resources(
+    fn prepare_close_with_limit(
         &mut self,
         token: u64,
         slot_limit: usize,
-        counter: &AtomicU64,
     ) -> Result<CloseReceipt, SystemKeyLeaseError> {
         if token == 0 {
             return Err(SystemKeyLeaseError::Invalid);
@@ -236,7 +236,7 @@ impl SystemKeyLeaseBank {
             .iter()
             .position(|slot| slot.as_ref().is_some_and(|lease| lease.token == token))
             .ok_or(SystemKeyLeaseError::Invalid)?;
-        let receipt = self.receipts.prepare(token, slot_limit, counter)?;
+        let receipt = self.receipts.prepare(token, slot_limit, &self.identities)?;
         self.leases[index] = None;
         Ok(receipt)
     }
@@ -254,10 +254,24 @@ impl SystemKeyLeaseBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::num::NonZeroU32;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    fn new_bank() -> SystemKeyLeaseBank {
+        static NEXT_INCARNATION: AtomicU32 = AtomicU32::new(1);
+        let incarnation = NEXT_INCARNATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .unwrap();
+        SystemKeyLeaseBank::new(Rc::new(CmIdentitySource::new(
+            NonZeroU32::new(incarnation).unwrap(),
+        )))
+    }
 
     #[test]
     fn leases_are_opaque_exact_and_reuse_storage_without_reusing_tokens() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         let first = bank
             .open(
                 CellId(17),
@@ -278,7 +292,7 @@ mod tests {
 
     #[test]
     fn mount_replacement_invalidates_every_lease() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         let token = bank.open(CellId(1), String::from("key")).unwrap();
         bank.invalidate();
         assert!(bank.get(token).is_none());
@@ -290,7 +304,7 @@ mod tests {
 
     #[test]
     fn retained_close_and_ack_are_independently_retryable() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         let token = open(&mut bank);
         let receipt = bank.prepare_close(token).unwrap();
         assert!(bank.get(token).is_none());
@@ -309,7 +323,7 @@ mod tests {
 
     #[test]
     fn old_ack_cannot_release_reused_slot_or_other_outstanding_receipt() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         let first = open(&mut bank);
         let first = bank.prepare_close(first).unwrap();
         let other = open(&mut bank);
@@ -332,8 +346,8 @@ mod tests {
 
     #[test]
     fn foreign_and_future_receipts_never_mutate_the_owner() {
-        let mut first = SystemKeyLeaseBank::new();
-        let mut second = SystemKeyLeaseBank::new();
+        let mut first = new_bank();
+        let mut second = new_bank();
         let a = open(&mut first);
         let b = open(&mut second);
         assert_ne!(a, b);
@@ -362,7 +376,7 @@ mod tests {
 
     #[test]
     fn invalidated_live_owners_and_pending_receipts_survive_mount_replacement() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         let live = open(&mut bank);
         let legacy = open(&mut bank);
         let closing = open(&mut bank);
@@ -390,29 +404,30 @@ mod tests {
 
     #[test]
     fn receipt_capacity_and_identity_exhaustion_preserve_the_live_lease() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         let token = open(&mut bank);
-        let counter = AtomicU64::new(9);
+        let sequence = bank.identities.next_sequence.get();
         assert_eq!(
-            bank.prepare_close_with_resources(token, 0, &counter),
+            bank.prepare_close_with_limit(token, 0),
             Err(SystemKeyLeaseError::Exhausted)
         );
         assert!(bank.get(token).is_some());
-        assert_eq!(counter.load(Ordering::Relaxed), 9);
-        let exhausted = AtomicU64::new(u64::MAX);
+        assert_eq!(bank.identities.next_sequence.get(), sequence);
+        bank.identities.next_sequence.set(0);
         assert_eq!(
-            bank.prepare_close_with_resources(token, 1, &exhausted),
+            bank.prepare_close_with_limit(token, 1),
             Err(SystemKeyLeaseError::Exhausted)
         );
         assert!(bank.get(token).is_some());
         assert!(bank.receipts.slots.is_empty());
         assert_eq!(bank.receipts.identity, 0);
+        bank.identities.next_sequence.set(sequence);
         assert!(bank.prepare_close(token).is_ok());
     }
 
     #[test]
     fn exhausted_slot_generation_does_not_wrap_or_reuse_receipt_identity() {
-        let mut bank = SystemKeyLeaseBank::new();
+        let mut bank = new_bank();
         bank.receipts.slots.push(ReceiptSlot {
             acknowledged: u64::MAX,
             pending: None,
@@ -421,13 +436,46 @@ mod tests {
         let receipt = bank.prepare_close(token).unwrap();
         assert_eq!(receipt.slot, 1);
         assert_eq!(receipt.generation, 1);
+        bank.identities.next_sequence.set(u32::MAX);
+        assert!(take_identity(&bank.identities).is_ok());
         assert_eq!(
-            take_identity(&AtomicU64::new(0)),
+            take_identity(&bank.identities),
             Err(SystemKeyLeaseError::Exhausted)
         );
+    }
+
+    #[test]
+    fn reconstruction_shared_source_and_restart_incarnation_reject_old_owners() {
+        let source = Rc::new(CmIdentitySource::new(NonZeroU32::new(80).unwrap()));
+        let mut first = SystemKeyLeaseBank::new(source.clone());
+        let token = open(&mut first);
+        let receipt = first.prepare_close(token).unwrap();
+        let mut reconstructed = SystemKeyLeaseBank::new(source);
+        let local = open(&mut reconstructed);
+        let local_receipt = reconstructed.prepare_close(local).unwrap();
+        assert_ne!(local, token);
+        assert_ne!(local_receipt.bank, receipt.bank);
         assert_eq!(
-            take_identity(&AtomicU64::new(u64::MAX)),
-            Err(SystemKeyLeaseError::Exhausted)
+            reconstructed.prepare_close(token),
+            Err(SystemKeyLeaseError::Invalid)
+        );
+        assert_eq!(
+            reconstructed.acknowledge_close(receipt.bank, receipt.slot, receipt.generation),
+            Err(SystemKeyLeaseError::Invalid)
+        );
+        let mut restarted =
+            SystemKeyLeaseBank::new(Rc::new(CmIdentitySource::new(NonZeroU32::new(81).unwrap())));
+        let restarted_token = open(&mut restarted);
+        let restarted_receipt = restarted.prepare_close(restarted_token).unwrap();
+        assert_ne!(restarted_token, token);
+        assert_ne!(restarted_receipt.bank, receipt.bank);
+        assert_eq!(
+            restarted.prepare_close(token),
+            Err(SystemKeyLeaseError::Invalid)
+        );
+        assert_eq!(
+            restarted.acknowledge_close(receipt.bank, receipt.slot, receipt.generation),
+            Err(SystemKeyLeaseError::Invalid)
         );
     }
 }

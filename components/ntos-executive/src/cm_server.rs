@@ -10,7 +10,7 @@ use crate::*;
 
 use alloc::rc::Rc;
 use core::num::NonZeroU32;
-use nt_config_server::{CmServer, DeviceActionClaimTokenSource};
+use nt_config_server::{CmServer, CmIdentitySource};
 use surt_sel4::surt_core::surt_abi::{SurtCqe, SurtSqe};
 use surt_sel4::surt_core::{Consumer, Producer};
 use surt_sel4::{drain_blocking, Sel4Notify};
@@ -38,8 +38,8 @@ pub unsafe extern "C" fn cm_server_entry(launch_context: u64) -> ! {
     let Some(incarnation) = NonZeroU32::new(launch_context.incarnation()) else {
         park();
     };
-    let claim_tokens = Rc::new(DeviceActionClaimTokenSource::new(incarnation));
-    let mut server = CmServer::new_with_claim_token_source(claim_tokens);
+    let identities = Rc::new(CmIdentitySource::new(incarnation));
+    let mut server = CmServer::new_with_identity_source(identities);
 
     let _ = drain_blocking(&mut submissions, &wait_requests, |sqe: &SurtSqe| {
         // SAFETY: single request in flight; the ring push/pop orders the client's

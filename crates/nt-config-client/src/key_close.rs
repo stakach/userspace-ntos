@@ -22,9 +22,30 @@ impl SystemHiveKeyCloseReceipt {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SystemHiveKeyCloseAcknowledgement {
+pub enum SystemHiveKeyCloseAcknowledgementDisposition {
     Acknowledged,
     AlreadyAcknowledged,
+}
+
+/// Evidence for one exact receipt, constructible only by validation of a successful ACK reply.
+///
+/// ```compile_fail
+/// use nt_config_client::SystemHiveKeyCloseAcknowledgement;
+/// let proof = SystemHiveKeyCloseAcknowledgement { receipt: todo!(), disposition: todo!() };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SystemHiveKeyCloseAcknowledgement {
+    receipt: SystemHiveKeyCloseReceipt,
+    disposition: SystemHiveKeyCloseAcknowledgementDisposition,
+}
+
+impl SystemHiveKeyCloseAcknowledgement {
+    pub const fn receipt(self) -> SystemHiveKeyCloseReceipt {
+        self.receipt
+    }
+    pub const fn disposition(self) -> SystemHiveKeyCloseAcknowledgementDisposition {
+        self.disposition
+    }
 }
 
 impl<B: Backend> ConfigClient<B> {
@@ -73,13 +94,17 @@ impl<B: Backend> ConfigClient<B> {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        match body.disposition {
-            disposition::ACKNOWLEDGED => Ok(SystemHiveKeyCloseAcknowledgement::Acknowledged),
+        let disposition = match body.disposition {
+            disposition::ACKNOWLEDGED => SystemHiveKeyCloseAcknowledgementDisposition::Acknowledged,
             disposition::ALREADY_ACKNOWLEDGED => {
-                Ok(SystemHiveKeyCloseAcknowledgement::AlreadyAcknowledged)
+                SystemHiveKeyCloseAcknowledgementDisposition::AlreadyAcknowledged
             }
-            _ => Err(STATUS_INVALID_PARAMETER),
-        }
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        };
+        Ok(SystemHiveKeyCloseAcknowledgement {
+            receipt,
+            disposition,
+        })
     }
 
     fn exchange_system_hive_key_close(

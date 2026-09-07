@@ -10,8 +10,15 @@
 
 extern crate alloc;
 
+mod key_open;
+pub use key_open::{
+    SystemHiveKeyOpenAttempt, SystemHiveKeyOpenAttempts, SystemHiveKeyOpenExchange,
+    SystemHiveKeyOpenOperation, SystemHiveKeyOpenResponse,
+};
+
 mod key_close;
-pub use key_close::{SystemHiveKeyCloseAcknowledgement, SystemHiveKeyCloseReceipt};
+pub use key_close::{SystemHiveKeyCloseAcknowledgement, SystemHiveKeyCloseAcknowledgementDisposition,
+    SystemHiveKeyCloseReceipt};
 
 mod broker_key_owner;
 pub use broker_key_owner::{

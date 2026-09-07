@@ -767,7 +767,7 @@ fn with_opened_system_hive_key<R>(
         Err(status) => return Err(status as u32),
     };
     let result = visit(Some(&opened));
-    unsafe { config_manager_close_system_hive_key(opened.lease) }
+    unsafe { config_manager_retire_system_hive_key(opened.lease) }
         .map_err(|status| status as u32)?;
     result
 }
@@ -956,7 +956,7 @@ impl CollectSystemSetupSeedTarget {
         let keys = core::mem::take(self.keys.get_mut());
         for key in keys {
             if let CachedSystemSetupKey::Open { lease, .. } = key {
-                if let Err(status) = unsafe { config_manager_close_system_hive_key(lease) } {
+                if let Err(status) = unsafe { config_manager_retire_system_hive_key(lease) } {
                     self.note_failure(status as u32);
                 }
             }
@@ -5308,7 +5308,7 @@ impl ExecNtHandler {
         }) {
             Ok(target) => target,
             Err(status) => {
-                match crate::config_manager_close_system_hive_key(opened.lease) {
+                match crate::config_manager_retire_system_hive_key(opened.lease) {
                     Ok(()) => {
                         CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.fetch_add(1, Ordering::Relaxed);
                     }
@@ -5505,7 +5505,7 @@ impl ExecNtHandler {
                 .get_mut(index)
                 .and_then(Option::take)
             {
-                match unsafe { crate::config_manager_close_system_hive_key(entry.lease) } {
+                match unsafe { crate::config_manager_retire_system_hive_key(entry.lease) } {
                     Ok(()) => {
                         CM_NATIVE_SYSTEM_KEY_LEASE_CLOSES.fetch_add(1, Ordering::Relaxed);
                     }

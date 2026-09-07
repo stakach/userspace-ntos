@@ -12266,7 +12266,7 @@ fn close_win32k_reg_target(target: Win32kRegHandleTarget) -> i32 {
         Win32kRegHandleTarget::Empty => STATUS_OBJECT_NAME_NOT_FOUND,
         Win32kRegHandleTarget::VideoDeviceMap => 0,
         Win32kRegHandleTarget::SystemHive { lease, .. } => unsafe {
-            crate::config_manager_close_system_hive_key(lease)
+            crate::config_manager_retire_system_hive_key(lease)
                 .map(|()| 0)
                 .unwrap_or_else(|status| status)
         },
@@ -12555,7 +12555,7 @@ unsafe fn service_win32k_registry_create(
         Err(STATUS_OBJECT_NAME_NOT_FOUND) => return Err(0xC000_003Au32 as i32),
         Err(status) => return Err(status),
     };
-    crate::config_manager_close_system_hive_key(parent_lease)?;
+    crate::config_manager_retire_system_hive_key(parent_lease)?;
 
     let mut mutations = Vec::new();
     mutations

@@ -59,8 +59,12 @@ fn image() -> alloc::vec::Vec<u8> {
 }
 
 fn client() -> ConfigClient<Direct> {
+    client_for_incarnation(NonZeroU32::MIN)
+}
+
+fn client_for_incarnation(incarnation: NonZeroU32) -> ConfigClient<Direct> {
     let mut client = ConfigClient::new(Direct {
-        server: CmServer::new_for_incarnation(NonZeroU32::MIN),
+        server: CmServer::new_for_incarnation(incarnation),
         corrupt: None,
         calls: 0,
     });
@@ -92,12 +96,16 @@ fn uncertain_prepare_and_ack_replies_recover_without_invalid_handle_fallback() {
     assert_eq!(client.prepare_system_hive_key_close(lease), Ok(receipt));
     client.backend.corrupt = Some((operation::ACKNOWLEDGE, 1));
     assert_eq!(
-        client.acknowledge_system_hive_key_close(receipt),
+        client
+            .acknowledge_system_hive_key_close(receipt)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
         Err(STATUS_INVALID_PARAMETER)
     );
     assert_eq!(
-        client.acknowledge_system_hive_key_close(receipt),
-        Ok(SystemHiveKeyCloseAcknowledgement::AlreadyAcknowledged)
+        client
+            .acknowledge_system_hive_key_close(receipt)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
+        Ok(SystemHiveKeyCloseAcknowledgementDisposition::AlreadyAcknowledged)
     );
     assert_eq!(
         client.prepare_system_hive_key_close(lease),
@@ -108,12 +116,16 @@ fn uncertain_prepare_and_ack_replies_recover_without_invalid_handle_fallback() {
     assert_eq!(next.slot, receipt.slot);
     assert_eq!(next.generation, receipt.generation + 1);
     assert_eq!(
-        client.acknowledge_system_hive_key_close(receipt),
-        Ok(SystemHiveKeyCloseAcknowledgement::AlreadyAcknowledged)
+        client
+            .acknowledge_system_hive_key_close(receipt)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
+        Ok(SystemHiveKeyCloseAcknowledgementDisposition::AlreadyAcknowledged)
     );
     assert_eq!(
-        client.acknowledge_system_hive_key_close(next),
-        Ok(SystemHiveKeyCloseAcknowledgement::Acknowledged)
+        client
+            .acknowledge_system_hive_key_close(next)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
+        Ok(SystemHiveKeyCloseAcknowledgementDisposition::Acknowledged)
     );
 }
 
@@ -129,7 +141,9 @@ fn every_malformed_success_preserves_retryable_server_receipt() {
         );
     }
     let receipt = client.prepare_system_hive_key_close(lease).unwrap();
-    client.acknowledge_system_hive_key_close(receipt).unwrap();
+    client
+        .acknowledge_system_hive_key_close(receipt)
+        .unwrap();
 }
 
 #[test]
@@ -154,15 +168,17 @@ fn replaced_mount_retains_exact_close_authority_but_not_key_access() {
     );
     let receipt = client.prepare_system_hive_key_close(lease).unwrap();
     assert_eq!(
-        client.acknowledge_system_hive_key_close(receipt),
-        Ok(SystemHiveKeyCloseAcknowledgement::Acknowledged)
+        client
+            .acknowledge_system_hive_key_close(receipt)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
+        Ok(SystemHiveKeyCloseAcknowledgementDisposition::Acknowledged)
     );
 }
 
 #[test]
 fn foreign_server_lease_and_receipt_cannot_close_local_owners() {
     let mut first = client();
-    let mut second = client();
+    let mut second = client_for_incarnation(NonZeroU32::new(2).unwrap());
     let a = open(&mut first);
     let b = open(&mut second);
     assert_ne!(a.token, b.token);
@@ -170,14 +186,20 @@ fn foreign_server_lease_and_receipt_cannot_close_local_owners() {
     let receipt = first.prepare_system_hive_key_close(a).unwrap();
     let local = second.prepare_system_hive_key_close(b).unwrap();
     assert_eq!(
-        second.acknowledge_system_hive_key_close(receipt),
+        second
+            .acknowledge_system_hive_key_close(receipt)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
         Err(INVALID_HANDLE)
     );
     assert_eq!(
-        second.acknowledge_system_hive_key_close(local),
-        Ok(SystemHiveKeyCloseAcknowledgement::Acknowledged)
+        second
+            .acknowledge_system_hive_key_close(local)
+            .map(SystemHiveKeyCloseAcknowledgement::disposition),
+        Ok(SystemHiveKeyCloseAcknowledgementDisposition::Acknowledged)
     );
-    first.acknowledge_system_hive_key_close(receipt).unwrap();
+    first
+        .acknowledge_system_hive_key_close(receipt)
+        .unwrap();
 }
 
 #[test]

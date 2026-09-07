@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod key_lease;
 mod key_close;
+mod key_open;
 mod mutation;
 mod snapshot;
 
@@ -208,14 +209,22 @@ fn system_hive_relative_path(
     path: &str,
     current_control_set: &CurrentControlSet,
 ) -> Option<String> {
-    let mut components = path.split('\\').filter(|component| !component.is_empty());
-    if !components.next()?.eq_ignore_ascii_case("Registry")
-        || !components.next()?.eq_ignore_ascii_case("Machine")
-        || !components.next()?.eq_ignore_ascii_case("System")
-    {
-        return None;
-    }
     let mut relative = String::new();
+    system_hive_relative_path_into(path, current_control_set, &mut relative).then_some(relative)
+}
+
+fn system_hive_relative_path_into(
+    path: &str,
+    current_control_set: &CurrentControlSet,
+    relative: &mut String,
+) -> bool {
+    let mut components = path.split('\\').filter(|component| !component.is_empty());
+    if !components.next().is_some_and(|part| part.eq_ignore_ascii_case("Registry"))
+        || !components.next().is_some_and(|part| part.eq_ignore_ascii_case("Machine"))
+        || !components.next().is_some_and(|part| part.eq_ignore_ascii_case("System"))
+    {
+        return false;
+    }
     if let Some(first) = components.next() {
         relative.push_str(if first.eq_ignore_ascii_case("CurrentControlSet") {
             current_control_set.as_str()
@@ -227,7 +236,7 @@ fn system_hive_relative_path(
         relative.push('\\');
         relative.push_str(component);
     }
-    Some(relative)
+    true
 }
 
 fn config_manager_from_system_hive(
@@ -898,17 +907,18 @@ struct DeviceActionClaim {
     complete: bool,
 }
 
-/// Process-lifetime source for opaque device-action claim tokens.
+/// Service-lifetime source for opaque CM ownership identities, including device-action claims,
+/// SYSTEM key leases, and retained OPEN/CLOSE journals.
 ///
 /// A service incarnation owns one source and shares it with every reconstructed
 /// [`CmServer`]. The source is intentionally single-threaded: the CM dispatcher
 /// serializes access to its authority and never requires a writable image global.
-pub struct DeviceActionClaimTokenSource {
+pub struct CmIdentitySource {
     incarnation: NonZeroU32,
     next_sequence: Cell<u32>,
 }
 
-impl DeviceActionClaimTokenSource {
+impl CmIdentitySource {
     pub fn new(incarnation: NonZeroU32) -> Self {
         Self {
             incarnation,
@@ -972,6 +982,7 @@ pub struct CmServer {
     prepared_system_checkpoint: Option<PreparedSystemHiveCheckpoint>,
     next_system_checkpoint_token: u64,
     system_key_leases: SystemKeyLeaseBank,
+    system_key_opens: key_open::OpenJournal,
     hive_key_snapshots: SnapshotPool<HiveKeySnapshotKey>,
     hive_export_snapshots: SnapshotPool<HiveExportSnapshotKey>,
     driver_launch_plan_snapshots: SnapshotBank<u16>,
@@ -980,7 +991,7 @@ pub struct CmServer {
     network_adapter_plan_snapshots: SnapshotBank<u16>,
     device_action_journal: DeviceActionJournal,
     device_action_claim: Option<DeviceActionClaim>,
-    device_action_claim_tokens: Rc<DeviceActionClaimTokenSource>,
+    identities: Rc<CmIdentitySource>,
     raw_value_uploads: Vec<RawValueUpload>,
     next_raw_value_upload_token: u64,
     raw_value_snapshots: SnapshotPool<u32>,
@@ -992,28 +1003,28 @@ impl CmServer {
     /// Device-action claims combine this incarnation with a server-owned
     /// sequence, so a client cannot replay a pre-restart transfer token.
     pub fn new_for_incarnation(incarnation: NonZeroU32) -> Self {
-        Self::new_with_claim_token_source(Rc::new(DeviceActionClaimTokenSource::new(incarnation)))
+        Self::new_with_identity_source(Rc::new(CmIdentitySource::new(incarnation)))
     }
 
     /// Build a fresh authority sharing a process-lifetime claim-token source.
-    pub fn new_with_claim_token_source(
-        device_action_claim_tokens: Rc<DeviceActionClaimTokenSource>,
+    pub fn new_with_identity_source(
+        identities: Rc<CmIdentitySource>,
     ) -> Self {
-        Self::with_config_and_claim_token_source(ConfigManager::new(), device_action_claim_tokens)
+        Self::with_config_and_identity_source(ConfigManager::new(), identities)
     }
 
     /// Build a seeded authority for one kernel-issued service incarnation.
     pub fn with_config_for_incarnation(cm: ConfigManager, incarnation: NonZeroU32) -> Self {
-        Self::with_config_and_claim_token_source(
+        Self::with_config_and_identity_source(
             cm,
-            Rc::new(DeviceActionClaimTokenSource::new(incarnation)),
+            Rc::new(CmIdentitySource::new(incarnation)),
         )
     }
 
     /// Build a seeded authority sharing a process-lifetime claim-token source.
-    pub fn with_config_and_claim_token_source(
+    pub fn with_config_and_identity_source(
         cm: ConfigManager,
-        device_action_claim_tokens: Rc<DeviceActionClaimTokenSource>,
+        identities: Rc<CmIdentitySource>,
     ) -> Self {
         Self {
             cm,
@@ -1026,7 +1037,8 @@ impl CmServer {
             prepared_system_mutation: None,
             prepared_system_checkpoint: None,
             next_system_checkpoint_token: 1,
-            system_key_leases: SystemKeyLeaseBank::new(),
+            system_key_leases: SystemKeyLeaseBank::new(identities.clone()),
+            system_key_opens: key_open::OpenJournal::new(),
             hive_key_snapshots: SnapshotPool::with_limits(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
                 MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
@@ -1041,7 +1053,7 @@ impl CmServer {
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
             device_action_claim: None,
-            device_action_claim_tokens,
+            identities,
             raw_value_uploads: Vec::new(),
             next_raw_value_upload_token: 1,
             raw_value_snapshots: SnapshotPool::with_limits(
@@ -1052,7 +1064,7 @@ impl CmServer {
     }
 
     fn take_device_action_claim_token(&mut self) -> Option<u64> {
-        self.device_action_claim_tokens.take()
+        self.identities.take()
     }
 
     /// Direct read access to the registry authority.
@@ -1087,6 +1099,7 @@ impl CmServer {
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_CLOSE => self.op_system_hive_key_close(in_buf, out_buf),
+            opcode::CM_OP_SYSTEM_HIVE_KEY_OPEN => self.op_system_hive_key_open(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_RECORD => {
                 self.op_query_leased_hive_record(in_buf, out_buf)
@@ -4115,8 +4128,8 @@ mod tests {
     #[test]
     fn device_action_claim_is_exclusive_and_distinct_across_reconstruction_and_restart() {
         let image = encode_image(&selected_system_hive(1));
-        let claim_tokens = Rc::new(DeviceActionClaimTokenSource::new(NonZeroU32::MIN));
-        let mut server = CmServer::new_with_claim_token_source(Rc::clone(&claim_tokens));
+        let claim_tokens = Rc::new(CmIdentitySource::new(NonZeroU32::MIN));
+        let mut server = CmServer::new_with_identity_source(Rc::clone(&claim_tokens));
         assert_eq!(publish_hive(&mut server, &image), 1);
         publish_test_device_action(&mut server);
 
@@ -4200,7 +4213,7 @@ mod tests {
         assert_eq!(ack.status, STATUS_SUCCESS);
         assert_eq!(ack.information, 0);
 
-        let mut replacement = CmServer::new_with_claim_token_source(claim_tokens);
+        let mut replacement = CmServer::new_with_identity_source(claim_tokens);
         assert_eq!(publish_hive(&mut replacement, &image), 1);
         publish_test_device_action(&mut replacement);
         let replacement_begin = replacement.dispatch(

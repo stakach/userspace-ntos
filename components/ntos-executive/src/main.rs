@@ -25,6 +25,7 @@ mod allocator;
 mod alpc_selftest;
 pub(crate) use acpi_platform::*;
 mod cm_server;
+mod cm_key_ownership;
 mod io_server;
 mod lpc_server;
 mod ntoskrnl_shared;
@@ -3391,6 +3392,7 @@ const DELAY_TIMER_SOURCE_ACPI_PCI_ROUTE_RECOVERY: u64 = 11;
 const DELAY_TIMER_SOURCE_PROVIDER_WAIT: u64 = 12;
 const DELAY_TIMER_SOURCE_PROVIDER_TIMER: u64 = 13;
 const DELAY_TIMER_SOURCE_REGISTRY_CLOSE: u64 = 14;
+const DELAY_TIMER_SOURCE_CM_KEY_CLEANUP: u64 = 15;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -5055,11 +5057,16 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         (&b" close-attempts="[..], registry.close_attempts),
         (&b" close-failures="[..], registry.close_failures),
         (&b" retries="[..], registry.retry_attempts),
+        (&b" open-pending="[..], registry.open_pending as u64),
+        (&b" open-inflight="[..], registry.open_inflight as u64),
+        (&b" open-requests="[..], registry.open_requests),
+        (&b" open-failures="[..], registry.open_failures),
     ] {
         print_str(label);
         print_u64(value);
     }
     print_str(b"\n");
+    unsafe { cm_key_ownership::print_stats() };
     let fb_readback = unsafe { explorer_framebuffer_final_readback() };
     let fb_span_x = fb_readback.span_x();
     let fb_span_y = fb_readback.span_y();
@@ -7396,7 +7403,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 14;
+pub(crate) const SUBDRAIN_N: usize = 15;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -16082,19 +16089,18 @@ pub(crate) unsafe fn config_manager_query_system_hive_key(
 pub(crate) unsafe fn config_manager_open_system_hive_key(
     path: &str,
 ) -> Result<nt_config_client::OpenedSystemHiveKey, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    if expected_generation == 0 {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    cm_key_ownership::open(path)
+}
+
+pub(crate) unsafe fn config_manager_exchange_system_hive_key_open(
+    exchange: &nt_config_client::SystemHiveKeyOpenExchange,
+) -> nt_config_client::SystemHiveKeyOpenResponse {
+    match CONFIG_CLIENT_PTR.as_mut() {
+        Some(client) => client.exchange_system_hive_key_open(exchange),
+        None => nt_config_client::SystemHiveKeyOpenResponse::transport_error(
+            CONFIG_STATUS_DEVICE_NOT_READY,
+        ),
     }
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let opened = client.open_system_hive_key_with_path(path)?;
-    if opened.lease.opened_generation != expected_generation {
-        let _ = client.close_system_hive_key(opened.lease);
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    Ok(opened)
 }
 
 pub(crate) unsafe fn config_manager_resolve_system_hive_path(
@@ -16114,21 +16120,12 @@ pub(crate) unsafe fn config_manager_resolve_system_hive_path(
     Ok(resolved)
 }
 
-pub(crate) unsafe fn config_manager_close_system_hive_key(
+/// Relinquish a retired target's lease. Errors describe the first cleanup attempt, not returned
+/// ownership: the retained journal completes failed cleanup at the outer maintenance boundary.
+pub(crate) unsafe fn config_manager_retire_system_hive_key(
     lease: nt_config_client::SystemHiveKeyLease,
 ) -> Result<(), i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    if expected_generation == 0 {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let generation = client.close_system_hive_key(lease)?;
-    if generation != expected_generation {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    Ok(())
+    cm_key_ownership::retire(lease)
 }
 
 pub(crate) unsafe fn config_manager_prepare_system_hive_key_close(
@@ -17282,6 +17279,7 @@ unsafe fn delay_timer_next_deadline(
         driver_launch::hosted_acpi_pci_route_recovery_next_deadline();
     let job_time_deadline = handler.job_time_sample_next_deadline();
     let registry_close_deadline = driver_launch::driver_registry_close_retry_deadline();
+    let cm_key_cleanup_deadline = cm_key_ownership::next_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
         .into_iter()
@@ -17297,6 +17295,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(acpi_pci_route_recovery_deadline)
         .chain(job_time_deadline)
         .chain(registry_close_deadline)
+        .chain(cm_key_cleanup_deadline)
         .chain(deadman_deadline)
         .min()?;
     let source = if delay_deadline == Some(deadline) {
@@ -17325,6 +17324,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_JOB_TIME
     } else if registry_close_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_REGISTRY_CLOSE
+    } else if cm_key_cleanup_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_CM_KEY_CLEANUP
     } else {
         DELAY_TIMER_SOURCE_WATCHDOG
     };
@@ -17551,6 +17552,7 @@ unsafe fn delay_timer_drain_due_work(
             nt_time_snapshot_at(now_100ns),
         ))
         + subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
+        + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + watchdog_tick
 }
 

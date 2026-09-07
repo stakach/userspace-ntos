@@ -29008,7 +29008,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review found no remaining introduced lifetime blocker. Tranche 115 and canonical NT Key/security
     migration remain open; this checkpoint is not desktop acceptance.
 
-    B3 retained registry open tranche 115 (queued after 114):
+    B3 retained registry open tranche 115 (2026-09-08, complete):
 
     Native open and temporary query/create paths also discard cleanup errors. ConfigClient and the
     executive OPEN helper can discard a returned lease before exposing malformed path/generation
@@ -29016,6 +29016,60 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     nor infer an unknown token after an ambiguous OPEN response. Complete retained OPEN request,
     response and publication ownership, then remove those ignored-close paths. Tranche 114 covers
     known owners and retry-safe CLOSE, not this distinct publication contract.
+
+    Implementation contract: reserve a non-clone client attempt before IPC, bind it to a queried
+    server incarnation, and journal the immutable request before CM acquires a lease. Exact retries
+    replay the same successful or failed outcome. Explicit outcome acknowledgements advance reusable
+    slot watermarks so old requests cannot acquire a second lease after acknowledgement. Retain any
+    known lease before path/generation validation; failed validation uses the retained CLOSE protocol.
+    Native maintenance must never publish a handle after its original caller has received failure.
+    Driver broker rows and ordinary executive helpers need separate publication owners, not invented
+    driver handles for unrelated registry operations. No table borrow may cross CM IPC.
+
+    Consumer audit: `query_active_driver_service_by_registry_path` still owns two temporary legacy
+    leases, and native setup caches, USER registry targets, and executive key publication have their
+    own close paths. Migrate these explicitly after the retained OPEN transport is integrated; do not
+    equate broker lifecycle completion with canonical NT Key/access-control completion or replace
+    stable-key identity with path-only lookup to avoid cleanup.
+
+    Implemented a retained OPEN journal and non-clone client attempt/exchange tickets. Exact replay
+    does not allocate or reacquire; immutable failed outcomes survive namespace changes. Successful
+    or failed outcomes require explicit ACK, and query-only cancellation does not skip a slot's next
+    request generation. Acquired lease identity is retained before path/generation validation and
+    cannot be replaced by a changed retry. Client output storage is reserved before acquisition.
+    Close acknowledgement is now an opaque proof bound to the exact retained receipt.
+
+    Review also replaced process-local identity counters with CmIdentitySource: the kernel-issued
+    service incarnation plus a checked shared sequence now identifies leases, OPEN journals, CLOSE
+    receipt banks and device-action claims. Reconstructed servers share the source; a restarted
+    service cannot reuse an old bank or lease identity. The historical device-action-only source
+    name and static lease/receipt/OPEN counters were removed.
+
+    Driver broker rows retain both OPEN and CLOSE obligations before becoming reusable. Ordinary
+    executive/setup/USER opens use a separate focused cm_key_ownership module, without creating
+    driver handles. Successful transfers retain a pre-reserved cleanup record. All six native
+    cleanup callers relinquish their lease, so the helper is explicitly named retire rather than
+    promising a caller-retryable close: its first error leaves cleanup ownership in the journal.
+    Bounded outer-loop maintenance resolves abandoned opens and retires their leases without late
+    publication; timer drains only latch work. New census fields report real OPEN/cleanup owners and
+    attempts. Canonical NT handle close result observation remains a distinct contract, not an
+    excuse to treat INVALID_HANDLE as successful cleanup.
+
+    Focused config validation passes 117 tests, including five real client/server lost-reply,
+    malformed-path, cached-failure, cancellation and restart regressions, in
+    `.tmp/test-retained-registry-open-final-20260908.log`. The 24-crate regression passes 2,644 tests
+    in `.tmp/test-registry-open-integration-regression-20260908.log`. Native release passes with
+    unchanged 262 warnings in `.tmp/build-retained-registry-open-20260908.log`. No desktop acceptance
+    is claimed; the strict native import frontier remains open.
+
+    B3 legacy registry lease removal tranche 116 (next):
+
+    Replace the remaining runtime legacy OPEN/CLOSE consumer, active driver-service path resolution,
+    with one CM-owned immutable snapshot. Resolve the actual mounted-hive active Services cell and
+    candidate child cell in one serialized server turn, then capture generation, physical path and
+    service binding. This avoids creating temporary leases without weakening stable identity to a
+    textual prefix test. Migrate lease test fixtures to the retained protocol and remove the old
+    unacknowledged OPEN/CLOSE client methods and server branches; preserve non-acquiring RESOLVE.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
