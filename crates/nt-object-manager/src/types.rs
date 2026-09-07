@@ -143,12 +143,25 @@ impl DirectoryBody {
     /// Insert `child` under `name`. `STATUS_OBJECT_NAME_COLLISION` if a name that
     /// folds to the same key already exists.
     pub(crate) fn insert(&mut self, name: UnicodeString, child: ObjectRef) -> Result<(), NtStatus> {
-        let key = name.to_ascii_folded();
-        if self.entries.iter().any(|e| e.key == key) {
+        self.insert_case(name, child, CaseSensitivity::CaseInsensitive)
+    }
+
+    pub(crate) fn insert_case(
+        &mut self,
+        name: UnicodeString,
+        child: ObjectRef,
+        case: CaseSensitivity,
+    ) -> Result<(), NtStatus> {
+        if self.find(&name, case).is_some() {
             return Err(NtStatus::OBJECT_NAME_COLLISION);
         }
+        let key = name.to_ascii_folded();
         self.entries.push(DirEntry { key, name, child });
         Ok(())
+    }
+
+    pub(crate) fn children(&self) -> impl Iterator<Item = (&UnicodeString, &ObjectRef)> {
+        self.entries.iter().map(|entry| (&entry.name, &entry.child))
     }
 
     /// Look up a child by name, returning a new counted reference.

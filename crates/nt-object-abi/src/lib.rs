@@ -41,6 +41,8 @@ pub mod opcode {
     pub const OB_OP_CREATE_DEVICE: u16 = 0x2024;
     pub const OB_OP_CREATE_FILE_HANDLE: u16 = 0x2025;
     pub const OB_OP_REFERENCE_FILE_HANDLE: u16 = 0x2026;
+    pub const OB_OP_CREATE_DIRECTORY_HANDLE: u16 = 0x2027;
+    pub const OB_OP_OPEN_DIRECTORY_HANDLE: u16 = 0x2028;
 
     pub const OB_OP_LOOKUP_PATH: u16 = 0x2030;
     pub const OB_OP_QUERY_OBJECT: u16 = 0x2031;
@@ -108,6 +110,39 @@ pub struct ObCreateDirectoryRequest {
     pub path_offset: u32,
     pub path_len_bytes: u32,
 }
+
+/// Atomic directory create/open. The root is a handle in the authenticated
+/// client's table. A zero root requires an absolute name (or unnamed create).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObDirectoryHandleRequest {
+    pub abi_size: u16,
+    pub obj_attributes: u16,
+    pub desired_access: u32,
+    pub root_directory: u64,
+    pub name_offset: u32,
+    pub name_len_bytes: u32,
+}
+
+/// A single directory enumeration. `output_base` is only used to relocate the
+/// x64 UNICODE_STRING pointers in the returned bytes, never dereferenced.
+/// Reply: information = bytes written, detail0 = next context, detail1 = required
+/// length. The output transport must hold all `buffer_length` bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ObQueryDirectoryRequest {
+    pub abi_size: u16,
+    pub restart_scan: u8,
+    pub return_single_entry: u8,
+    pub context: u32,
+    pub handle: u64,
+    pub output_base: u64,
+    pub buffer_length: u32,
+    pub reserved: u32,
+}
+
+const _: [(); 24] = [(); core::mem::size_of::<ObDirectoryHandleRequest>()];
+const _: [(); 32] = [(); core::mem::size_of::<ObQueryDirectoryRequest>()];
 
 /// `OB_OP_CREATE_SYMBOLIC_LINK` payload — link path + target path both in-buffer.
 #[repr(C)]

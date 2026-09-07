@@ -20,6 +20,7 @@ mod native_sd;
 mod port;
 pub mod se_exports;
 mod sid;
+pub mod subject_context;
 mod token;
 mod token_filter;
 mod token_info;
@@ -51,11 +52,16 @@ pub use job_token::{
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
-    capture_object_type_list, capture_security_descriptor, capture_security_descriptor_bytes,
-    native_acl_to_acl, query_security_descriptor_bytes, set_security_descriptor_bytes,
-    DACL_SECURITY_INFORMATION, DEFAULT_KEY_SECURITY_DESCRIPTOR, GROUP_SECURITY_INFORMATION,
-    MAX_CAPTURED_OBJECT_TYPES, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PROTECTED_SACL_SECURITY_INFORMATION, SACL_SECURITY_INFORMATION, STATUS_DATATYPE_MISALIGNMENT,
+    assign_object_security, assign_object_security_with_audit, capture_object_type_list,
+    capture_security_descriptor, capture_security_descriptor_bytes, native_acl_to_acl,
+    query_security_descriptor_bytes, set_security_descriptor_bytes, ObjectSecurityAssignment,
+    SecurityAssignmentAudit, SecurityAssignmentClient, SecurityAssignmentInheritance,
+    SecurityAssignmentPrivilegeOutcome, DACL_SECURITY_INFORMATION, DEFAULT_KEY_SECURITY_DESCRIPTOR,
+    GROUP_SECURITY_INFORMATION, MAX_CAPTURED_OBJECT_TYPES, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PROTECTED_SACL_SECURITY_INFORMATION,
+    SACL_SECURITY_INFORMATION, SEF_AVOID_OWNER_CHECK, SEF_AVOID_PRIVILEGE_CHECK,
+    SEF_DACL_AUTO_INHERIT, SEF_DEFAULT_DESCRIPTOR_FOR_OBJECT, SEF_DEFAULT_GROUP_FROM_PARENT,
+    SEF_DEFAULT_OWNER_FROM_PARENT, SEF_SACL_AUTO_INHERIT, STATUS_DATATYPE_MISALIGNMENT,
     STATUS_INVALID_SECURITY_DESCR, STATUS_UNKNOWN_REVISION, UNPROTECTED_DACL_SECURITY_INFORMATION,
     UNPROTECTED_SACL_SECURITY_INFORMATION,
 };
@@ -63,6 +69,9 @@ pub use port::{
     validate_secure_port_connect, SecurePortConnectSecurity, STATUS_SERVER_SID_MISMATCH,
 };
 pub use sid::{write_native_sid_sddl_utf16, Luid, Sid, STATUS_INVALID_SID};
+pub use subject_context::{
+    CapturedClientToken, CapturedSubjectContext, CapturedSubjectTokens, SubjectClientIdentity,
+};
 pub use token::{
     plan_client_impersonation, token_can_impersonate, AccessToken, AnonymousLogonTokenIds,
     ClientImpersonationPlan, GroupAdjustment, GroupAdjustmentPlan, GroupAdjustmentSummary,

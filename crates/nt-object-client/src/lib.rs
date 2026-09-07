@@ -11,6 +11,9 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+mod directory_tests;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -20,10 +23,10 @@ use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
     ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDereferenceObjectRequest,
     ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo, ObReferenceFileHandleRequest,
-    ObReferenceHandleRequest, ObReply,
+    ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
 };
 use nt_status::NtStatus;
-use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId};
+use nt_types::{AccessMask, HandleValue, ObjAttrFlags, ObjectId, ObjectTypeId, UnicodeString};
 
 /// A transport that carries one request to the Object Manager and returns the
 /// reply. `out_buf` receives any variable-length result payload.
@@ -46,7 +49,110 @@ pub struct ObjectInfo {
     pub route_kind: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryHandleResult {
+    pub status: NtStatus,
+    pub handle: HandleValue,
+    pub created: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryQueryResult {
+    pub status: NtStatus,
+    pub context: u32,
+    pub return_length: u32,
+    pub written: u32,
+}
+
 impl<B: Backend> ObjectClient<B> {
+    pub fn create_directory_handle(&mut self, root: Option<HandleValue>, name: &UnicodeString,
+        access: AccessMask, attributes: ObjAttrFlags) -> Result<DirectoryHandleResult, NtStatus>
+    {
+        self.directory_handle(root, name, access, attributes, true)
+    }
+
+    pub fn open_directory_handle(&mut self, root: Option<HandleValue>, name: &UnicodeString,
+        access: AccessMask, attributes: ObjAttrFlags) -> Result<HandleValue, NtStatus>
+    {
+        self.directory_handle(root, name, access, attributes, false).map(|result| result.handle)
+    }
+
+    fn directory_handle(&mut self, root: Option<HandleValue>, name: &UnicodeString,
+        access: AccessMask, attributes: ObjAttrFlags, create: bool)
+        -> Result<DirectoryHandleResult, NtStatus>
+    {
+        if root.is_some_and(|handle| handle.0 == 0) { return Err(NtStatus::INVALID_HANDLE); }
+        let flags = u16::try_from(attributes.bits()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        let bytes = name.len().checked_mul(2).and_then(|n| u32::try_from(n).ok())
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if bytes > u16::MAX as u32 { return Err(NtStatus::OBJECT_NAME_INVALID); }
+        let req = ObDirectoryHandleRequest { abi_size: size_of::<ObDirectoryHandleRequest>() as u16,
+            obj_attributes: flags, desired_access: access.bits(), root_directory: root.map_or(0, |h| h.0),
+            name_offset: size_of::<ObDirectoryHandleRequest>() as u32, name_len_bytes: bytes };
+        let mut buf = Vec::from(bytemuck::bytes_of(&req));
+        for unit in name.as_units() { buf.extend_from_slice(&unit.to_le_bytes()); }
+        let op = if create { opcode::OB_OP_CREATE_DIRECTORY_HANDLE } else { opcode::OB_OP_OPEN_DIRECTORY_HANDLE };
+        let reply = self.backend.call(op, &buf, &mut []);
+        let status = NtStatus(reply.status);
+        if !status.is_success() { return Err(status); }
+        if reply.detail0 == 0 || reply.detail1 > 1 { return Err(NtStatus::INVALID_PARAMETER); }
+        if (create && !((status == NtStatus::SUCCESS && reply.detail1 == 1)
+            || (status == NtStatus(0x4000_0000) && reply.detail1 == 0)))
+            || (!create && (status != NtStatus::SUCCESS || reply.detail1 != 0))
+        { return Err(NtStatus::INVALID_PARAMETER); }
+        Ok(DirectoryHandleResult { status, handle: HandleValue(reply.detail0), created: reply.detail1 != 0 })
+    }
+
+    /// The returned context must be committed by the native adapter only after
+    /// successful output delivery. No caller pointer is dereferenced here.
+    pub fn query_directory(&mut self, handle: HandleValue, context: u32, restart: bool,
+        single: bool, output_base: u64, output: &mut [u8]) -> Result<DirectoryQueryResult, NtStatus>
+    {
+        let length = u32::try_from(output.len()).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        let req = ObQueryDirectoryRequest { abi_size: size_of::<ObQueryDirectoryRequest>() as u16,
+            restart_scan: u8::from(restart), return_single_entry: u8::from(single), context,
+            handle: handle.0, output_base, buffer_length: length, reserved: 0 };
+        let reply = self.backend.call(opcode::OB_OP_QUERY_DIRECTORY, bytemuck::bytes_of(&req), output);
+        let status = NtStatus(reply.status);
+        // BUFFER_TOO_SMALL and NO_MORE_ENTRIES are complete enumeration results,
+        // unlike malformed packets or a transport too short for the request.
+        if status != NtStatus::SUCCESS && status != NtStatus(0x105)
+            && status != NtStatus::BUFFER_TOO_SMALL
+            && status != NtStatus(0x8000_001a_u32 as i32) { return Err(status); }
+        let next = u32::try_from(reply.detail0).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        let returned = u32::try_from(reply.detail1).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        if reply.information > length || returned < 32 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let valid = if status.is_success() {
+            let start = if restart { 0 } else { context };
+            let count = next.checked_sub(start).ok_or(NtStatus::INVALID_PARAMETER)?;
+            // Every entry needs a 32-byte record and two UTF-16 terminators,
+            // in addition to the final zero record. Bound cursor claims even
+            // when the transport returns malformed success metadata.
+            let minimum = 32 + u64::from(count) * 36;
+            u64::from(returned) >= minimum
+                && if count == 0 {
+                    status == NtStatus(0x105) && !single && returned == 32
+                        && reply.information == if length >= 32 { 32 } else { 0 }
+                } else {
+                    returned == reply.information
+                        && (!single || (status == NtStatus::SUCCESS && count == 1))
+                }
+        } else if status == NtStatus::BUFFER_TOO_SMALL {
+            single && next == context && reply.information == 0
+                && returned > length && returned >= 68
+        } else {
+            next == context && returned == 32
+                && reply.information == if length >= 32 { 32 } else { 0 }
+        };
+        if !valid { return Err(NtStatus::INVALID_PARAMETER); }
+        Ok(DirectoryQueryResult { status,
+            context: next,
+            return_length: returned,
+            written: reply.information })
+    }
+
     /// Wrap a transport backend.
     pub fn new(backend: B) -> Self {
         Self { backend }

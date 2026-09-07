@@ -19,3 +19,7 @@ bytemuck = { version = "1", default-features = false }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
+
+[dev-dependencies]
+nt-object-server = { workspace = true }
+nt-object-manager = { workspace = true }

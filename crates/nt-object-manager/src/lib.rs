@@ -17,6 +17,7 @@ mod access;
 mod handles;
 mod io;
 mod namespace;
+pub mod directory;
 pub mod object_security;
 pub mod object_type;
 mod store;

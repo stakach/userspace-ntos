@@ -21,7 +21,7 @@ use nt_object_abi::{
     opcode, ObCloseHandleRequest, ObCreateDirectoryRequest, ObCreateFileHandleRequest,
     ObCreateIoObjectRequest, ObCreateSymbolicLinkRequest, ObDereferenceObjectRequest,
     ObLookupPathRequest, ObOpenObjectRequest, ObQueryObjectInfo, ObReferenceFileHandleRequest,
-    ObReferenceHandleRequest, ObReply,
+    ObReferenceHandleRequest, ObReply, ObDirectoryHandleRequest, ObQueryDirectoryRequest,
 };
 use nt_object_manager::{ClientKind, ComponentId, ObjectBody, ObjectManager, ObjectRef};
 use nt_status::NtStatus;
@@ -108,6 +108,9 @@ impl Server {
             opcode::OB_OP_REPARSE_FILE_PATH => self.op_reparse_file_path(in_buf, out_buf),
             opcode::OB_OP_QUERY_OBJECT => self.op_query_object(in_buf, out_buf),
             opcode::OB_OP_CREATE_DIRECTORY => self.op_create_directory(in_buf),
+            opcode::OB_OP_CREATE_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, true),
+            opcode::OB_OP_OPEN_DIRECTORY_HANDLE => self.op_directory_handle(client, in_buf, false),
+            opcode::OB_OP_QUERY_DIRECTORY => self.op_query_directory(client, in_buf, out_buf),
             opcode::OB_OP_CREATE_SYMBOLIC_LINK => self.op_create_symlink(in_buf),
             opcode::OB_OP_QUERY_SYMBOLIC_LINK => self.op_query_symlink(in_buf, out_buf),
             opcode::OB_OP_CREATE_DRIVER => self.op_create_driver(client, in_buf),
@@ -240,6 +243,44 @@ impl Server {
             info.object_id,
             info.type_id,
         ))
+    }
+
+    fn op_directory_handle(&mut self, client: ClientId, buf: &[u8], create: bool)
+        -> Result<ObReply, NtStatus>
+    {
+        let req: ObDirectoryHandleRequest = read_req(buf)?;
+        check_size::<ObDirectoryHandleRequest>(req.abi_size)?;
+        if req.name_offset < req.abi_size as u32 || req.name_offset % 2 != 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let name = read_unicode(buf, req.name_offset, req.name_len_bytes)?;
+        let root = (req.root_directory != 0).then_some(HandleValue(req.root_directory));
+        let attributes = ObjAttrFlags::from_bits_retain(req.obj_attributes as u32);
+        let desired = AccessMask::from_bits_retain(req.desired_access);
+        if create {
+            let result = self.om.create_directory_handle(client, root, &name, desired, attributes)?;
+            let status = if result.created { NtStatus::SUCCESS } else {
+                nt_object_manager::directory::OBJECT_NAME_EXISTS
+            };
+            Ok(reply(status, 0, result.handle.0, u64::from(result.created)))
+        } else {
+            let handle = self.om.open_directory_handle(client, root, &name, desired, attributes)?;
+            Ok(reply(NtStatus::SUCCESS, 0, handle.0, 0))
+        }
+    }
+
+    fn op_query_directory(&mut self, client: ClientId, buf: &[u8], out: &mut [u8])
+        -> Result<ObReply, NtStatus>
+    {
+        let req: ObQueryDirectoryRequest = read_req(buf)?;
+        check_size::<ObQueryDirectoryRequest>(req.abi_size)?;
+        if req.reserved != 0 || req.restart_scan > 1 || req.return_single_entry > 1 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let output = out.get_mut(..req.buffer_length as usize).ok_or(NtStatus::INVALID_PARAMETER)?;
+        let result = self.om.query_directory(client, HandleValue(req.handle), req.context,
+            req.restart_scan != 0, req.return_single_entry != 0, req.output_base, output)?;
+        Ok(reply(result.status, result.written, u64::from(result.context), u64::from(result.return_length)))
     }
 
     fn op_create_directory(&mut self, buf: &[u8]) -> Result<ObReply, NtStatus> {

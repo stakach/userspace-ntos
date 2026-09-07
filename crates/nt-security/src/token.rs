@@ -2,6 +2,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::native_acl::NativeAcl;
 use crate::sid::{Luid, Sid};
@@ -861,11 +862,25 @@ pub struct TokenStatistics {
 /// Monotonic token-object arena. Process fields, thread impersonation contexts, and handles each
 /// hold an explicit reference, so closing the handle used to assign a thread token cannot destroy
 /// the thread's effective security context.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TokenStore {
     objects: Vec<Option<TokenObject>>,
     logon_sessions: Vec<LogonSessionReference>,
     next_luid: u64,
+    subject_domain: u64,
+}
+
+static NEXT_SUBJECT_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
+impl Clone for TokenStore {
+    fn clone(&self) -> Self {
+        Self {
+            objects: self.objects.clone(),
+            logon_sessions: self.logon_sessions.clone(),
+            next_luid: self.next_luid,
+            subject_domain: 0,
+        }
+    }
 }
 
 impl Default for TokenStore {
@@ -874,6 +889,7 @@ impl Default for TokenStore {
             objects: Vec::new(),
             logon_sessions: Vec::new(),
             next_luid: 1,
+            subject_domain: 0,
         }
     }
 }
@@ -888,7 +904,21 @@ impl TokenStore {
             objects: Vec::with_capacity(capacity),
             logon_sessions: Vec::new(),
             next_luid: 1,
+            subject_domain: 0,
         }
+    }
+
+    pub(crate) fn acquire_subject_domain(&mut self) -> Result<u64, u32> {
+        if self.subject_domain == 0 {
+            self.subject_domain = NEXT_SUBJECT_DOMAIN
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                .map_err(|_| 0xc000_009au32)?;
+        }
+        Ok(self.subject_domain)
+    }
+
+    pub(crate) fn subject_domain(&self) -> u64 {
+        self.subject_domain
     }
 
     /// Create the two long-lived Anonymous Logon objects owned by the security subsystem. Their
@@ -1413,4 +1443,37 @@ fn dynamic_usage(token: &AccessToken) -> usize {
             .default_dacl
             .as_ref()
             .map_or(0, |acl| acl.acl_size() as usize)
+}
+
+#[cfg(test)]
+mod subject_reference_tests {
+    use super::*;
+    use crate::{CapturedSubjectContext, SubjectClientIdentity};
+
+    #[test]
+    fn subject_capture_preflights_both_reference_count_limits() {
+        for overflow_client in [false, true] {
+            let mut tokens = TokenStore::new();
+            let primary = tokens.insert(AccessToken::system());
+            let mut impersonation = AccessToken::user(12);
+            impersonation.token_type = TokenType::Impersonation;
+            let client = tokens.insert(impersonation);
+            let overflowing = if overflow_client { client } else { primary };
+            tokens.objects[overflowing.slot()].as_mut().unwrap().references = u32::MAX;
+            let primary_before = tokens.reference_count(primary);
+            let client_before = tokens.reference_count(client);
+            let result = CapturedSubjectContext::capture(
+                &mut tokens,
+                primary,
+                Some(SubjectClientIdentity {
+                    token: client,
+                    level: SecurityImpersonationLevel::Anonymous,
+                }),
+                0,
+            );
+            assert_eq!(result.unwrap_err(), 0xc000_009a);
+            assert_eq!(tokens.reference_count(primary), primary_before);
+            assert_eq!(tokens.reference_count(client), client_before);
+        }
+    }
 }

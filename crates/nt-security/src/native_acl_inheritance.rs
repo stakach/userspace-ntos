@@ -21,6 +21,7 @@ const IO: u8 = 8;
 const INHERITED: u8 = 16;
 const INHERIT_FLAGS: u8 = OI | CI | NP | IO | INHERITED;
 
+#[derive(Clone, Copy)]
 pub struct NativeAclInheritance<'a> {
     pub is_container: bool,
     /// NT5 legacy inheritance clears effective inherited flags; automatic inheritance sets them.
@@ -173,8 +174,9 @@ fn effective_ace(
     ace: &ParsedAce<'_>,
     options: &NativeAclInheritance<'_>,
     propagate: bool,
+    filter_object_type: bool,
 ) -> Result<Option<(Vec<u8>, bool)>, u32> {
-    if let Some(required) = ace.inherited_guid {
+    if let Some(required) = ace.inherited_guid.filter(|_| filter_object_type) {
         if !options
             .object_type
             .is_some_and(|actual| actual.as_slice() == required)
@@ -194,7 +196,7 @@ fn effective_ace(
     let server = ace.server_sid.map(|sid| substitute_sid(sid, options));
     let mut mapped =
         mask != ace.mask || sid.replaced() || server.as_ref().is_some_and(SidSource::replaced);
-    let remove_guid = ace.inherited_guid.is_some() && (!propagate || mapped);
+    let remove_guid = filter_object_type && ace.inherited_guid.is_some() && (!propagate || mapped);
     let prefix_len = if remove_guid {
         mapped = true;
         if ace.object_guid.is_some() {
@@ -256,6 +258,13 @@ pub fn inherit_native_acl(
     parent: &NativeAcl,
     options: &NativeAclInheritance<'_>,
 ) -> Result<NativeAcl, u32> {
+    inherit_native_acl_with_provenance(parent, options).map(|(acl, _)| acl)
+}
+
+pub(crate) fn inherit_native_acl_with_provenance(
+    parent: &NativeAcl,
+    options: &NativeAclInheritance<'_>,
+) -> Result<(NativeAcl, bool), u32> {
     for sid in [
         Some(options.owner),
         Some(options.group),
@@ -276,6 +285,7 @@ pub fn inherit_native_acl(
         .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
     output.extend_from_slice(&[parent[0], 0, 8, 0, 0, 0, 0, 0]);
     let mut count = 0;
+    let mut object_specific = false;
     let mut offset = 8;
     for _ in 0..u16::from_le_bytes(parent[4..6].try_into().unwrap()) {
         let size = u16::from_le_bytes(parent[offset + 2..offset + 4].try_into().unwrap()) as usize;
@@ -284,7 +294,10 @@ pub fn inherit_native_acl(
         let flags = ace.bytes[1];
         let propagate = options.is_container && flags & (OI | CI) != 0 && flags & NP == 0;
         let effective = if flags & (if options.is_container { CI } else { OI }) != 0 {
-            effective_ace(&ace, options, propagate)?
+            // NT5 records a matched inheritance type even when mapped rights discard the ACE.
+            object_specific |= ace.inherited_guid.is_some_and(|required|
+                options.object_type.is_some_and(|actual| actual.as_slice() == required));
+            effective_ace(&ace, options, propagate, true)?
         } else {
             None
         };
@@ -300,6 +313,58 @@ pub fn inherit_native_acl(
         if propagation_needed && ace.mask != 0 {
             let flags = ace.bytes[1] | IO | if options.auto_inherit { INHERITED } else { 0 };
             append_ace(&mut output, &mut count, ace.bytes, flags)?;
+        }
+    }
+    let length = output.len() as u16;
+    output[2..4].copy_from_slice(&length.to_le_bytes());
+    output[4..6].copy_from_slice(&count.to_le_bytes());
+    NativeAcl::from_owned_bytes(output).map(|acl| (acl, object_specific)).map_err(|error| error.status())
+}
+
+/// NT5 explicit-child copying differs from parent inheritance: inherit-only ACEs are not
+/// effective, and inherited-object GUIDs never filter an explicit child ACE.
+pub(crate) fn copy_explicit_native_acl(source: &NativeAcl, options: &NativeAclInheritance<'_>,
+    map_creators: bool, drop_inherited: bool, clear_inherited: bool) -> Result<NativeAcl, u32>
+{
+    let source = source.as_bytes();
+    let mut output = Vec::new();
+    output.try_reserve_exact(8).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    output.extend_from_slice(&[source[0], 0, 8, 0, 0, 0, 0, 0]);
+    let mut count = 0;
+    let mut offset = 8;
+    let effective_options = NativeAclInheritance { auto_inherit: false, ..*options };
+    for _ in 0..u16::from_le_bytes(source[4..6].try_into().unwrap()) {
+        let size = u16::from_le_bytes(source[offset + 2..offset + 4].try_into().unwrap()) as usize;
+        let ace = parse_ace(&source[offset..offset + size], source[0])?;
+        offset += size;
+        if drop_inherited && ace.bytes[1] & INHERITED != 0 { continue; }
+        let reset = if clear_inherited { INHERITED } else { 0 };
+        if !map_creators {
+            let start = output.len();
+            append_ace(&mut output, &mut count, ace.bytes, ace.bytes[1] & !reset)?;
+            if ace.bytes[1] & IO == 0 {
+                let audit = matches!(ace.bytes[0], 2 | 3 | 7 | 8);
+                let mask = options.mapping.map(ace.mask)
+                    & (options.mapping.generic_all | if audit { ACCESS_SYSTEM_SECURITY } else { 0 });
+                output[start + 4..start + 8].copy_from_slice(&mask.to_le_bytes());
+            }
+            continue;
+        }
+        let propagate = options.is_container && ace.bytes[1] & (OI | CI) != 0;
+        let effective = if ace.bytes[1] & IO == 0 {
+            effective_ace(&ace, &effective_options, propagate, false)?
+        } else { None };
+        let mut propagation_needed = propagate;
+        if let Some((effective, mapped)) = effective {
+            let mut flags = effective[1];
+            if propagate && !mapped {
+                flags |= ace.bytes[1] & INHERIT_FLAGS;
+                propagation_needed = false;
+            }
+            append_ace(&mut output, &mut count, &effective, flags & !reset)?;
+        }
+        if propagation_needed && ace.mask != 0 {
+            append_ace(&mut output, &mut count, ace.bytes, (ace.bytes[1] | IO) & !reset)?;
         }
     }
     let length = output.len() as u16;

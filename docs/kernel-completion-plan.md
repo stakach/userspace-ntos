@@ -236,6 +236,23 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Add shared lossless native ACE inheritance for security assignment, including creator SID
   substitution, generic mapping and object/compound ACE propagation (tranche 95). Descriptor
   selection, subject authorization and publication remain separate.
+- [x] Capture exact primary/client token references with the actual effective impersonation level,
+  independent of later process/thread token replacement (tranche 96; host core).
+  Replace native primary-only capture, no-op releases and fixed SYSTEM privilege checks at cutover.
+- [x] Implement kernel security descriptor selection/authorization on the shared inheritance core
+  (tranche 97; host core). Do not bind native ObAssignSecurity until subject
+  identity, type-method dispatch and publication ownership are connected.
+- [x] Add atomic directory create/open and genuine enumeration to the canonical object service
+  (tranche 98; host service). Migrate Nt and Zw callers together and remove the
+  executive's duplicate ASCII name tree; provider-only namespace routing is not acceptable.
+- [~] Retain a generation-exact logical caller through provider dispatch, callback and wait resumes
+  (tranche 99). Validate the actual runtime binding and PM thread activation before capturing tokens;
+  neither ambient current-thread state nor a physical executor TCB is client authority.
+- [ ] Move real Ps/token bootstrap ownership ahead of provider DriverEntry, retaining one initial
+  System process and thread through handler initialization. Replace fake initialization identities
+  and bind PsIsSystemProcess only against the retained canonical System EPROCESS.
+- [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
+  through retained token leases. Complete shared Nt/Zw namespace migration and descriptor admission.
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
@@ -28370,6 +28387,90 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     required before binding ObAssignSecurity or replacing ntdll's existing security-object creation
     scaffolding. Directory-provider imports also require one canonical namespace shared with Nt
     callers; adding a separate provider directory universe would not close that contract.
+
+    B3 captured subject ownership tranche 96 (2026-09-08):
+
+    Add a non-cloneable captured context owning real TokenStore references to the primary and
+    optional client tokens. Both reference increments are validated before either is applied.
+    The captured effective impersonation level cannot exceed the token's inherent level and is
+    not silently raised when the descriptor consumer resolves it. Capture permits anonymous
+    contexts; each authorization operation must enforce its own required level, without falling
+    back to a more privileged primary token. Exact token identities survive later process/thread
+    replacement. Store-domain identities reject contexts presented to another store or a clone.
+    Resolution borrows the real store for a complete policy operation; release prevalidates both
+    references and cannot decrement a second time. Native context capture/release/privilege
+    wrappers remain unconverted and are not claimed correct by this preparatory host core.
+
+    The captured-subject privilege operation enforces NT5's impersonation-level guard before even
+    KernelMode or empty-set bypasses, then uses enabled full-LUID matches and preserves native
+    USED_FOR_ACCESS updates without the old eight-entry cap. Seventeen new ownership/integration
+    tests cover reference exhaustion, store identity, replacement, lowered authority and descriptor
+    assignment. The security crate passes 171 tests including tranche 97. The fifteen-crate
+    regression suite passes 1,916 tests; the executive release build passes with 262 warnings.
+    Logs: `.tmp/test-security-directory-regression-20260908.log` and
+    `.tmp/build-security-directory-20260908.log`. Root alone ran validation.
+
+    Review adjustment: native SeCaptureSubjectContext is still primary-only and SePrivilegeCheck
+    uses a fixed SYSTEM privilege list. Those are real authority gaps, not harmless instrumentation.
+    Complete authenticated broker-held token identities and context lifetime before native security
+    assignment; do not reuse process references as a substitute for exact token references.
+
+    B3 kernel descriptor assignment tranche 97 (2026-09-08):
+
+    Implement a pure kernel assignment policy consuming authenticated primary/client AccessToken
+    references and the captured effective impersonation level, not synthetic SYSTEM authority.
+    Reuse the native descriptor parser/builder and ACE inheritance core. Preserve absent, null,
+    empty and defaulted ACL distinctions, explicit owner/group selection, privilege checks,
+    protected/automatic inheritance, generic mapping and object-type inheritance. Unknown or
+    unimplemented server/untrusted descriptor modes must fail explicitly. Native publication and
+    the RTL-specific authority policy remain separate requirements.
+
+    Forty-three assignment tests cover legacy/extended inheritance, protected/defaulted/null/empty
+    ACLs, object GUIDs, token defaults, explicit owner/SACL authority and unsupported encodings.
+    Kernel assignment permits anonymous default selection, unlike RTL's Identification minimum;
+    explicit UserMode authorization still requires the stronger captured level. The audited API
+    retains actual SeSecurity/SeRestore grant and denial outcomes even when construction fails,
+    without fabricating privilege use for membership, bypass or unreached checks. Native callers
+    must deliver those outcomes before descriptor publication. Independent NT5 kernel review found
+    no supported-policy blocker; validation is shared with tranche 96 above.
+
+    B3 canonical directory service tranche 98 (2026-09-08):
+
+    Extend the existing ObjectManager service with atomic create-and-open, counted-name relative
+    opens and actual directory enumeration. Handles must retain canonical ObjectRefs, collision
+    and OBJ_OPENIF semantics must be real, and x64 enumeration records must relocate only into the
+    caller's output buffer. A failed operation cannot fabricate a handle or advance enumeration.
+    The service is already live before win32k DriverEntry, but ExecNtHandler still has a separate
+    ASCII/truncating namespace and direct unlink/permanence mutations. The native migration must
+    replace that name tree and route both Nt and Zw callers to one authority, retaining executive
+    runtime bodies by exact ObjectId. Remove duplicate WindowStations bootstrap ownership during
+    migration. Full NLS case folding and native security policy remain prerequisites, not implied
+    by preserving counted UTF-16 names in this service extension.
+
+    The shared resolver follows final/intermediate and dangling symbolic links with one bounded
+    expansion budget. Case-sensitive insertion and exact-name last-handle reaping preserve distinct
+    siblings. Admission prevents publishing a leaf that enumeration cannot encode. Client transport
+    rejects inconsistent success/warning lengths and cursor movement; NT5 zero-buffer, single-entry,
+    restart and end-of-directory semantics are preserved. Object Manager passes 102 tests, client
+    eight, ABI two, server twelve; these are included in the 1,916-test regression above. Independent
+    review found two wire/name boundary gaps, both fixed with tests before acceptance. Native bindings
+    remain deliberately absent until the single-namespace/security cutover.
+
+    B3 logical provider caller tranche 99 (2026-09-08, in progress):
+
+    PM thread activation generations must not wrap: dormant slots intentionally reuse both TID and
+    ETHREAD address. Preserve the exact activation alongside process lifetime and admitted runtime
+    routing through every provider dispatch, callback registry and parked message waiter. Missing
+    retained callback metadata must fail, not reconstruct authority from current state. Token capture
+    consumes this authenticated channel identity, never provider-supplied identity fields.
+
+    Review adjustment: the current PM/TokenStore are created after win32k DriverEntry, PID 4 is
+    presently allocated to SMSS, and the temporary provider process body is later re-keyed to CSRSS.
+    None identifies the initial System process. Introduce early root-owned Ps/token bootstrap state
+    and move those same stores into ExecNtHandler later; allocate and retain a separate canonical
+    System EPROCESS and actual bootstrap system thread before provider activation. Do not infer
+    System from PID, executable name, SYSTEM SID or the temporary CSRSS projection. This ordering
+    is also required for genuine initialization-time subject capture.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

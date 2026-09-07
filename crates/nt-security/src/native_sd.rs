@@ -17,6 +17,16 @@ use crate::create_token::{
 use crate::native_acl::{NativeAcl, STATUS_INVALID_ACL};
 use crate::sid::Sid;
 
+#[path = "security_assignment.rs"]
+mod security_assignment;
+pub use security_assignment::{
+    assign_object_security, assign_object_security_with_audit, ObjectSecurityAssignment,
+    SecurityAssignmentAudit, SecurityAssignmentClient, SecurityAssignmentInheritance,
+    SecurityAssignmentPrivilegeOutcome, SEF_AVOID_OWNER_CHECK, SEF_AVOID_PRIVILEGE_CHECK,
+    SEF_DACL_AUTO_INHERIT, SEF_DEFAULT_DESCRIPTOR_FOR_OBJECT, SEF_DEFAULT_GROUP_FROM_PARENT,
+    SEF_DEFAULT_OWNER_FROM_PARENT, SEF_SACL_AUTO_INHERIT,
+};
+
 pub const STATUS_UNKNOWN_REVISION: u32 = 0xC000_0058;
 pub const STATUS_INVALID_SECURITY_DESCR: u32 = 0xC000_0079;
 pub const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;

@@ -42,6 +42,11 @@ const ROOT_DIRECTORIES: &[&str] = &[
 /// Maximum symbolic-link expansions during one lookup (spec §9.3), to bound loops.
 const SYMLINK_LIMIT: u32 = 32;
 
+pub(crate) enum ResolvedPath {
+    Found(ObjectRef),
+    Vacant { parent: ObjectRef, name: UnicodeString },
+}
+
 impl ObjectManager {
     /// Register the Directory type (idempotent), returning its id.
     fn ensure_directory_type(&mut self) -> Result<ObjectTypeId, NtStatus> {
@@ -368,8 +373,35 @@ impl ObjectManager {
         follow_final: bool,
     ) -> Result<ObjectRef, NtStatus> {
         let root = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
-        let mut comps: Vec<UnicodeString> = path.components().to_vec();
-        let mut current = root.clone();
+        self.lookup_components_from(&root, path.components(), case, follow_final)
+    }
+
+    pub(crate) fn lookup_components_from(
+        &self,
+        start: &ObjectRef,
+        components: &[UnicodeString],
+        case: CaseSensitivity,
+        follow_final: bool,
+    ) -> Result<ObjectRef, NtStatus> {
+        match self.resolve_components_from(start, components, case, follow_final, false)? {
+            ResolvedPath::Found(object) => Ok(object),
+            ResolvedPath::Vacant { .. } => Err(NtStatus::OBJECT_NAME_NOT_FOUND),
+        }
+    }
+
+    /// Creation and lookup use the same reparse budget and directory authority.
+    /// Only creation may return a vacant final component after link expansion.
+    pub(crate) fn resolve_components_from(
+        &self,
+        start: &ObjectRef,
+        components: &[UnicodeString],
+        case: CaseSensitivity,
+        follow_final: bool,
+        allow_missing_final: bool,
+    ) -> Result<ResolvedPath, NtStatus> {
+        let root = self.root.clone().ok_or(NtStatus::OBJECT_PATH_NOT_FOUND)?;
+        let mut comps: Vec<UnicodeString> = components.to_vec();
+        let mut current = start.clone();
         let mut idx = 0usize;
         let mut hops = 0u32;
 
@@ -382,6 +414,9 @@ impl ObjectManager {
             let child = match step {
                 Err(()) => return Err(NtStatus::OBJECT_PATH_NOT_FOUND), // not a directory
                 Ok(None) => {
+                    if is_final && allow_missing_final {
+                        return Ok(ResolvedPath::Vacant { parent: current, name: comps[idx].clone() });
+                    }
                     return Err(if is_final {
                         NtStatus::OBJECT_NAME_NOT_FOUND
                     } else {
@@ -415,7 +450,7 @@ impl ObjectManager {
                 }
             }
         }
-        Ok(current)
+        Ok(ResolvedPath::Found(current))
     }
 
     /// Make a named object temporary: clear its permanent flag, and if it has no
@@ -453,7 +488,7 @@ impl ObjectManager {
             if let Ok(parent) = self.reference_by_id(parent_id) {
                 parent.with_body_mut(|b| {
                     if let ObjectBody::Directory(d) = b {
-                        d.remove(&name, CaseSensitivity::CaseInsensitive);
+                        d.remove(&name, CaseSensitivity::CaseSensitive);
                     }
                 });
             }
