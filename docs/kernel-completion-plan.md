@@ -184,18 +184,23 @@ below are historical baselines, not acceptance of the current provider cutover.
 - [x] Seal construction inventory into one exact-attempt retirement actor; retain suspend/delete/
   recycle phases, remove the independent cached construction TCB, and block generic memory cleanup
   until mechanism retirement completes (tranche 77, host/build; native retirement remains disabled).
+- [x] Add checked root-slot publication and migrate retained SC cleanup off the void recycler;
+  reject capacity, ownership and accounting failures before mutation (tranche 78, host/build).
 - [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
   emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
   its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
   holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Exact registry
-  coverage and full external alias state are now captured without transferring ownership. Next
-  retain complete external-alias cleanup journals and implement checked native slot/frame recycling
+  coverage and full external alias state are now captured without transferring ownership. Checked
+  root-slot publication is available and used by retained SC cleanup. Next split failed-memory-slot
+  ownership from immutable provenance, retain complete external-alias cleanup journals and implement
+  checked native frame recycling
   before transferring registry ownership or driving the sealed retirement actor. Failed SC
   attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
   inventory transfers explicitly to registry ownership on publication.
   The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
   longer invokes the destructive legacy release chain. Implement the checked retry backend and
-  checked empty-slot/frame free-list publication before attempting native retirement. Close remaining non-ingress routing
+  failed-memory-slot retirement and checked frame free-list publication before attempting native
+  retirement. Close remaining non-ingress routing
   bypasses and retain complete external-alias journals, then wire registered-resume
   failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
   follow complete journal retention and exclusion publication. Then cover other launch families
@@ -27555,6 +27560,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retained owners complete. Ordinary termination, first-resume failure, other launch families
     and live failure validation remain open. No QEMU/desktop proof is claimed; the recorded 33
     unresolved win32k imports remain the full desktop-gate blocker.
+
+    B3 checked root-slot publication tranche 78 (2026-09-07):
+    A host-tested SlotRecycleState borrows the allocator's existing storage without allocating or
+    becoming another slot owner. It validates the selected CSpace/tracker range, live and pinned
+    bits, raw free-list count/capacity, duplicate entry in the active prefix, and per-slot/aggregate
+    accounting before mutation. Rejection leaves all arrays and counters unchanged; it does not
+    clamp a corrupt count or discard an owned slot. Inactive popped cells do not participate in
+    duplicate detection. Successful publication appends the slot, clears its allocated bit and
+    retype bytes once, updates checked aggregate accounting and publishes the new count.
+
+    The focused native root_slot_recycle adapter uses that implementation over the actual allocator
+    arrays and counters under serialized executive execution, with no allocation, syscall, IPC or
+    callback between validation and commit. Retained scheduling-context cleanup now calls it
+    directly; its duplicated prechecks and void-recycler call are removed. Deletion acknowledgement
+    remains in SchedContextConstruction, so publication failure retains the empty slot and never
+    repeats deletion. This helper acknowledges allocator publication only: it cannot infer CSpace
+    emptiness, grant deletion authority or authorize physical-frame release.
+
+    Validation: nine new host tests cover selected-slot accounting, allocated-empty publication,
+    every tracker bound, invalid/reserved slots, pinned/unowned rejection, full/corrupt counts,
+    active-prefix duplicates, accounting underflow/overflow and SC-owner composition. The composed
+    test injects repeated free-list exhaustion after failed retype or failed configuration, then
+    returns capacity and verifies one publication with zero or one deletion respectively.
+    The serialized nine-crate suite passes 1,184 tests (255 in nt-user-host: 229 unit, 3 existing
+    integration and 23 construction integration). The subsequent executive build passes with the
+    unchanged 262-warning baseline. Logs: `.tmp/test-slot-recycle-20260907.log` and
+    `.tmp/build-slot-recycle-20260907.log`. Two read-only agents reviewed the native allocator
+    boundary and the remaining failed-memory-slot ownership contract; only root ran checks.
+
+    Review adjustment: failed-memory slots cover failed frame retype as well as failed copy.
+    MemoryConstructionProgress currently uses their slot number as both ownership and immutable
+    reconciliation provenance. Clearing that field on recycling would cause ProgressChanged;
+    leaving it as an owner risks deleting a reused slot. Next transfer a non-clone empty-slot owner
+    allocation-free into the existing sealed thread actor, preserve immutable provenance separately,
+    and keep the actor incomplete until checked recycling succeeds. Make revalidation phase-aware
+    so legitimate post-recycle reuse does not fabricate a new conflict, while changed coverage and
+    replay through later Alias/Frame/Mechanism journals still fail. No separate retirement queue or
+    generic mutable pending-runtime projection is needed.
+
+    The legacy void recycler and combined cnode_delete_recycle_r remain for unmigrated callers:
+    changing their return semantics globally would make delete-only retry callers replay already
+    acknowledged deletion. Migrate each with retained phases rather than silently substituting the
+    new helper. Failed-memory-slot retirement, external AliasTransition cleanup, frame free lists,
+    complete journals/exclusions and terminal registry transfer still block native thread retirement
+    activation. No QEMU/fault-injection/desktop proof is claimed; the recorded 33 unresolved win32k
+    imports remain the full desktop-gate blocker.
 
     Review adjustment: the scheduler capacity is primary plus 48 secondary lanes. Carry a
     generation-safe lane handle in provider/LPC pending records and callback dispatch context before

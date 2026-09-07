@@ -40,23 +40,7 @@ impl SchedContextIo for Backend {
         checked(unsafe { cnode_delete_r(cap) })
     }
     fn recycle_slot(&mut self, slot: u64) -> Result<(), u64> {
-        // The legacy recycler is infallible only after these checks, under this serialized borrow.
-        // In particular, never clear the live bit/accounting before free-list space is available.
-        let Some((word, bit)) = root_slot_bit(slot) else {
-            return Err(u64::MAX);
-        };
-        unsafe {
-            let live =
-                core::ptr::read((core::ptr::addr_of!(ROOT_SLOT_LIVE_BITS) as *const u64).add(word));
-            if root_slot_is_pinned(slot)
-                || live & bit == 0
-                || ROOT_SLOT_RECYCLE_N.load(Ordering::Relaxed) >= ROOT_SLOT_RECYCLE_CAP as u64
-            {
-                return Err(u64::MAX);
-            }
-            recycle_deleted_root_slot(slot);
-        }
-        Ok(())
+        unsafe { root_slot_recycle::publish_empty(slot) }.map_err(|_| u64::MAX)
     }
 }
 

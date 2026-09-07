@@ -15140,6 +15140,7 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
 }
 
 mod thread_sched_context;
+mod root_slot_recycle;
 use thread_sched_context::attach_sched_context;
 
 /// Build the page table for the relocated shared "cluster" region (rings, stack, IPC buffer,
