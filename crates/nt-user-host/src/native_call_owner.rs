@@ -5,8 +5,8 @@
 //! refer to the issuing ProcessManager; equal numeric IDs from another PM are not interchangeable.
 //! The native runtime must retain this non-clone owner across IPC and refuse runtime retirement
 //! while it is nonempty. No method exposes mutable frames or takes ownership out before IPC.
-//! Termination cancellation requires a separate mechanism acknowledgement and is not supplied
-//! here; termination never authorizes dropping a retained or ambiguous invocation.
+//! Termination never authorizes dropping a retained invocation. Cancellation requires serialized
+//! mechanism quiescence, cancellation of every retained reply, and separate local retirement.
 
 use crate::thread_binding::ThreadBinding;
 use alloc::vec::Vec;
@@ -49,6 +49,61 @@ pub enum NativeCallError {
     InvalidArguments,
     InvalidEnvelope,
     ServiceChanged,
+    LocalRetirement(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCallCancellationPhase {
+    Idle,
+    Invoking,
+    Acknowledged,
+    Indeterminate(u32),
+    Retired,
+}
+
+/// Evidence from the teardown adapter, never inferred from logical termination or a status sign.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCallCancellationOutcome {
+    /// The actual TCB is quiescent and all retained reply paths have been cancelled. Any issuer
+    /// of an earlier ambiguous operation has also been fenced from executing that operation.
+    /// This does not acknowledge deletion/recycling of locally retained reply capabilities.
+    QuiescedAndRepliesCancelled,
+    NotEntered(u32),
+    Indeterminate(u32),
+}
+
+/// Retained through local retirement. No unrestricted constructor or clone can issue authority.
+///
+/// ```compile_fail
+/// use nt_user_host::native_call_owner::NativeCallCancellation;
+/// fn duplicate(ticket: NativeCallCancellation<()>) {
+///     let _second_authority = ticket.clone();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct NativeCallCancellation<R> {
+    owner: u64,
+    attempt: u64,
+    binding: ThreadBinding<R>,
+    lifetime: ThreadLifetime,
+    call: u64,
+    depth: usize,
+    consumed: bool,
+}
+
+impl<R: Copy> NativeCallCancellation<R> {
+    pub fn binding(&self) -> ThreadBinding<R> {
+        self.binding
+    }
+    pub const fn lifetime(&self) -> ThreadLifetime {
+        self.lifetime
+    }
+    pub const fn call_epoch(&self) -> u64 {
+        self.call
+    }
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +252,9 @@ pub struct NativeCallOwner<R> {
     last_call: u64,
     last_attempt: u64,
     frames: Vec<Frame>,
+    cancellation: NativeCallCancellationPhase,
+    cancellation_attempt: Option<u64>,
+    cancellation_failure: Option<u32>,
 }
 
 impl<R: Copy + Eq> NativeCallOwner<R> {
@@ -223,6 +281,9 @@ impl<R: Copy + Eq> NativeCallOwner<R> {
             last_call: 0,
             last_attempt: 0,
             frames: Vec::new(),
+            cancellation: NativeCallCancellationPhase::Idle,
+            cancellation_attempt: None,
+            cancellation_failure: None,
         })
     }
 
@@ -242,6 +303,9 @@ impl<R: Copy + Eq> NativeCallOwner<R> {
 
     fn live(&self, binding: ThreadBinding<R>, pm: &ProcessManager) -> Result<(), NativeCallError> {
         self.validate(binding, pm)?;
+        if self.cancellation != NativeCallCancellationPhase::Idle {
+            return Err(NativeCallError::InvalidPhase);
+        }
         if pm.thread(self.lifetime.thread_id()).unwrap().state == ThreadState::Terminated {
             return Err(NativeCallError::Terminated);
         }
@@ -273,6 +337,130 @@ impl<R: Copy + Eq> NativeCallOwner<R> {
 
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+    pub const fn cancellation_phase(&self) -> NativeCallCancellationPhase {
+        self.cancellation
+    }
+    pub const fn cancellation_failure(&self) -> Option<u32> {
+        self.cancellation_failure
+    }
+
+    /// Begin only after all ordinary invocations have returned or been classified ambiguous.
+    /// The adapter must serialize teardown against every such issuer before acknowledging it;
+    /// this owner cannot itself stop an external actor or cancel a kernel reply path.
+    pub fn begin_cancellation(
+        &mut self,
+        binding: ThreadBinding<R>,
+        pm: &ProcessManager,
+    ) -> Result<NativeCallCancellation<R>, NativeCallError> {
+        self.validate(binding, pm)?;
+        if self.cancellation != NativeCallCancellationPhase::Idle
+            || self.frames.is_empty()
+            || self
+                .frames
+                .iter()
+                .any(|frame| matches!(frame.phase, NativeCallPhase::InFlight(_)))
+            || pm.thread(self.lifetime.thread_id()).unwrap().state != ThreadState::Terminated
+        {
+            return Err(NativeCallError::InvalidPhase);
+        }
+        let attempt = self
+            .last_attempt
+            .checked_add(1)
+            .ok_or(NativeCallError::Exhausted)?;
+        let ticket = NativeCallCancellation {
+            owner: self.owner,
+            attempt,
+            binding: self.binding,
+            lifetime: self.lifetime,
+            call: self.frames.last().unwrap().epoch,
+            depth: self.frames.len(),
+            consumed: false,
+        };
+        self.last_attempt = attempt;
+        self.cancellation_attempt = Some(attempt);
+        self.cancellation = NativeCallCancellationPhase::Invoking;
+        Ok(ticket)
+    }
+
+    fn validate_cancellation(
+        &self,
+        binding: ThreadBinding<R>,
+        pm: &ProcessManager,
+        ticket: &NativeCallCancellation<R>,
+    ) -> Result<(), NativeCallError> {
+        self.validate(binding, pm)?;
+        if ticket.consumed
+            || ticket.owner != self.owner
+            || ticket.binding != self.binding
+            || ticket.lifetime != self.lifetime
+            || self.cancellation_attempt != Some(ticket.attempt)
+            || self.current_epoch() != Some(ticket.call)
+            || self.frames.len() != ticket.depth
+        {
+            return Err(NativeCallError::WrongAttempt);
+        }
+        if pm.thread(self.lifetime.thread_id()).unwrap().state != ThreadState::Terminated {
+            return Err(NativeCallError::InvalidPhase);
+        }
+        Ok(())
+    }
+
+    /// A successful acknowledgement retains the same ticket and every original call frame.
+    /// Unknown cancellation is non-replayable, including through a second cancellation attempt.
+    pub fn record_cancellation(
+        &mut self,
+        binding: ThreadBinding<R>,
+        pm: &ProcessManager,
+        ticket: &mut NativeCallCancellation<R>,
+        outcome: NativeCallCancellationOutcome,
+    ) -> Result<(), NativeCallError> {
+        self.validate_cancellation(binding, pm, ticket)?;
+        if self.cancellation != NativeCallCancellationPhase::Invoking {
+            return Err(NativeCallError::InvalidPhase);
+        }
+        match outcome {
+            NativeCallCancellationOutcome::QuiescedAndRepliesCancelled => {
+                self.cancellation = NativeCallCancellationPhase::Acknowledged;
+                self.cancellation_failure = None;
+            }
+            NativeCallCancellationOutcome::NotEntered(status) => {
+                self.cancellation = NativeCallCancellationPhase::Idle;
+                self.cancellation_failure = Some(status);
+                self.cancellation_attempt = None;
+                ticket.consumed = true;
+            }
+            NativeCallCancellationOutcome::Indeterminate(status) => {
+                self.cancellation = NativeCallCancellationPhase::Indeterminate(status);
+                self.cancellation_failure = Some(status);
+            }
+        }
+        Ok(())
+    }
+
+    /// Report actual local reply-cap/bookkeeping retirement separately from mechanism quiescence.
+    /// A failed local attempt keeps Acknowledged and all frames, permitting only local retry.
+    pub fn finish_cancellation(
+        &mut self,
+        binding: ThreadBinding<R>,
+        pm: &ProcessManager,
+        ticket: &mut NativeCallCancellation<R>,
+        local_retirement: Result<(), u32>,
+    ) -> Result<(), NativeCallError> {
+        self.validate_cancellation(binding, pm, ticket)?;
+        if self.cancellation != NativeCallCancellationPhase::Acknowledged {
+            return Err(NativeCallError::InvalidPhase);
+        }
+        if let Err(status) = local_retirement {
+            self.cancellation_failure = Some(status);
+            return Err(NativeCallError::LocalRetirement(status));
+        }
+        self.frames.clear();
+        self.cancellation = NativeCallCancellationPhase::Retired;
+        self.cancellation_attempt = None;
+        self.cancellation_failure = None;
+        ticket.consumed = true;
+        Ok(())
     }
     pub fn depth(&self) -> usize {
         self.frames.len()
@@ -606,6 +794,9 @@ impl<R: Copy + Eq> NativeCallOwner<R> {
         outcome: NativeCallOutcome,
     ) -> Result<(), NativeCallError> {
         self.validate(binding, pm)?;
+        if self.cancellation != NativeCallCancellationPhase::Idle {
+            return Err(NativeCallError::InvalidPhase);
+        }
         if ticket.owner != self.owner || ticket.consumed {
             return Err(NativeCallError::WrongAttempt);
         }
@@ -659,6 +850,9 @@ impl<R: Copy + Eq> NativeCallOwner<R> {
         epoch: u64,
     ) -> Result<(), NativeCallError> {
         self.validate(binding, pm)?;
+        if self.cancellation != NativeCallCancellationPhase::Idle {
+            return Err(NativeCallError::InvalidPhase);
+        }
         if !matches!(self.top(epoch)?.phase, NativeCallPhase::Accepted(_)) {
             return Err(NativeCallError::InvalidPhase);
         }

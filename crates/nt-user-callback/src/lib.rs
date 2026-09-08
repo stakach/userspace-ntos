@@ -1358,7 +1358,6 @@ pub struct ActiveCallbackFrame {
     request: CallbackHeader,
     client: ActiveCallbackClient,
     saved_user_context: [u64; 20],
-    outer_resume_ip: u64,
     redirected: bool,
     callback_window: Option<ClientCallbackWindowState>,
     dispatch_context: DispatchContext,
@@ -1375,7 +1374,6 @@ impl ActiveCallbackFrame {
             request: CallbackHeader::idle(0, 0, 0, 0),
             client: ActiveCallbackClient::empty(),
             saved_user_context: [0; 20],
-            outer_resume_ip: 0,
             redirected: false,
             callback_window: None,
             dispatch_context: DispatchContext::EMPTY,
@@ -1404,7 +1402,6 @@ impl ActiveCallbackFrame {
         self.request.client_badge = 0;
         self.client.clear();
         self.saved_user_context.fill(0);
-        self.outer_resume_ip = 0;
         self.redirected = false;
         self.callback_window = None;
         self.dispatch_context.lane = nt_component_suspension::LaneHandle::INVALID;
@@ -1495,7 +1492,7 @@ impl ActiveCallbackFrame {
     }
 
     pub const fn outer_resume_ip(&self) -> u64 {
-        self.outer_resume_ip
+        self.saved_user_context[USER_CONTEXT_RIP]
     }
 
     pub const fn is_redirected(&self) -> bool {
@@ -1664,7 +1661,6 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
             request,
             client,
             saved_user_context: [0; 20],
-            outer_resume_ip: 0,
             redirected: false,
             callback_window: None,
             dispatch_context: DispatchContext::EMPTY,
@@ -1676,19 +1672,19 @@ impl<const DEPTH: usize> ActiveCallbackStack<DEPTH> {
         Ok(())
     }
 
+    /// Retain the parent's canonical execution snapshot before the child runs. Its RIP is the
+    /// only continuation address; callers must validate it in the exact client address space.
     pub fn record_redirect(
         &mut self,
         correlation: CallbackCorrelation,
         saved_user_context: [u64; 20],
-        outer_resume_ip: u64,
     ) -> Result<(), ValidationError> {
         let index = self.correlated_index(&correlation)?;
         let frame = &mut self.frames[index];
-        if frame.redirected || outer_resume_ip == 0 {
+        if frame.redirected || saved_user_context[USER_CONTEXT_RIP] == 0 {
             return Err(ValidationError::State);
         }
         frame.saved_user_context = saved_user_context;
-        frame.outer_resume_ip = outer_resume_ip;
         frame.redirected = true;
         Ok(())
     }
@@ -1893,7 +1889,6 @@ pub const USER_CONTEXT_R14: usize = 16;
 pub const USER_CONTEXT_R15: usize = 17;
 pub const USER_CONTEXT_FS_BASE: usize = 18;
 pub const USER_CONTEXT_GS_BASE: usize = 19;
-pub const X64_SYSCALL_INSTRUCTION_LEN: u64 = 2;
 pub const DISPATCH_ARG_SNAPSHOT_BYTES: usize = 0x400;
 
 /// Build the context which starts `KiUserCallbackDispatcher` through the kernel's normal sysret
@@ -1927,56 +1922,27 @@ pub const fn callback_redirect_context(
     redirected
 }
 
-/// Complete the suspended outer syscall after `NtCallbackReturn`. `TCB_ReadRegisters` reports the
-/// instruction address for a thread blocked on an `UnknownSyscall`, so the caller supplies the
-/// captured post-`syscall` return address and this helper rebuilds its sysret aliases. RAX receives
-/// the completed win32k result rather than the old SSN; all other general registers are preserved.
+/// Complete the suspended outer syscall from its retained canonical context, not the current
+/// child callback's context. Only RAX changes. RCX and R11 may have been explicitly edited and
+/// must not be reconstructed from RIP and RFLAGS; the kernel can restore them through IRET.
 pub const fn completed_outer_context(
     saved: &[u64; 20],
     result: u64,
-    outer_resume_ip: u64,
 ) -> [u64; 20] {
     let mut completed = *saved;
-    completed[USER_CONTEXT_RIP] = outer_resume_ip;
     completed[USER_CONTEXT_RAX] = result;
-    completed[USER_CONTEXT_RCX] = outer_resume_ip;
-    completed[USER_CONTEXT_R11] = completed[USER_CONTEXT_RFLAGS];
     completed
 }
 
-/// The post-syscall instruction pointer captured in a user context.
-///
-/// On x64 `syscall` saves the user return address in `RCX`. Some synthetic/test contexts only carry
-/// `RIP`, so fall back to that when `RCX` is absent.
-pub const fn syscall_resume_ip_from_context(saved: &[u64; 20]) -> u64 {
-    let rcx = saved[USER_CONTEXT_RCX];
-    if rcx == 0 {
-        saved[USER_CONTEXT_RIP]
-    } else {
-        rcx
-    }
-}
-
-/// Pick the post-`syscall` resume IP for a controlled user callback.
-///
-/// The fault IPC carries the authoritative x64 `syscall` return address in MR2. If that value is
-/// missing or stale, a suspended `TCB_ReadRegisters` context normally reports the trapping
-/// `syscall` instruction in `RIP`, so the real user-mode continuation is `RIP + 2`. The caller owns
-/// the address-space check because executability is process-specific.
-pub fn repaired_syscall_resume_ip(
-    message_resume_ip: u64,
+/// Validate the exact RIP of a canonical execution snapshot. The caller must use the private
+/// context operation, not the upstream fault-reporting register ABI. Neither RCX nor an adjusted
+/// fault address substitutes for the captured continuation. Executability is process-specific.
+pub fn canonical_callback_resume_ip(
     saved: &[u64; 20],
     mut executable: impl FnMut(u64) -> bool,
 ) -> Option<u64> {
-    if message_resume_ip != 0 && executable(message_resume_ip) {
-        return Some(message_resume_ip);
-    }
-    let fallback = saved[USER_CONTEXT_RIP].checked_add(X64_SYSCALL_INSTRUCTION_LEN)?;
-    if executable(fallback) {
-        Some(fallback)
-    } else {
-        None
-    }
+    let ip = saved[USER_CONTEXT_RIP];
+    (ip != 0 && executable(ip)).then_some(ip)
 }
 
 /// The x64 `MACHINE_FRAME` tail of a ReactOS `UCALLOUT_FRAME`.
@@ -2871,68 +2837,63 @@ mod tests {
         assert!(layout.frame_pointer < inherited[USER_CONTEXT_RSP]);
         assert!(layout.frame_pointer > current[USER_CONTEXT_RSP]);
 
-        let completed = completed_outer_context(&inherited, 0x1234, inherited[USER_CONTEXT_RIP]);
+        let completed = completed_outer_context(&inherited, 0x1234);
         assert_eq!(completed[USER_CONTEXT_RIP], inherited[USER_CONTEXT_RIP]);
         assert_eq!(completed[USER_CONTEXT_RSP], inherited[USER_CONTEXT_RSP]);
         assert_eq!(completed[USER_CONTEXT_RAX], 0x1234);
-        assert_eq!(
-            syscall_resume_ip_from_context(&current),
-            current[USER_CONTEXT_RCX]
-        );
+        assert_ne!(completed[USER_CONTEXT_RIP], current[USER_CONTEXT_RIP]);
+        assert_ne!(completed[USER_CONTEXT_RSP], current[USER_CONTEXT_RSP]);
+        assert_eq!(completed[USER_CONTEXT_RCX], inherited[USER_CONTEXT_RCX]);
+    }
 
-        current[USER_CONTEXT_RCX] = 0;
+    #[test]
+    fn canonical_callback_resume_uses_exact_rip_not_rcx() {
+        let mut saved = [0u64; 20];
+        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
+        saved[USER_CONTEXT_RCX] = 0x7fff_2000;
         assert_eq!(
-            syscall_resume_ip_from_context(&current),
-            current[USER_CONTEXT_RIP]
+            canonical_callback_resume_ip(&saved, |ip| ip == 0x7fff_1000),
+            Some(0x7fff_1000)
         );
     }
 
     #[test]
-    fn repaired_syscall_resume_ip_prefers_executable_fault_message_ip() {
+    fn canonical_callback_resume_never_repairs_an_unexecutable_rip() {
         let mut saved = [0u64; 20];
         saved[USER_CONTEXT_RIP] = 0x7fff_1000;
+        saved[USER_CONTEXT_RCX] = 0x7fff_2000;
         assert_eq!(
-            repaired_syscall_resume_ip(0x7fff_2000, &saved, |ip| ip == 0x7fff_2000),
-            Some(0x7fff_2000)
-        );
-    }
-
-    #[test]
-    fn repaired_syscall_resume_ip_uses_tcb_fault_ip_plus_syscall_length() {
-        let mut saved = [0u64; 20];
-        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
-        assert_eq!(
-            repaired_syscall_resume_ip(0x1000_0560_000, &saved, |ip| ip == 0x7fff_1002),
-            Some(0x7fff_1002)
-        );
-    }
-
-    #[test]
-    fn repaired_syscall_resume_ip_fails_closed_without_executable_continuation() {
-        let mut saved = [0u64; 20];
-        saved[USER_CONTEXT_RIP] = 0x7fff_1000;
-        assert_eq!(
-            repaired_syscall_resume_ip(0x1000_0560_000, &saved, |_| false),
+            canonical_callback_resume_ip(&saved, |ip| ip == 0x7fff_1002 || ip == 0x7fff_2000),
             None
         );
     }
 
     #[test]
-    fn completed_outer_context_uses_repaired_executable_resume() {
+    fn canonical_callback_resume_rejects_zero_without_access_check() {
+        let mut saved = [0u64; 20];
+        saved[USER_CONTEXT_RCX] = 0x7fff_2000;
+        assert_eq!(
+            canonical_callback_resume_ip(&saved, |_| panic!("zero RIP must be rejected")),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_callback_completion_preserves_edited_syscall_volatile_registers() {
         let mut saved = [0u64; 20];
         saved[USER_CONTEXT_RIP] = 0x7fff_1000;
         saved[USER_CONTEXT_RSP] = 0x1001_3f4f_e58;
         saved[USER_CONTEXT_RFLAGS] = 0x202;
-        let repaired =
-            repaired_syscall_resume_ip(0x1000_0560_000, &saved, |ip| ip == 0x7fff_1002).unwrap();
+        saved[USER_CONTEXT_RCX] = 0x1234;
+        saved[USER_CONTEXT_R11] = 0x5678;
 
-        let completed = completed_outer_context(&saved, 0xcafe_babe, repaired);
+        let completed = completed_outer_context(&saved, 0xcafe_babe);
 
-        assert_eq!(completed[USER_CONTEXT_RIP], 0x7fff_1002);
-        assert_eq!(completed[USER_CONTEXT_RCX], 0x7fff_1002);
+        assert_eq!(completed[USER_CONTEXT_RIP], saved[USER_CONTEXT_RIP]);
+        assert_eq!(completed[USER_CONTEXT_RCX], 0x1234);
+        assert_eq!(completed[USER_CONTEXT_R11], 0x5678);
         assert_eq!(completed[USER_CONTEXT_RAX], 0xcafe_babe);
         assert_eq!(completed[USER_CONTEXT_RSP], saved[USER_CONTEXT_RSP]);
-        assert_ne!(completed[USER_CONTEXT_RIP], 0x1000_0560_000);
     }
 
     #[test]
@@ -3367,8 +3328,8 @@ mod tests {
                 },
             )
             .unwrap();
-        stack.record_redirect(ca, [7; 20], 0xdead).unwrap();
-        stack.record_redirect(cb, [9; 20], 0xbeef).unwrap();
+        stack.record_redirect(ca, [7; 20]).unwrap();
+        stack.record_redirect(cb, [9; 20]).unwrap();
         assert_eq!(stack.is_lane_top(ca), Ok(true));
         assert_eq!(stack.is_lane_top(cb), Ok(true));
         // A returns FIRST, from underneath B's frame.
@@ -3394,7 +3355,7 @@ mod tests {
                 capacity: DISPATCH_MESSAGE_OUTPUT_BYTES,
             })
         );
-        assert_eq!(popped_a.outer_resume_ip(), 0xdead);
+        assert_eq!(popped_a.outer_resume_ip(), 7);
         assert_eq!(stack.len(), 1);
         // B's frame survived the middle-removal with its own context intact.
         let identity_b = ClientThreadIdentity::new(2, 21, 13);
@@ -3539,7 +3500,7 @@ mod tests {
             )
             .unwrap();
         stack
-            .record_redirect(outer_correlation, [0x11; 20], 0x1111)
+            .record_redirect(outer_correlation, [0x11; 20])
             .unwrap();
         stack.push(inner, 0xbbb0).unwrap();
         stack
@@ -3549,12 +3510,12 @@ mod tests {
             )
             .unwrap();
         stack
-            .record_redirect(inner_correlation, [0x22; 20], 0x2222)
+            .record_redirect(inner_correlation, [0x22; 20])
             .unwrap();
 
         let completed_inner = stack.pop(inner_correlation).unwrap();
         assert_eq!(completed_inner.saved_user_context(), &[0x22; 20]);
-        assert_eq!(completed_inner.outer_resume_ip(), 0x2222);
+        assert_eq!(completed_inner.outer_resume_ip(), 0x22);
         assert_eq!(
             completed_inner.callback_window(),
             Some(&ClientCallbackWindowState::new(0xbbbb, [0x21, 0x22, 0x23]))
@@ -3623,10 +3584,24 @@ mod tests {
             .record_callback_window(correlation, callback_window)
             .unwrap();
         assert_eq!(
-            stack.record_redirect(stale, [0; 20], 0x1000),
+            stack.record_redirect(stale, [0x1000; 20]),
             Err(ValidationError::Correlation)
         );
-        stack.record_redirect(correlation, [0; 20], 0x1000).unwrap();
+        let mut missing_rip = [0x1000; 20];
+        missing_rip[USER_CONTEXT_RIP] = 0;
+        assert_eq!(
+            stack.record_redirect(correlation, missing_rip),
+            Err(ValidationError::State)
+        );
+        assert!(!stack.top().unwrap().is_redirected());
+        assert_eq!(stack.top().unwrap().saved_user_context(), &[0; 20]);
+        assert_eq!(stack.top().unwrap().outer_resume_ip(), 0);
+        stack.record_redirect(correlation, [0x1000; 20]).unwrap();
+        assert_eq!(
+            stack.record_redirect(correlation, [0x2000; 20]),
+            Err(ValidationError::State)
+        );
+        assert_eq!(stack.top().unwrap().outer_resume_ip(), 0x1000);
         assert_eq!(stack.pop(stale), Err(ValidationError::Correlation));
         assert_eq!(stack.len(), 1);
         assert_eq!(
@@ -3751,26 +3726,22 @@ mod tests {
     }
 
     #[test]
-    fn completed_outer_context_restores_result_and_sysret_resume_aliases() {
+    fn completed_outer_context_changes_only_result() {
         let mut saved = [0u64; 20];
         let mut index = 0;
         while index < saved.len() {
             saved[index] = 0x2000 + index as u64;
             index += 1;
         }
-        let completed = completed_outer_context(&saved, 0xcafe_babe, 0x7fff_1234);
-        assert_eq!(completed[USER_CONTEXT_RIP], 0x7fff_1234);
+        let completed = completed_outer_context(&saved, 0xcafe_babe);
+        assert_eq!(completed[USER_CONTEXT_RIP], saved[USER_CONTEXT_RIP]);
         assert_eq!(completed[USER_CONTEXT_RAX], 0xcafe_babe);
-        assert_eq!(completed[USER_CONTEXT_RCX], 0x7fff_1234);
-        assert_eq!(completed[USER_CONTEXT_R11], saved[USER_CONTEXT_RFLAGS]);
+        assert_eq!(completed[USER_CONTEXT_RCX], saved[USER_CONTEXT_RCX]);
+        assert_eq!(completed[USER_CONTEXT_R11], saved[USER_CONTEXT_R11]);
         assert_eq!(completed[USER_CONTEXT_R10], saved[USER_CONTEXT_R10]);
         let mut index = 0;
         while index < saved.len() {
-            if index != USER_CONTEXT_RIP
-                && index != USER_CONTEXT_RAX
-                && index != USER_CONTEXT_RCX
-                && index != USER_CONTEXT_R11
-            {
+            if index != USER_CONTEXT_RAX {
                 assert_eq!(completed[index], saved[index]);
             }
             index += 1;

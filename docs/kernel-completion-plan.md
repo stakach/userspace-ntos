@@ -30551,6 +30551,76 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     never substitute for a retained parent's continuation. Keep genuine synchronous File retry
     request restoration separate until the native owner replaces it.
 
+    Canonical-callback checkpoint (2026-09-09): live initial and nested callback admission now
+    uses the checked private canonical snapshot; direct return and chained callback use only their
+    retained parent frame. Reporter-PC-plus-two, synthetic RCX/RIP fallback selection, duplicate
+    outer-PC storage and SYSRET alias repair are removed. Redirect and parent installation use the
+    checked private operation. Ordinary immediate completion is status-only; installed callback/APC
+    redirects still use an empty reply and atomic Continue bypasses reply. Obsolete full-reply
+    staging and provider/LPC continuation coordinate plumbing are removed. Explicit synchronous
+    File retry remains separate until its native owner cutover.
+
+    Two actual userspace probes now execute the selected GPR/SP/flags/x87/MXCSR/XMM image after a
+    private nonrestart edit and one-word terminal reply, then trigger a real local DR0 write-eight
+    watchpoint. Immediate and parked variants verify raw DR6 B0, real debug-fault acknowledgement,
+    cleared subsequent DR6 and exact TCB/Reply/independent-SC identity. The separate kernel test
+    continues to cover donated-SC return and duplicate reply rejection. All four-CPU kernel specs
+    and 14 userspace microtests pass (`.tmp/run-executed-context-probe-final-20260909.log`).
+
+    The probes exposed stale empty-receive metadata: NBRecv cleared user registers, but the syscall
+    tail reconstructed the previous label/length from the TCB. Empty polls and notification delivery
+    now publish one coherent empty IPC result, with stale-metadata regressions. The standalone
+    rootserver also now links compiler memory builtins, and failed microtests emit a nonzero guest
+    verdict. A QEMU exit without that verdict is no longer treated as success.
+
+    Apple Silicon QEMU 11's default JIT mapping stalled in host `cpu_check_watchpoint` ->
+    `do_tb_phys_invalidate` before guest debug delivery; host sampling and QMP register inspection
+    isolated the stall (`.tmp/qemu-context-watchpoint-sample-20260909.txt`). The unchanged guest
+    passes with split W^X and multi-threaded TCG. The launcher selects this mapping on that host
+    architecture while honoring explicit accelerator arguments/QEMU_ACCEL. This changes host code
+    mapping, not guest watchpoint semantics or CPU count; see the
+    [QEMU accelerator documentation](https://www.qemu.org/docs/master/system/invocation.html).
+    Original NT rootserver/disk staging is restored byte-for-byte. This is not an NT desktop run.
+
+    Review refinement: callback-to-provider/LPC transfer already installs its parent before parking.
+    Its terminal completion must therefore update only RAX, not replay the retained pre-wait GPR
+    image over a later acknowledged edit. Retain a staged-parent proof instead of duplicate saved
+    registers. The canonical SYSRET snapshot intentionally projects clobbered RCX/R11 as zero;
+    explicitly edited IRET contexts preserve their exact values. Neither form needs alias repair.
+    Rejected terminal writes/replies currently fail-stop before reply-cap pool release. The native
+    component coordinator still removes its suspension row before terminal reply processing; a
+    durable terminal-result phase remains required for recoverable completion without replaying the
+    provider. Do not describe that fail-stop behavior as retryable ownership.
+
+    Native producer refinement: share the generated naked Windows-ABI stubs with internal ntdll
+    callers rather than capturing an apparent caller inside the compiler-framed marshaling helper.
+    Capture the application record before any register/flag clobber, retain a separate immutable
+    exact-arity argument vector, and restage every argument before each retry. Both current producers
+    omit part of retry staging; the internal helper also always advertises eight arguments. Remove
+    those emitters and implicit geometry together with native consumer migration. Real PE execution
+    must validate captured registers, stack arguments, retry after transport-buffer clobber, and
+    Windows nonvolatile preservation; source-string tests alone are not the producer oracle.
+
+    Native-call cancellation host checkpoint: exact lifetime/binding and logical
+    termination admit a non-clone cancellation ticket only after ordinary InFlight operations have
+    settled. Quiescence and cancellation of every retained reply require explicit mechanism evidence
+    and fencing of any ambiguous issuer. That acknowledgement retains all nested original frames;
+    only separately acknowledged local reply-cap/bookkeeping retirement drains them. Dropped or
+    ambiguous cancellation cannot replay, and local cleanup failure permits only local retry. This
+    does not yet supply the native teardown adapter or relax any runtime-retirement boundary.
+    Seven new cancellation cases and a non-clone ticket check pass with all 654 affected unit,
+    49 integration and 11 compile-fail tests
+    (`.tmp/test-canonical-callback-cancellation-20260909.log`).
+    Native executive release and x86 production microkernel builds pass after the final callback
+    cleanup; the ARM microkernel compile-only check also passes
+    (`.tmp/build-canonical-callback-cancellation-executive-20260909.log`,
+    `.tmp/build-empty-recv-production-20260909.log`, `.tmp/build-empty-recv-aarch64-20260909.log`).
+    Microkernel execution probes, coherent empty-receive state and the host launcher changes are
+    committed and pushed as `a003133`. The strict 27-import desktop frontier is unchanged.
+    The rebuilt ntdll passes import/export verification and the actual-PE context-capture probe
+    (`.tmp/build-canonical-callback-cancellation-ntdll-20260909.log`,
+    `.tmp/test-canonical-callback-cancellation-ntdll-artifact-20260909.log`).
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

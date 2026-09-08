@@ -693,3 +693,320 @@ fn terminated_runtime_cannot_start_new_effects_but_can_record_exact_late_ack() {
         Err(NativeCallError::Terminated)
     );
 }
+
+#[test]
+fn cancellation_requires_termination_and_refuses_an_outstanding_invocation() {
+    let (mut pm, binding, mut owner) = setup();
+    assert_eq!(
+        owner.begin_cancellation(binding, &pm).unwrap_err(),
+        NativeCallError::InvalidPhase
+    );
+    let epoch = owner.admit(binding, &pm, capture(), &[1], None).unwrap();
+    assert_eq!(
+        owner.begin_cancellation(binding, &pm).unwrap_err(),
+        NativeCallError::InvalidPhase
+    );
+    owner.ready(binding, &pm, epoch, 0).unwrap();
+    let mut operation = owner.begin_completion(binding, &pm, epoch).unwrap();
+    pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+    assert_eq!(
+        owner.begin_cancellation(binding, &pm).unwrap_err(),
+        NativeCallError::InvalidPhase
+    );
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Idle
+    );
+    assert_eq!(
+        owner.phase(epoch),
+        Ok(NativeCallPhase::InFlight(NativeCallOperation::Complete))
+    );
+    owner
+        .record(
+            binding,
+            &pm,
+            &mut operation,
+            NativeCallOutcome::Acknowledged,
+        )
+        .unwrap();
+    let ticket = owner.begin_cancellation(binding, &pm).unwrap();
+    assert_eq!(ticket.binding(), binding);
+    assert_eq!(ticket.lifetime(), owner.lifetime);
+    assert_eq!(ticket.call_epoch(), epoch);
+    assert_eq!(ticket.depth(), 1);
+    assert_eq!(owner.phase(epoch), Ok(NativeCallPhase::Accepted(0)));
+    assert_eq!(
+        owner.acknowledge_retirement(binding, &pm, epoch),
+        Err(NativeCallError::InvalidPhase)
+    );
+}
+
+#[test]
+fn cancellation_ack_preserves_all_nested_ambiguous_frames_until_local_retirement() {
+    let (mut pm, binding, mut owner) = setup();
+    let outer = owner.admit(binding, &pm, capture(), &[1], None).unwrap();
+    let correlation = callback(binding, 1);
+    let mut redirect = owner
+        .begin_callback(binding, &pm, outer, correlation)
+        .unwrap();
+    owner
+        .record(binding, &pm, &mut redirect, NativeCallOutcome::Acknowledged)
+        .unwrap();
+    let inner = owner
+        .admit(binding, &pm, capture(), &[2], Some(correlation))
+        .unwrap();
+    let mut edit = owner.begin_edit(binding, &pm, inner, [99; 18], 7).unwrap();
+    owner
+        .record(
+            binding,
+            &pm,
+            &mut edit,
+            NativeCallOutcome::Indeterminate(0xdead),
+        )
+        .unwrap();
+    let proposal = *owner.pending_work(inner).unwrap().unwrap();
+    pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+    assert_eq!(owner.depth(), 2, "logical termination cannot drain frames");
+    let mut cancellation = owner.begin_cancellation(binding, &pm).unwrap();
+    assert_eq!(
+        owner.finish_cancellation(binding, &pm, &mut cancellation, Ok(())),
+        Err(NativeCallError::InvalidPhase)
+    );
+    owner
+        .record_cancellation(
+            binding,
+            &pm,
+            &mut cancellation,
+            NativeCallCancellationOutcome::QuiescedAndRepliesCancelled,
+        )
+        .unwrap();
+    assert_eq!(owner.depth(), 2);
+    assert_eq!(
+        owner.frames[0].phase,
+        NativeCallPhase::CallbackSuspended(correlation)
+    );
+    assert_eq!(
+        owner.phase(inner),
+        Ok(NativeCallPhase::Indeterminate(
+            NativeCallOperation::Edit,
+            0xdead
+        ))
+    );
+    assert_eq!(owner.pending_work(inner).unwrap(), Some(&proposal));
+    assert_eq!(
+        owner.finish_cancellation(binding, &pm, &mut cancellation, Err(0xc000_0001)),
+        Err(NativeCallError::LocalRetirement(0xc000_0001))
+    );
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Acknowledged
+    );
+    assert_eq!(owner.cancellation_failure(), Some(0xc000_0001));
+    assert_eq!(owner.depth(), 2);
+    assert!(!cancellation.consumed);
+    assert_eq!(
+        owner.begin_cancellation(binding, &pm).unwrap_err(),
+        NativeCallError::InvalidPhase
+    );
+    assert_eq!(
+        owner.record_cancellation(
+            binding,
+            &pm,
+            &mut cancellation,
+            NativeCallCancellationOutcome::QuiescedAndRepliesCancelled
+        ),
+        Err(NativeCallError::InvalidPhase)
+    );
+    owner
+        .finish_cancellation(binding, &pm, &mut cancellation, Ok(()))
+        .unwrap();
+    assert!(owner.is_empty());
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Retired
+    );
+    assert!(cancellation.consumed);
+    assert_eq!(
+        owner.finish_cancellation(binding, &pm, &mut cancellation, Ok(())),
+        Err(NativeCallError::WrongAttempt)
+    );
+    assert_eq!(
+        owner.record(binding, &pm, &mut edit, NativeCallOutcome::Acknowledged),
+        Err(NativeCallError::InvalidPhase)
+    );
+}
+
+#[test]
+fn cancellation_not_entered_retains_frames_and_uses_a_new_checked_attempt() {
+    let (mut pm, binding, mut owner) = setup();
+    let epoch = owner.admit(binding, &pm, capture(), &[1], None).unwrap();
+    pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+    let mut first = owner.begin_cancellation(binding, &pm).unwrap();
+    owner
+        .record_cancellation(
+            binding,
+            &pm,
+            &mut first,
+            NativeCallCancellationOutcome::NotEntered(9),
+        )
+        .unwrap();
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Idle
+    );
+    assert_eq!(owner.cancellation_failure(), Some(9));
+    assert_eq!(owner.phase(epoch), Ok(NativeCallPhase::Active));
+    let second = owner.begin_cancellation(binding, &pm).unwrap();
+    assert_ne!(first.attempt, second.attempt);
+    assert_eq!(
+        owner.record_cancellation(
+            binding,
+            &pm,
+            &mut first,
+            NativeCallCancellationOutcome::QuiescedAndRepliesCancelled
+        ),
+        Err(NativeCallError::WrongAttempt)
+    );
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Invoking
+    );
+}
+
+#[test]
+fn cancellation_ambiguity_and_dropped_ticket_never_authorize_replay_or_drain() {
+    for ambiguous in [false, true] {
+        let (mut pm, binding, mut owner) = setup();
+        let epoch = owner.admit(binding, &pm, capture(), &[1], None).unwrap();
+        pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+        let mut ticket = owner.begin_cancellation(binding, &pm).unwrap();
+        if ambiguous {
+            owner
+                .record_cancellation(
+                    binding,
+                    &pm,
+                    &mut ticket,
+                    NativeCallCancellationOutcome::Indeterminate(77),
+                )
+                .unwrap();
+            assert_eq!(
+                owner.cancellation_phase(),
+                NativeCallCancellationPhase::Indeterminate(77)
+            );
+            assert_eq!(
+                owner.record_cancellation(
+                    binding,
+                    &pm,
+                    &mut ticket,
+                    NativeCallCancellationOutcome::QuiescedAndRepliesCancelled
+                ),
+                Err(NativeCallError::InvalidPhase)
+            );
+            assert_eq!(
+                owner.finish_cancellation(binding, &pm, &mut ticket, Ok(())),
+                Err(NativeCallError::InvalidPhase)
+            );
+        }
+        drop(ticket);
+        assert_eq!(
+            owner.begin_cancellation(binding, &pm).unwrap_err(),
+            NativeCallError::InvalidPhase
+        );
+        assert_eq!(owner.phase(epoch), Ok(NativeCallPhase::Active));
+        assert_eq!(owner.depth(), 1);
+    }
+}
+
+#[test]
+fn cancellation_wrong_owner_binding_and_stale_ticket_do_not_mutate_either_owner() {
+    let (mut pm, binding, mut first) = setup();
+    let mut second = NativeCallOwner::new(binding, first.lifetime, &pm).unwrap();
+    first.admit(binding, &pm, capture(), &[1], None).unwrap();
+    second.admit(binding, &pm, capture(), &[1], None).unwrap();
+    pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+    let mut first_ticket = first.begin_cancellation(binding, &pm).unwrap();
+    let mut second_ticket = second.begin_cancellation(binding, &pm).unwrap();
+    assert_eq!(first_ticket.call, second_ticket.call);
+    assert_eq!(first_ticket.attempt, second_ticket.attempt);
+    let ack = NativeCallCancellationOutcome::QuiescedAndRepliesCancelled;
+    assert_eq!(
+        second.record_cancellation(binding, &pm, &mut first_ticket, ack),
+        Err(NativeCallError::WrongAttempt)
+    );
+    let mut changed = binding;
+    changed.tcb += 1;
+    assert_eq!(
+        first.record_cancellation(changed, &pm, &mut first_ticket, ack),
+        Err(NativeCallError::BindingChanged)
+    );
+    assert!(!first_ticket.consumed);
+    first
+        .record_cancellation(binding, &pm, &mut first_ticket, ack)
+        .unwrap();
+    second
+        .record_cancellation(binding, &pm, &mut second_ticket, ack)
+        .unwrap();
+    assert_eq!(
+        first.finish_cancellation(changed, &pm, &mut first_ticket, Ok(())),
+        Err(NativeCallError::BindingChanged)
+    );
+    assert_eq!(first.depth(), 1);
+    first
+        .finish_cancellation(binding, &pm, &mut first_ticket, Ok(()))
+        .unwrap();
+    second
+        .finish_cancellation(binding, &pm, &mut second_ticket, Ok(()))
+        .unwrap();
+}
+
+#[test]
+fn cancellation_revalidates_lifetime_after_mechanism_acknowledgement() {
+    let (mut pm, binding, mut owner) = setup();
+    pm.create_thread(binding.process.pid, 0x2000, 0, false)
+        .unwrap();
+    owner.admit(binding, &pm, capture(), &[1], None).unwrap();
+    pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+    let mut ticket = owner.begin_cancellation(binding, &pm).unwrap();
+    owner
+        .record_cancellation(
+            binding,
+            &pm,
+            &mut ticket,
+            NativeCallCancellationOutcome::QuiescedAndRepliesCancelled,
+        )
+        .unwrap();
+    // The runtime adapter must forbid this reuse while an owner exists. Even if it violates
+    // that prerequisite, a stale cancellation ticket cannot drain the old retained evidence.
+    let activation = pm
+        .prepare_thread_activation(binding.tid as u32, 0x3000, 0, false, 0x9000, 2, false)
+        .unwrap();
+    pm.commit_thread_activation(activation).unwrap();
+    assert_eq!(
+        owner.finish_cancellation(binding, &pm, &mut ticket, Ok(())),
+        Err(NativeCallError::LifetimeChanged)
+    );
+    assert_eq!(owner.depth(), 1);
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Acknowledged
+    );
+    assert!(!ticket.consumed);
+}
+
+#[test]
+fn cancellation_epoch_exhaustion_leaves_retained_owner_untouched() {
+    let (mut pm, binding, mut owner) = setup();
+    let epoch = owner.admit(binding, &pm, capture(), &[1], None).unwrap();
+    pm.exit_thread_at(binding.tid as u32, 0, 1).unwrap();
+    owner.last_attempt = u64::MAX;
+    assert_eq!(
+        owner.begin_cancellation(binding, &pm).unwrap_err(),
+        NativeCallError::Exhausted
+    );
+    assert_eq!(
+        owner.cancellation_phase(),
+        NativeCallCancellationPhase::Idle
+    );
+    assert_eq!(owner.phase(epoch), Ok(NativeCallPhase::Active));
+    assert_eq!(owner.cancellation_attempt, None);
+}

@@ -30,7 +30,6 @@ static USER_CALLBACK_EXPLORER_ATL_CREATE_DATA_TRACES: AtomicU64 = AtomicU64::new
 static USER_CALLBACK_TABLE_VALID: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_REDIRECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RETURNS: AtomicU64 = AtomicU64::new(0);
-static USER_CALLBACK_RESUME_IP_REPAIRS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_RESUME_IP_REJECTS: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_CONTEXT_TRACES: AtomicU64 = AtomicU64::new(0);
 static USER_CALLBACK_REAL_RESOURCE_STARTED: AtomicU64 = AtomicU64::new(0);
@@ -590,24 +589,11 @@ unsafe fn release_dispatch_output_stage(context: nt_user_callback::DispatchConte
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RetainedUserCallbackContext {
+/// The callback's parent has already been installed in the live TCB. The enclosing component
+/// continuation retains the bound reply and exact callback transfer; this marker carries no
+/// second register image that could overwrite edits made while that continuation is parked.
+pub(crate) struct StagedUserCallbackContext {
     client_tcb: u64,
-    saved_user_context: [u64; 20],
-    outer_resume_ip: u64,
-}
-
-impl RetainedUserCallbackContext {
-    pub(crate) const fn resume_ip(self) -> u64 {
-        self.outer_resume_ip
-    }
-
-    pub(crate) const fn resume_sp(self) -> u64 {
-        self.saved_user_context[nt_user_callback::USER_CONTEXT_RSP]
-    }
-
-    pub(crate) const fn resume_flags(self) -> u64 {
-        self.saved_user_context[nt_user_callback::USER_CONTEXT_RFLAGS]
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -618,12 +604,12 @@ pub(crate) enum CompletedUserCallback {
     ProviderWaitSuspended {
         pending: PendingProviderWaitDispatch,
         callback_token: u64,
-        callback_context: RetainedUserCallbackContext,
+        callback_context: StagedUserCallbackContext,
     },
     LpcWaitSuspended {
         pending: PendingLpcWaitDispatch,
         callback_token: u64,
-        callback_context: RetainedUserCallbackContext,
+        callback_context: StagedUserCallbackContext,
     },
 }
 
@@ -2710,16 +2696,21 @@ pub(crate) unsafe fn tcb_write_regs20(tcb: u64, registers: &[u64; 20], resume: b
     reply_info >> 12
 }
 
-pub(crate) unsafe fn restore_retained_user_callback_context(
-    context: RetainedUserCallbackContext,
+pub(crate) unsafe fn complete_staged_user_callback_context(
+    context: StagedUserCallbackContext,
     result: u64,
 ) -> bool {
-    let completed = nt_user_callback::completed_outer_context(
-        &context.saved_user_context,
-        result,
-        context.outer_resume_ip,
-    );
-    tcb_write_regs20(context.client_tcb, &completed, false) == 0
+    let mut registers = [0; 20];
+    registers[nt_user_callback::USER_CONTEXT_RAX] = result;
+    let update = nt_thread_start::amd64_context::LegacyContextRestore {
+        registers,
+        register_mask: 1 << nt_user_callback::USER_CONTEXT_RAX,
+        floating_point: None,
+        debug: None,
+    };
+    // The parent is already canonical. Neither its controls nor other registers are recaptured
+    // or replayed; the private operation preserves every unselected group atomically.
+    crate::thread_context::write(context.client_tcb, &update, false).is_ok()
 }
 
 pub(crate) unsafe fn tcb_unset_breakpoint(tcb: u64, bp_num: u64) -> u64 {
@@ -2775,40 +2766,22 @@ fn callback_resume_ip_executable(client: Win32kClientContext, ip: u64) -> bool {
     }
 }
 
-unsafe fn resolve_callback_resume_ip(
+unsafe fn validate_callback_resume_ip(
     client: Win32kClientContext,
-    message_resume_ip: u64,
     saved: &[u64; 20],
     phase: &[u8],
 ) -> Option<u64> {
-    let resolved = nt_user_callback::repaired_syscall_resume_ip(message_resume_ip, saved, |ip| {
+    let resolved = nt_user_callback::canonical_callback_resume_ip(saved, |ip| {
         callback_resume_ip_executable(client, ip)
     });
     match resolved {
-        Some(ip) if ip != message_resume_ip => {
-            let n = USER_CALLBACK_RESUME_IP_REPAIRS.fetch_add(1, Ordering::Relaxed);
-            if n < 16 {
-                print_str(b"[user-callback] repaired ");
-                print_str(phase);
-                print_str(b" resume-ip primary=0x");
-                print_crash_hex64(message_resume_ip);
-                print_str(b" tcb-rip=0x");
-                print_crash_hex64(saved[nt_user_callback::USER_CONTEXT_RIP]);
-                print_str(b" repaired=0x");
-                print_crash_hex64(ip);
-                print_str(b"\n");
-            }
-            Some(ip)
-        }
         Some(ip) => Some(ip),
         None => {
             let n = USER_CALLBACK_RESUME_IP_REJECTS.fetch_add(1, Ordering::Relaxed);
             if n < 16 {
                 print_str(b"[user-callback] rejected ");
                 print_str(phase);
-                print_str(b" resume-ip primary=0x");
-                print_crash_hex64(message_resume_ip);
-                print_str(b" tcb-rip=0x");
+                print_str(b" canonical resume-ip=0x");
                 print_crash_hex64(saved[nt_user_callback::USER_CONTEXT_RIP]);
                 print_str(b"\n");
             }
@@ -2817,61 +2790,45 @@ unsafe fn resolve_callback_resume_ip(
     }
 }
 
-pub(crate) unsafe fn resolve_active_callback_syscall_resume_ip(
+pub(crate) unsafe fn validate_active_callback_syscall_resume(
     client: Win32kClientContext,
-    message_resume_ip: u64,
-) -> Option<u64> {
+) -> bool {
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
     if active.top_for(&identity).is_none() {
-        return Some(message_resume_ip);
+        return true;
     }
     let Some(tcb) = callback_context_tcb(client) else {
-        return None;
+        return false;
     };
-    let mut saved = [0u64; 20];
-    tcb_read_regs20(tcb, &mut saved);
-    resolve_callback_resume_ip(client, message_resume_ip, &saved, b"nested-syscall")
+    let Ok(saved) = crate::thread_context::LegacyThreadContext::read(tcb) else {
+        return false;
+    };
+    validate_callback_resume_ip(client, &saved.registers, b"nested-syscall").is_some()
 }
 
 pub(crate) unsafe fn begin_controlled_user_callback_redirect(
     client: Win32kClientContext,
-    outer_resume_ip: u64,
-    outer_rsp: u64,
-    outer_flags: u64,
 ) -> bool {
     let Some(tcb) = callback_context_tcb(client) else {
         return false;
     };
-    let mut saved = [0u64; 20];
-    tcb_read_regs20(tcb, &mut saved);
-    let Some(outer_resume_ip) =
-        resolve_callback_resume_ip(client, outer_resume_ip, &saved, b"outer")
-    else {
+    let Ok(saved) = crate::thread_context::LegacyThreadContext::read(tcb) else {
         return false;
     };
-    redirect_pending_user_callback(
-        client,
-        &saved,
-        &saved,
-        outer_resume_ip,
-        outer_resume_ip,
-        outer_rsp,
-        outer_flags,
-        b"root-redirect",
-    )
+    redirect_pending_user_callback(client, &saved.registers, b"root-redirect")
 }
 
 unsafe fn redirect_pending_user_callback(
     client: Win32kClientContext,
-    redirect_context: &[u64; 20],
-    completion_context: &[u64; 20],
-    completion_resume_ip: u64,
-    callout_resume_ip: u64,
-    callout_rsp: u64,
-    callout_flags: u64,
+    saved: &[u64; 20],
     phase: &[u8],
 ) -> bool {
+    let Some(resume_ip) = validate_callback_resume_ip(client, saved, phase) else {
+        return false;
+    };
+    let saved_rsp = saved[nt_user_callback::USER_CONTEXT_RSP];
+    let saved_flags = saved[nt_user_callback::USER_CONTEXT_RFLAGS];
     let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
     let active = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE);
     // The frame to redirect is the innermost one of THIS client thread — another thread's frame may
@@ -2892,7 +2849,7 @@ unsafe fn redirect_pending_user_callback(
     }
 
     let Ok(layout) = nt_user_callback::UserCallbackStackLayout::below(
-        redirect_context[nt_user_callback::USER_CONTEXT_RSP],
+        saved_rsp,
         request.input_length as usize,
     ) else {
         return false;
@@ -2939,9 +2896,9 @@ unsafe fn redirect_pending_user_callback(
         layout.input_pointer,
         request.input_length,
         request.api_index,
-        callout_resume_ip,
-        callout_rsp,
-        callout_flags as u32,
+        resume_ip,
+        saved_rsp,
+        saved_flags as u32,
     );
     let frame_bytes = core::slice::from_raw_parts(
         core::ptr::addr_of!(frame) as *const u8,
@@ -2959,7 +2916,7 @@ unsafe fn redirect_pending_user_callback(
     }
 
     let redirected = nt_user_callback::callback_redirect_context(
-        redirect_context,
+        saved,
         dispatcher,
         layout.frame_pointer,
     );
@@ -2967,14 +2924,19 @@ unsafe fn redirect_pending_user_callback(
         phase,
         client,
         request.api_index,
-        redirect_context,
-        completion_context,
+        saved,
+        saved,
         &redirected,
-        completion_resume_ip,
-        callout_rsp,
+        resume_ip,
+        saved_rsp,
     );
-    let error = tcb_write_regs20(tcb, &redirected, false);
-    if error != 0 {
+    let update = nt_thread_start::amd64_context::LegacyContextRestore {
+        registers: redirected,
+        register_mask: sel4_rt::legacy_context::REGISTER_MASK,
+        floating_point: None,
+        debug: None,
+    };
+    if let Err(error) = crate::thread_context::write(tcb, &update, false) {
         print_str(b"[user-callback] client redirect TCB_WriteRegisters failed error=");
         print_u64(error);
         print_str(b"\n");
@@ -2983,8 +2945,7 @@ unsafe fn redirect_pending_user_callback(
     if active
         .record_redirect(
             nt_user_callback::CallbackCorrelation::from_request(&request),
-            *completion_context,
-            completion_resume_ip,
+            *saved,
         )
         .is_err()
     {
@@ -4030,23 +3991,18 @@ unsafe fn stage_returned_user_callback_context(
     result: u64,
     return_rsp: u64,
     phase: &[u8],
-) -> Option<RetainedUserCallbackContext> {
+) -> Option<StagedUserCallbackContext> {
     let tcb = (frame.client_tcb() > 1).then_some(frame.client_tcb())?;
-    let outer_resume_ip = resolve_callback_resume_ip(
+    // The live TCB is the child NtCallbackReturn invocation. Its parent continuation belongs to
+    // this exact completed frame and must not be recaptured from the child.
+    let outer_resume_ip = validate_callback_resume_ip(
         client,
-        frame.outer_resume_ip(),
         frame.saved_user_context(),
         phase,
     )?;
-    let context = RetainedUserCallbackContext {
-        client_tcb: tcb,
-        saved_user_context: *frame.saved_user_context(),
-        outer_resume_ip,
-    };
     let completed = nt_user_callback::completed_outer_context(
         frame.saved_user_context(),
         result,
-        outer_resume_ip,
     );
     let mut return_context = [0u64; 20];
     tcb_read_regs20(tcb, &mut return_context);
@@ -4060,7 +4016,16 @@ unsafe fn stage_returned_user_callback_context(
         outer_resume_ip,
         return_rsp,
     );
-    (tcb_write_regs20(tcb, &completed, false) == 0).then_some(context)
+    let update = nt_thread_start::amd64_context::LegacyContextRestore {
+        registers: completed,
+        register_mask: sel4_rt::legacy_context::REGISTER_MASK,
+        floating_point: None,
+        debug: None,
+    };
+    // Publish the staged marker only after exact acknowledgment of the parent installation.
+    // The caller can now park a provider/LPC wait without retaining a stale completion image.
+    crate::thread_context::write(tcb, &update, false).ok()?;
+    Some(StagedUserCallbackContext { client_tcb: tcb })
 }
 
 pub(crate) unsafe fn complete_controlled_user_callback(
@@ -4333,27 +4298,11 @@ pub(crate) unsafe fn complete_controlled_user_callback(
             print_str(b"[user-callback] chained callback missing client TCB\n");
             return None;
         }
-        let Some(chained_outer_resume_ip) = resolve_callback_resume_ip(
-            chained_client,
-            completed_frame.outer_resume_ip(),
-            completed_frame.saved_user_context(),
-            b"chained-outer",
-        ) else {
-            abort_controlled_user_callbacks();
-            print_str(b"[user-callback] chained callback missing executable outer resume=0x");
-            print_crash_hex64(completed_frame.outer_resume_ip());
-            print_str(b"\n");
-            return None;
-        };
+        // A sibling callback inherits the same retained parent, never the current child's TCB.
         let saved_outer = completed_frame.saved_user_context();
         if !redirect_pending_user_callback(
             chained_client,
             saved_outer,
-            saved_outer,
-            chained_outer_resume_ip,
-            chained_outer_resume_ip,
-            saved_outer[nt_user_callback::USER_CONTEXT_RSP],
-            saved_outer[nt_user_callback::USER_CONTEXT_RFLAGS],
             b"chained-redirect",
         ) {
             abort_controlled_user_callbacks();

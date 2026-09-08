@@ -191,17 +191,14 @@ impl ComponentSuspensionCompletion {
 struct ComponentNativeContinuation {
     pending: PendingComponentDispatch,
     reply_cap: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
-    callback_context: Option<win32k_glue::RetainedUserCallbackContext>,
+    callback_context: Option<win32k_glue::StagedUserCallbackContext>,
     abandon_native_reply: bool,
 }
 
 #[derive(Clone, Copy)]
 struct ComponentCallbackTransfer {
     token: u64,
-    context: win32k_glue::RetainedUserCallbackContext,
+    context: win32k_glue::StagedUserCallbackContext,
 }
 
 const COMPONENT_SUSPENSION_MAX_DEPTH: usize = 64;
@@ -670,25 +667,6 @@ impl SyscallReplyContext {
         context
     }
 
-    unsafe fn stage_fault_reply(
-        self,
-        status: u64,
-        resume_ip: u64,
-        sp: u64,
-        flags: u64,
-    ) -> (u64, u64, u64, u64) {
-        let mut regs = self.regs;
-        regs[0] = status;
-        regs[15] = resume_ip;
-        regs[16] = sp;
-        regs[17] = flags;
-        let mut i = 4;
-        while i < regs.len() {
-            set_reply_mr(i, regs[i]);
-            i += 1;
-        }
-        (regs[0], regs[1], regs[2], regs[3])
-    }
 }
 
 unsafe fn capture_authoritative_unknown_syscall_context(
@@ -771,26 +749,6 @@ fn trace_unknown_syscall_tcb_restage(
     print_str(b" tcb-flags=0x");
     print_hex_u64(user_flags);
     print_str(b"\n");
-}
-
-unsafe fn stage_serviced_syscall_reply(
-    native_call_transport: bool,
-    context: SyscallReplyContext,
-    result: u64,
-    m1: u64,
-    m3: u64,
-    resume_ip: u64,
-    sp: u64,
-    flags: u64,
-) -> (u64, u64, u64, u64) {
-    if native_call_transport {
-        set_reply_mr(15, resume_ip);
-        set_reply_mr(16, sp);
-        set_reply_mr(17, flags);
-        (result, m1, 0, m3)
-    } else {
-        context.stage_fault_reply(result, resume_ip, sp, flags)
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -2072,9 +2030,6 @@ unsafe fn provider_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
     reply_cap: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     if reply_cap == 0 {
@@ -2085,24 +2040,10 @@ unsafe fn provider_wait_admit_retained(
     };
     let wait_id = pending.request.header.wait_id;
     let sequence = next_dispatcher_wait_sequence();
-    let (resume_ip, resume_sp, resume_flags, callback_context) =
-        if let Some(transfer) = callback_transfer {
-            (
-                transfer.context.resume_ip(),
-                transfer.context.resume_sp(),
-                transfer.context.resume_flags(),
-                Some(transfer.context),
-            )
-        } else {
-            (resume_ip, resume_sp, resume_flags, None)
-        };
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
         reply_cap,
-        resume_ip,
-        resume_sp,
-        resume_flags,
-        callback_context,
+        callback_context: callback_transfer.map(|transfer| transfer.context),
         abandon_native_reply: false,
     };
     let lane = pending.dispatch.lane;
@@ -2210,9 +2151,6 @@ unsafe fn provider_wait_admit_retained(
 unsafe fn provider_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -2226,9 +2164,6 @@ unsafe fn provider_wait_admit_current(
         nt_handler,
         pending,
         active_reply,
-        resume_ip,
-        resume_sp,
-        resume_flags,
         callback_transfer,
     ) {
         return false;
@@ -2242,9 +2177,6 @@ unsafe fn lpc_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
     reply_cap: u64,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let Ok(reservation) = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() else {
@@ -2260,24 +2192,10 @@ unsafe fn lpc_wait_admit_retained(
     };
     let key = nt_component_suspension::SuspensionKey::lpc_request(pending.request.generation);
     let sequence = next_dispatcher_wait_sequence();
-    let (resume_ip, resume_sp, resume_flags, callback_context) =
-        if let Some(transfer) = callback_transfer {
-            (
-                transfer.context.resume_ip(),
-                transfer.context.resume_sp(),
-                transfer.context.resume_flags(),
-                Some(transfer.context),
-            )
-        } else {
-            (resume_ip, resume_sp, resume_flags, None)
-        };
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
         reply_cap,
-        resume_ip,
-        resume_sp,
-        resume_flags,
-        callback_context,
+        callback_context: callback_transfer.map(|transfer| transfer.context),
         abandon_native_reply: false,
     };
     let lane = pending.dispatch.lane;
@@ -2318,9 +2236,6 @@ unsafe fn lpc_wait_admit_retained(
 unsafe fn lpc_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
-    resume_ip: u64,
-    resume_sp: u64,
-    resume_flags: u64,
     callback_transfer: Option<ComponentCallbackTransfer>,
 ) -> bool {
     let active_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
@@ -2334,9 +2249,6 @@ unsafe fn lpc_wait_admit_current(
         nt_handler,
         pending,
         active_reply,
-        resume_ip,
-        resume_sp,
-        resume_flags,
         callback_transfer,
     ) {
         return false;
@@ -2350,8 +2262,10 @@ unsafe fn reply_component_native_continuation(
     continuation: ComponentNativeContinuation,
     status: u64,
 ) -> bool {
+    // The coordinator has completed its provider phase. Callers must fail-stop on rejection
+    // before releasing reply authority; this stack-held terminal outcome is not retryable yet.
     if let Some(context) = continuation.callback_context {
-        if !win32k_glue::restore_retained_user_callback_context(context, status) {
+        if !win32k_glue::complete_staged_user_callback_context(context, status) {
             return false;
         }
         client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0)
@@ -2418,11 +2332,11 @@ unsafe fn component_suspension_drain_ready(
                     let client = continuation.pending.client();
                     if win32k_glue::begin_controlled_user_callback_redirect(
                         client,
-                        continuation.resume_ip,
-                        continuation.resume_sp,
-                        continuation.resume_flags,
                     ) {
-                        client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0);
+                        assert!(
+                            client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0),
+                            "callback redirect reply failed before reply authority release"
+                        );
                     } else {
                         let cancelled = win32k_glue::cancel_suspended_user_callback();
                         assert!(reply_component_native_continuation(
@@ -3015,9 +2929,6 @@ unsafe fn drain_deferred_user_callback_returns(
                         nt_handler,
                         pending,
                         deferred.reply_cap,
-                        deferred.reply.resume_ip(),
-                        deferred.reply.resume_sp(),
-                        deferred.reply.resume_flags(),
                         Some(ComponentCallbackTransfer {
                             token: callback_token,
                             context: callback_context,
@@ -3035,9 +2946,6 @@ unsafe fn drain_deferred_user_callback_returns(
                         nt_handler,
                         pending,
                         deferred.reply_cap,
-                        deferred.reply.resume_ip(),
-                        deferred.reply.resume_sp(),
-                        deferred.reply.resume_flags(),
                         Some(ComponentCallbackTransfer {
                             token: callback_token,
                             context: callback_context,
@@ -10941,7 +10849,7 @@ pub(crate) unsafe fn service_sec_image(
                 wl_ring[wl_ri % 48] = m0 as u16;
                 wl_ri += 1;
             }
-            let mut resume_ip = m2; // RCX = syscall return address
+            let resume_ip = m2; // Ingress coordinates retained for explicit waits/APCs and retries.
             let sp = get_recv_mr(16);
             let flags = get_recv_mr(17);
             let syscall_reply_context = authoritative_syscall_context
@@ -11181,9 +11089,6 @@ pub(crate) unsafe fn service_sec_image(
                                     assert!(provider_wait_admit_current(
                                         &mut nt_handler,
                                         pending,
-                                        resume_ip,
-                                        sp,
-                                        flags,
                                         Some(ComponentCallbackTransfer {
                                             token: callback_token,
                                             context: callback_context,
@@ -11222,9 +11127,6 @@ pub(crate) unsafe fn service_sec_image(
                                     assert!(lpc_wait_admit_current(
                                         &mut nt_handler,
                                         pending,
-                                        resume_ip,
-                                        sp,
-                                        flags,
                                         Some(ComponentCallbackTransfer {
                                             token: callback_token,
                                             context: callback_context,
@@ -16514,9 +16416,6 @@ pub(crate) unsafe fn service_sec_image(
                     component_suspension_park_request = provider_wait_admit_current(
                         &mut nt_handler,
                         pending,
-                        resume_ip,
-                        sp,
-                        flags,
                         None,
                     );
                     assert!(
@@ -16532,9 +16431,6 @@ pub(crate) unsafe fn service_sec_image(
                     component_suspension_park_request = lpc_wait_admit_current(
                         &mut nt_handler,
                         pending,
-                        resume_ip,
-                        sp,
-                        flags,
                         None,
                     );
                     assert!(
@@ -16624,9 +16520,6 @@ pub(crate) unsafe fn service_sec_image(
                             peb_mirror,
                             scratch_base,
                         ),
-                        resume_ip,
-                        sp,
-                        flags,
                     );
                     if !redirected_user_callback {
                         let resumed = win32k_glue::cancel_suspended_user_callback();
@@ -16634,14 +16527,7 @@ pub(crate) unsafe fn service_sec_image(
                         ok = resumed.1;
                     }
                 } else if !component_suspension_park_request && ok {
-                    if let Some(resolved_resume_ip) =
-                        win32k_glue::resolve_active_callback_syscall_resume_ip(
-                            dispatch_client,
-                            resume_ip,
-                        )
-                    {
-                        resume_ip = resolved_resume_ip;
-                    } else {
+                    if !win32k_glue::validate_active_callback_syscall_resume(dispatch_client) {
                         active_callback_bad_resume = true;
                         st = 0xC000_0005;
                         ok = false;
@@ -17999,44 +17885,25 @@ pub(crate) unsafe fn service_sec_image(
             let inspect_component_lpc_after_reply =
                 (&*core::ptr::addr_of!(LPC_COMPONENT_WAITS))
                     .requires_post_reply_inspection(nt_handler.lpc_reply_published);
+            // Ordinary completion changes only RAX. Provider reentry can legitimately install
+            // newer target registers while this syscall is serviced; never replay ingress state.
+            // A committed callback/APC redirect already owns the full canonical context and gets
+            // an empty reply. Successful NtContinue has restarted atomically and bypassed this tail.
+            let len = if redirected_user_control { 0 } else { 1 };
+            let r0 = if redirected_user_control { 0 } else { result };
             let ((nb, nmi, nm0, nm1, nm2, nm3), native_reply_delivered) = if reply_main == 0 {
                 // Pre-retype (demo path): no reply objects exist yet, legacy `reply_to` it is.
-                let (r0, r1, r2, r3) = stage_serviced_syscall_reply(
-                    native_call_transport,
-                    syscall_reply_context,
-                    result,
-                    m1,
-                    m3,
-                    resume_ip,
-                    sp,
-                    flags,
-                );
-                (reply_recv_badge(fault_ep, 18, r0, r1, r2, r3), true)
+                (reply_recv_badge(fault_ep, len, r0, 0, 0, 0), true)
             } else {
                 // A client redirected into a win32k user-mode callback resumes with the length-0
                 // fault reply the redirect staged, not with a syscall result. User APC delivery uses
                 // the same shape because the APC dispatcher frame already carries the eventual
                 // STATUS_USER_APC return in the restored context.
-                let len = if redirected_user_control { 0 } else { 18 };
-                let (r0, r1, r2, r3) = if redirected_user_control {
-                    (0, 0, 0, 0)
-                } else {
-                    stage_serviced_syscall_reply(
-                        native_call_transport,
-                        syscall_reply_context,
-                        result,
-                        m1,
-                        m3,
-                        resume_ip,
-                        sp,
-                        flags,
-                    )
-                };
                 if inspect_component_lpc_after_reply {
                     // The broker reply is visible, but its server must observe this native reply
                     // before the retained component client resumes. Calls made during the bounded
                     // drain queue on the endpoint until `recv_full_r12` re-registers this Reply.
-                    let delivered = client_reply_on(reply_main, len, r0, r1, r2, r3);
+                    let delivered = client_reply_on(reply_main, len, r0, 0, 0, 0);
                     assert!(
                         delivered,
                         "LPC server native reply failed before component continuation selection"
@@ -18046,7 +17913,7 @@ pub(crate) unsafe fn service_sec_image(
                     (recv_full_r12(fault_ep, reply_main), delivered)
                 } else {
                     let received =
-                        client_reply_recv_badge(fault_ep, reply_main, len, r0, r1, r2, r3);
+                        client_reply_recv_badge(fault_ep, reply_main, len, r0, 0, 0, 0);
                     let delivered = received.0 != COMPOSITE_SEND_ERROR_BADGE;
                     (received, delivered)
                 }
