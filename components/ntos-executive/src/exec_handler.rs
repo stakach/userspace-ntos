@@ -22286,6 +22286,7 @@ impl ExecNtHandler {
     /// mechanism can discard only an untouched candidate. Once cleanup begins, its exact owner
     /// survives even an inconsistent mechanism generation and must not affect its replacement.
     pub(crate) fn drain_hosted_process_deletion_candidates(&mut self) -> usize {
+        self.drain_failed_thread_construction_mechanisms();
         let mut deleted = 0usize;
         for pi in 0..MAX_PI {
             let Some(candidate) = self.process_deletion_candidates.get(pi) else {
@@ -22318,6 +22319,24 @@ impl ExecNtHandler {
         }
         self.ps_object_retirements.print_census_changes();
         deleted
+    }
+
+    fn drain_failed_thread_construction_mechanisms(&mut self) {
+        for index in 0..self.thread_runtime.slot_count() {
+            let Some((id, runtime)) = self.thread_runtime.pending_construction_at(index) else {
+                continue;
+            };
+            if self.capture_thread_process_identity(runtime.pi, runtime.tid) != Some(runtime.process)
+                || self.capture_hosted_thread_reservations(
+                    runtime.pi, runtime.tid, runtime.badge, runtime.role,
+                ) != runtime.reservations
+            { continue; }
+            if unsafe { self.thread_runtime.advance_construction_mechanisms(index, id) }.is_ok() {
+                print_str(b"[thread-mechanisms] retired pending tid=");
+                print_u64(runtime.tid);
+                print_str(b"; memory and reservations retained\n");
+            }
+        }
     }
 
     pub(crate) fn duplicate_process_handle_with_access(

@@ -29994,6 +29994,31 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     slot in the sealed retirement actor; recycle failure must retain the empty slot without
     re-deleting it. This is a narrow actor-controlled update, not public mutable pending access.
 
+    B3 checked pending-construction mechanisms tranche 139 (2026-09-09, accepted):
+    retry pending construction mechanisms from the existing serialized retirement checkpoint.
+    Revalidate PM/process identity and the actual held pool/window reservations, then complete
+    registry, scratch and external alias reconciliation before invoking any mechanism operation.
+    An exclusive slot borrow drives the existing sealed actor with checked Suspend, Delete and
+    Recycle operations. CNode/SC release follows TCB deletion; failed memory-copy slots use only
+    unretyped slot recycling. No memory, address reservations or commitment is released here.
+
+    The actor-controlled TCB projection hook runs after deletion acknowledgment and before slot
+    recycling. A failed delete leaves the projection unchanged; a failed recycle leaves it cleared
+    while the actor still owns the empty slot. Wrong-cap clearing refuses allocator publication.
+    Retained original slot numbers remain provenance only; retry ownership checks use the actor's
+    currently pending failed-memory slot, not historical coverage. Native error diagnostics change
+    only when an exact owner's error changes, avoiding repeated stall-log flooding.
+    Full memory/external-alias retirement and final reservation release remain the next step;
+    completing this mechanism actor is not completion of the pending thread owner.
+
+    Serialized validation passes 602 unit tests, 47 integration tests (including four new TCB
+    projection/recycling cases) and three compile-fail checks in
+    .tmp/test-thread-mechanism-retirement-20260909.log. Native integration builds in
+    .tmp/build-thread-mechanism-retirement-20260909.log. Source review confirmed that slot claims,
+    memory exclusions and held pool/window reservations survive clearing the TCB projection; the
+    retired numeric slot no longer participates as a live TCB in binding admission. No desktop
+    result or full failed-thread memory reclamation is claimed by this checkpoint.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

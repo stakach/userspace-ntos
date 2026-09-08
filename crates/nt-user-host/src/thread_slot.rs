@@ -26,6 +26,12 @@ pub trait RuntimeConstruction: RuntimeIdentity {
     /// Read-only, allocation-free validation of failed-memory slot versus retained live owners.
     fn validate_construction(partial: &Self::Partial) -> Result<(), ThreadRollbackError>;
     fn publication_mut(&mut self) -> &mut ThreadPublicationSlot;
+    /// Clear only the copied TCB projection after the sealed actor acknowledges its deletion,
+    /// before the empty slot is recycled. Accept the exact expected cap or the already-cleared
+    /// reservation sentinel (1), and leave identity, reservations and memory untouched. Rejection
+    /// must not mutate anything; retries after a failed recycle must be idempotent. No allocation,
+    /// backend operation or reentry is allowed here.
+    fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32>;
     /// Infallible, allocation-free ownership move with no backend calls or reentrancy. Preserve
     /// identity, reservations and the publication slot; update binding.tcb to the partial TCB, or
     /// keep the unbuilt reservation sentinel when absent. Preserve any resource inventory already
@@ -353,7 +359,10 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
         &mut self,
         expected: ThreadRollbackId,
         io: &mut impl crate::thread_retirement::ThreadRetirementIo,
-    ) -> Result<(), SlotError> {
+    ) -> Result<(), SlotError>
+    where
+        R: RuntimeConstruction,
+    {
         self.pending_mut_exact(expected)?
             .advance_construction_retirement(io)
             .map_err(SlotError::Retirement)

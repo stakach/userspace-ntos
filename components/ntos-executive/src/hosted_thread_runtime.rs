@@ -13,6 +13,7 @@ pub(crate) struct HostedThreadRuntimeOwner {
     alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasCleanup>,
     prefetch_preparation: core::cell::OnceCell<client_prefetch::ThreadPrefetchCleanup>,
     provider_preparation: core::cell::OnceCell<win32k_glue::ThreadProviderAliasCleanup>,
+    retirement_error: core::cell::Cell<Option<u32>>,
 }
 
 impl HostedThreadRuntimeOwner {
@@ -24,6 +25,7 @@ impl HostedThreadRuntimeOwner {
             alias_preparation: core::cell::OnceCell::new(),
             prefetch_preparation: core::cell::OnceCell::new(),
             provider_preparation: core::cell::OnceCell::new(),
+            retirement_error: core::cell::Cell::new(None),
         }
     }
 
@@ -360,7 +362,7 @@ impl HostedThreadRuntimeTable {
         provider.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
         for cap in snapshot.rollback_resources().iter().map(|resource| resource.cap)
             .chain(construction.entries().filter_map(|(_, state)| state.slot()))
-            .chain(owner.memory_coverage.empty_slot())
+            .chain(retirement.pending_memory_slot())
         {
             if client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
                 || win32k_glue::provider_alias_owns_root_cap(cap)
@@ -905,6 +907,53 @@ impl HostedThreadRuntimes {
         unsafe { (&mut *self.table).validate_spawn(prepared, spawn) }
     }
 
+    pub(crate) fn slot_count(&self) -> usize {
+        unsafe { (&*self.table).entries.len() }
+    }
+
+    pub(crate) fn pending_construction_at(&self, index: usize) -> Option<(
+        nt_user_host::thread_rollback::ThreadRollbackId, HostedThreadRuntime,
+    )> {
+        let pending = unsafe { (&*self.table).entries.get(index)?.pending()? };
+        (!pending.construction_retirement()?.is_complete())
+            .then(|| (pending.id(), pending.runtime().runtime))
+    }
+
+    /// # Safety
+    /// Caller has validated current PM/process identity and held pool/window reservations.
+    /// This drives mechanisms only; memory, journals and reservations remain in the pending row.
+    pub(crate) unsafe fn advance_construction_mechanisms(
+        &mut self, index: usize, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), u32> {
+        let table = &mut *self.table;
+        let result = (|| {
+            if table.entries.get(index).and_then(RuntimeSlot::pending)
+                .is_none_or(|pending| pending.id() != id)
+            { return Err(nt_address_space::STATUS_INVALID_PARAMETER); }
+            table.reconcile_failed_spawn(id).map_err(|error| error.status())?;
+            let slot = table.entries.get_mut(index).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+            if slot.pending().is_none_or(|pending| pending.id() != id) {
+                return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+            }
+            crate::thread_construction_retirement::advance(slot, id)
+        })();
+        if let Some(pending) = table.entries.get(index).and_then(RuntimeSlot::pending)
+            .filter(|pending| pending.id() == id)
+        {
+            let current = result.as_ref().err().copied();
+            if pending.runtime().retirement_error.replace(current) != current {
+                if let Some(status) = current {
+                    print_str(b"[thread-mechanisms] retained tid=");
+                    print_u64(id.identity().tid);
+                    print_str(b" status=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                }
+            }
+        }
+        result
+    }
+
     pub(crate) fn commit_spawn(
         &mut self,
         prepared: PreparedHostedThreadRuntime,
@@ -1021,6 +1070,14 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
 
 impl RuntimeConstruction for HostedThreadRuntimeOwner {
     type Partial = RetainedHostedThreadConstruction;
+
+    fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
+        if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+        }
+        self.runtime.tcb = 1;
+        Ok(())
+    }
 
     fn construction_binding(partial: &Self::Partial) -> nt_user_host::thread_binding::ThreadBinding<Self::Role> {
         partial.binding

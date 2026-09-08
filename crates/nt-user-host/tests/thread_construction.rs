@@ -113,6 +113,7 @@ struct Runtime {
     partial: Option<Partial>,
     reconciliation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<2>,
     coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<2>,
+    projection_override: Option<u64>,
 }
 
 impl RuntimeIdentity for Runtime {
@@ -139,9 +140,16 @@ impl RuntimeConstruction for Runtime {
     fn publication_mut(&mut self) -> &mut ThreadPublicationSlot {
         &mut self.publication
     }
+    fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
+        if self.binding.tcb != expected_cap && self.binding.tcb != 1 {
+            return Err(0xc000_000d);
+        }
+        self.binding.tcb = 1;
+        Ok(())
+    }
     fn retain_partial(&mut self, mut partial: Partial) -> (ThreadConstructionInventory, Option<nt_user_host::thread_construction::FailedMemorySlot>) {
         assert!(self.partial.is_none());
-        self.binding.tcb = partial.tcb.unwrap_or(1);
+        self.binding.tcb = self.projection_override.unwrap_or(partial.tcb.unwrap_or(1));
         let inventory = std::mem::replace(&mut partial.inventory, ThreadConstructionInventory::empty());
         let progress = std::mem::replace(&mut partial.memory_progress, nt_user_host::thread_construction::MemoryConstructionProgress::empty());
         let (coverage, memory_slot) = progress.into_retained();
@@ -178,6 +186,7 @@ fn fixture(tcb: Option<u64>, built: bool) -> (Slot, Ticket, Partial, Rc<Cell<usi
         partial: None,
         reconciliation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
         coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
+        projection_override: None,
     })
     .unwrap();
     let ticket = slot
@@ -912,3 +921,6 @@ fn pending_memory_is_excluded_before_fallible_journal_preparation() {
     assert!(check_pending_thread_memory(2, 0x1000, 1, [pending]).is_err());
     assert!(owner.cleanup().is_none());
 }
+
+#[path = "thread_construction/tcb_projection.rs"]
+mod tcb_projection;

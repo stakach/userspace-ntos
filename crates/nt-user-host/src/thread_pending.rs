@@ -1,7 +1,8 @@
 //! Retained runtime ownership before fallible rollback-journal construction.
 use crate::thread_binding::ThreadRuntimeReservations;
-use crate::thread_construction::{FailedMemorySlot, ThreadConstructionInventory};
+use crate::thread_construction::{FailedMemorySlot, Role, ThreadConstructionInventory};
 use crate::thread_retirement::{RetirementError, ThreadConstructionRetirement, ThreadRetirementIo};
+use crate::thread_slot::RuntimeConstruction;
 use crate::thread_rollback::{
     new_rollback_id, ThreadRollback, ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity,
     ThreadRollbackIo, ThreadRollbackResource, ThreadRollbackStage,
@@ -26,6 +27,34 @@ pub struct PendingThreadRuntime<R> {
 enum PendingMechanisms {
     Registered(u64),
     Construction(ThreadConstructionRetirement),
+}
+
+struct ProjectionRetirementIo<'a, R, T> {
+    runtime: &'a mut R,
+    backend: &'a mut T,
+}
+
+impl<R: RuntimeConstruction, T: ThreadRetirementIo> ThreadRetirementIo
+    for ProjectionRetirementIo<'_, R, T>
+{
+    fn is_current(&self, id: ThreadRollbackId) -> bool {
+        self.backend.is_current(id)
+    }
+    fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32> {
+        self.backend.suspend_tcb(tcb)
+    }
+    fn delete_cap(&mut self, role: Role, cap: u64) -> Result<(), u32> {
+        self.backend.delete_cap(role, cap)
+    }
+    fn recycle_slot(&mut self, role: Role, slot: u64) -> Result<(), u32> {
+        if role == Role::Tcb {
+            self.runtime.clear_retired_tcb_projection(slot)?;
+        }
+        self.backend.recycle_slot(role, slot)
+    }
+    fn recycle_failed_memory_slot(&mut self, slot: u64) -> Result<(), u32> {
+        self.backend.recycle_failed_memory_slot(slot)
+    }
 }
 
 impl<R> PendingThreadRuntime<R> {
@@ -100,9 +129,15 @@ impl<R> PendingThreadRuntime<R> {
     pub(crate) fn advance_construction_retirement(
         &mut self,
         io: &mut impl ThreadRetirementIo,
-    ) -> Result<(), RetirementError> {
+    ) -> Result<(), RetirementError>
+    where
+        R: RuntimeConstruction,
+    {
         match &mut self.mechanisms {
-            PendingMechanisms::Construction(owner) => owner.advance(io),
+            PendingMechanisms::Construction(owner) => owner.advance(&mut ProjectionRetirementIo {
+                runtime: &mut self.runtime,
+                backend: io,
+            }),
             PendingMechanisms::Registered(_) => Err(RetirementError::NotConstruction),
         }
     }
