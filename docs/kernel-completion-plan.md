@@ -29689,7 +29689,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the unused preparatory adapter), .tmp/build-ps-object-paging-20260908.log. The broader 26-crate
     regression passes 2,924 tests in 59 suites, .tmp/test-mapping-ownership-regression-20260908.log.
 
-    B3 canonical ASID lifetime tranche 134 (next, required before provider-root expansion): remove
+    B3 canonical ASID lifetime tranche 134 (2026-09-08, complete; physical derivation follows in 135): remove
     the initial-pool wrapping allocator and the parallel per-pool used counters. A checked pool
     identity and the canonical live ASID catalog must select free slots without recycling zero or
     a live root. Capability copies may account for an already registered exact identity, not
@@ -29701,6 +29701,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Include TCB-held VSpace references in final-root lifetime: deleting the last CNode alias alone
     must not invalidate a still-referenced root. Pool finalization separately invalidates all of
     that exact pool's assignments, with the required architecture-specific TLB handling.
+    The x86 review additionally requires synchronous, lock-independent remote flush ACKs;
+    the old per-sender pending-IPI cause can be overwritten and cannot prove retirement.
+    Service retirement mailboxes before taking BKL and while spinning for it with IF clear.
+    Every user-return path, including same-thread IRQ and transparent debug-syscall returns,
+    must select a current assigned root or the real kernel-only root, never a cached CR3 or
+    zero meaning "keep the previous address space." The unused pre-MCS demo launchers and
+    their diagnostic-byte exit hooks are removed rather than adapted around this boundary;
+    the live SMP probe moves to a focused spec module with actual pool/root CTE owners.
+    Initial runtime validation exposed an existing fixture lifecycle bug: invocation tests freed
+    runnable TCB slots without unlinking scheduler queues, while APs could concurrently walk
+    those queues. Monitor inspection identified the BSP waiting for retirement ACKs and an AP
+    cycling in choose_thread. Global-state fixture groups now take an interrupt-safe kernel-lock
+    guard, syscall-entry fixtures lock setup and teardown separately, and TCB teardown unlinks
+    readiness before slab reuse. This fixes the test lifecycle; it does not weaken shootdown ACKs.
+    Final validation passes all four-CPU kernel specs, including real retirement ACKs from IF-clear
+    BKL waiters, and 12/12 userspace microtests with sentinel and QEMU exit 0. Both the production
+    x86 kernel (209 warnings) and the supported standalone ARM kernel configuration (200 warnings)
+    build, as does the native executive. Logs: .tmp/build-asid-lifetime-final-20260908.log,
+    .tmp/run-asid-lifetime-final-20260908.log,
+    .tmp/build-asid-lifetime-production-final-20260908.log,
+    .tmp/build-asid-lifetime-aarch64-20260908.log,
+    .tmp/build-asid-lifetime-executive-20260908.log. Original NT rootserver/disk staging is restored.
+    These are microkernel results, not a new NT desktop boot or proof of TCB physical derivation.
+
+    B3 TCB capability derivation tranche 135 (required before Ps backing activation): ASID
+    reference accounting alone does not protect physical backing. TCB-held VSpace capabilities
+    currently have no MDB edge, while Untyped revoke resets its allocation watermark after
+    deleting only CNode descendants. Represent the TCB's actual derived capability ownership,
+    authenticated against the exact source CTE, in copy/move/delete/revoke/reparent and TCB
+    destruction. Revoke must withdraw derived TCB access and complete architecture invalidation
+    before physical memory can be retyped. Audit the analogous held CSpace root in the same
+    ownership boundary. Do not substitute an address-range retention blocker or equate a queued
+    remote invalidation IPI with completed invalidation. Add regressions for source deletion,
+    source movement, ancestor revoke, TCB replacement/destruction and physical-address reuse.
+    Source review selects real TCB-internal CTEs, matching seL4's ownership model, with generic
+    MDB location access rather than a second parent/reference side table. Include the installed
+    IPC-buffer, fault-handler and timeout-handler capabilities in this boundary as well as CSpace
+    and VSpace. Drain those slots through state-owned finalization before freeing the TCB; a
+    destructor must not reacquire mutable global kernel state while its slab is borrowed.
 
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
