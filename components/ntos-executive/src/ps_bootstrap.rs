@@ -82,6 +82,7 @@ unsafe fn publish_initial_objects(
     // collide with a hosted object; a failed invariant is fatal, never a partial live bootstrap.
     assert!(pm.publish_process_kernel_object(identity.process_id(), process as u64));
     assert!(pm.publish_thread_kernel_object(identity.thread_id(), thread as u64));
+    ps_object_backing::initialize(identity)?;
     core::ptr::addr_of_mut!(INITIAL_SYSTEM_PROJECTION).write(Some(InitialSystemProjection {
         identity,
         process_body: process as u64,

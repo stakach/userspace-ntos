@@ -29873,6 +29873,54 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lifetime admission and RW/NX aliases; arbitrary addresses in this arena must never fall through
     to attached-user or generic fault mapping.
 
+    B3 canonical Ps page ownership tranche 136 (2026-09-09, ownership mechanism accepted;
+    live cutover pending): compose the retained
+    paging mechanism with an unmapped backing-frame owner and independent AliasTransition rows.
+    Prepublish durable address/body rows before acquisition or mapping, initialize neutral bytes
+    only in fresh unpublished root aliases, and retain every failed copy/map/delete/recycle stage.
+    Drain provider aliases before the root alias, then release backing before its address lease.
+    Bootstrap designates the root arena with the existing InitialSystemIdentity and root VSpace;
+    it does not allocate ordinary bodies or publish replacement PM pointers yet. Root capability
+    exclusion must cover pending paging/alias/empty slots as well as original backing. Ordinary
+    frame cleanup must not bypass that owner; its final transfer uses a private, borrow-scoped
+    release permit after all aliases drain.
+
+    Cutover review: ThreadId owns stable ETHREAD storage across dormant activation; a captured
+    ThreadLifetime identifies one activation and must not become permanent body identity.
+    Prepared unpublished initialization rejects changed activation data. Provider aliases and
+    requestors must hold actual PM references or participate in activation admission before live
+    cutover. Existing provider finalization currently frees pool EPROCESS/ETHREAD and PM finish
+    releases body-address reservations immediately afterward. Reverse publication only after
+    replacing both ends together: executive prepares and publishes; win32k requires supplied
+    nonzero exact bodies and owns GUI adjuncts only; PM sync validates bodies instead of adopting
+    provider output; the withdrawal ticket drains aliases/backing before PM finish. Remove both
+    synthetic initialize_eprocess_body and canonical identity/TEB rewrites from GUI selection.
+    No provider grants, native requestor activation, or desktop result is claimed for this tranche.
+
+    Implemented OwnedObjectPage composes the existing AliasTransition rather than adding another
+    copy/map/rollback state machine. Thirteen focused failure/retry tests pass, including failed
+    acquisition, empty-slot retention, initialization retry without live reinitialization,
+    independent target identities, rights rollback, and provider-first/root-last retirement.
+    The native ps_object_backing arena retains the address lease, original unmapped frame and
+    root alias alongside its PsObjectPaging ledger, binds to the existing PM designation, and
+    initializes bytes through the neutral ABI. Unpublished thread preparation requires the exact
+    current activation and a ready parent body; child rows block parent abort. Ordinary abort
+    refuses both published pointers and missing/withdrawn PM records. A private borrow-scoped
+    permit is the only Ps-owned path through checked frame-pool publication. Capability exclusions
+    now cover thread cleanup, client frame registration and legacy frame recycling. Provider
+    faults anywhere in the reserved branch are refused before generic/client demand mapping;
+    enabling a provider alias requires exact lifetime admission, not removal of this guard.
+
+    Final serialized host validation passes 660 unit tests (nt-kernel-abi 17,
+    nt-memory-manager 396, nt-pnp-context 16, nt-process 231) plus four compile-fail ownership
+    checks, with no ignored tests: .tmp/test-ps-object-backing-final-20260909.log. Native executive
+    integration compiles after using the existing PM query API for its private PEB field:
+    .tmp/build-ps-object-backing-executive-final-20260909.log. Bootstrap registers only the empty
+    arena; prepare/publication callers remain deliberately inactive. Before activating them,
+    introduce an explicit published/retiring state and connect the PM withdrawal ticket to the
+    exact body owner. PM lookup absence alone cannot authorize freeing a formerly published body.
+    No QEMU run or new desktop proof was produced by this ownership tranche.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

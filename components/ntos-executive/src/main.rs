@@ -8790,7 +8790,11 @@ pub(crate) unsafe fn csrss_frame_put_at_cap_source_backing(
     owns_frame: bool,
     owned_backing_cap: u64,
 ) -> bool {
-    if [fr, alias_cap, source_cap].into_iter().any(frame_acquisition::owns_root_cap) {
+    if [fr, alias_cap, source_cap, owned_backing_cap]
+        .into_iter()
+        .any(|cap| frame_acquisition::owns_root_cap(cap)
+            || ps_object_backing::owns_root_cap(cap))
+    {
         return false;
     }
     if !temporary_frame_alias::memory_available(pi, page, 0x1000) {
@@ -12951,6 +12955,7 @@ unsafe fn vm_frame_return_to_free_list(frame: u64) {
         return;
     }
     assert!(!frame_acquisition::owns_root_cap(frame), "frame acquisition retains this owner");
+    assert!(!ps_object_backing::owns_root_cap(frame), "canonical Ps backing retains this owner");
     temporary_frame_alias::drain()
         .expect("legacy frame publication requires completed temporary-frame alias retirement");
     if let Err(frame) = (&mut *core::ptr::addr_of_mut!(VM_FREE_FRAMES)).try_recycle(frame) {
@@ -12965,6 +12970,8 @@ unsafe fn vm_frame_release_unmapped(frame: u64) {
 unsafe fn vm_frame_release(frame: u64, alias_cap: u64) {
     assert!(!frame_acquisition::owns_root_cap(frame), "frame acquisition retains this owner");
     assert!(!frame_acquisition::owns_root_cap(alias_cap), "frame acquisition retains this alias slot");
+    assert!(!ps_object_backing::owns_root_cap(frame), "canonical Ps backing retains this owner");
+    assert!(!ps_object_backing::owns_root_cap(alias_cap), "canonical Ps backing retains this alias slot");
     temporary_frame_alias::drain()
         .expect("legacy frame release requires completed temporary-frame alias retirement");
     let _ = page_unmap_r(frame);
@@ -15103,6 +15110,7 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
 mod thread_sched_context;
 mod root_slot_recycle;
 mod ps_object_paging;
+mod ps_object_backing;
 mod frame_acquisition;
 mod frame_recycle;
 mod client_frame_cleanup;

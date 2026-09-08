@@ -366,6 +366,7 @@ impl HostedThreadRuntimeTable {
                 || win32k_glue::provider_alias_owns_root_cap(cap)
                 || temporary_frame_alias::owns_root_cap(cap)
                 || frame_acquisition::owns_root_cap(cap)
+                || crate::ps_object_backing::owns_root_cap(cap)
             {
                 return Err(ThreadReconciliationError::OwnershipConflict);
             }
@@ -379,6 +380,10 @@ impl HostedThreadRuntimeTable {
                 client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
                     || temporary_frame_alias::owns_root_cap(cap))
             || provider.root_capabilities().any(frame_acquisition::owns_root_cap)
+            || aliases.capabilities()
+                .chain(prefetch.capabilities())
+                .chain(provider.root_capabilities())
+                .any(crate::ps_object_backing::owns_root_cap)
         {
             return Err(ThreadReconciliationError::OwnershipConflict);
         }

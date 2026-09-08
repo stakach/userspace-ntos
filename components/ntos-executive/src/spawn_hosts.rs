@@ -3029,6 +3029,11 @@ unsafe fn pump_service_vm_fault(
     faults: u64,
     demand: u64,
 ) -> bool {
+    // Ps storage is never generic demand-zero memory or an attached-client mapping. The
+    // canonical owner must authenticate an exact provider alias before this branch can map it.
+    if crate::ps_object_backing::contains_address(addr) {
+        return false;
+    }
     if pump_addr_in_root_image(addr) {
         return pump_map_root_image_page(ch, ip, addr, fsr, demand);
     }

@@ -28,6 +28,19 @@ pub(super) unsafe fn validate_owned_backing(frame: u64) -> Result<(), u32> {
 
 /// Capacity growth precedes release effects; drop allocator borrows before any capability syscall.
 pub(super) unsafe fn prepare(frame: u64) -> Result<(), u32> {
+    if ps_object_backing::owns_root_cap(frame) {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
+    prepare_inner(frame)
+}
+
+/// The canonical page owner issues this permit only after its aliases have drained. Ordinary
+/// callers cannot construct it or use a raw frame value to bypass the Ps ownership exclusion.
+pub(super) unsafe fn prepare_ps_owned(permit: &ps_object_backing::FrameRelease<'_>) -> Result<(), u32> {
+    prepare_inner(permit.frame())
+}
+
+unsafe fn prepare_inner(frame: u64) -> Result<(), u32> {
     if frame_acquisition::owns_root_cap(frame) {
         return Err(nt_address_space::STATUS_INVALID_PARAMETER);
     }
@@ -56,6 +69,17 @@ pub(super) unsafe fn prepare(frame: u64) -> Result<(), u32> {
 /// Caller retains the exact owner on error; on success it must acknowledge the transfer without
 /// allocation, IPC or callback before another frame can be acquired from the pool.
 pub(super) unsafe fn publish(frame: u64) -> Result<(), u32> {
+    if ps_object_backing::owns_root_cap(frame) {
+        return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+    }
+    publish_inner(frame)
+}
+
+pub(super) unsafe fn publish_ps_owned(permit: &ps_object_backing::FrameRelease<'_>) -> Result<(), u32> {
+    publish_inner(permit.frame())
+}
+
+unsafe fn publish_inner(frame: u64) -> Result<(), u32> {
     if frame_acquisition::owns_root_cap(frame) {
         return Err(nt_address_space::STATUS_INVALID_PARAMETER);
     }
