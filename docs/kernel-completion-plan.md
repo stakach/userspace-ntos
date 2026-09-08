@@ -29617,11 +29617,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Logs: .tmp/test-ps-retirement-20260908.log, .tmp/test-ps-retirement-regression-20260908.log,
     .tmp/build-ps-retirement-final-20260908.log. No desktop boot was attempted.
 
-    B3 x86 mapping-boundary tranche 128 (next): public rust-micro frame/table map invocations must
-    reject noncanonical and upper-half user addresses before same-address shortcuts or hardware
-    effects. Existing masked index extraction is not address validation. Test lower-user bounds,
-    full mapping extents, supported frame/table sizes, noncanonical aliases and overflow; preserve
-    internal kernel-only mapping helpers. This precedes a new dedicated canonical Ps VA arena.
+    B3 x86 mapping-boundary tranche 128 (2026-09-08, complete): public rust-micro frame/table map
+    invocations reject noncanonical and upper-half user addresses before same-address shortcuts or
+    hardware effects. Checked extents preserve seL4's reserved final user frame and permit the last
+    valid paging container. Boundary matrices cover all frame/table sizes, zero, the proposed Ps
+    arena, noncanonical aliases, overflow and unchanged capabilities on rejection. Internal
+    kernel-only mapping helpers are unchanged. The first spec fixture incorrectly compared a raw
+    malformed address with its capability-encoded value; the corrected fixture snapshots the
+    actual stored cap. All kernel specs and 12/12 userspace microtests pass, with sentinel and QEMU
+    exit 0. The production kernel build also passes (240 existing warnings). NT staging artifacts
+    were restored after the standalone test; no NT desktop boot is claimed. Submodule commit
+    0869a55 is pushed. Logs: .tmp/build-x86-map-bounds-microtest-20260908.log,
+    .tmp/run-x86-map-bounds-microtest-20260908.log,
+    .tmp/build-x86-map-bounds-production-20260908.log.
+
+    B3 x86 frame mapping authority tranche 129 (2026-09-08, in progress): replace the already-mapped
+    same-address success shortcut with genuine validated leaf installation and permission updates.
+    Authenticate the exact mapped root/ASID and invoked source capability before any mutation;
+    preserve capability rights while masking effective leaf permissions. Decode upstream cache
+    attributes separately from the project's compressed NX flag. Permit same-size leaf replacement
+    as seL4 does, reject a conflicting lower-level subtree, and invalidate the exact VSpace after
+    changes. Tests must inspect real PTE flags and unchanged cap/PTE state on failure. Frame rights
+    attenuation in CNode Copy/Mint is an adjacent prerequisite, not implicitly completed by Map.
 
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
