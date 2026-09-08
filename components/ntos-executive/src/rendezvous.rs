@@ -8,6 +8,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
@@ -47,7 +48,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             ),
             _ => return Err(HostedThreadSpawnFailure::Unstarted),
         };
-    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_context, initial_teb) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
@@ -78,13 +79,17 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
     )
 }
 
-fn hosted_loader_thread_context(
+fn hosted_loader_thread_context<'a>(
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &'a nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
-) -> Option<HostedUserThreadContext> {
+) -> Option<HostedUserThreadContext<'a>> {
     let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
-    (loader_rva != 0).then_some(HostedUserThreadContext {
+    let continue_rva = img_spawn::OUR_NT_CONTINUE_RVA.load(Ordering::Relaxed);
+    (loader_rva != 0 && continue_rva != 0).then_some(HostedUserThreadContext {
         loader_va: Some(NTDLL_BASE + loader_rva),
+        nt_continue_va: Some(NTDLL_BASE + continue_rva),
+        initial_context,
         start,
         initial_teb,
         stack_origin: ThreadStackOrigin::Caller(initial_teb),
@@ -98,6 +103,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
     worker_slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     stack_origin: ThreadStackOrigin,
     cid_proc: u64,
     cid_thread: u64,
@@ -116,6 +122,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
             slot: worker_slot,
             pml4,
             start,
+            initial_context,
             stack_origin,
             cid_proc,
             cid_thread,
@@ -131,7 +138,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
 
 /// Everything the general cross-VSpace thread spawn needs. See [`spawn_slot_thread`].
 #[derive(Clone, Copy)]
-pub(crate) struct RemoteThreadSpawn {
+pub(crate) struct RemoteThreadSpawn<'a> {
     /// Hosted-process index the new thread BELONGS TO (selects its executive-side mirror/scratch).
     pub target_pi: usize,
     /// Which bounded per-process thread window to build it in.
@@ -140,6 +147,7 @@ pub(crate) struct RemoteThreadSpawn {
     pub pml4: u64,
     /// Caller-supplied start context: `rip` = the start routine, `rcx` = its parameter.
     pub start: nt_thread_start::Amd64ThreadContext,
+    pub initial_context: &'a nt_thread_start::amd64_context::InitialAmd64Context,
     pub stack_origin: ThreadStackOrigin,
     /// The `ClientId` stamped into the new thread's TEB.
     pub cid_proc: u64,
@@ -179,7 +187,8 @@ pub(crate) unsafe fn spawn_slot_thread(
         target_pi,
         slot,
         pml4,
-        mut start,
+        start,
+        initial_context,
         stack_origin,
         cid_proc,
         cid_thread,
@@ -190,20 +199,23 @@ pub(crate) unsafe fn spawn_slot_thread(
     if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || !fault_ep.is_valid() {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
-    let loader_va = if use_loader {
+    let (loader_va, nt_continue_va) = if use_loader {
         let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
-        if loader_rva == 0 {
+        let continue_rva = img_spawn::OUR_NT_CONTINUE_RVA.load(Ordering::Relaxed);
+        if loader_rva == 0 || continue_rva == 0 {
             return Err(HostedThreadSpawnFailure::Unstarted);
         }
-        Some(NTDLL_BASE + loader_rva)
+        (Some(NTDLL_BASE + loader_rva), Some(NTDLL_BASE + continue_rva))
     } else {
-        None
+        (None, None)
     };
     let user_context = if use_loader || matches!(stack_origin, ThreadStackOrigin::Caller(_)) {
         let initial_teb = match stack_origin {
             ThreadStackOrigin::Caller(initial_teb) => initial_teb,
             ThreadStackOrigin::ConstructorStack => {
-                start.rsp = tp_worker_context_rsp(slot);
+                if start.rsp != tp_worker_context_rsp(slot) {
+                    return Err(HostedThreadSpawnFailure::Unstarted);
+                }
                 nt_thread_start::InitialTeb64 {
                     stack_base: tp_worker_stack_top(slot),
                     stack_limit: tp_worker_stack_base(slot),
@@ -213,6 +225,8 @@ pub(crate) unsafe fn spawn_slot_thread(
         };
         Some(HostedUserThreadContext {
             loader_va,
+            nt_continue_va,
+            initial_context,
             start,
             initial_teb,
             stack_origin,
@@ -254,12 +268,13 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
     owner_pi: usize,
     svc_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_context, initial_teb) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
@@ -299,12 +314,13 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
     owner_pi: usize,
     lsass_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_context, initial_teb) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
@@ -344,12 +360,13 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
     owner_pi: usize,
     lsass_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_context, initial_teb) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(
@@ -388,12 +405,13 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
     owner_pi: usize,
     lsass_pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
 ) -> HostedThreadSpawnResult {
-    let Some(loader_context) = hosted_loader_thread_context(start, initial_teb) else {
+    let Some(loader_context) = hosted_loader_thread_context(start, initial_context, initial_teb) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
     spawn_hosted_thread(

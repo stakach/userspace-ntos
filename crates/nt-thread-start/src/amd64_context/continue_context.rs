@@ -17,6 +17,11 @@ const EFLAGS_OFFSET: usize = 0x44;
 const EFLAGS_AC: u64 = 1 << 18;
 const NT5_USER_EFLAGS_MASK: u64 = 0x40dd5;
 
+/// NT's logical native selector and this platform's actual native64 GDT selector are separate
+/// ABI namespaces. Neither selector denotes NT compatibility mode (0x23).
+pub const NT_NATIVE_CODE_SELECTOR: u16 = 0x33;
+pub const PLATFORM_NATIVE_CODE_SELECTOR: u16 = 0x2b;
+
 /// Validated native legacy CONTEXT restore payload, with seL4 UserContext register ordering.
 ///
 /// Only selected register bits may be written. Floating point is a separate optional group;
@@ -57,7 +62,10 @@ impl CapturedAmd64Context {
         }
         // NT5 KeContextToKframes chooses native versus compatibility CS independently of the
         // CONTROL group. This native-only path must not silently choose a compatibility frame.
-        if u16::from_le_bytes(self.bytes[CS_OFFSET..CS_OFFSET + 2].try_into().unwrap()) != 0x33 {
+        if !matches!(
+            u16::from_le_bytes(self.bytes[CS_OFFSET..CS_OFFSET + 2].try_into().unwrap()),
+            NT_NATIVE_CODE_SELECTOR | PLATFORM_NATIVE_CODE_SELECTOR
+        ) {
             return Err(CodecError::UnsupportedCompatibilityMode);
         }
         let (ip, sp, flags) = if self.flags() & CONTROL == CONTROL {

@@ -298,6 +298,11 @@ desktop proofs are historical baselines, not acceptance of the current provider 
 - [x] Add coherent GPR/legacy-FP snapshot and selected atomic install/restart to the microkernel;
   wire checked native context query and supported NtContinue groups without deleting the reply
   before a fallible restore (tranche 148; host tests, four-CPU kernel specs and executive build).
+- [x] Carry a complete owned initial context through additional-thread creation and restore it
+  after loader initialization through the real NtContinue export (tranche 149). Complete actual
+  RtlCaptureContext capture and validate the built DLL's machine code (host and native build
+  checkpoint). First-process-thread creation, live loader startup, APC delivery and full
+  exception/restore semantics remain separate acceptance items.
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30354,6 +30359,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/build-legacy-context-executive-20260909.log (292 warnings). Original NT rootserver/disk
     staging was restored byte-for-byte. Microkernel commit effca42 is the matching submodule
     revision. No fresh NT desktop or 27-import gate acceptance is claimed.
+
+    B3 initial-context tranche 149 (2026-09-09, accepted code/artifact slice): replace the additional-thread four-register
+    handoff with an owned normalized CONTEXT. Preserve requested integer/register payloads and
+    exact caller RSP while applying distinct fresh-thread control/FP initialization. Loader
+    execution must return through its resolved NtContinue export over the owned TEB context;
+    direct diagnostics without ntdll use the same checked microkernel install without restart,
+    before publication. Missing exports or rejected context state are construction failures,
+    never a downgrade to a synthetic startup or caller-stack replacement.
+
+    Correct RtlCaptureContext's FULL flag, selectors, EFLAGS, MXCSR, x87 and all sixteen XMM
+    registers. Retain untouched home/debug/vector fields. The NT FloatSave uses plain FXSAVE's
+    XMM_SAVE_AREA32 pointer/selector format, while the microkernel retains FXSAVE64; convert the
+    instruction/data pointer lanes explicitly instead of interpreting selectors as high address
+    bits. Admission distinguishes logical NT native CS 0x33 and the actual platform native CS
+    0x2b from unsupported NT compatibility CS 0x23. This is an explicit hosted ABI boundary, not
+    permission to accept arbitrary selectors. Direct fresh-thread installation uses NT5 FCW
+    0x023f; the later loader NtContinue applies its SET mask (0x0237). Keep these distinct policies
+    explicit. Remove the replaced four-register jump/loader generators and their obsolete tests;
+    retain only the separate internal constructor entry. Remove the unused projection-only
+    capture API and migrate its fault/alignment/partial-copy tests to the complete owned capture.
+
+    Serialized validation passes 1,364 unit tests, 49 integration tests and 13 compile-fail checks
+    in .tmp/test-initial-context-final-20260909.log. The rebuilt DLL passes the existing PE/export/import
+    verifier in .tmp/build-initial-context-ntdll-final-20260909.log. A standalone x86-64/Rosetta harness
+    maps the actual built DLL and invokes its real RtlCaptureContext export: the previous artifact
+    fails its flags check, while the rebuilt artifact passes exact GPR/control/selectors, all
+    x87/XMM payloads, untouched fields and canaries in .tmp/test-ntdll-capture-artifact-final-20260909.log.
+    The executive release build passes in .tmp/build-initial-context-executive-final-20260909.log
+    (292 warnings). Independent source review found no new blocking ownership, ABI or publication
+    regression. This is not a native loader/first-thread/APC or desktop acceptance claim.
+
+    Next context refinement: APC staging still constructs a GPR-only frame with advertised but
+    empty FP state and no trailing MACHINE_FRAME, then dequeues without an exact retained owner.
+    Its dispatcher uses the local partial RtlRestoreContext assembly instead of NtContinue(TRUE).
+    Replace this as one delivery contract: coherent saved state, exact APC selection retained
+    through failures, complete frame, one acknowledged selected install, and proper alert testing
+    against the restored continuation. Do not restore/restart first and inject an APC afterward.
+    NtTestAlert returns success or a real prior STATUS_ALERTED, not wait-interruption STATUS_USER_APC.
+
+    Review adjustment before APC cutover: NT5 KiInitializeUserApc captures FULL plus DEBUG_REGISTERS.
+    The current continuation explicitly refuses DEBUG, and NtSetContextThread still performs a
+    GPR read/merge/write followed by independent breakpoint writes. Extend the checked atomic
+    legacy context operation with raw debug state first; retain actual DR6 at normal and quiesced
+    debug-fault delivery, preserve real local/global enables and disabled address registers, and
+    validate the whole selected image before any target mutation or reply cancellation. NT
+    masking and user-address policy remain in the host-tested adapter. Then migrate native
+    Get/Set/Continue without the old separate breakpoint reconstruction/write loops, and use
+    that coherent complete snapshot for APC construction. Do not call a GPR/FP-only snapshot a
+    complete APC context.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

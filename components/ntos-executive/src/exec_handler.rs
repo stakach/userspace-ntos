@@ -15265,6 +15265,7 @@ impl ExecNtHandler {
         &mut self,
         args: &[u64],
         start: nt_thread_start::Amd64ThreadContext,
+        initial_context: nt_thread_start::amd64_context::InitialAmd64Context,
         initial_teb: nt_thread_start::InitialTeb64,
     ) -> u32 {
         const PROCESS_CREATE_THREAD: u32 = 0x0002;
@@ -15352,6 +15353,7 @@ impl ExecNtHandler {
             slot,
             pml4,
             start,
+            initial_context,
             stack_origin: ThreadStackOrigin::Caller(initial_teb),
             cid_proc: target_pid as u64,
             cid_thread: tid,
@@ -15493,10 +15495,21 @@ impl ExecNtHandler {
                 return status;
             }
         };
+        let start = nt_thread_start::Amd64ThreadContext { rsp: tp_worker_context_rsp(slot), ..start };
+        let initial_context = match nt_thread_start::amd64_context::InitialAmd64Context::constructor(
+            start, HIGHEST_USER_ADDRESS,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                self.abort_unbuilt_hosted_thread_request(publication);
+                return error.status();
+            }
+        };
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: target_pi,
             slot,
             start,
+            initial_context,
             stack_origin: ThreadStackOrigin::ConstructorStack,
             publication,
         });
@@ -15833,6 +15846,7 @@ impl ExecNtHandler {
         args: &[u64],
         spec: RoleOwnedLocalThreadSpec,
         start: nt_thread_start::Amd64ThreadContext,
+        initial_context: nt_thread_start::amd64_context::InitialAmd64Context,
         initial_teb: nt_thread_start::InitialTeb64,
     ) -> u32 {
         if args.len() <= NT_CREATE_THREAD_CREATE_SUSPENDED_ARG || args[3] != u64::MAX {
@@ -15879,6 +15893,7 @@ impl ExecNtHandler {
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::Multiplexed {
             kind: spec.spawn_kind,
             start,
+            initial_context,
             initial_teb,
             publication,
         });
@@ -15949,6 +15964,7 @@ impl ExecNtHandler {
         args: &[u64],
         ntdll_pool_worker_only: bool,
         start: nt_thread_start::Amd64ThreadContext,
+        initial_context: &mut Option<nt_thread_start::amd64_context::InitialAmd64Context>,
         initial_teb: nt_thread_start::InitialTeb64,
     ) -> Option<u32> {
         if args.len() <= NT_CREATE_THREAD_CREATE_SUSPENDED_ARG
@@ -16115,6 +16131,7 @@ impl ExecNtHandler {
             pi: self.pi,
             slot: tp_slot,
             start,
+            initial_context: initial_context.take().expect("classified captured thread context"),
             stack_origin: ThreadStackOrigin::Caller(initial_teb),
             publication,
         });
@@ -37273,16 +37290,21 @@ impl ExecNtHandler {
                 if args[NT_CREATE_THREAD_CONTEXT_ARG] == 0 {
                     return STATUS_INVALID_PARAMETER;
                 }
-                // Capture each required user structure once, before routing or allocating. The
-                // existing startup mechanism still projects four registers; a complete capture
-                // is not evidence that it implements every CONTEXT register group.
-                let start = match nt_thread_start::Amd64ThreadContext::capture(
+                // Capture and normalize once before routing; the queued owner retains every
+                // supported register group until it is published into the new thread's TEB.
+                let captured = match nt_thread_start::amd64_context::CapturedAmd64Context::capture(
                     |address, bytes| unsafe { self.process_memory_read_status(self.pi, address, bytes) },
                     args[NT_CREATE_THREAD_CONTEXT_ARG],
                 ) {
-                    Ok(start) => start,
+                    Ok(context) => context,
                     Err(error) => return error.status(),
                 };
+                let normalized = match captured.normalize_initial(HIGHEST_USER_ADDRESS) {
+                    Ok(context) => context,
+                    Err(error) => return error.status(),
+                };
+                let start = normalized.startup_projection();
+                let mut initial_context = Some(normalized);
                 let initial_stack = match nt_thread_start::InitialTeb64::capture(
                     |address, bytes| unsafe { self.process_memory_read_status(self.pi, address, bytes) },
                     args[NT_CREATE_THREAD_INITIAL_TEB_ARG],
@@ -37350,6 +37372,7 @@ impl ExecNtHandler {
                                 pi: self.pi,
                                 slot,
                                 start,
+                                initial_context: initial_context.take().expect("captured CSR context"),
                                 stack_origin: ThreadStackOrigin::Caller(initial_stack),
                                 publication,
                             });
@@ -37396,7 +37419,8 @@ impl ExecNtHandler {
                         }
                         if PM_INITIAL_THREAD_DONE.load(Ordering::Relaxed) & (1u64 << target_pi) != 0 {
                             // The target already has its initial thread ⇒ REAL cross-VSpace create.
-                            return self.create_remote_thread(args, start, initial_stack);
+                            return self.create_remote_thread(args, start,
+                                initial_context.take().expect("captured remote context"), initial_stack);
                         }
                         let tid = match self.pm.main_thread(target_pid) {
                             Some(tid) => tid,
@@ -37471,7 +37495,7 @@ impl ExecNtHandler {
                     // listener routes claim them as winlogon/services RPC threads.
                     if let Some(status) =
                         unsafe {
-                            self.create_generic_local_tp_worker_thread(args, true, start, initial_stack)
+                            self.create_generic_local_tp_worker_thread(args, true, start, &mut initial_context, initial_stack)
                         }
                     {
                         return status;
@@ -37546,6 +37570,7 @@ impl ExecNtHandler {
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::Winlogon {
                                 slot,
                                 start,
+                                initial_context: initial_context.take().expect("captured winlogon context"),
                                 initial_teb: initial_stack,
                                 publication,
                             });
@@ -37597,7 +37622,8 @@ impl ExecNtHandler {
                 if matches!(ctx.service, NativeService::NtCreateThread) {
                     if let Some(spec) = self.next_role_owned_local_thread_spec() {
                         return unsafe {
-                            self.create_role_owned_local_thread(args, spec, start, initial_stack)
+                            self.create_role_owned_local_thread(args, spec, start,
+                                initial_context.take().expect("captured role context"), initial_stack)
                         };
                     }
                 }
@@ -37614,7 +37640,7 @@ impl ExecNtHandler {
                 // ETHREAD, TEB, ClientId, fault badge, and seL4 TCB.
                 if let Some(status) =
                     unsafe {
-                        self.create_generic_local_tp_worker_thread(args, false, start, initial_stack)
+                        self.create_generic_local_tp_worker_thread(args, false, start, &mut initial_context, initial_stack)
                     }
                 {
                     return status;

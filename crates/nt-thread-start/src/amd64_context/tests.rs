@@ -84,7 +84,7 @@ fn full_context_capture_preserves_reader_status_after_partial_or_complete_copy()
 }
 
 #[test]
-fn extraction_uses_top_level_mxcsr_and_preserves_all_other_fp_bytes() {
+fn extraction_uses_top_level_mxcsr_and_preserves_fp_register_payload() {
     let mut bytes = bytes(CONTEXT_FLOATING_POINT);
     bytes[FLOAT_SAVE_OFFSET..FLOAT_SAVE_OFFSET + 2].copy_from_slice(&u16::MAX.to_le_bytes());
     bytes[CONTEXT_MXCSR_OFFSET..CONTEXT_MXCSR_OFFSET + 4]
@@ -95,6 +95,10 @@ fn extraction_uses_top_level_mxcsr_and_preserves_all_other_fp_bytes() {
     assert_eq!(u16::from_le_bytes(image[..2].try_into().unwrap()), 0x1f37);
     assert_eq!(read_u32(&image, FX_MXCSR_OFFSET), 0xffbf);
     for offset in 0..LEGACY_FLOATING_POINT_BYTES {
+        if (12..16).contains(&offset) || (20..24).contains(&offset) {
+            assert_eq!(image[offset], 0);
+            continue;
+        }
         if offset < 2 || (FX_MXCSR_OFFSET..FX_MXCSR_OFFSET + 4).contains(&offset) {
             continue;
         }
@@ -119,6 +123,8 @@ fn publication_updates_both_mxcsr_locations_and_only_requested_fp_group() {
     let mut expected = original;
     expected[FLOAT_SAVE_OFFSET..FLOAT_SAVE_OFFSET + LEGACY_FLOATING_POINT_BYTES]
         .copy_from_slice(&image);
+    expected[FLOAT_SAVE_OFFSET + 12..FLOAT_SAVE_OFFSET + 16].fill(0);
+    expected[FLOAT_SAVE_OFFSET + 20..FLOAT_SAVE_OFFSET + 24].fill(0);
     expected[CONTEXT_MXCSR_OFFSET..CONTEXT_MXCSR_OFFSET + 4]
         .copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(context.as_bytes(), &expected);

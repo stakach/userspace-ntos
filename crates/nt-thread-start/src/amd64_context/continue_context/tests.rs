@@ -183,6 +183,17 @@ fn architecture_and_extended_state_rejections_are_explicit() {
 }
 
 #[test]
+fn nt_logical_and_platform_physical_native_selectors_are_both_explicitly_admitted() {
+    assert_eq!(NT_NATIVE_CODE_SELECTOR, 0x33);
+    assert_eq!(PLATFORM_NATIVE_CODE_SELECTOR, 0x2b);
+    for cs in [NT_NATIVE_CODE_SELECTOR, PLATFORM_NATIVE_CODE_SELECTOR] {
+        let mut context = context(CONTROL);
+        context.bytes[CS_OFFSET..CS_OFFSET + 2].copy_from_slice(&cs.to_le_bytes());
+        assert!(prepare(&context).is_ok());
+    }
+}
+
+#[test]
 fn compatibility_cs_is_rejected_even_when_control_is_not_requested() {
     for flags in [CONTEXT_AMD64, CONTROL] {
         for cs in [0u16, 0x23, 0x10, 0xffff] {

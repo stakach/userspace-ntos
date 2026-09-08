@@ -10,6 +10,8 @@ use crate::*;
 pub(crate) static OUR_LDRP_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of `LdrInitializeThunk`, used by secondary-thread startup trampolines.
 pub(crate) static OUR_LDR_INITIALIZE_THUNK_RVA: AtomicU64 = AtomicU64::new(0);
+/// Resolved native NtContinue entry required after additional-thread loader initialization.
+pub(crate) static OUR_NT_CONTINUE_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of the callback entry in the same loaded Rust ntdll, resolved from its export table at boot.
 pub(crate) static OUR_KI_USER_CALLBACK_DISPATCHER_RVA: AtomicU64 = AtomicU64::new(0);
 /// RVA of the user APC entry in the same loaded Rust ntdll, resolved from its export table at boot.

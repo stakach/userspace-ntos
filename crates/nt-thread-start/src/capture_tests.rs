@@ -1,10 +1,11 @@
 use super::*;
+use crate::amd64_context::CapturedAmd64Context;
 
 #[test]
 fn invalid_context_span_never_calls_reader() {
     for address in [0, u64::MAX, u64::MAX - AMD64_CONTEXT_SIZE as u64 + 1] {
         assert_eq!(
-            Amd64ThreadContext::capture(|_, _| panic!("invalid span reached reader"), address),
+            CapturedAmd64Context::capture(|_, _| panic!("invalid span reached reader"), address),
             Err(CaptureError::InvalidAddress)
         );
     }
@@ -25,7 +26,7 @@ fn misaligned_context_never_calls_reader() {
     assert_eq!(AMD64_CONTEXT_ALIGNMENT, 16);
     for offset in 1..AMD64_CONTEXT_ALIGNMENT {
         assert_eq!(
-            Amd64ThreadContext::capture(
+            CapturedAmd64Context::capture(
                 |_, _| panic!("misaligned context reached reader"),
                 0x1000 + offset,
             ),
@@ -87,9 +88,9 @@ fn capture_errors_have_exact_native_statuses() {
 }
 
 #[test]
-fn complete_context_is_requested_once_even_when_only_four_registers_are_projected() {
+fn complete_context_is_retained_after_a_single_capture_and_projection() {
     let mut calls = 0;
-    let context = Amd64ThreadContext::capture(
+    let context = CapturedAmd64Context::capture(
         |address, bytes| {
             calls += 1;
             assert_eq!(address, 0x1000);
@@ -105,8 +106,9 @@ fn complete_context_is_requested_once_even_when_only_four_registers_are_projecte
     )
     .unwrap();
     assert_eq!(calls, 1);
+    assert_eq!(context.as_bytes()[AMD64_CONTEXT_SIZE - 1], 0xa5);
     assert_eq!(
-        context,
+        context.startup_projection(),
         Amd64ThreadContext {
             rip: 1,
             rsp: 2,
@@ -150,7 +152,7 @@ fn short_context_capture_never_returns_partially_decoded_registers() {
     let source = [0x5a; AMD64_CONTEXT_SIZE];
     for available in [0, 1, 0x100, AMD64_CONTEXT_SIZE - 1] {
         let mut calls = 0;
-        let result = Amd64ThreadContext::capture(
+        let result = CapturedAmd64Context::capture(
             |_, output| {
                 calls += 1;
                 output[..available].copy_from_slice(&source[..available]);
@@ -184,7 +186,7 @@ fn short_initial_teb_capture_never_returns_partially_decoded_bounds() {
 #[test]
 fn reader_failure_is_authoritative_even_after_filling_the_destination() {
     assert_eq!(
-        Amd64ThreadContext::capture(
+        CapturedAmd64Context::capture(
             |_, bytes| {
                 bytes.fill(0xff);
                 Err(0x8000_0001)
@@ -209,14 +211,14 @@ fn reader_failure_is_authoritative_even_after_filling_the_destination() {
 fn highest_aligned_nonwrapping_span_is_read_without_adding_address_space_policy() {
     let context_address = (u64::MAX - AMD64_CONTEXT_SIZE as u64) & !(AMD64_CONTEXT_ALIGNMENT - 1);
     assert_eq!(
-        Amd64ThreadContext::capture(
+        CapturedAmd64Context::capture(
             |address, bytes| {
                 assert_eq!(address, context_address);
                 bytes.fill(0);
                 Ok(())
             },
             context_address,
-        ),
+        ).map(|context| context.startup_projection()),
         Ok(Amd64ThreadContext {
             rip: 0,
             rsp: 0,

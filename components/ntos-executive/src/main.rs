@@ -23107,7 +23107,6 @@ impl ExecLoopCtx {
 /// A pending cross-VSpace thread creation: everything the LOOP needs to turn the handler's
 /// already-completed policy decision into the real seL4 thread inside the TARGET process.
 /// See [`rendezvous::spawn_slot_thread`] and `ExecNtHandler::create_remote_thread`.
-#[derive(Clone, Copy)]
 pub(crate) struct RemoteThreadRequest {
     /// Hosted-process index of the TARGET (the process the new thread belongs to).
     pub target_pi: usize,
@@ -23117,6 +23116,7 @@ pub(crate) struct RemoteThreadRequest {
     pub pml4: u64,
     /// The caller-supplied start context (`rip` = start routine, `rcx` = parameter).
     pub start: nt_thread_start::Amd64ThreadContext,
+    pub initial_context: nt_thread_start::amd64_context::InitialAmd64Context,
     pub stack_origin: ThreadStackOrigin,
     /// The new thread's `ClientId` — the TARGET's pid + the ETHREAD's tid.
     pub cid_proc: u64,
@@ -23175,17 +23175,18 @@ pub(crate) enum ThreadStackOrigin {
     ConstructorStack,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedThreadSpawnRequest {
     Winlogon {
         slot: usize,
         start: nt_thread_start::Amd64ThreadContext,
+        initial_context: nt_thread_start::amd64_context::InitialAmd64Context,
         initial_teb: nt_thread_start::InitialTeb64,
         publication: PreparedHostedThreadPublication,
     },
     Multiplexed {
         kind: HostedMultiplexedThreadKind,
         start: nt_thread_start::Amd64ThreadContext,
+        initial_context: nt_thread_start::amd64_context::InitialAmd64Context,
         initial_teb: nt_thread_start::InitialTeb64,
         publication: PreparedHostedThreadPublication,
     },
@@ -23193,6 +23194,7 @@ enum HostedThreadSpawnRequest {
         pi: usize,
         slot: usize,
         start: nt_thread_start::Amd64ThreadContext,
+        initial_context: nt_thread_start::amd64_context::InitialAmd64Context,
         stack_origin: ThreadStackOrigin,
         publication: PreparedHostedThreadPublication,
     },
@@ -25875,8 +25877,10 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
 /// `*_va`/`*_base` fields live in the TARGET process's VSpace (`pml4`) except `scr` and
 /// `stack_mirror_va`, which are in the EXECUTIVE's VSpace (`CAP_INIT_THREAD_VSPACE`).
 #[derive(Clone, Copy)]
-struct HostedUserThreadContext {
+struct HostedUserThreadContext<'a> {
     loader_va: Option<u64>,
+    nt_continue_va: Option<u64>,
+    initial_context: &'a nt_thread_start::amd64_context::InitialAmd64Context,
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
     stack_origin: ThreadStackOrigin,
@@ -25890,7 +25894,7 @@ struct HostedUserThreadContext {
 /// executive endpoint.
 const HOSTED_USER_THREAD_PRIORITY: u8 = 100;
 
-struct HostedThread {
+struct HostedThread<'a> {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
     /// image/ntdll/PEB/KUSER mappings.
     pml4: u64,
@@ -25902,7 +25906,7 @@ struct HostedThread {
     arg1: u64,
     /// Captured user entry; a missing loader selects explicit direct context restoration.
     /// No user context denotes an internal constructor-stack entry.
-    user_context: Option<HostedUserThreadContext>,
+    user_context: Option<HostedUserThreadContext<'a>>,
     /// Executive-side scratch base (≥ 3 pages: TEB, TEB2/ACS, trampoline) used to write the env
     /// before the frames are mapped into `pml4`.
     scr: u64,
@@ -26320,38 +26324,31 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"\n");
         return failed!();
     }
-    if let Some(loader) = t.user_context.filter(|context| context.loader_va.is_some()) {
+    if let Some(context) = t.user_context {
         const CONTEXT_OFFSET: u64 = 0x1900;
+        const _: () = assert!(0x1900 + nt_thread_start::AMD64_CONTEXT_SIZE <= 0x1fc0);
         let context_scratch = scr + CONTEXT_OFFSET;
         let context_target = t.teb_va + CONTEXT_OFFSET;
-        core::ptr::write_volatile(
-            (context_scratch + nt_thread_start::CONTEXT_RCX_OFFSET) as *mut u64,
-            loader.start.rcx,
-        );
-        core::ptr::write_volatile(
-            (context_scratch + nt_thread_start::CONTEXT_RDX_OFFSET) as *mut u64,
-            loader.start.rdx,
-        );
-        core::ptr::write_volatile(
-            (context_scratch + nt_thread_start::CONTEXT_RSP_OFFSET) as *mut u64,
-            loader.start.rsp,
-        );
-        core::ptr::write_volatile(
-            (context_scratch + nt_thread_start::CONTEXT_RIP_OFFSET) as *mut u64,
-            loader.start.rip,
-        );
-        let tb = nt_thread_start::Amd64ThreadContext::loader_trampoline(
-            loader.loader_va.expect("loader entry selected"),
-            NTDLL_BASE,
-            context_target,
-        );
-        for (j, &b) in tb.iter().enumerate() {
-            core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+        if context.initial_context.startup_projection() != context.start {
+            return failed!();
         }
-    } else if let Some(context) = t.user_context {
-        let tb = context.start.jump_trampoline();
-        for (j, &b) in tb.iter().enumerate() {
-            core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+        for (j, &byte) in context.initial_context.as_bytes().iter().enumerate() {
+            core::ptr::write_volatile((context_scratch + j as u64) as *mut u8, byte);
+        }
+        if let Some(loader_va) = context.loader_va {
+            let Some(nt_continue_va) = context.nt_continue_va else { return failed!(); };
+            let tb = match nt_thread_start::amd64_context::initial_context_trampoline(
+                context_target, nt_continue_va, Some((loader_va, NTDLL_BASE)),
+            ) {
+                Ok(tb) => tb,
+                Err(_) => return failed!(),
+            };
+            for (j, &byte) in tb.as_bytes().iter().enumerate() {
+                core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, byte);
+            }
+        } else {
+            // The ntdll-free diagnostic installs the same full context through the kernel below.
+            core::ptr::write_volatile((scr + 0x2000) as *mut u16, 0x0b0f); // UD2, never entered.
         }
     } else {
         let tb = nt_thread_start::Amd64ThreadContext {
@@ -26425,7 +26422,17 @@ unsafe fn spawn_hosted_thread_mechanism(
     if e_space != 0 { return failed!(); }
     let e_ipc = tcb_set_ipc_buffer_r(tcb, t.ipcbuf_va, ipcbuf);
     if e_ipc != 0 { return failed!(); }
-    let e_regs = tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0);
+    let e_regs = if let Some(context) = t.user_context {
+        let initial = context.initial_context.prepare_direct_install();
+        if thread_context::write(tcb, &initial, false).is_err() { return failed!(); }
+        if context.loader_va.is_some() {
+            tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
+        } else {
+            0
+        }
+    } else {
+        tcb_write_registers_r(tcb, t.tramp_va, new_sp, 0)
+    };
     if e_regs != 0 { return failed!(); }
     if tcb_set_gs_base_r(tcb, t.teb_va) != 0 {
         return failed!();
@@ -32234,6 +32241,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     let callback_dispatcher_rva = ntdll_export_rva("KiUserCallbackDispatcher");
                     let apc_dispatcher_rva = ntdll_export_rva("KiUserApcDispatcher");
                     let ldr_initialize_thunk_rva = ntdll_export_rva("LdrInitializeThunk");
+                    let nt_continue_rva = ntdll_export_rva("NtContinue");
                     let tp_worker_rva = ntdll_export_rva("RtlpWorkerThread");
                     let tp_completion_worker_rva = ntdll_export_rva("RtlpCompletionWorkerThread");
                     // Relocate ntdll for its load at NTDLL_BASE — its .data list heads etc. hold
@@ -32245,6 +32253,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     img_spawn::OUR_LDRP_RVA.store(smss_ldrp_rva, Ordering::Relaxed);
                     img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA
                         .store(ldr_initialize_thunk_rva, Ordering::Relaxed);
+                    img_spawn::OUR_NT_CONTINUE_RVA.store(nt_continue_rva, Ordering::Relaxed);
                     img_spawn::OUR_KI_USER_CALLBACK_DISPATCHER_RVA
                         .store(callback_dispatcher_rva, Ordering::Relaxed);
                     img_spawn::OUR_KI_USER_APC_DISPATCHER_RVA

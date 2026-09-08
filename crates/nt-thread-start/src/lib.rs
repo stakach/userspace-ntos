@@ -59,8 +59,6 @@ pub const INITIAL_TEB_STACK_LIMIT_OFFSET: u64 = 0x18;
 pub const INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET: u64 = 0x20;
 
 pub const CALL_TRAMPOLINE_LEN: usize = 42;
-pub const JUMP_TRAMPOLINE_LEN: usize = 42;
-pub const LOADER_TRAMPOLINE_LEN: usize = 93;
 pub const AMD64_HW_BREAKPOINT_SLOTS: usize = 4;
 pub const AMD64_DR6_INITIAL: u64 = 0xFFFF_0FF0;
 pub const AMD64_DR7_RESERVED_ONE: u64 = 0x0000_0400;
@@ -128,24 +126,6 @@ pub struct Amd64ThreadContext {
 }
 
 impl Amd64ThreadContext {
-    /// Capture the complete AMD64_CONTEXT_SIZE-byte structure in one read before projecting
-    /// RIP/RSP/RCX/RDX. The reader must return Ok only after filling the entire buffer; an error
-    /// preserves the reader's exact status and never exposes a partial projection.
-    /// Capture validates the pointer span and native 16-byte alignment, not context flags,
-    /// execution policy or other registers.
-    pub fn capture(
-        read: impl FnMut(u64, &mut [u8]) -> Result<(), u32>,
-        context_va: u64,
-    ) -> Result<Self, CaptureError> {
-        let bytes = capture_bytes::<AMD64_CONTEXT_SIZE>(read, context_va, AMD64_CONTEXT_ALIGNMENT)?;
-        Ok(Self {
-            rip: captured_u64(&bytes, CONTEXT_RIP_OFFSET),
-            rsp: captured_u64(&bytes, CONTEXT_RSP_OFFSET),
-            rcx: captured_u64(&bytes, CONTEXT_RCX_OFFSET),
-            rdx: captured_u64(&bytes, CONTEXT_RDX_OFFSET),
-        })
-    }
-
     pub fn call_trampoline(self) -> [u8; CALL_TRAMPOLINE_LEN] {
         let mut code = [0u8; CALL_TRAMPOLINE_LEN];
         code[0..4].copy_from_slice(&[0x48, 0x83, 0xec, 0x20]); // sub rsp, 32-byte home space
@@ -161,64 +141,6 @@ impl Amd64ThreadContext {
         code
     }
 
-    /// Enter the captured four-register projection directly, preserving its exact stack pointer.
-    /// RAX is the jump scratch register; this does not restore a complete native CONTEXT.
-    /// Unlike constructor entry, this neither pushes a return address nor reserves home space.
-    pub fn jump_trampoline(self) -> [u8; JUMP_TRAMPOLINE_LEN] {
-        let mut code = [0u8; JUMP_TRAMPOLINE_LEN];
-        code[0..2].copy_from_slice(&[0x48, 0xb9]); // movabs rcx
-        code[2..10].copy_from_slice(&self.rcx.to_le_bytes());
-        code[10..12].copy_from_slice(&[0x48, 0xba]); // movabs rdx
-        code[12..20].copy_from_slice(&self.rdx.to_le_bytes());
-        code[20..22].copy_from_slice(&[0x48, 0xbc]); // movabs rsp
-        code[22..30].copy_from_slice(&self.rsp.to_le_bytes());
-        code[30..32].copy_from_slice(&[0x48, 0xb8]); // movabs rax
-        code[32..40].copy_from_slice(&self.rip.to_le_bytes());
-        code[40..42].copy_from_slice(&[0xff, 0xe0]); // jmp rax
-        code
-    }
-
-    /// Call `LdrInitializeThunk` with the native initial-APC register contract, then restore this
-    /// context from durable target memory and jump to its original instruction pointer.
-    pub fn loader_trampoline(
-        loader_va: u64,
-        ntdll_base: u64,
-        context_va: u64,
-    ) -> [u8; LOADER_TRAMPOLINE_LEN] {
-        let mut code = [0u8; LOADER_TRAMPOLINE_LEN];
-        let mut at = 0usize;
-        let mut emit = |bytes: &[u8]| {
-            code[at..at + bytes.len()].copy_from_slice(bytes);
-            at += bytes.len();
-        };
-
-        emit(&[0x48, 0xb9]); // movabs rcx, 0
-        emit(&0u64.to_le_bytes());
-        emit(&[0x48, 0xba]); // movabs rdx, ntdll_base
-        emit(&ntdll_base.to_le_bytes());
-        emit(&[0x45, 0x31, 0xc0]); // xor r8d, r8d
-        emit(&[0x49, 0xb9]); // movabs r9, context_va
-        emit(&context_va.to_le_bytes());
-        emit(&[0x48, 0xb8]); // movabs rax, loader_va
-        emit(&loader_va.to_le_bytes());
-        emit(&[0x48, 0x83, 0xec, 0x20]); // Win64 caller home space
-        emit(&[0xff, 0xd0]); // call rax
-        emit(&[0x48, 0x83, 0xc4, 0x20]);
-
-        emit(&[0x48, 0xb8]); // movabs rax, context_va
-        emit(&context_va.to_le_bytes());
-        emit(&[0x48, 0x8b, 0x88]); // mov rcx, [rax+CONTEXT.Rcx]
-        emit(&(CONTEXT_RCX_OFFSET as u32).to_le_bytes());
-        emit(&[0x48, 0x8b, 0x90]); // mov rdx, [rax+CONTEXT.Rdx]
-        emit(&(CONTEXT_RDX_OFFSET as u32).to_le_bytes());
-        emit(&[0x48, 0x8b, 0xa0]); // mov rsp, [rax+CONTEXT.Rsp]
-        emit(&(CONTEXT_RSP_OFFSET as u32).to_le_bytes());
-        emit(&[0x48, 0x8b, 0x80]); // mov rax, [rax+CONTEXT.Rip]
-        emit(&(CONTEXT_RIP_OFFSET as u32).to_le_bytes());
-        emit(&[0xff, 0xe0]); // jmp rax
-        debug_assert_eq!(at, LOADER_TRAMPOLINE_LEN);
-        code
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,7 +468,7 @@ mod tests {
 
     #[test]
     fn decodes_reactos_amd64_context_layout() {
-        let context = Amd64ThreadContext::capture(
+        let context = amd64_context::CapturedAmd64Context::capture(
             |address, bytes| {
                 assert_eq!(address, 0x1000);
                 assert_eq!(bytes.len(), AMD64_CONTEXT_SIZE);
@@ -559,7 +481,7 @@ mod tests {
             0x1000,
         ).unwrap();
         assert_eq!(
-            context,
+            context.startup_projection(),
             Amd64ThreadContext {
                 rip: 0x4444,
                 rsp: 0x3333,
@@ -602,7 +524,7 @@ mod tests {
             u32::from_le_bytes(bytes[0x44..0x48].try_into().unwrap()),
             0x200
         );
-        let decoded = Amd64ThreadContext::capture(
+        let decoded = amd64_context::CapturedAmd64Context::capture(
             |address, output| {
                 assert_eq!(address, 0x1000);
                 output.copy_from_slice(&bytes);
@@ -610,6 +532,7 @@ mod tests {
             },
             0x1000,
         ).unwrap();
+        let decoded = decoded.startup_projection();
         assert_eq!(decoded.rip, 0x1234_5678);
         assert_eq!(decoded.rcx, 0xfeed_beef);
         assert_eq!(decoded.rsp, 0x7000_ffc8);
@@ -787,47 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn jump_trampoline_restores_exact_registers_without_call_or_stack_adjustment() {
-        let context = Amd64ThreadContext {
-            rip: 0x8877_6655_4433_2211,
-            rsp: 0x1234_5678_9abc_def3,
-            rcx: 0x1020_3040_5060_7080,
-            rdx: 0xfeed_face_cafe_beef,
-        };
-        let code = context.jump_trampoline();
-        assert_eq!(code.len(), 42);
-        for (offset, opcode, value) in [
-            (0, [0x48, 0xb9], context.rcx),
-            (10, [0x48, 0xba], context.rdx),
-            (20, [0x48, 0xbc], context.rsp),
-            (30, [0x48, 0xb8], context.rip),
-        ] {
-            assert_eq!(&code[offset..offset + 2], &opcode);
-            assert_eq!(
-                u64::from_le_bytes(code[offset + 2..offset + 10].try_into().unwrap()),
-                value
-            );
-        }
-        assert_eq!(&code[40..], &[0xff, 0xe0]);
-    }
-
-    #[test]
-    fn jump_trampoline_encodes_zero_and_full_width_fields_without_policy() {
-        for value in [0, u64::MAX] {
-            let code = Amd64ThreadContext {
-                rip: value,
-                rsp: value,
-                rcx: value,
-                rdx: value,
-            }.jump_trampoline();
-            for offset in [2, 12, 22, 32] {
-                assert_eq!(&code[offset..offset + 8], &value.to_le_bytes());
-            }
-            assert_eq!(&code[40..], &[0xff, 0xe0]);
-        }
-    }
-
-    #[test]
     fn trampoline_restores_both_windows_argument_registers() {
         let code = Amd64ThreadContext {
             rip: 0x8877_6655_4433_2211,
@@ -856,40 +738,6 @@ mod tests {
             &code[34..],
             &[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x20, 0xeb, 0xfe]
         );
-    }
-
-    #[test]
-    fn loader_trampoline_calls_thunk_then_restores_durable_context() {
-        let loader = 0x1111_2222_3333_4444;
-        let ntdll = 0x5555_6666_7777_8888;
-        let context = 0x9999_aaaa_bbbb_cccc;
-        let code = Amd64ThreadContext::loader_trampoline(loader, ntdll, context);
-
-        assert_eq!(&code[0..2], &[0x48, 0xb9]);
-        assert_eq!(u64::from_le_bytes(code[2..10].try_into().unwrap()), 0);
-        assert_eq!(&code[10..12], &[0x48, 0xba]);
-        assert_eq!(u64::from_le_bytes(code[12..20].try_into().unwrap()), ntdll);
-        assert_eq!(&code[20..23], &[0x45, 0x31, 0xc0]);
-        assert_eq!(&code[23..25], &[0x49, 0xb9]);
-        assert_eq!(
-            u64::from_le_bytes(code[25..33].try_into().unwrap()),
-            context
-        );
-        assert_eq!(&code[33..35], &[0x48, 0xb8]);
-        assert_eq!(u64::from_le_bytes(code[35..43].try_into().unwrap()), loader);
-        assert_eq!(&code[43..47], &[0x48, 0x83, 0xec, 0x20]);
-        assert_eq!(&code[47..49], &[0xff, 0xd0]);
-        assert_eq!(&code[49..53], &[0x48, 0x83, 0xc4, 0x20]);
-        assert_eq!(&code[53..55], &[0x48, 0xb8]);
-        assert_eq!(
-            u64::from_le_bytes(code[55..63].try_into().unwrap()),
-            context
-        );
-        assert_eq!(&code[63..70], &[0x48, 0x8b, 0x88, 0x80, 0, 0, 0]);
-        assert_eq!(&code[70..77], &[0x48, 0x8b, 0x90, 0x88, 0, 0, 0]);
-        assert_eq!(&code[77..84], &[0x48, 0x8b, 0xa0, 0x98, 0, 0, 0]);
-        assert_eq!(&code[84..91], &[0x48, 0x8b, 0x80, 0xf8, 0, 0, 0]);
-        assert_eq!(&code[91..93], &[0xff, 0xe0]);
     }
 
     #[test]

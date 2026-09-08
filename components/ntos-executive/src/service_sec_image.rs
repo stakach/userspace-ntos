@@ -21661,7 +21661,7 @@ pub(crate) unsafe fn service_sec_image(
                         ]
                     );
                     let request = nt_handler.remote_thread_request.take();
-                    let publication_invisible = request.is_some_and(|request| {
+                    let publication_invisible = request.as_ref().is_some_and(|request| {
                         smss_stack_read(A_THREAD_HANDLE) == 0
                             && smss_stack_read(A_CID_OUT) == 0
                             && smss_stack_read(A_CID_OUT + 8) == 0
@@ -21680,7 +21680,7 @@ pub(crate) unsafe fn service_sec_image(
                     // lands in a page that exists ONLY there.
                     let mut spawned_tcb = 0u64;
                     let mut breakin_runtime_slot = 0usize;
-                    if let Some(request) = request {
+                    if let Some(request) = request.as_ref() {
                         breakin_runtime_slot = request.slot;
                         let runtime_publication = nt_handler.prepare_hosted_thread_runtime_publication(
                             test_pi, request.cid_thread, tp_worker_badge(test_pi, request.slot),
@@ -21693,6 +21693,7 @@ pub(crate) unsafe fn service_sec_image(
                                 slot: request.slot,
                                 pml4: request.pml4,
                                 start: request.start,
+                                initial_context: &request.initial_context,
                                 stack_origin: request.stack_origin,
                                 cid_proc: request.cid_proc,
                                 cid_thread: request.cid_thread,
@@ -21747,7 +21748,7 @@ pub(crate) unsafe fn service_sec_image(
                         && cid_proc == target as u64
                         && breakin_tid != 0
                         && breakin_tid != target_main as u64
-                        && request.is_some_and(|r| {
+                        && request.as_ref().is_some_and(|r| {
                             r.target_pi == test_pi
                                 && r.pml4 == target_pml4
                                 && r.start.rip == selftests::DBGK_BREAKIN_CODE_VA
@@ -22299,6 +22300,7 @@ unsafe fn spawn_requested_multiplexed_thread(
     spec: HostedThreadSpawnSpec,
     procs: &[ProcExec],
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     initial_teb: nt_thread_start::InitialTeb64,
     publication: PreparedHostedThreadPublication,
     fault_ep: u64,
@@ -22356,6 +22358,7 @@ unsafe fn spawn_requested_multiplexed_thread(
             owner_pi,
             pml4,
             start,
+            initial_context,
             initial_teb,
             cid_proc,
             tid,
@@ -22366,6 +22369,7 @@ unsafe fn spawn_requested_multiplexed_thread(
             owner_pi,
             pml4,
             start,
+            initial_context,
             initial_teb,
             cid_proc,
             tid,
@@ -22376,6 +22380,7 @@ unsafe fn spawn_requested_multiplexed_thread(
             owner_pi,
             pml4,
             start,
+            initial_context,
             initial_teb,
             cid_proc,
             tid,
@@ -22386,6 +22391,7 @@ unsafe fn spawn_requested_multiplexed_thread(
             owner_pi,
             pml4,
             start,
+            initial_context,
             initial_teb,
             cid_proc,
             tid,
@@ -22981,12 +22987,12 @@ unsafe fn spawn_requested_local_thread(
     procs: &[ProcExec],
     fault_ep: u64,
 ) -> Result<(), u32> {
-    let (publication, start, stack_origin) = match request {
+    let (publication, start, stack_origin) = match &request {
         HostedThreadSpawnRequest::Multiplexed { publication, start, initial_teb, .. }
         | HostedThreadSpawnRequest::Winlogon { publication, start, initial_teb, .. } =>
-            (publication, start, ThreadStackOrigin::Caller(initial_teb)),
+            (*publication, *start, ThreadStackOrigin::Caller(*initial_teb)),
         HostedThreadSpawnRequest::TpWorker { publication, start, stack_origin, .. } =>
-            (publication, start, stack_origin),
+            (*publication, *start, *stack_origin),
     };
     if let ThreadStackOrigin::Caller(initial_teb) = stack_origin {
         if let Err(status) = nt_handler.validate_hosted_caller_stack(
@@ -23000,6 +23006,7 @@ unsafe fn spawn_requested_local_thread(
         HostedThreadSpawnRequest::Multiplexed {
             kind,
             start,
+            initial_context,
             initial_teb,
             publication,
         } => {
@@ -23012,6 +23019,7 @@ unsafe fn spawn_requested_local_thread(
                 spec,
                 procs,
                 start,
+                &initial_context,
                 initial_teb,
                 publication,
                 fault_ep,
@@ -23020,6 +23028,7 @@ unsafe fn spawn_requested_local_thread(
         HostedThreadSpawnRequest::Winlogon {
             slot,
             start,
+            initial_context,
             initial_teb,
             publication,
         } => {
@@ -23088,6 +23097,7 @@ unsafe fn spawn_requested_local_thread(
                 slot,
                 pml4,
                 start,
+                &initial_context,
                 initial_teb,
                 cid_proc,
                 tid,
@@ -23144,6 +23154,7 @@ unsafe fn spawn_requested_local_thread(
             pi,
             slot,
             start,
+            initial_context,
             stack_origin,
             publication,
         } => {
@@ -23154,6 +23165,7 @@ unsafe fn spawn_requested_local_thread(
                     slot,
                     procs[pi].pml4,
                     start,
+                    &initial_context,
                     stack_origin,
                     publication,
                     fault_ep,
@@ -23174,6 +23186,7 @@ unsafe fn spawn_requested_tp_worker(
     worker_slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    initial_context: &nt_thread_start::amd64_context::InitialAmd64Context,
     stack_origin: ThreadStackOrigin,
     publication: PreparedHostedThreadPublication,
     fault_ep: u64,
@@ -23210,6 +23223,7 @@ unsafe fn spawn_requested_tp_worker(
         worker_slot,
         pml4,
         start,
+        initial_context,
         stack_origin,
         cid_proc,
         tid,
@@ -23303,6 +23317,7 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
             slot: request.slot,
             pml4: request.pml4,
             start: request.start,
+            initial_context: &request.initial_context,
             stack_origin: request.stack_origin,
             cid_proc: request.cid_proc,
             cid_thread: request.cid_thread,

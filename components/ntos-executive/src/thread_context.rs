@@ -15,8 +15,18 @@ pub(crate) unsafe fn continue_thread(
     tcb: u64,
     context: &nt_thread_start::amd64_context::LegacyContextRestore,
 ) -> Result<(), u64> {
+    write(tcb, context, true)
+}
+
+/// Install selected state before first publication, or resume a parked caller atomically.
+/// With `restart == false`, installation does not make a suspended target runnable.
+pub(crate) unsafe fn write(
+    tcb: u64,
+    context: &nt_thread_start::amd64_context::LegacyContextRestore,
+    restart: bool,
+) -> Result<(), u64> {
     let mut words = [0u64; WRITE_WORDS];
-    words[0] = context.register_mask | RESTART_MASK;
+    words[0] = context.register_mask | if restart { RESTART_MASK } else { 0 };
     words[1..1 + REGISTER_WORDS].copy_from_slice(&context.registers);
     if let Some(image) = &context.floating_point {
         words[0] |= FX_MASK;
@@ -49,7 +59,7 @@ pub(crate) unsafe fn continue_thread(
     // reply to the now-unbound invocation.
     assert_eq!(
         info, 0,
-        "legacy context restart returned a malformed success envelope"
+        "legacy context write returned a malformed success envelope"
     );
     Ok(())
 }

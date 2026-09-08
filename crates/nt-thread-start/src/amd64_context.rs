@@ -25,13 +25,21 @@ const CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const EXTENDED_STATE_GROUPS: u32 = 0x40 | 0x80; // XSTATE and CET
 
 mod continue_context;
-pub use continue_context::LegacyContextRestore;
+mod floating_point;
+pub use continue_context::{LegacyContextRestore, NT_NATIVE_CODE_SELECTOR, PLATFORM_NATIVE_CODE_SELECTOR};
+mod initial_trampoline;
+pub use initial_trampoline::{
+    initial_context_trampoline, InitialContextTrampoline, INITIAL_CONTEXT_TRAMPOLINE_CAPACITY,
+};
+mod initial_context;
+pub use initial_context::{InitialAmd64Context, INITIAL_THREAD_FCW, INITIAL_THREAD_MXCSR};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecError {
     UnsupportedExtendedState,
     InvalidArchitecture,
     InvalidInstructionPointer,
+    InvalidContextAddress,
     InvalidStackPointer,
     UnsupportedCompatibilityMode,
     UnsupportedDebugRegisters,
@@ -44,6 +52,7 @@ impl CodecError {
         match self {
             Self::InvalidArchitecture
             | Self::InvalidInstructionPointer
+            | Self::InvalidContextAddress
             | Self::InvalidStackPointer => 0xc000_000d,
             Self::UnsupportedExtendedState
             | Self::UnsupportedCompatibilityMode
@@ -117,13 +126,15 @@ impl CapturedAmd64Context {
         );
         let mxcsr = read_u32(&self.bytes, CONTEXT_MXCSR_OFFSET);
         sanitize(&mut image, mxcsr);
+        floating_point::wire_to_hardware(&mut image);
         Ok(Some(image))
     }
 
     /// Publish the requested native legacy FP group, preserving flags and all unrelated bytes.
     /// Like NT5 KeContextFromKframes, observation preserves the raw saved hardware FCW/MXCSR;
     /// the SET/restore masks are not applied here. The hardware MXCSR is mirrored into the
-    /// top-level field, while the complete supplied image is copied unchanged into FloatSave.
+    /// top-level field. FXSAVE64 pointer fields are converted to XMM_SAVE_AREA32 offsets;
+    /// all remaining supplied hardware bytes are copied unchanged into FloatSave.
     /// Returns false without mutation for an unrequested group; unsupported extended state is
     /// rejected before any field is written.
     pub fn publish_legacy_floating_point(
@@ -134,8 +145,10 @@ impl CapturedAmd64Context {
             return Ok(false);
         }
         let mxcsr = read_u32(image, FX_MXCSR_OFFSET);
+        let mut wire = *image;
+        floating_point::hardware_to_wire(&mut wire);
         self.bytes[FLOAT_SAVE_OFFSET..FLOAT_SAVE_OFFSET + LEGACY_FLOATING_POINT_BYTES]
-            .copy_from_slice(image);
+            .copy_from_slice(&wire);
         self.bytes[CONTEXT_MXCSR_OFFSET..CONTEXT_MXCSR_OFFSET + 4]
             .copy_from_slice(&mxcsr.to_le_bytes());
         Ok(true)

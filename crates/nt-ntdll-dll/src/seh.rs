@@ -51,7 +51,7 @@ const CTX_XMM0: usize = 0x1A0;
 /// `CONTEXT` size in bytes.
 const CONTEXT_SIZE: usize = 0x4D0;
 /// `CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT`.
-const CONTEXT_FULL: u32 = 0x0010_0007;
+const CONTEXT_FULL: u32 = 0x0010_000b;
 
 /// Stack storage for an AMD64 `CONTEXT`. `RtlCaptureContext` uses aligned XMM stores, matching the
 /// platform ABI's 16-byte alignment requirement for this structure.
@@ -1053,11 +1053,12 @@ pub unsafe extern "C" fn ki_user_exception_dispatcher(record: *mut c_void, conte
 // =================================================================================================
 
 /// `RtlCaptureContext(CONTEXT*)` — capture the live register file into `*ctx`. Naked so it does not
-/// perturb the registers it is capturing. Captures the integer GPRs (Rax..R15), the return address
-/// as Rip, and Rsp as it was at the call site (after the return address is accounted for).
+/// perturb the registers it is capturing. Captures all legacy user execution groups, the return
+/// address as Rip, and Rsp after the return address is accounted for. Unrequested fields remain
+/// untouched, including the home slots, debug registers, and extended/vector state.
 ///
 /// # Safety
-/// `ctx` (RCX) a valid writable CONTEXT (>= 0x4D0 bytes).
+/// `ctx` (RCX) a 16-byte-aligned writable CONTEXT (>= 0x4D0 bytes).
 #[unsafe(naked)]
 pub unsafe extern "C" fn capture_context(_ctx: *mut u8) {
     core::arch::naked_asm!(
@@ -1077,23 +1078,26 @@ pub unsafe extern "C" fn capture_context(_ctx: *mut u8) {
         "mov [rcx + 0xE0], r13",
         "mov [rcx + 0xE8], r14",
         "mov [rcx + 0xF0], r15",
+        "mov dword ptr [rcx + 0x30], 0x0010000f", // FULL | SEGMENTS
         // Rip = the return address at [rsp].
         "mov rax, [rsp]",
         "mov [rcx + 0xF8], rax",
         // Rsp = the caller's RSP AFTER the call returns (rsp + 8, popping the return address).
         "lea rax, [rsp + 8]",
         "mov [rcx + 0x98], rax",
-        // Save XMM6..XMM15 (nonvols) at their offsets (0x1A0 + 16*n).
-        "movaps [rcx + 0x200], xmm6",
-        "movaps [rcx + 0x210], xmm7",
-        "movaps [rcx + 0x220], xmm8",
-        "movaps [rcx + 0x230], xmm9",
-        "movaps [rcx + 0x240], xmm10",
-        "movaps [rcx + 0x250], xmm11",
-        "movaps [rcx + 0x260], xmm12",
-        "movaps [rcx + 0x270], xmm13",
-        "movaps [rcx + 0x280], xmm14",
-        "movaps [rcx + 0x290], xmm15",
+        // All preceding instructions preserve the caller's flags.
+        "pushfq",
+        "pop rax",
+        "mov [rcx + 0x44], eax",
+        "mov [rcx + 0x38], cs",
+        "mov [rcx + 0x3a], ds",
+        "mov [rcx + 0x3c], es",
+        "mov [rcx + 0x3e], fs",
+        "mov [rcx + 0x40], gs",
+        "mov [rcx + 0x42], ss",
+        "stmxcsr [rcx + 0x34]",
+        // CONTEXT uses XMM_SAVE_AREA32 pointer/selector fields, not FXSAVE64 pointers.
+        "fxsave [rcx + 0x100]",
         "ret",
     );
 }
