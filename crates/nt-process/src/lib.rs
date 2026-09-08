@@ -962,6 +962,8 @@ pub struct NtThread {
     pub user_time_100ns: i64,
     /// Generation of the dormant/reclaimed-thread activation boundary.
     activation_generation: u64,
+    /// Initial main-runtime metadata has been published, including any explicit zero values.
+    initial_runtime_published: bool,
     /// LPC port objects referenced by `NtRegisterThreadTerminatePort`, in registration order.
     /// `PspExitThread` drains this as a stack, so duplicates intentionally remain distinct.
     termination_ports: Vec<u64>,
@@ -2078,6 +2080,7 @@ impl ProcessManager {
                 kernel_time_100ns: 0,
                 user_time_100ns: 0,
                 activation_generation: 1,
+                initial_runtime_published: false,
                 termination_ports,
                 impersonation: None,
                 security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
@@ -2646,14 +2649,6 @@ impl ProcessManager {
         let this_period_job_user_time = self.job_accounting(job_id)?.this_period_total_user_time;
         self.jobs
             .evaluate_time_limits(job_id, pid, process_user_time, this_period_job_user_time)
-    }
-
-    pub fn set_thread_create_time(&mut self, tid: ThreadId, create_time_100ns: i64) -> bool {
-        let Some(thread) = self.threads.get_mut(&tid) else {
-            return false;
-        };
-        thread.create_time_100ns = create_time_100ns;
-        true
     }
 
     pub fn thread_start_address(
@@ -3360,19 +3355,64 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// Bind a thread's start address (spec §10) — a host that pre-creates the main thread as an
-    /// identity (before its image entry point is known) sets it once the entry is resolved at the
-    /// real spawn. Returns `false` for an unknown thread. Alloc-free (a field write) so it is safe
-    /// to call during a serviced call on a reset bump allocator.
-    pub fn set_thread_start_address(&mut self, tid: ThreadId, start_address: u64) -> bool {
-        match self.threads.get_mut(&tid) {
-            Some(t) => {
-                t.start_address = start_address;
-                t.win32_start_address = start_address;
-                true
-            }
-            None => false,
+    /// Publish the initial main thread's actual runtime metadata without activating a dormant
+    /// thread or changing its lifetime. The snapshot must come from this same manager. Native
+    /// callers must keep the runtime suspended through publication and provide its actual mapped
+    /// TEB; zero denotes an explicitly absent user environment, not an inferred System identity.
+    ///
+    /// Existing nonzero initialization must agree. Once published, even zero values are fixed.
+    /// The entry must be nonzero. A canonical ETHREAD may already exist only if all initialization
+    /// fields already agree. A later independent Win32-start-address update makes initial replay
+    /// fail rather than overwrite that update.
+    /// Validation precedes every write; exact replay is allocation-free and idempotent.
+    pub fn publish_initial_thread_runtime(
+        &mut self,
+        lifetime: ThreadLifetime,
+        start_address: u64,
+        teb_base: u64,
+        create_time_100ns: i64,
+    ) -> Result<(), u32> {
+        let thread = self.threads.get(&lifetime.thread_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if !self.validate_thread_lifetime(lifetime) {
+            return Err(STATUS_INVALID_PARAMETER);
         }
+        if thread.state == ThreadState::Terminated || thread.exit_status.is_some() {
+            return Err(STATUS_THREAD_IS_TERMINATING);
+        }
+        let process = self.processes.get(&lifetime.process_id).ok_or(STATUS_INVALID_HANDLE)?;
+        if matches!(process.state, ProcessState::Exiting | ProcessState::Terminated)
+            || process.exit_status.is_some()
+        {
+            return Err(STATUS_PROCESS_IS_TERMINATING);
+        }
+        if start_address == 0
+            || lifetime.generation != 1
+            || thread.state == ThreadState::Initialized
+            || process.main_thread != Some(lifetime.thread_id)
+            || process.threads.iter().filter(|&&tid| tid == lifetime.thread_id).count() != 1
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let exact = thread.start_address == start_address
+            && thread.win32_start_address == start_address
+            && thread.teb_base == teb_base
+            && thread.create_time_100ns == create_time_100ns;
+        let conflicting = (thread.start_address != 0 && thread.start_address != start_address)
+            || (thread.win32_start_address != 0 && thread.win32_start_address != start_address)
+            || (thread.teb_base != 0 && thread.teb_base != teb_base)
+            || (thread.create_time_100ns != 0 && thread.create_time_100ns != create_time_100ns);
+        if conflicting
+            || ((thread.initial_runtime_published || thread.kernel_thread_object.is_some()) && !exact)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let thread = self.threads.get_mut(&lifetime.thread_id).unwrap();
+        thread.start_address = start_address;
+        thread.win32_start_address = start_address;
+        thread.teb_base = teb_base;
+        thread.create_time_100ns = create_time_100ns;
+        thread.initial_runtime_published = true;
+        Ok(())
     }
 
     /// Set the user-visible Win32 entry point without altering the scheduler's execution entry.
@@ -3384,19 +3424,6 @@ impl ProcessManager {
         let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
         thread.win32_start_address = start_address;
         Ok(())
-    }
-
-    /// Bind a thread's TEB base VA (spec §7.2) — the host sets it once it maps the thread's TEB page
-    /// at the real spawn. Returns `false` for an unknown thread. Alloc-free (a field write), so it is
-    /// safe to call during a serviced call on a reset bump allocator.
-    pub fn set_thread_teb(&mut self, tid: ThreadId, teb_base: u64) -> bool {
-        match self.threads.get_mut(&tid) {
-            Some(t) => {
-                t.teb_base = teb_base;
-                true
-            }
-            None => false,
-        }
     }
 
     /// Read back a thread's TEB base VA (`0` until the host maps it) — for
@@ -5268,3 +5295,6 @@ mod thread_lifetime_tests;
 
 #[cfg(test)]
 mod kernel_object_publication_tests;
+
+#[cfg(test)]
+mod initial_thread_runtime_tests;

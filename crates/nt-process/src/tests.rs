@@ -1101,10 +1101,9 @@ fn pre_created_main_thread_bound_at_spawn() {
     assert_eq!(pm.main_thread(pid), Some(tid));
     assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
     // Bind the entry at "spawn".
-    assert!(pm.set_thread_start_address(tid, 0x1400_18e60));
+    pm.publish_initial_thread_runtime(pm.thread_lifetime(tid).unwrap(), 0x1400_18e60, 0, 0).unwrap();
     assert_eq!(pm.thread(tid).unwrap().start_address, 0x1400_18e60);
-    assert!(!pm.set_thread_start_address(9999, 0)); // unknown tid rejected, not a panic
-                                                    // Teardown: terminate the process → signalled, thread terminated, exit status readable.
+    // Teardown: terminate the process, leaving its thread signalled and exit status readable.
     assert!(!pm.is_process_signaled(pid));
     pm.terminate_process(pid, 0x1234).unwrap();
     assert!(pm.is_process_signaled(pid));
@@ -1142,17 +1141,16 @@ fn runtime_thread_create_with_teb_and_handle() {
     let pid = pm.create_process("winlogon.exe", None, None);
     pm.reserve_handles(pid, 16);
     let main = pm.create_thread(pid, 0, 0, false).unwrap(); // main (identity at boot)
-                                                            // Pool: one extra ETHREAD pre-created at boot (entry/teb unknown yet).
-    let listener = pm.create_thread(pid, 0, 0, false).unwrap();
+    // Pool: one extra ETHREAD pre-created at boot (entry/teb unknown yet).
+    let listener = pm.create_dormant_thread(pid).unwrap();
     assert_ne!(listener, main);
     assert_eq!(pm.main_thread(pid), Some(main)); // the pool thread is NOT the main thread
-                                                 // Runtime NtCreateThread: bind the RPC listener start routine + record its mapped TEB.
-    assert!(pm.set_thread_start_address(listener, 0x7ff0_1234));
-    assert!(pm.set_thread_teb(listener, 0x0000_0100_1049_0000));
+    // Runtime NtCreateThread: bind the RPC listener start routine + record its mapped TEB.
+    let plan = pm.prepare_thread_activation(listener, 0x7ff0_1234, 0, false, 0x0000_0100_1049_0000, 0, false).unwrap();
+    pm.commit_thread_activation(plan).unwrap();
     assert_eq!(pm.thread_teb(listener), Some(0x0000_0100_1049_0000));
     assert_eq!(pm.thread_teb(main), Some(0)); // TEB unbound until mapped
-    assert!(!pm.set_thread_teb(9999, 0)); // unknown tid rejected, not a panic
-                                          // Mint a typed Thread(tid) handle in the caller's table → resolvable for 162.
+    // Mint a typed Thread(tid) handle in the caller's table, resolvable for 162.
     let h = pm
         .insert_handle(pid, HandleObject::Thread(listener), 0)
         .unwrap();
@@ -1179,10 +1177,10 @@ fn multiple_runtime_threads_have_distinct_handles_cids_and_tebs() {
     let mut seen = alloc::vec::Vec::new();
 
     for index in 0..3u64 {
-        let tid = pm.create_thread(pid, 0, index, false).unwrap();
+        let tid = pm.create_dormant_thread(pid).unwrap();
         let teb = 0x0000_0100_1049_0000 + index * 0x60000;
-        assert!(pm.set_thread_start_address(tid, 0x7ff0_1000 + index * 0x100));
-        assert!(pm.set_thread_teb(tid, teb));
+        let plan = pm.prepare_thread_activation(tid, 0x7ff0_1000 + index * 0x100, index, false, teb, 0, false).unwrap();
+        pm.commit_thread_activation(plan).unwrap();
         let handle = pm
             .insert_handle(pid, HandleObject::Thread(tid), 0x0040)
             .unwrap();
@@ -3036,8 +3034,8 @@ fn dbgk_existing_thread_create_reports_claimed_pool_thread() {
     assert_eq!(pm.report_existing_thread_create(dormant), None);
 
     const START: u64 = 0x0000_0001_7000_4321;
-    assert!(pm.set_thread_start_address(dormant, START));
-    pm.set_thread_state(dormant, ThreadState::Running).unwrap();
+    let plan = pm.prepare_thread_activation(dormant, START, 0, false, 0x7000, 0, false).unwrap();
+    pm.commit_thread_activation(plan).unwrap();
     assert_eq!(pm.report_existing_thread_create(dormant), Some(object));
 
     let created = pm.wait_for_debug_event(object, debugger).unwrap().unwrap();

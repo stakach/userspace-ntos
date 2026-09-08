@@ -30019,7 +30019,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retired numeric slot no longer participates as a live TCB in binding admission. No desktop
     result or full failed-thread memory reclamation is claimed by this checkpoint.
 
-    B3 pending-construction memory retirement tranche 140 (2026-09-09, host/native validation):
+    B3 pending-construction memory retirement tranche 140 (2026-09-09, accepted):
     replace the mechanism-only native drain with the complete failed-construction owner. Prepare
     the memory journal while its original resource projections and reservations remain protected,
     acquire the exact terminal registry transfer, then perform a one-time allocation-free handoff
@@ -30051,6 +30051,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and checked TCB deletion/recycling before its legacy release chain can be removed. Canonical
     provider Ps-body allocation/grant cutover and the strict 27-import frontier remain open; no
     new NT boot or desktop result is claimed.
+
+    B3 initial main-runtime publication tranche 141 (2026-09-09, accepted):
+    the SEC_IMAGE constructor now returns the actual process/thread IDs, image entry, optional
+    mapped TEB, stable creation timestamp and whether it has already resumed the TCB. The no-user-
+    environment diagnostic returns no TEB. Native registration requires the matching unstarted
+    hosted runtime, retains its mechanism, publishes the exact PM lifetime's initial tuple, and
+    only then publishes stack metadata and runtime instrumentation. Child construction retains
+    its VSpace owner before this publication. Remove the separate main-entry binder and all three
+    public piecemeal start/TEB/create-time setters, migrating model fixtures to real initial
+    publication or dormant activation instead.
+
+    Initial publication is main-thread/generation-one only and rejects stale, exiting, conflicting
+    or body-inconsistent initialization before any field changes. Exact replay is idempotent;
+    explicit zero TEB/time values are fixed, not uninitialized defaults. An independently changed
+    Win32StartAddress is never overwritten by replay. ThreadLifetime remains a same-manager caller
+    contract, not a new cross-manager identity mechanism. This does not activate canonical provider
+    Ps bodies or claim a new desktop proof.
+
+    Serialized validation passes 620 unit tests, 47 integration tests and three compile-fail checks
+    in .tmp/test-initial-thread-runtime-publication-final-20260909.log. The initial run exposed a
+    migrated debugger fixture that tried to activate a pooled thread with a null TEB; correct the
+    fixture rather than weakening activation validation. Native release build passes in
+    .tmp/build-initial-thread-runtime-publication-20260909.log. Source review confirms both real
+    main routes use setup_env=true/start_immediately=false, and the diagnostic with no environment
+    cannot accidentally publish the ordinary TEB constant. No legacy setter or binder remains.
+
+    Next ordinary teardown review: the active live-thread path still combines TCB deletion and
+    slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
+    Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a
+    fabricated failed-construction identity. Main threads need an explicit no-pool-reservation
+    state. Retain charged fixed-memory ranges and dynamic stack VAD cleanup in the same owner;
+    pending-range exclusions must admit only that exact retirement authority. Retain GUI EXIT
+    entry/completion outcomes across owner-out IPC so an entered but incomplete call is not replayed.
+    Replace the common termination funnel only after these owners are complete, and migrate the
+    remote-breakin diagnostic bypass too. Pool/window reuse and accounting release remain last.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

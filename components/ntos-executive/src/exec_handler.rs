@@ -9803,32 +9803,31 @@ impl ExecNtHandler {
         &mut self,
         pi: usize,
         spawn: img_spawn::SecImageSpawn,
-    ) {
-        if let Some(tid) = self.pm_main_tid_for_pi(pi) {
-            let Some(process) = self.capture_thread_process_identity(pi, u64::from(tid)) else {
-                return;
-            };
-            let badge = self.hosted_process_top_badge(pi).unwrap_or(0);
-            if self
-                .thread_runtime
-                .register_main(
-                    pi,
-                    process,
-                    u64::from(tid),
-                    spawn.main_tcb,
-                    badge,
-                    spawn.main_mechanism,
-                )
-                .is_some()
-            {
-                publish_hosted_thread_runtime_gate(pi, HostedThreadRole::Main);
-                let _ = self.thread_runtime.set_user_stack(
-                    u64::from(tid),
-                    HOSTED_MAIN_STACK_ALLOCATION_BASE,
-                    STACK_BASE + STACK_FRAMES * 0x1000,
-                );
-            }
-        }
+    ) -> Result<(), u32> {
+        let tid = self.pm_main_tid_for_pi(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let process = self.capture_thread_process_identity(pi, u64::from(tid))
+            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let badge = self.hosted_process_top_badge(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let lifetime = self.pm.thread_lifetime(tid).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        let mapped = spawn.main_runtime;
+        let teb = mapped.teb.filter(|teb| *teb != 0).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        if mapped.process_id != u64::from(process.pid) || mapped.thread_id != u64::from(tid)
+            || mapped.started || mapped.entry == 0
+        { return Err(nt_process::STATUS_INVALID_PARAMETER); }
+        self.thread_runtime.register_main(
+            pi, process, u64::from(tid), spawn.main_tcb, badge, spawn.main_mechanism,
+        ).ok_or(nt_process::STATUS_INSUFFICIENT_RESOURCES)?;
+        // Retain the actual mechanism before Ps validation. Neither caller may resume the main
+        // TCB until this complete tuple and the real stack geometry have been published.
+        self.pm.publish_initial_thread_runtime(
+            lifetime, mapped.entry, teb, mapped.create_time_100ns,
+        )?;
+        self.thread_runtime.set_user_stack(
+            u64::from(tid), HOSTED_MAIN_STACK_ALLOCATION_BASE, STACK_BASE + STACK_FRAMES * 0x1000,
+        ).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
+        publish_hosted_thread_runtime_gate(pi, HostedThreadRole::Main);
+        Ok(())
     }
 
     pub(crate) fn hosted_thread_tcb(&self, tid: u64) -> Option<u64> {
@@ -16246,20 +16245,6 @@ impl ExecNtHandler {
         Some(0)
     }
 
-    /// Bind a hosted process's MAIN THREAD to its real image entry at the actual seL4 spawn — the
-    /// "route NtCreateThread through pm at real spawn time" step (the thread object was pre-created
-    /// at boot for the non-leaking heap solution; this alloc-free field write completes it).
-    pub(crate) fn bind_main_thread_entry(&mut self, pi: usize, entry: u64) {
-        if let Some(tid) = self.pm_main_tid_for_pi(pi) {
-            if self.pm.set_thread_start_address(tid, entry) {
-                let _ = self.pm.set_thread_teb(tid, SMSS_TEB_VA);
-                let _ = self
-                    .pm
-                    .set_thread_create_time(tid, nt_system_time_100ns() as i64);
-                PM_THREAD_BINDS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
     /// Apply native `NtOpenProcess` selector and access policy after the caller structures have
     /// been captured from its address space. Publication of the returned handle remains the
     /// caller's responsibility so copyout can be transactional.

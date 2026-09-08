@@ -27125,9 +27125,7 @@ static PM_RUNNING_PROCESS_MASK: AtomicU64 = AtomicU64::new(0);
 static PM_MAIN_THREADS_OK: AtomicU64 = AtomicU64::new(0);
 /// Post-loop proof bits for hosted runtime roles that were promoted to live TCB-backed records.
 static HOSTED_THREAD_RUNTIME_OK: AtomicU64 = AtomicU64::new(0);
-/// Count of spawn-time `set_thread_start_address` binds (csrss/winlogon main threads bound to their
-/// real image entry when the seL4 process is actually spawned) — the "NtCreateThread through pm at
-/// real spawn time" routing.
+/// Count of actual hosted main-runtime tuples published through exact Ps lifetime validation.
 static PM_THREAD_BINDS: AtomicU64 = AtomicU64::new(0);
 /// Lifecycle self-test result (post-loop): NtTerminateProcess policy teardown on a throwaway EPROCESS
 /// (process signalled + main thread terminated + exit status via wait + handle-table closed).

@@ -5943,14 +5943,13 @@ unsafe fn spawn_requested_hosted_exe(
         child_pid as u64,
         child_tid as u64,
     );
-    nt_handler.register_main_thread_spawn(pi, child_spawn);
     procs[pi].pid = child_pid as u64;
     procs[pi].pml4 = child_spawn.pml4;
     nt_handler.publish_hosted_process_vspace(pi, child_spawn.vspace_caps)?;
+    nt_handler.register_main_thread_spawn(pi, child_spawn)?;
     procs[pi].img_end = PE_LOAD_BASE + image_extent(spec.pe);
     procs[pi].scratch_base = spec.runtime.scratch_base;
     map_demand_scratch_pts(spec.runtime.scratch_base);
-    nt_handler.bind_main_thread_entry(pi, PE_LOAD_BASE + spec.pe.entry_point_rva() as u64);
     let _ = nt_handler.pm.set_peb_base(child_pid, SMSS_PEB_VA);
 
     let process_handle = match nt_handler.insert_process_handle(
@@ -8153,7 +8152,8 @@ pub(crate) unsafe fn service_sec_image(
         provider_dispatcher.timers,
     );
     print_str(b"[sec-init] handler-ready\n");
-    nt_handler.register_main_thread_spawn(primary_pi, primary_spawn);
+    nt_handler.register_main_thread_spawn(primary_pi, primary_spawn)
+        .expect("primary runtime publication must precede first execution");
     let delay_queue = reset_service_delay_queue_work().expect("delay wait queue allocation failed");
     register_service_delay_drain_context(&mut nt_handler, delay_queue);
     // Boot drivers can publish timer deadlines before the service loop owns its
@@ -8179,11 +8179,6 @@ pub(crate) unsafe fn service_sec_image(
     // Primary PE (the function param `pe` is shadowed per-iteration to the active process's image).
     // The generated SEC_IMAGE diagnostic uses its own fault loop, never this live service state.
     let primary_pe: &nt_pe_loader::PeFile = pe;
-    // Bind the pre-created main ETHREAD to the primary image entry.
-    nt_handler.bind_main_thread_entry(
-        primary_pi,
-        PE_LOAD_BASE + primary_pe.entry_point_rva() as u64,
-    );
     // Slots are EPROCESS-linked via the handler-owned process mechanism lookup. smss is live from
     // the initial recv; later hosted processes claim their pid on the native create-process path and
     // fill pml4/scratch/img_end when the service loop constructs their seL4 mechanism.

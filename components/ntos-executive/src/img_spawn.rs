@@ -446,6 +446,18 @@ pub(crate) struct SecImageSpawn {
     pub(crate) main_tcb: u64,
     pub(crate) main_mechanism: HostedThreadMechanismCaps,
     pub(crate) vspace_caps: HostedProcessVspaceCaps,
+    pub(crate) main_runtime: MainThreadRuntime,
+}
+
+/// What this constructor actually installed, not a later reconstruction from process identity.
+#[derive(Clone, Copy)]
+pub(crate) struct MainThreadRuntime {
+    pub(crate) process_id: u64,
+    pub(crate) thread_id: u64,
+    pub(crate) entry: u64,
+    pub(crate) teb: Option<u64>,
+    pub(crate) create_time_100ns: i64,
+    pub(crate) started: bool,
 }
 
 /// Build a PE32+/x86_64 image. `sections` = (name8, va, chars, data); `dirs` = (index, rva,
@@ -1671,6 +1683,14 @@ pub(crate) unsafe fn spawn_sec_image(
         main_tcb: tcb,
         main_mechanism: HostedThreadMechanismCaps::new(raw, cnode, sched_context),
         vspace_caps,
+        main_runtime: MainThreadRuntime {
+            process_id: client_process_id,
+            thread_id: client_thread_id,
+            entry: PE_LOAD_BASE + pe.entry_point_rva() as u64,
+            teb: setup_env.then_some(SMSS_TEB_VA),
+            create_time_100ns: nt_system_time_100ns() as i64,
+            started: start_immediately,
+        },
     }
 }
 
