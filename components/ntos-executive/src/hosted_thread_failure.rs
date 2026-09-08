@@ -1,4 +1,4 @@
-//! Failed constructors remain owned by their original runtime reservation until checked cleanup.
+//! Constructors remain owned by their original runtime reservation through publication or cleanup.
 use super::*;
 use nt_user_host::thread_binding::ThreadBinding;
 use nt_user_host::thread_construction::{MemoryConstructionProgress, ThreadConstructionInventory};
@@ -30,7 +30,7 @@ impl ThreadReconciliationError {
 }
 
 #[derive(Debug)]
-pub(crate) struct FailedHostedThreadConstruction {
+pub(crate) struct RetainedHostedThreadConstruction {
     pub(crate) binding: ThreadBinding<HostedThreadRole>,
     pub(crate) resources: HostedThreadResources,
     pub(crate) construction: ThreadConstructionInventory,

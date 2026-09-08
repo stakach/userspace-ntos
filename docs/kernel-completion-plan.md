@@ -29968,6 +29968,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     host-tested actors; ordinary teardown is not yet such a backend. Retain window/pool/commitment
     ownership through every failure, and remove the unchecked spawn destructor at this cutover.
 
+    B3 completed-constructor publication tranche 138 (2026-09-09, accepted):
+    successful construction no longer consumes/discards its capability inventory or memory
+    construction progress. The nonclone spawn payload retains both through the fallible PM/body
+    activation and first resume. A read-only live-slot observer supplies routing values without
+    granting duplicate ownership. Before either activation or resume, validate the exact protected
+    runtime ticket, process/thread binding, completed owner and empty destination runtime.
+
+    Rejected publication consumes the original spawn payload into the existing pending runtime
+    slot before canceling the caller's handle or outputs. An uncommitted MM/job charge proposal is
+    discarded, not subtracted from live accounting. Pool/window reservations remain protected by
+    the pending owner and all alias/journal preparation failures remain retryable. Success commits
+    the runtime and charge before caller-handle publication, with no component IPC in between.
+    Remove abort_registered_hosted_thread_spawn and release_unpublished_hosted_thread_runtime;
+    their unchecked deletion/resource-release path is no longer reachable. Ordinary running-thread
+    teardown still needs conversion to the retained native backend and is not marked complete.
+
+    Validation: 602 PM/user-host unit tests, 43 integration tests and three compile-fail ownership
+    checks pass in .tmp/test-retained-spawn-publication-20260909.log. Native integration builds
+    in .tmp/build-retained-spawn-publication-final-20260909.log after adding the existing runtime
+    wrapper's missing validation forwarder. No fresh boot or desktop result is claimed.
+    Review found one necessary retirement hook before recycling TCB slots: pending rows still
+    contribute their TCB number to binding-conflict checks. Clear that projection to the reserved
+    sentinel only after acknowledged deletion and before allocator publication. Keep the original
+    slot in the sealed retirement actor; recycle failure must retain the empty slot without
+    re-deleting it. This is a narrow actor-controlled update, not public mutable pending access.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

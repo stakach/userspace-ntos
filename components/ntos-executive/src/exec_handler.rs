@@ -10857,17 +10857,6 @@ impl ExecNtHandler {
         self.thread_runtime.release_tid(tid)
     }
 
-    pub(crate) fn abort_registered_hosted_thread_spawn(&mut self, tid: u64) -> bool {
-        let Some(runtime) = self.release_hosted_thread_runtime(tid) else {
-            return false;
-        };
-        unsafe {
-            self.release_hosted_thread_commitment(runtime.resources);
-            crate::release_unpublished_hosted_thread_runtime(runtime);
-        }
-        true
-    }
-
     fn hosted_thread_mechanism_for_tid(&self, tid: u64) -> Option<nt_user_host::ThreadMechanism> {
         if tid == 0 || tid > u32::MAX as u64 {
             return None;
@@ -15801,18 +15790,22 @@ impl ExecNtHandler {
         }
     }
 
-    /// Complete a freshly constructed, still-suspended runtime before exposing its handle.
+    /// Retain construction ownership until activation and first resume succeed, then publish
+    /// runtime routing and the caller's handle without intervening provider IPC.
     pub(crate) unsafe fn finish_hosted_thread_publication(
         &mut self,
+        prepared: PreparedHostedThreadRuntime,
+        spawn: HostedThreadSpawn,
         publication: PreparedHostedThreadPublication,
-        tcb: u64,
         resume: bool,
     ) -> Result<(), u32> {
         let tid = publication.activation.thread_id();
-        let runtime = self.thread_runtime.get_by_tid(u64::from(tid))
-            .expect("registered construction retains its runtime until publication");
-        assert_eq!(runtime.tcb, tcb, "publication resumes its exact registered TCB");
-        let window_slot = runtime.role.worker_window_slot();
+        assert_eq!(prepared.ticket.owner().tid, u64::from(tid),
+            "activation belongs to the exact construction ticket");
+        assert_eq!(prepared.ticket.owner().pi, publication.owner_pi);
+        assert!(self.thread_runtime.validate_spawn(&prepared, &spawn),
+            "first run requires the exact completed construction and protected reservation");
+        let tcb = spawn.tcb();
         let activation = crate::ps_object_backing::commit_thread_activation(
             &mut self.pm, publication.activation, publication.handle,
         );
@@ -15835,13 +15828,17 @@ impl ExecNtHandler {
             }
         };
         if let Some(status) = failure {
-            let _ = self.abort_registered_hosted_thread_spawn(u64::from(tid));
-            if let Some(slot) = window_slot {
-                self.clear_hosted_tp_worker_window_slot(publication.owner_pi, slot);
-            }
-            self.abort_hosted_thread_publication(publication);
+            let (partial, commitment) = spawn.into_failed();
+            self.fail_hosted_thread_runtime_publication(
+                prepared, HostedThreadSpawnFailure::Retained(partial),
+            );
+            // Only a proposal was prepared: neither commitment nor mapping accounting was
+            // published. The protected runtime retains all actual construction resources.
+            drop(commitment);
+            self.abort_unbuilt_hosted_thread_request(publication);
             return Err(status);
         }
+        self.commit_hosted_thread_runtime_publication(prepared, spawn);
         self.publish_hosted_thread_caller_handle(publication);
         Ok(())
     }

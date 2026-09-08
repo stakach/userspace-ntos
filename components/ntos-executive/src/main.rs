@@ -18758,15 +18758,6 @@ unsafe fn release_unpublished_sec_image_spawn(
     release_sec_image_vspace_caps(&mut owner)
 }
 
-pub(crate) unsafe fn release_unpublished_hosted_thread_runtime(runtime: HostedThreadRuntime) {
-    if runtime.tcb > 1 {
-        let _ = tcb_suspend_r(runtime.tcb);
-        let _ = cnode_delete_recycle_r(runtime.tcb);
-    }
-    release_hosted_thread_resources(runtime.resources);
-    release_hosted_thread_mechanism_caps(runtime.tid, runtime.mechanism);
-}
-
 unsafe fn hosted_io_cancel_thread(tid: u64, handler: &mut ExecNtHandler) {
     let _ = power_manager::remove_thread_execution_state(tid);
     let _ = crate::service_sec_image::pending_driver_start_abandon_thread(handler, tid);
@@ -26455,7 +26446,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     let mut retained_teb_alias = 0;
     macro_rules! failed {
         () => {
-            Err(HostedThreadSpawnFailure::Retained(FailedHostedThreadConstruction {
+            Err(HostedThreadSpawnFailure::Retained(RetainedHostedThreadConstruction {
                 binding, resources, construction, memory_progress, teb_alias: retained_teb_alias,
             }))
         };
@@ -26891,18 +26882,17 @@ unsafe fn spawn_hosted_thread_mechanism(
         }
     };
     construction.adopt_object(Role::SchedContext, sched_context).expect("attached SC owner");
-    let [raw, cnode, tcb, sched_context] = construction.into_live_slots()
-        .expect("completed construction transfers every live mechanism cap");
-    Ok(HostedThreadSpawn::new(
-        tcb,
-        HostedThreadMechanismCaps::new(raw, cnode, sched_context),
-        if teb_live_alias != 0 && teb_live_map == 0 && teb2_live_map == 0 {
+    Ok(HostedThreadSpawn::new(RetainedHostedThreadConstruction {
+        binding,
+        resources,
+        construction,
+        memory_progress,
+        teb_alias: if teb_live_alias != 0 && teb_live_map == 0 && teb2_live_map == 0 {
             teb_live_alias
         } else {
             0
         },
-        resources,
-    ))
+    }))
 }
 
 /// Next user vaddr the executive hands out for NtAllocateVirtualMemory (bump allocator).

@@ -282,7 +282,7 @@ impl HostedThreadRuntimeTable {
     }
 
     pub(crate) fn retain_failed_spawn(
-        &mut self, prepared: PreparedHostedThreadRuntime, partial: FailedHostedThreadConstruction,
+        &mut self, prepared: PreparedHostedThreadRuntime, partial: RetainedHostedThreadConstruction,
     ) -> nt_user_host::thread_rollback::ThreadRollbackId {
         let slot = self.entries.get_mut(prepared.index)
             .expect("constructor retains its pre-reserved runtime row");
@@ -401,11 +401,25 @@ impl HostedThreadRuntimeTable {
         provider.claim(id).map_err(ThreadReconciliationError::Aliases)
     }
 
+    /// Validate the original reservation and completed owner before PM activation or first run.
+    pub(crate) fn validate_spawn(
+        &mut self, prepared: &PreparedHostedThreadRuntime, spawn: &HostedThreadSpawn,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(prepared.index)
+            .and_then(|slot| slot.publishing_mut(&prepared.ticket)) else { return false; };
+        let key = entry.binding();
+        entry.construction_is_empty() && !entry.resources.is_live() && !entry.mechanism.is_live()
+            && entry.tcb == 1 && entry.teb_alias == 0 && key == spawn.binding()
+            && key == *prepared.ticket.owner() && spawn.resources().client_pi == key.pi
+            && spawn.tcb() > 1 && spawn.mechanism().is_live() && spawn.resources().is_live()
+    }
+
     pub(crate) fn commit_spawn(
         &mut self,
         prepared: PreparedHostedThreadRuntime,
         spawn: &HostedThreadSpawn,
     ) {
+        assert!(self.validate_spawn(&prepared, spawn), "prevalidated constructor publication remains current");
         let entry = self.entries[prepared.index]
             .publishing_mut(&prepared.ticket)
             .expect("construction ticket retains its runtime slot");
@@ -874,7 +888,7 @@ impl HostedThreadRuntimes {
     }
 
     pub(crate) fn retain_failed_spawn(
-        &mut self, prepared: PreparedHostedThreadRuntime, partial: FailedHostedThreadConstruction,
+        &mut self, prepared: PreparedHostedThreadRuntime, partial: RetainedHostedThreadConstruction,
     ) -> nt_user_host::thread_rollback::ThreadRollbackId {
         unsafe { (&mut *self.table).retain_failed_spawn(prepared, partial) }
     }
@@ -883,6 +897,12 @@ impl HostedThreadRuntimes {
         &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
     ) -> Result<(), ThreadReconciliationError> {
         (&*self.table).reconcile_failed_spawn(id)
+    }
+
+    pub(crate) fn validate_spawn(
+        &mut self, prepared: &PreparedHostedThreadRuntime, spawn: &HostedThreadSpawn,
+    ) -> bool {
+        unsafe { (&mut *self.table).validate_spawn(prepared, spawn) }
     }
 
     pub(crate) fn commit_spawn(
@@ -1000,7 +1020,7 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
 }
 
 impl RuntimeConstruction for HostedThreadRuntimeOwner {
-    type Partial = FailedHostedThreadConstruction;
+    type Partial = RetainedHostedThreadConstruction;
 
     fn construction_binding(partial: &Self::Partial) -> nt_user_host::thread_binding::ThreadBinding<Self::Role> {
         partial.binding

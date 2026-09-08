@@ -48,6 +48,70 @@ fn completed_mechanism_inventory_transfers_every_live_slot() {
 }
 
 #[test]
+fn live_observation_leaves_completed_inventory_owned_and_retireable() {
+    let mut inventory = ThreadConstructionInventory::empty();
+    for (index, role) in ROLES.into_iter().enumerate() {
+        inventory.adopt_object(role, 100 + index as u64).unwrap();
+    }
+    let before: Vec<_> = inventory.entries().collect();
+    for _ in 0..2 {
+        assert_eq!(inventory.live_slots(), Ok([100, 101, 102, 103]));
+        assert_eq!(inventory.entries().collect::<Vec<_>>(), before);
+    }
+    let mut retired = Vec::new();
+    while let Some((role, SlotState::LiveObject(slot))) = inventory.next_retirement() {
+        inventory.validate_retirement(role, slot).unwrap();
+        inventory.acknowledge_delete(role, slot).unwrap();
+        inventory.acknowledge_recycle(role, slot).unwrap();
+        retired.push(slot);
+    }
+    assert_eq!(retired, alloc::vec![102, 101, 100, 103]);
+    assert!(inventory.is_empty());
+    assert_eq!(inventory.live_slots(), Err(InventoryError::InvalidPhase));
+}
+
+#[test]
+fn observation_rejects_each_incomplete_role_without_consuming_inventory() {
+    for incomplete in ROLES {
+        for empty in [false, true] {
+            let mut inventory = ThreadConstructionInventory::empty();
+            for (index, role) in ROLES.into_iter().enumerate() {
+                if role != incomplete {
+                    inventory.adopt_object(role, 100 + index as u64).unwrap();
+                } else if empty {
+                    inventory.adopt_empty(role, 100 + index as u64).unwrap();
+                }
+            }
+            let before: Vec<_> = inventory.entries().collect();
+            assert_eq!(inventory.live_slots(), Err(InventoryError::InvalidPhase));
+            assert_eq!(inventory.entries().collect::<Vec<_>>(), before);
+            while let Some((role, state)) = inventory.next_retirement() {
+                let slot = state.slot().unwrap();
+                if matches!(state, SlotState::LiveObject(_)) {
+                    inventory.acknowledge_delete(role, slot).unwrap();
+                }
+                inventory.acknowledge_recycle(role, slot).unwrap();
+            }
+            assert!(inventory.is_empty());
+        }
+    }
+}
+
+#[test]
+fn observation_rejects_deleted_slot_and_preserves_cleanup_progress() {
+    let mut inventory = ThreadConstructionInventory::empty();
+    for (index, role) in ROLES.into_iter().enumerate() {
+        inventory.adopt_object(role, 100 + index as u64).unwrap();
+    }
+    inventory.acknowledge_delete(Role::Tcb, 102).unwrap();
+    let before: Vec<_> = inventory.entries().collect();
+    assert_eq!(inventory.live_slots(), Err(InventoryError::InvalidPhase));
+    assert_eq!(inventory.entries().collect::<Vec<_>>(), before);
+    inventory.acknowledge_recycle(Role::Tcb, 102).unwrap();
+    assert_eq!(inventory.next_retirement(), Some((Role::GuardedCnode, SlotState::LiveObject(101))));
+}
+
+#[test]
 fn incomplete_mechanism_transfer_returns_ownership_unchanged() {
     for phase in [
         SlotState::Absent,

@@ -222,17 +222,29 @@ impl ThreadConstructionInventory {
         }
     }
 
-    /// Transfer fully constructed mechanism ownership to the published runtime representation.
-    /// Incomplete/deleted inventories are returned intact; this is never a rollback operation.
-    pub fn into_live_slots(self) -> Result<[u64; 4], Self> {
+    /// Observe completed mechanisms without transferring ownership. The inventory must remain
+    /// retained through fallible activation/resume and is still responsible for checked cleanup.
+    /// Returned slots are in RawCnode, GuardedCnode, Tcb, SchedContext order, not release authority.
+    pub fn live_slots(&self) -> Result<[u64; 4], InventoryError> {
         let mut caps = [0; 4];
         for (index, state) in self.slots.iter().enumerate() {
             let SlotState::LiveObject(cap) = *state else {
-                return Err(self);
+                return Err(InventoryError::InvalidPhase);
             };
+            if cap <= 1 { return Err(InventoryError::InvalidSlot); }
+            if caps[..index].contains(&cap) { return Err(InventoryError::DuplicateSlot); }
             caps[index] = cap;
         }
         Ok(caps)
+    }
+
+    /// Transfer fully constructed mechanism ownership to the published runtime representation.
+    /// Incomplete/deleted inventories are returned intact; this is never a rollback operation.
+    pub fn into_live_slots(self) -> Result<[u64; 4], Self> {
+        match self.live_slots() {
+            Ok(caps) => Ok(caps),
+            Err(_) => Err(self),
+        }
     }
 
     pub fn state(&self, role: Role) -> SlotState {

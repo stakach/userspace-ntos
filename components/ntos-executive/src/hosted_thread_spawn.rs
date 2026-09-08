@@ -10,47 +10,64 @@ pub(crate) type HostedThreadSpawnResult = Result<HostedThreadSpawn, HostedThread
 /// construction must enter protected ownership through the original ticket before public abort.
 pub(crate) enum HostedThreadSpawnFailure {
     Unstarted,
-    Retained(FailedHostedThreadConstruction),
+    Retained(RetainedHostedThreadConstruction),
 }
 
 /// Successful construction only. A failed construction can own a real TCB, so no failure
 /// discriminator or empty-TCB sentinel is exposed through this payload.
+#[must_use = "publish the completed construction or retain it through checked failure cleanup"]
 pub(crate) struct HostedThreadSpawn {
-    tcb: u64,
-    mechanism: HostedThreadMechanismCaps,
-    teb_alias: u64,
-    resources: HostedThreadResources,
+    construction: RetainedHostedThreadConstruction,
     commitment: Option<exec_handler::PreparedHostedThreadCommitment>,
 }
 
 impl HostedThreadSpawn {
-    pub(crate) fn new(
-        tcb: u64,
-        mechanism: HostedThreadMechanismCaps,
-        teb_alias: u64,
-        resources: HostedThreadResources,
-    ) -> Self {
-        assert!(tcb > 1 && mechanism.is_live() && resources.is_live());
+    pub(crate) fn new(construction: RetainedHostedThreadConstruction) -> Self {
+        construction
+            .construction
+            .live_slots()
+            .expect("completed construction retains every live slot");
+        assert!(construction.resources.is_live());
         Self {
-            tcb,
-            mechanism,
-            teb_alias,
-            resources,
+            construction,
             commitment: None,
         }
     }
 
-    pub(crate) const fn tcb(&self) -> u64 {
-        self.tcb
+    pub(crate) fn tcb(&self) -> u64 {
+        self.construction
+            .construction
+            .live_slots()
+            .expect("unpublished completed inventory")[2]
     }
-    pub(crate) const fn mechanism(&self) -> HostedThreadMechanismCaps {
-        self.mechanism
+    pub(crate) fn mechanism(&self) -> HostedThreadMechanismCaps {
+        let [raw, cnode, _, sc] = self
+            .construction
+            .construction
+            .live_slots()
+            .expect("unpublished completed inventory");
+        HostedThreadMechanismCaps::new(raw, cnode, sc)
     }
     pub(crate) const fn teb_alias(&self) -> u64 {
-        self.teb_alias
+        self.construction.teb_alias
     }
     pub(crate) const fn resources(&self) -> HostedThreadResources {
-        self.resources
+        self.construction.resources
+    }
+
+    pub(crate) fn binding(&self) -> nt_user_host::thread_binding::ThreadBinding<HostedThreadRole> {
+        self.construction.binding
+    }
+
+    /// Rejected publication transfers the original inventory, never reconstructed copied caps.
+    /// The optional commitment is an uncommitted preflight, not an accounting charge to release.
+    pub(crate) fn into_failed(
+        self,
+    ) -> (
+        RetainedHostedThreadConstruction,
+        Option<exec_handler::PreparedHostedThreadCommitment>,
+    ) {
+        (self.construction, self.commitment)
     }
 
     pub(crate) fn attach_commitment(
