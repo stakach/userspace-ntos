@@ -1145,6 +1145,7 @@ pub const W32_ATOM_OP_ADD_INTEGER: u64 = 2;
 /// and owns the opaque lease; win32k receives no mutable MM state or raw executive pointer.
 pub const W32_MM_SECURE_LABEL: u64 = 0x77F;
 pub const W32_DEVICE_PROPERTY_LABEL: u64 = 0x780;
+pub const W32_DEVICE_POINTER_LABEL: u64 = 0x781;
 pub const W32_MM_SECURE_OP_SECURE: u64 = 1;
 pub const W32_MM_SECURE_OP_UNSECURE: u64 = 2;
 pub const W32_EVENT_OP_CREATE: u64 = 1;
@@ -3567,7 +3568,7 @@ extern "win64" fn s_ob_reference_object_by_pointer(
     }
     if unsafe {
         token_context_index(object).is_some()
-            || crate::video_device::video_projection_contains(object)
+            || crate::video_device::video_file_projection_contains(object)
     } {
         if object_type != 0 {
             return STATUS_OBJECT_TYPE_MISMATCH;
@@ -3575,7 +3576,11 @@ extern "win64" fn s_ob_reference_object_by_pointer(
         s_ob_reference_object(object);
         return 0;
     }
-    STATUS_INVALID_HANDLE_I32
+    if object_type != 0 && object_type != nt_object_manager::object_type::device_object_type_addr() {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    unsafe { crate::driver_launch::win32k_device_pointers::reference(object) }
+        .map(|_| 0).unwrap_or_else(|status| status)
 }
 
 extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
@@ -3604,14 +3609,15 @@ extern "win64" fn s_ob_reference_object(object: u64) -> u64 {
             .unwrap_or_else(|status| reject_ps_broker("token pointer retain", status))
             as u64;
     }
-    if unsafe { crate::video_device::video_projection_contains(object) } {
+    if unsafe { crate::video_device::video_file_projection_contains(object) } {
         return unsafe {
-            crate::video_device::retain_video_projection(object, nt_types::AccessMask::empty())
+            crate::video_device::retain_video_file_projection(object, nt_types::AccessMask::empty())
         }
         .unwrap_or_else(|status| panic!("video projection retain failed: {status:#010x}"));
     }
     if !provider_event_projection_contains(object) {
-        return object;
+        return unsafe { crate::driver_launch::win32k_device_pointers::reference(object) }
+            .unwrap_or_else(|status| panic!("Device pointer reference failed: {status:#010x}"));
     }
     let (status, count, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_RETAIN_POINTER, object, 0, 0) };
@@ -3657,12 +3663,13 @@ extern "win64" fn s_ob_dereference_object(object: u64) -> u64 {
             .unwrap_or_else(|status| reject_ps_broker("token pointer release", status))
             as u64;
     }
-    if unsafe { crate::video_device::video_projection_contains(object) } {
-        return unsafe { crate::video_device::release_video_projection(object) }
+    if unsafe { crate::video_device::video_file_projection_contains(object) } {
+        return unsafe { crate::video_device::release_video_file_projection(object) }
             .unwrap_or_else(|status| panic!("video projection release failed: {status:#010x}"));
     }
     if !provider_event_projection_contains(object) {
-        return 0;
+        return unsafe { crate::driver_launch::win32k_device_pointers::dereference(object) }
+            .unwrap_or_else(|status| panic!("Device pointer dereference failed: {status:#010x}"));
     }
     let (status, count, _, _) =
         unsafe { win32k_event_broker_call(W32_EVENT_OP_DEREFERENCE, object, 0, 0) };

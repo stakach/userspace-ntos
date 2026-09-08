@@ -5049,6 +5049,19 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
         print_u64(value);
     }
     print_str(b"\n");
+    let (pointer_requests, pointer_references, pointer_dereferences, pointer_failures) =
+        driver_launch::win32k_device_pointers::stats();
+    print_str(b"[win32k-device-pointers]");
+    for (label, value) in [
+        (&b" requests="[..], pointer_requests),
+        (&b" references="[..], pointer_references),
+        (&b" dereferences="[..], pointer_dereferences),
+        (&b" failures="[..], pointer_failures),
+    ] {
+        print_str(label);
+        print_u64(value);
+    }
+    print_str(b"\n");
     let registry = unsafe { driver_launch::driver_registry_owner_stats() };
     print_str(b"[driver-registry-owners]");
     for (label, value) in [
@@ -33606,12 +33619,18 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
         print_str(b" file=0x");
         print_hex((video_file >> 32) as u32);
         print_hex(video_file as u32);
-        let (video_file_references, video_device_references) =
-            video_device::video_projection_reference_census();
+        let video_file_references = video_device::video_file_projection_reference_count();
         print_str(b" refs=");
         print_u64(video_file_references);
         print_str(b"/");
-        print_u64(video_device_references);
+        match driver_launch::win32k_device_consumer::pointer_reference_count(video_device) {
+            Ok(Some(count)) => print_u64(count),
+            Ok(None) => print_str(b"unregistered"),
+            Err(status) => {
+                print_str(b"error:0x");
+                print_hex(status as u32);
+            }
+        }
         print_str(b"\n");
         check(
             b"exec_video_device_objects_registered",

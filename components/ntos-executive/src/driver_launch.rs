@@ -31,6 +31,8 @@ pub(crate) mod device_property;
 pub(crate) mod win32k_device_properties;
 #[path = "win32k_device_consumer.rs"]
 pub(crate) mod win32k_device_consumer;
+#[path = "win32k_device_pointers.rs"]
+pub(crate) mod win32k_device_pointers;
 
 #[path = "driver_registry_handles.rs"]
 pub(crate) mod driver_registry_handles;

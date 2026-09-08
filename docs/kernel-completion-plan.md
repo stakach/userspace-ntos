@@ -29241,6 +29241,60 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     broker routing and removal of the video Device-to-File reference alias are the next cutover;
     hosted-driver generic Ob reference no-ops remain a separate required producer-side conversion.
 
+    B3 native consumer pointer cutover tranche 120 (2026-09-08, complete):
+
+    Route win32k Device pointer reference/dereference through a dedicated bounded broker message
+    authenticated by the actual physical channel, active dispatch and exact consumer registration.
+    Use the existing canonical pointer counts; do not retry ambiguous mutating replies or fabricate
+    counts for unknown objects. Preserve explicit USER/LPC/Ps/token/Event paths and remove the old
+    unknown-pointer return/zero fallbacks. Supply the genuine native Device type identity and NT5
+    scalar initializer for pointer type checking, without claiming its unwired parse/delete/security
+    method table is implemented.
+
+    Narrow the video reference alias to the File object only. IoGetDeviceObjectPointer must keep
+    its one File reference and borrowed Device semantics; Device caller references are independent
+    canonical ledger references, not File handle tokens. Report actual broker outcomes and device
+    pointer counts, distinguishing missing registration from zero references. The separate hosted
+    driver producer reference conversion and native IRP/result publication bridge remain required.
+
+    Implemented the two-word native broker with exact framing, zero sender badge and physical
+    dispatch/registration checks before allocation-free canonical mutations. Native Ob pointer
+    operations preserve explicit USER/LPC/Ps/token/Event paths and now reject unknown objects instead
+    of returning the pointer/zero. Device references no longer use the video File reference ledger;
+    the renamed File-only helpers preserve IoGetDeviceObjectPointer's borrowed Device semantics.
+    Added the named native Device descriptor with NT5 mapping, access mask, pool and initializer
+    flags; its unwired method pointers are not presented as a complete type procedure implementation.
+
+    Review corrected two protocol hazards: Obf operations return the canonical Device reference
+    count, not a registration-local caller count, and ambiguous replies fail-stop inside transport
+    even for ObReferenceObjectByPointer. Typed allocation-free nt-io-abi decoding has six tests for
+    operation values, exact status width, count shape and unexpected positive/pending statuses. A
+    nonzero NT_SUCCESS status is malformed here, not an acquisition failure which a caller could
+    misread as success. No mutating request is retried from an ambiguous response.
+
+    Focused I/O/ABI/Object Manager validation passes 440 tests in
+    `.tmp/test-native-device-pointer-cutover-20260908.log`. The 26-crate regression passes 2,779 tests
+    in `.tmp/test-native-device-pointer-regression-20260908.log`; native release passes with unchanged
+    262 warnings in `.tmp/build-native-device-pointer-cutover-20260908.log`. Independent final review
+    found no additional framing, ownership or re-entrant borrow blocker. New census fields report
+    real Device pointer broker outcomes and distinguish absent registration from zero caller refs.
+    No desktop acceptance or completed native IRP bridge is claimed.
+
+    B3 producer device publication tranche 121 (2026-09-08, in progress):
+
+    Pre-admit producer Device pointer registrations at canonical IoCreateDevice publication, imported
+    PDO projection publication before AddDevice, and exact FDO binding replay. Retire drained
+    registrations before canonical destruction, unbinding or projection free; the old destroy-first
+    loop would otherwise strand the new base reference. Every allocation/admission failure must leave
+    a tracked rollback owner rather than an unpublished device or mapping. Use existing authenticated
+    driver domain/address bindings, not a second identity table or executable-specific routing.
+
+    Do not replace the generic hosted Obf reference no-ops with a Device-only success path. NPFS
+    actually references File, Event and client Token objects; its current client-security constructor
+    also returns a zeroed successful context. Those owners and exact caller authority must be wired
+    before the generic producer reference export cutover. New producer pointer messages also need
+    exact framing and worker authority, not just an instance lookup which ignores the sender badge.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

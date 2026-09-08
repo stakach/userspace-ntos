@@ -9,11 +9,16 @@
 
 #![no_std]
 
+pub mod device_pointer;
 pub mod ioctl;
 pub mod major;
 pub mod opcodes;
 pub mod projection;
 pub mod wire;
+
+pub use device_pointer::{
+    DevicePointerOperation, DevicePointerReply, MalformedDevicePointerReply,
+};
 
 pub use projection::{
     DeviceObjectProjection, DriverObjectProjection, FileObjectProjection, IoStackLocationProjection,

@@ -1486,6 +1486,8 @@ fn pump_label_can_arrive_after_timer(ch: &PumpChannel, label: u64) -> bool {
             && ch.caps.kind == ReqKind::Syscall)
         || (label == crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL
             && ch.caps.kind == ReqKind::Syscall)
+        || (label == crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL
+            && ch.caps.kind == ReqKind::Syscall)
         || label == 6
         || (label == 3 && (ch.caps.io_port_faults || ch.caps.assert_skip))
 }
@@ -2775,6 +2777,18 @@ unsafe fn component_pump_loop(
                 0,
                 0
             );
+            continue;
+        } else if label == crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL
+            && ch.caps.kind == ReqKind::Syscall
+        {
+            let (status, count) = if msg.badge != 0
+                || msg.mi != ((crate::win32k_subsystem::W32_DEVICE_POINTER_LABEL << 12) | 2)
+            {
+                (0xc000_000du32 as i32, 0)
+            } else {
+                crate::driver_launch::win32k_device_pointers::service(ch, *reply_cap, msg.m0, msg.m1)
+            };
+            pump_reply_recv4_into!(ch, *reply_cap, msg, 2, status as u32 as u64, count, 0, 0);
             continue;
         } else if label == crate::win32k_subsystem::W32_DEVICE_PROPERTY_LABEL
             && ch.caps.kind == ReqKind::Syscall

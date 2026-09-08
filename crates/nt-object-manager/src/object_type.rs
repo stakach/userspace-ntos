@@ -2,7 +2,7 @@
 //!
 //! win32k.sys imports a handful of `POBJECT_TYPE` **data** globals from `ntoskrnl.exe`
 //! (`PsProcessType`, `PsThreadType`, `ExDesktopObjectType`, `ExWindowStationObjectType`,
-//! `ExEventObjectType`, `LpcPortObjectType`). Each is a pointer to an `OBJECT_TYPE` struct that
+//! `ExEventObjectType`, `LpcPortObjectType`, `IoDeviceObjectType`). Each is a pointer to an `OBJECT_TYPE` struct that
 //! ntoskrnl creates at boot; win32k treats the pointed-at struct as its **type identity** and — for
 //! the desktop / window-station types — *writes* its own `TypeInfo` fields into it during
 //! `InitDesktopImpl` / `InitWindowStationImpl` (see
@@ -186,6 +186,9 @@ pub const INDEX_PORT: u32 = 21;
 pub const INDEX_DESKTOP: u32 = 24;
 /// `ExWindowStationObjectType` index.
 pub const INDEX_WINDOW_STATION: u32 = 25;
+/// Device projection type index in this native descriptor catalog. NT type indices are not a
+/// portable ABI; this value is distinct from the already published native type identities.
+pub const INDEX_DEVICE: u32 = 26;
 
 // UTF-16 type names (const, no alloc).
 static NAME_PROCESS: [u16; 7] = [
@@ -213,6 +216,14 @@ static NAME_EVENT: [u16; 5] = [
     b't' as u16,
 ];
 static NAME_PORT: [u16; 4] = [b'P' as u16, b'o' as u16, b'r' as u16, b't' as u16];
+static NAME_DEVICE: [u16; 6] = [
+    b'D' as u16,
+    b'e' as u16,
+    b'v' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'e' as u16,
+];
 static NAME_DESKTOP: [u16; 7] = [
     b'D' as u16,
     b'e' as u16,
@@ -255,6 +266,33 @@ pub static mut DESKTOP_OBJECT_TYPE: ObjectType = ObjectType::new(&NAME_DESKTOP, 
 pub static mut WINDOW_STATION_OBJECT_TYPE: ObjectType =
     ObjectType::new(&NAME_WINSTA, INDEX_WINDOW_STATION);
 
+/// `IoDeviceObjectType` identity and scalar policy from NT5 `IopCreateObjectTypes`
+/// (`base/ntos/io/iomgr/ioinit.c`) and ReactOS `io/iomgr/iomgr.c`.
+///
+/// The native broker owns device lifetime; this descriptor does not provide callable NT
+/// IopDeleteDevice/IopParseDevice/IopGetSetSecurityObject entry points. Its method slots remain
+/// unset, and publishing its identity does not implement generic Ob creation, parsing or security.
+pub static mut DEVICE_OBJECT_TYPE: ObjectType = device_object_type();
+
+const fn device_object_type() -> ObjectType {
+    let mut object_type = ObjectType::new(&NAME_DEVICE, INDEX_DEVICE);
+    let info = &mut object_type.type_info;
+    info.use_default_object = 1;
+    info.case_insensitive = 1;
+    info.invalid_attributes = 0x0000_0100; // OBJ_OPENLINK
+                                           // IopFileMapping: STANDARD_RIGHTS_{READ,WRITE,EXECUTE}, SYNCHRONIZE, file rights.
+    info.generic_mapping = GenericMapping {
+        generic_read: 0x0012_0089,
+        generic_write: 0x0012_0116,
+        generic_execute: 0x0012_00A0,
+        generic_all: 0x001F_01FF,
+    };
+    info.valid_access_mask = 0x001F_01FF; // FILE_ALL_ACCESS
+    info.pool_type = 0; // NonPagedPool
+    info.default_nonpaged_pool_charge = 0x150; // Native x64 DEVICE_OBJECT layout.
+    object_type
+}
+
 /// Address of the [`PsProcessType`](PROCESS_OBJECT_TYPE) static (the value its data-export cell holds).
 pub fn process_object_type_addr() -> u64 {
     core::ptr::addr_of!(PROCESS_OBJECT_TYPE) as u64
@@ -278,6 +316,10 @@ pub fn desktop_object_type_addr() -> u64 {
 /// Address of the [`ExWindowStationObjectType`](WINDOW_STATION_OBJECT_TYPE) static.
 pub fn window_station_object_type_addr() -> u64 {
     core::ptr::addr_of!(WINDOW_STATION_OBJECT_TYPE) as u64
+}
+/// Address of the [`IoDeviceObjectType`](DEVICE_OBJECT_TYPE) native descriptor.
+pub fn device_object_type_addr() -> u64 {
+    core::ptr::addr_of!(DEVICE_OBJECT_TYPE) as u64
 }
 
 #[cfg(test)]
@@ -304,6 +346,7 @@ mod tests {
             INDEX_PORT,
             INDEX_DESKTOP,
             INDEX_WINDOW_STATION,
+            INDEX_DEVICE,
         ];
         for (i, a) in indices.iter().enumerate() {
             for b in &indices[i + 1..] {
@@ -321,6 +364,7 @@ mod tests {
             port_object_type_addr(),
             desktop_object_type_addr(),
             window_station_object_type_addr(),
+            device_object_type_addr(),
         ];
         for (i, a) in addrs.iter().enumerate() {
             assert_ne!(*a, 0);
@@ -328,6 +372,44 @@ mod tests {
                 assert_ne!(a, b, "each type must be a distinct object");
             }
         }
+    }
+
+    #[test]
+    fn device_descriptor_matches_nt5_scalar_initialization() {
+        let device = device_object_type();
+        assert_eq!(device.name_units(), &NAME_DEVICE);
+        assert_eq!(device.index(), INDEX_DEVICE);
+        let info = &device.type_info;
+        assert_eq!(
+            info.length as usize,
+            core::mem::size_of::<ObjectTypeInitializer>()
+        );
+        assert_eq!(info.use_default_object, 1);
+        assert_eq!(info.case_insensitive, 1);
+        assert_eq!(info.invalid_attributes, 0x100);
+        let standard_read = 0x0002_0000;
+        let synchronize = 0x0010_0000;
+        assert_eq!(
+            info.generic_mapping.generic_read,
+            standard_read | synchronize | 1 | 8 | 0x80
+        );
+        assert_eq!(
+            info.generic_mapping.generic_write,
+            standard_read | synchronize | 2 | 4 | 0x10 | 0x100
+        );
+        assert_eq!(
+            info.generic_mapping.generic_execute,
+            standard_read | synchronize | 0x20 | 0x80
+        );
+        assert_eq!(info.generic_mapping.generic_all, 0x001F_0000 | 0x1FF);
+        assert_eq!(info.valid_access_mask, info.generic_mapping.generic_all);
+        assert_eq!(info.pool_type, 0);
+        assert_eq!(info.default_nonpaged_pool_charge, 0x150);
+        assert_eq!(info.default_paged_pool_charge, 0);
+        assert_eq!(info.security_required, 0);
+        assert_eq!(info.maintain_handle_count, 0);
+        assert_eq!(info.maintain_type_list, 0);
+        assert_eq!(info.methods, [0; 8]);
     }
 
     #[test]

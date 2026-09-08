@@ -180,7 +180,7 @@ impl VideoBridgeState {
 }
 
 static mut VIDEO_STATE: VideoBridgeState = VideoBridgeState::empty();
-static mut VIDEO_PROJECTION_REFERENCES:
+static mut VIDEO_FILE_REFERENCES:
     nt_object_manager::win32k_ob::ExternalReferenceTokenLedger =
     nt_object_manager::win32k_ob::ExternalReferenceTokenLedger::new();
 
@@ -188,7 +188,7 @@ static mut VIDEO_PROJECTION_REFERENCES:
 pub(crate) unsafe fn publish_hosted_video_device_route(
     reg: &HostedVideoDeviceRegistration<'_>,
 ) -> bool {
-    if !(*addr_of!(VIDEO_PROJECTION_REFERENCES)).is_empty() {
+    if !(*addr_of!(VIDEO_FILE_REFERENCES)).is_empty() {
         print_hosted_video_publish_failure(b"route-busy", None);
         return false;
     }
@@ -497,7 +497,7 @@ unsafe fn projected_video_route_ready() -> bool {
 }
 
 unsafe fn teardown_video_io_route() -> bool {
-    if !(*addr_of!(VIDEO_PROJECTION_REFERENCES)).is_empty() {
+    if !(*addr_of!(VIDEO_FILE_REFERENCES)).is_empty() {
         return false;
     }
     let route = video_state_snapshot().route;
@@ -610,7 +610,7 @@ pub(crate) unsafe fn video_get_device_object_pointer(
     if !objects.ready() {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-    if let Err(status) = retain_video_projection(
+    if let Err(status) = retain_video_file_projection(
         objects.file,
         nt_types::AccessMask::from_bits_retain(desired_access as u32),
     ) {
@@ -642,20 +642,20 @@ pub(crate) unsafe fn video_related_device_object(file_object: u64) -> Result<u64
     Ok(state.objects.device)
 }
 
-pub(crate) unsafe fn video_projection_contains(object: u64) -> bool {
+pub(crate) unsafe fn video_file_projection_contains(object: u64) -> bool {
     let objects = video_state_snapshot().objects;
-    objects.ready() && (object == objects.file || object == objects.device)
+    objects.ready() && object == objects.file
 }
 
-pub(crate) unsafe fn retain_video_projection(
+pub(crate) unsafe fn retain_video_file_projection(
     object: u64,
     desired_access: nt_types::AccessMask,
 ) -> Result<u64, i32> {
-    if !projected_video_route_ready() || !video_projection_contains(object) {
+    if !projected_video_route_ready() || !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
     let state = video_state_snapshot();
-    let ledger = &mut *addr_of_mut!(VIDEO_PROJECTION_REFERENCES);
+    let ledger = &mut *addr_of_mut!(VIDEO_FILE_REFERENCES);
     if !ledger.reserve() {
         return Err(STATUS_NO_MEMORY);
     }
@@ -675,28 +675,25 @@ pub(crate) unsafe fn retain_video_projection(
     Ok(u64::from(count) + 1)
 }
 
-pub(crate) unsafe fn release_video_projection(object: u64) -> Result<u64, i32> {
-    if !video_projection_contains(object) {
+pub(crate) unsafe fn release_video_file_projection(object: u64) -> Result<u64, i32> {
+    if !video_file_projection_contains(object) {
         return Err(STATUS_OBJECT_NAME_NOT_FOUND);
     }
-    let ledger = &mut *addr_of_mut!(VIDEO_PROJECTION_REFERENCES);
+    let ledger = &mut *addr_of_mut!(VIDEO_FILE_REFERENCES);
     let Some(token) = ledger.release_token(object) else {
         return Err(STATUS_INVALID_PARAMETER);
     };
     crate::driver_launch::release_io_object_reference(token).map_err(|status| status.raw())?;
     let remaining = ledger
         .complete_release(object, token)
-        .expect("video projection reference disappeared after canonical release");
+        .expect("video File reference disappeared after canonical release");
     Ok(u64::from(remaining) + 1)
 }
 
-pub(crate) unsafe fn video_projection_reference_census() -> (u64, u64) {
+pub(crate) unsafe fn video_file_projection_reference_count() -> u64 {
     let objects = video_state_snapshot().objects;
-    let ledger = &*addr_of!(VIDEO_PROJECTION_REFERENCES);
-    (
-        u64::from(ledger.count(objects.file)),
-        u64::from(ledger.count(objects.device)),
-    )
+    let ledger = &*addr_of!(VIDEO_FILE_REFERENCES);
+    u64::from(ledger.count(objects.file))
 }
 
 pub(crate) unsafe fn video_device_io_control(

@@ -55,6 +55,26 @@ unsafe fn consumer_mut() -> Result<&'static mut Consumer, i32> {
         .ok_or(STATUS_DEVICE_NOT_READY)
 }
 
+/// Diagnostic observation only; it neither admits a request nor manufactures a zero for a missing
+/// registration. Caller references are independent of the registration's enduring base reference.
+pub(crate) unsafe fn pointer_reference_count(address: u64) -> Result<Option<u64>, i32> {
+    let Some(consumer) = (&*core::ptr::addr_of!(CONSUMER)).as_ref() else {
+        return Ok(None);
+    };
+    let registration = consumer
+        .projections
+        .iter()
+        .find(|p| p.address == address)
+        .and_then(|p| p.registration);
+    registration
+        .map(|registration| {
+            io_manager_mut()
+                .hosted_device_pointer_count(registration)
+                .map_err(|status| status.raw())
+        })
+        .transpose()
+}
+
 unsafe fn live_consumer() -> Result<&'static mut Consumer, i32> {
     let consumer = consumer_mut()?;
     if consumer.retiring
@@ -180,6 +200,10 @@ impl DeviceAccess {
     }
     pub(crate) fn device(&self) -> nt_io_manager::DeviceId {
         self.device
+    }
+
+    pub(crate) fn registration(&self) -> nt_io_manager::HostedDevicePointerRegistration {
+        self.registration
     }
 
     pub(crate) unsafe fn validate(&self) -> Result<(), i32> {
