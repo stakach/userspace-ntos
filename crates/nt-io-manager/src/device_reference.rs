@@ -66,6 +66,18 @@ fn allocate_manager_identity(counter: &AtomicU64) -> Result<u64, NtStatus> {
 }
 
 impl<P> IoManager<P> {
+    pub(crate) fn ownership_identity(&self) -> u64 {
+        self.device_references.manager_identity
+    }
+
+    pub(crate) fn ensure_ownership_identity(&mut self) -> Result<u64, NtStatus> {
+        if self.device_references.manager_identity == 0 {
+            self.device_references.manager_identity =
+                allocate_manager_identity(&NEXT_MANAGER_IDENTITY)?;
+        }
+        Ok(self.device_references.manager_identity)
+    }
+
     /// Retain the canonical device independently of any hosted address binding. A pending delete or
     /// driver unload denies new acquisition, while existing references remain releasable.
     pub fn retain_device_reference(

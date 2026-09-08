@@ -29151,6 +29151,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     implementing the missing real provider imports. Do not report old import counts as fresh boot
     evidence, or enable fallback bindings to obtain a desktop screenshot.
 
+    B3 exact-device provider I/O prerequisite tranche 118 (2026-09-08, complete):
+
+    Prepare canonical PnP IRPs against the exact supplied device as required by IoCallDriver, while
+    preserving the existing PDO/top-of-attached-stack route for PnP lifecycle requests. Share the
+    existing prepared owner, backend validation, terminal receipt and pending/indeterminate retention
+    machinery; never substitute an attached device when the requested device has no dispatch route.
+    Separate win32k's canonical consumer-device authority from PDO-only property transfer policy so
+    real FDOs can be authenticated for I/O without granting them PDO property authority. Retain exact
+    physical-lane dispatch validation, canonical device references and quiescent retirement.
+
+    The first genuine native IRP bridge target is TargetDeviceRelation. It needs requestor thread
+    lifetime, native IRP allocation identity, completion/IOSB/event ownership, and returned canonical
+    device references projected into the consumer domain. Existing driver-local constructors and
+    IofCallDriver use local pointers and implicit stack-size defaults and must not be bound into
+    win32k. This prerequisite does not implement the bridge or license missing-import bindings.
+
+    Implemented exact-target borrowed/owned PnP preparation through the existing dispatch/receipt
+    engine, preserving lower-stack forwarding and the old top-of-stack lifecycle route. Extracted
+    win32k_device_consumer from property transport: common authentication accepts real FDOs or PDOs,
+    while property admission still requires the exact captured DevnodeIdentity. Projection references,
+    physical dispatch validation, registration and quiescent retirement remain centralized; property
+    transfers own only their lane/domain tables. No replacement identity table or fallback was added.
+
+    Review found and fixed a pre-existing cross-manager preparation bug: private IrpIds can collide
+    across I/O managers. Preparations now carry the same checked manager identity used by canonical
+    DeviceReferences, and dispatch/discard reject a foreign manager before any IRP lookup or mutation.
+    Rejections own the original preparation and payload for retry. Native canonical-manager callers
+    assert that ownership invariant, and formerly ignored discard failures no longer silently lose
+    ownership. Nine focused tests cover exact routing, lower-stack retention, receipts, rejection,
+    pending/indeterminate outcomes, colliding managers, recovery and moving the issuing manager.
+
+    Added ProviderIrpRequestor in nt-user-host using an existing retained NativeObjectReference, not
+    another reference-count implementation. Hosted capture validates fresh ingress and the exact
+    ThreadLifetime; bootstrap capture requires explicit initial-System authority. Eight tests and a
+    non-Clone doctest cover wrong PM, changed admission, process/thread retirement, missing projection
+    and explicit release after exit. This supplies the real ETHREAD for the future native IRP arena;
+    it is not itself a native builder or dispatch binding.
+
+    Focused validation passes in `.tmp/test-provider-io-prerequisites-20260908.log`; the 25-crate
+    regression passes 2,743 tests in `.tmp/test-provider-io-prerequisites-regression-20260908.log`.
+    Native release passes with unchanged 262 warnings in
+    `.tmp/build-provider-io-prerequisites-20260908.log`. Independent review found no introduced
+    consumer authority, PDO policy or re-entrant borrow regression. All validation was serialized.
+
+    Review adjustment for the native bridge: TargetDeviceRelation does not guarantee a PDO. ReactOS
+    videoprt returns its actual current DeviceObject, potentially the video FDO; win32k tolerates the
+    subsequent PDO registry-query failure. Preserve the actual returned device identity. Hosted-driver
+    ObfReferenceObject/ObfDereferenceObject are still no-ops, so result translation alone cannot claim
+    correct ownership. Implement independently releasable canonical pointer references and transfer
+    them to the receiving projection ledger before publishing a relation result. The enduring
+    consumer projection reference cannot substitute for each caller's returned object reference.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

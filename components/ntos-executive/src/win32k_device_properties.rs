@@ -1,36 +1,20 @@
-//! Win32k's independent I/O consumer domain and lane-owned property snapshots.
+//! Lane-owned property snapshots over the independent win32k device consumer.
 
 use super::device_property::{
     PropertyQueryReply, PropertyQueryRequest, PropertyQueryTransport, PropertyScratch,
     PropertyTransfers, PROPERTY_CHUNK_BYTES,
 };
+use super::win32k_device_consumer::{self as consumer, DeviceAccess};
 use super::*;
 use nt_component_suspension::LaneDispatchIdentity;
-use nt_provider_wait::{CatalogIdentity, ProviderDomainIdentity};
-
-struct Projection {
-    address: u64,
-    reference: nt_io_manager::DeviceReference,
-    bound: bool,
-    pdo_identity: Option<nt_pnp_manager::DevnodeIdentity>,
-}
 
 struct LaneTransfers {
     dispatch: LaneDispatchIdentity,
+    domain: HostedDomainIdentity,
     table: HostedDevicePropertyTransferTable,
 }
 
-struct Consumer {
-    catalog: CatalogIdentity,
-    provider: ProviderDomainIdentity,
-    domain: HostedDomainIdentity,
-    pml4: u64,
-    retiring: bool,
-    projections: Vec<Projection>,
-    lanes: Vec<LaneTransfers>,
-}
-
-static mut CONSUMER: Option<Consumer> = None;
+static mut LANES: Vec<LaneTransfers> = Vec::new();
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 static QUERIES: AtomicU64 = AtomicU64::new(0);
 static PULLS: AtomicU64 = AtomicU64::new(0);
@@ -53,186 +37,69 @@ pub(crate) struct ConsumerStats {
 }
 
 pub(crate) unsafe fn stats() -> ConsumerStats {
-    let mut stats = ConsumerStats {
+    let consumer = consumer::stats();
+    ConsumerStats {
         requests: REQUESTS.load(Ordering::Relaxed),
         queries: QUERIES.load(Ordering::Relaxed),
         pulls: PULLS.load(Ordering::Relaxed),
         aborts: ABORTS.load(Ordering::Relaxed),
         failures: FAILURES.load(Ordering::Relaxed),
-        ..ConsumerStats::default()
-    };
-    if let Some(consumer) = (&*core::ptr::addr_of!(CONSUMER)).as_ref() {
-        stats.projections = consumer.projections.len();
-        stats.references = consumer
-            .projections
+        projections: consumer.projections,
+        references: consumer.references,
+        transfers: (&*core::ptr::addr_of!(LANES))
             .iter()
-            .filter(|p| p.reference.is_held())
-            .count();
-        stats.transfers = consumer.lanes.iter().map(|lane| lane.table.len()).sum();
-        stats.retiring = consumer.retiring;
-        stats.domain = consumer.domain.domain_id.raw();
-        stats.cookie = consumer.domain.cookie;
+            .map(|lane| lane.table.len())
+            .sum(),
+        retiring: consumer.retiring,
+        domain: consumer.domain,
+        cookie: consumer.cookie,
     }
-    stats
 }
 
-/// Release only snapshots belonging to completed/replaced jobs. This neither retires live
-/// projections nor touches a suspended job, and is safe at a normal executive event boundary.
+/// Release completed/replaced job snapshots, never a suspended job or its device projection.
 pub(crate) unsafe fn retire_completed_transfers() {
-    let Some(consumer) = (&mut *core::ptr::addr_of_mut!(CONSUMER)).as_mut() else {
-        return;
-    };
-    for lane in &mut consumer.lanes {
+    for lane in &mut *core::ptr::addr_of_mut!(LANES) {
         if crate::service_sec_image::component_execution_dispatch_identity(lane.dispatch.lane())
             != Some(lane.dispatch)
         {
-            lane.table.remove_domain(consumer.domain);
+            lane.table.remove_domain(lane.domain);
         }
     }
 }
 
-unsafe fn consumer_mut() -> Result<&'static mut Consumer, i32> {
-    (&mut *core::ptr::addr_of_mut!(CONSUMER))
-        .as_mut()
-        .ok_or(STATUS_DEVICE_NOT_READY)
-}
-
-unsafe fn live_consumer() -> Result<&'static mut Consumer, i32> {
-    let consumer = consumer_mut()?;
-    if consumer.retiring
-        || (&*core::ptr::addr_of!(crate::PROVIDER_WAIT_DOMAINS)).identity()
-            != Some(consumer.catalog)
-        || !crate::win32k_provider_domain_is_current(consumer.provider)
-    {
-        return Err(STATUS_ACCESS_DENIED);
+pub(super) unsafe fn retire_quiescent_transfers(domain: HostedDomainIdentity) -> Result<(), i32> {
+    let lanes = &mut *core::ptr::addr_of_mut!(LANES);
+    if lanes.iter().any(|lane| {
+        lane.domain == domain
+            && crate::service_sec_image::component_execution_dispatch_identity(lane.dispatch.lane())
+                .is_some()
+    }) {
+        return Err(STATUS_DEVICE_NOT_READY);
     }
-    Ok(consumer)
-}
-
-/// Root-only registration before the genuine primary DriverEntry dispatch starts.
-pub(crate) unsafe fn register_consumer(pml4: u64) -> Result<(), i32> {
-    if pml4 == 0 {
-        return Err(STATUS_INVALID_PARAMETER);
+    for lane in lanes.iter_mut().filter(|lane| lane.domain == domain) {
+        lane.table.remove_domain(domain);
     }
-    let provider = crate::current_win32k_provider_domain().ok_or(STATUS_DEVICE_NOT_READY)?;
-    let catalog = (&*core::ptr::addr_of!(crate::PROVIDER_WAIT_DOMAINS))
-        .identity()
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
-    if let Some(existing) = (&*core::ptr::addr_of!(CONSUMER)).as_ref() {
-        return if !existing.retiring
-            && existing.catalog == catalog
-            && existing.provider == provider
-            && existing.pml4 == pml4
-        {
-            Ok(())
-        } else {
-            Err(STATUS_ACCESS_DENIED)
-        };
-    }
-    let domain = io_manager_mut().register_hosted_domain();
-    *core::ptr::addr_of_mut!(CONSUMER) = Some(Consumer {
-        catalog,
-        provider,
-        domain,
-        pml4,
-        retiring: false,
-        projections: Vec::new(),
-        lanes: Vec::new(),
-    });
-    Ok(())
-}
-
-/// Retain the canonical device before publishing its provider-local identity. Failed binding
-/// keeps the exact reference in the registry for retry; it never borrows a driver's domain.
-pub(crate) unsafe fn bind_projection(
-    address: u64,
-    device: nt_io_manager::DeviceId,
-) -> Result<(), i32> {
-    if address == 0 {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    let consumer = live_consumer()?;
-    let index = if let Some(index) = consumer
-        .projections
-        .iter()
-        .position(|p| p.address == address)
-    {
-        if consumer.projections[index].reference.device_id() != device {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        index
-    } else {
-        if consumer
-            .projections
-            .iter()
-            .any(|p| p.reference.device_id() == device)
-        {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        consumer
-            .projections
-            .try_reserve(1)
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let reference = io_manager_mut()
-            .retain_device_reference(device)
-            .map_err(|e| e.raw())?;
-        let pdo_identity = hosted_pnp_manager_mut().devnode_identity_for_pdo(device.raw());
-        consumer.projections.push(Projection {
-            address,
-            reference,
-            bound: false,
-            pdo_identity,
-        });
-        consumer.projections.len() - 1
-    };
-    io_manager_mut()
-        .bind_hosted_device_identity(consumer.domain, address, device)
-        .map_err(|e| e.raw())?;
-    consumer.projections[index].bound = true;
+    lanes.retain(|lane| lane.domain != domain);
     Ok(())
 }
 
 #[derive(Clone, Copy)]
 struct TransferAccess {
-    catalog: CatalogIdentity,
-    provider: ProviderDomainIdentity,
-    dispatch: LaneDispatchIdentity,
+    device: DeviceAccess,
     owner: HostedDevicePropertyOwner,
     pdo_identity: nt_pnp_manager::DevnodeIdentity,
 }
 
 impl TransferAccess {
     unsafe fn table(&self) -> Result<&'static mut HostedDevicePropertyTransferTable, i32> {
-        let consumer = live_consumer()?;
-        if consumer.catalog != self.catalog
-            || consumer.provider != self.provider
-            || crate::service_sec_image::component_execution_dispatch_identity(self.dispatch.lane())
-                != Some(self.dispatch)
-        {
-            return Err(STATUS_ACCESS_DENIED);
-        }
-        if consumer.domain != self.owner.domain
-            || !consumer.projections.iter().any(|p| {
-                p.address == self.owner.pdo_address
-                    && p.bound
-                    && p.reference.is_held()
-                    && p.reference.device_id() == self.owner.pdo_device_id
-                    && p.pdo_identity == Some(self.pdo_identity)
-            })
-            || io_manager_mut().hosted_device_by_identity(self.owner.domain, self.owner.pdo_address)
-                != Some(self.owner.pdo_device_id)
-            || hosted_pnp_manager_mut()
-                .devnode_for_pdo(self.owner.pdo_device_id.raw())
-                .is_none()
-            || hosted_pnp_manager_mut().devnode_identity_for_pdo(self.owner.pdo_device_id.raw())
-                != Some(self.pdo_identity)
-        {
+        if self.device.require_pdo()? != self.pdo_identity {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
-        consumer
-            .lanes
+        (&mut *core::ptr::addr_of_mut!(LANES))
             .iter_mut()
-            .find(|lane| lane.dispatch == self.dispatch)
+            .find(|lane| {
+                lane.dispatch == self.device.dispatch() && lane.domain == self.device.domain()
+            })
             .map(|lane| &mut lane.table)
             .ok_or(STATUS_ACCESS_DENIED)
     }
@@ -240,6 +107,9 @@ impl TransferAccess {
 
 impl PropertyTransfers for TransferAccess {
     fn busy(&self, domain: HostedDomainIdentity) -> Result<bool, i32> {
+        if domain != self.owner.domain {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         Ok(unsafe { self.table()?.domain_busy(domain) })
     }
     fn begin(
@@ -248,6 +118,9 @@ impl PropertyTransfers for TransferAccess {
         value: Vec<u8>,
         data: &mut [u8],
     ) -> Result<(usize, u64, usize), i32> {
+        if owner != self.owner {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         unsafe { self.table()?.begin(owner, value, data) }
             .map(|p| (p.total_len, p.token, p.written))
             .map_err(hosted_device_property_transfer_status)
@@ -259,12 +132,15 @@ impl PropertyTransfers for TransferAccess {
         offset: usize,
         data: &mut [u8],
     ) -> Result<(usize, u64, usize), i32> {
+        if owner != self.owner {
+            return Err(STATUS_ACCESS_DENIED);
+        }
         unsafe { self.table()?.pull(owner, token, offset, data) }
             .map(|p| (p.total_len, p.token, p.written))
             .map_err(hosted_device_property_transfer_status)
     }
     fn abort(&mut self, owner: HostedDevicePropertyOwner, token: u64) -> bool {
-        unsafe { self.table().is_ok_and(|table| table.abort(owner, token)) }
+        owner == self.owner && unsafe { self.table().is_ok_and(|table| table.abort(owner, token)) }
     }
 }
 
@@ -273,74 +149,46 @@ unsafe fn authenticate(
     reply_cap: u64,
     address: u64,
 ) -> Result<(HostedDevicePropertyOwner, TransferAccess), i32> {
-    let consumer = live_consumer()?;
-    if ch.caps.kind != crate::spawn_hosts::ReqKind::Syscall
-        || ch.pml4 != consumer.pml4
-        || ch.shared_va != crate::win32k_subsystem::WIN32K_SHARED_VADDR
-        || ch.code_va != crate::win32k_subsystem::WIN32K_CODE_VA
-    {
-        return Err(STATUS_ACCESS_DENIED);
-    }
-    let lane = crate::win32k_glue::win32k_physical_lane_for_channel(ch.tcb, ch.fault_ep, reply_cap)
-        .ok_or(STATUS_ACCESS_DENIED)?;
-    let dispatch = crate::service_sec_image::component_execution_dispatch_identity(lane)
-        .ok_or(STATUS_ACCESS_DENIED)?;
-    let projection = consumer
-        .projections
-        .iter()
-        .find(|p| p.address == address && p.bound && p.reference.is_held())
-        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
-    let device = projection.reference.device_id();
-    if io_manager_mut().hosted_device_by_identity(consumer.domain, address) != Some(device)
-        || hosted_pnp_manager_mut()
-            .devnode_for_pdo(device.raw())
-            .is_none()
-        || projection.pdo_identity.is_none()
-        || hosted_pnp_manager_mut().devnode_identity_for_pdo(device.raw())
-            != projection.pdo_identity
-    {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
-    }
-    let pdo_identity = projection
-        .pdo_identity
-        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
-    if let Some(row) = consumer
-        .lanes
+    let device = consumer::authenticate(ch, reply_cap, address)?;
+    let pdo_identity = device.require_pdo()?;
+    let dispatch = device.dispatch();
+    let domain = device.domain();
+    let lanes = &mut *core::ptr::addr_of_mut!(LANES);
+    if let Some(row) = lanes
         .iter_mut()
-        .find(|row| row.dispatch.lane() == lane)
+        .find(|row| row.dispatch.lane() == dispatch.lane())
     {
-        if row.dispatch != dispatch {
-            row.table.remove_domain(consumer.domain);
+        if row.dispatch != dispatch || row.domain != domain {
+            row.table.remove_domain(row.domain);
             row.dispatch = dispatch;
+            row.domain = domain;
         }
     } else {
-        consumer
-            .lanes
+        lanes
             .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        consumer.lanes.push(LaneTransfers {
+        lanes.push(LaneTransfers {
             dispatch,
+            domain,
             table: HostedDevicePropertyTransferTable::new(),
         });
     }
     let owner = HostedDevicePropertyOwner {
-        domain: consumer.domain,
-        pdo_device_id: device,
-        pdo_address: address,
+        domain,
+        pdo_device_id: device.device(),
+        pdo_address: device.address(),
     };
     Ok((
         owner,
         TransferAccess {
-            catalog: consumer.catalog,
-            provider: consumer.provider,
-            dispatch,
+            device,
             owner,
             pdo_identity,
         },
     ))
 }
 
-/// The returned bytes remain stack-owned while snapshot acquisition performs nested CM IPC.
+/// Reply bytes stay stack-owned while snapshot acquisition performs nested CM IPC.
 pub(crate) unsafe fn service(
     ch: &crate::spawn_hosts::PumpChannel,
     reply_cap: u64,
@@ -371,49 +219,6 @@ pub(crate) unsafe fn service(
         FAILURES.fetch_add(1, Ordering::Relaxed);
     }
     reply
-}
-
-/// This is not a wall-timeout/bugcheck cleanup. The caller must have retired every provider-local
-/// projection pointer and mapping and quiesced every physical lane. Failure retains all unfinished
-/// ownership and denies further admission; invoke again only with the same quiescence proof.
-#[allow(dead_code)]
-pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
-    let consumer = consumer_mut()?;
-    consumer.retiring = true;
-    if !crate::win32k_glue::win32k_physical_lanes_quiescent() {
-        return Err(STATUS_DEVICE_NOT_READY);
-    }
-    for lane in &consumer.lanes {
-        if crate::service_sec_image::component_execution_dispatch_identity(lane.dispatch.lane())
-            .is_some()
-        {
-            return Err(STATUS_DEVICE_NOT_READY);
-        }
-    }
-    for lane in &mut consumer.lanes {
-        lane.table.remove_domain(consumer.domain);
-    }
-    while let Some(row) = consumer.projections.last_mut() {
-        if row.bound {
-            if !io_manager_mut().unbind_hosted_device_identity(
-                consumer.domain,
-                row.address,
-                row.reference.device_id(),
-            ) {
-                return Err(STATUS_ACCESS_DENIED);
-            }
-            row.bound = false;
-        }
-        io_manager_mut()
-            .release_device_reference(&mut row.reference)
-            .map_err(|e| e.raw())?;
-        consumer.projections.pop();
-    }
-    io_manager_mut()
-        .unregister_hosted_domain(consumer.domain)
-        .map_err(|e| e.raw())?;
-    *core::ptr::addr_of_mut!(CONSUMER) = None;
-    Ok(())
 }
 
 struct Win32kPropertyClient;

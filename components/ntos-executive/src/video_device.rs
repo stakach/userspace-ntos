@@ -200,7 +200,7 @@ pub(crate) unsafe fn publish_hosted_video_device_route(
         print_hosted_video_publish_failure(b"objects", None);
         return false;
     }
-    if let Err(status) = crate::driver_launch::win32k_device_properties::bind_projection(
+    if let Err(status) = crate::driver_launch::win32k_device_consumer::bind_projection(
         (*addr_of!(VIDEO_STATE)).objects.device,
         nt_io_manager::DeviceId(route_info.device_id),
     ) {

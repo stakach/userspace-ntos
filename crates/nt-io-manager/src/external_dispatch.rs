@@ -88,10 +88,40 @@ pub enum ExternalDispatchResult {
 /// Exclusive ownership of one fully prepared, but not yet dispatched, canonical PnP IRP.
 ///
 /// The payload is copied into this owner so acquiring external PnP lifecycle authority cannot be
-/// followed by a buffer allocation or extent failure. The token is deliberately non-`Clone`.
+/// followed by a buffer allocation or extent failure. The token is deliberately non-`Clone` and
+/// belongs to its issuing manager even when another manager has an identical numeric IRP id.
+#[derive(Debug)]
+#[must_use = "dispatch or discard through the issuing I/O Manager"]
 pub struct PreparedExternalPnpIrp {
+    manager_identity: u64,
     irp_id: IrpId,
     payload: Vec<u8>,
+}
+
+/// A rejected operation retains its preparation for retry through the issuing manager.
+#[derive(Debug)]
+#[must_use = "recover the retained preparation before dropping this rejection"]
+pub struct PreparedExternalPnpRejection {
+    status: NtStatus,
+    prepared: PreparedExternalPnpIrp,
+}
+
+impl PreparedExternalPnpRejection {
+    pub const fn status(&self) -> NtStatus {
+        self.status
+    }
+
+    pub fn prepared(&self) -> &PreparedExternalPnpIrp {
+        &self.prepared
+    }
+
+    pub fn into_prepared(self) -> PreparedExternalPnpIrp {
+        self.prepared
+    }
+
+    pub fn into_parts(self) -> (NtStatus, PreparedExternalPnpIrp) {
+        (self.status, self.prepared)
+    }
 }
 
 impl PreparedExternalPnpIrp {
@@ -168,26 +198,100 @@ impl<P> IoManager<P> {
         parameters: PnpParameters,
         owned_payload: Vec<u8>,
     ) -> Result<PreparedExternalPnpIrp, NtStatus> {
+        self.prepare_external_pnp_owned(
+            client,
+            pdo_device_id,
+            requestor_tid,
+            parameters,
+            owned_payload,
+            false,
+        )
+    }
+
+    /// Prepare a File-less PnP IRP entering the exact supplied device, as `IoCallDriver` does.
+    /// Attached devices above this object are excluded; lower devices remain in the captured stack
+    /// for ordinary forwarding. The caller must already hold authority over the target device.
+    pub fn prepare_external_pnp_to_exact_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        requestor_tid: u64,
+        parameters: PnpParameters,
+        payload: &[u8],
+    ) -> Result<PreparedExternalPnpIrp, NtStatus> {
+        if payload.len() != parameters.payload_len() as usize {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        let mut owned_payload = Vec::new();
+        owned_payload
+            .try_reserve_exact(payload.len())
+            .map_err(|_| NtStatus::INSUFFICIENT_RESOURCES)?;
+        owned_payload.extend_from_slice(payload);
+        self.prepare_external_pnp_owned_to_exact_device(
+            client,
+            device_id,
+            requestor_tid,
+            parameters,
+            owned_payload,
+        )
+    }
+
+    /// Exact-device preparation using an already-owned payload, with no second payload copy.
+    pub fn prepare_external_pnp_owned_to_exact_device(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        requestor_tid: u64,
+        parameters: PnpParameters,
+        owned_payload: Vec<u8>,
+    ) -> Result<PreparedExternalPnpIrp, NtStatus> {
+        self.prepare_external_pnp_owned(
+            client,
+            device_id,
+            requestor_tid,
+            parameters,
+            owned_payload,
+            true,
+        )
+    }
+
+    fn prepare_external_pnp_owned(
+        &mut self,
+        client: ClientId,
+        device_id: DeviceId,
+        requestor_tid: u64,
+        parameters: PnpParameters,
+        owned_payload: Vec<u8>,
+        exact_device: bool,
+    ) -> Result<PreparedExternalPnpIrp, NtStatus> {
         let expected_len = parameters.payload_len() as usize;
         if owned_payload.len() != expected_len {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        let origin = self
-            .device(pdo_device_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        let origin = self.device(device_id).ok_or(NtStatus::INVALID_PARAMETER)?;
         if origin.delete_pending {
             return Err(NtStatus::DELETE_PENDING);
         }
         let origin_driver_id = origin.driver_id;
 
-        let mut irp = self.build_irp_record(
-            client,
-            origin_driver_id,
-            pdo_device_id,
-            None,
-            nt_io_abi::major::IRP_MJ_PNP,
-            IoParameters::Pnp(parameters),
-        )?;
+        let mut irp = if exact_device {
+            self.build_irp_record_at_device(
+                client,
+                device_id,
+                None,
+                nt_io_abi::major::IRP_MJ_PNP,
+                IoParameters::Pnp(parameters),
+            )?
+        } else {
+            self.build_irp_record(
+                client,
+                origin_driver_id,
+                device_id,
+                None,
+                nt_io_abi::major::IRP_MJ_PNP,
+                IoParameters::Pnp(parameters),
+            )?
+        };
         irp.requestor_tid = requestor_tid;
         irp.buffer = Some(IoBufferRef {
             buffer_id: 0,
@@ -197,6 +301,7 @@ impl<P> IoManager<P> {
             output_len: parameters.output_len(),
             access: BufferAccess::ReadWrite,
         });
+        let manager_identity = self.ensure_ownership_identity()?;
         let irp_id = self.allocate_irp(irp)?;
         let prepared = (|| {
             let record = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
@@ -234,35 +339,63 @@ impl<P> IoManager<P> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         Ok(PreparedExternalPnpIrp {
+            manager_identity,
             irp_id,
             payload: owned_payload,
         })
     }
 
     /// Discard an exact prepared PnP IRP when external lifecycle authority could not be acquired.
+    /// Rejection returns the original preparation; a foreign manager cannot retire its own
+    /// colliding IRP or consume the caller's payload.
     pub fn discard_prepared_external_pnp(
         &mut self,
         prepared: PreparedExternalPnpIrp,
-    ) -> Result<(), NtStatus> {
-        let irp = self
-            .irp_mut(prepared.irp_id)
-            .filter(|irp| {
-                irp.origin_major == nt_io_abi::major::IRP_MJ_PNP
-                    && irp.state == IrpState::Initialized
-            })
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if !irp.transition(IrpState::Failed) {
-            return Err(NtStatus::INVALID_PARAMETER);
+    ) -> Result<(), PreparedExternalPnpRejection> {
+        if prepared.manager_identity == 0 || prepared.manager_identity != self.ownership_identity()
+        {
+            return Err(PreparedExternalPnpRejection {
+                status: NtStatus::INVALID_PARAMETER,
+                prepared,
+            });
         }
-        self.free_irp(prepared.irp_id)
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        Ok(())
+        let result = (|| {
+            let irp = self
+                .irp_mut(prepared.irp_id)
+                .filter(|irp| {
+                    irp.origin_major == nt_io_abi::major::IRP_MJ_PNP
+                        && irp.state == IrpState::Initialized
+                })
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if !irp.transition(IrpState::Failed) {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            self.free_irp(prepared.irp_id)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            Ok(())
+        })();
+        result.map_err(|status| PreparedExternalPnpRejection { status, prepared })
     }
 
     /// Enter an exact prepared PnP IRP. This consumes the preparation token and performs no payload
     /// allocation. Any violated invariant or backend transport error retains the IRP as
-    /// `Indeterminate`; only a genuine synchronous return reclaims it here.
+    /// `Indeterminate`; only a genuine synchronous return reclaims it here. A foreign manager is
+    /// rejected before examining any IRP and returns the preparation unchanged.
     pub fn dispatch_prepared_external_pnp(
+        &mut self,
+        prepared: PreparedExternalPnpIrp,
+    ) -> Result<ExternalPnpDispatchResult, PreparedExternalPnpRejection> {
+        if prepared.manager_identity == 0 || prepared.manager_identity != self.ownership_identity()
+        {
+            return Err(PreparedExternalPnpRejection {
+                status: NtStatus::INVALID_PARAMETER,
+                prepared,
+            });
+        }
+        Ok(self.dispatch_owned_external_pnp(prepared))
+    }
+
+    fn dispatch_owned_external_pnp(
         &mut self,
         mut prepared: PreparedExternalPnpIrp,
     ) -> ExternalPnpDispatchResult {

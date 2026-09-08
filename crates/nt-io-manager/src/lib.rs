@@ -104,7 +104,7 @@ pub use ea::{
 };
 pub use external_dispatch::{
     ExternalDispatchResult, ExternalPnpDispatchResult, ExternalPnpTerminalReceipt,
-    PreparedExternalPnpIrp,
+    PreparedExternalPnpIrp, PreparedExternalPnpRejection,
 };
 pub use file::{CreateOptions, FileFlags, FileRecord, FileState, ShareAccess};
 pub use file_information::{
@@ -1236,6 +1236,8 @@ impl<P> IoManager<P> {
 #[cfg(test)]
 mod tests {
     extern crate std;
+
+    mod exact_external_pnp;
 
     use super::*;
     use nt_io_abi::{ioctl, major};
@@ -2740,7 +2742,7 @@ mod tests {
         assert_eq!(irp.origin_device_id, pdo);
         assert_eq!(irp.current_stack().unwrap().device_id, pdo);
         assert_eq!(irp.current_stack().unwrap().driver_id, driver);
-        let receipt = match io.dispatch_prepared_external_pnp(prepared) {
+        let receipt = match io.dispatch_prepared_external_pnp(prepared).unwrap() {
             ExternalPnpDispatchResult::Returned {
                 status,
                 information,
@@ -2780,7 +2782,7 @@ mod tests {
             .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
             .unwrap();
         let returned_id = prepared.irp_id();
-        let returned_receipt = match returned_io.dispatch_prepared_external_pnp(prepared) {
+        let returned_receipt = match returned_io.dispatch_prepared_external_pnp(prepared).unwrap() {
             ExternalPnpDispatchResult::Returned {
                 status,
                 information,
@@ -2805,7 +2807,7 @@ mod tests {
             .prepare_external_pnp_to_device(client, root, 0, parameters, &[])
             .unwrap();
         let failed_id = prepared.irp_id();
-        match failed_io.dispatch_prepared_external_pnp(prepared) {
+        match failed_io.dispatch_prepared_external_pnp(prepared).unwrap() {
             ExternalPnpDispatchResult::Returned {
                 status,
                 information,
@@ -2835,7 +2837,7 @@ mod tests {
             .unwrap();
         let pending_id = prepared.irp_id();
         assert_eq!(
-            pending_io.dispatch_prepared_external_pnp(prepared),
+            pending_io.dispatch_prepared_external_pnp(prepared).unwrap(),
             ExternalPnpDispatchResult::Pending { irp_id: pending_id }
         );
         assert_eq!(pending_io.irp(pending_id).unwrap().state, IrpState::Pending);
@@ -2875,7 +2877,7 @@ mod tests {
             .unwrap();
         let indeterminate_id = prepared.irp_id();
         assert_eq!(
-            indeterminate_io.dispatch_prepared_external_pnp(prepared),
+            indeterminate_io.dispatch_prepared_external_pnp(prepared).unwrap(),
             ExternalPnpDispatchResult::Indeterminate {
                 irp_id: indeterminate_id,
                 transport_status: NtStatus::DEVICE_NOT_CONNECTED,
@@ -2896,7 +2898,7 @@ mod tests {
             .unwrap();
         let not_dispatched_id = prepared.irp_id();
         assert_eq!(
-            not_dispatched_io.dispatch_prepared_external_pnp(prepared),
+            not_dispatched_io.dispatch_prepared_external_pnp(prepared).unwrap(),
             ExternalPnpDispatchResult::Indeterminate {
                 irp_id: not_dispatched_id,
                 transport_status: NtStatus::DEVICE_NOT_CONNECTED,
@@ -2918,7 +2920,7 @@ mod tests {
             .unwrap();
         let irp_id = prepared.irp_id();
 
-        match io.dispatch_prepared_external_pnp(prepared) {
+        match io.dispatch_prepared_external_pnp(prepared).unwrap() {
             ExternalPnpDispatchResult::Returned {
                 status,
                 information,
@@ -2957,7 +2959,7 @@ mod tests {
                 &initialized,
             )
             .unwrap();
-        match io.dispatch_prepared_external_pnp(prepared) {
+        match io.dispatch_prepared_external_pnp(prepared).unwrap() {
             ExternalPnpDispatchResult::ReturnedPayload {
                 status,
                 information,
@@ -5805,7 +5807,7 @@ mod tests {
             .unwrap();
         let irp_id = prepared.irp_id();
         assert_eq!(
-            io.dispatch_prepared_external_pnp(prepared),
+            io.dispatch_prepared_external_pnp(prepared).unwrap(),
             ExternalPnpDispatchResult::Pending { irp_id }
         );
         assert_eq!(io.pump(), 1);

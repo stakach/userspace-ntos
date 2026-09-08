@@ -30842,7 +30842,7 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             };
             // DriverEntry owns a real dispatch epoch before servicing its first request. Readiness
             // remains unpublished until its completion sentinel arrives.
-            driver_launch::win32k_device_properties::register_consumer(host_pml4)
+            driver_launch::win32k_device_consumer::register_consumer(host_pml4)
                 .expect("win32k I/O consumer domain registration failed");
             assert!(
                 win32k_glue::register_primary_win32k_physical_lane(

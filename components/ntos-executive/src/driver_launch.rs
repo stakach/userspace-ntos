@@ -29,6 +29,8 @@ pub(crate) mod device_property;
 
 #[path = "win32k_device_properties.rs"]
 pub(crate) mod win32k_device_properties;
+#[path = "win32k_device_consumer.rs"]
+pub(crate) mod win32k_device_consumer;
 
 #[path = "driver_registry_handles.rs"]
 pub(crate) mod driver_registry_handles;
@@ -38113,7 +38115,10 @@ unsafe fn dispatch_hosted_query_id(child_index: usize, id_type: u32) -> bool {
             id_type,
         };
     }
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
@@ -38373,7 +38378,10 @@ unsafe fn dispatch_hosted_bus_property(child_index: usize, minor: u8) -> bool {
         query.phase =
             HostedDeviceRelationQueryPhase::AwaitingPropertyCompletion { child_index, minor };
     }
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
@@ -38586,7 +38594,10 @@ unsafe fn dispatch_hosted_device_capabilities(child_index: usize) -> bool {
         query.phase =
             HostedDeviceRelationQueryPhase::AwaitingCapabilitiesCompletion { child_index };
     }
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::ReturnedPayload {
             status, payload, ..
         } => retain_hosted_device_capabilities_result(child_index, status, Some(&payload), false),
@@ -41347,7 +41358,10 @@ unsafe fn start_hosted_device_relation_query() -> usize {
         acpi_pci_link_candidates: Vec::new(),
         acpi_pci_catalog_update: None,
     });
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
@@ -57422,11 +57436,15 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
     let Some((origin_driver_id, completion_driver_id, completion_device_id, allocation_instance)) =
         identities
     else {
-        io_manager_mut().discard_prepared_external_pnp(prepared)?;
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     };
     if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
-        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(status);
     }
     let transaction = HostedFilterRequirementsTransaction {
@@ -57443,10 +57461,15 @@ pub(crate) unsafe fn filter_hosted_device_resource_requirements(
         filtered: None,
     };
     if let Err(status) = reserve_hosted_filter_requirements_transaction(transaction) {
-        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(status);
     }
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::Returned {
             status,
             information,
@@ -57544,12 +57567,16 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         match stack_identity {
             Ok(identity) => identity,
             Err(status) => {
-                let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+                io_manager_mut()
+                    .discard_prepared_external_pnp(prepared)
+                    .expect("owned prepared hosted PnP request could not be discarded");
                 return Err(status);
             }
         };
     if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
-        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(status);
     }
     let transaction = HostedPnpTransaction {
@@ -57585,7 +57612,9 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         pnp_remove_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
-        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(status);
     }
     let token = match hosted_pnp_manager_mut().begin_pnp_dispatch(
@@ -57596,7 +57625,9 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         Ok(token) => token,
         Err(error) => {
             let status = hosted_pnp_status(error);
-            let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+            io_manager_mut()
+                .discard_prepared_external_pnp(prepared)
+                .expect("owned prepared hosted PnP request could not be discarded");
             remove_hosted_pnp_transaction(irp_id);
             return Err(status);
         }
@@ -57617,7 +57648,10 @@ pub(crate) unsafe fn dispatch_hosted_pnp_lifecycle_canonical(
         }
     }
 
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::Returned {
             status, receipt, ..
         } => {
@@ -57756,12 +57790,16 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         match stack_identity {
             Ok(identity) => identity,
             Err(failure) => {
-                let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+                io_manager_mut()
+                    .discard_prepared_external_pnp(prepared)
+                    .expect("owned prepared hosted PnP request could not be discarded");
                 return Err(failure);
             }
         };
     if let Err(status) = reserve_active_hosted_irp_transfer_slot() {
-        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(local_failure(status));
     }
     let transaction = HostedPnpTransaction {
@@ -57797,7 +57835,9 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         pnp_remove_published: false,
     };
     if let Err(status) = reserve_hosted_pnp_transaction(transaction) {
-        let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+        io_manager_mut()
+            .discard_prepared_external_pnp(prepared)
+            .expect("owned prepared hosted PnP request could not be discarded");
         return Err(local_failure(status));
     }
     let token = match hosted_pnp_manager_mut().begin_pnp_dispatch(
@@ -57808,7 +57848,9 @@ pub(crate) unsafe fn start_hosted_device_canonical(
         Ok(token) => token,
         Err(error) => {
             let status = hosted_pnp_status(error);
-            let _ = io_manager_mut().discard_prepared_external_pnp(prepared);
+            io_manager_mut()
+                .discard_prepared_external_pnp(prepared)
+                .expect("owned prepared hosted PnP request could not be discarded");
             remove_hosted_pnp_transaction(irp_id);
             return Err(HostedPnpStartFailure {
                 status,
@@ -57819,7 +57861,10 @@ pub(crate) unsafe fn start_hosted_device_canonical(
     set_hosted_pnp_transaction_token(irp_id, token)
         .expect("reserved hosted PnP transaction disappeared before dispatch");
 
-    match io_manager_mut().dispatch_prepared_external_pnp(prepared) {
+    match io_manager_mut()
+        .dispatch_prepared_external_pnp(prepared)
+        .expect("prepared hosted PnP request belongs to the canonical I/O manager")
+    {
         ExternalPnpDispatchResult::Returned {
             status, receipt, ..
         } => {

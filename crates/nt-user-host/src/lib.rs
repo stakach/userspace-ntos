@@ -16,6 +16,7 @@ mod profile;
 pub mod process_identity;
 pub mod provider_alias_bank;
 pub mod provider_logical_caller;
+pub mod provider_irp_requestor;
 pub mod provider_subject;
 pub mod ps_bootstrap;
 mod services;
