@@ -30116,6 +30116,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retry blocker. Ordinary native teardown is deliberately not activated yet: GUI outcomes and
     charged fixed/dynamic VAD ownership below remain required. No fresh NT boot or desktop proof.
 
+    B3 ordinary teardown authority tranche 143 (2026-09-09, accepted preparation): retain GUI EXIT and
+    job-removal invocation evidence before component IPC; only provably unentered operations may
+    retry. Bind lifecycle dispatch to the exact pending attempt, PM lifetime and in-flight outcome
+    owner without reopening normal provider ingress. Dynamic stack cleanup now has a borrowed,
+    bounded pending-owner permit; all foreign pending owners and stale generations still deny
+    access. The native resident/pagefile/attachment cleanup adapters carry this explicit authority
+    through their existing checked journals, not a boolean admission bypass. Fixed transport
+    memory remains outside that permit and belongs solely to its existing memory rollback owner.
+    Capture selected fixed-charge and dynamic VAD witnesses, then revalidate against current
+    canonical tables before final physical/accounting/range publication. Dynamic cleanup budgets
+    every page, including reserved pages whose actual backing must not be assumed absent; only
+    committed witnesses contribute charge. Rebuild candidate tables from current canonical state
+    so unrelated changes survive retry. The paired MM/job debit is the final fallible commit step.
+
+    GUI outcomes retain non-clone invocation tokens for thread EXIT, actual job removal, and process
+    EXIT. Accepted provider effects survive failed local PM clears; every entered nonzero or
+    incomplete result is indeterminate, including negative NTSTATUS values. Exact pending dispatch
+    proof checks the original GUI owner/epoch, PM's existing initial-System designation, current
+    ThreadLifetime and canonical bodies/W32 pointers/job. Recording any outcome invalidates the
+    old proof; normal ingress and callback/wait resume remain unchanged. No table borrow crosses
+    component IPC. Native lifecycle attachment/demand-fault propagation remains to be integrated.
+
+    Root review removed another historical constructor shortcut: the fake DESKTOPINFO/zeroed WND
+    page and nonnull TEB GUI-pointer seeds. ReactOS user32 misc.c:GetW32ThreadInfo explicitly invokes
+    NtUserGetThreadState when Win32ThreadInfo is null; a fake nonnull pointer suppressed this real
+    path. GUI fields now remain zero until canonical win32k publication. The remote-breakin marker
+    is separately allocated in its throwaway VSpace and no longer names a production desktop page.
+    This removal has source/build validation only, not a claim of fresh GUI runtime acceptance.
+
+    Serialized validation passes 1,254 unit tests, 49 integration tests and 11 compile-fail checks
+    in .tmp/test-thread-retirement-authority-20260909.log. Native release build passes in
+    .tmp/build-thread-retirement-authority-20260909.log. Review corrected unconditional provider-lane
+    quiescence: require it for an actual retained attachment, not for a never-attached stack page;
+    existing mappings with missing lane ownership still refuse. Explicit detach runs even when
+    backing tables have no row, and independent prefetch/provider-bank owners are never recycled
+    through the private-stack path. Ordinary teardown cutover and desktop acceptance remain open.
+
+    Review adjustment for the next cutover: serialize registered teardown admission per process
+    so exactly the last mechanism captures required PROCESS_EXIT; queuing all threads before any
+    TCB retires would otherwise capture final=false everywhere. Preserve successful worker memory
+    registration coverage and add a distinct registered reconciliation entry. Main runtimes still
+    lack a thread memory inventory: transfer actual ACS/IPC/trampoline ownership out of process
+    vspace_caps rather than duplicating it, and withdraw TEB diagnostic projections before release.
+    Main stack growth still bypasses VAD/accounting publication; its reported growth bounds must
+    not be treated as an existing private VAD or as proof of absent backing. Fix that ownership
+    boundary before the main-thread cutover. These are prerequisites, not absent-memory fallbacks.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

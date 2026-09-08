@@ -1113,55 +1113,8 @@ pub(crate) unsafe fn spawn_sec_image(
         // in-TEB StaticUnicodeBuffer. Both live in the 2nd TEB page (offset 0x258/0x268).
         core::ptr::write_volatile((scr + 0x5000 + 0x25a) as *mut u16, 522); // MaximumLength
         core::ptr::write_volatile((scr + 0x5000 + 0x260) as *mut u64, SMSS_TEB_VA + 0x1268); // Buffer
-                                                                                             // BATCH 39 — client-side win32k CLIENTINFO.pDeskInfo. An interactive GUI client (winlogon)
-                                                                                             // eventually calls user32 `GetThreadDesktopWnd()` (= `ValidateHwndOrDesk(HWND_DESKTOP)`),
-                                                                                             // whose `GetThreadDesktopInfo()` reads `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) and then
-                                                                                             // derefs `pDeskInfo->spwnd` (DESKTOPINFO+0x10). In real Windows win32k maps the desktop heap
-                                                                                             // into the process and fills CLIENTINFO.pDeskInfo when the thread connects to a desktop; our
-                                                                                             // host has not wired that per-thread desktop-heap view, so pDeskInfo stayed NULL and winlogon
-                                                                                             // NULL-derefed at `[pDeskInfo+0x10]` (cr2=0x10, user32 GetThreadDesktopWnd RVA 0x50009). Give
-                                                                                             // the client a self-contained, readable DESKTOPINFO here (a WND page it can map+read), so
-                                                                                             // GetThreadDesktopWnd returns a valid (zeroed) desktop window instead of faulting.
-                                                                                             // DESKTOPINFO @ SMSS_DESKINFO_VA: pvDesktopBase@0x00, pvDesktopLimit@0x08, spwnd@0x10. A
-                                                                                             // zeroed WND at +0x800 (same page, bracketed by base/limit so DesktopPtrToUser accepts it).
-        let deskinfo = alloc_frame();
-        let _ = checked_spawn_page_map(
-            deskinfo,
-            scr + 0x7000,
-            RW_NX,
-            CAP_INIT_THREAD_VSPACE,
-            b"deskinfo-scratch",
-        );
-        zero_scratch_page(scr + 0x7000);
-        core::ptr::write_volatile((scr + 0x7000 + 0x00) as *mut u64, SMSS_DESKINFO_VA); // pvDesktopBase
-        core::ptr::write_volatile((scr + 0x7000 + 0x08) as *mut u64, SMSS_DESKINFO_VA + 0x1000); // pvDesktopLimit
-        core::ptr::write_volatile((scr + 0x7000 + 0x10) as *mut u64, SMSS_DESKINFO_VA + 0x800); // spwnd -> zeroed WND
-        let deskinfo_client = checked_spawn_copy_cap(deskinfo, b"deskinfo-target");
-        let _ = checked_spawn_page_map(
-            deskinfo_client,
-            SMSS_DESKINFO_VA,
-            RW_NX,
-            pml4,
-            b"deskinfo-target",
-        );
-        vspace_caps.push_mapped(deskinfo);
-        vspace_caps.push_mapped(deskinfo_client);
-        checked_register_spawn_private_mapping(
-            pi,
-            SMSS_DESKINFO_VA,
-            0x1000,
-            nt_address_space::PAGE_READWRITE,
-            b"deskinfo",
-        );
-        // TEB.Win32ThreadInfo (x64 TEB+0x78): user32 `GetThreadDesktopInfo()` first calls
-        // `GetW32ThreadInfo()` (reads [TEB+0x78]) and returns NULL if it is NULL — SHORT-CIRCUITING
-        // before it ever reads pDeskInfo (so a valid pDeskInfo alone doesn't stop the crash). Seed it
-        // non-NULL (point at the readable DESKTOPINFO page) so GetThreadDesktopWnd reaches pDeskInfo.
-        core::ptr::write_volatile((scr + 0x78) as *mut u64, SMSS_DESKINFO_VA); // TEB.Win32ThreadInfo
-                                                                               // TEB.Win32ClientInfo (x64 TEB+0x800): pDeskInfo@+0x20 (TEB+0x820), ulClientDelta@+0x28
-                                                                               // (TEB+0x828 = 0: the WND already carries its client VA — no server->client shift needed).
-        core::ptr::write_volatile((scr + 0x820) as *mut u64, SMSS_DESKINFO_VA); // CLIENTINFO.pDeskInfo
-        core::ptr::write_volatile((scr + 0x828) as *mut u64, 0); // CLIENTINFO.ulClientDelta
+        // GUI state remains zero until the real win32k thread/desktop connection publishes it.
+        // In particular, user32 GetW32ThreadInfo must enter NtUserGetThreadState on first use.
         crate::seed_teb_tail_canary(scr + 0x5000);
         crate::publish_process_teb_tail_alias(pi as usize, teb2);
         let teb2_client_cap = checked_spawn_copy_cap(teb2, b"teb-tail-target");

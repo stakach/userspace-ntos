@@ -335,6 +335,10 @@ unsafe fn acquire_or_provision_win32k_execution_lane(
 #[path = "win32k_client_cap_bank.rs"]
 mod client_cap_bank;
 pub(crate) use client_cap_bank::ThreadProviderAliasCleanup;
+
+pub(crate) fn provider_client_page_is_unowned(pi: usize, page: u64) -> bool {
+    client_cap_bank::page_is_unowned(pi, page)
+}
 static WIN32K_CLIENT_CAP_BANK_FAILS: AtomicU64 = AtomicU64::new(0);
 static WIN32K_CLIENT_PROCESS_ROW_ALLOCATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static mut WIN32K_USER_HEAP_CLIENT_MAPPED_FRAMES: Vec<AtomicU64> = Vec::new();

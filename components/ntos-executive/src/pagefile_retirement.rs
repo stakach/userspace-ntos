@@ -20,16 +20,24 @@ impl PagefileRetirementIo for Io {
 }
 
 pub(super) unsafe fn discard(pi: u64, page: u64) -> Result<(), u32> {
+    discard_with_access(pi, page, &retirement_memory_access::Access::Ordinary)
+}
+
+pub(super) unsafe fn discard_with_access(
+    pi: u64,
+    page: u64,
+    access: &retirement_memory_access::Access<'_>,
+) -> Result<(), u32> {
+    access.check(pi, page)?;
     if !(&*core::ptr::addr_of!(PROCESS_PAGEFILE)).contains(pi, page) {
         return Ok(());
     }
-    hosted_thread_memory_retirement_access(pi, page, 0x1000)?;
     if hosted_thread_retains_page_backing(pi, page)
         || !service_sec_image::section_scratch_is_quiescent()
     {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    win32k_glue::detach_attached_client_page(pi, page)?;
+    win32k_glue::detach_attached_client_page_with_access(pi, page, access)?;
     let store = &mut *core::ptr::addr_of_mut!(PROCESS_PAGEFILE);
     let Some(mut retained) = store.begin_retirement(pi, page)? else {
         return Ok(());

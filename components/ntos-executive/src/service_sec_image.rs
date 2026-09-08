@@ -21393,7 +21393,7 @@ pub(crate) unsafe fn service_sec_image(
 
             // ── The throwaway TARGET's address space ────────────────────────────────────────
             // A real hosted-process paging skeleton: the image PT, the hosted-client env PT
-            // (PEB/DESKINFO live in the dedicated env band), plus the WORK_CLUSTER PT that holds the
+            // (PEB and test marker live in the dedicated env band), plus the WORK_CLUSTER PT that holds the
             // bounded thread-slot windows the remote thread's stack/TEB/IPC/trampoline land in.
             let target_pml4 = make!(OBJ_X86_PML4, PAGING_BITS);
             require_vspace_asid(target_pml4, b"dbgk-breakin-target");

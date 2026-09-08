@@ -434,7 +434,7 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
             .map_err(SlotError::Retirement)
     }
 
-    fn pending_mut_exact(
+    pub(crate) fn pending_mut_exact(
         &mut self,
         expected: ThreadRollbackId,
     ) -> Result<&mut PendingThreadRuntime<R>, SlotError> {

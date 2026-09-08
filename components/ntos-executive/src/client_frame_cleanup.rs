@@ -34,8 +34,8 @@ impl ClientFrameReclaimIo for Io {
     }
 }
 
-unsafe fn admit(record: ClientFrameRecord) -> Result<(), u32> {
-    hosted_thread_memory_retirement_access(record.pi, record.page, 0x1000)?;
+unsafe fn admit(record: ClientFrameRecord, access: &retirement_memory_access::Access<'_>) -> Result<(), u32> {
+    access.check(record.pi, record.page)?;
     if hosted_thread_retains_page_backing(record.pi, record.page) {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -49,16 +49,25 @@ unsafe fn admit(record: ClientFrameRecord) -> Result<(), u32> {
     {
         return Err(nt_address_space::STATUS_INSUFFICIENT_RESOURCES);
     }
-    win32k_glue::detach_attached_client_page(record.pi, record.page)
+    win32k_glue::detach_attached_client_page_with_access(record.pi, record.page, access)
 }
 
 /// The caller is retiring this page's VM ownership, not merely trimming its working set.
 /// That permits cancelling an unfinished pageout while preserving all cleanup acknowledgements.
 pub(super) unsafe fn release(pi: u64, page: u64) -> Result<bool, u32> {
+    release_with_access(pi, page, &retirement_memory_access::Access::Ordinary)
+}
+
+pub(super) unsafe fn release_with_access(
+    pi: u64,
+    page: u64,
+    access: &retirement_memory_access::Access<'_>,
+) -> Result<bool, u32> {
+    access.check(pi, page)?;
     let Some(mut record) = (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(pi, page) else {
         return Ok(false);
     };
-    admit(record)?;
+    admit(record, access)?;
     if record.owns_frame {
         frame_recycle::prepare(record.owned_backing_cap)?;
     }
@@ -98,7 +107,7 @@ pub(super) unsafe fn pageout(pi: u64, page: u64, protection: u32) -> Result<bool
     if !record.owns_frame {
         return Ok(false);
     }
-    admit(record)?;
+    admit(record, &retirement_memory_access::Access::Ordinary)?;
     let intent = ClientFrameReclaimIntent::Pageout { protection };
     let registry = &mut *core::ptr::addr_of_mut!(CLIENT_FRAME_REGISTRY);
     record = registry

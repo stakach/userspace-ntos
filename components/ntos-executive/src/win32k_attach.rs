@@ -130,14 +130,23 @@ unsafe fn replace(pi: u64, page: u64, source: u64, rights: u64, pml4: u64) -> Re
 }
 
 pub(crate) unsafe fn detach_attached_client_page(pi: u64, page: u64) -> Result<(), u32> {
+    detach_attached_client_page_with_access(pi, page, &retirement_memory_access::Access::Ordinary)
+}
+
+pub(crate) unsafe fn detach_attached_client_page_with_access(
+    pi: u64,
+    page: u64,
+    access: &retirement_memory_access::Access<'_>,
+) -> Result<(), u32> {
+    access.check(pi, page)?;
     if W32_ATTACHED_PI.load(Ordering::Acquire) != pi {
         return Ok(());
     }
-    hosted_thread_memory_retirement_access(pi, page, 4096)?;
     let mappings = &mut *core::ptr::addr_of_mut!(MAPPINGS);
     let Some(index) = mappings.iter().position(|mapping| mapping.page() == page) else {
         return Ok(());
     };
+    access.check_attachment_retirement()?;
     mappings[index].retire(&mut Backend {
         page,
         pml4: 0,

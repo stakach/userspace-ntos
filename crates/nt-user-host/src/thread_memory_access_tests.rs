@@ -12,6 +12,9 @@ mod mutations;
 #[path = "thread_memory_writeback_tests.rs"]
 mod writeback;
 
+#[path = "thread_memory_retirement_access_tests.rs"]
+mod retirement;
+
 struct Runtime {
     mechanisms: [u64; 4],
     binding: ThreadBinding<()>,
@@ -19,6 +22,15 @@ struct Runtime {
     memory: ThreadMemoryResources<2>,
     bottom: u64,
     top: u64,
+}
+
+impl crate::thread_memory_retirement_access::RuntimeThreadMemory<2> for Runtime {
+    fn thread_memory(&self) -> &ThreadMemoryResources<2> {
+        &self.memory
+    }
+    fn user_stack_bounds(&self) -> (u64, u64) {
+        (self.bottom, self.top)
+    }
 }
 
 impl crate::thread_slot::RuntimeTcbProjection for Runtime {

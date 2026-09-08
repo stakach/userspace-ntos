@@ -18,6 +18,7 @@ mod profile;
 pub mod process_identity;
 pub mod provider_alias_bank;
 pub mod provider_finalization;
+pub mod gui_exit;
 pub mod provider_logical_caller;
 pub mod provider_irp_requestor;
 pub mod provider_subject;
@@ -34,12 +35,15 @@ pub mod thread_endpoint;
 pub mod thread_publication;
 pub mod thread_pending;
 pub mod thread_memory_access;
+pub mod thread_memory_retirement_access;
+pub mod thread_charge_retirement;
 pub mod thread_resources;
 pub mod thread_registry;
 pub mod thread_reconciliation;
 pub mod thread_retirement;
 pub mod thread_rollback;
 pub mod thread_slot;
+pub mod thread_exit_dispatch;
 
 use alloc::vec::Vec;
 

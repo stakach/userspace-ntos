@@ -126,6 +126,17 @@ pub(super) fn is_empty(pi: usize) -> bool {
     }
 }
 
+pub(super) fn page_is_unowned(pi: usize, page: u64) -> bool {
+    let Ok(_borrow) = Borrow::acquire() else {
+        return false;
+    };
+    unsafe {
+        (&*core::ptr::addr_of!(BANK)).as_ref().is_none_or(|bank| {
+            !bank.snapshots().any(|row| row.request.pi == pi && row.request.page == page)
+        })
+    }
+}
+
 pub(super) fn all_empty() -> bool {
     let Ok(_borrow) = Borrow::acquire() else {
         return false;

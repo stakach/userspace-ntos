@@ -161,6 +161,22 @@ impl<R> PendingThreadRuntime<R> {
         }
     }
 
+    /// Lifecycle-only dispatch must precede every mechanism or memory ownership handoff.
+    pub(crate) fn permits_gui_exit_dispatch(&self) -> bool {
+        matches!(
+            self.mechanisms,
+            PendingMechanisms::RegisteredUntransferred(_)
+        ) && self.rollback.is_none()
+            && !self.memory_handed_off
+    }
+
+    pub(crate) fn gui_exit_owner_mut(&mut self) -> Option<&mut crate::gui_exit::GuiExitOwner>
+    where
+        R: crate::thread_exit_dispatch::RuntimeGuiExit,
+    {
+        self.runtime.gui_exit_owner_mut()
+    }
+
     /// All validation and engine preparation precede the failure-atomic source projection clear.
     /// Successful handoff and exact retries allocate nothing and perform no backend operations.
     pub fn handoff_registered_mechanisms(

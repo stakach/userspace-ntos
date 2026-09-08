@@ -15,6 +15,11 @@ pub(crate) unsafe fn owns_cap(cap: u64) -> bool {
         .any(|owned| owned == cap)
 }
 
+/// Deny-only ownership query; unlike ordinary prefetch lookup it does not admit client access.
+pub(crate) fn page_is_unowned(pi: u64, page: u64) -> bool {
+    !unsafe { (&*core::ptr::addr_of!(FRAMES)).contains(pi, page) }
+}
+
 fn process(pi: u64) -> Result<(PrefetchProcess, u64), u32> {
     let runtime = usize::try_from(pi)
         .ok()

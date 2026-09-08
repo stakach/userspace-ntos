@@ -1088,6 +1088,40 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
     }
 }
 
+impl nt_user_host::thread_memory_retirement_access::RuntimeThreadMemory<TP_WORKER_STACK_FRAME_COUNT>
+    for HostedThreadRuntimeOwner
+{
+    fn thread_memory(&self) -> &HostedThreadResources {
+        &self.runtime.resources
+    }
+
+    fn user_stack_bounds(&self) -> (u64, u64) {
+        (self.runtime.user_stack_allocation_base, self.runtime.user_stack_base)
+    }
+}
+
+pub(crate) fn check_user_stack_retirement_access(
+    permit: &nt_user_host::thread_memory_retirement_access::UserStackRetirementPermit<'_>,
+    current: nt_user_host::process_identity::ProcessIdentity,
+    pi: usize,
+    page: u64,
+) -> Result<(), u32> {
+    if !temporary_frame_alias::memory_available(pi as u64, page, 4096) {
+        return Err(nt_address_space::STATUS_ACCESS_VIOLATION);
+    }
+    let table = unsafe { &*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK) };
+    permit.check(pi, current, page, 4096, table.entries.iter().filter_map(|slot| {
+        let owner = slot.pending()?;
+        let runtime = owner.runtime();
+        Some(nt_user_host::thread_memory_access::PendingThreadMemory {
+            owner: owner.id(),
+            memory: &runtime.resources,
+            user_stack_allocation_base: runtime.user_stack_allocation_base,
+            user_stack_base: runtime.user_stack_base,
+        })
+    })).map_err(|_| nt_address_space::STATUS_ACCESS_VIOLATION)
+}
+
 impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {

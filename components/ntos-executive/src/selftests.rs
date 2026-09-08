@@ -296,7 +296,7 @@ pub(crate) fn dbgk_debugger_client_code() -> alloc::vec::Vec<u8> {
 // | +0x10 | the `PEB->BeingDebugged` BYTE it actually read — the write-through, observed by the debuggee |
 // | +0x18 | the caller-supplied thread PARAMETER (RCX at entry) — proof the start context is honoured |
 /// The marker page's VA inside the throwaway break-in target (its own address space).
-pub(crate) const DBGK_BREAKIN_MARK_VA: u64 = SMSS_DESKINFO_VA;
+pub(crate) const DBGK_BREAKIN_MARK_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0003_0000;
 /// The break-in thread's entry point inside the throwaway target (its code page).
 pub(crate) const DBGK_BREAKIN_CODE_VA: u64 = PE_LOAD_BASE;
 /// The `Parameter` the break-in create passes, echoed back by the thread at `MARK + 0x18`.

@@ -219,14 +219,6 @@ pub const HOSTED_CLIENT_ENV_BASE: u64 = 0x0000_0100_1600_0000;
 /// 64 KiB spacing keeps the historical main-thread layout shape while fitting all env pages in one
 /// dedicated page table.
 pub const SMSS_TRAMP_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0004_0000;
-/// A per-hosted-process page holding a minimal client-side win32k DESKTOPINFO + a zeroed desktop
-/// WND, mapped at spawn (BATCH 39). user32's `GetThreadDesktopInfo()` reads
-/// `TEB.Win32ClientInfo.pDeskInfo` (TEB+0x820) and `GetThreadDesktopWnd()` then derefs
-/// `pDeskInfo->spwnd` (DESKTOPINFO+0x10). Without a non-NULL pDeskInfo an interactive client
-/// (winlogon) NULL-derefs at `[pDeskInfo+0x10]` (cr2=0x10). This page provides a readable
-/// DESKTOPINFO whose spwnd points at a zeroed WND (bracketed by pvDesktopBase/Limit, ulClientDelta=0
-/// so `DesktopPtrToUser(spwnd)` returns it unchanged). See BATCH 39 in ntdll_plan.md.
-pub const SMSS_DESKINFO_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0003_0000;
 pub const SMSS_PEB_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0002_0000;
 pub const SMSS_PARAMS_VA: u64 = HOSTED_CLIENT_ENV_BASE + 0x0001_0000;
 pub const SMSS_TEB_VA: u64 = HOSTED_CLIENT_ENV_BASE;
@@ -14697,6 +14689,7 @@ mod ps_object_backing;
 mod frame_acquisition;
 mod frame_recycle;
 mod client_frame_cleanup;
+mod retirement_memory_access;
 mod provider_bugcheck;
 mod pagefile_retirement;
 use thread_sched_context::attach_sched_context;
