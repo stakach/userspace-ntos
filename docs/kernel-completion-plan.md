@@ -29441,25 +29441,91 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and tombstones its owner without a replay receipt; retained exact retirement acknowledgement is
     required before recycling File projections after an uncertain ACK.
 
-    B3 detached File IRP invocation tranche 124 (2026-09-08, planned):
+    B3 detached File IRP invocation tranche 124 (2026-09-08, complete):
 
-    Add an owned prepare/begin/invoke/finish/discard protocol for general File IRPs. Tranche 118's
+    Implemented an owned prepare/begin/invoke/finish/discard protocol for general File IRPs in
+    nt-io-manager/detached_file_irp. Tranche 118's
     PreparedExternalPnpIrp supplies manager identity and recoverable rejection, but its execution
     still calls a backend under an IoManager mutable borrow; it is not itself detached execution.
-    An invocation must own its generation-bearing IRP, immutable exact route/projection and buffers
+    An invocation owns its generation-bearing IRP, immutable exact route/projection and buffers
     while native execution holds no manager/backend borrow. Wrong-manager or stale finishes return
     the complete owner intact. Distinguish never-entered rejection, genuine returned results,
     pending I/O and indeterminate transport; an uncertain provider call is not a completed failure.
 
-    Preparation must reserve CREATE ownership so another create cannot reuse an Allocated File,
-    preserve source/related/rename-target references, and restore exact relative-open authority on
-    pre-entry discard. Validate complete buffer extents rather than copying the old min-clamping.
-    Retain terminal receipts until explicit checked retirement; actual reentrant completion records,
+    Preparation reserves CREATE ownership so another create cannot reuse an Allocated File,
+    preserves source/related/rename-target references, and restores exact relative-open authority on
+    pre-entry discard. Complete buffer extents share the existing typed parameter validator rather
+    than copying the old min-clamping. Terminal receipts survive until explicit checked retirement;
+    actual reentrant completion records,
     not a changed state alone, prove completion. The separate native requestor/mapping owner remains
     required. The intended native consumer is dispatch_external_irp_to_device_record_result_exact,
     using the stateless execution portion of HostedDriverBackend::dispatch_irp with dynamic DriverPeer
     routing and real allocating-provider identity. Remove the borrowed execution path when callers
     have moved to this protocol; do not keep it as a fallback.
+
+    Review constraints: the first detached admission must reject raw CLEANUP/CLOSE requests; those
+    need a canonical close transaction preserving tranche 123's last-reference and close-entry
+    gates. Async adoption and backend ACK also require detached ownership, not a mutable backend
+    call hidden inside terminal retirement. The old optional tuple adapter loses fault-wall and
+    guarded-abort acceptance evidence. Video initialization/StartIo need the same exact transport
+    classification; a registry-commit error after initialization is an accepted result, not evidence
+    of non-entry. The current stack-local video request cannot prove durable pending ownership.
+    Native ETHREAD requestor projection remains a separate prerequisite; a numeric requestor TID
+    and the current process-placeholder address are not that authority.
+
+    Implemented source-reference close rescheduling on discard, synchronous retirement and backend
+    ACK. Raw free/ACK, orphan-completion ACK, route mutation/removal and stack forwarding cannot
+    bypass detached ownership. All immutable projection fields are checked without allocating;
+    mutable completion status/information are not confused with request identity. Transport faults
+    retain uncertainty without publishing synthetic completion, and real later driver completion
+    remains admissible. Accepted ACK evidence survives local/wrong-manager retry; only proven
+    non-entry or a validated rejection permits another destructive ACK invocation.
+
+    Native extraction: hosted_file_dispatch and hosted_video_dispatch now hold the stateless File
+    executor and videoport policy separately. Deleted the optional-tuple transport adapter after
+    moving all remaining backend dispatch/cancel/copy/ACK calls to exact transport outcomes. Owned
+    invoke/ACK adapters compile but remain unactivated until tranche 125's durable arena and copy/
+    cancellation delivery are connected. Existing borrowed callers explicitly park on uncertain
+    transport rather than release live objects or replay an unknown destructive call; this is a
+    safety boundary, not completed detached lifecycle integration. Video pending without a durable
+    VRP owner also denies further provider admission. No desktop/import acceptance is claimed.
+
+    Validation: 363 I/O Manager unit tests pass, including 23 focused new ownership/race/extent
+    cases. Four compile-fail ownership checks pass (two new). The 26-crate regression passes 2,849
+    tests across 59 suites. Native release build passes in 35.75 seconds with 264 warnings: the
+    existing 262 plus the two explicitly unactivated owned invoke/ACK entry points for tranche 125.
+    Independent lifetime and native transport/ACK reviews are clear. Logs:
+    .tmp/test-detached-file-irp-20260908.log, .tmp/test-detached-file-regression-20260908.log and
+    .tmp/build-detached-file-irp-20260908.log.
+
+    B3 native detached File owner tranche 125 (planned):
+
+    Publish a durable native owner before the first detached provider invocation. Keep the exact
+    prepared/returned/pending/indeterminate/completion-ACK owner and original delivery reservation
+    through every rejection; no references into the owner arena may cross IPC. Migrate the generic
+    external caller, output-copy, cancellation, abandonment and completion-ACK boundaries together.
+    The current outward STATUS_PENDING plus canonical IrpId can represent an executive operation
+    still outstanding after uncertain transport, but only the arena's explicit classification and
+    a genuine later driver completion may resolve it. Returning a fabricated failure would instead
+    make CREATE callers roll back their pending handle reservation. An accepted ACK receipt must
+    survive local retries; an unknown ACK cannot be replayed without provider retirement receipts.
+    Raw lifecycle calls remain excluded until canonical CLEANUP/CLOSE transactions are detached.
+    Cancellation needs monotonic intent plus an exact in-flight/accepted/indeterminate attempt:
+    receiving a cancel request is not proof of terminal cancellation, even when no cancel routine
+    was installed. Latch intent while another invocation owns the request; raw cancel/retry paths
+    must not re-enter a detached owner. Completion copy requires a checked offset/range and immutable
+    completion snapshot; it can retry a lost read reply while ACK is excluded. Copy required output
+    before destructive ACK, or explicitly record abandoned delivery. Abandonment never fabricates
+    STATUS_CANCELLED and never relinquishes File ownership before genuine completion and ACK.
+
+    B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
+    bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
+    Mapping those pool pages into unrelated providers would expose unrelated objects. Allocate
+    page-isolated, executive-owned bodies for each exact PM lifetime and use win32k's existing
+    supplied-body path instead of maintaining two identity sources. Retain both ETHREAD and owning
+    EPROCESS backing/aliases through ProviderIrpRequestor ownership. Reuse checked frame acquisition
+    and alias retirement, with prepublished ownership for failed map/cap cleanup, not the existing
+    resource-map helper's ignored delete errors or unproven borrowed paging caps.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

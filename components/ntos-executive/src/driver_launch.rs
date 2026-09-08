@@ -35,6 +35,11 @@ pub(crate) mod win32k_device_consumer;
 pub(crate) mod win32k_device_pointers;
 #[path = "hosted_add_device_rollback.rs"]
 pub(crate) mod hosted_add_device_rollback;
+#[path = "hosted_file_dispatch.rs"]
+mod hosted_file_dispatch;
+#[path = "hosted_video_dispatch.rs"]
+mod hosted_video_dispatch;
+use hosted_video_dispatch::dispatch_video_irp_for_binding_exact;
 
 #[path = "driver_registry_handles.rs"]
 pub(crate) mod driver_registry_handles;
@@ -42325,86 +42330,32 @@ impl DriverDispatchBackend for HostedDriverBackend {
             _ => return Err(nt_status::NtStatus::INVALID_PARAMETER),
         };
         let input = Vec::from(&ctx.system_buffer[..input_len]);
-        let fsctl = projection_fsctl(irp);
-        let request = hosted_irp_dispatch_request(self.instance, irp, input_len, output_len)?;
-        let (route_instance, route_inst, device_object) =
-            hosted_driver_device_route_by_device_id(irp.device_id.raw())
-                .filter(|(instance, _, _)| *instance == self.instance)
-                .ok_or(nt_status::NtStatus::INVALID_DEVICE_REQUEST)?;
-        let binding = hosted_device_binding_by_device_id(irp.device_id.raw())
-            .filter(|binding| binding.instance == route_instance);
-        let result = unsafe {
-            if let Some(binding) = binding {
-                match dispatch_video_irp_for_binding(
-                    route_instance,
-                    route_inst,
-                    binding,
-                    irp.major as u64,
-                    irp.minor as u64,
-                    fsctl,
-                    irp.user_data,
-                    &input,
-                    &mut ctx.system_buffer[output_offset..output_end],
-                ) {
-                    Ok(Some((status, information))) => Some((status, information, 0, false)),
-                    Ok(None) => dispatch_irp_for_instance(
-                        self.instance,
-                        irp.major as u64,
-                        irp.minor as u64,
-                        device_object,
-                        irp.irp_id.raw(),
-                        irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
-                        fsctl,
-                        irp.user_data,
-                        irp.requestor_tid,
-                        Some(request),
-                        &input,
-                        &mut ctx.system_buffer[output_offset..output_end],
-                    )
-                    .map(|(status, information, file_context)| {
-                        (status, information, file_context, true)
-                    }),
-                    Err(status) => Some((status.raw(), 0, 0, false)),
-                }
-            } else {
-                dispatch_irp_for_instance(
-                    route_instance,
-                    irp.major as u64,
-                    irp.minor as u64,
-                    device_object,
-                    irp.irp_id.raw(),
-                    irp.file_id.map(|file_id| file_id.raw()).unwrap_or(0),
-                    fsctl,
-                    irp.user_data,
-                    irp.requestor_tid,
-                    Some(request),
-                    &input,
-                    &mut ctx.system_buffer[output_offset..output_end],
-                )
-                .map(|(status, information, file_context)| {
-                    (status, information, file_context, true)
-                })
-            }
-        };
+        let result = hosted_file_dispatch::execute(
+            self.instance,
+            irp,
+            &input,
+            &mut ctx.system_buffer[output_offset..output_end],
+        );
         match result {
-            Some((status, _, _, true)) if status as u32 == STATUS_PENDING => {
-                Ok(DispatchOutcome::Pending)
-            }
-            Some((status, information, file_context, _)) => Ok(DispatchOutcome::Completed {
-                status: nt_status::NtStatus(status),
+            HostedIrpTransportResult::NotDispatched { status } => Err(status),
+            HostedIrpTransportResult::Returned {
+                status: nt_status::NtStatus::PENDING,
+                ..
+            } => Ok(DispatchOutcome::Pending),
+            HostedIrpTransportResult::Returned {
+                status,
                 information,
-                file_context: if irp.major == major::IRP_MJ_CREATE
-                    || irp.major == major::IRP_MJ_CREATE_NAMED_PIPE
-                    || irp.major == major::IRP_MJ_CREATE_MAILSLOT
-                {
-                    Some(file_context)
-                } else {
-                    None
-                },
+                file_context,
+            } => Ok(DispatchOutcome::Completed {
+                status,
+                information,
+                file_context: major::is_create_major(irp.major).then_some(file_context),
             }),
-            None => Ok(DispatchOutcome::Failed {
-                status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
-            }),
+            // The remaining borrowed lifecycle callers cannot retain uncertain native buffers.
+            // Do not return a fabricated terminal failure and release a possibly live raw IRP.
+            HostedIrpTransportResult::Indeterminate { transport_status } => {
+                panic!("indeterminate borrowed File IRP {:?}: {:?}", irp.irp_id, transport_status)
+            }
         }
     }
 
@@ -42510,30 +42461,10 @@ impl DriverDispatchBackend for HostedDriverBackend {
     }
 
     fn cancel_irp(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
-        let storage_instance = hosted_completion_storage_instance(self.instance);
-        let mut output = [];
-        let (status, _, _) = unsafe {
-            dispatch_irp_for_instance(
-                storage_instance,
-                FSD_DISPATCH_CANCEL_IRP,
-                0,
-                0,
-                irp_id.raw(),
-                0,
-                0,
-                0,
-                0,
-                None,
-                &[],
-                &mut output,
-            )
-        }
-        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(nt_status::NtStatus(status))
-        }
+        let result = hosted_file_dispatch::control(
+            self.instance, irp_id, FSD_DISPATCH_CANCEL_IRP, 0, &mut [],
+        );
+        hosted_file_dispatch::borrowed_control_result(result, irp_id).map(|_| ())
     }
 
     fn poll_completion(&mut self) -> Option<nt_io_manager::DriverCompletion> {
@@ -42546,55 +42477,21 @@ impl DriverDispatchBackend for HostedDriverBackend {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, nt_status::NtStatus> {
-        let storage_instance = hosted_completion_storage_instance(self.instance);
-        let (status, information, _) = unsafe {
-            dispatch_irp_for_instance(
-                storage_instance,
-                FSD_DISPATCH_COPY_COMPLETION,
-                0,
-                0,
-                irp_id.raw(),
-                0,
-                offset,
-                0,
-                0,
-                None,
-                &[],
-                output,
-            )
-        }
-        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        if status != 0 {
-            return Err(nt_status::NtStatus(status));
-        }
-        usize::try_from(information).map_err(|_| nt_status::NtStatus::INVALID_PARAMETER)
+        let result = hosted_file_dispatch::control(
+            self.instance, irp_id, FSD_DISPATCH_COPY_COMPLETION, offset, output,
+        );
+        let information = hosted_file_dispatch::borrowed_control_result(result, irp_id)?;
+        usize::try_from(information)
+            .ok()
+            .filter(|copied| *copied <= output.len())
+            .ok_or(nt_status::NtStatus::INVALID_PARAMETER)
     }
 
     fn acknowledge_completion(&mut self, irp_id: IrpId) -> Result<(), nt_status::NtStatus> {
-        let storage_instance = hosted_completion_storage_instance(self.instance);
-        let mut output = [];
-        let (status, _, _) = unsafe {
-            dispatch_irp_for_instance(
-                storage_instance,
-                FSD_DISPATCH_ACK_COMPLETION,
-                0,
-                0,
-                irp_id.raw(),
-                0,
-                0,
-                0,
-                0,
-                None,
-                &[],
-                &mut output,
-            )
-        }
-        .ok_or(nt_status::NtStatus::DEVICE_NOT_CONNECTED)?;
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(nt_status::NtStatus(status))
-        }
+        let result = hosted_file_dispatch::control(
+            self.instance, irp_id, FSD_DISPATCH_ACK_COMPLETION, 0, &mut [],
+        );
+        hosted_file_dispatch::borrowed_acknowledgement_result(result, irp_id)
     }
 
     fn is_faulted(&self) -> bool {
@@ -57098,195 +56995,6 @@ unsafe fn commit_video_registry_parameters_for_instance(
     Ok(())
 }
 
-unsafe fn dispatch_video_initialize_for_instance(
-    index: usize,
-    inst: DriverInstance,
-    device_object: u64,
-) -> Result<(i32, u64), nt_status::NtStatus> {
-    if !hosted_instance_video_port_initialized(inst) {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    let sh = inst.exec_shared_va;
-    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
-    write_volatile(
-        (sh + SH_REQ_MAJOR) as *mut u64,
-        FSD_DISPATCH_VIDEO_INITIALIZE,
-    );
-    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_INLEN) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_FILEID) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
-    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
-
-    let ch = crate::spawn_hosts::PumpChannel {
-        fault_ep: inst.fault_ep,
-        pml4: inst.pml4,
-        code_va: 0,
-        image_frames: 0,
-        exec_code_va: ExecVaWindow::try_for_instance(index)
-            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
-            .code_va,
-        root_image_rights: 3,
-        root_image_map_owner: inst.map_cap_bank.owner,
-        shared_va: sh,
-        dispatch_label: FSD_DISPATCH_LABEL,
-        demand_cap: 256,
-        trace_faults: false,
-        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        tcb: inst.tcb,
-        reply_cap: inst.reply_cap,
-        client_pi: 0,
-        client_generation: 0,
-        logical_caller: None,
-        kernel_caller: None,
-        caps: crate::spawn_hosts::HostCaps {
-            dispatch_server: true,
-            kind: crate::spawn_hosts::ReqKind::Irp,
-            io_port_faults: shared_has_port_resources(sh),
-            ..crate::spawn_hosts::HostCaps::default()
-        },
-    };
-    let pr = hosted_component_pump(&ch);
-    if !pr.completed {
-        register_instance_ready(index, false);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    if pr.status == 0 {
-        commit_video_registry_parameters_for_instance(inst)?;
-    }
-    let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
-    Ok((pr.status, info))
-}
-
-unsafe fn dispatch_video_start_io_for_instance(
-    index: usize,
-    inst: DriverInstance,
-    device_object: u64,
-    ioctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<(i32, u64), nt_status::NtStatus> {
-    if !hosted_instance_video_port_initialized(inst) {
-        return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
-    }
-    if ioctl > u32::MAX as u64 || in_data.len() > u32::MAX as usize || out.len() > u32::MAX as usize
-    {
-        return Err(nt_status::NtStatus::INVALID_PARAMETER);
-    }
-    let sh = inst.exec_shared_va;
-    let inlen = in_data.len();
-    write_volatile((sh + SH_ACTIVE_DEVICE_OBJECT) as *mut u64, device_object);
-    write_volatile((sh + SH_REQ_MAJOR) as *mut u64, FSD_DISPATCH_VIDEO_START_IO);
-    write_volatile((sh + SH_REQ_MINOR) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_FSCTL) as *mut u64, ioctl);
-    write_volatile((sh + SH_REQ_INLEN) as *mut u64, inlen as u64);
-    write_volatile((sh + SH_REQ_OUTLEN) as *mut u64, out.len() as u64);
-    write_volatile((sh + SH_REQ_FILEID) as *mut u64, file_id);
-    write_volatile((sh + SH_REQ_CONTROL_ID) as *mut u64, 0);
-    write_volatile((sh + SH_REQ_STATUS) as *mut i32, 0);
-    write_volatile((sh + SH_REQ_INFO) as *mut u64, 0);
-
-    let ch = crate::spawn_hosts::PumpChannel {
-        fault_ep: inst.fault_ep,
-        pml4: inst.pml4,
-        code_va: 0,
-        image_frames: 0,
-        exec_code_va: ExecVaWindow::try_for_instance(index)
-            .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?
-            .code_va,
-        root_image_rights: 3,
-        root_image_map_owner: inst.map_cap_bank.owner,
-        shared_va: sh,
-        dispatch_label: FSD_DISPATCH_LABEL,
-        demand_cap: 256,
-        trace_faults: false,
-        initial: crate::spawn_hosts::InitialAction::ReplyRequest,
-        tcb: inst.tcb,
-        reply_cap: inst.reply_cap,
-        client_pi: 0,
-        client_generation: 0,
-        logical_caller: None,
-        kernel_caller: None,
-        caps: crate::spawn_hosts::HostCaps {
-            dispatch_server: true,
-            kind: crate::spawn_hosts::ReqKind::Irp,
-            io_port_faults: shared_has_port_resources(sh),
-            ..crate::spawn_hosts::HostCaps::default()
-        },
-    };
-    let transfer_guard = enter_active_hosted_irp_transfer(sh, 0, in_data, out)
-        .ok_or(nt_status::NtStatus::INSUFFICIENT_RESOURCES)?;
-    let pr = hosted_component_pump(&ch);
-    drop(transfer_guard);
-    if !pr.completed {
-        register_instance_ready(index, false);
-        return Err(nt_status::NtStatus::UNSUCCESSFUL);
-    }
-    let info = read_volatile((sh + SH_REQ_INFO) as *const u64);
-    Ok((pr.status, info))
-}
-
-unsafe fn dispatch_video_irp_for_binding(
-    index: usize,
-    inst: DriverInstance,
-    binding: HostedDeviceBinding,
-    major: u64,
-    minor: u64,
-    fsctl: u64,
-    file_id: u64,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Result<Option<(i32, u64)>, nt_status::NtStatus> {
-    if !hosted_instance_video_port_initialized(inst) {
-        return Ok(None);
-    }
-    if major > u8::MAX as u64 {
-        return Ok(Some((nt_status::NtStatus::INVALID_PARAMETER.raw(), 0)));
-    }
-    let device_object = binding.device_object;
-    let outcome = match major as u8 {
-        major::IRP_MJ_CREATE => {
-            let result = dispatch_video_initialize_for_instance(index, inst, device_object)?;
-            let initialize_calls =
-                read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_CALLS) as *const u64);
-            let initialize_ok =
-                read_volatile((inst.exec_shared_va + SH_VIDEO_HW_INITIALIZE_OK) as *const u8);
-            if result.0 != 0 || initialize_ok == 0 {
-                print_str(b"[driver-launch] hosted video Initialize failed device_id=");
-                print_u64(binding.device_id);
-                print_str(b" status=0x");
-                print_hex(result.0 as u32);
-                print_str(b" info=");
-                print_u64(result.1);
-                print_str(b" calls=");
-                print_u64(initialize_calls);
-                print_str(b" ok=");
-                print_u64(initialize_ok as u64);
-                print_str(b"\n");
-            }
-            result
-        }
-        major::IRP_MJ_CLEANUP | major::IRP_MJ_CLOSE => (0, 0),
-        major::IRP_MJ_DEVICE_CONTROL | major::IRP_MJ_INTERNAL_DEVICE_CONTROL => {
-            dispatch_video_start_io_for_instance(
-                index,
-                inst,
-                device_object,
-                fsctl,
-                file_id,
-                in_data,
-                out,
-            )?
-        }
-        _ => (nt_status::NtStatus::INVALID_DEVICE_REQUEST.raw(), 0),
-    };
-    let _ = minor;
-    Ok(Some(outcome))
-}
-
 fn clone_pnp_resource_list(bytes: &[u8]) -> Result<Vec<u8>, nt_status::NtStatus> {
     let mut copy = Vec::new();
     copy.try_reserve_exact(bytes.len())
@@ -58633,49 +58341,6 @@ unsafe fn dispatch_irp_for_instance_exact(
             information: info,
             file_context,
         })
-    }
-}
-
-/// Compatibility adapter for non-PnP callers that still consume the historical optional tuple.
-/// Exact transport provenance is intentionally available only through
-/// [`dispatch_irp_for_instance_exact`].
-unsafe fn dispatch_irp_for_instance(
-    inst: usize,
-    major: u64,
-    minor: u64,
-    device_object: u64,
-    canonical_irp_id: u64,
-    canonical_file_id: u64,
-    fsctl: u64,
-    file_id: u64,
-    requestor_tid: u64,
-    dispatch_request: Option<IrpDispatchRequest>,
-    in_data: &[u8],
-    out: &mut [u8],
-) -> Option<(i32, u64, u64)> {
-    match dispatch_irp_for_instance_exact(
-        inst,
-        major,
-        minor,
-        device_object,
-        canonical_irp_id,
-        canonical_file_id,
-        fsctl,
-        file_id,
-        requestor_tid,
-        dispatch_request,
-        in_data,
-        out,
-    )? {
-        HostedIrpTransportResult::NotDispatched { status } => Some((status.raw(), 0, 0)),
-        HostedIrpTransportResult::Returned {
-            status,
-            information,
-            file_context,
-        } => Some((status.raw(), information, file_context)),
-        HostedIrpTransportResult::Indeterminate { transport_status } => {
-            Some((transport_status.raw(), 0, 0))
-        }
     }
 }
 

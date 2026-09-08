@@ -99,6 +99,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 if self.publish_backend_completion(idx, completion) {
                     progress += 1;
                 } else {
+                    if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+                        continue;
+                    }
                     // Poll transfers one retained backend completion to the manager. If its
                     // canonical identity is stale, foreign, or already terminal, it has no valid
                     // consumer; release that exact backend owner instead of stranding it in a
@@ -177,6 +180,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut index = 0;
         while index < self.rejected_completion_acks.len() {
             let (backend_index, irp_id) = self.rejected_completion_acks[index];
+            if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+                index += 1;
+                continue;
+            }
             let complete = self.backends.get_mut(backend_index).is_some_and(|backend| {
                 backend.is_faulted() || backend.acknowledge_completion(irp_id).is_ok()
             });
@@ -301,6 +308,13 @@ impl<P: ObjectManagerPort> IoManager<P> {
         {
             return false;
         }
+        if let Some(irp) = self.irp_mut(completion.irp_id).filter(|irp| irp.detached_file_owner) {
+            if matches!(irp.state, IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested) {
+                irp.state = IrpState::Indeterminate;
+                irp.status = completion.status;
+            }
+            return false;
+        }
         self.publish_verified_completion(completion, IrpCompletionOrigin::TransportFault)
     }
 
@@ -320,7 +334,8 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if !matches!(
                 irp.state,
                 IrpState::Dispatched | IrpState::Pending | IrpState::CancelRequested
-            ) {
+            ) && !(irp.detached_file_owner && irp.state == IrpState::Indeterminate
+                && origin == IrpCompletionOrigin::Driver) {
                 return false;
             }
             irp.status = completion.status;
@@ -330,7 +345,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
             if completion.status == NtStatus::CANCELLED {
                 irp.cancel = CancelState::Cancelled;
             }
-            if !irp.transition(IrpState::Completing) || !irp.transition(IrpState::Completed) {
+            if irp.detached_file_owner && irp.state == IrpState::Indeterminate {
+                // A real completion from the exact backend resolves this detached outer-return
+                // uncertainty. Ordinary PnP indeterminate barriers keep their existing policy.
+                irp.state = IrpState::Completing;
+            } else if !irp.transition(IrpState::Completing) {
+                return false;
+            }
+            if !irp.transition(IrpState::Completed) {
                 return false;
             }
             (irp.origin_major, irp.file_id)
@@ -563,6 +585,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         irp_id: IrpId,
         reclaim_faulted_backend: bool,
     ) -> Result<CompletedIrp, NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         let queue_index = self
             .completed_irps
             .iter()
@@ -619,7 +644,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
         }
     }
 
-    fn completed_irp_snapshot(&self, irp_id: IrpId) -> Option<CompletedIrp> {
+    pub(crate) fn completed_irp_snapshot(&self, irp_id: IrpId) -> Option<CompletedIrp> {
         let irp = self.irp(irp_id)?;
         if irp.state != IrpState::Completed {
             return None;

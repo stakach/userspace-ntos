@@ -528,6 +528,8 @@ pub struct IrpRecord {
     pub completion_origin: Option<IrpCompletionOrigin>,
     /// One-shot authority consumed when an external PnP owner claims the terminal stack receipt.
     pub(crate) external_pnp_terminal_receipt_claimed: bool,
+    /// A detached dispatch owns retirement; ordinary free/ACK cannot consume it across IPC.
+    pub(crate) detached_file_owner: bool,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
     pub buffer: Option<IoBufferRef>,
@@ -561,6 +563,7 @@ impl IrpRecord {
             completion_file_context: None,
             completion_origin: None,
             external_pnp_terminal_receipt_claimed: false,
+            detached_file_owner: false,
             stack: Vec::new(),
             current_location: 0,
             buffer: None,
@@ -604,6 +607,7 @@ impl IrpRecord {
         caller: DriverId,
         next_stack: IoStackLocation,
     ) -> Result<&IoStackLocation, NtStatus> {
+        if self.detached_file_owner { return Err(NtStatus::INVALID_DEVICE_REQUEST); }
         let current = self.current_stack().ok_or(NtStatus::INVALID_PARAMETER)?;
         if current.driver_id != caller {
             return Err(NtStatus::INVALID_PARAMETER);

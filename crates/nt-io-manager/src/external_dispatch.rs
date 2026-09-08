@@ -20,6 +20,172 @@ use crate::irp::{
 use crate::object_port::ObjectManagerPort;
 use crate::{DeviceId, DriverId, FileId, IoManager, IrpId};
 
+pub(crate) fn validate_external_parameter_layout(
+    major: u8,
+    params: &IoParameters,
+    stack_flags: StackFlags,
+    input_len: u32,
+    output_len: u32,
+    system_buffer_len: usize,
+) -> Result<(), NtStatus> {
+    match params {
+        IoParameters::Pnp(parameters) => {
+            let expected_input = parameters.input_len();
+            let expected_output = parameters.output_len();
+            if major != nt_io_abi::major::IRP_MJ_PNP
+                || input_len != expected_input
+                || output_len != expected_output
+                || system_buffer_len != parameters.payload_len() as usize
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        _ if major == nt_io_abi::major::IRP_MJ_PNP => {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        IoParameters::QueryEa(parameters) => {
+            let expected_total = parameters
+                .ea_list_length
+                .checked_add(parameters.length)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if major != nt_io_abi::major::IRP_MJ_QUERY_EA
+                || input_len != parameters.ea_list_length
+                || output_len != parameters.length
+                || system_buffer_len != expected_total as usize
+                || stack_flags.bits() & !0x07 != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        IoParameters::SetEa(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_SET_EA
+                || input_len != parameters.length
+                || output_len != 0
+                || system_buffer_len != parameters.length as usize
+                || !stack_flags.is_empty()
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        _ if matches!(
+            major,
+            nt_io_abi::major::IRP_MJ_QUERY_EA | nt_io_abi::major::IRP_MJ_SET_EA
+        ) =>
+        {
+            return Err(NtStatus::INVALID_PARAMETER)
+        }
+        IoParameters::QueryQuota(parameters) => {
+            let expected_input = parameters
+                .input_length()
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            let expected_total = expected_input
+                .checked_add(parameters.length)
+                .ok_or(NtStatus::INVALID_PARAMETER)?;
+            if major != nt_io_abi::major::IRP_MJ_QUERY_QUOTA
+                || input_len != expected_input
+                || output_len != parameters.length
+                || system_buffer_len != expected_total as usize
+                || stack_flags.bits() & !0x07 != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        IoParameters::SetQuota(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_SET_QUOTA
+                || input_len != parameters.length
+                || output_len != 0
+                || system_buffer_len != parameters.length as usize
+                || !stack_flags.is_empty()
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        _ if matches!(
+            major,
+            nt_io_abi::major::IRP_MJ_QUERY_QUOTA | nt_io_abi::major::IRP_MJ_SET_QUOTA
+        ) =>
+        {
+            return Err(NtStatus::INVALID_PARAMETER)
+        }
+        IoParameters::QueryVolumeInformation(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION
+                || input_len != 0
+                || output_len != parameters.length
+                || system_buffer_len != parameters.length as usize
+                || !stack_flags.is_empty()
+                || !nt_io_abi::valid_volume_information_parameters(
+                    major,
+                    parameters.information_class,
+                    input_len,
+                    output_len,
+                )
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        IoParameters::SetVolumeInformation(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_SET_VOLUME_INFORMATION
+                || input_len != parameters.length
+                || output_len != 0
+                || system_buffer_len != parameters.length as usize
+                || !stack_flags.is_empty()
+                || !nt_io_abi::valid_volume_information_parameters(
+                    major,
+                    parameters.information_class,
+                    input_len,
+                    output_len,
+                )
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        _ if matches!(
+            major,
+            nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION
+                | nt_io_abi::major::IRP_MJ_SET_VOLUME_INFORMATION
+        ) =>
+        {
+            return Err(NtStatus::INVALID_PARAMETER)
+        }
+        IoParameters::LockControl(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_LOCK_CONTROL
+                || input_len != 0
+                || output_len != 0
+                || system_buffer_len != 0
+                || !nt_io_abi::valid_lock_control_parameters(
+                    major,
+                    parameters.minor,
+                    stack_flags.bits(),
+                    parameters.byte_offset,
+                    parameters.length,
+                    parameters.key,
+                )
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        _ if major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL => {
+            return Err(NtStatus::INVALID_PARAMETER)
+        }
+        IoParameters::NotifyDirectory(parameters) => {
+            if major != nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
+                || input_len != 0
+                || output_len != parameters.length
+                || system_buffer_len != parameters.length as usize
+                || stack_flags.bits() & !crate::SL_WATCH_TREE != 0
+                || !crate::valid_directory_notify_parameters(*parameters)
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+        }
+        _ if major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL => {
+            return Err(NtStatus::INVALID_PARAMETER)
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// I/O-manager-minted terminal identity for one canonical external PnP IRP.
 ///
 /// Private fields prevent lifecycle managers from manufacturing stack completion evidence out of
@@ -824,161 +990,7 @@ impl<P> IoManager<P> {
         output_len: u32,
         system_buffer: &mut [u8],
     ) -> Result<ExternalDispatchResult, NtStatus> {
-        match &params {
-            IoParameters::Pnp(parameters) => {
-                let expected_input = parameters.input_len();
-                let expected_output = parameters.output_len();
-                if major != nt_io_abi::major::IRP_MJ_PNP
-                    || input_len != expected_input
-                    || output_len != expected_output
-                    || system_buffer.len() != parameters.payload_len() as usize
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            _ if major == nt_io_abi::major::IRP_MJ_PNP => {
-                return Err(NtStatus::INVALID_PARAMETER);
-            }
-            IoParameters::QueryEa(parameters) => {
-                let expected_total = parameters
-                    .ea_list_length
-                    .checked_add(parameters.length)
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                if major != nt_io_abi::major::IRP_MJ_QUERY_EA
-                    || input_len != parameters.ea_list_length
-                    || output_len != parameters.length
-                    || system_buffer.len() != expected_total as usize
-                    || stack_flags.bits() & !0x07 != 0
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            IoParameters::SetEa(parameters) => {
-                if major != nt_io_abi::major::IRP_MJ_SET_EA
-                    || input_len != parameters.length
-                    || output_len != 0
-                    || system_buffer.len() != parameters.length as usize
-                    || !stack_flags.is_empty()
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            _ if matches!(
-                major,
-                nt_io_abi::major::IRP_MJ_QUERY_EA | nt_io_abi::major::IRP_MJ_SET_EA
-            ) =>
-            {
-                return Err(NtStatus::INVALID_PARAMETER)
-            }
-            IoParameters::QueryQuota(parameters) => {
-                let expected_input = parameters
-                    .input_length()
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                let expected_total = expected_input
-                    .checked_add(parameters.length)
-                    .ok_or(NtStatus::INVALID_PARAMETER)?;
-                if major != nt_io_abi::major::IRP_MJ_QUERY_QUOTA
-                    || input_len != expected_input
-                    || output_len != parameters.length
-                    || system_buffer.len() != expected_total as usize
-                    || stack_flags.bits() & !0x07 != 0
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            IoParameters::SetQuota(parameters) => {
-                if major != nt_io_abi::major::IRP_MJ_SET_QUOTA
-                    || input_len != parameters.length
-                    || output_len != 0
-                    || system_buffer.len() != parameters.length as usize
-                    || !stack_flags.is_empty()
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            _ if matches!(
-                major,
-                nt_io_abi::major::IRP_MJ_QUERY_QUOTA | nt_io_abi::major::IRP_MJ_SET_QUOTA
-            ) =>
-            {
-                return Err(NtStatus::INVALID_PARAMETER)
-            }
-            IoParameters::QueryVolumeInformation(parameters) => {
-                if major != nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION
-                    || input_len != 0
-                    || output_len != parameters.length
-                    || system_buffer.len() != parameters.length as usize
-                    || !stack_flags.is_empty()
-                    || !nt_io_abi::valid_volume_information_parameters(
-                        major,
-                        parameters.information_class,
-                        input_len,
-                        output_len,
-                    )
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            IoParameters::SetVolumeInformation(parameters) => {
-                if major != nt_io_abi::major::IRP_MJ_SET_VOLUME_INFORMATION
-                    || input_len != parameters.length
-                    || output_len != 0
-                    || system_buffer.len() != parameters.length as usize
-                    || !stack_flags.is_empty()
-                    || !nt_io_abi::valid_volume_information_parameters(
-                        major,
-                        parameters.information_class,
-                        input_len,
-                        output_len,
-                    )
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            _ if matches!(
-                major,
-                nt_io_abi::major::IRP_MJ_QUERY_VOLUME_INFORMATION
-                    | nt_io_abi::major::IRP_MJ_SET_VOLUME_INFORMATION
-            ) =>
-            {
-                return Err(NtStatus::INVALID_PARAMETER)
-            }
-            IoParameters::LockControl(parameters) => {
-                if major != nt_io_abi::major::IRP_MJ_LOCK_CONTROL
-                    || input_len != 0
-                    || output_len != 0
-                    || !system_buffer.is_empty()
-                    || !nt_io_abi::valid_lock_control_parameters(
-                        major,
-                        parameters.minor,
-                        stack_flags.bits(),
-                        parameters.byte_offset,
-                        parameters.length,
-                        parameters.key,
-                    )
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            _ if major == nt_io_abi::major::IRP_MJ_LOCK_CONTROL => {
-                return Err(NtStatus::INVALID_PARAMETER)
-            }
-            IoParameters::NotifyDirectory(parameters) => {
-                if major != nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL
-                    || input_len != 0
-                    || output_len != parameters.length
-                    || system_buffer.len() != parameters.length as usize
-                    || stack_flags.bits() & !crate::SL_WATCH_TREE != 0
-                    || !crate::valid_directory_notify_parameters(*parameters)
-                {
-                    return Err(NtStatus::INVALID_PARAMETER);
-                }
-            }
-            _ if major == nt_io_abi::major::IRP_MJ_DIRECTORY_CONTROL => {
-                return Err(NtStatus::INVALID_PARAMETER)
-            }
-            _ => {}
-        }
+        validate_external_parameter_layout(major, &params, stack_flags, input_len, output_len, system_buffer.len())?;
         if self.driver(driver_id).is_none() {
             return Err(NtStatus::INVALID_PARAMETER);
         }

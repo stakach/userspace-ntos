@@ -36,6 +36,7 @@ mod driver_host;
 mod driver_peer;
 mod ea;
 mod external_dispatch;
+pub mod detached_file_irp;
 mod fault;
 mod file;
 mod file_reference;
@@ -272,16 +273,22 @@ impl<P> IoManager<P> {
         self.drivers.get(id)
     }
     pub fn driver_mut(&mut self, id: DriverId) -> Option<&mut DriverRecord> {
+        if self.detached_irp_uses_driver(id) { return None; }
         self.drivers.get_mut(id)
     }
     pub fn remove_driver(&mut self, id: DriverId) -> Option<DriverRecord> {
-        if self.driver_has_device_references(id) {
+        if self.driver_has_device_references(id) || self.detached_irp_uses_driver(id) {
             return None;
         }
         self.drivers.remove(id)
     }
     pub fn driver_count(&self) -> usize {
         self.drivers.len()
+    }
+
+    fn detached_irp_uses_driver(&self, driver: DriverId) -> bool {
+        self.irps.iter().any(|(_, irp)| irp.detached_file_owner
+            && (irp.origin_driver_id == driver || irp.stack.iter().any(|stack| stack.driver_id == driver)))
     }
 
     /// Resolve a driver by its Object Manager `Driver` object id.
@@ -978,6 +985,11 @@ impl<P> IoManager<P> {
 
     /// Allocate an IRP record, assigning + returning its id.
     pub fn allocate_irp(&mut self, mut record: IrpRecord) -> Result<IrpId, NtStatus> {
+        if is_create_major(record.origin_major) && record.file_id.is_some()
+            && self.irps.iter().any(|(_, existing)| existing.file_id == record.file_id
+                && is_create_major(existing.origin_major)) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
         if record.origin_driver_id == DriverId::NULL {
             return Err(NtStatus::INVALID_PARAMETER);
         }
@@ -1178,6 +1190,9 @@ impl<P> IoManager<P> {
         self.irps.get_mut(id)
     }
     pub fn free_irp(&mut self, id: IrpId) -> Option<IrpRecord> {
+        if self.irp(id).is_some_and(|irp| irp.detached_file_owner) {
+            return None;
+        }
         let record = self.irps.remove(id)?;
         self.completed_irps.retain(|queued| *queued != id);
         if let Some(file_id) = record.file_id {

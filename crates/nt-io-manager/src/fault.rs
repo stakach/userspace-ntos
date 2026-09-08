@@ -20,7 +20,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// Fault a driver (spec §16.6): mark it faulted, fail its in-flight IRPs, and
     /// mark its devices delete-pending. Idempotent-safe (skip if already faulted).
     pub fn fault_driver(&mut self, driver: DriverId) -> usize {
-        match self.driver_mut(driver) {
+        match self.drivers.get_mut(driver) {
             Some(d) if !d.flags.contains(DriverFlags::FAULTED) => {
                 d.flags |= DriverFlags::FAULTED;
             }
