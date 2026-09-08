@@ -29062,7 +29062,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     unchanged 262 warnings in `.tmp/build-retained-registry-open-20260908.log`. No desktop acceptance
     is claimed; the strict native import frontier remains open.
 
-    B3 legacy registry lease removal tranche 116 (next):
+    B3 legacy registry lease removal tranche 116 (2026-09-08, complete):
 
     Replace the remaining runtime legacy OPEN/CLOSE consumer, active driver-service path resolution,
     with one CM-owned immutable snapshot. Resolve the actual mounted-hive active Services cell and
@@ -29070,6 +29070,49 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     service binding. This avoids creating temporary leases without weakening stable identity to a
     textual prefix test. Migrate lease test fixtures to the retained protocol and remove the old
     unacknowledged OPEN/CLOSE client methods and server branches; preserve non-acquiring RESOLVE.
+
+    Source review constraint: generic Configuration Manager writes can modify its compatibility
+    registry independently of the mounted SYSTEM hive and its generation. The new snapshot must
+    derive service values, Linkage/Export and matching Enum device instances from the actual mounted
+    hive, not attach a mounted generation to an unverified mutable mirror. Validate both missing and
+    extra mirror rows in tests; do not manufacture agreement by changing the mounted identity.
+
+    Implemented the atomic query in focused client/server active_driver_service modules. CM proves
+    the exact mounted candidate is an immediate child of the actual active Services cell, then
+    captures service metadata, matching Enum instances and their class Linkage/Export from that same
+    mounted hive. A bounded private projection reuses existing typed configuration policy without
+    exposing its temporary RegistryKeyIds or reading the mutable mirror. Disabled/non-driver/
+    incomplete service records fail before Enum traversal; depth and byte limits fail explicitly.
+    This preserves the narrower query_active API policy, not a claim that NT5 NtLoadDriver rejects
+    every registry path outside active Services.
+
+    Removed the legacy client OPEN/CLOSE methods, server branches, direct lease-bank close, and test
+    fixture use of the old protocol. Non-acquiring RESOLVE now has its own 16-byte CmHivePathRequest
+    and opcode name, with no dead operation or lease-token fields. Concurrent SnapshotPools require
+    CmIdentitySource directly; no optional local-counter fallback remains. The new query keeps
+    concurrent readers independent and binds transfers to their original path and service incarnation.
+
+    Focused validation passes 168 tests across the four config crates in
+    `.tmp/test-atomic-driver-service-query-20260908.log`; native release passes with unchanged 262
+    warnings in `.tmp/build-atomic-driver-service-query-20260908.log`. The 25-crate regression passes
+    2,695 tests in `.tmp/test-atomic-service-query-regression-20260908.log`. Independent review found no
+    introduced authority or framing blocker. This slice still uses the existing bounded immutable
+    snapshot transfer contract: it does not claim recovery of an unknown BEGIN token or a lost final
+    PULL/ABORT reply. Tranche 117 replaces that remaining transport lifetime, before desktop acceptance.
+
+    B3 retained CM snapshot ownership tranche 117 (next):
+
+    Introduce a caller-owned request identity before BEGIN, bound to the actual CM incarnation and
+    a persistent requester bank with reusable slots. Retain the exact immutable outcome until an
+    explicit ACK; random-access PULL must be idempotent and must not consume the final bytes. ACK must
+    also fence an abandoned request whose BEGIN outcome was never observed, so a delayed BEGIN cannot
+    acquire a new snapshot. Bound metadata and retained bytes separately, preserve contiguous slot
+    watermarks, and reject changed payloads or generation leaps without retiring another reader.
+    Client errors keep a non-clone attempt; native bounded maintenance owns failed cleanup without
+    late publication or IPC in timer drains. Start with the active-service dialect, remove its replaced
+    best-effort machinery, and reuse the core for the remaining CM snapshot families. Test lost BEGIN,
+    PULL and ACK, cancellation before BEGIN delivery, allocation failure, server restart, concurrent
+    readers and slot reuse before considering this lifetime closed.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

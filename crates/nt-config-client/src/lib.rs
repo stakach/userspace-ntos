@@ -10,6 +10,11 @@
 
 extern crate alloc;
 
+mod active_driver_service;
+
+#[cfg(test)]
+mod retained_test_keys;
+
 mod key_open;
 pub use key_open::{
     SystemHiveKeyOpenAttempt, SystemHiveKeyOpenAttempts, SystemHiveKeyOpenExchange,
@@ -32,13 +37,13 @@ use alloc::vec::Vec;
 use nt_config_abi::{
     device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
     driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
-    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_flags,
+    hive_key_transfer, hive_mount, hive_mutation_flags,
     hive_mutation_kind, hive_mutation_transfer, key_flags, launch_plan_kind, launch_plan_transfer,
     leased_hive_record_kind, network_plan_kind, opcode, pnp_query_kind, pnp_query_transfer,
     raw_value_query_transfer, raw_value_transfer, win32_service_plan_kind,
     win32_service_process_kind, CmDeviceActionRequest, CmDevicePropertyRequest,
     CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader, CmHiveCheckpointRequest,
-    CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest, CmHiveKeyRequest,
+    CmHiveExportHeader, CmHiveImportRequest, CmHivePathRequest, CmHiveKeyRequest,
     CmHiveMutationRecord, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
     CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueQueryRequest,
     CmRawValueRequest, CmRawValueTransferRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
@@ -1016,31 +1021,6 @@ fn utf16_bytes(s: &str) -> Vec<u8> {
     v
 }
 
-fn immediate_registry_child_name<'a>(path: &'a str, parent: &str) -> Option<&'a str> {
-    let path = path.strip_prefix('\\')?;
-    let parent = parent.strip_prefix('\\')?;
-    if path.is_empty()
-        || parent.is_empty()
-        || path.ends_with('\\')
-        || parent.ends_with('\\')
-        || path.contains("\\\\")
-        || parent.contains("\\\\")
-    {
-        return None;
-    }
-    let mut path_components = path.split('\\');
-    for parent_component in parent.split('\\') {
-        if !path_components
-            .next()?
-            .eq_ignore_ascii_case(parent_component)
-        {
-            return None;
-        }
-    }
-    let child = path_components.next()?;
-    (!child.is_empty() && path_components.next().is_none()).then_some(child)
-}
-
 fn append_hive_mutation_record(
     journal: &mut Vec<u8>,
     kind: u16,
@@ -1768,67 +1748,6 @@ impl<B: Backend> ConfigClient<B> {
         }
     }
 
-    /// Resolve a driver service only when `service_path` names an immediate child of the mounted
-    /// active `CurrentControlSet\Services` key. All leases are released before this returns.
-    pub fn query_active_driver_service_by_registry_path(
-        &mut self,
-        service_path: &str,
-    ) -> Result<ActiveDriverServiceBinding, i32> {
-        const ACTIVE_SERVICES_PATH: &str = r"\Registry\Machine\System\CurrentControlSet\Services";
-
-        let active_services = self.open_system_hive_key_with_path(ACTIVE_SERVICES_PATH)?;
-        let candidate = match self.open_system_hive_key_with_path(service_path) {
-            Ok(candidate) => candidate,
-            Err(status) => {
-                let _ = self.close_system_hive_key(active_services.lease);
-                return Err(status);
-            }
-        };
-        let generation = active_services.lease.opened_generation;
-        let validation = (|| {
-            if candidate.lease.opened_generation != generation {
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-            let service_name = immediate_registry_child_name(
-                &candidate.physical_path,
-                &active_services.physical_path,
-            )
-            .ok_or(STATUS_OBJECT_PATH_SYNTAX_BAD)?;
-            let binding = self.query_driver_service(service_name)?;
-            if !binding.service_name.eq_ignore_ascii_case(service_name) {
-                return Err(STATUS_REGISTRY_CORRUPT);
-            }
-            let information = self.query_leased_system_hive_key_information(candidate.lease)?;
-            if information.mount_generation != generation {
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-            if !information
-                .path
-                .eq_ignore_ascii_case(&candidate.physical_path)
-            {
-                return Err(STATUS_REGISTRY_CORRUPT);
-            }
-            Ok(ActiveDriverServiceBinding {
-                mount_generation: generation,
-                physical_path: candidate.physical_path.clone(),
-                binding,
-            })
-        })();
-
-        // Both identities must be released even when one close fails. A validation failure remains
-        // the primary error, while a successful validation also requires stable close generations.
-        let candidate_close = self.close_system_hive_key(candidate.lease);
-        let active_services_close = self.close_system_hive_key(active_services.lease);
-        let resolved = match validation {
-            Ok(resolved) => resolved,
-            Err(status) => return Err(status),
-        };
-        if candidate_close? != generation || active_services_close? != generation {
-            return Err(STATUS_DEVICE_NOT_READY);
-        }
-        Ok(resolved)
-    }
-
     /// Atomically publish one complete `nt-hive-core` SYSTEM image in the isolated
     /// Configuration Manager. No partial image becomes visible.
     pub fn import_system_hive(&mut self, image: &[u8]) -> Result<u64, i32> {
@@ -2218,12 +2137,6 @@ impl<B: Backend> ConfigClient<B> {
         self.abort_hive_checkpoint(prepared.transfer_token, prepared.mount_generation);
     }
 
-    /// Acquire one stable CM-owned key identity from the mounted SYSTEM hive.
-    pub fn open_system_hive_key(&mut self, path: &str) -> Result<SystemHiveKeyLease, i32> {
-        self.open_system_hive_key_with_path(path)
-            .map(|opened| opened.lease)
-    }
-
     /// Resolve `CurrentControlSet` through CM's mounted SYSTEM identity. The target itself may be
     /// absent, which lets native create operations select their durable physical path before the
     /// mutation is submitted.
@@ -2235,16 +2148,15 @@ impl<B: Backend> ConfigClient<B> {
         {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
-        let request_header = CmHiveKeyLeaseRequest {
+        let header_size = core::mem::size_of::<CmHivePathRequest>();
+        let request_header = CmHivePathRequest {
             abi_size: header_size as u16,
             abi_version: CM_ABI_VERSION,
-            operation: hive_key_lease_operation::RESOLVE,
             mount: hive_mount::SYSTEM,
+            _reserved: 0,
             path_offset: header_size as u32,
             path_len_bytes: u32::try_from(path_bytes.len())
                 .map_err(|_| STATUS_INVALID_PARAMETER)?,
-            lease_token: 0,
         };
         let mut request = Vec::new();
         request
@@ -2254,7 +2166,7 @@ impl<B: Backend> ConfigClient<B> {
         request.extend_from_slice(&path_bytes);
         let mut reply_path = [0u8; CM_MAX_HIVE_PATH_UNITS * 4];
         let response = self.backend.call(
-            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE,
+            opcode::CM_OP_RESOLVE_SYSTEM_HIVE_PATH,
             &request,
             &mut reply_path,
         );
@@ -2279,105 +2191,6 @@ impl<B: Backend> ConfigClient<B> {
             mount_generation: response.detail0,
             physical_path: String::from(physical_path),
         })
-    }
-
-    /// Acquire a stable CM-owned key identity and the physical path selected at open time.
-    pub fn open_system_hive_key_with_path(
-        &mut self,
-        path: &str,
-    ) -> Result<OpenedSystemHiveKey, i32> {
-        let path_bytes = utf16_bytes(path);
-        if path_bytes.is_empty()
-            || path_bytes.len() > CM_MAX_HIVE_PATH_UNITS * 2
-            || path.chars().any(|ch| ch == '\0')
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
-        let request_header = CmHiveKeyLeaseRequest {
-            abi_size: header_size as u16,
-            abi_version: CM_ABI_VERSION,
-            operation: hive_key_lease_operation::OPEN,
-            mount: hive_mount::SYSTEM,
-            path_offset: header_size as u32,
-            path_len_bytes: u32::try_from(path_bytes.len())
-                .map_err(|_| STATUS_INVALID_PARAMETER)?,
-            lease_token: 0,
-        };
-        let mut request = Vec::new();
-        request
-            .try_reserve_exact(header_size.saturating_add(path_bytes.len()))
-            .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        request.extend_from_slice(request_header.as_bytes());
-        request.extend_from_slice(&path_bytes);
-        let mut reply_path = [0u8; CM_MAX_HIVE_PATH_UNITS * 4];
-        let response = self.backend.call(
-            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE,
-            &request,
-            &mut reply_path,
-        );
-        if response.status != STATUS_SUCCESS {
-            return Err(response.status);
-        }
-        let path_len = response.information as usize;
-        if response.detail0 == 0
-            || response.detail1 == 0
-            || path_len == 0
-            || path_len > reply_path.len()
-        {
-            if response.detail0 != 0 && response.detail1 != 0 {
-                let _ = self.close_system_hive_key(SystemHiveKeyLease {
-                    token: response.detail1,
-                    opened_generation: response.detail0,
-                });
-            }
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let lease = SystemHiveKeyLease {
-            token: response.detail1,
-            opened_generation: response.detail0,
-        };
-        let Ok(physical_path) = core::str::from_utf8(&reply_path[..path_len]) else {
-            let _ = self.close_system_hive_key(lease);
-            return Err(STATUS_INVALID_PARAMETER);
-        };
-        if physical_path.chars().any(|ch| ch == '\0') {
-            let _ = self.close_system_hive_key(lease);
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        Ok(OpenedSystemHiveKey {
-            lease,
-            physical_path: String::from(physical_path),
-        })
-    }
-
-    /// Release exactly one CM-owned SYSTEM key identity.
-    pub fn close_system_hive_key(&mut self, lease: SystemHiveKeyLease) -> Result<u64, i32> {
-        if lease.token == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
-        let request = CmHiveKeyLeaseRequest {
-            abi_size: header_size as u16,
-            abi_version: CM_ABI_VERSION,
-            operation: hive_key_lease_operation::CLOSE,
-            mount: hive_mount::SYSTEM,
-            path_offset: 0,
-            path_len_bytes: 0,
-            lease_token: lease.token,
-        };
-        let response = self.backend.call(
-            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE,
-            request.as_bytes(),
-            &mut [],
-        );
-        if response.status != STATUS_SUCCESS {
-            return Err(response.status);
-        }
-        if response.detail0 == 0 || response.detail1 != lease.token {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        Ok(response.detail0)
     }
 
     /// Read a complete immutable snapshot through one CM-owned SYSTEM key identity.
@@ -3914,14 +3727,6 @@ mod tests {
         server: CmServer,
     }
 
-    struct TrackingDirect {
-        server: CmServer,
-        successful_opens: usize,
-        successful_closes: usize,
-        skew_second_open_generation: bool,
-        skew_first_close_generation: bool,
-    }
-
     /// Model the integrated service: dispatch into a whole page even when the final caller's slice
     /// is smaller, then copy completion bytes exactly as `RingChannel` does.
     struct Framed {
@@ -3945,54 +3750,12 @@ mod tests {
             self.server.dispatch(opcode, in_buf, out_buf)
         }
     }
-    impl Backend for TrackingDirect {
-        fn call(&mut self, opcode: u16, in_buf: &[u8], out_buf: &mut [u8]) -> CmReply {
-            let lease_operation = if opcode == opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE {
-                CmHiveKeyLeaseRequest::from_bytes(in_buf).map(|request| request.operation)
-            } else {
-                None
-            };
-            let mut reply = self.server.dispatch(opcode, in_buf, out_buf);
-            if reply.status == STATUS_SUCCESS {
-                match lease_operation {
-                    Some(hive_key_lease_operation::OPEN) => {
-                        self.successful_opens += 1;
-                        if self.skew_second_open_generation && self.successful_opens == 2 {
-                            reply.detail0 = reply.detail0.saturating_add(1);
-                        }
-                    }
-                    Some(hive_key_lease_operation::CLOSE) => {
-                        self.successful_closes += 1;
-                        if self.skew_first_close_generation && self.successful_closes == 1 {
-                            reply.detail0 = reply.detail0.saturating_add(1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            reply
-        }
-    }
-
     fn client() -> ConfigClient<Direct> {
         client_with_server(fresh_server())
     }
 
     fn client_with_server(server: CmServer) -> ConfigClient<Direct> {
         ConfigClient::new(Direct { server })
-    }
-
-    fn tracking_client(
-        skew_second_open_generation: bool,
-        skew_first_close_generation: bool,
-    ) -> ConfigClient<TrackingDirect> {
-        ConfigClient::new(TrackingDirect {
-            server: fresh_server(),
-            successful_opens: 0,
-            successful_closes: 0,
-            skew_second_open_generation,
-            skew_first_close_generation,
-        })
     }
 
     fn active_driver_service_identity_hive() -> Hive {
@@ -4112,9 +3875,7 @@ mod tests {
         let mut client = client();
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(1));
         assert_eq!(client.prepare_system_hive_checkpoint(1), Ok(None));
-        let root = client
-            .open_system_hive_key(r"\Registry\Machine\System")
-            .unwrap();
+        let root = retained_test_keys::open(&mut client, r"\Registry\Machine\System").lease;
         let exported_root = client.export_leased_system_hive(root).unwrap();
         assert_eq!(exported_root.mount_generation, 1);
         let decoded_root = decode_image(&exported_root.image).unwrap();
@@ -4126,7 +3887,7 @@ mod tests {
             .open_key(r"ControlSet002\Services\Stable")
             .is_some());
         assert_eq!(client.prepare_system_hive_checkpoint(1), Ok(None));
-        assert_eq!(client.close_system_hive_key(root), Ok(1));
+        retained_test_keys::close(&mut client, root).unwrap();
         let resolved_absent = client
             .resolve_system_hive_path(
                 r"\Registry\Machine\System\CurrentControlSet\Services\Absent\Child",
@@ -4148,11 +3909,8 @@ mod tests {
             client.resolve_system_hive_path(r"\Registry\Machine\Software\WrongHive"),
             Err(STATUS_INVALID_PARAMETER)
         );
-        let opened = client
-            .open_system_hive_key_with_path(
-                r"\Registry\Machine\System\CurrentControlSet\Services\Stable",
-            )
-            .unwrap();
+        let opened = retained_test_keys::open(&mut client,
+            r"\Registry\Machine\System\CurrentControlSet\Services\Stable");
         assert_eq!(
             opened.physical_path,
             r"\Registry\Machine\System\ControlSet001\Services\Stable"
@@ -4277,7 +4035,7 @@ mod tests {
             Some(2u32.to_le_bytes().as_slice())
         );
 
-        assert_eq!(client.close_system_hive_key(lease), Ok(2));
+        retained_test_keys::close(&mut client, lease).unwrap();
         assert_eq!(
             client.query_leased_system_hive_key(lease),
             Err(STATUS_INVALID_HANDLE)
@@ -4287,17 +4045,16 @@ mod tests {
             Err(STATUS_INVALID_HANDLE)
         );
 
-        let stale = client
-            .open_system_hive_key(r"\Registry\Machine\System\ControlSet002\Services\Stable")
-            .unwrap();
+        let stale = retained_test_keys::open(&mut client,
+            r"\Registry\Machine\System\ControlSet002\Services\Stable").lease;
         assert_eq!(client.import_system_hive(&encode_image(&hive)), Ok(3));
         assert_eq!(
             client.query_leased_system_hive_key(stale),
             Err(STATUS_INVALID_HANDLE)
         );
-        assert_eq!(client.close_system_hive_key(stale), Ok(3));
+        retained_test_keys::close(&mut client, stale).unwrap();
         assert_eq!(
-            client.close_system_hive_key(stale),
+            client.prepare_system_hive_key_close(stale),
             Err(STATUS_INVALID_HANDLE)
         );
     }
@@ -4949,7 +4706,7 @@ mod tests {
     fn active_driver_service_registry_path_requires_exact_active_physical_child() {
         const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034u32 as i32;
 
-        let mut client = tracking_client(false, false);
+        let mut client = client();
         assert_eq!(
             client.import_system_hive(&encode_image(&active_driver_service_identity_hive())),
             Ok(1)
@@ -4991,46 +4748,6 @@ mod tests {
             ),
             Err(STATUS_OBJECT_NAME_NOT_FOUND)
         );
-        assert_eq!(
-            client.backend.successful_opens,
-            client.backend.successful_closes
-        );
-    }
-
-    #[test]
-    fn active_driver_service_registry_path_fences_generation_and_closes_both_leases() {
-        let image = encode_image(&active_driver_service_identity_hive());
-        let service_path = r"\Registry\Machine\System\CurrentControlSet\Services\Stable";
-
-        let mut open_skew = tracking_client(true, false);
-        assert_eq!(open_skew.import_system_hive(&image), Ok(1));
-        assert_eq!(
-            open_skew.query_active_driver_service_by_registry_path(service_path),
-            Err(STATUS_DEVICE_NOT_READY)
-        );
-        assert_eq!(open_skew.backend.successful_opens, 2);
-        assert_eq!(open_skew.backend.successful_closes, 2);
-
-        let mut close_skew = tracking_client(false, true);
-        assert_eq!(close_skew.import_system_hive(&image), Ok(1));
-        assert_eq!(
-            close_skew.query_active_driver_service_by_registry_path(service_path),
-            Err(STATUS_DEVICE_NOT_READY)
-        );
-        assert_eq!(close_skew.backend.successful_opens, 2);
-        assert_eq!(close_skew.backend.successful_closes, 2);
-
-        let mut primary_error = tracking_client(false, true);
-        assert_eq!(primary_error.import_system_hive(&image), Ok(1));
-        assert_eq!(
-            primary_error.query_active_driver_service_by_registry_path(
-                r"\Registry\Machine\System\ControlSet001\Services\Stable",
-            ),
-            Err(STATUS_OBJECT_PATH_SYNTAX_BAD),
-            "a physical-identity validation error remains primary when close fencing also fails"
-        );
-        assert_eq!(primary_error.backend.successful_opens, 2);
-        assert_eq!(primary_error.backend.successful_closes, 2);
     }
 
     #[test]

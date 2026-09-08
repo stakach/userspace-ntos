@@ -1,3 +1,5 @@
+use crate::CmIdentitySource;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,20 +133,24 @@ impl<K> SnapshotBank<K> {
 /// An immutable transfer pool for protocols that permit concurrent readers.
 pub(crate) struct SnapshotPool<K> {
     snapshots: Vec<Snapshot<K>>,
-    tokens: TokenSequence,
     max_snapshots: usize,
     max_retained_bytes: usize,
     retained_bytes: usize,
+    identities: Rc<CmIdentitySource>,
 }
 
 impl<K> SnapshotPool<K> {
-    pub(crate) const fn with_limits(max_snapshots: usize, max_retained_bytes: usize) -> Self {
+    pub(crate) fn with_identity_source(
+        max_snapshots: usize,
+        max_retained_bytes: usize,
+        identities: Rc<CmIdentitySource>,
+    ) -> Self {
         Self {
             snapshots: Vec::new(),
-            tokens: TokenSequence::new(),
             max_snapshots,
             max_retained_bytes,
             retained_bytes: 0,
+            identities,
         }
     }
 
@@ -174,7 +180,7 @@ impl<K> SnapshotPool<K> {
             return None;
         }
         self.snapshots.try_reserve(1).ok()?;
-        let token = self.tokens.take()?;
+        let token = self.identities.take()?;
         self.snapshots.push(Snapshot {
             token,
             key,
@@ -233,7 +239,18 @@ impl<K> SnapshotPool<K> {
 #[cfg(test)]
 mod tests {
     use super::{SnapshotBank, SnapshotPool};
+    use crate::CmIdentitySource;
+    use alloc::rc::Rc;
     use alloc::vec;
+    use core::num::NonZeroU32;
+
+    fn pool<K>(count: usize, bytes: usize) -> SnapshotPool<K> {
+        SnapshotPool::with_identity_source(
+            count,
+            bytes,
+            Rc::new(CmIdentitySource::new(NonZeroU32::MIN)),
+        )
+    }
 
     #[test]
     fn single_flight_transfer_is_ordered_and_retires_on_completion() {
@@ -274,7 +291,7 @@ mod tests {
 
     #[test]
     fn pool_keeps_independent_snapshots_live() {
-        let mut pool = SnapshotPool::with_limits(2, usize::MAX);
+        let mut pool = pool(2, usize::MAX);
         let first = pool.begin(1, vec![1, 2], 1, &mut [0; 1]).unwrap();
         let second = pool.begin(2, vec![3, 4], 1, &mut [0; 1]).unwrap();
         let mut tail = [0];
@@ -287,7 +304,7 @@ mod tests {
 
     #[test]
     fn pool_rejects_excess_readers_without_invalidating_live_tokens() {
-        let mut pool = SnapshotPool::with_limits(2, usize::MAX);
+        let mut pool = pool(2, usize::MAX);
         let first = pool.begin(1, vec![1, 2], 1, &mut [0; 1]).unwrap();
         let second = pool.begin(2, vec![3, 4], 1, &mut [0; 1]).unwrap();
         assert!(pool.begin(3, vec![5, 6], 1, &mut [0; 1]).is_none());
@@ -306,7 +323,7 @@ mod tests {
     #[test]
     fn pool_reclaims_retained_byte_budget_on_completion_and_abort() {
         let retained = vec![1, 2].capacity();
-        let mut pool = SnapshotPool::with_limits(usize::MAX, retained);
+        let mut pool = pool(usize::MAX, retained);
         let first = pool.begin(1, vec![1, 2], 1, &mut [0; 1]).unwrap();
         assert!(pool.begin(2, vec![3, 4], 1, &mut [0; 1]).is_none());
         assert!(pool
@@ -320,9 +337,26 @@ mod tests {
 
     #[test]
     fn complete_first_chunk_does_not_consume_pool_capacity() {
-        let mut pool = SnapshotPool::with_limits(0, 0);
+        let mut pool = pool(0, 0);
         let complete = pool.begin(1, vec![1, 2], 2, &mut [0; 2]).unwrap();
         assert_eq!(complete.token, 0);
         assert_eq!(complete.written, 2);
+    }
+
+    #[test]
+    fn pools_share_incarnation_identity_and_fail_closed_after_sequence_exhaustion() {
+        let source = Rc::new(CmIdentitySource::new(NonZeroU32::MIN));
+        let mut first = SnapshotPool::with_identity_source(2, 32, source.clone());
+        let mut reconstructed = SnapshotPool::with_identity_source(2, 32, source.clone());
+        let a = first.begin(1, vec![1, 2], 1, &mut [0]).unwrap();
+        let b = reconstructed.begin(1, vec![3, 4], 1, &mut [0]).unwrap();
+        assert_ne!(a.token, b.token);
+        assert!(reconstructed
+            .pull(a.token, 1, 1, &mut [0], |_| true)
+            .is_none());
+        source.next_sequence.set(0);
+        assert!(first.begin(2, vec![5, 6], 1, &mut [0]).is_none());
+        assert!(first.pull(a.token, 1, 1, &mut [0], |_| true).is_some());
+        assert!(reconstructed.abort(b.token, |_| true));
     }
 }

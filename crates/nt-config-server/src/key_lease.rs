@@ -187,18 +187,6 @@ impl SystemKeyLeaseBank {
             .flatten()
     }
 
-    pub(crate) fn close(&mut self, token: u64) -> Result<(), SystemKeyLeaseError> {
-        let Some(slot) = self
-            .leases
-            .iter_mut()
-            .find(|slot| slot.as_ref().is_some_and(|lease| lease.token == token))
-        else {
-            return Err(SystemKeyLeaseError::Invalid);
-        };
-        *slot = None;
-        Ok(())
-    }
-
     pub(crate) fn invalidate(&mut self) {
         // The old cell is no longer readable, but its outstanding owner still needs exact close
         // evidence. Keep only that identity until an explicit close consumes it.
@@ -279,7 +267,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bank.get(first).unwrap().key, CellId(17));
-        bank.close(first).unwrap();
+        let receipt = bank.prepare_close(first).unwrap();
+        bank.acknowledge_close(receipt.bank, receipt.slot, receipt.generation).unwrap();
         assert!(bank.get(first).is_none());
 
         let second = bank
@@ -287,7 +276,7 @@ mod tests {
             .unwrap();
         assert_ne!(second, first);
         assert_eq!(bank.get(second).unwrap().key, CellId(23));
-        assert_eq!(bank.close(first), Err(SystemKeyLeaseError::Invalid));
+        assert_eq!(bank.prepare_close(first), Err(SystemKeyLeaseError::Invalid));
     }
 
     #[test]
@@ -309,7 +298,6 @@ mod tests {
         let receipt = bank.prepare_close(token).unwrap();
         assert!(bank.get(token).is_none());
         assert_eq!(bank.prepare_close(token), Ok(receipt));
-        assert_eq!(bank.close(token), Err(SystemKeyLeaseError::Invalid));
         assert_eq!(
             bank.acknowledge_close(receipt.bank, receipt.slot, receipt.generation),
             Ok(CloseAcknowledgement::Acknowledged)
@@ -378,18 +366,10 @@ mod tests {
     fn invalidated_live_owners_and_pending_receipts_survive_mount_replacement() {
         let mut bank = new_bank();
         let live = open(&mut bank);
-        let legacy = open(&mut bank);
         let closing = open(&mut bank);
         let closing = bank.prepare_close(closing).unwrap();
         bank.invalidate();
         assert!(bank.get(live).is_none());
-        assert!(bank.get(legacy).is_none());
-        assert_eq!(bank.close(legacy), Ok(()));
-        assert_eq!(bank.close(legacy), Err(SystemKeyLeaseError::Invalid));
-        assert_eq!(
-            bank.prepare_close(legacy),
-            Err(SystemKeyLeaseError::Invalid)
-        );
         let receipt = bank.prepare_close(live).unwrap();
         assert_eq!(bank.prepare_close(closing.lease_token), Ok(closing));
         bank.acknowledge_close(receipt.bank, receipt.slot, receipt.generation)

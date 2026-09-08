@@ -73,9 +73,8 @@ fn client_for_incarnation(incarnation: NonZeroU32) -> ConfigClient<Direct> {
 }
 
 fn open(client: &mut ConfigClient<Direct>) -> SystemHiveKeyLease {
-    client
-        .open_system_hive_key(r"\Registry\Machine\System\CurrentControlSet\Services\Device")
-        .unwrap()
+    crate::retained_test_keys::open(client,
+        r"\Registry\Machine\System\CurrentControlSet\Services\Device").lease
 }
 
 #[test]
@@ -150,20 +149,19 @@ fn every_malformed_success_preserves_retryable_server_receipt() {
 fn replaced_mount_retains_exact_close_authority_but_not_key_access() {
     let mut client = client();
     let lease = open(&mut client);
-    let legacy = open(&mut client);
+    let second = open(&mut client);
     client.import_system_hive(&image()).unwrap();
     assert_eq!(
         client.query_leased_system_hive_key_information(lease),
         Err(INVALID_HANDLE)
     );
     assert_eq!(
-        client.query_leased_system_hive_key_information(legacy),
+        client.query_leased_system_hive_key_information(second),
         Err(INVALID_HANDLE)
     );
-    assert_eq!(client.close_system_hive_key(legacy), Ok(2));
-    assert_eq!(client.close_system_hive_key(legacy), Err(INVALID_HANDLE));
+    crate::retained_test_keys::close(&mut client, second).unwrap();
     assert_eq!(
-        client.prepare_system_hive_key_close(legacy),
+        client.prepare_system_hive_key_close(second),
         Err(INVALID_HANDLE)
     );
     let receipt = client.prepare_system_hive_key_close(lease).unwrap();
@@ -203,7 +201,7 @@ fn foreign_server_lease_and_receipt_cannot_close_local_owners() {
 }
 
 #[test]
-fn legacy_close_and_zero_token_keep_their_original_contracts() {
+fn zero_token_is_rejected_without_transport_and_completed_close_is_not_reprepared() {
     let mut client = client();
     let before = client.backend.calls;
     assert_eq!(
@@ -215,7 +213,7 @@ fn legacy_close_and_zero_token_keep_their_original_contracts() {
     );
     assert_eq!(client.backend.calls, before);
     let lease = open(&mut client);
-    assert_eq!(client.close_system_hive_key(lease), Ok(1));
+    crate::retained_test_keys::close(&mut client, lease).unwrap();
     assert_eq!(
         client.prepare_system_hive_key_close(lease),
         Err(INVALID_HANDLE)

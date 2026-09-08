@@ -13,6 +13,7 @@ extern crate alloc;
 mod key_lease;
 mod key_close;
 mod key_open;
+mod active_driver_service;
 mod mutation;
 mod snapshot;
 
@@ -29,12 +30,12 @@ use snapshot::{SnapshotBank, SnapshotChunk, SnapshotPool};
 use nt_config_abi::{
     device_action_kind, device_action_service, device_action_transfer, device_property_transfer,
     driver_service_class, driver_service_transfer, hive_checkpoint_transfer, hive_import_transfer,
-    hive_key_lease_operation, hive_key_transfer, hive_mount, hive_mutation_transfer, key_flags,
+    hive_key_transfer, hive_mount, hive_mutation_transfer, key_flags,
     launch_plan_kind, launch_plan_transfer, leased_hive_record_kind, network_plan_kind, opcode,
     pnp_query_kind, pnp_query_transfer, raw_value_query_transfer, raw_value_transfer, read_utf16,
     win32_service_plan_kind, win32_service_process_kind, CmDeviceActionRequest,
     CmDevicePropertyRequest, CmDriverServiceRequest, CmEnumerateKeyRequest, CmHiveCheckpointHeader,
-    CmHiveCheckpointRequest, CmHiveExportHeader, CmHiveImportRequest, CmHiveKeyLeaseRequest,
+    CmHiveCheckpointRequest, CmHiveExportHeader, CmHiveImportRequest, CmHivePathRequest,
     CmHiveKeyRequest, CmHiveMutationRequest, CmKeyRequest, CmLaunchPlanRequest,
     CmLeasedHiveKeyRequest, CmLeasedHiveRecordRequest, CmPnpQueryRequest, CmRawValueQueryRequest,
     CmRawValueRequest, CmRawValueTransferRequest, CmReply, CmValueRequest, CM_ABI_VERSION,
@@ -974,6 +975,7 @@ pub struct CmServer {
     cm: ConfigManager,
     device_property_snapshots: SnapshotBank<DevicePropertySnapshotKey>,
     driver_service_snapshots: SnapshotBank<String>,
+    active_driver_service_snapshots: SnapshotPool<String>,
     system_hive: Option<MountedSystemHive>,
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
@@ -1030,6 +1032,11 @@ impl CmServer {
             cm,
             device_property_snapshots: SnapshotBank::new(),
             driver_service_snapshots: SnapshotBank::new(),
+            active_driver_service_snapshots: SnapshotPool::with_identity_source(
+                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
+                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+                identities.clone(),
+            ),
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
@@ -1039,13 +1046,15 @@ impl CmServer {
             next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(identities.clone()),
             system_key_opens: key_open::OpenJournal::new(),
-            hive_key_snapshots: SnapshotPool::with_limits(
+            hive_key_snapshots: SnapshotPool::with_identity_source(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
                 MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+                identities.clone(),
             ),
-            hive_export_snapshots: SnapshotPool::with_limits(
+            hive_export_snapshots: SnapshotPool::with_identity_source(
                 MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
                 MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
+                identities.clone(),
             ),
             driver_launch_plan_snapshots: SnapshotBank::new(),
             win32_service_launch_plan_snapshots: SnapshotBank::new(),
@@ -1053,12 +1062,13 @@ impl CmServer {
             network_adapter_plan_snapshots: SnapshotBank::new(),
             device_action_journal: DeviceActionJournal::new(),
             device_action_claim: None,
-            identities,
+            identities: identities.clone(),
             raw_value_uploads: Vec::new(),
             next_raw_value_upload_token: 1,
-            raw_value_snapshots: SnapshotPool::with_limits(
+            raw_value_snapshots: SnapshotPool::with_identity_source(
                 MAX_OUTSTANDING_RAW_VALUE_SNAPSHOTS,
                 MAX_RETAINED_RAW_VALUE_SNAPSHOT_BYTES,
+                identities,
             ),
         }
     }
@@ -1093,11 +1103,14 @@ impl CmServer {
             opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
+            opcode::CM_OP_QUERY_ACTIVE_DRIVER_SERVICE => {
+                self.op_query_active_driver_service(in_buf, out_buf)
+            }
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),
             opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE => self.op_checkpoint_system_hive(in_buf, out_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
-            opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE => self.op_system_hive_key_lease(in_buf, out_buf),
+            opcode::CM_OP_RESOLVE_SYSTEM_HIVE_PATH => self.op_resolve_system_hive_path(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_CLOSE => self.op_system_hive_key_close(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_OPEN => self.op_system_hive_key_open(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
@@ -2602,11 +2615,11 @@ impl CmServer {
         }
     }
 
-    fn op_system_hive_key_lease(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
-        let Some(req) = CmHiveKeyLeaseRequest::from_bytes(buf) else {
+    fn op_resolve_system_hive_path(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {
+        let Some(req) = CmHivePathRequest::from_bytes(buf) else {
             return reply(STATUS_INVALID_PARAMETER, 0);
         };
-        let header_size = core::mem::size_of::<CmHiveKeyLeaseRequest>();
+        let header_size = core::mem::size_of::<CmHivePathRequest>();
         if req.abi_size as usize != header_size
             || req.abi_version != CM_ABI_VERSION
             || req.mount != hive_mount::SYSTEM
@@ -2618,137 +2631,45 @@ impl CmServer {
             .as_ref()
             .map(|mounted| mounted.generation)
             .unwrap_or(0);
-        match req.operation {
-            hive_key_lease_operation::RESOLVE => {
-                if req.lease_token != 0
-                    || req.path_offset as usize != header_size
-                    || req.path_len_bytes == 0
-                    || req.path_len_bytes % 2 != 0
-                    || req.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
-                    || header_size.checked_add(req.path_len_bytes as usize) != Some(buf.len())
-                {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                }
-                let mut units = [0u16; CM_MAX_HIVE_PATH_UNITS];
-                let Some(unit_count) =
-                    read_utf16(buf, req.path_offset, req.path_len_bytes, &mut units)
-                else {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                };
-                let units = &units[..unit_count];
-                if units.contains(&0) {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                }
-                let Ok(path) = String::from_utf16(units) else {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                };
-                let Some(mounted) = self.system_hive.as_ref() else {
-                    return reply(STATUS_DEVICE_NOT_READY, 0);
-                };
-                let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set)
-                else {
-                    return reply(STATUS_INVALID_PARAMETER, mounted.generation);
-                };
-                let mut physical_path = String::from(SYSTEM_HIVE_PATH);
-                if !relative.is_empty() {
-                    physical_path.push('\\');
-                    physical_path.push_str(&relative);
-                }
-                let path_bytes = physical_path.as_bytes();
-                if path_bytes.len() > out_buf.len() {
-                    return reply_with_info(
-                        STATUS_BUFFER_TOO_SMALL,
-                        path_bytes.len() as u32,
-                        mounted.generation,
-                        0,
-                    );
-                }
-                out_buf[..path_bytes.len()].copy_from_slice(path_bytes);
-                reply_with_info(
-                    STATUS_SUCCESS,
-                    path_bytes.len() as u32,
-                    mounted.generation,
-                    0,
-                )
-            }
-            hive_key_lease_operation::OPEN => {
-                if req.lease_token != 0
-                    || req.path_offset as usize != header_size
-                    || req.path_len_bytes == 0
-                    || req.path_len_bytes % 2 != 0
-                    || req.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
-                    || header_size.checked_add(req.path_len_bytes as usize) != Some(buf.len())
-                {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                }
-                let mut units = [0u16; CM_MAX_HIVE_PATH_UNITS];
-                let Some(unit_count) =
-                    read_utf16(buf, req.path_offset, req.path_len_bytes, &mut units)
-                else {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                };
-                let units = &units[..unit_count];
-                if units.contains(&0) {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                }
-                let Ok(path) = String::from_utf16(units) else {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                };
-                let Some(mounted) = self.system_hive.as_ref() else {
-                    return reply(STATUS_DEVICE_NOT_READY, 0);
-                };
-                let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set)
-                else {
-                    return reply(STATUS_INVALID_PARAMETER, mounted.generation);
-                };
-                let Some(key) = mounted.hive.open_key(&relative) else {
-                    return reply(STATUS_OBJECT_NAME_NOT_FOUND, mounted.generation);
-                };
-                let mut physical_path = String::from(SYSTEM_HIVE_PATH);
-                if !relative.is_empty() {
-                    physical_path.push('\\');
-                    physical_path.push_str(&relative);
-                }
-                let path_bytes = physical_path.as_bytes();
-                let path_len = path_bytes.len();
-                if path_len > out_buf.len() {
-                    return reply_with_info(
-                        STATUS_BUFFER_TOO_SMALL,
-                        path_len as u32,
-                        mounted.generation,
-                        0,
-                    );
-                }
-                out_buf[..path_len].copy_from_slice(path_bytes);
-                match self.system_key_leases.open(key, physical_path) {
-                    Ok(token) => {
-                        reply_with_info(STATUS_SUCCESS, path_len as u32, mounted.generation, token)
-                    }
-                    Err(SystemKeyLeaseError::Exhausted) => {
-                        reply(STATUS_INSUFFICIENT_RESOURCES, mounted.generation)
-                    }
-                    Err(SystemKeyLeaseError::Invalid) => {
-                        reply(STATUS_INVALID_PARAMETER, mounted.generation)
-                    }
-                }
-            }
-            hive_key_lease_operation::CLOSE => {
-                if req.lease_token == 0
-                    || req.path_offset != 0
-                    || req.path_len_bytes != 0
-                    || buf.len() != header_size
-                {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                }
-                match self.system_key_leases.close(req.lease_token) {
-                    Ok(()) => {
-                        reply_with_info(STATUS_SUCCESS, 0, current_generation, req.lease_token)
-                    }
-                    Err(_) => reply(STATUS_INVALID_HANDLE, current_generation),
-                }
-            }
-            _ => reply(STATUS_INVALID_PARAMETER, current_generation),
+        if req._reserved != 0
+            || req.path_offset as usize != header_size
+            || req.path_len_bytes == 0
+            || req.path_len_bytes % 2 != 0
+            || req.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
+            || header_size.checked_add(req.path_len_bytes as usize) != Some(buf.len())
+        {
+            return reply(STATUS_INVALID_PARAMETER, current_generation);
         }
+        let mut units = [0u16; CM_MAX_HIVE_PATH_UNITS];
+        let Some(unit_count) = read_utf16(buf, req.path_offset, req.path_len_bytes, &mut units) else {
+            return reply(STATUS_INVALID_PARAMETER, current_generation);
+        };
+        let units = &units[..unit_count];
+        if units.contains(&0) {
+            return reply(STATUS_INVALID_PARAMETER, current_generation);
+        }
+        let Ok(path) = String::from_utf16(units) else {
+            return reply(STATUS_INVALID_PARAMETER, current_generation);
+        };
+        let Some(mounted) = self.system_hive.as_ref() else {
+            return reply(STATUS_DEVICE_NOT_READY, 0);
+        };
+        let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set) else {
+            return reply(STATUS_INVALID_PARAMETER, mounted.generation);
+        };
+        let mut physical_path = String::from(SYSTEM_HIVE_PATH);
+        if !relative.is_empty() {
+            physical_path.push('\\');
+            physical_path.push_str(&relative);
+        }
+        let path_bytes = physical_path.as_bytes();
+        if path_bytes.len() > out_buf.len() {
+            return reply_with_info(
+                STATUS_BUFFER_TOO_SMALL, path_bytes.len() as u32, mounted.generation, 0,
+            );
+        }
+        out_buf[..path_bytes.len()].copy_from_slice(path_bytes);
+        reply_with_info(STATUS_SUCCESS, path_bytes.len() as u32, mounted.generation, 0)
     }
 
     fn op_query_leased_hive_key(&mut self, buf: &[u8], out_buf: &mut [u8]) -> CmReply {

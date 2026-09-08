@@ -112,8 +112,8 @@ pub mod opcode {
     pub const CM_OP_QUERY_NETWORK_PLAN: u16 = 0x2155;
     /// Apply one generation-checked atomic mutation journal to the mounted SYSTEM hive.
     pub const CM_OP_MUTATE_SYSTEM_HIVE: u16 = 0x2156;
-    /// Acquire or release one opaque, stable key identity in the mounted SYSTEM hive.
-    pub const CM_OP_SYSTEM_HIVE_KEY_LEASE: u16 = 0x2157;
+    /// Resolve a mounted SYSTEM path without acquiring a key lease.
+    pub const CM_OP_RESOLVE_SYSTEM_HIVE_PATH: u16 = 0x2157;
     /// Return an immutable snapshot of a key addressed by an owned SYSTEM key lease.
     pub const CM_OP_QUERY_LEASED_HIVE_KEY: u16 = 0x2158;
     /// Return one bounded immutable key/value record addressed by an owned SYSTEM key lease.
@@ -128,6 +128,8 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_KEY_CLOSE: u16 = 0x215d;
     /// Query retained-OPEN authority, acquire/replay one exact open attempt, or acknowledge it.
     pub const CM_OP_SYSTEM_HIVE_KEY_OPEN: u16 = 0x215e;
+    /// Atomically resolve an active Services child and snapshot its mounted-hive binding.
+    pub const CM_OP_QUERY_ACTIVE_DRIVER_SERVICE: u16 = 0x215f;
 }
 
 pub mod hive_key_open_operation {
@@ -196,15 +198,6 @@ pub mod hive_key_transfer {
     pub const BEGIN: u16 = 1;
     pub const PULL: u16 = 2;
     pub const ABORT: u16 = 3;
-}
-
-/// Operation carried by [`CmHiveKeyLeaseRequest::operation`].
-pub mod hive_key_lease_operation {
-    pub const OPEN: u16 = 1;
-    pub const CLOSE: u16 = 2;
-    /// Resolve a SYSTEM namespace path to its physical control-set identity without opening it.
-    /// The path need not exist; the reply carries no lease token.
-    pub const RESOLVE: u16 = 3;
 }
 
 /// Record selector carried by [`CmLeasedHiveRecordRequest::record_kind`].
@@ -471,6 +464,28 @@ pub struct CmDriverServiceRequest {
     pub transfer_token: u64,
 }
 
+pub const CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_MAGIC: u32 = 0x5044_4d43;
+pub const CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 1;
+pub const CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 32;
+
+/// An immutable mounted-hive service binding selected by a complete registry path.
+/// Operations and chunk limits match [`driver_service_transfer`]. The reply payload contains
+/// magic/version/header-size, mount generation, UTF-8 path length, binding length, zero u64,
+/// then the physical path and an ordinary driver-service snapshot.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmActiveDriverServiceRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub _reserved: u16,
+    pub value_offset: u32,
+    pub chunk_capacity: u32,
+    pub path_offset: u32,
+    pub path_len_bytes: u32,
+    pub transfer_token: u64,
+}
+
 /// `import_hive`: a tokenized upload. BEGIN reserves `total_len_bytes`; PUSH carries one chunk at
 /// `chunk_offset` and appends it at `value_offset`; COMMIT atomically validates and publishes the
 /// complete image; ABORT releases the staged bytes.
@@ -503,19 +518,17 @@ pub struct CmHiveKeyRequest {
     pub transfer_token: u64,
 }
 
-/// `system_hive_key_lease`: OPEN resolves a full NT path to one stable hive cell and returns an
-/// opaque lease token. CLOSE releases exactly that token. Reply `detail0` is the mount generation
-/// and `detail1` is the lease token.
+/// Resolve a full SYSTEM namespace path without acquiring it. The path need not exist.
+/// Reply `detail0` is the mount generation, `detail1` is zero, and the payload is its UTF-8 path.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct CmHiveKeyLeaseRequest {
+pub struct CmHivePathRequest {
     pub abi_size: u16,
     pub abi_version: u16,
-    pub operation: u16,
     pub mount: u16,
+    pub _reserved: u16,
     pub path_offset: u32,
     pub path_len_bytes: u32,
-    pub lease_token: u64,
 }
 
 /// PREPARE carries only `lease_token`; ACKNOWLEDGE carries only the exact receipt identity.
@@ -780,9 +793,10 @@ wire!(CmRawValueTransferRequest);
 wire!(CmRawValueQueryRequest);
 wire!(CmDevicePropertyRequest);
 wire!(CmDriverServiceRequest);
+wire!(CmActiveDriverServiceRequest);
 wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
-wire!(CmHiveKeyLeaseRequest);
+wire!(CmHivePathRequest);
 wire!(CmHiveKeyCloseRequest);
 wire!(CmHiveKeyCloseReply);
 wire!(CmHiveKeyOpenRequest);
@@ -886,7 +900,7 @@ mod tests {
         assert_eq!(opcode::CM_OP_QUERY_WIN32_SERVICE_PLAN, 0x2153);
         assert_eq!(opcode::CM_OP_QUERY_PNP, 0x2154);
         assert_eq!(opcode::CM_OP_QUERY_NETWORK_PLAN, 0x2155);
-        assert_eq!(opcode::CM_OP_SYSTEM_HIVE_KEY_LEASE, 0x2157);
+        assert_eq!(opcode::CM_OP_RESOLVE_SYSTEM_HIVE_PATH, 0x2157);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_KEY, 0x2158);
         assert_eq!(opcode::CM_OP_QUERY_LEASED_HIVE_RECORD, 0x2159);
         assert_eq!(opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE, 0x215a);
@@ -894,7 +908,7 @@ mod tests {
         assert_eq!(CM_HIVE_KEY_RECORD_VERSION, 2);
         assert_eq!(core::mem::size_of::<CmHiveImportRequest>(), 32);
         assert_eq!(core::mem::size_of::<CmHiveKeyRequest>(), 32);
-        assert_eq!(core::mem::size_of::<CmHiveKeyLeaseRequest>(), 24);
+        assert_eq!(core::mem::size_of::<CmHivePathRequest>(), 16);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseRequest>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyCloseReply>(), 40);
         assert_eq!(core::mem::size_of::<CmHiveKeyOpenRequest>(), 48);
@@ -935,18 +949,17 @@ mod tests {
         };
         assert_eq!(CmHiveKeyRequest::from_bytes(query.as_bytes()), Some(query));
 
-        let lease = CmHiveKeyLeaseRequest {
-            abi_size: 24,
+        let path = CmHivePathRequest {
+            abi_size: 16,
             abi_version: CM_ABI_VERSION,
-            operation: hive_key_lease_operation::OPEN,
             mount: hive_mount::SYSTEM,
-            path_offset: 24,
+            _reserved: 0,
+            path_offset: 16,
             path_len_bytes: 0x1122_3344,
-            lease_token: 0x0102_0304_0506_0708,
         };
         assert_eq!(
-            CmHiveKeyLeaseRequest::from_bytes(lease.as_bytes()),
-            Some(lease)
+            CmHivePathRequest::from_bytes(path.as_bytes()),
+            Some(path)
         );
 
         let leased_query = CmLeasedHiveKeyRequest {
@@ -1014,7 +1027,6 @@ mod tests {
     fn mounted_hive_mutation_has_stable_wire_layout() {
         assert_eq!(opcode::CM_OP_MUTATE_SYSTEM_HIVE, 0x2156);
         assert_eq!(opcode::CM_OP_EXPORT_LEASED_HIVE, 0x215b);
-        assert_eq!(hive_key_lease_operation::RESOLVE, 3);
         assert_eq!(core::mem::size_of::<CmHiveExportHeader>(), 24);
         assert_eq!(CM_HIVE_EXPORT_HEADER_BYTES, 24);
         assert_eq!(core::mem::size_of::<CmHiveMutationRequest>(), 40);
@@ -1045,5 +1057,24 @@ mod tests {
                 0x13, 0x12, 0x11,
             ]
         );
+    }
+
+    #[test]
+    fn active_driver_service_path_has_stable_wire_layout() {
+        assert_eq!(opcode::CM_OP_QUERY_ACTIVE_DRIVER_SERVICE, 0x215f);
+        assert_eq!(core::mem::size_of::<CmActiveDriverServiceRequest>(), 32);
+        assert_eq!(CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, 32);
+        let request = CmActiveDriverServiceRequest {
+            abi_size: 32,
+            abi_version: CM_ABI_VERSION,
+            operation: driver_service_transfer::PULL,
+            value_offset: 512,
+            chunk_capacity: 4096,
+            path_offset: 32,
+            path_len_bytes: 120,
+            transfer_token: 0x1234_5678_9abc_def0,
+            ..CmActiveDriverServiceRequest::default()
+        };
+        assert_eq!(CmActiveDriverServiceRequest::from_bytes(request.as_bytes()), Some(request));
     }
 }
