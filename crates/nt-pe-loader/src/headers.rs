@@ -55,6 +55,10 @@ pub struct Headers {
     pub file_alignment: u32,
     pub size_of_image: u32,
     pub size_of_headers: u32,
+    /// Raw PE32+ SizeOfStackReserve; stack allocation policy is not applied by the parser.
+    pub size_of_stack_reserve: u64,
+    /// Raw PE32+ SizeOfStackCommit; may require validation against reserve by the caller.
+    pub size_of_stack_commit: u64,
     pub subsystem: u16,
     pub major_subsystem_version: u16,
     pub minor_subsystem_version: u16,
@@ -107,6 +111,8 @@ impl Headers {
         let size_of_image = u32_at(b, oh + 56)?;
         let size_of_headers = u32_at(b, oh + 60)?;
         let subsystem = u16_at(b, oh + 68)?;
+        let size_of_stack_reserve = u64_at(b, oh + 72)?;
+        let size_of_stack_commit = u64_at(b, oh + 80)?;
         // MajorSubsystemVersion@oh+48, MinorSubsystemVersion@oh+50 (optional-header offsets 0x30/0x32).
         let major_subsystem_version = u16_at(b, oh + 48)?;
         let minor_subsystem_version = u16_at(b, oh + 50)?;
@@ -143,6 +149,8 @@ impl Headers {
             file_alignment,
             size_of_image,
             size_of_headers,
+            size_of_stack_reserve,
+            size_of_stack_commit,
             subsystem,
             major_subsystem_version,
             minor_subsystem_version,

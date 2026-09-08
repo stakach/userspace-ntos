@@ -284,6 +284,16 @@ impl<'a> PeFile<'a> {
     pub fn size_of_image(&self) -> u32 {
         self.headers.size_of_image
     }
+    /// Raw PE32+ `SizeOfStackReserve`, read from the checked optional header.
+    /// No defaults, alignment, allocation limits or reserve/commit policy are applied.
+    pub fn size_of_stack_reserve(&self) -> u64 {
+        self.headers.size_of_stack_reserve
+    }
+    /// Raw PE32+ `SizeOfStackCommit`, read from the checked optional header.
+    /// This can be zero or exceed reserve; the stack allocator must validate its sizing policy.
+    pub fn size_of_stack_commit(&self) -> u64 {
+        self.headers.size_of_stack_commit
+    }
     /// The entry-point RVA (`DriverEntry`).
     pub fn entry_point_rva(&self) -> u32 {
         self.headers.entry_point_rva

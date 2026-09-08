@@ -84,6 +84,40 @@ pub fn write_kernel_buffer(
     Ok(())
 }
 
+/// Capture user bytes into a kernel buffer through exact page-contained reads. Validate the whole
+/// source range before the first read; an empty output touches no address. Return the backend's
+/// exact error without retrying through another alias. Completed chunks remain in `output` on a
+/// later failure, and the failing callback may have changed its own chunk: callers must discard
+/// the partial buffer on any error, never interpret it as a complete captured input.
+pub fn read_kernel_buffer(
+    address: u64,
+    output: &mut [u8],
+    user_limit: u64,
+    mut read_page: impl FnMut(u64, &mut [u8]) -> Result<(), u32>,
+) -> Result<(), u32> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    address
+        .checked_add(output.len() as u64)
+        .filter(|end| *end <= user_limit)
+        .ok_or(STATUS_ACCESS_VIOLATION)?;
+    let chunks = crate::page_chunks(address, output.len()).ok_or(STATUS_ACCESS_VIOLATION)?;
+    let mut copied = 0;
+    for chunk in chunks {
+        read_page(
+            address + copied as u64,
+            &mut output[copied..copied + chunk.length],
+        )?;
+        copied += chunk.length;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "copy_read_kernel_buffer_tests.rs"]
+mod read_kernel_buffer_tests;
+
 #[cfg(test)]
 #[path = "copy_kernel_buffer_tests.rs"]
 mod kernel_buffer_tests;

@@ -105,6 +105,62 @@ fn text_section(va: u32, data: Vec<u8>) -> Sec {
 const BASE: u64 = 0x1_4000_0000;
 
 #[test]
+fn stack_sizes_report_exact_pe32_plus_fields_without_sizing_policy() {
+    for (reserve, commit) in [
+        (0x10_0000, 0x1000),
+        (0x1234_5678_9abc_def0, 0x0102_0304_0506_0708),
+        (0, 0),
+        (0, 0x1000),
+        (0x1000, 0x2000),
+        (0x1001, 0x123),
+        (u64::MAX, u64::MAX),
+    ] {
+        let mut bytes = build_pe(BASE, 0, 0x1000, &[], &[]);
+        put_u64(&mut bytes, OPT_OFF + 72, reserve);
+        put_u64(&mut bytes, OPT_OFF + 80, commit);
+        // Adjacent heap-size fields must not be confused with the stack sizes.
+        put_u64(&mut bytes, OPT_OFF + 88, 0xaabb_ccdd_eeff_0011);
+        put_u64(&mut bytes, OPT_OFF + 96, 0x1122_3344_5566_7788);
+        let pe = PeFile::parse(&bytes).unwrap();
+        assert_eq!(pe.size_of_stack_reserve(), reserve);
+        assert_eq!(pe.size_of_stack_commit(), commit);
+        assert_eq!(pe.headers().size_of_stack_reserve, reserve);
+        assert_eq!(pe.headers().size_of_stack_commit, commit);
+    }
+}
+
+#[test]
+fn stack_fields_require_a_complete_declared_optional_header() {
+    let mut bytes = build_pe(BASE, 0, 0x1000, &[], &[]);
+    put_u64(&mut bytes, OPT_OFF + 72, 0x10_0000);
+    put_u64(&mut bytes, OPT_OFF + 80, 0x1000);
+    // The fixed PE32+ header remains mandatory even when the stack fields themselves fit.
+    for declared in [0, 72, 79, 80, 87, 88, 111] {
+        put_u16(&mut bytes, NT_OFF + 20, declared);
+        assert!(matches!(PeFile::parse(&bytes), Err(PeError::Truncated)));
+    }
+    put_u16(&mut bytes, NT_OFF + 20, 112);
+    put_u32(&mut bytes, OPT_OFF + 108, 0);
+    for available in [72, 79, 80, 87, 88, 111] {
+        assert!(matches!(
+            PeFile::parse(&bytes[..OPT_OFF + available]),
+            Err(PeError::Truncated)
+        ));
+    }
+    let pe = PeFile::parse(&bytes[..OPT_OFF + 112]).unwrap();
+    assert_eq!(
+        (pe.size_of_stack_reserve(), pe.size_of_stack_commit()),
+        (0x10_0000, 0x1000)
+    );
+    // A larger declared header may not be silently shortened to the available fixed fields.
+    put_u16(&mut bytes, NT_OFF + 20, 240);
+    assert!(matches!(
+        PeFile::parse(&bytes[..OPT_OFF + 112]),
+        Err(PeError::Truncated)
+    ));
+}
+
+#[test]
 fn minimal_pe_parses_and_maps() {
     let pe_bytes = build_pe(
         BASE,

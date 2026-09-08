@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod stack_vad;
+
 pub const CONTEXT_RCX_OFFSET: u64 = 0x80;
 pub const CONTEXT_RDX_OFFSET: u64 = 0x88;
 pub const CONTEXT_RAX_OFFSET: u64 = 0x78;
@@ -18,6 +20,9 @@ pub const CONTEXT_R14_OFFSET: u64 = 0xe8;
 pub const CONTEXT_R15_OFFSET: u64 = 0xf0;
 pub const CONTEXT_RIP_OFFSET: u64 = 0xf8;
 pub const AMD64_CONTEXT_SIZE: usize = 0x4d0;
+pub const AMD64_CONTEXT_ALIGNMENT: u64 = 16;
+pub const INITIAL_TEB64_SIZE: usize = 40;
+pub const INITIAL_TEB64_ALIGNMENT: u64 = 4;
 pub const USER_PAGE_SIZE: u64 = 0x1000;
 
 pub const CONTEXT_P1_HOME_OFFSET: u64 = 0x00;
@@ -72,6 +77,47 @@ const AMD64_DR7_SUPPORTED_MASK: u64 = AMD64_DR7_ENABLE_MASK
     | AMD64_DR7_SLOT_CONTROL_MASK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureError {
+    InvalidAddress,
+    ReadFailed(u32),
+    Misaligned,
+    UnsupportedOldStack,
+}
+
+impl CaptureError {
+    pub const fn status(self) -> u32 {
+        match self {
+            Self::InvalidAddress => 0xc000_0005,
+            Self::ReadFailed(status) => status,
+            Self::Misaligned => 0x8000_0002,
+            Self::UnsupportedOldStack => 0xc000_00bb,
+        }
+    }
+}
+
+fn capture_bytes<const N: usize>(
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), u32>,
+    address: u64,
+    alignment: u64,
+) -> Result<[u8; N], CaptureError> {
+    if address == 0 || address.checked_add(N as u64).is_none() {
+        return Err(CaptureError::InvalidAddress);
+    }
+    if address % alignment != 0 {
+        return Err(CaptureError::Misaligned);
+    }
+    let mut bytes = [0; N];
+    read(address, &mut bytes).map_err(CaptureError::ReadFailed)?;
+    Ok(bytes)
+}
+
+fn captured_u64(bytes: &[u8], offset: u64) -> u64 {
+    let offset = offset as usize;
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// Four-register startup projection, not a full native AMD64 context implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Amd64ThreadContext {
     pub rip: u64,
     pub rsp: u64,
@@ -80,13 +126,22 @@ pub struct Amd64ThreadContext {
 }
 
 impl Amd64ThreadContext {
-    pub fn read(mut read_u64: impl FnMut(u64) -> u64, context_va: u64) -> Self {
-        Self {
-            rip: read_u64(context_va + CONTEXT_RIP_OFFSET),
-            rsp: read_u64(context_va + CONTEXT_RSP_OFFSET),
-            rcx: read_u64(context_va + CONTEXT_RCX_OFFSET),
-            rdx: read_u64(context_va + CONTEXT_RDX_OFFSET),
-        }
+    /// Capture the complete AMD64_CONTEXT_SIZE-byte structure in one read before projecting
+    /// RIP/RSP/RCX/RDX. The reader must return Ok only after filling the entire buffer; an error
+    /// preserves the reader's exact status and never exposes a partial projection.
+    /// Capture validates the pointer span and native 16-byte alignment, not context flags,
+    /// execution policy or other registers.
+    pub fn capture(
+        read: impl FnMut(u64, &mut [u8]) -> Result<(), u32>,
+        context_va: u64,
+    ) -> Result<Self, CaptureError> {
+        let bytes = capture_bytes::<AMD64_CONTEXT_SIZE>(read, context_va, AMD64_CONTEXT_ALIGNMENT)?;
+        Ok(Self {
+            rip: captured_u64(&bytes, CONTEXT_RIP_OFFSET),
+            rsp: captured_u64(&bytes, CONTEXT_RSP_OFFSET),
+            rcx: captured_u64(&bytes, CONTEXT_RCX_OFFSET),
+            rdx: captured_u64(&bytes, CONTEXT_RDX_OFFSET),
+        })
     }
 
     pub fn call_trampoline(self) -> [u8; CALL_TRAMPOLINE_LEN] {
@@ -443,14 +498,26 @@ pub fn next_stack_growth_page(
 }
 
 impl InitialTeb64 {
-    pub fn read(mut read_u64: impl FnMut(u64) -> u64, initial_teb_va: u64) -> Self {
-        Self {
-            stack_base: read_u64(initial_teb_va + INITIAL_TEB_STACK_BASE_OFFSET),
-            stack_limit: read_u64(initial_teb_va + INITIAL_TEB_STACK_LIMIT_OFFSET),
-            allocated_stack_base: read_u64(
-                initial_teb_va + INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET,
-            ),
+    /// Capture the 40-byte ReactOS-shaped INITIAL_TEB in one read with native 4-byte alignment.
+    /// The reader must return Ok only after filling the entire buffer; errors preserve its exact
+    /// status and never expose a partial projection. Only the modern
+    /// three-field stack projection is supported: either nonzero OldInitialTeb field is rejected.
+    /// Stack geometry is deliberately not validated here; old-stack ABI support remains separate.
+    pub fn capture(
+        read: impl FnMut(u64, &mut [u8]) -> Result<(), u32>,
+        initial_teb_va: u64,
+    ) -> Result<Self, CaptureError> {
+        let bytes = capture_bytes::<INITIAL_TEB64_SIZE>(
+            read, initial_teb_va, INITIAL_TEB64_ALIGNMENT,
+        )?;
+        if captured_u64(&bytes, 0) != 0 || captured_u64(&bytes, 8) != 0 {
+            return Err(CaptureError::UnsupportedOldStack);
         }
+        Ok(Self {
+            stack_base: captured_u64(&bytes, INITIAL_TEB_STACK_BASE_OFFSET),
+            stack_limit: captured_u64(&bytes, INITIAL_TEB_STACK_LIMIT_OFFSET),
+            allocated_stack_base: captured_u64(&bytes, INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET),
+        })
     }
 }
 
@@ -460,16 +527,18 @@ mod tests {
 
     #[test]
     fn decodes_reactos_amd64_context_layout() {
-        let context = Amd64ThreadContext::read(
-            |address| match address - 0x1000 {
-                CONTEXT_RCX_OFFSET => 0x1111,
-                CONTEXT_RDX_OFFSET => 0x2222,
-                CONTEXT_RSP_OFFSET => 0x3333,
-                CONTEXT_RIP_OFFSET => 0x4444,
-                _ => 0,
+        let context = Amd64ThreadContext::capture(
+            |address, bytes| {
+                assert_eq!(address, 0x1000);
+                assert_eq!(bytes.len(), AMD64_CONTEXT_SIZE);
+                put_u64(bytes, CONTEXT_RCX_OFFSET as usize, 0x1111);
+                put_u64(bytes, CONTEXT_RDX_OFFSET as usize, 0x2222);
+                put_u64(bytes, CONTEXT_RSP_OFFSET as usize, 0x3333);
+                put_u64(bytes, CONTEXT_RIP_OFFSET as usize, 0x4444);
+                Ok(())
             },
             0x1000,
-        );
+        ).unwrap();
         assert_eq!(
             context,
             Amd64ThreadContext {
@@ -514,13 +583,14 @@ mod tests {
             u32::from_le_bytes(bytes[0x44..0x48].try_into().unwrap()),
             0x200
         );
-        let decoded = Amd64ThreadContext::read(
-            |address| {
-                let at = address as usize;
-                u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+        let decoded = Amd64ThreadContext::capture(
+            |address, output| {
+                assert_eq!(address, 0x1000);
+                output.copy_from_slice(&bytes);
+                Ok(())
             },
-            0,
-        );
+            0x1000,
+        ).unwrap();
         assert_eq!(decoded.rip, 0x1234_5678);
         assert_eq!(decoded.rcx, 0xfeed_beef);
         assert_eq!(decoded.rsp, 0x7000_ffc8);
@@ -764,15 +834,17 @@ mod tests {
 
     #[test]
     fn decodes_initial_teb_stack_bounds() {
-        let teb = InitialTeb64::read(
-            |address| match address - 0x2000 {
-                INITIAL_TEB_STACK_BASE_OFFSET => 0x9000,
-                INITIAL_TEB_STACK_LIMIT_OFFSET => 0x8000,
-                INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET => 0x7000,
-                _ => 0,
+        let teb = InitialTeb64::capture(
+            |address, bytes| {
+                assert_eq!(address, 0x2000);
+                assert_eq!(bytes.len(), INITIAL_TEB64_SIZE);
+                put_u64(bytes, INITIAL_TEB_STACK_BASE_OFFSET as usize, 0x9000);
+                put_u64(bytes, INITIAL_TEB_STACK_LIMIT_OFFSET as usize, 0x8000);
+                put_u64(bytes, INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET as usize, 0x7000);
+                Ok(())
             },
             0x2000,
-        );
+        ).unwrap();
         assert_eq!(teb.stack_base, 0x9000);
         assert_eq!(teb.stack_limit, 0x8000);
         assert_eq!(teb.allocated_stack_base, 0x7000);
@@ -799,3 +871,6 @@ mod tests {
         assert_eq!(next_stack_growth_page(1, 0x700f_e000, 0x700f_d123), None);
     }
 }
+
+#[cfg(test)]
+mod capture_tests;

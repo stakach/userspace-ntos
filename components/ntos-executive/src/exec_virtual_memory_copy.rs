@@ -182,6 +182,21 @@ impl ExecNtHandler {
         )
     }
 
+    pub(super) unsafe fn process_memory_read_status(
+        &mut self,
+        pi: usize,
+        address: u64,
+        output: &mut [u8],
+    ) -> Result<(), u32> {
+        hosted_thread_memory_access(pi as u64, address, output.len() as u64)?;
+        nt_address_space::copy::read_kernel_buffer(
+            address,
+            output,
+            USER_ADDRESS_LIMIT,
+            |va, bytes| self.copy_read_page(pi, va, bytes),
+        )
+    }
+
     pub(crate) unsafe fn prepare_mapped_section_alias(
         &mut self,
         pi: usize,

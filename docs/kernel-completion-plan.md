@@ -293,32 +293,18 @@ desktop proofs are historical baselines, not acceptance of the current provider 
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
-- [~] Close unpublished-spawn cleanup and handler-owned handoff lifetime gaps before treating runtime
-  emptiness as a complete execution-quiescence proof. Native hosted-thread construction now retains
-  its partial memory, empty slots, raw/minted CNodes, optional real TCB and original process/pool/window
-  holds in the pre-reserved runtime row. Thread endpoint copies belong to the CNode. Exact registry
-  coverage and full external alias state are now captured without transferring ownership. Checked
-  root-slot publication is available for retained SC cleanup and alias/prefetch retirement, including
-  a strict zero-retype-accounting path for copied/failed slots. Failed-memory-slot ownership now
-  moves into the sealed actor independently of immutable coverage. External aliases retain distinct
-  deletion/recycle phases. Win32k attachment, prefetch and provider-bank journals now claim their
-  exact pending attempt after joint conflict validation; direct detach, attachment switches,
-  process-wide prefetch retirement and provider-bank teardown cannot bypass them. Known copied
-  temporary aliases must be quiescent before reconciliation. Complete remaining stale-reference
-  exclusions and ownership handoffs, and
-  connect the checked native frame publication primitive
-  before transferring registry ownership or driving the sealed retirement actor. Failed SC
-  attachment now retains its own unbound object/slot independently of the failed TCB. TEB mirror/source
-  inventory transfers explicitly to registry ownership on publication.
-  The exact-ticket handoff precedes fallible reconciliation and public abort. The constructor no
-  longer invokes the destructive legacy release chain. Connect the checked thread retry backend
-  and failed-memory-slot primitive. Checked frame free-list publication now serves retained section
-  and registry cleanup; connect it through the complete thread backend before native retirement.
-  Close remaining non-ingress routing
-  bypasses and retain complete external-alias journals, then wire registered-resume
-  failure with once-only caller cancellation and persistent refault/native-copy exclusion. Registry handoff must
-  follow complete journal retention and exclusion publication. Then cover other launch families
-  and handler-owned handoffs; validate retained cleanup with live failures.
+- [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
+  mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
+  registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
+  construction now retains distinct complete registration provenance. Ordinary teardown still needs
+  native retained GUI EXIT dispatch, main transport ownership, and the NT5 opt-in user-stack release
+  contract before replacing its legacy destructor. Validate those boundaries with live failures;
+  host tests and a successful build are not runtime acceptance.
+- [~] Correct thread startup and stack semantics. Checked startup capture and host stack-VAD
+  planning are implemented. Preserve full caller context and existing stack through additional and
+  first-thread creation; remove fixed-stack substitution, old first-thread PI-bit tracking and both
+  adjacent-page growth branches at their proper cutovers. Implement guarded VAD growth with exact
+  accounting, TEB publication, retained failure state and genuine user exception delivery.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
   cleanup is incomplete; retain private COW backing and exact failed capabilities.
 - [ ] Bind parsed-image caches, every SEC_IMAGE section reference, mapped view, and process image
@@ -30193,6 +30179,60 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and collision-free user-stack ownership together; do not hide these gaps by reserving the old
     overlapping range or treating the caller's stack metadata as irrelevant. The geometry-only
     guard-growth work uses caller-supplied layouts and does not move ntdll sizing policy into Mm.
+
+    B3 stack/startup boundary tranche 145 (2026-09-09, accepted host/native admission slice): add a geometry-only
+    stack VAD planner, with caller-owned before/candidate scratch maps and a compact borrowed
+    publication plan. Initial reservation commits only the supplied suffix and actual guard.
+    Guard growth consumes the old guard, charges only new commitment, and handles NT5's terminal
+    emergency page, disabled extension and commitment-limited overflow ordering. No frame,
+    accounting, TEB or durable retry ownership is implied by a validated map plan. PE32+ parsing
+    now exposes checked raw 64-bit stack reserve/commit fields without adding sizing policy to Mm.
+
+    Native NtCreateThread now captures required startup structures before routing/allocation,
+    replacing the infallible per-field readers and duplicate reads. Capture uses the existing
+    access-checked, fault-aware native copy backend, not raw PE or mirror fallback. Preserve native
+    read/probe failures and enforce AMD64 input/output alignment. The caller handle and optional
+    ClientId are probed before resource effects. All additional-thread routes consume the captured
+    projection; the CSR route also records its caller's stack metadata. The first foreign-thread
+    route now enforces PROCESS_CREATE_THREAD and target liveness as well. These are admission fixes,
+    not a claim that queued output publication or first-thread activation is already atomic.
+
+    Review adjustment: the four original main stack pages remain the actual lifelong user stack;
+    our LdrpInitialize returns to the fixed trampoline instead of making the old comments' claimed
+    NtContinue transfer. Do not classify those pages as disposable bootstrap memory yet. Generic
+    additional/remote startup also still rewrites the caller's RSP and INITIAL_TEB to its fixed
+    mechanism stack. Preserve real captured stack/context through those requests, then split
+    mechanism-stack ownership from the caller's existing private VAD without charging it again.
+    NtCreateThreadEx's explicitly limited kernel-created stack route remains a separate gap.
+
+    Native guard cutover must replace both the Winlogon-specific and generic adjacent-page growth
+    branches together. Retain current geometry under exact thread/process lifetime; validate/adopt
+    additional threads' existing VADs rather than recreating them. Main stacks need collision-free
+    VAD admission and actual bootstrap page-table ownership below SMSS_ALLOC_VA. Complete PT and
+    working-set preparation before preparing stack commitment, since PT allocation changes charge
+    generations. A new guard may be committed demand-zero without a resident frame, but no existing
+    accessible alias may survive there. Retain old-guard mapping/TEB publication failures and the
+    original fault reply through checked completion; do not keep whole scratch maps over reentry.
+    Implement genuine user exception delivery for non-stack guard violations and stack overflow.
+    Full AMD64 context restoration and the NT5 OldInitialTeb variant remain explicit gaps, not
+    supported inputs that may be silently projected away. No fresh NT desktop proof is claimed.
+
+    Stack teardown policy correction from NT5 ps/psdelete.c:1277 and rtl/rtlexec.c:1485: user-stack
+    VAD release is not automatic thread-resource cleanup. RtlExitUserThread sets the real TEB's
+    FreeStackOnTermination flag; PspExitThread releases the live DeallocationStack only when that
+    flag is set and the thread is not a failed-creation DeadThread. A bare NtTerminateThread must
+    not infer release authority from INITIAL_TEB or recorded growth bounds. Capture and retain
+    this explicit request before TEB destruction. No opt-in means the caller's VAD and commitment
+    remain process-owned. The tranche 143 range/charge journals enforce mechanism safety, not this
+    missing policy authorization. Require it at admission, and remove the unconditional native
+    release_hosted_thread_user_stack_vad call. User-mode cleanup of a failed RtlCreateUserThread's
+    own allocation is separate and must not be duplicated by constructor rollback.
+
+    Serialized validation passes 1,315 unit tests, 71 integration tests and 11 compile-fail checks
+    in .tmp/test-stack-startup-capture-final-20260909.log. Native release build passes in
+    .tmp/build-stack-startup-capture-final-20260909.log (291 warnings). The debugger create-thread
+    fixture now supplies initialized, aligned CONTEXT/INITIAL_TEB records instead of a null stack
+    pointer. It has build coverage only; no QEMU or desktop acceptance was performed in this slice.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

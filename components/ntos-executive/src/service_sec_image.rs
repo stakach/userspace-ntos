@@ -21310,6 +21310,7 @@ pub(crate) unsafe fn service_sec_image(
             const A_CID_OUT: u64 = STACK_BASE + 0x408;
             const A_CALLER_SP: u64 = STACK_BASE + 0x420; // the "client stack" NtCreateThread reads
             const A_CONTEXT: u64 = STACK_BASE + 0x500; // the caller's CONTEXT record
+            const A_INITIAL_TEB: u64 = STACK_BASE + 0xa00;
                                                        // Executive scratch inside the SAME proven-resident 2 MiB page table the other post-loop
                                                        // self-tests use (SMSS_SCRATCH_BASE + 3000*0x1000, PT index 5).
             let write_scratch = SMSS_SCRATCH_BASE + 3020 * 0x1000;
@@ -21599,19 +21600,25 @@ pub(crate) unsafe fn service_sec_image(
                     // stack-resident arguments (ClientId / ThreadContext / InitialTeb /
                     // CreateSuspended) in CLIENT memory and stage the caller stack pointer the
                     // handler reads them through, then issue SSN 55 with the TARGET's handle.
-                    let ctx_ok =
-                        img_spawn::smss_copyout(
-                            A_CONTEXT + nt_thread_start::CONTEXT_RIP_OFFSET,
-                            &selftests::DBGK_BREAKIN_CODE_VA.to_le_bytes(),
-                        ) && img_spawn::smss_copyout(
-                            A_CONTEXT + nt_thread_start::CONTEXT_RCX_OFFSET,
-                            &selftests::DBGK_BREAKIN_PARAM.to_le_bytes(),
-                        ) && img_spawn::smss_copyout(A_CALLER_SP + 0x28, &A_CID_OUT.to_le_bytes())
+                    let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
+                    nt_thread_start::initialize_amd64_user_context(
+                        &mut context,
+                        selftests::DBGK_BREAKIN_CODE_VA,
+                        selftests::DBGK_BREAKIN_PARAM,
+                        tp_worker_stack_top(0),
+                    );
+                    let mut initial_teb = [0u8; nt_thread_start::INITIAL_TEB64_SIZE];
+                    initial_teb[0x10..0x18].copy_from_slice(&tp_worker_stack_top(0).to_le_bytes());
+                    initial_teb[0x18..0x20].copy_from_slice(&tp_worker_stack_base(0).to_le_bytes());
+                    initial_teb[0x20..0x28].copy_from_slice(&tp_worker_stack_base(0).to_le_bytes());
+                    let ctx_ok = img_spawn::smss_copyout(A_CONTEXT, &context)
+                        && img_spawn::smss_copyout(A_INITIAL_TEB, &initial_teb)
+                        && img_spawn::smss_copyout(A_CALLER_SP + 0x28, &A_CID_OUT.to_le_bytes())
                             && img_spawn::smss_copyout(
                                 A_CALLER_SP + 0x30,
                                 &A_CONTEXT.to_le_bytes(),
                             )
-                            && img_spawn::smss_copyout(A_CALLER_SP + 0x38, &0u64.to_le_bytes())
+                            && img_spawn::smss_copyout(A_CALLER_SP + 0x38, &A_INITIAL_TEB.to_le_bytes())
                             && img_spawn::smss_copyout(A_CALLER_SP + 0x40, &0u64.to_le_bytes())
                             && img_spawn::smss_copyout(A_THREAD_HANDLE, &0u64.to_le_bytes())
                             && img_spawn::smss_copyout(A_CID_OUT, &[0u8; 16]);
@@ -21631,7 +21638,7 @@ pub(crate) unsafe fn service_sec_image(
                             h_target_no_create,
                             A_CID_OUT,
                             A_CONTEXT,
-                            0,
+                            A_INITIAL_TEB,
                             0,
                         ]
                     );
@@ -21646,7 +21653,7 @@ pub(crate) unsafe fn service_sec_image(
                             h_target,
                             A_CID_OUT,
                             A_CONTEXT,
-                            0,
+                            A_INITIAL_TEB,
                             0,
                         ]
                     );

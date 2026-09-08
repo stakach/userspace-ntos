@@ -15354,7 +15354,12 @@ impl ExecNtHandler {
     /// 5. `*ThreadHandle` / `*ClientId {target pid, new tid}` out-params are queued.
     /// 6. The MECHANISM (the seL4 thread in the target's VSpace) is requested from the loop, which
     ///    owns the main fault endpoint the new thread is badged onto.
-    pub(crate) unsafe fn create_remote_thread(&mut self, args: &[u64]) -> u32 {
+    unsafe fn create_remote_thread(
+        &mut self,
+        args: &[u64],
+        start: nt_thread_start::Amd64ThreadContext,
+        initial_teb: nt_thread_start::InitialTeb64,
+    ) -> u32 {
         const PROCESS_CREATE_THREAD: u32 = 0x0002;
         const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
         const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -15399,24 +15404,9 @@ impl ExecNtHandler {
             );
         };
         let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-        if ctx_va == 0 {
-            reject!(b"null-thread-context", STATUS_INVALID_PARAMETER);
-        }
-        let start = nt_thread_start::Amd64ThreadContext::read(
-            |address| unsafe { smss_stack_read(address) },
-            ctx_va,
-        );
         if start.rip == 0 {
             reject!(b"null-start-address", STATUS_INVALID_PARAMETER);
         }
-        let initial_teb_va = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
-        let initial_teb = (initial_teb_va != 0).then(|| {
-            nt_thread_start::InitialTeb64::read(
-                |address| unsafe { smss_stack_read(address) },
-                initial_teb_va,
-            )
-        });
         let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         // The bounded per-process thread windows are a shared resource with the ntdll thread-pool
         // workers — one window per extra thread of that process.
@@ -15443,9 +15433,7 @@ impl ExecNtHandler {
             self.abort_hosted_thread_publication(publication);
             reject!(b"reserve-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         }
-        if let Some(initial_teb) = initial_teb {
-            let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
-        }
+        let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
         self.remote_thread_request = Some(RemoteThreadRequest {
             target_pi,
             slot,
@@ -15929,19 +15917,12 @@ impl ExecNtHandler {
         &mut self,
         args: &[u64],
         spec: RoleOwnedLocalThreadSpec,
+        start: nt_thread_start::Amd64ThreadContext,
+        initial_teb: nt_thread_start::InitialTeb64,
     ) -> u32 {
         if args.len() <= NT_CREATE_THREAD_CREATE_SUSPENDED_ARG || args[3] != u64::MAX {
             return STATUS_INVALID_PARAMETER;
         }
-        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-        let start =
-            nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
-        let initial_teb_va = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
-        if initial_teb_va == 0 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let initial_teb =
-            nt_thread_start::InitialTeb64::read(|address| smss_stack_read(address), initial_teb_va);
         let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         let pid = self.current_pm_pid().ok_or(STATUS_INVALID_HANDLE);
         let pid = match pid {
@@ -15987,6 +15968,7 @@ impl ExecNtHandler {
             args,
             spec,
             start,
+            initial_teb,
             publication.handle(),
             publication.tid(),
         );
@@ -15998,6 +15980,7 @@ impl ExecNtHandler {
         args: &[u64],
         spec: RoleOwnedLocalThreadSpec,
         start: nt_thread_start::Amd64ThreadContext,
+        stack: nt_thread_start::InitialTeb64,
         handle: u64,
         tid: u64,
     ) {
@@ -16028,14 +16011,12 @@ impl ExecNtHandler {
         print_hex_u64(spec.teb);
         print_str(b" initial_teb=0x");
         print_hex_u64(initial_teb);
-        if initial_teb != 0 {
-            print_str(b" stack_base=0x");
-            print_hex_u64(smss_stack_read(initial_teb + 0x10));
-            print_str(b" stack_limit=0x");
-            print_hex_u64(smss_stack_read(initial_teb + 0x18));
-            print_str(b" alloc_base=0x");
-            print_hex_u64(smss_stack_read(initial_teb + 0x20));
-        }
+        print_str(b" stack_base=0x");
+        print_hex_u64(stack.stack_base);
+        print_str(b" stack_limit=0x");
+        print_hex_u64(stack.stack_limit);
+        print_str(b" alloc_base=0x");
+        print_hex_u64(stack.allocated_stack_base);
         print_str(b" handle=0x");
         print_hex(handle as u32);
         print_str(b" tid=");
@@ -16049,6 +16030,8 @@ impl ExecNtHandler {
         &mut self,
         args: &[u64],
         ntdll_pool_worker_only: bool,
+        start: nt_thread_start::Amd64ThreadContext,
+        initial_teb: nt_thread_start::InitialTeb64,
     ) -> Option<u32> {
         if args.len() <= NT_CREATE_THREAD_CREATE_SUSPENDED_ARG
             || args[3] != u64::MAX
@@ -16058,12 +16041,7 @@ impl ExecNtHandler {
         }
         let pid = self.pm_pid_for_pi(self.pi)?;
         let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
-        let start =
-            nt_thread_start::Amd64ThreadContext::read(|address| smss_stack_read(address), ctx_va);
         let initial_teb_va = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
-        let initial_teb = (initial_teb_va != 0).then(|| {
-            nt_thread_start::InitialTeb64::read(|address| smss_stack_read(address), initial_teb_va)
-        });
         let scheduler_rva = img_spawn::OUR_TP_WORKER_RVA.load(Ordering::Relaxed);
         let completion_rva = img_spawn::OUR_TP_COMPLETION_WORKER_RVA.load(Ordering::Relaxed);
         let scheduler_entry = NTDLL_BASE.wrapping_add(scheduler_rva);
@@ -16102,15 +16080,13 @@ impl ExecNtHandler {
                 print_hex_u64(start.rsp);
                 print_str(b" initial_teb=0x");
                 print_hex_u64(initial_teb_va);
-                if let Some(initial_teb) = initial_teb {
-                    print_str(b" stack=(");
-                    print_hex_u64(initial_teb.stack_base);
-                    print_str(b",");
-                    print_hex_u64(initial_teb.stack_limit);
-                    print_str(b",");
-                    print_hex_u64(initial_teb.allocated_stack_base);
-                    print_str(b")");
-                }
+                print_str(b" stack=(");
+                print_hex_u64(initial_teb.stack_base);
+                print_str(b",");
+                print_hex_u64(initial_teb.stack_limit);
+                print_str(b",");
+                print_hex_u64(initial_teb.allocated_stack_base);
+                print_str(b")");
                 print_str(b" preferred=");
                 match preferred_slot {
                     Some(slot) => print_u64(slot as u64),
@@ -16213,9 +16189,7 @@ impl ExecNtHandler {
             self.abort_hosted_thread_publication(publication);
             return Some(0xC000_009A);
         }
-        if let Some(initial_teb) = initial_teb {
-            let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
-        }
+        let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: self.pi,
             slot: tp_slot,
@@ -37353,15 +37327,42 @@ impl ExecNtHandler {
             // table, hosted worker window, loader trampoline, and NtResumeThread suspend state as the
             // existing NtCreateThread plane.
             NativeService::NtCreateThreadEx => unsafe { self.nt_create_thread_ex_service(args) },
-            // SM/CSR worker threads + semaphores. ★ OUT-PARAM FIX (path-B prep): the fake handle now
-            // goes to the x64 out-arg0 *Handle = R10 = args[0] via the out-writer queue (was RCX =
-            // get_recv_mr(2), which at UnknownSyscall-fault holds the syscall RETURN IP, so the handle
-            // landed on a code address and silently missed) — the SAME class as the NtCreatePort /
-            // NtCreateEvent bug. Harmless-but-latent while the handles are unused; making it correct is
-            // load-bearing for the AUTHENTIC path B (smss's real SmpApiLoop thread needs a REAL handle
-            // from NtCreateThread), so land the correct target now. NtCreateThread's REAL spawn (a
-            // running smss thread in smss's VSpace) is the next path-B step.
             NativeService::NtCreateThread => {
+                if args[0] % 8 != 0 {
+                    return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                }
+                if let Err(status) = unsafe { self.probe_copy_output(self.pi, args[0], 8) } {
+                    return status;
+                }
+                let client_id_out = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
+                if client_id_out != 0 {
+                    if client_id_out % 4 != 0 {
+                        return 0x8000_0002; // STATUS_DATATYPE_MISALIGNMENT
+                    }
+                    if let Err(status) = unsafe { self.probe_copy_output(self.pi, client_id_out, 16) } {
+                        return status;
+                    }
+                }
+                if args[NT_CREATE_THREAD_CONTEXT_ARG] == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                // Capture each required user structure once, before routing or allocating. The
+                // existing startup mechanism still projects four registers; a complete capture
+                // is not evidence that it implements every CONTEXT register group.
+                let start = match nt_thread_start::Amd64ThreadContext::capture(
+                    |address, bytes| unsafe { self.process_memory_read_status(self.pi, address, bytes) },
+                    args[NT_CREATE_THREAD_CONTEXT_ARG],
+                ) {
+                    Ok(start) => start,
+                    Err(error) => return error.status(),
+                };
+                let initial_stack = match nt_thread_start::InitialTeb64::capture(
+                    |address, bytes| unsafe { self.process_memory_read_status(self.pi, address, bytes) },
+                    args[NT_CREATE_THREAD_INITIAL_TEB_ARG],
+                ) {
+                    Ok(stack) => stack,
+                    Err(error) => return error.status(),
+                };
                 // CSRSS creates two suspended server workers during initialization. Back both with
                 // real ETHREADs and typed handles so ReactOS's NtResumeThread calls control their
                 // actual TCBs. Slot 0 is CsrApiRequestThread; slot 1 is CsrSbApiRequestThread.
@@ -37373,13 +37374,8 @@ impl ExecNtHandler {
                         .is_none()
                 {
                     unsafe {
-                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let create_suspended =
                             nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
                         if let Some(slot) = self.first_free_hosted_tp_worker_slot(self.pi) {
                             let (role, teb) = match slot {
                                 0 => (HostedThreadRole::CsrApi, tp_worker_teb_va(slot)),
@@ -37409,6 +37405,7 @@ impl ExecNtHandler {
                                 self.abort_hosted_thread_publication(publication);
                                 return 0xC000_009A;
                             }
+                            let _ = self.remember_hosted_thread_user_stack(tid, initial_stack);
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
                                 pi: self.pi,
                                 slot,
@@ -37437,30 +37434,28 @@ impl ExecNtHandler {
                 // no-op (a bare fake handle) is RETIRED for this path — kernel32/rpcrt4 now read a real
                 // TEB/ClientId (NtQueryInformationThread(162) resolves the typed handle → the ETHREAD).
                 //
-                // A FOREIGN `ProcessHandle` has TWO distinct meanings, and NT tells them apart the
-                // same way we do here — by whether the target already HAS its initial thread:
-                //   * the process's INITIAL thread, the second half of `RtlCreateUserProcess`
-                //     ("create the process, then its first thread"). The pre-created main ETHREAD +
-                //     the seL4 main TCB the spawn already built ARE that thread → bind them (below).
-                //   * any SUBSEQUENT thread — a genuine additional thread that must be BUILT inside
-                //     the target's address space (`RtlCreateUserThread(ProcessHandle != self)`, i.e.
-                //     `DbgUiIssueRemoteBreakin` / `CreateRemoteThread`) → `create_remote_thread`.
+                // Child initial-thread activation still uses a pre-created mechanism. Unlike the
+                // additional-thread route, it does not yet install the captured context/stack.
+                // Keep process access and liveness checks common while that ownership gap is open.
                 if matches!(ctx.service, NativeService::NtCreateThread) && args[3] != u64::MAX {
                     unsafe {
                         let caller_pid = match self.pm_pid_for_pi(self.pi) {
                             Some(pid) => pid,
                             None => return 0xC000_0008,
                         };
-                        let target_pid = match self.resolve_process_handle(args[3]) {
-                            Some(pid) => pid,
-                            None => return 0xC000_0008,
+                        let (target_pid, target_pi) = match self.resolve_process_for_access(args[3], 0x0002) {
+                            Ok(target) => target,
+                            Err(status) => return status,
                         };
-                        let target_pi = self.pi_for_pid(target_pid);
-                        if target_pi.is_some_and(|pi| {
-                            PM_INITIAL_THREAD_DONE.load(Ordering::Relaxed) & (1u64 << pi) != 0
+                        if self.pm.process(target_pid).is_some_and(|process| {
+                            matches!(process.state,
+                                nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated)
                         }) {
+                            return nt_process::STATUS_PROCESS_IS_TERMINATING;
+                        }
+                        if PM_INITIAL_THREAD_DONE.load(Ordering::Relaxed) & (1u64 << target_pi) != 0 {
                             // The target already has its initial thread ⇒ REAL cross-VSpace create.
-                            return self.create_remote_thread(args);
+                            return self.create_remote_thread(args, start, initial_stack);
                         }
                         let tid = match self.pm.main_thread(target_pid) {
                             Some(tid) => tid,
@@ -37486,7 +37481,7 @@ impl ExecNtHandler {
                                 let _ = self.pm.cancel_bound_handle(handle_reservation);
                                 return status;
                             }
-                        } else if let Some(target_pi) = self.pi_for_pid(target_pid) {
+                        } else {
                             let tcb = self.hosted_main_thread_tcb_for_pi(target_pi).unwrap_or(0);
                             if tcb <= 1 || tcb_resume(tcb) != 0 {
                                 let _ = self.pm.cancel_bound_handle(handle_reservation);
@@ -37525,9 +37520,7 @@ impl ExecNtHandler {
                         }
                         // This target now HAS its initial thread; any further foreign create for it
                         // is a genuine additional thread (the cross-VSpace path above).
-                        if let Some(pi) = target_pi {
-                            PM_INITIAL_THREAD_DONE.fetch_or(1u64 << pi, Ordering::Relaxed);
-                        }
+                        PM_INITIAL_THREAD_DONE.fetch_or(1u64 << target_pi, Ordering::Relaxed);
                         return 0;
                     }
                 }
@@ -37536,7 +37529,9 @@ impl ExecNtHandler {
                     // ntdll worker routine in RCX. Classify those workers before the process-local
                     // listener routes claim them as winlogon/services RPC threads.
                     if let Some(status) =
-                        unsafe { self.create_generic_local_tp_worker_thread(args, true) }
+                        unsafe {
+                            self.create_generic_local_tp_worker_thread(args, true, start, initial_stack)
+                        }
                     {
                         return status;
                     }
@@ -37553,18 +37548,9 @@ impl ExecNtHandler {
                 {
                     unsafe {
                         let cid_ptr = args[NT_CREATE_THREAD_CLIENT_ID_ARG];
-                        let ctx_va = args[NT_CREATE_THREAD_CONTEXT_ARG];
                         let initial_teb = args[NT_CREATE_THREAD_INITIAL_TEB_ARG];
-                        let initial_stack = nt_thread_start::InitialTeb64::read(
-                            |address| smss_stack_read(address),
-                            initial_teb,
-                        );
                         let create_suspended =
                             nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
-                        let start = nt_thread_start::Amd64ThreadContext::read(
-                            |address| smss_stack_read(address),
-                            ctx_va,
-                        );
                         if let Some(slot) = (0..3).find(|slot| {
                             let role = if *slot == 0 {
                                 HostedThreadRole::WinlogonListener
@@ -37666,7 +37652,9 @@ impl ExecNtHandler {
                 }
                 if matches!(ctx.service, NativeService::NtCreateThread) {
                     if let Some(spec) = self.next_role_owned_local_thread_spec() {
-                        return unsafe { self.create_role_owned_local_thread(args, spec) };
+                        return unsafe {
+                            self.create_role_owned_local_thread(args, spec, start, initial_stack)
+                        };
                     }
                 }
                 // SCM per-connection RPC workers are now handled by the dynamic hosted worker
@@ -37681,7 +37669,9 @@ impl ExecNtHandler {
                 // local hosted thread gets a real generic
                 // ETHREAD, TEB, ClientId, fault badge, and seL4 TCB.
                 if let Some(status) =
-                    unsafe { self.create_generic_local_tp_worker_thread(args, false) }
+                    unsafe {
+                        self.create_generic_local_tp_worker_thread(args, false, start, initial_stack)
+                    }
                 {
                     return status;
                 }

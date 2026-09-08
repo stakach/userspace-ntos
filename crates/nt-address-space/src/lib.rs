@@ -1776,7 +1776,7 @@ struct VmProtectionOverride {
 
 /// Fixed-capacity private VAD policy for the executive. This deliberately owns no `Vec` or
 /// `BTreeMap`: syscall dispatch rewinds its transient bump heap after every call.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct VmRegionMap<const N: usize> {
     lower_bound: u64,
     upper_bound: u64,
