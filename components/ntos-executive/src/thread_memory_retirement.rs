@@ -117,13 +117,6 @@ impl ThreadRollbackIo for Io<'_> {
                 .get()
                 .is_some_and(|owner| owner.id == id)
     }
-    fn suspend_tcb(&mut self, _: u64) -> Result<(), u32> {
-        Err(INVALID)
-    }
-    fn delete_tcb(&mut self, _: u64) -> Result<(), u32> {
-        Err(INVALID)
-    }
-
     fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
         if !self.is_current(id) {
             return Err(INVALID);

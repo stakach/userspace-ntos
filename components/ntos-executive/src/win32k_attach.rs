@@ -216,77 +216,6 @@ pub(crate) unsafe fn w32_client_attach(pi: u64) -> bool {
     true
 }
 
-pub(crate) unsafe fn remap_attached_client_frame_in_win32k(
-    page: u64,
-    pi: u64,
-    rights: u64,
-) -> bool {
-    if admit(pi, page).is_err() {
-        return false;
-    }
-    let pml4 = WIN32K_HOST_PML4.load(Ordering::Relaxed);
-    if pml4 == 0 {
-        return false;
-    }
-    let index = (&*core::ptr::addr_of!(MAPPINGS))
-        .iter()
-        .position(|mapping| mapping.page() == page);
-    let result = if let Some(index) = index {
-        (&mut *core::ptr::addr_of_mut!(MAPPINGS))[index].remap(
-            rights,
-            &mut Backend {
-                page,
-                pml4,
-                source: 0,
-            },
-        )
-    } else {
-        let Some(source) =
-            csrss_frame_get_exact_record(pi, page).and_then(|record| record.clone_source_cap())
-        else {
-            return false;
-        };
-        replace(pi, page, source, rights, pml4)
-    };
-    if result.is_err() {
-        return false;
-    }
-    if W32_CLIENT_TEB_TAIL_PROTECTED && rights == RO_NX && is_teb_tail_page(page) {
-        W32_TEB_TAIL_RO_MAPS.fetch_add(1, Ordering::Relaxed);
-    }
-    true
-}
-
-pub(crate) unsafe fn w32_teb_tail_cow(page: u64, pi: u64, pml4: u64, ip: u64) -> bool {
-    if admit(pi, page).is_err() {
-        return false;
-    }
-    let seen = W32_TEB_TAIL_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
-    let rva = ip.wrapping_sub(win32k_subsystem::WIN32K_CODE_VA);
-    let _ = W32_TEB_TAIL_FIRST_WRITER_RVA.compare_exchange(
-        0,
-        rva,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    );
-    let source = teb_tail_shadow(pi, page);
-    if source == 0 || replace(pi, page, source, RW_NX, pml4).is_err() {
-        return false;
-    }
-    if seen < 6 {
-        print_str(b"[teb-tail] private shadow attached pi=");
-        print_u64(pi);
-        print_str(b" page=0x");
-        print_hex((page >> 32) as u32);
-        print_hex(page as u32);
-        print_str(b" writer-rva=0x");
-        print_hex(rva as u32);
-        print_str(b"\n");
-        win32k_dispatch_backtrace();
-    }
-    true
-}
-
 pub(crate) unsafe fn map_csrss_page_into_win32k(
     page: u64,
     pi: u64,
@@ -322,11 +251,6 @@ pub(crate) unsafe fn map_csrss_page_into_win32k(
     if source == 0 {
         return Ok(false);
     }
-    let protect_tail = W32_CLIENT_TEB_TAIL_PROTECTED && is_teb_tail_page(page);
-    let rights = if protect_tail { RO_NX } else { RW_NX };
-    replace(pi, page, source, rights, pml4)?;
-    if protect_tail {
-        W32_TEB_TAIL_RO_MAPS.fetch_add(1, Ordering::Relaxed);
-    }
+    replace(pi, page, source, RW_NX, pml4)?;
     Ok(true)
 }

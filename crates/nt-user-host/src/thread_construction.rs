@@ -65,7 +65,6 @@ pub struct MemoryConstructionProgress<const STACK: usize> {
     empty_slot: Option<FailedMemorySlot>,
     stack_registered: [bool; STACK],
     teb_registered: [bool; 2],
-    protected_tail_registered: bool,
 }
 
 /// Exclusive allocated-empty slot from a failed memory retype or copy. No object was created.
@@ -88,7 +87,6 @@ pub struct MemoryConstructionCoverage<const STACK: usize> {
     empty_slot: Option<u64>,
     stack_registered: [bool; STACK],
     teb_registered: [bool; 2],
-    protected_tail_registered: bool,
 }
 
 impl<const STACK: usize> MemoryConstructionCoverage<STACK> {
@@ -97,14 +95,12 @@ impl<const STACK: usize> MemoryConstructionCoverage<STACK> {
             empty_slot: None,
             stack_registered: [false; STACK],
             teb_registered: [false; 2],
-            protected_tail_registered: false,
         }
     }
     pub fn is_empty(&self) -> bool {
         self.empty_slot.is_none()
             && !self.stack_registered.iter().any(|&v| v)
             && !self.teb_registered.iter().any(|&v| v)
-            && !self.protected_tail_registered
     }
     /// Original slot number only; checked recycling never changes this provenance.
     pub fn empty_slot(&self) -> Option<u64> {
@@ -116,9 +112,6 @@ impl<const STACK: usize> MemoryConstructionCoverage<STACK> {
     pub fn teb_registered(&self, index: usize) -> bool {
         self.teb_registered[index]
     }
-    pub fn protected_tail_registered(&self) -> bool {
-        self.protected_tail_registered
-    }
 }
 
 impl<const STACK: usize> MemoryConstructionProgress<STACK> {
@@ -127,7 +120,6 @@ impl<const STACK: usize> MemoryConstructionProgress<STACK> {
             empty_slot: None,
             stack_registered: [false; STACK],
             teb_registered: [false; 2],
-            protected_tail_registered: false,
         }
     }
 
@@ -135,7 +127,6 @@ impl<const STACK: usize> MemoryConstructionProgress<STACK> {
         self.empty_slot.is_none()
             && !self.stack_registered.iter().any(|&registered| registered)
             && !self.teb_registered.iter().any(|&registered| registered)
-            && !self.protected_tail_registered
     }
 
     pub fn retain_empty_slot(&mut self, slot: u64) -> Result<(), InventoryError> {
@@ -159,7 +150,6 @@ impl<const STACK: usize> MemoryConstructionProgress<STACK> {
             empty_slot: self.empty_slot(),
             stack_registered: self.stack_registered,
             teb_registered: self.teb_registered,
-            protected_tail_registered: self.protected_tail_registered,
         };
         (coverage, self.empty_slot)
     }
@@ -205,14 +195,6 @@ impl<const STACK: usize> MemoryConstructionProgress<STACK> {
     pub fn teb_registered(&self, index: usize) -> bool {
         self.teb_registered[index]
     }
-
-    /// Records successful metadata registration, not exclusive ownership of a shared VA entry.
-    pub fn record_protected_tail(&mut self) {
-        self.protected_tail_registered = true;
-    }
-    pub fn protected_tail_registered(&self) -> bool {
-        self.protected_tail_registered
-    }
 }
 
 impl ThreadConstructionInventory {
@@ -231,8 +213,12 @@ impl ThreadConstructionInventory {
             let SlotState::LiveObject(cap) = *state else {
                 return Err(InventoryError::InvalidPhase);
             };
-            if cap <= 1 { return Err(InventoryError::InvalidSlot); }
-            if caps[..index].contains(&cap) { return Err(InventoryError::DuplicateSlot); }
+            if cap <= 1 {
+                return Err(InventoryError::InvalidSlot);
+            }
+            if caps[..index].contains(&cap) {
+                return Err(InventoryError::DuplicateSlot);
+            }
             caps[index] = cap;
         }
         Ok(caps)

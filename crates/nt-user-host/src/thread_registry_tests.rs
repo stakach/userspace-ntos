@@ -597,7 +597,7 @@ fn newly_shared_caps_prevent_handoff_but_unrelated_registry_growth_does_not() {
 }
 
 #[test]
-fn rollback_admission_detects_tcb_and_mechanism_collisions_with_registry_only_aliases() {
+fn rollback_admission_detects_mechanism_class_collisions_with_registry_only_aliases() {
     let resources = resources(27);
     let registry = registry(27);
     let snapshot = ThreadRegistrySnapshot::capture(&resources, &registry, &REGISTERED).unwrap();
@@ -608,21 +608,17 @@ fn rollback_admission_detects_tcb_and_mechanism_collisions_with_registry_only_al
         tid: 301,
     };
     for cap in [33, 34, 43, 44] {
-        assert!(matches!(
-            ThreadRollback::prepare(identity, cap, snapshot.rollback_resources()),
-            Err(ThreadRollbackError::ConflictingOwnership)
-        ));
         let mut inventory = snapshot.rollback_resources().to_vec();
         inventory.push(ThreadRollbackResource {
             cap,
             kind: Kind::Mechanism,
         });
         assert!(matches!(
-            ThreadRollback::prepare(identity, 1000, &inventory),
+            ThreadRollback::prepare(identity, &inventory),
             Err(ThreadRollbackError::ConflictingOwnership)
         ));
     }
-    let rollback = ThreadRollback::prepare(identity, 1000, snapshot.rollback_resources()).unwrap();
+    let rollback = ThreadRollback::prepare(identity, snapshot.rollback_resources()).unwrap();
     assert_eq!(
         rollback.pending_resources().collect::<Vec<_>>(),
         snapshot.rollback_resources()

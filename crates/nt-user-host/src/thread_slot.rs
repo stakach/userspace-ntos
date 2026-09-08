@@ -16,7 +16,7 @@ pub trait RuntimeIdentity {
 /// Adapter for moving a constructor's complete partial inventory into its original reservation.
 /// Partial payloads must retain all allocated slots, object caps and memory/alias owners, including
 /// failed allocations. Journal reconciliation is a separate, later, fallible operation.
-pub trait RuntimeConstruction: RuntimeIdentity {
+pub trait RuntimeConstruction: RuntimeIdentity + RuntimeTcbProjection {
     type Partial;
     /// Original reservation captured before construction, not a replacement runtime identity.
     fn construction_binding(partial: &Self::Partial) -> ThreadBinding<Self::Role>;
@@ -26,12 +26,6 @@ pub trait RuntimeConstruction: RuntimeIdentity {
     /// Read-only, allocation-free validation of failed-memory slot versus retained live owners.
     fn validate_construction(partial: &Self::Partial) -> Result<(), ThreadRollbackError>;
     fn publication_mut(&mut self) -> &mut ThreadPublicationSlot;
-    /// Clear only the copied TCB projection after the sealed actor acknowledges its deletion,
-    /// before the empty slot is recycled. Accept the exact expected cap or the already-cleared
-    /// reservation sentinel (1), and leave identity, reservations and memory untouched. Rejection
-    /// must not mutate anything; retries after a failed recycle must be idempotent. No allocation,
-    /// backend operation or reentry is allowed here.
-    fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32>;
     /// Infallible, allocation-free ownership move with no backend calls or reentrancy. Preserve
     /// identity, reservations and the publication slot; update binding.tcb to the partial TCB, or
     /// keep the unbuilt reservation sentinel when absent. Preserve any resource inventory already
@@ -45,6 +39,31 @@ pub trait RuntimeConstruction: RuntimeIdentity {
         crate::thread_construction::ThreadConstructionInventory,
         Option<crate::thread_construction::FailedMemorySlot>,
     );
+}
+
+pub trait RuntimeTcbProjection {
+    /// Clear only the copied TCB projection after the sealed actor acknowledges its deletion,
+    /// before the empty slot is recycled. Accept the exact expected cap or the already-cleared
+    /// reservation sentinel (1), and leave identity, reservations and memory untouched. Rejection
+    /// must not mutate anything; retries after a failed recycle must be idempotent. No allocation,
+    /// backend operation or reentry is allowed here.
+    fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32>;
+}
+
+/// Exact, allocation-free transfer of a published runtime's live mechanism bundle. Neither
+/// callback may invoke a backend or reenter the runtime table. The binding's TCB remains a
+/// read-only projection until checked deletion; all other copied release fields must be cleared.
+pub trait RuntimeMechanismHandoff: RuntimeIdentity + RuntimeTcbProjection {
+    /// Role-indexed order: RawCnode, GuardedCnode, Tcb, SchedContext. No mutation or allocation.
+    fn registered_mechanism_slots(&self) -> Result<[u64; 4], u32>;
+    /// Validate the exact ID and entire bundle before any mutation. Failure preserves the entire
+    /// source; success clears its mutable mechanism owners while retaining identity, reservations,
+    /// memory and binding.tcb. No fallible work may follow the first field clear.
+    fn clear_registered_mechanism_projections(
+        &mut self,
+        id: ThreadRollbackId,
+        expected: [u64; 4],
+    ) -> Result<(), u32>;
 }
 
 enum State<R> {
@@ -306,7 +325,7 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
         if admit_thread_binding(binding, []).is_err() {
             return Err(SlotError::InvalidBinding);
         }
-        let reservations = binding.reservations.ok_or(SlotError::MissingReservations)?;
+        let reservations = binding.reservations;
         let identity = ThreadRollbackIdentity {
             pi: binding.pi,
             pid: binding.process.pid,
@@ -385,6 +404,33 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
     {
         self.pending_mut_exact(expected)?
             .advance_construction_retirement(io)
+            .map_err(SlotError::Retirement)
+    }
+
+    pub fn handoff_registered_mechanisms(
+        &mut self,
+        expected: ThreadRollbackId,
+    ) -> Result<(), SlotError>
+    where
+        R: RuntimeMechanismHandoff,
+    {
+        self.pending_mut_exact(expected)?
+            .handoff_registered_mechanisms(expected)
+            .map_err(SlotError::Retirement)
+    }
+
+    /// The adapter must retain complete memory/alias journals and execution exclusions first.
+    /// No mutable runtime/table borrow may cross a reentrant backend operation.
+    pub fn advance_registered_mechanism_retirement(
+        &mut self,
+        expected: ThreadRollbackId,
+        io: &mut impl crate::thread_retirement::ThreadRetirementIo,
+    ) -> Result<(), SlotError>
+    where
+        R: RuntimeTcbProjection,
+    {
+        self.pending_mut_exact(expected)?
+            .advance_registered_mechanism_retirement(io)
             .map_err(SlotError::Retirement)
     }
 

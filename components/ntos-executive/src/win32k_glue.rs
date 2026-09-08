@@ -5937,24 +5937,12 @@ pub(crate) unsafe fn win32k_dispatch_wide(
 
 pub(crate) unsafe fn win32k_flush_user_gdi_batch(client: Win32kClientContext) -> (u64, bool) {
     const STATUS_INVALID_PARAMETER: u64 = 0xC000_000Du32 as u64;
-    const STATUS_INSUFFICIENT_RESOURCES: u64 = 0xC000_009Au32 as u64;
 
     if client.pi == 0 || client.teb == 0 {
         return (STATUS_INVALID_PARAMETER, true);
     }
 
-    let client_pi = client.pi as u64;
-    if !w32_client_attach(client_pi) {
-        return (STATUS_INSUFFICIENT_RESOURCES, false);
-    }
-
-    let tail_page = (client.teb + nt_user_callback::TEB_GDI_BATCH_COUNT) & !0xFFF;
-    if !remap_attached_client_frame_in_win32k(tail_page, client_pi, RW_NX) {
-        return (STATUS_INSUFFICIENT_RESOURCES, true);
-    }
-    crate::GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.fetch_add(1, Ordering::Relaxed);
-
-    let result = win32k_dispatch_wide(
+    win32k_dispatch_wide(
         win32k_subsystem::SSN_GDI_BATCH_FLUSH_CALLOUT,
         0,
         0,
@@ -5963,18 +5951,7 @@ pub(crate) unsafe fn win32k_flush_user_gdi_batch(client: Win32kClientContext) ->
         0,
         &[],
         client,
-    );
-
-    if !remap_attached_client_frame_in_win32k(tail_page, client_pi, RO_NX) {
-        print_str(b"[gdi-batch] failed to restore read-only TEB tail mapping page=0x");
-        print_hex((tail_page >> 32) as u32);
-        print_hex(tail_page as u32);
-        print_str(b" pi=");
-        print_u64(client_pi);
-        print_str(b"\n");
-    }
-
-    result
+    )
 }
 
 pub(crate) unsafe fn win32k_dispatch_wide_with_completion_args(

@@ -37,6 +37,22 @@ fn process_commit_ledger_is_transactional_and_limit_checked() {
 }
 
 #[test]
+fn process_commit_release_preflight_is_read_only() {
+    let mut ledger = ProcessCommitLedger::new();
+    ledger.register(4, 0x3000).unwrap();
+    let before = ledger.accounting(4);
+    assert_eq!(ledger.validate_release(4, 0x2000), Ok(()));
+    assert_eq!(ledger.validate_release(4, 0), Ok(()));
+    assert_eq!(ledger.validate_release(4, 0x4000), Err(commit::STATUS_INVALID_PARAMETER));
+    assert_eq!(ledger.validate_release(4, 1), Err(commit::STATUS_INVALID_PARAMETER));
+    assert_eq!(ledger.validate_release(8, 0x1000), Err(commit::STATUS_INVALID_HANDLE));
+    assert_eq!(ledger.accounting(4), before);
+    ledger.release(4, 0x2000).unwrap();
+    assert_eq!(ledger.validate_release(4, 0x2000), Err(commit::STATUS_INVALID_PARAMETER));
+    assert_eq!(ledger.accounting(4).unwrap().current_bytes, 0x1000);
+}
+
+#[test]
 fn process_commit_ledger_rejects_stale_plans_and_scales_by_owner() {
     let mut ledger = ProcessCommitLedger::new();
     for owner in 1..=40 {

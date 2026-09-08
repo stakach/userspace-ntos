@@ -17,14 +17,11 @@ fn attempt() -> ThreadRollbackId {
 fn seal<const STACK: usize>(
     progress: MemoryConstructionProgress<STACK>,
     id: ThreadRollbackId,
-) -> (
-    MemoryConstructionCoverage<STACK>,
-    ThreadConstructionRetirement,
-) {
+) -> (MemoryConstructionCoverage<STACK>, ThreadMechanismRetirement) {
     let (coverage, slot) = progress.into_retained();
     (
         coverage,
-        ThreadConstructionRetirement::retain(id, ThreadConstructionInventory::empty(), slot),
+        ThreadMechanismRetirement::retain(id, ThreadConstructionInventory::empty(), slot),
     )
 }
 
@@ -283,7 +280,7 @@ fn unregistered_empty_construction_has_explicit_empty_snapshot() {
     assert!(snapshot.records().is_empty() && snapshot.rollback_resources().is_empty());
     let mut changed = MemoryConstructionProgress::<2>::empty();
     changed.retain_empty_slot(99).unwrap();
-    changed.record_protected_tail();
+    changed.record_teb(0);
     let (changed, _) = seal(changed, id);
     assert!(matches!(
         state.reconcile(id, &resources, &changed, &retirement, &registry),

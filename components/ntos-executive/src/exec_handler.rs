@@ -17842,15 +17842,8 @@ impl ExecNtHandler {
     }
 
     fn release_process_commit(&mut self, pid: nt_process::ProcessId, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.process_commit
-            .release(pid, bytes)
-            .expect("MM commit release matches the published address-space delta");
-        self.pm
-            .release_job_memory(pid, bytes)
-            .expect("Ps job commit release matches the published address-space delta");
+        nt_user_host::commit_release::release(&mut self.process_commit, &mut self.pm, pid, bytes)
+            .expect("MM/Ps release matches the published address-space delta");
     }
 
     pub(crate) fn release_process_page_table_commitment(&mut self, pi: usize, tables: u64) {

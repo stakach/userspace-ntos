@@ -13,11 +13,38 @@ mod mutations;
 mod writeback;
 
 struct Runtime {
+    mechanisms: [u64; 4],
     binding: ThreadBinding<()>,
     publication: ThreadPublicationSlot,
     memory: ThreadMemoryResources<2>,
     bottom: u64,
     top: u64,
+}
+
+impl crate::thread_slot::RuntimeTcbProjection for Runtime {
+    fn clear_retired_tcb_projection(&mut self, cap: u64) -> Result<(), u32> {
+        if self.binding.tcb != cap && self.binding.tcb != 1 {
+            return Err(1);
+        }
+        self.binding.tcb = 1;
+        Ok(())
+    }
+}
+impl crate::thread_slot::RuntimeMechanismHandoff for Runtime {
+    fn registered_mechanism_slots(&self) -> Result<[u64; 4], u32> {
+        Ok(self.mechanisms)
+    }
+    fn clear_registered_mechanism_projections(
+        &mut self,
+        id: ThreadRollbackId,
+        caps: [u64; 4],
+    ) -> Result<(), u32> {
+        if id.identity().tid != self.binding.tid || caps != self.mechanisms {
+            return Err(1);
+        }
+        self.mechanisms = [0; 4];
+        Ok(())
+    }
 }
 
 impl crate::thread_pending::RuntimeMemoryHandoff for Runtime {
@@ -42,6 +69,7 @@ impl RuntimeIdentity for Runtime {
 
 fn runtime(pi: usize, generation: ProcessGeneration) -> Runtime {
     Runtime {
+        mechanisms: [9001, 9002, 100, 9003],
         binding: ThreadBinding {
             pi,
             process: ProcessIdentity { pid: 8, generation },
@@ -74,7 +102,8 @@ fn slot(runtime: Runtime) -> ThreadRuntimeSlot<Runtime> {
 
 fn pending(runtime: Runtime) -> ThreadRuntimeSlot<Runtime> {
     let mut slot = slot(runtime);
-    slot.begin_pending(slot.owner().unwrap().binding).unwrap();
+    let id = slot.begin_pending(slot.owner().unwrap().binding).unwrap();
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     slot
 }
 
@@ -338,12 +367,7 @@ impl ThreadRollbackIo for Backend {
     fn is_current(&self, id: ThreadRollbackId) -> bool {
         self.id == id
     }
-    fn suspend_tcb(&mut self, _: u64) -> Result<(), u32> {
-        Ok(())
-    }
-    fn delete_tcb(&mut self, _: u64) -> Result<(), u32> {
-        Ok(())
-    }
+
     fn revoke_memory_access(&mut self, _: ThreadRollbackId) -> Result<(), u32> {
         if self.fail {
             Err(0xc000009a)
@@ -360,7 +384,9 @@ impl ThreadRollbackIo for Backend {
     fn recycle_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
         panic!("empty journal")
     }
-    fn finish_memory_transfers(&mut self, _: ThreadRollbackId) -> Result<(), u32> { Ok(()) }
+    fn finish_memory_transfers(&mut self, _: ThreadRollbackId) -> Result<(), u32> {
+        Ok(())
+    }
     fn commit_rollback(&mut self, _: ThreadRollbackId) {}
 }
 

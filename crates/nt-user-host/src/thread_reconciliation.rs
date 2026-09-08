@@ -6,7 +6,7 @@ use nt_memory_manager::ClientFrameRegistry;
 use crate::thread_construction::MemoryConstructionCoverage;
 use crate::thread_registry::{ThreadRegistryError, ThreadRegistrySnapshot};
 use crate::thread_resources::ThreadMemoryResources;
-use crate::thread_retirement::ThreadConstructionRetirement;
+use crate::thread_retirement::ThreadMechanismRetirement;
 use crate::thread_rollback::ThreadRollbackId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,7 +21,6 @@ struct Prepared<const STACK: usize> {
     id: ThreadRollbackId,
     snapshot: ThreadRegistrySnapshot<STACK>,
     empty_slot: Option<u64>,
-    protected_tail: bool,
 }
 
 /// Store inside the non-cloneable pending runtime owner. OnceCell permits attaching immutable
@@ -64,7 +63,7 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
         id: ThreadRollbackId,
         resources: &ThreadMemoryResources<STACK>,
         progress: &MemoryConstructionCoverage<STACK>,
-        retirement: &ThreadConstructionRetirement,
+        retirement: &ThreadMechanismRetirement,
         registry: &ClientFrameRegistry,
     ) -> Result<&ThreadRegistrySnapshot<STACK>, ReconciliationError> {
         if retirement.id() != id {
@@ -78,7 +77,6 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
                 return Err(ReconciliationError::AttemptChanged);
             }
             if prepared.empty_slot != progress.empty_slot()
-                || prepared.protected_tail != progress.protected_tail_registered()
                 || !registered_pages(resources, progress)?.eq(prepared
                     .snapshot
                     .records()
@@ -106,7 +104,6 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
             id,
             snapshot,
             empty_slot: progress.empty_slot(),
-            protected_tail: progress.protected_tail_registered(),
         };
         // No backend calls or reentrancy occur between the empty check and publication.
         assert!(self.prepared.set(prepared).is_ok());
@@ -141,7 +138,7 @@ fn registered_pages<'a, const STACK: usize>(
 
 fn validate_empty_slot<const STACK: usize>(
     progress: &MemoryConstructionCoverage<STACK>,
-    retirement: &ThreadConstructionRetirement,
+    retirement: &ThreadMechanismRetirement,
     snapshot: &ThreadRegistrySnapshot<STACK>,
     registry: &ClientFrameRegistry,
 ) -> Result<(), ReconciliationError> {

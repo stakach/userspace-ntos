@@ -4217,6 +4217,14 @@ impl ProcessManager {
         self.jobs.release_memory(pid, bytes)
     }
 
+    /// Allocation-free preflight; the caller retains exclusive MM/Ps ownership through release.
+    pub fn validate_job_memory_release(&self, pid: ProcessId, bytes: u64) -> Result<(), u32> {
+        if !self.processes.contains_key(&pid) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        self.jobs.validate_memory_release(pid, bytes)
+    }
+
     pub fn job_memory_usage(&self, pid: ProcessId) -> Result<(u64, u64), u32> {
         self.jobs.memory_usage(pid)
     }

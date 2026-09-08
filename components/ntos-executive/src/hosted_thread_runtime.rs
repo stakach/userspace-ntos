@@ -1,5 +1,5 @@
 use super::*;
-use nt_user_host::thread_slot::{RuntimeConstruction, RuntimeIdentity, ThreadRuntimeSlot};
+use nt_user_host::thread_slot::{RuntimeConstruction, RuntimeIdentity, RuntimeTcbProjection, ThreadRuntimeSlot};
 
 type RuntimeSlot = ThreadRuntimeSlot<HostedThreadRuntimeOwner>;
 
@@ -1088,9 +1088,7 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
     }
 }
 
-impl RuntimeConstruction for HostedThreadRuntimeOwner {
-    type Partial = RetainedHostedThreadConstruction;
-
+impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
     fn clear_retired_tcb_projection(&mut self, expected_cap: u64) -> Result<(), u32> {
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {
             return Err(nt_address_space::STATUS_INVALID_PARAMETER);
@@ -1098,6 +1096,10 @@ impl RuntimeConstruction for HostedThreadRuntimeOwner {
         self.runtime.tcb = 1;
         Ok(())
     }
+}
+
+impl RuntimeConstruction for HostedThreadRuntimeOwner {
+    type Partial = RetainedHostedThreadConstruction;
 
     fn construction_binding(partial: &Self::Partial) -> nt_user_host::thread_binding::ThreadBinding<Self::Role> {
         partial.binding

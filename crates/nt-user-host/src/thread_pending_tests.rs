@@ -22,7 +22,9 @@ fn reservations() -> ThreadRuntimeReservations {
 
 struct Runtime {
     drops: Rc<Cell<usize>>,
+    registered: super::registered_tests::PublishedMechanisms,
 }
+super::registered_tests::delegate!(Runtime, registered);
 
 impl crate::thread_pending::RuntimeMemoryHandoff for Runtime {
     fn clear_memory_projections(
@@ -44,23 +46,27 @@ fn owner() -> (PendingThreadRuntime<Runtime>, Rc<Cell<usize>>) {
     let drops = Rc::new(Cell::new(0));
     let runtime = Runtime {
         drops: drops.clone(),
+        registered: super::registered_tests::PublishedMechanisms::new(
+            identity(),
+            reservations(),
+            10,
+        ),
     };
-    match PendingThreadRuntime::retain(identity(), 10, reservations(), runtime) {
-        Ok(owner) => (owner, drops),
+    match PendingThreadRuntime::retain(identity(), 10, Some(reservations()), runtime) {
+        Ok(mut owner) => {
+            super::registered_tests::finish_pending(&mut owner);
+            (owner, drops)
+        }
         Err(_) => panic!("valid admission failed"),
     }
 }
 
-fn resources() -> [ThreadRollbackResource; 3] {
+fn resources() -> [ThreadRollbackResource; 2] {
     use ThreadRollbackResourceKind::*;
     [
         ThreadRollbackResource {
             cap: 200,
             kind: Frame,
-        },
-        ThreadRollbackResource {
-            cap: 300,
-            kind: Mechanism,
         },
         ThreadRollbackResource {
             cap: 100,
@@ -118,23 +124,13 @@ impl ThreadRollbackIo for Backend {
         self.current == id && self.held
     }
 
-    fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-        assert_eq!(tcb, 10);
+    fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
+        assert_eq!(id, self.current);
         self.effect(0)
     }
 
-    fn delete_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-        assert_eq!(tcb, 10);
-        self.effect(1)
-    }
-
-    fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
-        assert_eq!(id, self.current);
-        self.effect(2)
-    }
-
     fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
-        assert!(self.held && self.successes.contains(&2));
+        assert!(self.held && self.successes.contains(&0));
         assert_ne!(resource.kind, ThreadRollbackResourceKind::Mechanism);
         assert!(!self.unmapped.contains(&resource.cap));
         self.unmapped.push(resource.cap);
@@ -143,8 +139,10 @@ impl ThreadRollbackIo for Backend {
 
     fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
         assert_ne!(resource.kind, ThreadRollbackResourceKind::Frame);
-        assert!(resource.kind == ThreadRollbackResourceKind::Mechanism
-            || self.unmapped.contains(&resource.cap));
+        assert!(
+            resource.kind == ThreadRollbackResourceKind::Mechanism
+                || self.unmapped.contains(&resource.cap)
+        );
         Ok(())
     }
 
@@ -154,9 +152,9 @@ impl ThreadRollbackIo for Backend {
                 || self.unmapped.contains(&resource.cap)
         );
         let (step, expected) = match resource.kind {
-            ThreadRollbackResourceKind::Alias => (3, 100),
-            ThreadRollbackResourceKind::Mechanism => (4, 300),
-            ThreadRollbackResourceKind::Frame => (5, 200),
+            ThreadRollbackResourceKind::Alias => (1, 100),
+            ThreadRollbackResourceKind::Mechanism => panic!("mechanisms already retired"),
+            ThreadRollbackResourceKind::Frame => (2, 200),
         };
         assert_eq!(resource.cap, expected);
         self.effect(step)
@@ -165,12 +163,12 @@ impl ThreadRollbackIo for Backend {
     fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
         assert_eq!(id, self.current);
         assert!(self.held);
-        self.effect(6)
+        self.effect(3)
     }
 
     fn commit_rollback(&mut self, id: ThreadRollbackId) {
         assert_eq!(id, self.current);
-        self.effect(7).unwrap();
+        self.effect(4).unwrap();
         self.held = false;
     }
 }
@@ -180,7 +178,7 @@ fn admission_retains_nonclone_payload_and_exact_reservations_without_a_journal()
     let (owner, drops) = owner();
     assert!(Rc::ptr_eq(&owner.runtime().drops, &drops));
     assert_eq!(owner.id().identity(), identity());
-    assert_eq!(owner.reservations(), reservations());
+    assert_eq!(owner.reservations(), Some(reservations()));
     assert!(owner.cleanup().is_none());
     assert_eq!(drops.get(), 0);
 }
@@ -204,9 +202,14 @@ fn invalid_identity_returns_original_payload() {
         let drops = Rc::new(Cell::new(0));
         let runtime = Runtime {
             drops: drops.clone(),
+            registered: super::registered_tests::PublishedMechanisms::new(
+                identity(),
+                reservations(),
+                10,
+            ),
         };
         let (error, runtime) =
-            match PendingThreadRuntime::retain(invalid, 10, reservations(), runtime) {
+            match PendingThreadRuntime::retain(invalid, 10, Some(reservations()), runtime) {
                 Err(error) => error,
                 Ok(_) => panic!("invalid identity admitted"),
             };
@@ -223,7 +226,7 @@ fn invalid_tcb_returns_original_payload() {
     for tcb in [0, 1] {
         let runtime = alloc::boxed::Box::new(42);
         let ptr = &*runtime as *const i32;
-        match PendingThreadRuntime::retain(identity(), tcb, reservations(), runtime) {
+        match PendingThreadRuntime::retain(identity(), tcb, Some(reservations()), runtime) {
             Err((error, runtime)) => {
                 assert_eq!(error, ThreadRollbackError::InvalidCapability);
                 assert_eq!(&*runtime as *const i32, ptr);
@@ -240,11 +243,11 @@ fn reservations_are_captured_values_not_native_table_bounds() {
         pool_slot: usize::MAX,
         window_slot: None,
     };
-    let owner = match PendingThreadRuntime::retain(identity(), 10, holds, ()) {
+    let owner = match PendingThreadRuntime::retain(identity(), 10, Some(holds), ()) {
         Ok(owner) => owner,
         Err(_) => panic!("host owner must not invent native slot limits"),
     };
-    assert_eq!(owner.reservations(), holds);
+    assert_eq!(owner.reservations(), Some(holds));
 }
 
 #[test]
@@ -255,8 +258,7 @@ fn preparation_preserves_retained_attempt_identity() {
     owner.commit_memory_handoff(owner.id()).unwrap();
     assert_eq!(owner.id(), id);
     assert_eq!(owner.cleanup().unwrap().id(), id);
-    assert_eq!(owner.cleanup().unwrap().pending_tcb(), Some(10));
-    assert_eq!(owner.cleanup().unwrap().pending_resources().count(), 3);
+    assert_eq!(owner.cleanup().unwrap().pending_resources().count(), 2);
 }
 
 #[test]
@@ -265,16 +267,15 @@ fn journal_allocation_failure_preserves_owner_for_same_attempt_retry() {
     let id = owner.id();
     for _ in 0..3 {
         assert_eq!(
-            owner.prepare_journal_with(&resources(), |actual, tcb, inventory| {
+            owner.prepare_journal_with(&resources(), |actual, inventory| {
                 assert_eq!(actual, id);
-                assert_eq!(tcb, Some(10));
                 assert_eq!(inventory, resources());
                 Err(ThreadRollbackError::InsufficientResources)
             }),
             Err(ThreadRollbackError::InsufficientResources)
         );
         assert_eq!(owner.id(), id);
-        assert_eq!(owner.reservations(), reservations());
+        assert_eq!(owner.reservations(), Some(reservations()));
         assert!(owner.cleanup().is_none());
         assert_eq!(drops.get(), 0);
     }
@@ -295,7 +296,7 @@ fn invalid_inventory_preserves_owner_for_retry() {
         Err(ThreadRollbackError::ConflictingOwnership)
     );
     assert!(owner.cleanup().is_none());
-    assert_eq!(owner.reservations(), reservations());
+    assert_eq!(owner.reservations(), Some(reservations()));
     assert_eq!(drops.get(), 0);
     owner.prepare_journal(&resources()).unwrap();
     owner.commit_memory_handoff(owner.id()).unwrap();
@@ -316,13 +317,13 @@ fn unprepared_owner_cannot_advance_or_release_payload() {
         Ok(_) => panic!("unprepared payload released"),
     };
     assert_eq!(retained.id(), io.current);
-    assert_eq!(retained.reservations(), reservations());
+    assert_eq!(retained.reservations(), Some(reservations()));
     assert_eq!(drops.get(), 0);
 }
 
 #[test]
 fn every_cleanup_failure_retains_payload_reservations_and_retry_progress() {
-    for failure in 0..7 {
+    for failure in 0..4 {
         let (mut owner, drops) = owner();
         owner.prepare_journal(&resources()).unwrap();
         owner.commit_memory_handoff(owner.id()).unwrap();
@@ -338,14 +339,14 @@ fn every_cleanup_failure_retains_payload_reservations_and_retry_progress() {
                 Ok(_) => panic!("partially cleaned payload released"),
             };
             assert_eq!(owner.id(), io.current);
-            assert_eq!(owner.reservations(), reservations());
+            assert_eq!(owner.reservations(), Some(reservations()));
             assert!(io.held);
             assert_eq!(io.successes, (0..failure).collect::<Vec<_>>());
             assert_eq!(drops.get(), 0);
         }
         io.fail = None;
         owner.advance(&mut io).unwrap();
-        assert_eq!(io.successes, (0..8).collect::<Vec<_>>());
+        assert_eq!(io.successes, (0..5).collect::<Vec<_>>());
         assert!(!io.held);
         let runtime = match owner.try_into_retired_payload() {
             Ok(runtime) => runtime,
@@ -363,7 +364,7 @@ fn duplicate_preparation_cannot_reset_partial_progress() {
     owner.prepare_journal(&resources()).unwrap();
     owner.commit_memory_handoff(owner.id()).unwrap();
     let mut io = Backend::new(&owner, drops);
-    io.fail = Some(4);
+    io.fail = Some(2);
     assert!(owner.advance(&mut io).is_err());
     let stage = owner.cleanup().unwrap().stage();
     let pending = owner
@@ -372,7 +373,7 @@ fn duplicate_preparation_cannot_reset_partial_progress() {
         .pending_resources()
         .collect::<Vec<_>>();
     assert_eq!(
-        owner.prepare_journal_with(&[], |_, _, _| panic!("builder called twice")),
+        owner.prepare_journal_with(&[], |_, _| panic!("builder called twice")),
         Err(ThreadRollbackError::AlreadyPrepared)
     );
     assert_eq!(owner.cleanup().unwrap().stage(), stage);
@@ -399,7 +400,7 @@ fn reused_identity_cannot_drive_an_older_attempt() {
     let mut io = Backend::new(&new, drops);
     assert_eq!(old.advance(&mut io), Err(ThreadRollbackError::StaleOwner));
     assert!(io.calls.is_empty());
-    assert_eq!(old.cleanup().unwrap().pending_resources().count(), 3);
+    assert_eq!(old.cleanup().unwrap().pending_resources().count(), 2);
 }
 
 #[test]
@@ -442,7 +443,7 @@ fn completion_is_idempotent_and_retains_payload_through_commit() {
 
 #[test]
 fn stale_owner_at_each_partial_stage_preserves_progress_for_exact_owner_retry() {
-    for failure in 0..7 {
+    for failure in 0..4 {
         let (mut owner, drops) = owner();
         owner.prepare_journal(&resources()).unwrap();
         owner.commit_memory_handoff(owner.id()).unwrap();
@@ -470,11 +471,11 @@ fn stale_owner_at_each_partial_stage_preserves_progress_for_exact_owner_retry() 
                 .collect::<Vec<_>>(),
             pending
         );
-        assert_eq!(owner.reservations(), reservations());
+        assert_eq!(owner.reservations(), Some(reservations()));
         assert_eq!(io.calls, calls);
         assert_eq!(drops.get(), 0);
         io.current = exact;
         owner.advance(&mut io).unwrap();
-        assert_eq!(io.successes, (0..8).collect::<Vec<_>>());
+        assert_eq!(io.successes, (0..5).collect::<Vec<_>>());
     }
 }

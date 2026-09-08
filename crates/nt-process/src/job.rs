@@ -1322,27 +1322,44 @@ impl JobStore {
     }
 
     pub fn release_memory(&mut self, process_id: ProcessId, bytes: u64) -> Result<(), u32> {
+        let Some((id, process_bytes, job_bytes)) = self.released_memory_totals(process_id, bytes)? else {
+            return Ok(());
+        };
+        let job = self.get_mut(id).expect("validated memory-release job");
+        let member = job.members.iter_mut().find(|member| member.process_id == process_id)
+            .expect("validated memory-release member");
+        member.current_memory_used = process_bytes;
+        job.current_job_memory_used = job_bytes;
+        Ok(())
+    }
+
+    /// Validate both ledgers without effects before a serialized cross-owner release.
+    pub fn validate_memory_release(&self, process_id: ProcessId, bytes: u64) -> Result<(), u32> {
+        self.released_memory_totals(process_id, bytes).map(|_| ())
+    }
+
+    fn released_memory_totals(&self, process_id: ProcessId, bytes: u64) -> Result<Option<(JobId, u64, u64)>, u32> {
         if bytes & (PAGE_SIZE - 1) != 0 {
             return Err(crate::STATUS_INVALID_PARAMETER);
         }
         let Some(id) = self.job_for_process(process_id) else {
-            return Ok(());
+            return Ok(None);
         };
-        let job = self.get_mut(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
+        let job = self.get(id).ok_or(crate::STATUS_INVALID_HANDLE)?;
         let member = job
             .members
-            .iter_mut()
+            .iter()
             .find(|member| member.process_id == process_id)
             .ok_or(crate::STATUS_INVALID_HANDLE)?;
-        member.current_memory_used = member
+        let next_process_bytes = member
             .current_memory_used
             .checked_sub(bytes)
             .ok_or(crate::STATUS_INVALID_PARAMETER)?;
-        job.current_job_memory_used = job
+        let next_job_bytes = job
             .current_job_memory_used
             .checked_sub(bytes)
             .ok_or(crate::STATUS_INVALID_PARAMETER)?;
-        Ok(())
+        Ok(Some((id, next_process_bytes, next_job_bytes)))
     }
 
     pub fn memory_usage(&self, process_id: ProcessId) -> Result<(u64, u64), u32> {
@@ -1565,6 +1582,50 @@ impl JobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_release_underflow_leaves_both_ledgers_unchanged_for_retry() {
+        for (process_bytes, job_bytes) in [(PAGE_SIZE, PAGE_SIZE * 2), (PAGE_SIZE * 2, PAGE_SIZE)] {
+            let mut jobs = JobStore::new();
+            let id = jobs.create(0).unwrap();
+            jobs.assign(id, 40, 0, 0).unwrap();
+            let charge = jobs.prepare_memory_charge(40, PAGE_SIZE * 2).unwrap().unwrap();
+            jobs.commit_memory_charge(charge).unwrap();
+            let job = jobs.get_mut(id).unwrap();
+            job.members[0].current_memory_used = process_bytes;
+            job.current_job_memory_used = job_bytes;
+            for _ in 0..2 {
+                assert_eq!(jobs.release_memory(40, PAGE_SIZE * 2), Err(crate::STATUS_INVALID_PARAMETER));
+                assert_eq!(jobs.memory_usage(40), Ok((process_bytes, job_bytes)));
+            }
+            let job = jobs.get_mut(id).unwrap();
+            job.members[0].current_memory_used = PAGE_SIZE * 2;
+            job.current_job_memory_used = PAGE_SIZE * 2;
+            assert_eq!(jobs.release_memory(40, PAGE_SIZE * 2), Ok(()));
+            assert_eq!(jobs.memory_usage(40), Ok((0, 0)));
+            assert_eq!(jobs.release_memory(40, PAGE_SIZE), Err(crate::STATUS_INVALID_PARAMETER));
+            assert_eq!(jobs.memory_usage(40), Ok((0, 0)));
+        }
+    }
+
+    #[test]
+    fn memory_release_preserves_other_members_and_high_water_marks() {
+        let mut jobs = JobStore::new();
+        let id = jobs.create(0).unwrap();
+        for (pid, bytes) in [(40, PAGE_SIZE * 2), (44, PAGE_SIZE * 3)] {
+            jobs.assign(id, pid, 0, 0).unwrap();
+            let charge = jobs.prepare_memory_charge(pid, bytes).unwrap().unwrap();
+            jobs.commit_memory_charge(charge).unwrap();
+        }
+        assert_eq!(jobs.release_memory(40, PAGE_SIZE), Ok(()));
+        assert_eq!(jobs.memory_usage(40), Ok((PAGE_SIZE, PAGE_SIZE * 4)));
+        assert_eq!(jobs.memory_usage(44), Ok((PAGE_SIZE * 3, PAGE_SIZE * 4)));
+        let job = jobs.get(id).unwrap();
+        assert_eq!(job.members[0].peak_memory_used, PAGE_SIZE * 2);
+        assert_eq!(job.extended_limits.peak_job_memory_used, PAGE_SIZE * 5);
+        assert_eq!(jobs.release_memory(40, 1), Err(crate::STATUS_INVALID_PARAMETER));
+        assert_eq!(jobs.memory_usage(40), Ok((PAGE_SIZE, PAGE_SIZE * 4)));
+    }
 
     fn zero_times(user_time: i64, kernel_time: i64) -> ProcessTimes {
         ProcessTimes {

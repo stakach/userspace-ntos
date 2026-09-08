@@ -198,14 +198,29 @@ impl ProcessCommitLedger {
         owner: CommitOwnerId,
         bytes: u64,
     ) -> Result<ProcessCommitAccounting, u32> {
+        let accounting = self.released_accounting(owner, bytes)?;
+        let index = self.index(owner).expect("validated release owner");
+        self.records[index].accounting = accounting;
+        Ok(accounting)
+    }
+
+    /// Read-only preflight for a serialized commit shared with a higher-level quota owner.
+    pub fn validate_release(&self, owner: CommitOwnerId, bytes: u64) -> Result<(), u32> {
+        self.released_accounting(owner, bytes).map(|_| ())
+    }
+
+    fn released_accounting(
+        &self,
+        owner: CommitOwnerId,
+        bytes: u64,
+    ) -> Result<ProcessCommitAccounting, u32> {
         Self::validate_page_bytes(bytes)?;
-        let index = self.index(owner).ok_or(STATUS_INVALID_HANDLE)?;
-        let accounting = &mut self.records[index].accounting;
+        let mut accounting = self.accounting(owner).ok_or(STATUS_INVALID_HANDLE)?;
         accounting.current_bytes = accounting
             .current_bytes
             .checked_sub(bytes)
             .ok_or(STATUS_INVALID_PARAMETER)?;
-        Ok(*accounting)
+        Ok(accounting)
     }
 
     pub fn unregister(&mut self, owner: CommitOwnerId) -> Option<ProcessCommitAccounting> {

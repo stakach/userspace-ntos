@@ -1,4 +1,4 @@
-//! Sealed mechanism retirement for an exact pending thread construction.
+//! Sealed mechanism retirement for an exact pending thread owner.
 use crate::thread_construction::{FailedMemorySlot, Role, SlotState, ThreadConstructionInventory};
 use crate::thread_rollback::{
     ThreadRollbackId, ThreadRollbackResource, ThreadRollbackResourceKind,
@@ -15,6 +15,10 @@ pub enum Operation {
 pub enum RetirementError {
     StaleOwner,
     NotConstruction,
+    NotRegistered,
+    NotTransferred,
+    InvalidMechanisms,
+    Projection(u32),
     ConflictingOwnership,
     MemoryRecycle {
         status: u32,
@@ -44,9 +48,17 @@ pub trait ThreadRetirementIo {
 
 /// Consumes constructor mutation authority. Only this actor may suspend/delete/recycle these
 /// slots; neither the inventory nor a completion token can be extracted or replaced.
+/// Registered bundles enter through the same sealed actor only after their exact source handoff.
+///
+/// ```compile_fail
+/// use nt_user_host::thread_retirement::ThreadMechanismRetirement;
+/// fn duplicate(owner: &ThreadMechanismRetirement) -> ThreadMechanismRetirement {
+///     owner.clone()
+/// }
+/// ```
 #[derive(Debug)]
 #[must_use = "retain sealed retirement with its pending thread memory and reservations"]
-pub struct ThreadConstructionRetirement {
+pub struct ThreadMechanismRetirement {
     id: ThreadRollbackId,
     inventory: ThreadConstructionInventory,
     original_slots: [Option<u64>; 4],
@@ -55,7 +67,29 @@ pub struct ThreadConstructionRetirement {
     original_memory_slot: Option<u64>,
 }
 
-impl ThreadConstructionRetirement {
+impl ThreadMechanismRetirement {
+    /// Validate a complete registered bundle without allocating or touching its source owner.
+    pub(crate) fn registered(
+        id: ThreadRollbackId,
+        tcb: u64,
+        slots: [u64; 4],
+    ) -> Result<Self, RetirementError> {
+        if slots[Role::Tcb as usize] != tcb {
+            return Err(RetirementError::InvalidMechanisms);
+        }
+        let mut inventory = ThreadConstructionInventory::empty();
+        for role in [
+            Role::RawCnode,
+            Role::GuardedCnode,
+            Role::Tcb,
+            Role::SchedContext,
+        ] {
+            inventory
+                .adopt_object(role, slots[role as usize])
+                .map_err(|_| RetirementError::InvalidMechanisms)?;
+        }
+        Ok(Self::retain(id, inventory, None))
+    }
     pub(crate) fn retain(
         id: ThreadRollbackId,
         inventory: ThreadConstructionInventory,

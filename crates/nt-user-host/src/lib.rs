@@ -10,6 +10,8 @@
 
 extern crate alloc;
 
+pub mod commit_release;
+
 mod mechanism;
 mod ntdll;
 mod profile;

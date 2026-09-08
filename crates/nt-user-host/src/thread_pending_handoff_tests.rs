@@ -16,12 +16,14 @@ const INVENTORY: [ThreadRollbackResource; 2] = [
 ];
 
 struct Runtime {
+    registered: super::registered_tests::PublishedMechanisms,
     caps: [u64; 2],
     geometry: (usize, u64, u64),
     ready: Rc<Cell<bool>>,
     handoffs: Rc<Cell<usize>>,
     effects: Rc<Cell<usize>>,
 }
+super::registered_tests::delegate!(Runtime, registered);
 
 impl RuntimeMemoryHandoff for Runtime {
     fn clear_memory_projections(
@@ -44,6 +46,20 @@ impl RuntimeMemoryHandoff for Runtime {
 
 fn owner() -> PendingThreadRuntime<Runtime> {
     let runtime = Runtime {
+        registered: super::registered_tests::PublishedMechanisms::new(
+            ThreadRollbackIdentity {
+                pi: 2,
+                pid: 8,
+                process_generation: ProcessGeneration::Hosted(7),
+                tid: 24,
+            },
+            ThreadRuntimeReservations {
+                badge: 4,
+                pool_slot: 3,
+                window_slot: Some(5),
+            },
+            10,
+        ),
         caps: [200, 100],
         geometry: (2, 0x1000, 0x4000),
         ready: Rc::new(Cell::new(true)),
@@ -58,14 +74,17 @@ fn owner() -> PendingThreadRuntime<Runtime> {
             tid: 24,
         },
         10,
-        ThreadRuntimeReservations {
+        Some(ThreadRuntimeReservations {
             badge: 4,
             pool_slot: 3,
             window_slot: Some(5),
-        },
+        }),
         runtime,
     ) {
-        Ok(owner) => owner,
+        Ok(mut owner) => {
+            super::registered_tests::finish_pending(&mut owner);
+            owner
+        }
         Err(_) => panic!("valid retained owner"),
     }
 }
@@ -86,12 +105,7 @@ impl ThreadRollbackIo for BorrowedBackend<'_> {
     fn is_current(&self, id: ThreadRollbackId) -> bool {
         id == self.id
     }
-    fn suspend_tcb(&mut self, _: u64) -> Result<(), u32> {
-        self.effect()
-    }
-    fn delete_tcb(&mut self, _: u64) -> Result<(), u32> {
-        self.effect()
-    }
+
     fn revoke_memory_access(&mut self, _: ThreadRollbackId) -> Result<(), u32> {
         self.effect()
     }
@@ -132,6 +146,11 @@ fn unprepared_and_unarmed_owners_refuse_handoff_or_backend_construction() {
     );
     let effects = owner.runtime().effects.clone();
     let dummy = Runtime {
+        registered: super::registered_tests::PublishedMechanisms::new(
+            id.identity(),
+            owner.reservations().unwrap(),
+            10,
+        ),
         caps: [0; 2],
         geometry: (2, 0, 0),
         ready: Rc::new(Cell::new(true)),

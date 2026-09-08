@@ -1,12 +1,12 @@
 //! Retained runtime ownership before fallible rollback-journal construction.
 use crate::thread_binding::ThreadRuntimeReservations;
 use crate::thread_construction::{FailedMemorySlot, Role, ThreadConstructionInventory};
-use crate::thread_retirement::{RetirementError, ThreadConstructionRetirement, ThreadRetirementIo};
+use crate::thread_retirement::{RetirementError, ThreadMechanismRetirement, ThreadRetirementIo};
 use crate::thread_rollback::{
     new_rollback_id, ThreadRollback, ThreadRollbackError, ThreadRollbackId, ThreadRollbackIdentity,
     ThreadRollbackIo, ThreadRollbackResource, ThreadRollbackStage,
 };
-use crate::thread_slot::RuntimeConstruction;
+use crate::thread_slot::{RuntimeConstruction, RuntimeMechanismHandoff, RuntimeTcbProjection};
 use alloc::vec::Vec;
 
 /// Non-cloneable pending owner. Admission allocates no journal, and every preparation/cleanup
@@ -21,7 +21,7 @@ pub struct PendingThreadRuntime<R> {
     id: ThreadRollbackId,
     mechanisms: PendingMechanisms,
     runtime: R,
-    reservations: ThreadRuntimeReservations,
+    reservations: Option<ThreadRuntimeReservations>,
     rollback: Option<ThreadRollback>,
     // Immutable transfer preflight, never a second per-cap release authority.
     handoff_inventory: Vec<ThreadRollbackResource>,
@@ -48,8 +48,9 @@ pub enum MemoryHandoffError {
 }
 
 enum PendingMechanisms {
-    Registered(u64),
-    Construction(ThreadConstructionRetirement),
+    RegisteredUntransferred(u64),
+    Registered(ThreadMechanismRetirement),
+    Construction(ThreadMechanismRetirement),
 }
 
 struct ProjectionRetirementIo<'a, R, T> {
@@ -57,7 +58,7 @@ struct ProjectionRetirementIo<'a, R, T> {
     backend: &'a mut T,
 }
 
-impl<R: RuntimeConstruction, T: ThreadRetirementIo> ThreadRetirementIo
+impl<R: RuntimeTcbProjection, T: ThreadRetirementIo> ThreadRetirementIo
     for ProjectionRetirementIo<'_, R, T>
 {
     fn is_current(&self, id: ThreadRollbackId) -> bool {
@@ -85,7 +86,7 @@ impl<R> PendingThreadRuntime<R> {
     pub fn retain(
         identity: ThreadRollbackIdentity,
         tcb: u64,
-        reservations: ThreadRuntimeReservations,
+        reservations: Option<ThreadRuntimeReservations>,
         runtime: R,
     ) -> Result<Self, (ThreadRollbackError, R)> {
         if tcb <= 1 {
@@ -97,7 +98,7 @@ impl<R> PendingThreadRuntime<R> {
         };
         Ok(Self {
             id,
-            mechanisms: PendingMechanisms::Registered(tcb),
+            mechanisms: PendingMechanisms::RegisteredUntransferred(tcb),
             runtime,
             reservations,
             rollback: None,
@@ -117,13 +118,13 @@ impl<R> PendingThreadRuntime<R> {
     ) -> Self {
         Self {
             id,
-            mechanisms: PendingMechanisms::Construction(ThreadConstructionRetirement::retain(
+            mechanisms: PendingMechanisms::Construction(ThreadMechanismRetirement::retain(
                 id,
                 inventory,
                 memory_slot,
             )),
             runtime,
-            reservations,
+            reservations: Some(reservations),
             rollback: None,
             handoff_inventory: Vec::new(),
             memory_handed_off: false,
@@ -138,7 +139,7 @@ impl<R> PendingThreadRuntime<R> {
         &self.runtime
     }
 
-    pub fn reservations(&self) -> ThreadRuntimeReservations {
+    pub fn reservations(&self) -> Option<ThreadRuntimeReservations> {
         self.reservations
     }
 
@@ -146,10 +147,76 @@ impl<R> PendingThreadRuntime<R> {
         self.rollback.as_ref()
     }
 
-    pub fn construction_retirement(&self) -> Option<&ThreadConstructionRetirement> {
+    pub fn construction_retirement(&self) -> Option<&ThreadMechanismRetirement> {
         match &self.mechanisms {
             PendingMechanisms::Construction(owner) => Some(owner),
-            PendingMechanisms::Registered(_) => None,
+            _ => None,
+        }
+    }
+
+    pub fn registered_mechanism_retirement(&self) -> Option<&ThreadMechanismRetirement> {
+        match &self.mechanisms {
+            PendingMechanisms::Registered(owner) => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// All validation and engine preparation precede the failure-atomic source projection clear.
+    /// Successful handoff and exact retries allocate nothing and perform no backend operations.
+    pub fn handoff_registered_mechanisms(
+        &mut self,
+        expected: ThreadRollbackId,
+    ) -> Result<(), RetirementError>
+    where
+        R: RuntimeMechanismHandoff,
+    {
+        if expected != self.id {
+            return Err(RetirementError::StaleOwner);
+        }
+        let tcb = match &self.mechanisms {
+            PendingMechanisms::RegisteredUntransferred(tcb) => *tcb,
+            PendingMechanisms::Registered(_) => return Ok(()),
+            PendingMechanisms::Construction(_) => return Err(RetirementError::NotRegistered),
+        };
+        let binding = self.runtime.binding();
+        let identity = self.id.identity();
+        if self.runtime.publication().is_busy()
+            || crate::thread_binding::admit_thread_binding(binding, []).is_err()
+            || binding.tcb != tcb
+            || binding.pi != identity.pi
+            || binding.tid != identity.tid
+            || binding.process.pid != identity.pid
+            || binding.process.generation != identity.process_generation
+            || binding.reservations != self.reservations
+        {
+            return Err(RetirementError::StaleOwner);
+        }
+        let slots = self
+            .runtime
+            .registered_mechanism_slots()
+            .map_err(RetirementError::Projection)?;
+        let owner = ThreadMechanismRetirement::registered(self.id, tcb, slots)?;
+        self.runtime
+            .clear_registered_mechanism_projections(self.id, slots)
+            .map_err(RetirementError::Projection)?;
+        self.mechanisms = PendingMechanisms::Registered(owner);
+        Ok(())
+    }
+
+    pub(crate) fn advance_registered_mechanism_retirement(
+        &mut self,
+        io: &mut impl ThreadRetirementIo,
+    ) -> Result<(), RetirementError>
+    where
+        R: RuntimeTcbProjection,
+    {
+        match &mut self.mechanisms {
+            PendingMechanisms::Registered(owner) => owner.advance(&mut ProjectionRetirementIo {
+                runtime: &mut self.runtime,
+                backend: io,
+            }),
+            PendingMechanisms::RegisteredUntransferred(_) => Err(RetirementError::NotTransferred),
+            PendingMechanisms::Construction(_) => Err(RetirementError::NotRegistered),
         }
     }
 
@@ -165,7 +232,7 @@ impl<R> PendingThreadRuntime<R> {
                 runtime: &mut self.runtime,
                 backend: io,
             }),
-            PendingMechanisms::Registered(_) => Err(RetirementError::NotConstruction),
+            _ => Err(RetirementError::NotConstruction),
         }
     }
 
@@ -179,7 +246,7 @@ impl<R> PendingThreadRuntime<R> {
         &mut self,
         resources: &[ThreadRollbackResource],
     ) -> Result<(), ThreadRollbackError> {
-        self.prepare_journal_with(resources, ThreadRollback::prepare_optional_tcb)
+        self.prepare_journal_with(resources, ThreadRollback::prepare_with_id)
     }
 
     fn prepare_journal_with(
@@ -187,26 +254,26 @@ impl<R> PendingThreadRuntime<R> {
         resources: &[ThreadRollbackResource],
         prepare: impl FnOnce(
             ThreadRollbackId,
-            Option<u64>,
             &[ThreadRollbackResource],
         ) -> Result<ThreadRollback, ThreadRollbackError>,
     ) -> Result<(), ThreadRollbackError> {
         if self.rollback.is_some() {
             return Err(ThreadRollbackError::AlreadyPrepared);
         }
-        let tcb = match &self.mechanisms {
-            PendingMechanisms::Registered(tcb) => Some(*tcb),
-            PendingMechanisms::Construction(owner) => {
+        match &self.mechanisms {
+            PendingMechanisms::RegisteredUntransferred(_) => {
+                return Err(ThreadRollbackError::MechanismsPending)
+            }
+            PendingMechanisms::Construction(owner) | PendingMechanisms::Registered(owner) => {
                 if !owner.is_complete() {
-                    return Err(ThreadRollbackError::ConstructionPending);
+                    return Err(ThreadRollbackError::MechanismsPending);
                 }
                 if owner.conflicts(resources) {
                     return Err(ThreadRollbackError::ConflictingOwnership);
                 }
-                None
             }
-        };
-        let rollback = prepare(self.id, tcb, resources)?;
+        }
+        let rollback = prepare(self.id, resources)?;
         let mut inventory = Vec::new();
         inventory
             .try_reserve_exact(resources.len())
@@ -292,3 +359,7 @@ mod tests;
 #[cfg(test)]
 #[path = "thread_pending_handoff_tests.rs"]
 mod handoff_tests;
+
+#[cfg(test)]
+#[path = "thread_registered_tests.rs"]
+pub(crate) mod registered_tests;

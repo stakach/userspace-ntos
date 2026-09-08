@@ -3163,18 +3163,6 @@ unsafe fn pump_service_win32k_fault(
         crate::win32k_glue::win32k_dispatch_backtrace();
         return false;
     }
-    // The client TEB tail is read-only to win32k; service writes with a private COW shadow.
-    if crate::W32_CLIENT_TEB_TAIL_PROTECTED
-        && (fsr & 0x2) != 0
-        && crate::win32k_glue::w32_attach_mapped(page)
-        && crate::is_teb_tail_page(page)
-    {
-        if crate::win32k_glue::w32_teb_tail_cow(page, ch.client_pi, ch.pml4, ip) {
-            return true;
-        }
-        crate::win32k_glue::win32k_dispatch_backtrace();
-        return false;
-    }
     if foreign {
         pump_service_win32k_foreign_fault(ch, page, demand, fsr)
     } else {

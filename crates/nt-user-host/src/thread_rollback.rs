@@ -1,4 +1,4 @@
-//! Checked ownership for a registered thread whose Ps/handle publication never committed.
+//! Checked memory rollback after separately owned thread mechanisms have retired.
 use crate::process_identity::ProcessGeneration;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -85,8 +85,6 @@ pub struct ThreadRollbackResource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadRollbackStage {
-    Suspend,
-    DeleteTcb,
     RevokeMemoryAccess,
     Aliases,
     Mechanism,
@@ -105,7 +103,7 @@ pub enum ThreadRollbackError {
     StaleOwner,
     AlreadyPrepared,
     NotPrepared,
-    ConstructionPending,
+    MechanismsPending,
     Backend {
         stage: ThreadRollbackStage,
         status: u32,
@@ -116,9 +114,6 @@ pub trait ThreadRollbackIo {
     /// Validate the exact pending rollback owner on every attempt, including its held pool/window
     /// reservations. The runtime is retained but excluded from runnable/resume lookup. No effects.
     fn is_current(&self, id: ThreadRollbackId) -> bool;
-    fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32>;
-    /// Success must acknowledge deletion, not merely suspension. Failure retains the exact cap.
-    fn delete_tcb(&mut self, tcb: u64) -> Result<(), u32>;
     /// Exclude refault/native-copy admission and revoke external mappings before recycling backing.
     /// Reserve any needed bookkeeping first. Partial failure must retain its mapping/registry
     /// journal under this exact attempt for retry. Exclusions must survive through commit and prevent
@@ -166,7 +161,6 @@ pub trait ThreadRollbackIo {
 #[must_use = "retain the rollback owner and its reservations until cleanup completes"]
 pub struct ThreadRollback {
     id: ThreadRollbackId,
-    tcb: u64,
     stage: ThreadRollbackStage,
     resources: Vec<OwnedResource>,
 }
@@ -180,31 +174,15 @@ struct OwnedResource {
 impl ThreadRollback {
     pub fn prepare(
         identity: ThreadRollbackIdentity,
-        tcb: u64,
         resources: &[ThreadRollbackResource],
     ) -> Result<Self, ThreadRollbackError> {
-        Self::prepare_with_id(new_rollback_id(identity)?, tcb, resources)
+        Self::prepare_with_id(new_rollback_id(identity)?, resources)
     }
 
     pub(crate) fn prepare_with_id(
         id: ThreadRollbackId,
-        tcb: u64,
         resources: &[ThreadRollbackResource],
     ) -> Result<Self, ThreadRollbackError> {
-        if tcb <= 1 {
-            return Err(ThreadRollbackError::InvalidCapability);
-        }
-        Self::prepare_optional_tcb(id, Some(tcb), resources)
-    }
-
-    pub(crate) fn prepare_optional_tcb(
-        id: ThreadRollbackId,
-        tcb: Option<u64>,
-        resources: &[ThreadRollbackResource],
-    ) -> Result<Self, ThreadRollbackError> {
-        if tcb.is_some_and(|cap| cap <= 1) {
-            return Err(ThreadRollbackError::InvalidCapability);
-        }
         let mut owned: Vec<OwnedResource> = Vec::new();
         owned
             .try_reserve(resources.len())
@@ -213,9 +191,6 @@ impl ThreadRollback {
             // Zero is the existing runtime resource representation for an absent capability.
             if resource.cap == 0 {
                 continue;
-            }
-            if Some(resource.cap) == tcb {
-                return Err(ThreadRollbackError::ConflictingOwnership);
             }
             if let Some(existing) = owned
                 .iter()
@@ -234,12 +209,7 @@ impl ThreadRollback {
         }
         Ok(Self {
             id,
-            tcb: tcb.unwrap_or(0),
-            stage: if tcb.is_some() {
-                ThreadRollbackStage::Suspend
-            } else {
-                ThreadRollbackStage::RevokeMemoryAccess
-            },
+            stage: ThreadRollbackStage::RevokeMemoryAccess,
             resources: owned,
         })
     }
@@ -256,10 +226,6 @@ impl ThreadRollback {
         self.stage
     }
 
-    pub fn pending_tcb(&self) -> Option<u64> {
-        (self.tcb != 0).then_some(self.tcb)
-    }
-
     pub fn pending_resources(&self) -> impl Iterator<Item = ThreadRollbackResource> + '_ {
         self.resources
             .iter()
@@ -268,7 +234,8 @@ impl ThreadRollback {
     }
 
     /// Drive one serialized attempt. Every successful sub-operation is recorded before the next;
-    /// a retry never suspends a deleted TCB, deletes a recycled cap slot or commits accounting twice.
+    /// a retry never deletes a recycled cap slot or commits accounting twice. Mechanism retirement
+    /// and its TCB suspension/deletion are a separate prerequisite, not callbacks in this actor.
     pub fn advance(&mut self, io: &mut impl ThreadRollbackIo) -> Result<(), ThreadRollbackError> {
         if self.stage == ThreadRollbackStage::Complete {
             return Ok(());
@@ -279,17 +246,6 @@ impl ThreadRollback {
         loop {
             let stage = self.stage;
             let next = match stage {
-                ThreadRollbackStage::Suspend => {
-                    io.suspend_tcb(self.tcb)
-                        .map_err(|status| ThreadRollbackError::Backend { stage, status })?;
-                    ThreadRollbackStage::DeleteTcb
-                }
-                ThreadRollbackStage::DeleteTcb => {
-                    io.delete_tcb(self.tcb)
-                        .map_err(|status| ThreadRollbackError::Backend { stage, status })?;
-                    self.tcb = 0;
-                    ThreadRollbackStage::RevokeMemoryAccess
-                }
                 ThreadRollbackStage::RevokeMemoryAccess => {
                     io.revoke_memory_access(self.id)
                         .map_err(|status| ThreadRollbackError::Backend { stage, status })?;

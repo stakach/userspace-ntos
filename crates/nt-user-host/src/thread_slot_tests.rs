@@ -9,6 +9,33 @@ struct Runtime {
     binding: ThreadBinding<u32>,
     publication: ThreadPublicationSlot,
     drops: Rc<Cell<usize>>,
+    mechanisms: [u64; 4],
+}
+
+impl RuntimeTcbProjection for Runtime {
+    fn clear_retired_tcb_projection(&mut self, cap: u64) -> Result<(), u32> {
+        if self.binding.tcb != cap && self.binding.tcb != 1 {
+            return Err(1);
+        }
+        self.binding.tcb = 1;
+        Ok(())
+    }
+}
+impl RuntimeMechanismHandoff for Runtime {
+    fn registered_mechanism_slots(&self) -> Result<[u64; 4], u32> {
+        Ok(self.mechanisms)
+    }
+    fn clear_registered_mechanism_projections(
+        &mut self,
+        id: ThreadRollbackId,
+        caps: [u64; 4],
+    ) -> Result<(), u32> {
+        if id.identity().tid != self.binding.tid || caps != self.mechanisms {
+            return Err(1);
+        }
+        self.mechanisms = [0; 4];
+        Ok(())
+    }
 }
 
 impl crate::thread_pending::RuntimeMemoryHandoff for Runtime {
@@ -57,6 +84,7 @@ fn runtime(tcb: u64, drops: &Rc<Cell<usize>>) -> Runtime {
         },
         publication: ThreadPublicationSlot::empty(),
         drops: drops.clone(),
+        mechanisms: [9001, 9002, tcb, 9003],
     }
 }
 
@@ -187,6 +215,7 @@ fn ingress_stays_rejected_through_failed_and_completed_cleanup() {
     let (mut slot, drops) = slot(100);
     let binding = slot.owner().unwrap().binding;
     let id = slot.begin_pending(binding).unwrap();
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     slot.prepare_cleanup(id, &[]).unwrap();
     slot.commit_memory_handoff(id).unwrap();
     let mut backend = Backend {
@@ -230,25 +259,14 @@ impl ThreadRollbackIo for Backend {
     fn is_current(&self, id: ThreadRollbackId) -> bool {
         self.current == id
     }
-    fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-        assert_eq!(tcb, 100);
-        assert_eq!(self.effects, 0);
-        self.effects = 1;
-        Ok(())
-    }
-    fn delete_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-        assert_eq!(tcb, 100);
-        assert_eq!(self.effects, 1);
-        self.effects = 2;
-        Ok(())
-    }
+
     fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
         assert_eq!(id, self.current);
-        assert_eq!(self.effects, 2);
+        assert_eq!(self.effects, 0);
         if self.fail_revoke {
             return Err(0xc000_009a);
         }
-        self.effects = 3;
+        self.effects = 1;
         Ok(())
     }
     fn unmap_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
@@ -266,9 +284,9 @@ impl ThreadRollbackIo for Backend {
     }
     fn commit_rollback(&mut self, id: ThreadRollbackId) {
         assert_eq!(id, self.current);
-        assert_eq!(self.effects, 3);
+        assert_eq!(self.effects, 1);
         assert_eq!(self.drops.get(), 0);
-        self.effects = 4;
+        self.effects = 2;
     }
 }
 
@@ -395,16 +413,29 @@ fn stale_admission_does_not_move_the_original_runtime() {
 }
 
 #[test]
-fn missing_reservations_do_not_transfer_an_external_runtime() {
+fn main_runtime_without_pool_reservations_retains_explicit_none_through_cleanup() {
     let (mut slot, drops) = slot(100);
     slot.ordinary_mut().unwrap().binding.reservations = None;
     let binding = slot.owner().unwrap().binding;
-    assert_eq!(
-        slot.begin_pending(binding),
-        Err(SlotError::MissingReservations)
-    );
-    assert!(slot.executable().is_some());
+    let id = slot.begin_pending(binding).unwrap();
+    assert_eq!(slot.pending().unwrap().reservations(), None);
+    assert!(slot.executable().is_none());
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
+    slot.prepare_cleanup(id, &[]).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
+    let mut io = Backend {
+        current: id,
+        drops: drops.clone(),
+        effects: 0,
+        fail_revoke: false,
+    };
+    slot.advance_cleanup(id, &mut io).unwrap();
+    assert_eq!(slot.pending().unwrap().reservations(), None);
+    let retired = slot.take_retired_payload(id).unwrap();
+    assert_eq!(retired.binding.reservations, None);
     assert_eq!(drops.get(), 0);
+    drop(retired);
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]
@@ -426,6 +457,7 @@ fn invalid_cleanup_inventory_preserves_pending_owner_for_retry() {
     let (mut slot, drops) = slot(100);
     let binding = slot.owner().unwrap().binding;
     let id = slot.begin_pending(binding).unwrap();
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     assert_eq!(
         slot.prepare_cleanup(
             id,
@@ -441,6 +473,7 @@ fn invalid_cleanup_inventory_preserves_pending_owner_for_retry() {
     assert_eq!(slot.pending().unwrap().id(), id);
     assert!(slot.pending().unwrap().cleanup().is_none());
     assert_eq!(drops.get(), 0);
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     slot.prepare_cleanup(id, &[]).unwrap();
     slot.commit_memory_handoff(id).unwrap();
     assert_eq!(slot.pending().unwrap().cleanup().unwrap().id(), id);
@@ -461,18 +494,22 @@ fn failed_cleanup_retains_slot_and_completed_cleanup_retires_once() {
         slot.advance_cleanup(id, &mut io),
         Err(SlotError::Cleanup(ThreadRollbackError::NotPrepared))
     );
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     slot.prepare_cleanup(id, &[]).unwrap();
     slot.commit_memory_handoff(id).unwrap();
     assert!(slot.advance_cleanup(id, &mut io).is_err());
-    assert_eq!(io.effects, 2);
+    assert_eq!(io.effects, 0);
     assert!(slot.take_retired_payload(id).is_none());
     assert!(slot.is_pending() && slot.is_protected());
-    assert_eq!(slot.owner().unwrap().binding, binding);
+    assert_eq!(
+        slot.owner().unwrap().binding,
+        ThreadBinding { tcb: 1, ..binding }
+    );
     assert_eq!(drops.get(), 0);
     io.fail_revoke = false;
     slot.advance_cleanup(id, &mut io).unwrap();
     slot.advance_cleanup(id, &mut io).unwrap();
-    assert_eq!(io.effects, 4);
+    assert_eq!(io.effects, 2);
     assert!(slot.is_pending());
     assert!(slot.release_published().is_none());
     let retired = slot.take_retired_payload(id).unwrap();
@@ -493,9 +530,10 @@ fn stale_cleanup_backend_cannot_affect_the_retained_slot() {
     let (mut slot, drops) = slot(100);
     let binding = slot.owner().unwrap().binding;
     let id = slot.begin_pending(binding).unwrap();
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     slot.prepare_cleanup(id, &[]).unwrap();
     slot.commit_memory_handoff(id).unwrap();
-    let other = crate::thread_rollback::ThreadRollback::prepare(id.identity(), 100, &[]).unwrap();
+    let other = crate::thread_rollback::ThreadRollback::prepare(id.identity(), &[]).unwrap();
     let mut io = Backend {
         current: other.id(),
         drops: drops.clone(),
@@ -553,7 +591,7 @@ fn stale_attempt_cannot_prepare_drive_or_retire_a_replacement_owner() {
     let (mut slot, drops) = slot(100);
     let binding = slot.owner().unwrap().binding;
     let id = slot.begin_pending(binding).unwrap();
-    let foreign = crate::thread_rollback::ThreadRollback::prepare(id.identity(), 100, &[])
+    let foreign = crate::thread_rollback::ThreadRollback::prepare(id.identity(), &[])
         .unwrap()
         .id();
     let mut io = Backend {
@@ -566,13 +604,17 @@ fn stale_attempt_cannot_prepare_drive_or_retire_a_replacement_owner() {
         slot.prepare_cleanup(foreign, &[]),
         Err(SlotError::OwnerChanged)
     );
-    assert_eq!(slot.commit_memory_handoff(foreign), Err(SlotError::OwnerChanged));
+    assert_eq!(
+        slot.commit_memory_handoff(foreign),
+        Err(SlotError::OwnerChanged)
+    );
     assert_eq!(
         slot.advance_cleanup(foreign, &mut io),
         Err(SlotError::OwnerChanged)
     );
     assert_eq!(io.effects, 0);
     assert!(slot.pending().unwrap().cleanup().is_none());
+    crate::thread_pending::registered_tests::finish_slot(&mut slot, id);
     slot.prepare_cleanup(id, &[]).unwrap();
     slot.commit_memory_handoff(id).unwrap();
     slot.advance_cleanup(id, &mut io).unwrap();

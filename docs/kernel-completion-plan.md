@@ -30077,6 +30077,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     main routes use setup_env=true/start_immediately=false, and the diagnostic with no environment
     cannot accidentally publish the ordinary TEB constant. No legacy setter or binder remains.
 
+    B3 registered retirement and canonical TEB ownership tranche 142 (2026-09-09, accepted):
+    registered runtimes now have an allocation-free, exact-owner mechanism handoff into the shared
+    ThreadMechanismRetirement engine. Validate the full binding and four live role caps before the
+    failure-atomic source projection clear. Construction and registered provenance remain distinct;
+    a registered owner cannot prepare memory cleanup until TCB/SC/CNode retirement completes. Main
+    runtimes preserve explicit None reservations, never fabricated pool/window holds. Separate TCB
+    deletion, projection clearing and allocator acknowledgments prevent retry from deleting a reused
+    slot. Remove the superseded TCB fields/stages/callbacks from the memory rollback engine.
+
+    Fix job-memory release so both process and aggregate subtraction validate before either write.
+    MM and Ps expose read-only release preflights; the shared host-tested commit_release adapter
+    validates both ledgers and holds exclusive borrows through the no-IPC, allocation-free debit.
+    Native release_process_commit now uses it. A rejected job debit cannot leave MM already debited,
+    and rejected MM ownership cannot change job counters. Physical/VAD ownership is still the
+    caller's responsibility; this adapter does not infer absent charges or retire address ranges.
+
+    Review found and removed the historical TEB-tail COW workaround, rather than retaining another
+    synthetic memory owner. It discarded permanent real/shadow alias and paging-cap identities,
+    then reused a (PI, VA) shadow record without checking that its source still named current backing.
+    Pool reuse could expose unrelated frames through those stale root aliases. This also qualified
+    tranche 140's never-run argument: a failed fresh thread cannot create a shadow, but previously
+    reused windows could inherit one. Fresh kernels can no longer create this untracked alias class.
+
+    ReactOS winsta.c's NtCurrentTeb/StaticUnicodeString scratch path writes the caller's real TEB.
+    Remove shadow allocation/cache/PT ownership, VA-only tail classification, special RO/COW fault
+    dispatch and GDI temporary RW/restore-RO windows. TEBs use the existing canonical attachment
+    path, with section rights unchanged. Remove the obsolete protection-attribution success gate,
+    and retain only actual GDI flush/count/offset metrics and read-only descriptor/canary corruption
+    observations. Remove protected-tail constructor provenance from the host model as well. This
+    is not proof that the original corrupting writer was fixed; genuine corruption must remain
+    visible and be investigated at the real ABI/current-thread/attachment boundary, not hidden.
+
+    Serialized validation passes 1,042 unit tests, 49 integration tests and seven compile-fail
+    checks in .tmp/test-registered-thread-retirement-20260909.log; native release build passes in
+    .tmp/build-registered-thread-retirement-20260909.log. The registered mechanism path includes an
+    actual allocation-counted handoff/retirement test. Read-only review found no introduced owner/
+    retry blocker. Ordinary native teardown is deliberately not activated yet: GUI outcomes and
+    charged fixed/dynamic VAD ownership below remain required. No fresh NT boot or desktop proof.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a
@@ -30086,6 +30125,19 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     entry/completion outcomes across owner-out IPC so an entered but incomplete call is not replayed.
     Replace the common termination funnel only after these owners are complete, and migrate the
     remote-breakin diagnostic bypass too. Pool/window reuse and accounting release remain last.
+
+    GUI refinement: an entered THREAD_EXIT/PROCESS_EXIT may report failure after the real callout
+    mutated state. Record that as indeterminate, not an ordinary negative return that permits replay.
+    Freeze the expected W32 pointers, lifetime and EXIT flags in separate retained thread/process
+    owners before IPC; accepted outcomes survive later local clear failures. Ordinary logical-caller
+    admission rejects Pending runtimes, so add explicit exact retirement dispatch authority or a
+    pre-pending teardown ingress barrier; do not bypass ordinary caller validation.
+    VAD refinement: retain selected allocation/range evidence, not whole global scratch maps that
+    could overwrite unrelated updates on retry. An exact pending-range permit must bypass only its
+    own exclusion while preserving foreign pending, scratch, backing and provider checks. Dynamic
+    pages require resident and pagefile acknowledgments; fixed pages already belong to the memory
+    rollback journal and must not be reclaimed twice. Final range removal and checked MM/job debit
+    follow complete physical retirement, before releasing runtime and address reservations.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

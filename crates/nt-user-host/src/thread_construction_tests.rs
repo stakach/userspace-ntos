@@ -27,14 +27,12 @@ fn registry_publication_coverage_is_independent_of_remaining_registry_rows() {
     progress.record_stack(0);
     progress.record_stack(2);
     progress.record_teb(1);
-    progress.record_protected_tail();
     assert!(!progress.is_empty());
     for index in 0..4 {
         assert_eq!(progress.stack_registered(index), index == 0 || index == 2);
     }
     assert!(!progress.teb_registered(0));
     assert!(progress.teb_registered(1));
-    assert!(progress.protected_tail_registered());
     assert_eq!(progress.empty_slot(), None);
 }
 
@@ -108,7 +106,10 @@ fn observation_rejects_deleted_slot_and_preserves_cleanup_progress() {
     assert_eq!(inventory.live_slots(), Err(InventoryError::InvalidPhase));
     assert_eq!(inventory.entries().collect::<Vec<_>>(), before);
     inventory.acknowledge_recycle(Role::Tcb, 102).unwrap();
-    assert_eq!(inventory.next_retirement(), Some((Role::GuardedCnode, SlotState::LiveObject(101))));
+    assert_eq!(
+        inventory.next_retirement(),
+        Some((Role::GuardedCnode, SlotState::LiveObject(101)))
+    );
 }
 
 #[test]

@@ -4696,7 +4696,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     mapped_section_writecopy_cow_spec(passed);
     image_writecopy_cow_spec(passed);
     vm_pool_headroom_spec(passed);
-    unsafe { teb_tail_protected_spec(passed) };
+    unsafe { teb_tail_snapshot_diagnostic() };
     unsafe { lsarpc_connection_worker_spec(passed) };
     unsafe { gdi_user_batch_flush_spec(passed) };
     unsafe { profile_ntuser_dat_spec(passed) };
@@ -5547,7 +5547,6 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
     let flushes = GDI_BATCH_FLUSHES.load(Ordering::Relaxed);
     let records = GDI_BATCH_RECORDS_FLUSHED.load(Ordering::Relaxed);
     let failures = GDI_BATCH_FLUSH_FAILURES.load(Ordering::Relaxed);
-    let write_windows = GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.load(Ordering::Relaxed);
     let max_offset = GDI_BATCH_MAX_OFFSET.load(Ordering::Relaxed);
     let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
     let ntrpc = core::ptr::read_volatile((tail + 0x698) as *const u64);
@@ -5564,8 +5563,6 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
     print_u64(records);
     print_str(b" failures=");
     print_u64(failures);
-    print_str(b" tail-write-windows=");
-    print_u64(write_windows);
     print_str(b" max-Offset=0x");
     print_hex(max_offset as u32);
     print_str(b"/0x");
@@ -5587,7 +5584,6 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
             && flushes >= 1
             && records >= 1
             && failures == 0
-            && write_windows >= 1
             && max_offset <= GDI_BATCH_BUF_SIZE as u64
             && live_offset <= GDI_BATCH_BUF_SIZE
             && ntrpc_ok
@@ -5599,54 +5595,12 @@ unsafe fn gdi_user_batch_flush_spec(passed: &mut u64) {
     );
 }
 
-/// ═══ ★ THE CLIENT TEB TAIL SURVIVES TO THE GATE, AND win32k IS EXONERATED ══════════════════════
-///
-/// ★ THE PREVIOUS TWO BATCHES' ATTRIBUTION WAS WRONG, AND THIS SPEC IS WRITTEN AROUND THE
-/// MEASUREMENT THAT REFUTES IT. Batch 53 (the `ACTIVATION_CONTEXT_STACK` at `TEB+0x1800`) and batch
-/// 59 (`StaticUnicodeString` at `TEB+0x1258`, whose kernel32 `fileutils.c:26` `int 3` killed
-/// winlogon) both blamed win32k, on the strength of the clobbered bytes LOOKING like USER server
-/// data (`0x00c8d0d4` = `COLOR_BTNFACE`). Three independent measurements say otherwise:
-///
-///  1. `W32_TEB_TAIL_RO_MAPS == 0` — the tail page is NEVER handed to win32k at all. It is
-///     registered as a client frame, but no win32k demand fault ever asks for it, so
-///     `map_csrss_page_into_win32k` never runs for it;
-///  2. `W32_TEB_TAIL_WRITE_FAULTS == 0` — with the page mapped READ-ONLY into win32k (the class fix
-///     below), win32k never once took an unexpected store fault on it. The registered
-///     `NtGdiFlushUserBatch` callout has a narrow write-through window for `TEB.GdiBatchCount`;
-///  3. the frame is not ALIASED (`teb_tail_alias_scan`: exactly ONE registration, the legitimate
-///     one), and the good→bad transition never straddled a win32k dispatch — sampled before AND
-///     after every dispatch, at the single funnel every nested dispatch also goes through. It only
-///     ever appeared across the window in which the CLIENT runs.
-///
-/// So two things ship. **The class fix**: the tail page is mapped read-only into win32k and the
-/// first store is copy-on-written into a private shadow, which makes the whole mapping-borne class
-/// structurally impossible — measured cost zero, and its counters are what proves win32k innocent
-/// rather than merely unaccused. **The enforced invariant**: the page is also mapped read-only in
-/// WINLOGON's own VSpace, `RtlNtStatusToDosError`'s `TEB.LastStatusValue` store (derived at boot from
-/// the loaded ntdll image, because this RVA moves across builds) is emulated in place so the
-/// protection stays continuously armed, every other client store is reported with its RIP, and the
-/// descriptor invariant is re-asserted on every service-loop event.
-///
-/// The assertions, and why each generalises:
-///  * the 64-byte spawn CANARY at `TEB+0x1FC0` is byte-for-byte what the spawn wrote. ★ THIS is the
-///    clause that catches a field NOBODY HAS THOUGHT OF YET — nothing writes there, so any stray
-///    store into the tail's unused region breaks it, instead of waiting to be discovered by the next
-///    `int 3`;
-///  * `StaticUnicodeString.MaximumLength == 522` and `.Buffer == TEB+0x1268` at the gate — the exact
-///    shape kernel32 asserts, read from winlogon's LIVE tail;
-///  * `TEB+0x2C8` still addresses the private ACS page (batch 53's fix is still standing);
-///  * win32k took ZERO unexpected stores on it; the allowed GDI batch-count clear is counted by
-///    `GDI_BATCH_TEB_TAIL_WRITE_WINDOWS`.
-unsafe fn teb_tail_protected_spec(passed: &mut u64) {
+/// Read-only observation of the real client TEB; this does not attribute corruption to a writer.
+unsafe fn teb_tail_snapshot_diagnostic() {
     let tail = WINLOGON_MAIN_TEB_MIRROR_VA + 0x5000;
     let maximum_length = core::ptr::read_volatile((tail + 0x25a) as *const u16);
     let buffer = core::ptr::read_volatile((tail + 0x260) as *const u64);
-    let canary = teb_tail_canary_intact(tail);
     let actctx = core::ptr::read_volatile((WINLOGON_MAIN_TEB_MIRROR_VA + 0x2c8) as *const u64);
-    let write_faults = W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed);
-    let batch_write_windows = GDI_BATCH_TEB_TAIL_WRITE_WINDOWS.load(Ordering::Relaxed);
-    let ro_maps = W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed);
-    let repairs = TEB_TAIL_REPAIRS.load(Ordering::Relaxed);
     print_str(b"[teb-tail] winlogon MaximumLength=");
     print_u64(maximum_length as u64);
     print_str(b" Buffer=0x");
@@ -5654,31 +5608,12 @@ unsafe fn teb_tail_protected_spec(passed: &mut u64) {
     print_str(b" expected=0x");
     print_hex_u64(SMSS_TEB_VA + 0x1268);
     print_str(b" canary=");
-    print_u64(canary as u64);
+    print_u64(teb_tail_canary_intact(tail) as u64);
     print_str(b" actctx=0x");
     print_hex_u64(actctx);
-    print_str(b" | win32k ro-maps=");
-    print_u64(ro_maps);
-    print_str(b" store-faults=");
-    print_u64(write_faults);
-    print_str(b" gdi-write-windows=");
-    print_u64(batch_write_windows);
-    print_str(b" shadows=");
-    print_u64(W32_TEB_TAIL_SHADOWS.load(Ordering::Relaxed));
-    print_str(b" descriptor-restores=");
-    print_u64(repairs);
+    print_str(b" corrupt-observations=");
+    print_u64(TEB_TAIL_CORRUPT_OBSERVATIONS.load(Ordering::Relaxed));
     print_str(b"\n");
-    check(
-        b"exec_teb_not_clobbered_by_win32k",
-        canary
-            && maximum_length == 522
-            && buffer == SMSS_TEB_VA + 0x1268
-            && actctx == ACS_PAGE_VA
-            // win32k, the accused, never took an unexpected store path. The only legitimate
-            // write-through is `NtGdiFlushUserBatch` clearing `TEB.GdiBatchCount`.
-            && write_faults == 0,
-        passed,
-    );
 }
 
 /// ═══ ★ winlogon's `\pipe\lsarpc` BIND GETS A REAL SERVER THREAD, AND THE LOOP CANNOT HANG ═══════
@@ -10822,31 +10757,13 @@ pub(crate) unsafe fn require_vspace_asid(pml4: u64, owner: &[u8]) {
     }
 }
 
-// --- THE CLIENT TEB TAIL IS SERVER-WRITABLE, SO ITS INVARIANTS MUST BE RE-ASSERTED ---------------
-/// Times [`reassert_client_teb_tail`] checked, and times it really had to REPAIR the invariant.
-pub(crate) static TEB_TAIL_REASSERTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TEB_TAIL_REPAIRS: AtomicU64 = AtomicU64::new(0);
-/// The first bad `MaximumLength` observed (0xFFFF = none), so a repair is evidence, not a guess.
+// Read-only client TEB descriptor observations.
+pub(crate) static TEB_TAIL_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEB_TAIL_CORRUPT_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+/// The first bad MaximumLength observed (0xFFFF = none).
 pub(crate) static TEB_TAIL_FIRST_BAD: AtomicU64 = AtomicU64::new(0xFFFF);
 
-/// Re-assert `TEB.StaticUnicodeString` for a hosted process's MAIN thread.
-///
-/// ★ WHY THIS EXISTS. Both TEB pages of a GUI client are deliberately registered as win32k client
-/// frames (the `KeStackAttachProcess` model — win32k dereferences the caller's TEB directly), so
-/// win32k writes SERVER-side data straight through them; batch 53 measured winlogon's whole 2nd TEB
-/// page coming back overwritten with USER metrics spanning `TEB+0x1000..0x18B8`. The x64 TEB tail
-/// also holds `StaticUnicodeString` (`TEB+0x1258`), the fixed per-thread `UNICODE_STRING` the loader
-/// and kernel32 convert names into — and kernel32 ASSERTs `MaximumLength == sizeof(StaticUnicodeBuffer)`
-/// (`kernel32/client/file/fileutils.c:26`). That assertion is an `int 3`, so a clobbered field kills
-/// the process the first time it takes a `Rtl*` path through fileutils — which is exactly where
-/// batch 59's advanced profile flow ended up (`cpu-exception(3)` at `ntdll+0x34477`).
-///
-/// The repair goes through the executive's PERSISTENT alias of the client's 2nd TEB page
-/// (`scratch_base + 0x5000`, mapped at spawn and never unmapped), the same technique the callback
-/// window cache re-assert uses. Idempotent, and a no-op on every dispatch that did not clobber it.
-///
-/// `pi` selects the process's ENV-SCRATCH base — the `scr_base` its `spawn_sec_image` was given,
-/// which is NOT `procs[pi].scratch_base` (that is the per-process demand-fill window).
+/// Select the process's environment scratch base, distinct from its demand-fill window.
 pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
     hosted_env_scratch_base_for_pi(pi)
 }
@@ -10876,9 +10793,8 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
 // **Our host never did that step.** So `Offset` grew without bound and `GdiAllocBatchCommand`
 // marched GDI batch records straight through the caller's TEB: `Win32ClientInfo` (0x800),
 // `StaticUnicodeString` (0x1258 — `Offset` 0xF58), the TLS slots (0x1480) and `ReservedForNtRpc`
-// (0x1698 — `Offset` 0x1398). That is the single root cause of the whole TEB-clobber family, and it
-// is why win32k was measurably innocent every time it was accused (`w32 ro-maps = 0`,
-// `store-faults = 0`): the writer was always the CLIENT's own gdi32, in the client's own window.
+// (0x1698, Offset 0x1398). The batching path therefore needs the real kernel flush step.
+// These historical observations do not prove that all possible corruption writers are fixed.
 //
 // **The fix is the kernel step, at the kernel's site, done by the kernel.** The executive is what
 // plays `KiSystemCallHandler` for a hosted process' win32k syscalls, so it observes the caller's
@@ -10886,10 +10802,6 @@ pub(crate) fn env_scratch_base_for_pi(pi: usize) -> u64 {
 // `WIN32_CALLOUTS_FPNS.BatchFlushRoutine`. That routine walks the records, draws them, and clears
 // `GdiTebBatch.Offset` / `.HDC` / `GdiBatchCount`, just like ReactOS expects.
 //
-// The one host-specific wrinkle is the TEB-tail protection below: `GdiBatchCount` lives on the
-// second TEB page, which ordinary win32k dispatches see read-only. During this one registered
-// callout the bridge maps that page writable, then restores the normal read-only policy before the
-// next dispatch.
 /// Ship switch for the `KeGdiFlushUserBatch` kernel step (bypass control).
 pub(crate) const GDI_USER_BATCH_FLUSH: bool = true;
 /// ★ WHAT BOUNDING `Offset` COSTS, MEASURED — and why the flush executes the records it finds.
@@ -10917,8 +10829,6 @@ pub(crate) static GDI_BATCH_FLUSHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GDI_BATCH_RECORDS_FLUSHED: AtomicU64 = AtomicU64::new(0);
 /// Calls to the registered win32k batch flush routine that failed or walled.
 pub(crate) static GDI_BATCH_FLUSH_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Narrow writable mappings opened for `TEB.GdiBatchCount` while `NtGdiFlushUserBatch` runs.
-pub(crate) static GDI_BATCH_TEB_TAIL_WRITE_WINDOWS: AtomicU64 = AtomicU64::new(0);
 /// High-water `GdiTebBatch.Offset` ever OBSERVED at a win32k system call. With the kernel step in
 /// place this must stay `<= GDI_BATCH_BUF_SIZE`; without it, it grew past the TEB's second page.
 pub(crate) static GDI_BATCH_MAX_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -11000,10 +10910,7 @@ pub(crate) unsafe fn ke_gdi_flush_user_batch(
     }
 }
 
-///
-/// Kept as a TRIPWIRE now that the CLASS fix (`W32_CLIENT_TEB_TAIL_PROTECTED`, below) exists: with
-/// the tail no longer part of win32k's writable client-frame surface this must never fire, and
-/// `TEB_TAIL_REPAIRS` is asserted zero by `exec_teb_tail_protected_from_win32k`.
+/// Observe the real client's descriptor without repairing it or attributing the writer.
 pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
     let env_scratch = env_scratch_base_for_pi(pi);
     let Some(live_row) = teb_tail_alias_live_row(pi) else {
@@ -11016,7 +10923,7 @@ pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
     const STATIC_UNICODE_STRING: u64 = 0x258; // TEB+0x1258, i.e. offset 0x258 of the 2nd TEB page
     const MAXIMUM_LENGTH: u16 = 522; // sizeof(StaticUnicodeBuffer) = 261 * sizeof(WCHAR)
     let tail = env_scratch + 0x5000 + STATIC_UNICODE_STRING;
-    TEB_TAIL_REASSERTS.fetch_add(1, Ordering::Relaxed);
+    TEB_TAIL_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
     let max = core::ptr::read_volatile((tail + 2) as *const u16);
     let buffer = core::ptr::read_volatile((tail + 8) as *const u64);
     if max == MAXIMUM_LENGTH && buffer == SMSS_TEB_VA + 0x1268 {
@@ -11028,8 +10935,8 @@ pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
         Ordering::Relaxed,
         Ordering::Relaxed,
     );
-    if TEB_TAIL_REPAIRS.fetch_add(1, Ordering::Relaxed) < 4 {
-        print_str(b"[teb-tail] StaticUnicodeString CLOBBERED by win32k (MaximumLength=");
+    if TEB_TAIL_CORRUPT_OBSERVATIONS.fetch_add(1, Ordering::Relaxed) < 4 {
+        print_str(b"[teb-tail] StaticUnicodeString corrupted (MaximumLength=");
         print_u64(max as u64);
         print_str(b" Buffer=0x");
         print_hex((buffer >> 32) as u32);
@@ -11038,38 +10945,6 @@ pub(crate) unsafe fn observe_client_teb_tail(pi: usize) {
     }
 }
 
-// ═══ ★ THE CLIENT TEB TAIL IS NOT PART OF win32k's WRITABLE CLIENT-FRAME SURFACE ════════════════
-//
-// THE CLASS, not the field. Twice now a win32k dispatch has come back having overwritten the
-// CALLER's second TEB page: batch 53 lost the `ACTIVATION_CONTEXT_STACK` that used to live at
-// `TEB+0x1800` (fixed by moving the ACS to a private page — a FIELD fix), and batch 59 lost
-// `TEB.StaticUnicodeString` at `TEB+0x1258`, which kernel32 `fileutils.c:26` ASSERTs on and whose
-// `int 3` killed winlogon. `StaticUnicodeString` sits at a FIXED x64 TEB offset and cannot be moved,
-// so a third field was guaranteed. The *shape* of the bug is the mapping, not any one field:
-//
-//   `spawn_sec_image` / `spawn_hosted_thread` register BOTH TEB pages with `csrss_frame_put`, so a
-//   win32k demand fault at either VA is answered with the client's OWN frame, mapped RW at the same
-//   VA (`map_csrss_page_into_win32k`, the KeStackAttachProcess model). Anything win32k stores at
-//   `TEB+0x1000..0x1FFF` therefore lands in the client's real TEB.
-//
-// win32k has legitimate business in TEB page ONE — `CLIENTINFO` at `TEB+0x800` and
-// `Win32ThreadInfo` at `TEB+0x78` are exactly what the model exists for, and both stay RW-shared.
-// In page TWO the only field ReactOS' win32k touches by contract is `StaticUnicodeString`, and it
-// touches it as SCRATCH: `BuildUserModeWindowStationName` (`win32ss/user/ntuser/winsta.c:649`)
-// borrows the caller's `StaticUnicodeBuffer` to format `\Windows\WindowStations\Service-0x..-..$`
-// for its own `ObOpenObjectByName`, and the client never reads the result back. Every other write
-// there is server state that has no business in a user TEB at all.
-//
-// So the tail page is mapped into win32k **READ-ONLY**, and the FIRST write fault on it is answered
-// with a private **copy-on-write shadow** seeded from the client's live page. win32k keeps reading
-// consistent values (including a `StaticUnicodeString.Buffer` that still points into its own view of
-// the tail) and keeps writing wherever it likes — into the shadow. The client's real TEB tail
-// becomes STRUCTURALLY unreachable for a win32k store, which retires the whole class: no future
-// field can be scribbled, because no byte of the page can. The shadow rides the ordinary attach
-// table, so a client switch drops it and the next fault re-establishes the read-only view of the
-// (by then current) real page.
-/// Ship switch for the class fix — `false` restores the RW-shared tail and the clobber comes back.
-pub(crate) const W32_CLIENT_TEB_TAIL_PROTECTED: bool = true;
 /// `page_map` rights: bit1 = read, bit0 = write. Read-only + non-executable.
 pub(crate) const RO_NX: u64 = 2 | PAGE_EXECUTE_NEVER;
 /// The 64-byte spawn CANARY at the very end of every hosted thread's second TEB page
@@ -11148,10 +11023,6 @@ pub(crate) unsafe fn teb_tail_alias_scan(pi: usize) {
     print_u64(aliases);
     print_str(b"\n");
 }
-
-/// Tail pages that were really mapped READ-ONLY into win32k. Without this the "win32k took zero
-/// write faults" reading would be unfalsifiable — it could just mean win32k never touched the page.
-pub(crate) static W32_TEB_TAIL_RO_MAPS: AtomicU64 = AtomicU64::new(0);
 
 // --- TAIL WATCH: WHICH EVENT turns the tail bad? -------------------------------------------------
 /// Each process' MAIN-thread TEB tail frame cap, so a transition report can ask the decisive
@@ -11343,11 +11214,7 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
             print_u64(prev_tag);
             print_str(b" aux=0x");
             print_hex_u64(prev_aux);
-            print_str(b") w32-ro-maps=");
-            print_u64(W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed));
-            print_str(b" w32-store-faults=");
-            print_u64(W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed));
-            print_str(b" neighbours 0x1680..0x16b0:");
+            print_str(b") neighbours 0x1680..0x16b0:");
             let mut off = 0u64;
             while off < 0x30 {
                 print_str(b" ");
@@ -11385,10 +11252,6 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
     print_u64(max as u64);
     print_str(b" Buffer=0x");
     print_hex_u64(buffer);
-    print_str(b" win32k-ro-maps=");
-    print_u64(W32_TEB_TAIL_RO_MAPS.load(Ordering::Relaxed));
-    print_str(b" win32k-store-faults=");
-    print_u64(W32_TEB_TAIL_WRITE_FAULTS.load(Ordering::Relaxed));
     print_str(b" PREV-observation tag=");
     print_u64(TEB_WATCH_LAST_TAG.load(Ordering::Relaxed));
     print_str(b" aux=0x");
@@ -11409,288 +11272,6 @@ pub(crate) unsafe fn teb_tail_watch(pi: usize, tag: u64, aux: u64, aux2: u64) {
     print_str(b"\n");
 }
 
-/// Registered client TEB **tail** page VAs (the second page of every hosted thread's TEB). VAs
-/// repeat across VSpaces by design, so this is a small de-duplicated VA set, not a (pi, VA) table.
-static mut TEB_TAIL_PAGES: Option<Vec<u64>> = None;
-
-unsafe fn teb_tail_pages_mut() -> &'static mut Vec<u64> {
-    let slot = &mut *core::ptr::addr_of_mut!(TEB_TAIL_PAGES);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().expect("initialized above")
-}
-
-/// Record `page` as a client TEB tail page (called by BOTH spawn paths, next to the
-/// `csrss_frame_put` that makes it reachable from win32k at all).
-pub(crate) unsafe fn teb_tail_register(page: u64) -> bool {
-    let pages = teb_tail_pages_mut();
-    if pages.iter().any(|entry| *entry == page) {
-        return true;
-    }
-    if pages.try_reserve(1).is_err() {
-        print_str(b"[teb-tail] page registry allocation failed page=0x");
-        print_hex((page >> 32) as u32);
-        print_hex(page as u32);
-        print_str(b"\n");
-        return false;
-    }
-    pages.push(page);
-    true
-}
-pub(crate) unsafe fn is_teb_tail_page(page: u64) -> bool {
-    (&*core::ptr::addr_of!(TEB_TAIL_PAGES))
-        .as_ref()
-        .is_some_and(|pages| pages.iter().any(|entry| *entry == page))
-}
-
-/// Copy-on-write shadows of client TEB tail pages, keyed by (pi, page). Each entry keeps a
-/// PERMANENT pair of executive aliases — the client's real frame and the shadow — so re-seeding a
-/// shadow is a plain 4 KiB copy with no further capability work.
-/// Executive alias window for those pairs: a free 2 MiB page-table slot between `NTDLLBUF`
-/// (`0x1440_0000` + 480 frames) and the file-buffer `POOL` (`0x1500_0000`).
-pub const TEB_TAIL_ALIAS_BASE: u64 = 0x0000_0100_1460_0000;
-const TEB_TAIL_ALIAS_WINDOW_PAGES: usize = 512;
-
-#[derive(Clone, Copy)]
-struct TebTailShadowRecord {
-    pi: u64,
-    page: u64,
-    frame: u64,
-}
-
-static mut TEB_TAIL_SHADOW_RECORDS: Option<Vec<TebTailShadowRecord>> = None;
-static TEB_TAIL_ALIAS_PT: AtomicU64 = AtomicU64::new(0);
-/// win32k write faults on a protected tail page (each one is a scribble that DIDN'T happen).
-pub(crate) static W32_TEB_TAIL_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
-/// Shadows created, and re-seeds (a shadow re-established after a client switch dropped it).
-pub(crate) static W32_TEB_TAIL_SHADOWS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static W32_TEB_TAIL_RESEEDS: AtomicU64 = AtomicU64::new(0);
-/// The first win32k image RVA measured storing into a client TEB tail — the evidence that names the
-/// writer instead of guessing at it.
-pub(crate) static W32_TEB_TAIL_FIRST_WRITER_RVA: AtomicU64 = AtomicU64::new(0);
-
-unsafe fn teb_tail_shadows_mut() -> &'static mut Vec<TebTailShadowRecord> {
-    let slot = &mut *core::ptr::addr_of_mut!(TEB_TAIL_SHADOW_RECORDS);
-    if slot.is_none() {
-        *slot = Some(Vec::new());
-    }
-    slot.as_mut().expect("initialized above")
-}
-
-unsafe fn teb_tail_shadow_index(pi: u64, page: u64) -> Option<usize> {
-    (&*core::ptr::addr_of!(TEB_TAIL_SHADOW_RECORDS))
-        .as_ref()?
-        .iter()
-        .position(|record| record.pi == pi && record.page == page)
-}
-
-fn teb_tail_shadow_capacity() -> usize {
-    TEB_TAIL_ALIAS_WINDOW_PAGES / 2
-}
-
-unsafe fn teb_tail_shadow_prepare_insert(pi: u64, page: u64) -> Option<usize> {
-    let shadows = teb_tail_shadows_mut();
-    let slot = shadows.len();
-    if slot >= teb_tail_shadow_capacity() {
-        print_str(b"[teb-shadow] alias window exhausted pi=");
-        print_u64(pi);
-        print_str(b" page=0x");
-        print_hex((page >> 32) as u32);
-        print_hex(page as u32);
-        print_str(b" records=");
-        print_u64(slot as u64);
-        print_str(b"\n");
-        return None;
-    }
-    if shadows.try_reserve(1).is_err() {
-        print_str(b"[teb-shadow] shadow record allocation failed pi=");
-        print_u64(pi);
-        print_str(b" page=0x");
-        print_hex((page >> 32) as u32);
-        print_hex(page as u32);
-        print_str(b"\n");
-        return None;
-    }
-    Some(slot)
-}
-
-/// The private shadow frame for (`pi`, `page`), seeded from the client's LIVE tail page. Returns 0
-/// if the client frame is unknown or the executive is out of shadow slots (the caller then leaves
-/// the read-only mapping in place, which is a wall, never a silent scribble).
-pub(crate) unsafe fn teb_tail_shadow(pi: u64, page: u64) -> u64 {
-    let Some(record) = csrss_frame_get_exact_record(pi, page) else {
-        return 0;
-    };
-    let Some(real_source) = record.clone_source_cap() else {
-        return 0;
-    };
-    let mut slot = teb_tail_shadow_index(pi, page).unwrap_or(usize::MAX);
-    if slot == usize::MAX {
-        let Some(new_slot) = teb_tail_shadow_prepare_insert(pi, page) else {
-            return 0;
-        };
-        if TEB_TAIL_ALIAS_PT.swap(1, Ordering::Relaxed) == 0 {
-            let pt = alloc_slot();
-            let retype = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_X86_PAGE_TABLE, PAGING_BITS, 1, pt);
-            if retype != 0 {
-                let _ = cnode_delete_recycle_r(pt);
-                TEB_TAIL_ALIAS_PT.store(0, Ordering::Relaxed);
-                print_str(b"[teb-shadow] alias PT retype failed error=");
-                print_u64(retype);
-                print_str(b"\n");
-                return 0;
-            }
-            let map = paging_struct_map_r(
-                pt,
-                LBL_X86_PAGE_TABLE_MAP,
-                TEB_TAIL_ALIAS_BASE,
-                CAP_INIT_THREAD_VSPACE,
-            );
-            if map != 0 {
-                let _ = cnode_delete_recycle_r(pt);
-                TEB_TAIL_ALIAS_PT.store(0, Ordering::Relaxed);
-                print_str(b"[teb-shadow] alias PT map failed error=");
-                print_u64(map);
-                print_str(b"\n");
-                return 0;
-            }
-        }
-        let (shadow, shadow_retype) = alloc_frame_r();
-        if shadow_retype != 0 {
-            if shadow != 0 {
-                let _ = cnode_delete_recycle_r(shadow);
-            }
-            print_str(b"[teb-shadow] shadow frame retype failed pi=");
-            print_u64(pi);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" error=");
-            print_u64(shadow_retype);
-            print_str(b"\n");
-            return 0;
-        }
-        let real_alias = TEB_TAIL_ALIAS_BASE + (2 * new_slot as u64) * 0x1000;
-        let shadow_alias = real_alias + 0x1000;
-        let (real_copy, real_copy_error) = copy_cap_r(real_source);
-        if real_copy_error != 0 {
-            if real_copy != 0 {
-                let _ = cnode_delete_recycle_r(real_copy);
-            }
-            let _ = cnode_delete_recycle_r(shadow);
-            print_str(b"[teb-shadow] real alias copy failed pi=");
-            print_u64(pi);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" source=0x");
-            print_hex(real_source as u32);
-            print_str(b" error=");
-            print_u64(real_copy_error);
-            print_str(b"\n");
-            return 0;
-        }
-        let (shadow_copy, shadow_copy_error) = copy_cap_r(shadow);
-        if shadow_copy_error != 0 {
-            if shadow_copy != 0 {
-                let _ = cnode_delete_recycle_r(shadow_copy);
-            }
-            let _ = cnode_delete_recycle_r(real_copy);
-            let _ = cnode_delete_recycle_r(shadow);
-            print_str(b"[teb-shadow] shadow alias copy failed pi=");
-            print_u64(pi);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" shadow=0x");
-            print_hex(shadow as u32);
-            print_str(b" error=");
-            print_u64(shadow_copy_error);
-            print_str(b"\n");
-            return 0;
-        }
-        let e_real = page_map_r(real_copy, real_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
-        let e_shadow = page_map_r(shadow_copy, shadow_alias, RW_NX, CAP_INIT_THREAD_VSPACE);
-        if e_real != 0 || e_shadow != 0 {
-            let _ = cnode_delete_recycle_r(real_copy);
-            let _ = cnode_delete_recycle_r(shadow_copy);
-            let _ = cnode_delete_recycle_r(shadow);
-            print_str(b"[teb-shadow] alias map failed pi=");
-            print_u64(pi);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" real/shadow=");
-            print_u64(e_real);
-            print_str(b"/");
-            print_u64(e_shadow);
-            print_str(b"\n");
-            return 0;
-        }
-        let shadows = teb_tail_shadows_mut();
-        let mut created = false;
-        if shadows.len() != new_slot {
-            let _ = page_unmap_r(real_copy);
-            let _ = page_unmap_r(shadow_copy);
-            let _ = cnode_delete_recycle_r(real_copy);
-            let _ = cnode_delete_recycle_r(shadow_copy);
-            let _ = cnode_delete_recycle_r(shadow);
-            print_str(b"[teb-shadow] insertion order changed pi=");
-            print_u64(pi);
-            print_str(b" page=0x");
-            print_hex((page >> 32) as u32);
-            print_hex(page as u32);
-            print_str(b" expected=");
-            print_u64(new_slot as u64);
-            print_str(b" actual=");
-            print_u64(shadows.len() as u64);
-            print_str(b"\n");
-            return 0;
-        } else if let Some(existing) = shadows
-            .iter()
-            .position(|record| record.pi == pi && record.page == page)
-        {
-            let _ = page_unmap_r(real_copy);
-            let _ = page_unmap_r(shadow_copy);
-            let _ = cnode_delete_recycle_r(real_copy);
-            let _ = cnode_delete_recycle_r(shadow_copy);
-            let _ = cnode_delete_recycle_r(shadow);
-            slot = existing;
-        } else {
-            shadows.push(TebTailShadowRecord {
-                pi,
-                page,
-                frame: shadow,
-            });
-            slot = new_slot;
-            created = true;
-        }
-        if created {
-            W32_TEB_TAIL_SHADOWS.fetch_add(1, Ordering::Relaxed);
-        }
-    } else {
-        W32_TEB_TAIL_RESEEDS.fetch_add(1, Ordering::Relaxed);
-    }
-    // (Re-)seed: the shadow starts life as an exact copy of what the client's tail holds RIGHT NOW,
-    // so every value win32k may read there — `StaticUnicodeString`, `DeallocationStack`, TLS slots —
-    // is the caller's real one. Only the WRITES diverge.
-    let real_alias = TEB_TAIL_ALIAS_BASE + (2 * slot as u64) * 0x1000;
-    let shadow_alias = real_alias + 0x1000;
-    let mut offset = 0u64;
-    while offset < 0x1000 {
-        core::ptr::write_volatile(
-            (shadow_alias + offset) as *mut u64,
-            core::ptr::read_volatile((real_alias + offset) as *const u64),
-        );
-        offset += 8;
-    }
-    (&*core::ptr::addr_of!(TEB_TAIL_SHADOW_RECORDS))
-        .as_ref()
-        .and_then(|shadows| shadows.get(slot))
-        .map(|record| record.frame)
-        .unwrap_or(0)
-}
 
 // --- PRIVATE-VM UNMAP SELF-TEST (proves the ASID fix, by construction) --------------------------
 /// Proof bits for [`private_vm_unmap_selftest`].
@@ -26664,18 +26245,6 @@ unsafe fn spawn_hosted_thread_mechanism(
             print_str(b"\n");
             return failed!();
         }
-        // Read-only to win32k + copy-on-write on the first store (`W32_CLIENT_TEB_TAIL_PROTECTED`).
-        let tail_page = t.teb_va + 0x1000;
-        if !teb_tail_register(tail_page) {
-            print_str(b"[thread-life] failed to register protected TEB tail page pi=");
-            print_u64(t.client_pi);
-            print_str(b" page=0x");
-            print_hex((tail_page >> 32) as u32);
-            print_hex(tail_page as u32);
-            print_str(b"\n");
-            return failed!();
-        }
-        memory_progress.record_protected_tail();
     }
     // The private ACS page is initialized only after scratch and target mappings are checked.
     // Deliberately NOT `csrss_frame_put`-registered — win32k has no business with a

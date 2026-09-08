@@ -54,7 +54,7 @@ fn empty_memory_slot_alone_blocks_cleanup_until_checked_recycling() {
         );
         assert_eq!(
             slot.prepare_cleanup(id, &[]),
-            Err(SlotError::Cleanup(ThreadRollbackError::ConstructionPending))
+            Err(SlotError::Cleanup(ThreadRollbackError::MechanismsPending))
         );
         assert_eq!(
             slot.pending()

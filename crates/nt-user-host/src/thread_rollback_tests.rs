@@ -9,7 +9,6 @@ fn temporary_generation_zero_is_not_a_cleanup_identity() {
                 process_generation: ProcessGeneration::Temporary(0),
                 ..identity()
             },
-            10,
             &[]
         ),
         Err(ThreadRollbackError::InvalidIdentity)
@@ -23,7 +22,6 @@ fn cleanup_identity_retains_process_generation_domain() {
             process_generation: ProcessGeneration::Temporary(7),
             ..identity()
         },
-        10,
         &resources(),
     )
     .unwrap();
@@ -67,8 +65,6 @@ fn resources() -> Vec<ThreadRollbackResource> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
-    Suspend(u64),
-    Delete(u64),
     Revoke,
     Unmap(ThreadRollbackResource),
     DeleteResource(ThreadRollbackResource),
@@ -83,8 +79,6 @@ struct Backend {
     calls: Vec<Event>,
     successes: Vec<Event>,
     fail: Option<Event>,
-    suspended: bool,
-    tcb_deleted: bool,
     excluded: bool,
     pool_held: bool,
     window_held: bool,
@@ -99,8 +93,6 @@ impl Backend {
             calls: Vec::new(),
             successes: Vec::new(),
             fail: None,
-            suspended: false,
-            tcb_deleted: false,
             excluded: false,
             pool_held: true,
             window_held: true,
@@ -128,47 +120,36 @@ impl ThreadRollbackIo for Backend {
         self.current == id && self.pool_held && self.window_held
     }
 
-    fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-        assert!(!self.tcb_deleted);
-        self.attempt(Event::Suspend(tcb))?;
-        self.suspended = true;
-        Ok(())
-    }
-
-    fn delete_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-        assert!(self.suspended);
-        self.attempt(Event::Delete(tcb))?;
-        self.tcb_deleted = true;
-        Ok(())
-    }
-
     fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
         assert_eq!(id, self.current);
-        assert!(self.tcb_deleted);
         self.attempt(Event::Revoke)?;
         self.excluded = true;
         Ok(())
     }
 
     fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
-        assert!(self.tcb_deleted && self.excluded && self.pool_held && self.window_held);
+        assert!(self.excluded && self.pool_held && self.window_held);
         assert_ne!(resource.kind, ThreadRollbackResourceKind::Mechanism);
         self.attempt(Event::Unmap(resource))
     }
 
     fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
-        assert!(self.tcb_deleted && self.excluded && self.pool_held && self.window_held);
+        assert!(self.excluded && self.pool_held && self.window_held);
         assert_ne!(resource.kind, ThreadRollbackResourceKind::Frame);
-        assert!(resource.kind == ThreadRollbackResourceKind::Mechanism
-            || self.successes.contains(&Event::Unmap(resource)));
+        assert!(
+            resource.kind == ThreadRollbackResourceKind::Mechanism
+                || self.successes.contains(&Event::Unmap(resource))
+        );
         self.attempt(Event::DeleteResource(resource))
     }
 
     fn recycle_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
-        assert!(self.tcb_deleted && self.excluded && self.pool_held && self.window_held);
+        assert!(self.excluded && self.pool_held && self.window_held);
         assert_eq!(self.charge, 8192);
-        assert!(resource.kind == ThreadRollbackResourceKind::Frame
-            || self.successes.contains(&Event::DeleteResource(resource)));
+        assert!(
+            resource.kind == ThreadRollbackResourceKind::Frame
+                || self.successes.contains(&Event::DeleteResource(resource))
+        );
         assert!(
             resource.kind == ThreadRollbackResourceKind::Mechanism
                 || self.successes.contains(&Event::Unmap(resource))
@@ -184,7 +165,7 @@ impl ThreadRollbackIo for Backend {
 
     fn commit_rollback(&mut self, id: ThreadRollbackId) {
         assert_eq!(id, self.current);
-        assert!(self.tcb_deleted && self.excluded);
+        assert!(self.excluded);
         assert!(self.successes.contains(&Event::FinishTransfers));
         self.attempt(Event::Commit).unwrap();
         self.pool_held = false;
@@ -197,8 +178,6 @@ impl ThreadRollbackIo for Backend {
 fn expected_events() -> Vec<Event> {
     use ThreadRollbackResourceKind::*;
     vec![
-        Event::Suspend(10),
-        Event::Delete(10),
         Event::Revoke,
         Event::Unmap(resource(100, Alias)),
         Event::DeleteResource(resource(100, Alias)),
@@ -225,7 +204,7 @@ fn expected_events() -> Vec<Event> {
 #[test]
 fn alias_unmap_failure_blocks_all_backing_and_preserves_completed_cap_progress() {
     use ThreadRollbackResourceKind::*;
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
     let mut io = Backend::new(owner.id());
     io.fail = Some(Event::Unmap(resource(101, Alias)));
     assert!(owner.advance(&mut io).is_err());
@@ -249,7 +228,7 @@ fn alias_unmap_failure_blocks_all_backing_and_preserves_completed_cap_progress()
 fn failed_alias_and_frame_recycle_never_replay_acknowledged_unmap() {
     use ThreadRollbackResourceKind::*;
     for failed in [resource(101, Alias), resource(201, Frame)] {
-        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(owner.id());
         io.fail = Some(Event::Release(failed));
         for _ in 0..3 {
@@ -274,14 +253,21 @@ fn failed_alias_and_frame_recycle_never_replay_acknowledged_unmap() {
 fn delete_failure_retains_resource_and_blocks_recycle_until_acknowledged() {
     use ThreadRollbackResourceKind::*;
     for failed in [resource(101, Alias), resource(300, Mechanism)] {
-        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(owner.id());
         io.fail = Some(Event::DeleteResource(failed));
-        for _ in 0..3 { assert!(owner.advance(&mut io).is_err()); }
+        for _ in 0..3 {
+            assert!(owner.advance(&mut io).is_err());
+        }
         assert!(!io.calls.contains(&Event::Release(failed)));
         assert!(owner.pending_resources().any(|entry| entry == failed));
-        assert_eq!(io.calls.iter().filter(|&&e| e == Event::Unmap(failed)).count(),
-            usize::from(failed.kind == Alias));
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|&&e| e == Event::Unmap(failed))
+                .count(),
+            usize::from(failed.kind == Alias)
+        );
         io.fail = None;
         owner.advance(&mut io).unwrap();
         assert_eq!(io.successes, expected_events());
@@ -292,22 +278,40 @@ fn delete_failure_retains_resource_and_blocks_recycle_until_acknowledged() {
 #[test]
 fn recycle_failure_does_not_repeat_delete_or_unmap_for_any_resource_kind() {
     use ThreadRollbackResourceKind::*;
-    for failed in [resource(101, Alias), resource(300, Mechanism), resource(200, Frame)] {
-        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    for failed in [
+        resource(101, Alias),
+        resource(300, Mechanism),
+        resource(200, Frame),
+    ] {
+        let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(owner.id());
         io.fail = Some(Event::Release(failed));
-        for _ in 0..3 { assert!(owner.advance(&mut io).is_err()); }
-        assert_eq!(io.calls.iter().filter(|&&e| e == Event::DeleteResource(failed)).count(),
-            usize::from(failed.kind != Frame));
-        assert_eq!(io.calls.iter().filter(|&&e| e == Event::Unmap(failed)).count(),
-            usize::from(failed.kind != Mechanism));
+        for _ in 0..3 {
+            assert!(owner.advance(&mut io).is_err());
+        }
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|&&e| e == Event::DeleteResource(failed))
+                .count(),
+            usize::from(failed.kind != Frame)
+        );
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|&&e| e == Event::Unmap(failed))
+                .count(),
+            usize::from(failed.kind != Mechanism)
+        );
         assert!(owner.pending_resources().any(|entry| entry == failed));
         assert!(io.pool_held && io.window_held && io.commits == 0);
         io.fail = None;
         owner.advance(&mut io).unwrap();
         assert_eq!(io.successes, expected_events());
-        assert!(!io.calls.iter().any(|event| matches!(event,
-            Event::DeleteResource(ThreadRollbackResource { kind: Frame, .. }))));
+        assert!(!io.calls.iter().any(|event| matches!(
+            event,
+            Event::DeleteResource(ThreadRollbackResource { kind: Frame, .. })
+        )));
     }
 }
 
@@ -326,12 +330,7 @@ fn partial_registry_transfer_survives_failed_cap_cleanup_until_final_acknowledge
         fn is_current(&self, id: ThreadRollbackId) -> bool {
             self.base.is_current(id)
         }
-        fn suspend_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-            self.base.suspend_tcb(tcb)
-        }
-        fn delete_tcb(&mut self, tcb: u64) -> Result<(), u32> {
-            self.base.delete_tcb(tcb)
-        }
+
         fn revoke_memory_access(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
             self.base.revoke_memory_access(id)
         }
@@ -372,7 +371,7 @@ fn partial_registry_transfer_survives_failed_cap_cleanup_until_final_acknowledge
         .insert(identity().pi as u64, 0x1000, 100, 0, 0, 200, true)
         .unwrap();
     let snapshot = ThreadRegistrySnapshot::capture_partial(&memory, &registry, &[0x1000]).unwrap();
-    let mut owner = ThreadRollback::prepare(identity(), 10, snapshot.rollback_resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), snapshot.rollback_resources()).unwrap();
     let transfer = snapshot
         .prepare_transfer(&memory, &mut registry)
         .unwrap()
@@ -414,8 +413,6 @@ fn partial_registry_transfer_survives_failed_cap_cleanup_until_final_acknowledge
 fn stage_for(event: Event) -> ThreadRollbackStage {
     use ThreadRollbackResourceKind::*;
     match event {
-        Event::Suspend(_) => ThreadRollbackStage::Suspend,
-        Event::Delete(_) => ThreadRollbackStage::DeleteTcb,
         Event::Revoke => ThreadRollbackStage::RevokeMemoryAccess,
         Event::Release(ThreadRollbackResource { kind: Alias, .. })
         | Event::DeleteResource(ThreadRollbackResource { kind: Alias, .. })
@@ -425,10 +422,15 @@ fn stage_for(event: Event) -> ThreadRollbackStage {
         Event::Unmap(ThreadRollbackResource {
             kind: Mechanism, ..
         }) => panic!("mechanism unmap"),
-        Event::DeleteResource(ThreadRollbackResource { kind: Frame, .. }) => panic!("frame deletion"),
+        Event::DeleteResource(ThreadRollbackResource { kind: Frame, .. }) => {
+            panic!("frame deletion")
+        }
         Event::Release(ThreadRollbackResource {
             kind: Mechanism, ..
-        }) | Event::DeleteResource(ThreadRollbackResource { kind: Mechanism, .. }) => ThreadRollbackStage::Mechanism,
+        })
+        | Event::DeleteResource(ThreadRollbackResource {
+            kind: Mechanism, ..
+        }) => ThreadRollbackStage::Mechanism,
         Event::FinishTransfers => ThreadRollbackStage::FinishMemoryTransfers,
         Event::Commit => ThreadRollbackStage::Commit,
     }
@@ -436,14 +438,12 @@ fn stage_for(event: Event) -> ThreadRollbackStage {
 
 #[test]
 fn cleanup_is_stage_ordered_and_commits_target_ownership_once() {
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
     let mut io = Backend::new(owner.id());
     assert!(io.calls.is_empty());
-    assert_eq!(owner.pending_tcb(), Some(10));
     owner.advance(&mut io).unwrap();
     assert_eq!(io.successes, expected_events());
     assert_eq!(owner.stage(), ThreadRollbackStage::Complete);
-    assert_eq!(owner.pending_tcb(), None);
     assert_eq!(owner.pending_resources().count(), 0);
     assert!(!io.pool_held && !io.window_held);
     assert_eq!((io.charge, io.commits), (0, 1));
@@ -458,7 +458,7 @@ fn cleanup_is_stage_ordered_and_commits_target_ownership_once() {
 fn every_backend_failure_retains_exact_pending_caps_and_reservations() {
     let expected = expected_events();
     for (index, &failure) in expected[..expected.len() - 1].iter().enumerate() {
-        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(owner.id());
         io.fail = Some(failure);
         for _ in 0..3 {
@@ -473,10 +473,6 @@ fn every_backend_failure_retains_exact_pending_caps_and_reservations() {
             assert_eq!(io.successes, expected[..index]);
             assert!(io.pool_held && io.window_held);
             assert_eq!((io.charge, io.commits), (8192, 0));
-            assert_eq!(
-                owner.pending_tcb(),
-                if index <= 1 { Some(10) } else { None }
-            );
             let pending: Vec<_> = resources()
                 .into_iter()
                 .filter(|&entry| !io.successes.contains(&Event::Release(entry)))
@@ -496,7 +492,7 @@ fn stale_identity_refuses_all_effects_at_every_retry_stage() {
         .into_iter()
         .filter(|event| *event != Event::Commit)
     {
-        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(owner.id());
         io.fail = Some(failure);
         assert!(owner.advance(&mut io).is_err());
@@ -534,7 +530,7 @@ fn stale_identity_refuses_all_effects_at_every_retry_stage() {
 #[test]
 fn missing_target_reservation_refuses_cleanup() {
     for pool_missing in [true, false] {
-        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(owner.id());
         if pool_missing {
             io.pool_held = false;
@@ -551,7 +547,7 @@ fn repeated_registry_runtime_caps_are_retired_once() {
     let mut entries = resources();
     entries.extend(resources());
     entries.push(resource(0, ThreadRollbackResourceKind::Frame));
-    let mut owner = ThreadRollback::prepare(identity(), 10, &entries).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &entries).unwrap();
     assert_eq!(owner.pending_resources().count(), resources().len());
     let mut io = Backend::new(owner.id());
     owner.advance(&mut io).unwrap();
@@ -559,7 +555,7 @@ fn repeated_registry_runtime_caps_are_retired_once() {
 }
 
 #[test]
-fn conflicting_cap_classes_and_tcb_overlap_are_rejected_before_adoption() {
+fn conflicting_cap_classes_are_rejected_before_adoption() {
     use ThreadRollbackResourceKind::*;
     for (a, b) in [
         (Frame, Alias),
@@ -569,20 +565,14 @@ fn conflicting_cap_classes_and_tcb_overlap_are_rejected_before_adoption() {
     ] {
         let entries = [resource(100, a), resource(100, b)];
         assert!(matches!(
-            ThreadRollback::prepare(identity(), 10, &entries),
-            Err(ThreadRollbackError::ConflictingOwnership)
-        ));
-    }
-    for kind in [Frame, Alias, Mechanism] {
-        assert!(matches!(
-            ThreadRollback::prepare(identity(), 10, &[resource(10, kind)]),
+            ThreadRollback::prepare(identity(), &entries),
             Err(ThreadRollbackError::ConflictingOwnership)
         ));
     }
 }
 
 #[test]
-fn invalid_identities_and_tcb_sentinels_cannot_own_rollback() {
+fn invalid_identities_cannot_own_rollback() {
     for id in [
         ThreadRollbackIdentity {
             pid: 0,
@@ -598,54 +588,27 @@ fn invalid_identities_and_tcb_sentinels_cannot_own_rollback() {
         },
     ] {
         assert!(matches!(
-            ThreadRollback::prepare(id, 10, &[]),
+            ThreadRollback::prepare(id, &[]),
             Err(ThreadRollbackError::InvalidIdentity)
-        ));
-    }
-    for tcb in [0, 1] {
-        assert!(matches!(
-            ThreadRollback::prepare(identity(), tcb, &[]),
-            Err(ThreadRollbackError::InvalidCapability)
         ));
     }
 }
 
 #[test]
-fn empty_resource_set_still_requires_tcb_deletion_and_memory_exclusion() {
-    let mut owner = ThreadRollback::prepare(identity(), 10, &[]).unwrap();
+fn empty_resource_set_still_requires_memory_exclusion_and_transfer_finish() {
+    let mut owner = ThreadRollback::prepare(identity(), &[]).unwrap();
     let mut io = Backend::new(owner.id());
     owner.advance(&mut io).unwrap();
     assert_eq!(
         io.successes,
-        [
-            Event::Suspend(10),
-            Event::Delete(10),
-            Event::Revoke,
-            Event::FinishTransfers,
-            Event::Commit
-        ]
+        [Event::Revoke, Event::FinishTransfers, Event::Commit]
     );
-}
-
-#[test]
-fn deleted_tcb_slot_can_be_reused_without_being_touched_by_retry() {
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
-    let mut io = Backend::new(owner.id());
-    io.fail = Some(Event::Revoke);
-    assert!(owner.advance(&mut io).is_err());
-    assert_eq!(owner.pending_tcb(), None);
-    let boundary = io.calls.len();
-    io.fail = None;
-    owner.advance(&mut io).unwrap();
-    assert!(!io.calls[boundary..]
-        .iter()
-        .any(|event| matches!(event, Event::Suspend(_) | Event::Delete(_))));
 }
 
 #[test]
 fn released_alias_slots_are_not_deleted_again_after_later_failure() {
     use ThreadRollbackResourceKind::*;
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
     let mut io = Backend::new(owner.id());
     io.fail = Some(Event::Release(resource(201, Frame)));
     assert!(owner.advance(&mut io).is_err());
@@ -654,7 +617,11 @@ fn released_alias_slots_are_not_deleted_again_after_later_failure() {
     owner.advance(&mut io).unwrap();
     assert_eq!(
         io.calls[boundary..],
-        [Event::Release(resource(201, Frame)), Event::FinishTransfers, Event::Commit]
+        [
+            Event::Release(resource(201, Frame)),
+            Event::FinishTransfers,
+            Event::Commit
+        ]
     );
 }
 
@@ -664,11 +631,11 @@ fn pooled_tid_reuse_requires_a_new_attempt_owner_at_every_retry_stage() {
         .into_iter()
         .filter(|event| *event != Event::Commit)
     {
-        let mut old = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut old = ThreadRollback::prepare(identity(), &resources()).unwrap();
         let mut io = Backend::new(old.id());
         io.fail = Some(failure);
         assert!(old.advance(&mut io).is_err());
-        let replacement = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let replacement = ThreadRollback::prepare(identity(), &resources()).unwrap();
         assert_eq!(old.identity(), replacement.identity());
         assert_ne!(old.id(), replacement.id());
         io.current = replacement.id();
@@ -702,7 +669,7 @@ fn attempt_exhaustion_never_wraps_or_reuses_an_identity() {
 #[test]
 fn mechanism_failure_preserves_all_physical_frame_owners() {
     use ThreadRollbackResourceKind::*;
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
     let mut io = Backend::new(owner.id());
     io.fail = Some(Event::Release(resource(301, Mechanism)));
     assert!(owner.advance(&mut io).is_err());
@@ -724,24 +691,36 @@ fn mechanism_failure_preserves_all_physical_frame_owners() {
 
 #[test]
 fn terminal_transfer_failure_retains_owner_without_replaying_released_resources() {
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
     let mut io = Backend::new(owner.id());
     io.fail = Some(Event::FinishTransfers);
     for attempt in 1..=3 {
-        assert_eq!(owner.advance(&mut io), Err(ThreadRollbackError::Backend {
-            stage: ThreadRollbackStage::FinishMemoryTransfers,
-            status: 0xc000_009a,
-        }));
+        assert_eq!(
+            owner.advance(&mut io),
+            Err(ThreadRollbackError::Backend {
+                stage: ThreadRollbackStage::FinishMemoryTransfers,
+                status: 0xc000_009a,
+            })
+        );
         assert_eq!(owner.stage(), ThreadRollbackStage::FinishMemoryTransfers);
         assert_eq!(owner.pending_resources().count(), 0);
-        assert_eq!(owner.pending_tcb(), None);
         assert!(io.pool_held && io.window_held && io.charge == 8192);
         assert_eq!(io.commits, 0);
-        assert_eq!(io.calls.iter().filter(|&&event| event == Event::FinishTransfers).count(), attempt);
-        for event in expected_events().into_iter().filter(|event|
-            !matches!(event, Event::FinishTransfers | Event::Commit))
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|&&event| event == Event::FinishTransfers)
+                .count(),
+            attempt
+        );
+        for event in expected_events()
+            .into_iter()
+            .filter(|event| !matches!(event, Event::FinishTransfers | Event::Commit))
         {
-            assert_eq!(io.calls.iter().filter(|&&actual| actual == event).count(), 1);
+            assert_eq!(
+                io.calls.iter().filter(|&&actual| actual == event).count(),
+                1
+            );
         }
     }
     io.fail = None;
@@ -755,12 +734,12 @@ fn terminal_transfer_failure_retains_owner_without_replaying_released_resources(
 
 #[test]
 fn stale_terminal_retry_cannot_finish_transfers_or_commit_replacement() {
-    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &resources()).unwrap();
     let mut io = Backend::new(owner.id());
     io.fail = Some(Event::FinishTransfers);
     owner.advance(&mut io).unwrap_err();
     let calls = io.calls.len();
-    io.current = ThreadRollback::prepare(identity(), 11, &[]).unwrap().id();
+    io.current = ThreadRollback::prepare(identity(), &[]).unwrap().id();
     io.fail = None;
     assert_eq!(owner.advance(&mut io), Err(ThreadRollbackError::StaleOwner));
     assert_eq!(io.calls.len(), calls);
@@ -778,14 +757,9 @@ fn backend_failure_status_is_preserved() {
         fn is_current(&self, _: ThreadRollbackId) -> bool {
             true
         }
-        fn suspend_tcb(&mut self, _: u64) -> Result<(), u32> {
-            Err(0xc000_0001)
-        }
-        fn delete_tcb(&mut self, _: u64) -> Result<(), u32> {
-            panic!()
-        }
+
         fn revoke_memory_access(&mut self, _: ThreadRollbackId) -> Result<(), u32> {
-            panic!()
+            Err(0xc000_0001)
         }
         fn unmap_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
             panic!()
@@ -803,11 +777,11 @@ fn backend_failure_status_is_preserved() {
             panic!()
         }
     }
-    let mut owner = ThreadRollback::prepare(identity(), 10, &[]).unwrap();
+    let mut owner = ThreadRollback::prepare(identity(), &[]).unwrap();
     assert_eq!(
         owner.advance(&mut Failing),
         Err(ThreadRollbackError::Backend {
-            stage: ThreadRollbackStage::Suspend,
+            stage: ThreadRollbackStage::RevokeMemoryAccess,
             status: 0xc000_0001,
         })
     );
