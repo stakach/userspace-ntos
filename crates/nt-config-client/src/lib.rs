@@ -10,10 +10,20 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+mod retained_snapshot_integration;
+
 mod active_driver_service;
+mod retained_snapshot;
+pub use retained_snapshot::{
+    CmSnapshotAttempt, CmSnapshotAttempts, CmSnapshotExchange, CmSnapshotOperation,
+    CmSnapshotResponse,
+};
 
 #[cfg(test)]
 mod retained_test_keys;
+#[cfg(test)]
+mod retained_test_snapshots;
 
 mod key_open;
 pub use key_open::{
@@ -4711,9 +4721,9 @@ mod tests {
             client.import_system_hive(&encode_image(&active_driver_service_identity_hive())),
             Ok(1)
         );
-
-        let resolved = client
-            .query_active_driver_service_by_registry_path(
+        let mut attempts = CmSnapshotAttempts::new();
+        let mut query = |path: &str| retained_test_snapshots::query(&mut client, &mut attempts, path, 1);
+        let resolved = query(
                 r"\Registry\Machine\System\CurrentControlSet\Services\stable",
             )
             .unwrap();
@@ -4724,26 +4734,25 @@ mod tests {
         assert_eq!(resolved.binding.service_name, "Stable");
         assert_eq!(resolved.binding.image_path, r"system32\drivers\active.sys");
 
-        let direct_active = client
-            .query_active_driver_service_by_registry_path(
+        let direct_active = query(
                 r"\registry\machine\system\controlset002\services\STABLE",
             )
             .unwrap();
         assert_eq!(direct_active.binding.service_name, "Stable");
         assert_eq!(
-            client.query_active_driver_service_by_registry_path(
+            query(
                 r"\Registry\Machine\System\ControlSet001\Services\Stable",
             ),
             Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
         );
         assert_eq!(
-            client.query_active_driver_service_by_registry_path(
+            query(
                 r"\Registry\Machine\System\CurrentControlSet\Services\Stable\Parameters",
             ),
             Err(STATUS_OBJECT_PATH_SYNTAX_BAD)
         );
         assert_eq!(
-            client.query_active_driver_service_by_registry_path(
+            query(
                 r"\Registry\Machine\System\CurrentControlSet\Services\Missing",
             ),
             Err(STATUS_OBJECT_NAME_NOT_FOUND)

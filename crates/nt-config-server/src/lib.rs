@@ -14,6 +14,7 @@ mod key_lease;
 mod key_close;
 mod key_open;
 mod active_driver_service;
+mod retained_snapshot;
 mod mutation;
 mod snapshot;
 
@@ -641,6 +642,37 @@ fn encode_hive_value_record(
     Ok(out)
 }
 
+fn driver_service_binding_encoded_len(cm: &ConfigManager, binding: &DriverServiceBinding) -> Option<usize> {
+    let mut length = CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES;
+    for value in [Some(binding.service.service_name.as_str()), Some(binding.service.image_path.as_str()),
+        Some(binding.service.driver_object_path.as_str()), binding.service.class_guid.as_deref(),
+        binding.service.load_order_group.as_deref()] {
+        let bytes = value.map_or(0, str::len);
+        u32::try_from(bytes).ok()?;
+        length = length.checked_add(4)?.checked_add(bytes)?;
+    }
+    length = length.checked_add(8)?;
+    u32::try_from(binding.devnodes.len()).ok()?;
+    for devnode in &binding.devnodes {
+        let linkage = cm.devnode_linkage_export(devnode);
+        for value in [Some(devnode.instance_id.as_str()), devnode.pdo_name.as_deref(),
+            devnode.driver_key.as_deref(), linkage.as_deref()] {
+            let bytes = value.map_or(0, str::len);
+            u32::try_from(bytes).ok()?;
+            length = length.checked_add(4)?.checked_add(bytes)?;
+        }
+        for ids in [&devnode.hardware_ids, &devnode.compatible_ids] {
+            u32::try_from(ids.len()).ok()?;
+            length = length.checked_add(4)?;
+            for id in ids {
+                u32::try_from(id.len()).ok()?;
+                length = length.checked_add(4)?.checked_add(id.len())?;
+            }
+        }
+    }
+    Some(length)
+}
+
 fn encode_driver_service_binding(
     cm: &ConfigManager,
     binding: &DriverServiceBinding,
@@ -649,7 +681,9 @@ fn encode_driver_service_binding(
         DriverServiceClass::Device => driver_service_class::DEVICE,
         DriverServiceClass::FileSystem => driver_service_class::FILE_SYSTEM,
     };
+    let needed = driver_service_binding_encoded_len(cm, binding)?;
     let mut out = Vec::new();
+    out.try_reserve_exact(needed).ok()?;
     push_u32(&mut out, CM_DRIVER_SERVICE_SNAPSHOT_MAGIC);
     push_u16(&mut out, CM_DRIVER_SERVICE_SNAPSHOT_VERSION);
     push_u16(&mut out, class);
@@ -678,6 +712,7 @@ fn encode_driver_service_binding(
             push_string(&mut out, id)?;
         }
     }
+    debug_assert_eq!(out.len(), needed);
     Some(out)
 }
 
@@ -975,7 +1010,7 @@ pub struct CmServer {
     cm: ConfigManager,
     device_property_snapshots: SnapshotBank<DevicePropertySnapshotKey>,
     driver_service_snapshots: SnapshotBank<String>,
-    active_driver_service_snapshots: SnapshotPool<String>,
+    retained_snapshots: retained_snapshot::RetainedSnapshotJournal,
     system_hive: Option<MountedSystemHive>,
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
@@ -1032,11 +1067,7 @@ impl CmServer {
             cm,
             device_property_snapshots: SnapshotBank::new(),
             driver_service_snapshots: SnapshotBank::new(),
-            active_driver_service_snapshots: SnapshotPool::with_identity_source(
-                MAX_OUTSTANDING_HIVE_KEY_SNAPSHOTS,
-                MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES,
-                identities.clone(),
-            ),
+            retained_snapshots: retained_snapshot::RetainedSnapshotJournal::new(),
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
@@ -1103,8 +1134,8 @@ impl CmServer {
             opcode::CM_OP_ENUMERATE_KEY => self.op_enumerate_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_DEVICE_PROPERTY => self.op_query_device_property(in_buf, out_buf),
             opcode::CM_OP_QUERY_DRIVER_SERVICE => self.op_query_driver_service(in_buf, out_buf),
-            opcode::CM_OP_QUERY_ACTIVE_DRIVER_SERVICE => {
-                self.op_query_active_driver_service(in_buf, out_buf)
+            opcode::CM_OP_RETAINED_SNAPSHOT => {
+                self.op_retained_snapshot(in_buf, out_buf)
             }
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),

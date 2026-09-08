@@ -29100,7 +29100,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     snapshot transfer contract: it does not claim recovery of an unknown BEGIN token or a lost final
     PULL/ABORT reply. Tranche 117 replaces that remaining transport lifetime, before desktop acceptance.
 
-    B3 retained CM snapshot ownership tranche 117 (next):
+    B3 retained CM snapshot ownership tranche 117 (2026-09-08, complete):
 
     Introduce a caller-owned request identity before BEGIN, bound to the actual CM incarnation and
     a persistent requester bank with reusable slots. Retain the exact immutable outcome until an
@@ -29113,6 +29113,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     best-effort machinery, and reuse the core for the remaining CM snapshot families. Test lost BEGIN,
     PULL and ACK, cancellation before BEGIN delivery, allocation failure, server restart, concurrent
     readers and slot reuse before considering this lifetime closed.
+
+    Review adjustment: cancellation cannot depend on allocating a new watermark while the server is
+    full. QUERY must idempotently pre-admit a persistent requester bank and all of its bounded slot
+    metadata before authorizing BEGIN. An uncertain QUERY is replayed with the same requester and
+    grant, never a new bank per call; every admitted slot's ACK is allocation-free. Bank registration
+    belongs to the executive/CM connection lifetime, with retirement requiring explicit quiescence.
+
+    Implemented a generic retained query journal with separate metadata and immutable-byte budgets,
+    incarnation-bound authority, pre-admitted reusable slots, immutable positive/negative BEGIN
+    results, replayable random-access PULL and allocation-free ACK fencing. The active-service
+    dialect uses the existing mounted-hive capture and decoder; its previous opcode, request type,
+    snapshot pool and best-effort client collector are removed. Client attempt/exchange ownership is
+    non-cloneable, all request bytes are staged before IPC, cancellation is sticky, and output can
+    transfer only once after exact ACK and generation validation. Failed manifest allocation keeps
+    the request available for cancellation without requiring a learned server token.
+
+    The executive now owns a persistent request bank and every pending cleanup attempt in the focused
+    cm_snapshot_ownership module. Ordinary negative query results are acknowledged immediately;
+    uncertain outcomes enter bounded, fair outer-loop ACK-only cleanup with post-call backoff. Timer
+    drains only latch work. No failed query can publish a late result, no manager/row borrow crosses
+    CM IPC, and census records actual requests, outcomes and pending owners. This is transport
+    ownership, not canonical NT Key access control or a desktop acceptance claim.
+
+    Focused config tests pass in `.tmp/test-retained-cm-snapshot-20260908.log`. The final 25-crate
+    regression passes 2,725 tests in `.tmp/test-retained-cm-snapshot-regression-20260908.log`, including
+    eight real-dispatch integration cases covering lost QUERY/BEGIN/final PULL/ACK, pre-delivery
+    cancellation, malformed chunks, independent readers, negative outcomes, stale generation,
+    restart rejection and reusable slots. Client unit tests also inject manifest allocation failure.
+    The native release build passes with unchanged 262 warnings in
+    `.tmp/build-retained-cm-snapshot-20260908.log`. Independent client/server/native reviews found no
+    additional ownership or framing blocker. Root ran all builds and tests serially.
+
+    Review adjustment: return to the strict desktop provider-import frontier after this checkpoint.
+    Leased key/value record snapshots are the next useful CM transport migration because both win32k
+    and Nt registry paths use them, but migrating every snapshot dialect is not a prerequisite for
+    implementing the missing real provider imports. Do not report old import counts as fresh boot
+    evidence, or enable fallback bindings to obtain a desktop screenshot.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

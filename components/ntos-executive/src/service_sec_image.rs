@@ -8600,6 +8600,7 @@ pub(crate) unsafe fn service_sec_image(
         // CM retries run only between hosted events, never inside a timer callback or nested pump.
         driver_launch::retry_driver_registry_closes(monotonic_time_100ns());
         crate::cm_key_ownership::retry_cleanup(monotonic_time_100ns());
+        crate::cm_snapshot_ownership::retry_cleanup(monotonic_time_100ns());
         let ingress = if badge == DELAY_TIMER_BADGE || hosted_irq_lines_from_badge(badge) != 0 {
             None
         } else {

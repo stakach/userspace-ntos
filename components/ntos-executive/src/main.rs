@@ -26,6 +26,7 @@ mod alpc_selftest;
 pub(crate) use acpi_platform::*;
 mod cm_server;
 mod cm_key_ownership;
+mod cm_snapshot_ownership;
 mod io_server;
 mod lpc_server;
 mod ntoskrnl_shared;
@@ -3393,6 +3394,7 @@ const DELAY_TIMER_SOURCE_PROVIDER_WAIT: u64 = 12;
 const DELAY_TIMER_SOURCE_PROVIDER_TIMER: u64 = 13;
 const DELAY_TIMER_SOURCE_REGISTRY_CLOSE: u64 = 14;
 const DELAY_TIMER_SOURCE_CM_KEY_CLEANUP: u64 = 15;
+const DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP: u64 = 16;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -5067,6 +5069,7 @@ fn explorer_image_pipeline_spec(passed: &mut u64) {
     }
     print_str(b"\n");
     unsafe { cm_key_ownership::print_stats() };
+    unsafe { cm_snapshot_ownership::print_stats() };
     let fb_readback = unsafe { explorer_framebuffer_final_readback() };
     let fb_span_x = fb_readback.span_x();
     let fb_span_y = fb_readback.span_y();
@@ -7403,7 +7406,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 15;
+pub(crate) const SUBDRAIN_N: usize = 16;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -15900,18 +15903,16 @@ pub(crate) unsafe fn config_manager_query_device_property(
 pub(crate) unsafe fn config_manager_query_active_driver_service_by_registry_path(
     service_path: &str,
 ) -> Result<nt_config_client::ActiveDriverServiceBinding, i32> {
-    let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    if expected_generation == 0 {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
+    cm_snapshot_ownership::query_active_driver_service(service_path)
+}
+
+pub(crate) unsafe fn config_manager_exchange_retained_snapshot(
+    exchange: &nt_config_client::CmSnapshotExchange,
+) -> nt_config_client::CmSnapshotResponse {
+    match CONFIG_CLIENT_PTR.as_mut() {
+        Some(client) => client.exchange_retained_snapshot(exchange),
+        None => nt_config_client::CmSnapshotResponse::transport_error(CONFIG_STATUS_DEVICE_NOT_READY),
     }
-    let client = CONFIG_CLIENT_PTR
-        .as_mut()
-        .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
-    let resolved = client.query_active_driver_service_by_registry_path(service_path)?;
-    if resolved.mount_generation != expected_generation {
-        return Err(CONFIG_STATUS_DEVICE_NOT_READY);
-    }
-    Ok(resolved)
 }
 
 pub(crate) unsafe fn config_manager_query_driver_launch_plan(
@@ -17280,6 +17281,7 @@ unsafe fn delay_timer_next_deadline(
     let job_time_deadline = handler.job_time_sample_next_deadline();
     let registry_close_deadline = driver_launch::driver_registry_close_retry_deadline();
     let cm_key_cleanup_deadline = cm_key_ownership::next_deadline();
+    let cm_snapshot_cleanup_deadline = cm_snapshot_ownership::next_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
         .into_iter()
@@ -17296,6 +17298,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(job_time_deadline)
         .chain(registry_close_deadline)
         .chain(cm_key_cleanup_deadline)
+        .chain(cm_snapshot_cleanup_deadline)
         .chain(deadman_deadline)
         .min()?;
     let source = if delay_deadline == Some(deadline) {
@@ -17326,6 +17329,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_REGISTRY_CLOSE
     } else if cm_key_cleanup_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_CM_KEY_CLEANUP
+    } else if cm_snapshot_cleanup_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP
     } else {
         DELAY_TIMER_SOURCE_WATCHDOG
     };
@@ -17553,6 +17558,7 @@ unsafe fn delay_timer_drain_due_work(
         ))
         + subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
         + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
+        + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
         + watchdog_tick
 }
 

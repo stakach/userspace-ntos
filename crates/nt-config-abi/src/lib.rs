@@ -128,8 +128,8 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_KEY_CLOSE: u16 = 0x215d;
     /// Query retained-OPEN authority, acquire/replay one exact open attempt, or acknowledge it.
     pub const CM_OP_SYSTEM_HIVE_KEY_OPEN: u16 = 0x215e;
-    /// Atomically resolve an active Services child and snapshot its mounted-hive binding.
-    pub const CM_OP_QUERY_ACTIVE_DRIVER_SERVICE: u16 = 0x215f;
+    /// Register a requester bank, capture/replay a retained snapshot, read it, or acknowledge it.
+    pub const CM_OP_RETAINED_SNAPSHOT: u16 = 0x2160;
 }
 
 pub mod hive_key_open_operation {
@@ -468,22 +468,73 @@ pub const CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_MAGIC: u32 = 0x5044_4d43;
 pub const CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_VERSION: u16 = 1;
 pub const CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES: usize = 32;
 
-/// An immutable mounted-hive service binding selected by a complete registry path.
-/// Operations and chunk limits match [`driver_service_transfer`]. The reply payload contains
-/// magic/version/header-size, mount generation, UTF-8 path length, binding length, zero u64,
-/// then the physical path and an ordinary driver-service snapshot.
+pub const CM_RETAINED_SNAPSHOT_REPLY_HEADER_BYTES: usize = 64;
+pub const CM_RETAINED_SNAPSHOT_CHUNK_BYTES: usize = 4096 - CM_RETAINED_SNAPSHOT_REPLY_HEADER_BYTES;
+pub const CM_RETAINED_SNAPSHOT_MAX_SLOTS: usize = 256;
+pub const CM_RETAINED_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+pub mod retained_snapshot_operation {
+    pub const QUERY: u16 = 1;
+    pub const BEGIN: u16 = 2;
+    pub const PULL: u16 = 3;
+    pub const ACKNOWLEDGE: u16 = 4;
+}
+
+pub mod retained_snapshot_kind {
+    pub const ACTIVE_DRIVER_SERVICE: u16 = 1;
+}
+
+pub mod retained_snapshot_disposition {
+    pub const AUTHORITY: u16 = 1;
+    pub const OUTCOME: u16 = 2;
+    pub const CHUNK: u16 = 3;
+    pub const ACKNOWLEDGED: u16 = 4;
+    pub const ALREADY_ACKNOWLEDGED: u16 = 5;
+}
+
+/// QUERY registers a persistent requester bank: requester_nonce is nonzero and chunk_capacity
+/// requests its dense slot count. All other fields besides ABI and operation are zero.
+/// BEGIN carries an exact request identity and immutable query payload; offset/capacity are zero.
+/// ACTIVE_DRIVER_SERVICE carries a UTF-16 registry path after this header.
+/// PULL carries the identity, kind, offset and capacity only. It is random-access and idempotent.
+/// ACKNOWLEDGE carries the identity and kind only. It also fences a BEGIN not yet executed.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct CmActiveDriverServiceRequest {
+pub struct CmRetainedSnapshotRequest {
     pub abi_size: u16,
     pub abi_version: u16,
     pub operation: u16,
-    pub _reserved: u16,
+    pub query_kind: u16,
+    pub server_nonce: u64,
+    pub requester_nonce: u64,
+    pub request_slot: u64,
+    pub request_generation: u64,
     pub value_offset: u32,
     pub chunk_capacity: u32,
-    pub path_offset: u32,
-    pub path_len_bytes: u32,
-    pub transfer_token: u64,
+    pub request_offset: u32,
+    pub request_len_bytes: u32,
+}
+
+/// Protocol SUCCESS delivers this envelope. OUTCOME carries the actual query status, not an
+/// unconditional successful query. CHUNK appends chunk_bytes immutable bytes. AUTHORITY uses
+/// total_bytes for the granted dense slot count and echoes the requester nonce. ACK replies have
+/// zero outcome/length/offset fields and preserve the exact fenced identity.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmRetainedSnapshotReply {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub disposition: u16,
+    pub query_kind: u16,
+    pub server_nonce: u64,
+    pub requester_nonce: u64,
+    pub request_slot: u64,
+    pub request_generation: u64,
+    pub outcome_status: i32,
+    pub total_bytes: u32,
+    pub value_offset: u32,
+    pub chunk_bytes: u32,
+    pub _reserved: u64,
 }
 
 /// `import_hive`: a tokenized upload. BEGIN reserves `total_len_bytes`; PUSH carries one chunk at
@@ -793,7 +844,8 @@ wire!(CmRawValueTransferRequest);
 wire!(CmRawValueQueryRequest);
 wire!(CmDevicePropertyRequest);
 wire!(CmDriverServiceRequest);
-wire!(CmActiveDriverServiceRequest);
+wire!(CmRetainedSnapshotRequest);
+wire!(CmRetainedSnapshotReply);
 wire!(CmHiveImportRequest);
 wire!(CmHiveKeyRequest);
 wire!(CmHivePathRequest);
@@ -1060,21 +1112,27 @@ mod tests {
     }
 
     #[test]
-    fn active_driver_service_path_has_stable_wire_layout() {
-        assert_eq!(opcode::CM_OP_QUERY_ACTIVE_DRIVER_SERVICE, 0x215f);
-        assert_eq!(core::mem::size_of::<CmActiveDriverServiceRequest>(), 32);
+    fn retained_snapshot_has_stable_wire_layout() {
+        assert_eq!(opcode::CM_OP_RETAINED_SNAPSHOT, 0x2160);
+        assert_eq!(core::mem::size_of::<CmRetainedSnapshotRequest>(), 56);
+        assert_eq!(core::mem::size_of::<CmRetainedSnapshotReply>(), 64);
         assert_eq!(CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, 32);
-        let request = CmActiveDriverServiceRequest {
-            abi_size: 32,
+        let request = CmRetainedSnapshotRequest {
+            abi_size: 56,
             abi_version: CM_ABI_VERSION,
-            operation: driver_service_transfer::PULL,
+            operation: retained_snapshot_operation::PULL,
+            query_kind: retained_snapshot_kind::ACTIVE_DRIVER_SERVICE,
+            server_nonce: 0x1234_5678_9abc_def0,
+            requester_nonce: 42,
+            request_slot: 3,
+            request_generation: 6,
             value_offset: 512,
-            chunk_capacity: 4096,
-            path_offset: 32,
-            path_len_bytes: 120,
-            transfer_token: 0x1234_5678_9abc_def0,
-            ..CmActiveDriverServiceRequest::default()
+            chunk_capacity: CM_RETAINED_SNAPSHOT_CHUNK_BYTES as u32,
+            ..CmRetainedSnapshotRequest::default()
         };
-        assert_eq!(CmActiveDriverServiceRequest::from_bytes(request.as_bytes()), Some(request));
+        assert_eq!(CmRetainedSnapshotRequest::from_bytes(request.as_bytes()), Some(request));
+        let response = CmRetainedSnapshotReply { abi_size: 64, server_nonce: request.server_nonce,
+            ..CmRetainedSnapshotReply::default() };
+        assert_eq!(CmRetainedSnapshotReply::from_bytes(response.as_bytes()), Some(response));
     }
 }

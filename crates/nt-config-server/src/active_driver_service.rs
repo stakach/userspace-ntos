@@ -2,8 +2,8 @@
 
 use super::*;
 use nt_config_abi::{
-    CmActiveDriverServiceRequest, CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES,
-    CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_MAGIC, CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_VERSION,
+    CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES, CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_MAGIC,
+    CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_VERSION,
 };
 use nt_config_manager::{
     RegistryKeyId, RegistryValue, CONTROL_CLASS_PATH, ENUM_PATH, SERVICES_PATH,
@@ -157,7 +157,11 @@ fn project_enum(
     Ok(())
 }
 
-fn capture(mounted: &MountedSystemHive, path: &str) -> Result<Vec<u8>, i32> {
+pub(super) fn capture(
+    mounted: &MountedSystemHive,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, i32> {
     let hive = &mounted.hive;
     let relative = system_hive_relative_path(path, &mounted.current_control_set)
         .ok_or(STATUS_INVALID_PARAMETER)?;
@@ -176,6 +180,16 @@ fn capture(mounted: &MountedSystemHive, path: &str) -> Result<Vec<u8>, i32> {
         .ok_or(STATUS_INVALID_PARAMETER)?;
     if hive.open_subkey(services, service_name) != Some(candidate) {
         return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+    }
+    let envelope_bytes = CM_ACTIVE_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES
+        .checked_add(SYSTEM_HIVE_PATH.len())
+        .and_then(|length| length.checked_add(canonical.len()))
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    let binding_budget = max_bytes
+        .checked_sub(envelope_bytes)
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    if binding_budget < CM_DRIVER_SERVICE_SNAPSHOT_HEADER_BYTES {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
 
     // This private projection reuses typed registry policy. Its real, temporary RegistryKeyIds
@@ -222,6 +236,11 @@ fn capture(mounted: &MountedSystemHive, path: &str) -> Result<Vec<u8>, i32> {
     let binding = cm
         .driver_service_binding(service_name)
         .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+    if driver_service_binding_encoded_len(&cm, &binding).ok_or(STATUS_INSUFFICIENT_RESOURCES)?
+        > binding_budget
+    {
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     let binding =
         encode_driver_service_binding(&cm, &binding).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     let physical = alloc::format!("{}{}", SYSTEM_HIVE_PATH, canonical);
@@ -229,7 +248,7 @@ fn capture(mounted: &MountedSystemHive, path: &str) -> Result<Vec<u8>, i32> {
         .checked_add(physical.len())
         .and_then(|length| length.checked_add(binding.len()))
         .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
-    if total > MAX_RETAINED_HIVE_KEY_SNAPSHOT_BYTES {
+    if total > max_bytes {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
     let path_len = u32::try_from(physical.len()).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
@@ -251,84 +270,6 @@ fn capture(mounted: &MountedSystemHive, path: &str) -> Result<Vec<u8>, i32> {
     output.extend_from_slice(physical.as_bytes());
     output.extend_from_slice(&binding);
     Ok(output)
-}
-
-impl CmServer {
-    pub(super) fn op_query_active_driver_service(&mut self, buf: &[u8], out: &mut [u8]) -> CmReply {
-        let Some(req) = CmActiveDriverServiceRequest::from_bytes(buf) else {
-            return reply(STATUS_INVALID_PARAMETER, 0);
-        };
-        let header = core::mem::size_of::<CmActiveDriverServiceRequest>();
-        if req.abi_size as usize != header
-            || req.abi_version != CM_ABI_VERSION
-            || req._reserved != 0
-            || req.path_offset as usize != header
-            || req.path_len_bytes == 0
-            || req.path_len_bytes % 2 != 0
-            || req.path_len_bytes as usize > CM_MAX_HIVE_PATH_UNITS * 2
-            || header.checked_add(req.path_len_bytes as usize) != Some(buf.len())
-            || req.chunk_capacity as usize > CM_DRIVER_SERVICE_CHUNK_BYTES
-            || req.chunk_capacity as usize > out.len()
-        {
-            return reply(STATUS_INVALID_PARAMETER, 0);
-        }
-        let mut units = [0u16; CM_MAX_HIVE_PATH_UNITS];
-        let Some(count) = read_utf16(buf, req.path_offset, req.path_len_bytes, &mut units) else {
-            return reply(STATUS_INVALID_PARAMETER, 0);
-        };
-        if units[..count].contains(&0) {
-            return reply(STATUS_INVALID_PARAMETER, 0);
-        }
-        let Ok(path) = String::from_utf16(&units[..count]) else {
-            return reply(STATUS_INVALID_PARAMETER, 0);
-        };
-        match req.operation {
-            driver_service_transfer::BEGIN => {
-                if req.transfer_token != 0 || req.value_offset != 0 || req.chunk_capacity == 0 {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                let Some(mounted) = self.system_hive.as_ref() else {
-                    return reply(STATUS_DEVICE_NOT_READY, 0);
-                };
-                let value = match capture(mounted, &path) {
-                    Ok(value) => value,
-                    Err(status) => return reply(status, 0),
-                };
-                self.active_driver_service_snapshots
-                    .begin(path, value, req.chunk_capacity as usize, out)
-                    .map(snapshot_reply)
-                    .unwrap_or_else(|| reply(STATUS_INSUFFICIENT_RESOURCES, 0))
-            }
-            driver_service_transfer::PULL => {
-                if req.transfer_token == 0 || req.chunk_capacity == 0 {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                self.active_driver_service_snapshots
-                    .pull(
-                        req.transfer_token,
-                        req.value_offset as usize,
-                        req.chunk_capacity as usize,
-                        out,
-                        |key| key == &path,
-                    )
-                    .map(snapshot_reply)
-                    .unwrap_or_else(|| reply(STATUS_INVALID_PARAMETER, 0))
-            }
-            driver_service_transfer::ABORT => {
-                if req.transfer_token == 0
-                    || req.value_offset != 0
-                    || req.chunk_capacity != 0
-                    || !self
-                        .active_driver_service_snapshots
-                        .abort(req.transfer_token, |key| key == &path)
-                {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
-                }
-                reply(STATUS_SUCCESS, 0)
-            }
-            _ => reply(STATUS_INVALID_PARAMETER, 0),
-        }
-    }
 }
 
 #[cfg(test)]
