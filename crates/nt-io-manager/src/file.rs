@@ -121,11 +121,14 @@ pub struct FileRecord {
     /// IRPs whose canonical records still reference this file, including
     /// terminal completions that have not yet been acknowledged by their owner.
     pub outstanding_irp_refs: u32,
-    /// The user handle is gone, but final close is waiting for IRP references.
+    /// The user handle is gone, but final close may wait for IRP or pointer references.
     pub close_deferred: bool,
+    /// Allocation-free scheduling latch consumed by the outer completion pump.
+    pub(crate) close_retry_queued: bool,
     /// `IRP_MJ_CLEANUP` has been handed to the driver exactly once.
     pub cleanup_dispatched: bool,
-    /// `IRP_MJ_CLOSE` has been handed to the driver exactly once.
+    /// CLOSE entry has begun. Set before backend entry to forbid pointer resurrection; reset only
+    /// when dispatch proves the request was never accepted.
     pub close_dispatched: bool,
 }
 
@@ -156,6 +159,7 @@ impl FileRecord {
             state: FileState::Allocated,
             outstanding_irp_refs: 0,
             close_deferred: false,
+            close_retry_queued: false,
             cleanup_dispatched: false,
             close_dispatched: false,
         }

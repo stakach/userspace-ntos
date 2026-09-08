@@ -40,7 +40,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
             file.state
         };
         match state {
-            FileState::Allocated | FileState::Closed => return self.release_file_record(file_id),
+            FileState::Allocated | FileState::Closed => {
+                if self.file_reference_count(file_id) == 0 { return self.release_file_record(file_id); }
+                self.file_mut(file_id).expect("validated external File").close_deferred = true;
+                return Ok(());
+            }
             FileState::CreateIrpDispatched => {
                 // No process handle was published for a pending external create. Relinquishing the
                 // File therefore abandons that exact create IRP and keeps the File alive only until
@@ -151,6 +155,14 @@ impl<P: ObjectManagerPort> IoManager<P> {
             Some(file) => file.state,
             None => return Ok(()),
         };
+        if matches!(state, FileState::Allocated | FileState::Closed)
+            && self.file(file_id).is_some_and(|file| file.close_deferred)
+        {
+            if self.file_reference_count(file_id) != 0 {
+                return Ok(());
+            }
+            return self.release_file_record(file_id);
+        }
         if state == FileState::CleanupPending {
             let (client, device_id, dispatched) = {
                 let file = self.file(file_id).expect("checked above");
@@ -198,7 +210,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             _ => return Ok(()),
         };
 
-        if refs != 0 {
+        if refs != 0 || self.file_reference_count(file_id) != 0 {
             self.file_mut(file_id)
                 .expect("file still live")
                 .close_deferred = true;
@@ -212,13 +224,26 @@ impl<P: ObjectManagerPort> IoManager<P> {
         self.file_mut(file_id)
             .expect("file still live")
             .close_deferred = false;
-        match self.dispatch_lifecycle_irp_once(
+        self.file_mut(file_id)
+            .expect("file still live")
+            .close_dispatched = true;
+        let dispatched = self.dispatch_lifecycle_irp_once(
             client,
             device_id,
             file_id,
             major::IRP_MJ_CLOSE,
             IoParameters::Close,
-        )? {
+        );
+        let dispatched = match dispatched {
+            Ok(value) => value,
+            Err(status) => {
+                let file = self.file_mut(file_id).expect("unaccepted close keeps file live");
+                file.close_dispatched = false;
+                file.close_deferred = true;
+                return Err(status);
+            }
+        };
+        match dispatched {
             LifecycleDispatch::Completed(_) => {
                 self.file_mut(file_id)
                     .expect("close keeps file live")
@@ -319,6 +344,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
     }
 
     pub(crate) fn release_file_record(&mut self, file_id: FileId) -> Result<(), NtStatus> {
+        if self.file_reference_count(file_id) != 0 { return Err(NtStatus::DELETE_PENDING); }
         let (client, reference, refs) = self
             .file(file_id)
             .map(|file| {
@@ -372,7 +398,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             let state = self.file(id).expect("enumerated file").state;
             match state {
                 FileState::Allocated => {
-                    self.release_file_record(id)?;
+                    self.release_external_file(client, id)?;
                     continue;
                 }
                 FileState::CreateIrpDispatched => {
@@ -390,7 +416,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 }
                 FileState::ClosePending => {}
                 FileState::Closed => {
-                    self.release_file_record(id)?;
+                    self.release_external_file(client, id)?;
                     continue;
                 }
             }

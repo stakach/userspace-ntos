@@ -58,7 +58,6 @@ struct PumpStorageCapacity {
     manager_owned_irps: usize,
     cancel_dispatch_retries: usize,
     rejected_completion_acks: usize,
-    deferred_file_close_retries: usize,
     disconnected_client_retries: usize,
 }
 
@@ -69,7 +68,6 @@ impl<P: ObjectManagerPort> IoManager<P> {
             manager_owned_irps: self.manager_owned_irps.capacity(),
             cancel_dispatch_retries: self.cancel_dispatch_retries.capacity(),
             rejected_completion_acks: self.rejected_completion_acks.capacity(),
-            deferred_file_close_retries: self.deferred_file_close_retries.capacity(),
             disconnected_client_retries: self.disconnected_client_retries.capacity(),
         }
     }
@@ -193,17 +191,44 @@ impl<P: ObjectManagerPort> IoManager<P> {
     }
 
     fn retry_deferred_file_closes(&mut self) -> usize {
+        if self.deferred_file_close_queued == 0 {
+            return 0;
+        }
         let mut completed = 0;
-        let mut index = 0;
-        while index < self.deferred_file_close_retries.len() {
-            let file_id = self.deferred_file_close_retries[index];
-            if self.file(file_id).is_none() || self.finish_deferred_file_close(file_id).is_ok() {
-                self.deferred_file_close_retries.swap_remove(index);
+        let end = self.files.iter().map(|(id, _)| id.slot() + 1).max().unwrap_or(0);
+        if end == 0 {
+            self.deferred_file_close_cursor = 0;
+            return 0;
+        }
+        let start = self.deferred_file_close_cursor.min(end);
+        let mut cursor = start;
+        let mut wrapped = false;
+        // A fixed callback budget and rotating slot cursor ensure requeues/new work cannot monopolize
+        // one pump. Only the copied generation-bearing FileId survives a backend call.
+        for _ in 0..64 {
+            let limit = if wrapped { start } else { end };
+            let next = self.files.iter()
+                .find(|(id, file)| {
+                    file.close_retry_queued && id.slot() >= cursor && id.slot() < limit
+                })
+                .map(|(id, _)| id);
+            let Some(file_id) = next else {
+                if wrapped || start == 0 {
+                    break;
+                }
+                cursor = 0;
+                wrapped = true;
+                continue;
+            };
+            cursor = file_id.slot() + 1;
+            assert!(self.take_deferred_file_close(file_id), "selected live close retry");
+            if self.finish_deferred_file_close(file_id).is_ok() {
                 completed += 1;
             } else {
-                index += 1;
+                self.queue_deferred_file_close(file_id);
             }
         }
+        self.deferred_file_close_cursor = if cursor >= end { 0 } else { cursor };
         completed
     }
 

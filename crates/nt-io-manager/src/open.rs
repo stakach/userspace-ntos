@@ -496,7 +496,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         // The I/O Manager's retained ObjectRef keeps the File alive until the
         // IRP reference is gone and this teardown releases the record.
         let _ = self.port.close_handle(client, handle);
+        let file = self.file_mut(file_id).ok_or(NtStatus::INVALID_HANDLE)?;
+        file.transition(FileState::Closed);
+        file.close_deferred = true;
         self.free_irp(irp_id);
-        self.release_file_record(file_id)
+        self.release_external_file(client, file_id)
     }
 }

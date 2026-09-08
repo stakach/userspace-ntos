@@ -1992,8 +1992,8 @@ unsafe fn acknowledge_pending_irp_completion(canonical_irp_id: u64) -> bool {
                 .completion
                 .completed()
                 .expect("published hosted IRP owner has no completion payload");
-            let create_failed =
-                matches!(entry.major as u64, 0 | 1) && (completion.status as i32).is_negative();
+            let create_failed = major::is_create_major(entry.major)
+                && (completion.status as i32).is_negative();
             if !entry.owns_fo
                 && (entry.major as u64 == IRP_MJ_CLOSE || create_failed)
                 && entry.canonical_file_id != 0
@@ -33931,10 +33931,7 @@ unsafe fn run_irp(major: u64, handler: u64) -> (i32, u64) {
     let file_id = read_volatile((FSD_SHARED_VADDR + SH_REQ_FILEID) as *const u64);
     let requestor_tid =
         read_volatile((FSD_SHARED_VADDR + SH_REQ_REQUESTOR_TID) as *const u32) as u64;
-    let is_create = matches!(
-        major as u8,
-        major::IRP_MJ_CREATE | major::IRP_MJ_CREATE_NAMED_PIPE | major::IRP_MJ_CREATE_MAILSLOT
-    );
+    let is_create = major::is_create_major(major as u8);
     let create_ea_len = request.create_ea_length as u64;
     let create_file_name_len = if is_create {
         match inlen.checked_sub(create_ea_len) {

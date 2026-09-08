@@ -38,6 +38,7 @@ mod ea;
 mod external_dispatch;
 mod fault;
 mod file;
+mod file_reference;
 mod file_information;
 mod hosted_domain;
 mod hosted_device_pointer;
@@ -75,6 +76,7 @@ pub use completion_unwind::{
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use device_reference::DeviceReference;
+pub use file_reference::FileReference;
 pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration};
 pub use device_property_query::{
     query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
@@ -192,15 +194,7 @@ pub use nt_io_abi::{
     FileObjectProjection, HostedDomainId, IoRequestId, IrpId,
 };
 
-#[inline]
-pub(crate) const fn is_create_major(major: u8) -> bool {
-    matches!(
-        major,
-        nt_io_abi::major::IRP_MJ_CREATE
-            | nt_io_abi::major::IRP_MJ_CREATE_NAMED_PIPE
-            | nt_io_abi::major::IRP_MJ_CREATE_MAILSLOT
-    )
-}
+pub(crate) use nt_io_abi::major::is_create_major;
 
 /// The canonical I/O Manager (spec §6): owns the driver / device / file / IRP
 /// stores, the registered dispatch backends, and the port to the Object Manager
@@ -210,6 +204,7 @@ pub struct IoManager<P> {
     drivers: GenStore<DriverId, DriverRecord>,
     devices: GenStore<DeviceId, DeviceRecord>,
     device_references: device_reference::DeviceReferenceStore,
+    file_references: file_reference::FileReferenceStore,
     hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
@@ -218,7 +213,8 @@ pub struct IoManager<P> {
     manager_owned_irps: Vec<IrpId>,
     cancel_dispatch_retries: Vec<IrpId>,
     rejected_completion_acks: Vec<(usize, IrpId)>,
-    deferred_file_close_retries: Vec<FileId>,
+    deferred_file_close_cursor: u64,
+    deferred_file_close_queued: usize,
     disconnected_client_retries: Vec<ClientId>,
     port: P,
     backends: Vec<Box<dyn DriverDispatchBackend>>,
@@ -231,6 +227,7 @@ impl<P> IoManager<P> {
             drivers: GenStore::new(),
             devices: GenStore::new(),
             device_references: device_reference::DeviceReferenceStore::default(),
+            file_references: file_reference::FileReferenceStore::default(),
             hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore::default(),
             files: GenStore::new(),
             irps: GenStore::new(),
@@ -239,7 +236,8 @@ impl<P> IoManager<P> {
             manager_owned_irps: Vec::new(),
             cancel_dispatch_retries: Vec::new(),
             rejected_completion_acks: Vec::new(),
-            deferred_file_close_retries: Vec::new(),
+            deferred_file_close_cursor: 0,
+            deferred_file_close_queued: 0,
             disconnected_client_retries: Vec::new(),
             port,
             backends: Vec::new(),
@@ -956,6 +954,7 @@ impl<P> IoManager<P> {
         self.files.get_mut(id)
     }
     pub(crate) fn remove_file(&mut self, id: FileId) -> Option<FileRecord> {
+        if self.file_reference_count(id) != 0 { return None; }
         if self
             .files
             .get(id)
@@ -964,7 +963,12 @@ impl<P> IoManager<P> {
         {
             return None;
         }
-        self.files.remove(id)
+        if self.file(id).is_some_and(|file| file.close_retry_queued) {
+            self.take_deferred_file_close(id);
+        }
+        let record = self.files.remove(id)?;
+        self.file_references.remove_empty(id);
+        Some(record)
     }
     pub fn file_count(&self) -> usize {
         self.files.len()
@@ -1228,9 +1232,29 @@ impl<P> IoManager<P> {
     }
 
     pub(crate) fn queue_deferred_file_close(&mut self, file_id: FileId) {
-        if !self.deferred_file_close_retries.contains(&file_id) {
-            self.deferred_file_close_retries.push(file_id);
+        if self.file(file_id).is_some_and(|file| !file.close_retry_queued) {
+            let count = self.deferred_file_close_queued
+                .checked_add(1)
+                .expect("queued File count cannot exceed live File storage");
+            self.file_mut(file_id)
+                .expect("validated File close latch")
+                .close_retry_queued = true;
+            self.deferred_file_close_queued = count;
         }
+    }
+
+    pub(crate) fn take_deferred_file_close(&mut self, file_id: FileId) -> bool {
+        if !self.file(file_id).is_some_and(|file| file.close_retry_queued) {
+            return false;
+        }
+        let count = self.deferred_file_close_queued
+            .checked_sub(1)
+            .expect("queued File latch must be included in summary count");
+        self.file_mut(file_id)
+            .expect("validated File close latch")
+            .close_retry_queued = false;
+        self.deferred_file_close_queued = count;
+        true
     }
     pub fn irp_count(&self) -> usize {
         self.irps.len()

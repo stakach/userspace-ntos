@@ -29373,7 +29373,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reference. A root ETHREAD address is not proof that a dynamic thread's frames are mapped in the
     provider; keep those mappings through pending IRP completion, requestor-list unlink and retirement.
 
-    Next review target: canonical File pointer references, independent of handle and IRP ownership.
+    B3 canonical File pointer ownership tranche 123 (2026-09-08, complete):
+
+    Implement canonical File pointer references, independent of handle and IRP ownership.
     NPFS waitsup.c retains WaitEntry->FileObject, completes the IRP in its timer callback, and only
     then dereferences that File. Current deferred-close logic fences IRP references alone, so IRP
     completion cannot be the final File lifetime authority. Add exact-manager, non-clone FileReference
@@ -29381,12 +29383,83 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     deliver CLEANUP; final pointer release queues allocation-safe outer-pump close work instead of
     re-entering a driver synchronously from an Ob dereference broker.
 
+    Replace the allocating deferred-close retry vector with a pre-existing FileRecord latch and an
+    outer-pump retry budget; final pointer release must not lose its wakeup or allocate. Keep exact
+    issuing-manager ownership, preserve owners on failed release/transfer, and prevent fresh reference
+    acquisition from resurrecting a closing File. In particular, the CLOSE lifecycle IRP itself is
+    not permission to acquire new object references after object deletion has begun. Explicit CLEANUP
+    while a handle remains live must stay distinct from last-handle close.
+
+    Review adjustment: the queue uses an exact queued-count summary to avoid scanning on idle
+    completion-pump calls. A rotating slot cursor limits retries to 64 callbacks per pump and avoids
+    starvation; it does not impose a constant File-slot inspection bound (the current scan can visit
+    O(64*N) slots while work exists). Do not describe this as constant-time draining. Preserve the
+    no-allocation release path and measure before adding a separate indexing structure.
+
+    Native review found that asynchronous failed-create cleanup only classified ordinary and named
+    pipe CREATE, omitting mailslot CREATE. Use the shared, exhaustively tested I/O ABI create-major
+    classifier in canonical I/O and both native completion paths so mailslot failures retire the
+    same native File state. This narrow correction does not complete the pending File projection
+    registration/retirement protocol.
+
+    Implemented the manager-bound non-clone FileReference with counted retain/release and checked
+    split/merge transfer. Final release only latches canonical close-ready work; it never calls a
+    backend or allocates. Record removal and Object Manager reference release now fence pointer
+    references as well as IRPs. The old deferred-close vector and its capacity bookkeeping are
+    removed. CLEANUP runs at handle release; CLOSE starts only after both reference classes drain,
+    and its admission latch is set before allocating or dispatching the lifecycle IRP.
+
+    Never-created/closed File records and failed synchronous creates now retain record-only cleanup
+    through pointer release, including client disconnect, without fabricating driver CLOSE calls.
+    Fifteen focused ownership/lifecycle tests cover both ACK/dereference orders, failed close retry,
+    generation reuse, disconnect, overflow, wrong-manager/file transfer and a 130-record rotating
+    drain. Focused I/O Manager/ABI validation passes 365 tests in
+    `.tmp/test-file-pointer-ownership-20260908.log`. Native release passes with unchanged 262
+    warnings in `.tmp/build-file-pointer-ownership-20260908.log`; the serialized 26-crate regression
+    passes 2,824 tests in `.tmp/test-file-pointer-regression-20260908.log`.
+    Independent review found no further concrete lifetime blocker. The no-resurrection test models
+    the actual close-entry state and own-IRP reference, but the current safe test harness cannot
+    inspect IoManager from inside a backend callback. Keep that callback-level test gap explicit
+    until the detached invocation boundary permits safe re-entry; do not test it using aliased
+    mutable manager references.
+
     Native File publication needs exact domain/address/FileId binding and allocation identity before
     driver entry. Replace unchecked fo_release pool frees with checked retirement after canonical
     CLOSE completion. Do not count a projection registration anchor as a semantic File reference:
     registration survives until CLOSE, so using that anchor to gate CLOSE would deadlock lifetime
     retirement. Keep projection/mapping pins distinct from caller pointer references. This is another
     prerequisite, not permission to route generic File/Event/Token references as Device references.
+
+    Native follow-on review: IrpDispatchRequest.file_id is the canonical FileId; SH_REQ_FILEID carries
+    driver FsContext and is not File identity. Capture the actual allocating provider domain, which
+    can differ from PendingIrp.owner_domain (the dependent owner used for completion filtering).
+    The first registration belongs before fo_register/driver entry, after all cleanup owners are
+    reserved. General external dispatch currently holds a mutable backend/IoManager borrow through
+    provider IPC; introduce an owned prepared-dispatch/return boundary before a File registration
+    broker can safely re-enter the I/O Manager. A raw address plus domain is insufficient without the
+    admitted IRP/File identity and actual allocation extent. Native completion ACK currently frees
+    and tombstones its owner without a replay receipt; retained exact retirement acknowledgement is
+    required before recycling File projections after an uncertain ACK.
+
+    B3 detached File IRP invocation tranche 124 (2026-09-08, planned):
+
+    Add an owned prepare/begin/invoke/finish/discard protocol for general File IRPs. Tranche 118's
+    PreparedExternalPnpIrp supplies manager identity and recoverable rejection, but its execution
+    still calls a backend under an IoManager mutable borrow; it is not itself detached execution.
+    An invocation must own its generation-bearing IRP, immutable exact route/projection and buffers
+    while native execution holds no manager/backend borrow. Wrong-manager or stale finishes return
+    the complete owner intact. Distinguish never-entered rejection, genuine returned results,
+    pending I/O and indeterminate transport; an uncertain provider call is not a completed failure.
+
+    Preparation must reserve CREATE ownership so another create cannot reuse an Allocated File,
+    preserve source/related/rename-target references, and restore exact relative-open authority on
+    pre-entry discard. Validate complete buffer extents rather than copying the old min-clamping.
+    Retain terminal receipts until explicit checked retirement; actual reentrant completion records,
+    not a changed state alone, prove completion. The separate native requestor/mapping owner remains
+    required. The intended native consumer is dispatch_external_irp_to_device_record_result_exact,
+    using the stateless execution portion of HostedDriverBackend::dispatch_irp with dynamic DriverPeer
+    routing and real allocating-provider identity. Remove the borrowed execution path when callers
+    have moved to this protocol; do not keep it as a fallback.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

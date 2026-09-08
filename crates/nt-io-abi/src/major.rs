@@ -40,3 +40,23 @@ pub const IO_MAJOR_FUNCTION_COUNT: usize = 0x1c;
 pub const fn is_valid_major(major: u8) -> bool {
     (major as usize) < IO_MAJOR_FUNCTION_COUNT
 }
+
+/// All major functions that create a File object, including pipe and mailslot creation.
+pub const fn is_create_major(major: u8) -> bool {
+    matches!(
+        major,
+        IRP_MJ_CREATE | IRP_MJ_CREATE_NAMED_PIPE | IRP_MJ_CREATE_MAILSLOT
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_classification_covers_every_major_byte() {
+        for major in 0..=u8::MAX {
+            assert_eq!(is_create_major(major), [0x00, 0x01, 0x13].contains(&major));
+        }
+    }
+}
