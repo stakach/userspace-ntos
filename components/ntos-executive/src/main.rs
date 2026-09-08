@@ -2524,7 +2524,6 @@ struct ObjectWaiterRecord {
     resume_sp: u64,
     resume_flags: u64,
     deadline: nt_delay_execution::Deadline,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     pending_wake_index: u64,
     pending_wake_object: WaitObject,
 }
@@ -2547,7 +2546,6 @@ impl ObjectWaiterRecord {
             resume_sp: 0,
             resume_flags: 0,
             deadline: nt_delay_execution::Deadline::Infinite,
-            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             pending_wake_index: u64::MAX,
             pending_wake_object: WaitObject::FREE,
         }
@@ -2573,7 +2571,6 @@ impl ObjectWaiterRecord {
         resume_sp: u64,
         resume_flags: u64,
         deadline: nt_delay_execution::Deadline,
-        reply: nt_syscall_abi::ParkedSyscallReply,
     ) -> Self {
         let mut record = Self::empty();
         record.sequence = sequence;
@@ -2593,7 +2590,6 @@ impl ObjectWaiterRecord {
         record.resume_sp = resume_sp;
         record.resume_flags = resume_flags;
         record.deadline = deadline;
-        record.reply = reply;
         record
     }
 }
@@ -2790,7 +2786,6 @@ struct KeyedWaiterRecord {
     reply_cap: u64,
     tid: u64,
     deadline: nt_delay_execution::Deadline,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 impl KeyedWaiterRecord {
@@ -2800,7 +2795,6 @@ impl KeyedWaiterRecord {
             reply_cap: 0,
             tid: 0,
             deadline: nt_delay_execution::Deadline::Infinite,
-            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
         }
     }
 
@@ -3265,7 +3259,7 @@ unsafe fn watchdog_report(messages: u64) {
         print_str(b" deadline=");
         print_tagged_deadline(record.deadline, now);
         print_str(b" resume-ip=0x");
-        print_hex_u64(record.reply.resume_ip());
+        print_hex_u64(record.resume_ip);
         print_str(b"\n");
     }
     for slot in 0..keyed_waiter_len() {
@@ -17060,7 +17054,6 @@ unsafe fn delay_park(
     queue: &mut nt_delay_execution::Queue,
     deadline: nt_delay_execution::Deadline,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     thread_id: u64,
     badge: u64,
 ) -> bool {
@@ -17074,7 +17067,6 @@ unsafe fn delay_park(
         deadline,
         sequence: 0,
         reply_cap,
-        reply,
         thread_id,
         badge,
     };
@@ -17679,7 +17671,6 @@ unsafe fn wait_park(
     handler: &mut ExecNtHandler,
     object: WaitObject,
     alertable: bool,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: nt_delay_execution::Deadline,
 ) -> bool {
@@ -17690,7 +17681,6 @@ unsafe fn wait_park(
         &[0],
         false,
         alertable,
-        reply,
         tid,
         deadline,
     )
@@ -17748,7 +17738,6 @@ unsafe fn dbgk_reporter_park(
     pi: usize,
     tid: u64,
     badge: u64,
-    syscall_reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     sp: u64,
     flags: u64,
@@ -17767,7 +17756,6 @@ unsafe fn dbgk_reporter_park(
         pi: pi as u32,
         tid,
         badge,
-        syscall_reply,
         resume_ip,
         resume_sp: sp,
         resume_flags: flags,
@@ -17905,7 +17893,6 @@ fn keyed_wait_clear_slot(slot: usize) {
 /// user pointer instead of an executive event index.
 unsafe fn keyed_wait_park(
     key: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: nt_delay_execution::Deadline,
 ) -> bool {
@@ -17922,7 +17909,6 @@ unsafe fn keyed_wait_park(
         reply_cap: stolen,
         tid,
         deadline,
-        reply,
     }) {
         return false;
     }
@@ -17964,7 +17950,6 @@ fn keyed_release_wait_clear_slot(slot: usize) {
 /// `NtWaitForKeyedEvent` on the same raw key wakes this parked releaser and itself returns success.
 unsafe fn keyed_release_wait_park(
     key: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: nt_delay_execution::Deadline,
 ) -> bool {
@@ -17981,7 +17966,6 @@ unsafe fn keyed_release_wait_park(
         reply_cap: stolen,
         tid,
         deadline,
-        reply,
     }) {
         return false;
     }
@@ -18724,7 +18708,6 @@ unsafe fn wait_park_multi(
     result_indices: &[u8],
     wait_all: bool,
     alertable: bool,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     tid: u64,
     deadline: nt_delay_execution::Deadline,
 ) -> bool {
@@ -18785,7 +18768,6 @@ unsafe fn wait_park_multi(
         handler.current_sp,
         handler.current_flags,
         deadline,
-        reply,
     )) {
         for index in (0..objects.len()).rev() {
             handler
@@ -23206,7 +23188,6 @@ struct LpcReceiveContinuation {
     tid: u64,
     memory: SyscallUserMemory,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 /// Allocation-safe handoff for a broker connection that has become pending. The table reservation
@@ -23231,7 +23212,6 @@ struct LpcConnectContinuation {
     name: [u16; 32],
     name_len: u8,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 /// Terminal broker result transferred from accept/complete dispatch to the reply-cap owner.
@@ -23267,7 +23247,6 @@ struct LpcRequestContinuation {
     memory: SyscallUserMemory,
     completion: LpcRequestCompletion,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 impl PendingWaitTimeout {
@@ -24133,7 +24112,6 @@ struct PendingPnpSyscallReply {
     tid: u64,
     badge: u64,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 }
 
 struct PendingDriverStartTransfer {
@@ -33329,7 +33307,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             },
             sequence: 0,
             reply_cap: 1,
-            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             thread_id: 7,
             badge: 3,
         };
@@ -33357,7 +33334,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             },
             sequence: 0,
             reply_cap: 1,
-            reply: nt_syscall_abi::ParkedSyscallReply::native_call(),
             thread_id,
             badge,
         };

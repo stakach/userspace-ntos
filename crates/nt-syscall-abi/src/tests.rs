@@ -272,26 +272,7 @@ fn parked_unknown_syscall_retains_only_resume_metadata() {
     assert_eq!(parked.resume_ip(), 0xaaaa);
     assert_eq!(parked.resume_sp(), 0xbbbb);
     assert_eq!(parked.resume_flags(), 0xcccc);
-    assert_eq!(core::mem::size_of::<ParkedSyscallReply>(), 32);
-}
-
-#[test]
-fn debugger_edits_only_selected_resume_metadata() {
-    let parked = ParkedSyscallReply::unknown_syscall(1, 2, 3).with_resume_context(
-        Some(0xaaaa),
-        None,
-        Some(0xcccc),
-    );
-    assert_eq!(parked.resume_ip(), 0xaaaa);
-    assert_eq!(parked.resume_sp(), 2);
-    assert_eq!(parked.resume_flags(), 0xcccc);
-
-    let native = ParkedSyscallReply::native_call().with_resume_context(
-        Some(0xaaaa),
-        Some(0xbbbb),
-        Some(0xcccc),
-    );
-    assert_eq!(native, ParkedSyscallReply::native_call());
+    assert_eq!(core::mem::size_of::<ParkedSyscallReply>(), 24);
 }
 
 #[test]

@@ -455,8 +455,6 @@ pub struct ReporterBlock {
     pub tid: u64,
     /// The reporter's fault-endpoint badge (its identity in the host's service multiplex).
     pub badge: u64,
-    /// Complete hosted syscall continuation. Ignored for the fault flavours.
-    pub syscall_reply: nt_syscall_abi::ParkedSyscallReply,
     /// Resume `FaultIP` for a UserException block. Ignored for syscall and retry-only faults.
     pub resume_ip: u64,
     /// Resume stack pointer for a UserException block.
@@ -814,12 +812,7 @@ impl DebugObject {
             let Some(mut block) = event.reporter.filter(|block| block.is_blocked()) else {
                 continue;
             };
-            if block.kind == DBGK_BLOCK_SYSCALL {
-                block.syscall_reply =
-                    block
-                        .syscall_reply
-                        .with_resume_context(resume_ip, resume_sp, resume_flags);
-            } else {
+            if block.kind != DBGK_BLOCK_SYSCALL {
                 if let Some(ip) = resume_ip {
                     block.resume_ip = ip;
                 }

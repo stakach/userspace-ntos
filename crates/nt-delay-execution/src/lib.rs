@@ -77,7 +77,6 @@ pub struct Waiter {
     pub deadline: Deadline,
     pub sequence: u64,
     pub reply_cap: u64,
-    pub reply: nt_syscall_abi::ParkedSyscallReply,
     pub thread_id: u64,
     pub badge: u64,
 }
@@ -209,11 +208,6 @@ mod tests {
             deadline,
             sequence: 99,
             reply_cap: thread_id + 100,
-            reply: nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                1,
-                2,
-                3,
-            ),
             thread_id,
             badge: thread_id + 10,
         }

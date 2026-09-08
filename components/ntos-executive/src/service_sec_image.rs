@@ -191,7 +191,6 @@ impl ComponentSuspensionCompletion {
 struct ComponentNativeContinuation {
     pending: PendingComponentDispatch,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
@@ -938,7 +937,6 @@ unsafe fn lpc_receive_wait_park(
     pi: u32,
     badge: u64,
     tid: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     if tid == 0 {
         return false;
@@ -960,7 +958,6 @@ unsafe fn lpc_receive_wait_park(
         tid,
         memory: pending.memory,
         reply_cap: stolen,
-        reply,
     };
     if table
         .publish(
@@ -1016,7 +1013,6 @@ unsafe fn lpc_connect_wait_park(
     pi: u32,
     badge: u64,
     tid: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     if tid == 0 || lpc_thread_has_wait(tid, badge) {
         return false;
@@ -1036,7 +1032,6 @@ unsafe fn lpc_connect_wait_park(
         name: pending.name,
         name_len: pending.name_len,
         reply_cap: stolen,
-        reply,
     };
     if (&mut *core::ptr::addr_of_mut!(LPC_CONNECT_WAITS))
         .publish(
@@ -1070,7 +1065,6 @@ unsafe fn lpc_request_wait_park(
     pi: u32,
     badge: u64,
     tid: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     if tid == 0 || lpc_thread_has_wait(tid, badge) {
         return false;
@@ -1089,7 +1083,6 @@ unsafe fn lpc_request_wait_park(
         memory: pending.memory,
         completion: pending.completion,
         reply_cap: stolen,
-        reply,
     };
     if (&mut *core::ptr::addr_of_mut!(LPC_REQUEST_WAITS))
         .publish(
@@ -2079,7 +2072,6 @@ unsafe fn provider_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
@@ -2107,7 +2099,6 @@ unsafe fn provider_wait_admit_retained(
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Provider(pending),
         reply_cap,
-        reply,
         resume_ip,
         resume_sp,
         resume_flags,
@@ -2219,7 +2210,6 @@ unsafe fn provider_wait_admit_retained(
 unsafe fn provider_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingProviderWaitDispatch,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
@@ -2236,7 +2226,6 @@ unsafe fn provider_wait_admit_current(
         nt_handler,
         pending,
         active_reply,
-        reply,
         resume_ip,
         resume_sp,
         resume_flags,
@@ -2253,7 +2242,6 @@ unsafe fn lpc_wait_admit_retained(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
     reply_cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
@@ -2286,7 +2274,6 @@ unsafe fn lpc_wait_admit_retained(
     let continuation = ComponentNativeContinuation {
         pending: PendingComponentDispatch::Lpc(pending),
         reply_cap,
-        reply,
         resume_ip,
         resume_sp,
         resume_flags,
@@ -2331,7 +2318,6 @@ unsafe fn lpc_wait_admit_retained(
 unsafe fn lpc_wait_admit_current(
     nt_handler: &mut ExecNtHandler,
     pending: win32k_glue::PendingLpcWaitDispatch,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     resume_ip: u64,
     resume_sp: u64,
     resume_flags: u64,
@@ -2348,7 +2334,6 @@ unsafe fn lpc_wait_admit_current(
         nt_handler,
         pending,
         active_reply,
-        reply,
         resume_ip,
         resume_sp,
         resume_flags,
@@ -3030,7 +3015,6 @@ unsafe fn drain_deferred_user_callback_returns(
                         nt_handler,
                         pending,
                         deferred.reply_cap,
-                        deferred.reply,
                         deferred.reply.resume_ip(),
                         deferred.reply.resume_sp(),
                         deferred.reply.resume_flags(),
@@ -3051,7 +3035,6 @@ unsafe fn drain_deferred_user_callback_returns(
                         nt_handler,
                         pending,
                         deferred.reply_cap,
-                        deferred.reply,
                         deferred.reply.resume_ip(),
                         deferred.reply.resume_sp(),
                         deferred.reply.resume_flags(),
@@ -8437,7 +8420,6 @@ pub(crate) unsafe fn service_sec_image(
                 badge,
                 $kind,
                 0,
-                nt_syscall_abi::ParkedSyscallReply::native_call(),
                 $ip,
                 $sp,
                 $flags,
@@ -11199,7 +11181,6 @@ pub(crate) unsafe fn service_sec_image(
                                     assert!(provider_wait_admit_current(
                                         &mut nt_handler,
                                         pending,
-                                        parked_syscall_reply,
                                         resume_ip,
                                         sp,
                                         flags,
@@ -11241,7 +11222,6 @@ pub(crate) unsafe fn service_sec_image(
                                     assert!(lpc_wait_admit_current(
                                         &mut nt_handler,
                                         pending,
-                                        parked_syscall_reply,
                                         resume_ip,
                                         sp,
                                         flags,
@@ -11383,14 +11363,8 @@ pub(crate) unsafe fn service_sec_image(
                 bool,
                 nt_io_manager::PendingFileIoReservation,
             )> = None;
-            let mut transfer_pending_driver_start: Option<(
-                PendingDriverStartTransfer,
-                nt_syscall_abi::ParkedSyscallReply,
-            )> = None;
-            let mut transfer_pending_pnp_operation: Option<(
-                PendingPnpOperationTransfer,
-                nt_syscall_abi::ParkedSyscallReply,
-            )> = None;
+            let mut transfer_pending_driver_start: Option<PendingDriverStartTransfer> = None;
+            let mut transfer_pending_pnp_operation: Option<PendingPnpOperationTransfer> = None;
             let mut transfer_file_irp_drain: Option<(
                 nt_io_manager::PendingFileIrpDrain,
                 nt_io_manager::PendingFileIrpDrainReservation,
@@ -12006,10 +11980,10 @@ pub(crate) unsafe fn service_sec_image(
                     );
                 }
                 if let Some(transfer) = nt_handler.pending_driver_start_transfer.take() {
-                    transfer_pending_driver_start = Some((transfer, parked_syscall_reply));
+                    transfer_pending_driver_start = Some(transfer);
                 }
                 if let Some(transfer) = nt_handler.pending_pnp_operation_transfer.take() {
-                    transfer_pending_pnp_operation = Some((transfer, parked_syscall_reply));
+                    transfer_pending_pnp_operation = Some(transfer);
                 }
                 if let Some(mut waiter) = nt_handler.pending_synchronous_file_wait.take() {
                     // Publish the exact FIFO owner before any post-dispatch completion can release
@@ -16540,7 +16514,6 @@ pub(crate) unsafe fn service_sec_image(
                     component_suspension_park_request = provider_wait_admit_current(
                         &mut nt_handler,
                         pending,
-                        parked_syscall_reply,
                         resume_ip,
                         sp,
                         flags,
@@ -16559,7 +16532,6 @@ pub(crate) unsafe fn service_sec_image(
                     component_suspension_park_request = lpc_wait_admit_current(
                         &mut nt_handler,
                         pending,
-                        parked_syscall_reply,
                         resume_ip,
                         sp,
                         flags,
@@ -17365,7 +17337,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u32,
                         badge,
                         nt_handler.current_tid,
-                        parked_syscall_reply,
                     )
                 {
                     procs[pi].faults = faults;
@@ -17416,7 +17387,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u32,
                         badge,
                         nt_handler.current_tid,
-                        parked_syscall_reply,
                     )
                 {
                     procs[pi].faults = faults;
@@ -17458,7 +17428,6 @@ pub(crate) unsafe fn service_sec_image(
                         pi as u32,
                         badge,
                         nt_handler.current_tid,
-                        parked_syscall_reply,
                     )
                 {
                     procs[pi].faults = faults;
@@ -17508,7 +17477,6 @@ pub(crate) unsafe fn service_sec_image(
                     park_io_completion_apc_out,
                     park_io_completion_iosb_out,
                     park_io_completion_deadline,
-                    parked_syscall_reply,
                 ) {
                     delay_timer_rearm_after_park(delay_queue, &mut nt_handler, timed);
                     print_str(b"[io-completion] pi=");
@@ -17549,7 +17517,6 @@ pub(crate) unsafe fn service_sec_image(
                     delay_queue,
                     deadline,
                     reply_main,
-                    parked_syscall_reply,
                     delay_tid,
                     badge,
                 ) {
@@ -17576,7 +17543,6 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 } else if keyed_release_wait_park(
                     park_keyed_release_wait_key,
-                    parked_syscall_reply,
                     nt_handler.current_tid,
                     park_keyed_release_wait_deadline,
                 ) {
@@ -17619,7 +17585,6 @@ pub(crate) unsafe fn service_sec_image(
                     result = 0xC000_009A;
                 } else if keyed_wait_park(
                     park_keyed_wait_key,
-                    parked_syscall_reply,
                     nt_handler.current_tid,
                     park_keyed_wait_deadline,
                 ) {
@@ -17694,7 +17659,6 @@ pub(crate) unsafe fn service_sec_image(
                     &mut nt_handler,
                     park_object,
                     park_wait_alertable,
-                    parked_syscall_reply,
                     park_wait_tid,
                     park_wait_deadline,
                 ) {
@@ -17742,7 +17706,6 @@ pub(crate) unsafe fn service_sec_image(
                     &park_wait_indices[..park_wait_set_n],
                     park_wait_set_all,
                     park_wait_alertable,
-                    parked_syscall_reply,
                     park_wait_tid,
                     park_wait_deadline,
                 ) {
@@ -17799,8 +17762,8 @@ pub(crate) unsafe fn service_sec_image(
             }
             // A pending StartDevice syscall transfers its reply independently of the notification
             // stream. Publication precedes Reply-object rotation.
-            if let Some((transfer, reply)) = transfer_pending_driver_start.take() {
-                pending_driver_start_transfer(&mut nt_handler, transfer, reply);
+            if let Some(transfer) = transfer_pending_driver_start.take() {
+                pending_driver_start_transfer(&mut nt_handler, transfer);
                 trace_indefinite_wait_park(
                     &nt_handler,
                     badge,
@@ -17821,8 +17784,8 @@ pub(crate) unsafe fn service_sec_image(
                 m3 = nm3;
                 continue;
             }
-            if let Some((transfer, reply)) = transfer_pending_pnp_operation.take() {
-                pending_pnp_operation_transfer(&mut nt_handler, transfer, reply);
+            if let Some(transfer) = transfer_pending_pnp_operation.take() {
+                pending_pnp_operation_transfer(&mut nt_handler, transfer);
                 trace_indefinite_wait_park(
                     &nt_handler,
                     badge,
@@ -17956,7 +17919,6 @@ pub(crate) unsafe fn service_sec_image(
                     badge,
                     nt_process::dbgk::DBGK_BLOCK_SYSCALL,
                     0,
-                    parked_syscall_reply,
                     resume_ip,
                     sp,
                     flags,
@@ -20347,7 +20309,6 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_VM_FAULT,
                             reply_a,
-                            nt_syscall_abi::ParkedSyscallReply::native_call(),
                             f1_m0,
                             0,
                             0,
@@ -20499,7 +20460,6 @@ pub(crate) unsafe fn service_sec_image(
                                     0,
                                     dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                                     reply_hw,
-                                    nt_syscall_abi::ParkedSyscallReply::native_call(),
                                     f2hw_m0,
                                     f2hw_m2,
                                     f2hw_m3,
@@ -20627,7 +20587,6 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                             reply_b,
-                            nt_syscall_abi::ParkedSyscallReply::native_call(),
                             f2_m0,
                             0,
                             0,
@@ -20735,7 +20694,6 @@ pub(crate) unsafe fn service_sec_image(
                                 0,
                                 dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                                 reply_step,
-                                nt_syscall_abi::ParkedSyscallReply::native_call(),
                                 f2s_m0,
                                 0,
                                 0,
@@ -20831,11 +20789,6 @@ pub(crate) unsafe fn service_sec_image(
                         let f3_ip = f3_m2;
                         let f3_sp = get_recv_mr(16);
                         let f3_flags = get_recv_mr(17);
-                        let f3_reply = nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                            f3_ip,
-                            f3_sp,
-                            f3_flags,
-                        );
                         dbgk_blk_trace(b"f3", f3_mi, f3_m0, 0, marker_t());
                         if no_progress2
                             && cont2 == 0
@@ -20866,7 +20819,6 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_SYSCALL,
                             reply_c,
-                            f3_reply,
                             f3_ip,
                             f3_sp,
                             f3_flags,
@@ -20929,7 +20881,6 @@ pub(crate) unsafe fn service_sec_image(
                             0,
                             dbgk::DBGK_BLOCK_USER_EXCEPTION,
                             reply_d,
-                            nt_syscall_abi::ParkedSyscallReply::native_call(),
                             f4_m0,
                             f4_m1,
                             f4_m2,
@@ -21045,28 +20996,18 @@ pub(crate) unsafe fn service_sec_image(
                     // distinctive SSN, so the assertion below is unchanged in strength.
                     let mut w_mi = 0u64;
                     let mut w_m0 = 0u64;
-                    let mut w_m2 = 0u64;
                     let mut select_guard = 0;
                     while dphase_ready && select_guard < 8 {
                         select_guard += 1;
-                        let (_wb, mi_r, m0_r, _m1_r, m2_r, _m3_r) =
+                        let (_wb, mi_r, m0_r, _m1_r, _m2_r, _m3_r) =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         w_mi = mi_r;
                         w_m0 = m0_r;
-                        w_m2 = m2_r;
                         if (mi_r >> 12) == 2 && m0_r == 0xD1 {
                             break;
                         }
                         dbgk_blk_trace(b"dw1-foreign", mi_r, m0_r, 0, marker_d());
                     }
-                    let w_ip = w_m2; // RCX = the syscall return address (the loop's `resume_ip`)
-                    let w_sp = get_recv_mr(16);
-                    let w_flags = get_recv_mr(17);
-                    let w_reply = nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                        w_ip,
-                        w_sp,
-                        w_flags,
-                    );
                     dbgk_blk_trace(b"dw1", w_mi, w_m0, 0, marker_d());
                     // The handler's own park REQUEST (NULL *Timeout, empty queue) — the exact arm a
                     // hosted debugger would take.
@@ -21088,7 +21029,6 @@ pub(crate) unsafe fn service_sec_image(
                             &mut nt_handler,
                             WaitObject::dispatcher(park_index as usize),
                             false,
-                            w_reply,
                             0xD1D1_0001,
                             nt_delay_execution::Deadline::Infinite,
                         )
@@ -21129,7 +21069,6 @@ pub(crate) unsafe fn service_sec_image(
                         0,
                         dbgk::DBGK_BLOCK_VM_FAULT,
                         reply_spare,
-                        nt_syscall_abi::ParkedSyscallReply::native_call(),
                         0x1000,
                         0,
                         0,
@@ -21810,7 +21749,6 @@ pub(crate) unsafe fn service_sec_image(
                                     0,
                                     dbgk::DBGK_BLOCK_DEBUG_EXCEPTION,
                                     reply_a,
-                                    nt_syscall_abi::ParkedSyscallReply::native_call(),
                                     f1_m0,
                                     0,
                                     0,
@@ -24288,7 +24226,6 @@ unsafe fn io_completion_park(
     apc_context_out: u64,
     io_status_block_out: u64,
     deadline: nt_delay_execution::Deadline,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 ) -> bool {
     let stolen = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
     if stolen == 0 {
@@ -24304,7 +24241,6 @@ unsafe fn io_completion_park(
     waiter.port_id = port_id;
     waiter.process_index = nt_handler.pi as u8;
     waiter.reply_cap = stolen;
-    waiter.reply = reply;
     waiter.thread_id = nt_handler.current_tid;
     waiter.badge = nt_handler.current_badge;
     waiter.key_context_out = key_context_out;
@@ -24803,7 +24739,6 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
 unsafe fn pending_driver_start_transfer(
     nt_handler: &mut ExecNtHandler,
     transfer: PendingDriverStartTransfer,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
     let PendingDriverStartTransfer {
         batch,
@@ -24821,7 +24756,6 @@ unsafe fn pending_driver_start_transfer(
         tid: nt_handler.current_tid,
         badge: nt_handler.current_badge,
         reply_cap: stolen,
-        reply,
     };
     let owner = PendingDriverStartOwner::User {
         request: Some(request),
@@ -24838,7 +24772,6 @@ unsafe fn pending_driver_start_transfer(
 unsafe fn pending_pnp_operation_transfer(
     nt_handler: &mut ExecNtHandler,
     transfer: PendingPnpOperationTransfer,
-    reply: nt_syscall_abi::ParkedSyscallReply,
 ) {
     let PendingPnpOperationTransfer {
         operation,
@@ -24855,7 +24788,6 @@ unsafe fn pending_pnp_operation_transfer(
         tid: nt_handler.current_tid,
         badge: nt_handler.current_badge,
         reply_cap: stolen,
-        reply,
     });
     nt_handler
         .pending_pnp_operations

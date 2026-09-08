@@ -28,6 +28,7 @@ mod continue_context;
 mod debug_context;
 mod floating_point;
 mod register_publication;
+mod native_continuation;
 pub use continue_context::{
     LegacyContextRestore, NT_NATIVE_CODE_SELECTOR, PLATFORM_NATIVE_CODE_SELECTOR,
 };

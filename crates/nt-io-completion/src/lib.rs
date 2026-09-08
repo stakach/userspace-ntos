@@ -809,7 +809,6 @@ pub struct CompletionWaiter {
     pub process_index: u8,
     pub _reserved: [u8; 3],
     pub reply_cap: u64,
-    pub reply: nt_syscall_abi::ParkedSyscallReply,
     pub thread_id: u64,
     pub badge: u64,
     pub key_context_out: u64,

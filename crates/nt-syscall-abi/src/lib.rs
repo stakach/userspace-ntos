@@ -89,13 +89,12 @@ pub const fn native_syscall_message_info(argc: u8) -> u64 {
 /// reissued with the restored request MRs. It is deliberately outside the 32-bit NTSTATUS domain.
 pub const NT_NATIVE_RETRY_REPLY: u64 = 0x4E54_5254_5259_0001;
 
-/// Resume coordinates retained for deferred syscall handling and debugger reporting.
+/// Resume coordinates retained for deferred syscall and callback handling.
 ///
 /// These coordinates are metadata, not a register restore image. Ordinary completion sends only
 /// the terminal status through the retained Reply capability, preserving canonical TCB state.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ParkedSyscallReply {
-    native_call: bool,
     resume: [u64; 3],
 }
 
@@ -109,7 +108,6 @@ impl ParkedSyscallReply {
     /// Retain an ordinary native seL4-Call continuation.
     pub const fn native_call() -> Self {
         Self {
-            native_call: true,
             resume: [0; 3],
         }
     }
@@ -121,7 +119,6 @@ impl ParkedSyscallReply {
         resume_flags: u64,
     ) -> Self {
         Self {
-            native_call: false,
             resume: [resume_ip, resume_sp, resume_flags],
         }
     }
@@ -139,29 +136,6 @@ impl ParkedSyscallReply {
     /// Saved user flags for a hosted UnknownSyscall continuation.
     pub const fn resume_flags(self) -> u64 {
         self.resume[2]
-    }
-
-    /// Return a new continuation with debugger-edited resume coordinates.
-    ///
-    /// Native seL4-Call continuations have no hosted fault register file, so edits are ignored.
-    pub const fn with_resume_context(
-        mut self,
-        resume_ip: Option<u64>,
-        resume_sp: Option<u64>,
-        resume_flags: Option<u64>,
-    ) -> Self {
-        if !self.native_call {
-            if let Some(value) = resume_ip {
-                self.resume[0] = value;
-            }
-            if let Some(value) = resume_sp {
-                self.resume[1] = value;
-            }
-            if let Some(value) = resume_flags {
-                self.resume[2] = value;
-            }
-        }
-        self
     }
 }
 

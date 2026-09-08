@@ -20,6 +20,8 @@ nt-fs = { workspace = true }
 nt-cache-manager = { workspace = true }
 nt-address-space = { workspace = true }
 nt-memory-manager = { workspace = true }
+nt-syscall-abi = { workspace = true }
+nt-user-callback = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

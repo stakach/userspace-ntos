@@ -30494,6 +30494,63 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     current hosted-call admission test explicitly rejects that label and must change with both
     producers and the executive consumer, not as an isolated permissive classifier change.
 
+    Native continuation adapter checkpoint: `nt-thread-start` now prepares native NtContinue and
+    self SET by overlaying only selected NT groups onto an admitted application register image.
+    All 18 application GPR/control words are selected for the final restart so IPC-clobbered
+    volatile registers cannot leak into unrequested groups. TLS is never selected, FP/debug stay
+    independently optional, and only self SET forces terminal RAX to STATUS_SUCCESS. All 107
+    thread-start unit tests and its compile-fail test pass
+    (`.tmp/test-native-continuation-adapter-20260909.log`); independent NT5/source review found no
+    issue. This adapter is not yet wired into native service exit.
+
+    Runtime ownership refinement: embed the continuation owner in HostedThreadRuntimeOwner, never
+    its copied routing snapshot or ExecNtHandler.current_* fields. Nested user callbacks require a
+    per-thread stack correlated with existing callback tokens; an outer callback-suspended record
+    must not be reported as the current user frame. Retain the complete exact-arity argument vector
+    alongside original application state across retries. On terminal completion, an edited native
+    call uses acknowledged atomic install/restart instead of ordinary Reply; unedited calls retain
+    normal IPC completion. A remote SET must never wake an incomplete wait. Retain Ready while PM
+    suspended, and serialize native suspend/termination against an in-flight completion before
+    relying on that host eligibility check. Dropped/ambiguous operations keep ownership and cannot
+    be replayed. Retire the exact record only after reply-cap bookkeeping or acknowledged thread
+    cancellation; do not let runtime reset, promotion or copied-row escape discard it.
+
+    Tranche 151 host-owner checkpoint: `nt-user-host::native_call_owner` now retains exact runtime
+    binding/ThreadLifetime, per-call and invocation epochs, immutable captured application state and
+    the complete exact-arity argument vector. Non-clone invocation tickets leave their proposal in
+    the owner across IPC. Selected edits commit only after mechanism acknowledgement; terminal
+    success/error remains Ready while suspended and becomes non-replayable Accepted only after its
+    exact completion acknowledgement. Nested frames use the existing callback correlation and
+    depth bound. Retry ingress validates its envelope/SSN and reuses retained data without reading
+    user memory again. Ambiguous outcomes retain evidence without replay; termination cannot erase
+    an unacknowledged operation. Cancellation and native runtime embedding remain open.
+
+    Validation: the 17 new owner cases pass with all 454 user-host tests, 107 thread-start tests,
+    27 syscall-ABI tests, 49 integration tests and eight existing compile-fail tests
+    (`.tmp/test-native-call-owner-20260909.log`). Two additional compile-fail checks verify owner
+    and invocation tickets cannot be cloned; all nine user-host documentation tests pass
+    (`.tmp/test-native-call-owner-ownership-20260909.log`). Independent review found no concrete
+    ownership-loss/replay defect. These are host contracts, not native runtime acceptance.
+
+    Follow-up parked-metadata cleanup removes all now-dead ParkedSyscallReply fields/parameters from
+    terminal-only delay, IOCP, keyed/object, LPC, PnP, component and debugger records, plus three
+    unused crate dependencies and the obsolete debugger mutation helper. Only the existing GUI
+    and deferred-callback coordinate owners remain until native continuation cutover; explicit
+    APC and synchronous retry coordinates are preserved. All 671 affected unit tests and six
+    compile-fail tests pass (`.tmp/test-parked-metadata-cleanup-20260909.log`).
+    The native executive release and ntdll build/import-export verifier pass after the cleanup
+    (`.tmp/build-native-call-owner-executive-20260909.log`,
+    `.tmp/build-native-call-owner-ntdll-20260909.log`). No new boot is claimed.
+
+    Immediate-reply review: the ordinary service tail still sends an 18-word old snapshot, and
+    nested callback completion can replace resume IP using a historical message-first/reporter+2
+    repair. This is another possible overwrite of an acknowledged remote context edit during
+    reentrant service execution. Remove ordinary replay at this tail too. Preserve explicit
+    zero-word installed-state redirects and no-reply atomic Continue. Audit live versus retained
+    parent callback snapshots before replacing the repair logic: a fresh child TCB snapshot must
+    never substitute for a retained parent's continuation. Keep genuine synchronous File retry
+    request restoration separate until the native owner replaces it.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a
