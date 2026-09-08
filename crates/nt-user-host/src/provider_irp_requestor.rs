@@ -1,7 +1,7 @@
-//! A provider IRP retains its actual logical requestor thread independently of its executor lane.
+//! A provider IRP retains its actual logical requestor thread and owning process, not its lane.
 
+use nt_process::native_handle::NativeThreadProcessReference;
 use nt_process::{InitialSystemIdentity, ProcessManager, ThreadLifetime};
-use nt_process::native_handle::{NativeObjectReference, PsHandleType};
 use nt_types::AccessMode;
 
 use crate::provider_logical_caller::{ProviderCallerError, ProviderLogicalCaller};
@@ -14,7 +14,7 @@ pub enum ProviderIrpRequestorError {
     Process(u32),
 }
 
-/// One exact Ps thread reference, not a process pointer or the provider's physical executor TCB.
+/// One exact Ps thread/process pair, never a process pointer masquerading as an executor thread.
 /// The native IRP arena separately authenticates its provider, lane and dispatch ownership.
 /// Keep this owner until IRP completion/abort and requestor-list unlink, including pending I/O.
 /// Dropping it cannot contact the PM; explicit release is required and errors retain ownership.
@@ -23,10 +23,10 @@ pub enum ProviderIrpRequestorError {
 /// use nt_user_host::provider_irp_requestor::ProviderIrpRequestor;
 /// fn duplicate(owner: ProviderIrpRequestor) { let _ = owner.clone(); }
 /// ```
-#[must_use = "retain the requestor until IRP retirement and explicitly release its Ps reference"]
+#[must_use = "retain the requestor until IRP retirement and explicitly release its Ps references"]
 pub struct ProviderIrpRequestor {
     lifetime: ThreadLifetime,
-    reference: NativeObjectReference,
+    reference: NativeThreadProcessReference,
 }
 
 impl ProviderIrpRequestor {
@@ -63,9 +63,12 @@ impl ProviderIrpRequestor {
             .capture_native_handle_caller(lifetime, AccessMode::KernelMode)
             .map_err(ProviderIrpRequestorError::Process)?;
         let reference = pm
-            .reference_native_ps_handle(caller, u64::MAX - 1, Some(PsHandleType::Thread), 0)
+            .reference_native_requestor(caller)
             .map_err(ProviderIrpRequestorError::Process)?;
-        Ok(Self { lifetime, reference })
+        Ok(Self {
+            lifetime,
+            reference,
+        })
     }
 
     pub const fn thread_lifetime(&self) -> ThreadLifetime {
@@ -76,14 +79,18 @@ impl ProviderIrpRequestor {
         self.lifetime.thread_id() as u64
     }
 
+    pub const fn requestor_pid(&self) -> u64 {
+        self.lifetime.process_id() as u64
+    }
+
+    pub const fn process_body(&self) -> Option<u64> {
+        self.reference.process_body()
+    }
+
     /// A body is available only while this owner holds its reference. Copying the address does
     /// not transfer that reference to the provider or authorize a later request from another job.
     pub const fn thread_body(&self) -> Option<u64> {
-        if self.reference.is_held() {
-            Some(self.reference.body())
-        } else {
-            None
-        }
+        self.reference.thread_body()
     }
 
     pub const fn is_held(&self) -> bool {

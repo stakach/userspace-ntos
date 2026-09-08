@@ -29556,6 +29556,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     is claimed. Canonical requestor backing, File pointer projection and detached CLEANUP/CLOSE
     remain prerequisites for the next I/O-family admission step.
 
+    B3 paired requestor ownership tranche 126 (2026-09-08, complete): acquire the actual
+    requestor ETHREAD and its owning EPROCESS as one failure-atomic PM transaction. Resolve the
+    original thread's owning process, not an attached effective process or physical provider lane.
+    Check both exact bodies, counts and manager authority before incrementing either reference;
+    release must likewise validate both identities and floors before changing either count.
+    Extend ProviderIrpRequestor with the owning process body and retain the pair through pending
+    I/O. This is a prerequisite for backing aliases, not a new native IRP requestor binding yet.
+
+    NativeThreadProcessReference now owns the pair without Clone, splitting, partial acquisition
+    or fallible rollback. ProviderIrpRequestor requires both canonical bodies and exposes the
+    retained process body/PID as well as the thread body/TID. Release is valid after termination,
+    rejects a different PM or depleted count without changing either reference, preserves initial
+    System floors, and blocks dormant-thread reuse while held. Nine focused PM tests, one additional
+    provider test, strengthened existing provider cases and a compile-fail ownership test cover the
+    change. Serialized nt-process/nt-user-host validation passes 606 tests in seven suites; native
+    release build passes in 35.89 seconds with the same 266 warnings. Independent review is clear.
+    Logs: .tmp/test-paired-requestor-20260908.log and .tmp/build-paired-requestor-20260908.log.
+
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
     Mapping those pool pages into unrelated providers would expose unrelated objects. Allocate
@@ -29564,6 +29582,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     EPROCESS backing/aliases through ProviderIrpRequestor ownership. Reuse checked frame acquisition
     and alias retirement, with prepublished ownership for failed map/cap cleanup, not the existing
     resource-map helper's ignored delete errors or unproven borrowed paging caps.
+    Preserve the PM's stable ThreadId body across dormant-thread activation; ThreadLifetime guards
+    activation-specific contents and retained requestors forbid reuse while referenced. Process
+    deletion also needs a withdrawal phase: currently PM records disappear before provider object
+    finalization. Merely reversing the calls would expose freed bodies to nested pointer lookups.
+    Fence new references, retain exact body/thread identities through checked provider detachment,
+    then delete canonical records and retire their backing. Remove win32k's synthetic EPROCESS
+    initializer, not just its allocation branch, at the body-publication cutover.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

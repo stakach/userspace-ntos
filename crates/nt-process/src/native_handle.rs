@@ -123,6 +123,84 @@ pub struct NativeObjectReference {
     held: bool,
 }
 
+/// The original requestor thread and its owning process, retained as one indivisible owner.
+/// This does not select an attached effective process or allocate another Ps identity.
+///
+/// ```compile_fail
+/// use nt_process::native_handle::NativeThreadProcessReference;
+/// fn duplicate(owner: NativeThreadProcessReference) { let _ = owner.clone(); }
+/// ```
+#[must_use = "release both requestor references through their original ProcessManager"]
+#[derive(Debug)]
+pub struct NativeThreadProcessReference {
+    process: NativeObjectReference,
+    thread: NativeObjectReference,
+}
+
+impl NativeThreadProcessReference {
+    pub const fn thread_lifetime(&self) -> ThreadLifetime {
+        self.thread
+            .thread
+            .expect("requestor always retains a thread incarnation")
+    }
+
+    pub const fn is_held(&self) -> bool {
+        self.process.is_held() && self.thread.is_held()
+    }
+
+    pub const fn process_body(&self) -> Option<u64> {
+        if self.is_held() {
+            Some(self.process.body())
+        } else {
+            None
+        }
+    }
+
+    pub const fn thread_body(&self) -> Option<u64> {
+        if self.is_held() {
+            Some(self.thread.body())
+        } else {
+            None
+        }
+    }
+
+    /// No caller/runtime liveness is required after capture. Both identities and release floors
+    /// are checked before either count changes; a failed release retains the complete pair.
+    pub fn release(&mut self, pm: &mut ProcessManager) -> Result<(), u32> {
+        self.process.validate(pm)?;
+        self.thread.validate(pm)?;
+        let lifetime = self.thread_lifetime();
+        let pid = lifetime.process_id();
+        let tid = lifetime.thread_id();
+        if self.process.object != HandleObject::Process(pid)
+            || self.thread.object != HandleObject::Thread(tid)
+        {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let process_count = pm
+            .process(pid)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .kernel_pointer_references;
+        let thread_count = pm
+            .thread(tid)
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .kernel_pointer_references;
+        if process_count <= pm.initial_system_process_reference_floor(pid)
+            || thread_count <= pm.initial_system_thread_reference_floor(tid)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        pm.processes
+            .get_mut(&pid)
+            .unwrap()
+            .kernel_pointer_references = process_count - 1;
+        pm.threads.get_mut(&tid).unwrap().kernel_pointer_references = thread_count - 1;
+        self.process.held = false;
+        self.thread.held = false;
+        Ok(())
+    }
+}
+
 impl NativeObjectReference {
     pub const fn body(&self) -> u64 {
         self.body
@@ -442,6 +520,74 @@ impl ProcessManager {
         })
     }
 
+    /// Retain an authenticated kernel caller's original thread and owning process together.
+    /// Preflight both projections and checked increments before the first mutation. The pair
+    /// does not use CurrentProcess: attachment must never substitute a different owning process.
+    pub fn reference_native_requestor(
+        &mut self,
+        caller: NativeHandleCaller,
+    ) -> Result<NativeThreadProcessReference, u32> {
+        self.validate_native_handle_caller(caller)?;
+        if caller.mode != AccessMode::KernelMode {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let lifetime = caller.original_thread;
+        let pid = lifetime.process_id();
+        let tid = lifetime.thread_id();
+        let process = self.process(pid).ok_or(STATUS_INVALID_HANDLE)?;
+        let thread = self.thread(tid).ok_or(STATUS_INVALID_HANDLE)?;
+        let process_body = process
+            .kernel_process_object
+            .filter(|body| *body != 0)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        let thread_body = thread
+            .kernel_thread_object
+            .filter(|body| *body != 0)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if process_body == thread_body || thread.process_id != pid {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        let process_count = process
+            .kernel_pointer_references
+            .checked_add(1)
+            .ok_or(crate::STATUS_INSUFFICIENT_RESOURCES)?;
+        let thread_count = thread
+            .kernel_pointer_references
+            .checked_add(1)
+            .ok_or(crate::STATUS_INSUFFICIENT_RESOURCES)?;
+        let information = NativeHandleInformation {
+            attributes: 0,
+            granted_access: None,
+        };
+        let pair = NativeThreadProcessReference {
+            process: NativeObjectReference {
+                system: caller.system,
+                object: HandleObject::Process(pid),
+                thread: None,
+                body: process_body,
+                information,
+                held: true,
+            },
+            thread: NativeObjectReference {
+                system: caller.system,
+                object: HandleObject::Thread(tid),
+                thread: Some(lifetime),
+                body: thread_body,
+                information,
+                held: true,
+            },
+        };
+        self.processes
+            .get_mut(&pid)
+            .unwrap()
+            .kernel_pointer_references = process_count;
+        self.threads
+            .get_mut(&tid)
+            .unwrap()
+            .kernel_pointer_references = thread_count;
+        Ok(pair)
+    }
+
     /// Reference a Process/Thread handle, including native pseudo handles. All fallible admission,
     /// type, grant and projection checks precede the single counted reference acquisition.
     pub fn reference_native_ps_handle(
@@ -620,3 +766,7 @@ impl ProcessManager {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_handle/requestor_tests.rs"]
+mod requestor_tests;
