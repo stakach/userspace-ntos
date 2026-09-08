@@ -64,28 +64,7 @@ const NT_CREATE_THREAD_CLIENT_ID_ARG: usize = 4;
 const NT_CREATE_THREAD_CONTEXT_ARG: usize = 5;
 const NT_CREATE_THREAD_INITIAL_TEB_ARG: usize = 6;
 const NT_CREATE_THREAD_CREATE_SUSPENDED_ARG: usize = 7;
-const AMD64_CONTEXT_FLAGS_OFFSET: usize = 0x30;
-const AMD64_CONTEXT_SEG_CS_OFFSET: usize = 0x38;
-const AMD64_CONTEXT_SEG_DS_OFFSET: usize = 0x3A;
-const AMD64_CONTEXT_SEG_ES_OFFSET: usize = 0x3C;
-const AMD64_CONTEXT_SEG_FS_OFFSET: usize = 0x3E;
-const AMD64_CONTEXT_SEG_GS_OFFSET: usize = 0x40;
-const AMD64_CONTEXT_SEG_SS_OFFSET: usize = 0x42;
-const AMD64_CONTEXT_EFLAGS_OFFSET: usize = 0x44;
-const AMD64_CONTEXT_DR0_OFFSET: usize = 0x48;
-const AMD64_CONTEXT_DR1_OFFSET: usize = 0x50;
-const AMD64_CONTEXT_DR2_OFFSET: usize = 0x58;
-const AMD64_CONTEXT_DR3_OFFSET: usize = 0x60;
-const AMD64_CONTEXT_DR6_OFFSET: usize = 0x68;
-const AMD64_CONTEXT_DR7_OFFSET: usize = 0x70;
 const CONTEXT_AMD64: u32 = 0x0010_0000;
-const CONTEXT_CONTROL: u32 = 0x0000_0001;
-const CONTEXT_INTEGER: u32 = 0x0000_0002;
-const CONTEXT_SEGMENTS: u32 = 0x0000_0004;
-const CONTEXT_DEBUG_REGISTERS: u32 = 0x0000_0010;
-const USER_CODE_SELECTOR: u16 = 0x33;
-const USER_DATA_SELECTOR: u16 = 0x2B;
-const USER_CMTEB_SELECTOR: u16 = 0x53;
 const EXCEPTION_RECORD_SIZE: usize = 0x98;
 const EXCEPTION_RECORD_CODE_OFFSET: usize = 0x00;
 const EXCEPTION_RECORD_FLAGS_OFFSET: usize = 0x04;
@@ -1157,21 +1136,6 @@ fn read_le_u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-#[inline]
-fn write_le_u16_at(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-#[inline]
-fn write_le_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-#[inline]
-fn write_le_u64_at(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
 fn nt_boolean_arg(value: u64) -> bool {
     (value as u8) != 0
 }
@@ -1186,63 +1150,6 @@ fn nt_long_arg(value: u64) -> i32 {
     nt_ulong_arg(value) as i32
 }
 
-fn debug_register_error_status(error: nt_thread_start::Amd64DebugRegisterError) -> u32 {
-    match error {
-        nt_thread_start::Amd64DebugRegisterError::UnsupportedControlBits
-        | nt_thread_start::Amd64DebugRegisterError::UnsupportedIoBreakpoint => STATUS_NOT_SUPPORTED,
-        nt_thread_start::Amd64DebugRegisterError::InvalidBreakpointType
-        | nt_thread_start::Amd64DebugRegisterError::InvalidBreakpointAccess
-        | nt_thread_start::Amd64DebugRegisterError::InvalidDataBreakpointSize
-        | nt_thread_start::Amd64DebugRegisterError::UnalignedDataBreakpoint => {
-            STATUS_INVALID_PARAMETER
-        }
-    }
-}
-
-unsafe fn read_amd64_debug_register_state(
-    tcb: u64,
-) -> Result<nt_thread_start::Amd64DebugRegisterState, u32> {
-    let mut slots = [None; nt_thread_start::AMD64_HW_BREAKPOINT_SLOTS];
-    for (index, slot) in slots.iter_mut().enumerate() {
-        let Some(breakpoint) = crate::win32k_glue::tcb_get_breakpoint(tcb, index as u64) else {
-            return Err(STATUS_UNSUCCESSFUL);
-        };
-        if breakpoint.enabled {
-            *slot = Some(nt_thread_start::Amd64DebugBreakpoint {
-                address: breakpoint.vaddr,
-                breakpoint_type: breakpoint.breakpoint_type,
-                size: breakpoint.size,
-                access: breakpoint.access,
-            });
-        }
-    }
-    nt_thread_start::synthesize_amd64_debug_registers(&slots).map_err(|_| STATUS_UNSUCCESSFUL)
-}
-
-unsafe fn apply_amd64_debug_register_plan(
-    tcb: u64,
-    plan: &[Option<nt_thread_start::Amd64DebugBreakpoint>;
-         nt_thread_start::AMD64_HW_BREAKPOINT_SLOTS],
-) -> u32 {
-    for (index, breakpoint) in plan.iter().copied().enumerate() {
-        let status = if let Some(breakpoint) = breakpoint {
-            crate::win32k_glue::tcb_set_breakpoint(
-                tcb,
-                index as u64,
-                breakpoint.address,
-                breakpoint.breakpoint_type,
-                breakpoint.size,
-                breakpoint.access,
-            )
-        } else {
-            crate::win32k_glue::tcb_unset_breakpoint(tcb, index as u64)
-        };
-        if status != 0 {
-            return STATUS_UNSUCCESSFUL;
-        }
-    }
-    0
-}
 
 #[allow(clippy::too_many_arguments)]
 fn trace_named_pipe_io(
@@ -9985,11 +9892,9 @@ impl ExecNtHandler {
             Ok(context) => context,
             Err(error) => return error.status(),
         };
-        let context_flags = captured.flags();
-        if context_flags & CONTEXT_AMD64 == 0 {
+        if captured.flags() & CONTEXT_AMD64 == 0 {
             return STATUS_INVALID_PARAMETER;
         }
-        // Refuse extended-state contracts before inspecting or publishing a partial legacy view.
         if let Err(error) = captured.validate_legacy_state() {
             return error.status();
         }
@@ -9997,160 +9902,16 @@ impl ExecNtHandler {
             Ok(snapshot) => snapshot,
             Err(_) => return STATUS_UNSUCCESSFUL,
         };
+        if let Err(error) = captured.publish_legacy_registers(&snapshot.registers) {
+            return error.status();
+        }
         if let Err(error) = captured.publish_legacy_floating_point(&snapshot.floating_point) {
             return error.status();
         }
-        let mut context = *captured.as_bytes();
-        let registers = snapshot.registers;
-        if context_flags & CONTEXT_CONTROL != 0 {
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_CS_OFFSET,
-                USER_CODE_SELECTOR,
-            );
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_SS_OFFSET,
-                USER_DATA_SELECTOR,
-            );
-            write_le_u32_at(
-                &mut context,
-                AMD64_CONTEXT_EFLAGS_OFFSET,
-                registers[nt_user_callback::USER_CONTEXT_RFLAGS] as u32,
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RSP_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RSP],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RIP_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RIP],
-            );
+        if let Err(error) = captured.publish_legacy_debug_registers(&snapshot.debug) {
+            return error.status();
         }
-        if context_flags & CONTEXT_SEGMENTS != 0 {
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_CS_OFFSET,
-                USER_CODE_SELECTOR,
-            );
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_DS_OFFSET,
-                USER_DATA_SELECTOR,
-            );
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_ES_OFFSET,
-                USER_DATA_SELECTOR,
-            );
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_FS_OFFSET,
-                USER_CMTEB_SELECTOR,
-            );
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_GS_OFFSET,
-                USER_DATA_SELECTOR,
-            );
-            write_le_u16_at(
-                &mut context,
-                AMD64_CONTEXT_SEG_SS_OFFSET,
-                USER_DATA_SELECTOR,
-            );
-        }
-        if context_flags & CONTEXT_INTEGER != 0 {
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RAX_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RAX],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RBX_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RBX],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RCX_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RCX],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RDX_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RDX],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RSI_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RSI],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RDI_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RDI],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_RBP_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_RBP],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R8_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R8],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R9_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R9],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R10_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R10],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R11_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R11],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R12_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R12],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R13_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R13],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R14_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R14],
-            );
-            write_le_u64_at(
-                &mut context,
-                nt_thread_start::CONTEXT_R15_OFFSET as usize,
-                registers[nt_user_callback::USER_CONTEXT_R15],
-            );
-        }
-        if context_flags & CONTEXT_DEBUG_REGISTERS != 0 {
-            let debug = match read_amd64_debug_register_state(tcb) {
-                Ok(debug) => debug,
-                Err(status) => return status,
-            };
-            write_le_u64_at(&mut context, AMD64_CONTEXT_DR0_OFFSET, debug.dr[0]);
-            write_le_u64_at(&mut context, AMD64_CONTEXT_DR1_OFFSET, debug.dr[1]);
-            write_le_u64_at(&mut context, AMD64_CONTEXT_DR2_OFFSET, debug.dr[2]);
-            write_le_u64_at(&mut context, AMD64_CONTEXT_DR3_OFFSET, debug.dr[3]);
-            write_le_u64_at(&mut context, AMD64_CONTEXT_DR6_OFFSET, debug.dr6);
-            write_le_u64_at(&mut context, AMD64_CONTEXT_DR7_OFFSET, debug.dr7);
-        }
-        self.process_memory_write_status(self.pi, context_ptr, &context)
+        self.process_memory_write_status(self.pi, context_ptr, captured.as_bytes())
             .map(|_| 0).unwrap_or_else(|status| status)
     }
 
@@ -10169,93 +9930,54 @@ impl ExecNtHandler {
         let Some(tcb) = self.hosted_thread_tcb(tid as u64).filter(|tcb| *tcb > 1) else {
             return STATUS_INVALID_HANDLE;
         };
-        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
-        if !self.xas_read(context_ptr, &mut context) {
-            return STATUS_ACCESS_VIOLATION;
+        let captured = match nt_thread_start::amd64_context::CapturedAmd64Context::capture(
+            |address, bytes| self.process_memory_read_status(self.pi, address, bytes),
+            context_ptr,
+        ) {
+            Ok(context) => context,
+            Err(error) => return error.status(),
+        };
+        let context = match captured.prepare_set(HIGHEST_USER_ADDRESS) {
+            Ok(context) => context,
+            Err(error) => return error.status(),
+        };
+        // A remote native Call can still restore stack-saved state in its user stub. Until the
+        // thread owns its application continuation, neither PM wait state nor caller transport
+        // proves that a remote GPR/control edit can survive completion.
+        if tid as u64 != self.current_tid && context.register_mask != 0 {
+            return STATUS_NOT_SUPPORTED;
         }
-        let context_flags = read_le_u32_at(&context, AMD64_CONTEXT_FLAGS_OFFSET);
-        if context_flags & CONTEXT_AMD64 == 0 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let debug_register_plan = if context_flags & CONTEXT_DEBUG_REGISTERS != 0 {
-            match nt_thread_start::plan_amd64_debug_registers(
-                [
-                    read_le_u64_at(&context, AMD64_CONTEXT_DR0_OFFSET),
-                    read_le_u64_at(&context, AMD64_CONTEXT_DR1_OFFSET),
-                    read_le_u64_at(&context, AMD64_CONTEXT_DR2_OFFSET),
-                    read_le_u64_at(&context, AMD64_CONTEXT_DR3_OFFSET),
-                ],
-                read_le_u64_at(&context, AMD64_CONTEXT_DR7_OFFSET),
+        if tid as u64 == self.current_tid && context.register_mask != 0 {
+            // A normal fault reply would restore the pre-SET GPR/control snapshot. Native Call
+            // additionally restores registers in its user stub, and has no captured logical
+            // continuation record yet. Reject that transport before any target mutation.
+            if self.current_native_call_transport {
+                return STATUS_NOT_SUPPORTED;
+            }
+            let context = match captured.prepare_self_set(
+                self.current_resume_ip,
+                self.current_sp,
+                self.current_flags,
                 HIGHEST_USER_ADDRESS,
             ) {
-                Ok(plan) => Some(plan),
-                Err(error) => return debug_register_error_status(error),
-            }
-        } else {
-            None
-        };
-
-        let mut registers = [0u64; 20];
-        crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
-        let mut reporter_ip = None;
-        let mut reporter_sp = None;
-        let mut reporter_flags = None;
-        if context_flags & CONTEXT_CONTROL != 0 {
-            let rip = read_le_u64_at(&context, nt_thread_start::CONTEXT_RIP_OFFSET as usize);
-            let rsp = read_le_u64_at(&context, nt_thread_start::CONTEXT_RSP_OFFSET as usize);
-            let flags = read_le_u32_at(&context, AMD64_CONTEXT_EFLAGS_OFFSET) as u64;
-            if rip == 0 || rsp == 0 {
-                return STATUS_INVALID_PARAMETER;
-            }
-            registers[nt_user_callback::USER_CONTEXT_RIP] = rip;
-            registers[nt_user_callback::USER_CONTEXT_RSP] = rsp;
-            registers[nt_user_callback::USER_CONTEXT_RFLAGS] = flags;
-            reporter_ip = Some(rip);
-            reporter_sp = Some(rsp);
-            reporter_flags = Some(flags);
+                Ok(context) => context,
+                Err(error) => return error.status(),
+            };
+            self.context_continue_redirected = true;
+            self.post_action = ExecPostAction::ContinueCurrentThread {
+                tid: self.current_tid,
+                tcb,
+                context,
+            };
+            return 0;
         }
-        if context_flags & CONTEXT_INTEGER != 0 {
-            registers[nt_user_callback::USER_CONTEXT_RAX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RAX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RBX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RCX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RCX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RDX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RSI] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RSI_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RDI] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDI_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RBP] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBP_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R8] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R8_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R9] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R9_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R10] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R10_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R11] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R11_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R12] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R12_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R13] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R13_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R14] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R14_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R15] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R15_OFFSET as usize);
-        }
-
-        if crate::win32k_glue::tcb_write_regs20(tcb, &registers, false) != 0 {
+        if crate::thread_context::write(tcb, &context, false).is_err() {
             return STATUS_UNSUCCESSFUL;
         }
-        if let Some(plan) = debug_register_plan {
-            let status = apply_amd64_debug_register_plan(tcb, &plan);
-            if status != 0 {
-                return status;
-            }
-        }
+        // Reporter metadata follows only acknowledged selected register installation.
+        let reporter_ip = (context.register_mask & 1 != 0).then_some(context.registers[0]);
+        let reporter_sp = (context.register_mask & 2 != 0).then_some(context.registers[1]);
+        let reporter_flags = (context.register_mask & 4 != 0).then_some(context.registers[2]);
         if reporter_ip.is_some() || reporter_sp.is_some() || reporter_flags.is_some() {
             if let Some(process_id) = self.pm.thread(tid).map(|thread| thread.process_id) {
                 let client_id = nt_process::ClientId {
@@ -14303,8 +14025,6 @@ impl ExecNtHandler {
                     event_obj_idx,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -14541,10 +14261,6 @@ impl ExecNtHandler {
                             tid: self.current_tid,
                             badge: self.current_badge,
                             iosb_va: iosb,
-                            native_call_transport: self.current_native_call_transport,
-                            resume_ip: self.current_resume_ip,
-                            resume_sp: self.current_sp,
-                            resume_flags: self.current_flags,
                             ..nt_io_manager::PendingFileIrpDrain::default()
                         },
                         reservation,
@@ -14748,8 +14464,6 @@ impl ExecNtHandler {
                 event_obj_idx,
                 reply_cap: 0,
                 reply_required: false,
-                native_call_transport: false,
-                reply_mrs: [0; 18],
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -14821,8 +14535,6 @@ impl ExecNtHandler {
                 event_obj_idx,
                 reply_cap: 0,
                 reply_required: false,
-                native_call_transport: false,
-                reply_mrs: [0; 18],
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -15015,8 +14727,6 @@ impl ExecNtHandler {
                         event_obj_idx,
                         reply_cap: 0,
                         reply_required: false,
-                        native_call_transport: false,
-                        reply_mrs: [0; 18],
                         resume_ip: 0,
                         resume_sp: 0,
                         resume_flags: 0,
@@ -15091,8 +14801,6 @@ impl ExecNtHandler {
                     event_obj_idx,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -15224,8 +14932,6 @@ impl ExecNtHandler {
                 event_obj_idx: u64::MAX,
                 reply_cap: 0,
                 reply_required: false,
-                native_call_transport: false,
-                reply_mrs: [0; 18],
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -27917,8 +27623,6 @@ impl ExecNtHandler {
                 event_obj_idx: u64::MAX,
                 reply_cap: 0,
                 reply_required: false,
-                native_call_transport: false,
-                reply_mrs: [0; 18],
                 resume_ip: 0,
                 resume_sp: 0,
                 resume_flags: 0,
@@ -28445,8 +28149,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28539,8 +28241,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28632,8 +28332,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28726,8 +28424,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28817,8 +28513,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28912,8 +28606,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -28999,8 +28691,6 @@ impl ExecNtHandler {
                     event_obj_idx: u64::MAX,
                     reply_cap: 0,
                     reply_required: false,
-                    native_call_transport: false,
-                    reply_mrs: [0; 18],
                     resume_ip: 0,
                     resume_sp: 0,
                     resume_flags: 0,
@@ -29332,8 +29022,6 @@ impl ExecNtHandler {
             event_obj_idx: u64::MAX,
             reply_cap: 0,
             reply_required: false,
-            native_call_transport: false,
-            reply_mrs: [0; 18],
             resume_ip: 0,
             resume_sp: 0,
             resume_flags: 0,
@@ -36447,8 +36135,6 @@ impl ExecNtHandler {
                             event_obj_idx,
                             reply_cap: 0,
                             reply_required: false,
-                            native_call_transport: false,
-                            reply_mrs: [0; 18],
                             resume_ip: 0,
                             resume_sp: 0,
                             resume_flags: 0,
@@ -41692,8 +41378,6 @@ impl ExecNtHandler {
                                 event_obj_idx: u64::MAX,
                                 reply_cap: 0,
                                 reply_required: false,
-                                native_call_transport: false,
-                                reply_mrs: [0; 18],
                                 resume_ip: 0,
                                 resume_sp: 0,
                                 resume_flags: 0,
@@ -43631,8 +43315,6 @@ impl ExecNtHandler {
                         event_obj_idx,
                         reply_cap: 0,
                         reply_required: false,
-                        native_call_transport: false,
-                        reply_mrs: [0; 18],
                         resume_ip: 0,
                         resume_sp: 0,
                         resume_flags: 0,
@@ -44194,8 +43876,6 @@ impl ExecNtHandler {
                         event_obj_idx,
                         reply_cap: 0,
                         reply_required: false,
-                        native_call_transport: false,
-                        reply_mrs: [0; 18],
                         resume_ip: 0,
                         resume_sp: 0,
                         resume_flags: 0,
@@ -44743,8 +44423,6 @@ impl ExecNtHandler {
                             event_obj_idx: u64::MAX,
                             reply_cap: 0,
                             reply_required: false,
-                            native_call_transport: false,
-                            reply_mrs: [0; 18],
                             resume_ip: 0,
                             resume_sp: 0,
                             resume_flags: 0,

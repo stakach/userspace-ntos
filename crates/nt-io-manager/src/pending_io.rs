@@ -139,8 +139,6 @@ pub struct PendingFileIo {
     pub reply_required: bool,
     /// Whether the parked caller used the native seL4-Call transport. Native calls need only a
     /// terminal MR0 reply; UnknownSyscall replies must restore the complete captured register frame.
-    pub native_call_transport: bool,
-    pub reply_mrs: [u64; 18],
     /// Native-syscall resume context restored before replying to a synchronous request.
     pub resume_ip: u64,
     pub resume_sp: u64,
@@ -904,8 +902,6 @@ impl PendingFileIoTable {
             pending.event_obj_idx = u64::MAX;
             pending.reply_cap = 0;
             pending.reply_required = false;
-            pending.native_call_transport = false;
-            pending.reply_mrs = [0; 18];
             pending.resume_ip = 0;
             pending.resume_sp = 0;
             pending.resume_flags = 0;
@@ -981,8 +977,6 @@ mod tests {
             event_obj_idx: 7,
             reply_cap: 0x50,
             reply_required: true,
-            native_call_transport: false,
-            reply_mrs: [0; 18],
             resume_ip: 0x5000,
             resume_sp: 0x6000,
             resume_flags: 0x202,

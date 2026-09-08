@@ -22,11 +22,6 @@ pub struct PendingFileIrpDrain {
     pub badge: u64,
     pub iosb_va: u64,
     pub reply_cap: u64,
-    pub native_call_transport: bool,
-    pub reply_mrs: [u64; 18],
-    pub resume_ip: u64,
-    pub resume_sp: u64,
-    pub resume_flags: u64,
     pub delivery_state: u8,
 }
 

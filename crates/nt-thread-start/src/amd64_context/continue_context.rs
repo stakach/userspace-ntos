@@ -9,9 +9,25 @@ use crate::{
     CONTEXT_RSP_OFFSET,
 };
 
-const CONTROL: u32 = CONTEXT_AMD64 | 1;
-const INTEGER: u32 = CONTEXT_AMD64 | 2;
-const DEBUG_REGISTERS: u32 = CONTEXT_AMD64 | 0x10;
+pub(super) const CONTROL: u32 = CONTEXT_AMD64 | 1;
+pub(super) const INTEGER: u32 = CONTEXT_AMD64 | 2;
+pub(super) const INTEGER_OFFSETS: [u64; 15] = [
+    CONTEXT_RAX_OFFSET,
+    CONTEXT_RBX_OFFSET,
+    CONTEXT_RCX_OFFSET,
+    CONTEXT_RDX_OFFSET,
+    CONTEXT_RSI_OFFSET,
+    CONTEXT_RDI_OFFSET,
+    CONTEXT_RBP_OFFSET,
+    CONTEXT_R8_OFFSET,
+    CONTEXT_R9_OFFSET,
+    CONTEXT_R10_OFFSET,
+    CONTEXT_R11_OFFSET,
+    CONTEXT_R12_OFFSET,
+    CONTEXT_R13_OFFSET,
+    CONTEXT_R14_OFFSET,
+    CONTEXT_R15_OFFSET,
+];
 const CS_OFFSET: usize = 0x38;
 const EFLAGS_OFFSET: usize = 0x44;
 const EFLAGS_AC: u64 = 1 << 18;
@@ -32,6 +48,8 @@ pub struct LegacyContextRestore {
     pub registers: [u64; 20],
     pub register_mask: u64,
     pub floating_point: Option<[u8; LEGACY_FLOATING_POINT_BYTES]>,
+    /// DR0, DR1, DR2, DR3, DR6, DR7, selected and installed as one group.
+    pub debug: Option<[u64; 6]>,
 }
 
 impl CapturedAmd64Context {
@@ -40,7 +58,7 @@ impl CapturedAmd64Context {
     /// The resume tuple must be the caller's canonical syscall-return continuation, not the
     /// raw faulting SYSCALL instruction reported by a fault transport. It is used whenever
     /// CONTROL is absent, so a partial-group continue cannot accidentally reissue that syscall.
-    /// Segment bases are preserved, as NT5 does; compatibility CS, debug updates, TestAlert,
+    /// Segment bases are preserved, as NT5 does; compatibility CS, TestAlert,
     /// alignment-check exceptions and extended state require implementations beyond this codec.
     pub fn prepare_continue(
         &self,
@@ -50,16 +68,51 @@ impl CapturedAmd64Context {
         highest_user_address: u64,
         test_alert: bool,
     ) -> Result<LegacyContextRestore, CodecError> {
-        if self.flags() & CONTEXT_AMD64 == 0 {
-            return Err(CodecError::InvalidArchitecture);
-        }
-        self.validate_legacy_state()?;
+        self.validate_native_restore()?;
         if test_alert {
             return Err(CodecError::UnsupportedTestAlert);
         }
-        if self.flags() & DEBUG_REGISTERS == DEBUG_REGISTERS {
-            return Err(CodecError::UnsupportedDebugRegisters);
-        }
+        self.prepare_selected(
+            highest_user_address,
+            Some((resume_ip, resume_sp, resume_flags)),
+        )
+    }
+
+    /// Prepare NtSetContextThread without reading or merging the target's live context.
+    /// Absent CONTROL selects no control registers. Segment bases are never selected.
+    /// NT5 selects user CS independently of CONTROL, so even partial requests must supply a
+    /// supported native CS; compatibility mode is not silently inferred from missing bytes.
+    pub fn prepare_set(
+        &self,
+        highest_user_address: u64,
+    ) -> Result<LegacyContextRestore, CodecError> {
+        self.validate_native_restore()?;
+        self.prepare_selected(highest_user_address, None)
+    }
+
+    /// Prepare fault-transport self NtSetContextThread for atomic service-exit restart.
+    /// The fallback tuple is the canonical service return, never its faulting SYSCALL PC.
+    /// The service's STATUS_SUCCESS replaces RAX even when INTEGER supplied a different value.
+    /// This does not authorize a native-call transport to invent a missing continuation.
+    pub fn prepare_self_set(
+        &self,
+        resume_ip: u64,
+        resume_sp: u64,
+        resume_flags: u64,
+        highest_user_address: u64,
+    ) -> Result<LegacyContextRestore, CodecError> {
+        self.validate_native_restore()?;
+        let mut plan = self.prepare_selected(
+            highest_user_address,
+            Some((resume_ip, resume_sp, resume_flags)),
+        )?;
+        plan.registers[3] = 0;
+        plan.register_mask |= 1 << 3;
+        Ok(plan)
+    }
+
+    fn validate_native_restore(&self) -> Result<(), CodecError> {
+        self.validate_native_groups()?;
         // NT5 KeContextToKframes chooses native versus compatibility CS independently of the
         // CONTROL group. This native-only path must not silently choose a compatibility frame.
         if !matches!(
@@ -68,50 +121,42 @@ impl CapturedAmd64Context {
         ) {
             return Err(CodecError::UnsupportedCompatibilityMode);
         }
-        let (ip, sp, flags) = if self.flags() & CONTROL == CONTROL {
-            (
+        Ok(())
+    }
+
+    fn prepare_selected(
+        &self,
+        highest_user_address: u64,
+        continuation: Option<(u64, u64, u64)>,
+    ) -> Result<LegacyContextRestore, CodecError> {
+        let control = if self.flags() & CONTROL == CONTROL {
+            Some((
                 captured_u64(&self.bytes, CONTEXT_RIP_OFFSET),
                 captured_u64(&self.bytes, CONTEXT_RSP_OFFSET),
                 read_u32(&self.bytes, EFLAGS_OFFSET) as u64,
-            )
+            ))
         } else {
-            (resume_ip, resume_sp, resume_flags)
+            continuation
         };
-        if ip == 0 || ip > highest_user_address {
-            return Err(CodecError::InvalidInstructionPointer);
-        }
-        if sp == 0 || sp > highest_user_address {
-            return Err(CodecError::InvalidStackPointer);
-        }
-        if flags & EFLAGS_AC != 0 {
-            return Err(CodecError::UnsupportedAlignmentCheck);
-        }
         let mut registers = [0; 20];
-        registers[0] = ip;
-        registers[1] = sp;
-        registers[2] = (flags & NT5_USER_EFLAGS_MASK) | 0x202;
-        let mut register_mask = 0x7;
+        let mut register_mask = 0;
+        if let Some((ip, sp, flags)) = control {
+            if ip == 0 || ip > highest_user_address {
+                return Err(CodecError::InvalidInstructionPointer);
+            }
+            if sp == 0 || sp > highest_user_address {
+                return Err(CodecError::InvalidStackPointer);
+            }
+            if flags & EFLAGS_AC != 0 {
+                return Err(CodecError::UnsupportedAlignmentCheck);
+            }
+            registers[0] = ip;
+            registers[1] = sp;
+            registers[2] = (flags & NT5_USER_EFLAGS_MASK) | 0x202;
+            register_mask = 0x7;
+        }
         if self.flags() & INTEGER == INTEGER {
-            for (index, offset) in [
-                CONTEXT_RAX_OFFSET,
-                CONTEXT_RBX_OFFSET,
-                CONTEXT_RCX_OFFSET,
-                CONTEXT_RDX_OFFSET,
-                CONTEXT_RSI_OFFSET,
-                CONTEXT_RDI_OFFSET,
-                CONTEXT_RBP_OFFSET,
-                CONTEXT_R8_OFFSET,
-                CONTEXT_R9_OFFSET,
-                CONTEXT_R10_OFFSET,
-                CONTEXT_R11_OFFSET,
-                CONTEXT_R12_OFFSET,
-                CONTEXT_R13_OFFSET,
-                CONTEXT_R14_OFFSET,
-                CONTEXT_R15_OFFSET,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (index, offset) in INTEGER_OFFSETS.into_iter().enumerate() {
                 registers[index + 3] = captured_u64(&self.bytes, offset);
             }
             register_mask |= ((1 << 15) - 1) << 3;
@@ -120,6 +165,7 @@ impl CapturedAmd64Context {
             registers,
             register_mask,
             floating_point: self.extract_legacy_floating_point()?,
+            debug: self.extract_legacy_debug_registers(highest_user_address)?,
         })
     }
 }

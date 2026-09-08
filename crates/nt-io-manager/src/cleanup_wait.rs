@@ -16,11 +16,6 @@ pub struct PendingFileCleanupWait {
     pub tid: u64,
     pub badge: u64,
     pub reply_cap: u64,
-    pub native_call_transport: bool,
-    pub reply_mrs: [u64; 18],
-    pub resume_ip: u64,
-    pub resume_sp: u64,
-    pub resume_flags: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,7 +137,6 @@ impl PendingFileCleanupWaitTable {
             || pending.tid == 0
             || pending.badge == 0
             || pending.reply_cap == 0
-            || pending.resume_sp == 0
             || self.slots.iter().flatten().any(|current| {
                 current.file_id == pending.file_id
                     || current.tid == pending.tid
@@ -198,9 +192,6 @@ mod tests {
             tid,
             badge: tid + 100,
             reply_cap,
-            resume_ip: 0x1002,
-            resume_sp: 0x2000,
-            resume_flags: 0x202,
             ..PendingFileCleanupWait::default()
         }
     }

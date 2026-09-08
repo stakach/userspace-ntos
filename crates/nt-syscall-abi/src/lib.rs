@@ -31,6 +31,9 @@
 
 #![no_std]
 
+pub mod native_context;
+pub use native_context::NT_NATIVE_CONTEXT_SYSCALL_LABEL;
+
 /// A single `Nt*` service's ABI entry: its canonical export name and its SSN.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NtSyscall {
@@ -86,16 +89,14 @@ pub const fn native_syscall_message_info(argc: u8) -> u64 {
 /// reissued with the restored request MRs. It is deliberately outside the 32-bit NTSTATUS domain.
 pub const NT_NATIVE_RETRY_REPLY: u64 = 0x4E54_5254_5259_0001;
 
-/// The complete reply continuation retained while an NT syscall is parked.
+/// Resume coordinates retained for deferred syscall handling and debugger reporting.
 ///
-/// Hosted ReactOS binaries enter through an x86-64 `syscall` fault. Resuming that fault requires
-/// all 18 reply registers, not only RIP/RSP/RFLAGS: callee-saved registers such as RBX can hold live
-/// caller state across an arbitrarily long kernel wait. Native seL4-Call clients use the ordinary
-/// one-word IPC reply instead.
+/// These coordinates are metadata, not a register restore image. Ordinary completion sends only
+/// the terminal status through the retained Reply capability, preserving canonical TCB state.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ParkedSyscallReply {
     native_call: bool,
-    registers: [u64; Self::UNKNOWN_SYSCALL_REGISTER_COUNT],
+    resume: [u64; 3],
 }
 
 impl Default for ParkedSyscallReply {
@@ -105,55 +106,39 @@ impl Default for ParkedSyscallReply {
 }
 
 impl ParkedSyscallReply {
-    /// Number of register words in rust-micro's x86-64 UnknownSyscall reply ABI.
-    pub const UNKNOWN_SYSCALL_REGISTER_COUNT: usize = 18;
-
     /// Retain an ordinary native seL4-Call continuation.
     pub const fn native_call() -> Self {
         Self {
             native_call: true,
-            registers: [0; Self::UNKNOWN_SYSCALL_REGISTER_COUNT],
+            resume: [0; 3],
         }
     }
 
     /// Retain a hosted x86-64 UnknownSyscall continuation.
     pub const fn unknown_syscall(
-        mut registers: [u64; Self::UNKNOWN_SYSCALL_REGISTER_COUNT],
         resume_ip: u64,
         resume_sp: u64,
         resume_flags: u64,
     ) -> Self {
-        registers[15] = resume_ip;
-        registers[16] = resume_sp;
-        registers[17] = resume_flags;
         Self {
             native_call: false,
-            registers,
-        }
-    }
-
-    /// seL4 message length required to resume this continuation.
-    pub const fn message_length(self) -> usize {
-        if self.native_call {
-            1
-        } else {
-            Self::UNKNOWN_SYSCALL_REGISTER_COUNT
+            resume: [resume_ip, resume_sp, resume_flags],
         }
     }
 
     /// Saved user instruction pointer for a hosted UnknownSyscall continuation.
     pub const fn resume_ip(self) -> u64 {
-        self.registers[15]
+        self.resume[0]
     }
 
     /// Saved user stack pointer for a hosted UnknownSyscall continuation.
     pub const fn resume_sp(self) -> u64 {
-        self.registers[16]
+        self.resume[1]
     }
 
     /// Saved user flags for a hosted UnknownSyscall continuation.
     pub const fn resume_flags(self) -> u64 {
-        self.registers[17]
+        self.resume[2]
     }
 
     /// Return a new continuation with debugger-edited resume coordinates.
@@ -167,23 +152,16 @@ impl ParkedSyscallReply {
     ) -> Self {
         if !self.native_call {
             if let Some(value) = resume_ip {
-                self.registers[15] = value;
+                self.resume[0] = value;
             }
             if let Some(value) = resume_sp {
-                self.registers[16] = value;
+                self.resume[1] = value;
             }
             if let Some(value) = resume_flags {
-                self.registers[17] = value;
+                self.resume[2] = value;
             }
         }
         self
-    }
-
-    /// Produce the exact reply register file with only RAX/MR0 replaced by the terminal NTSTATUS.
-    pub const fn registers_with_status(self, status: u64) -> [u64; 18] {
-        let mut registers = self.registers;
-        registers[0] = status;
-        registers
     }
 }
 

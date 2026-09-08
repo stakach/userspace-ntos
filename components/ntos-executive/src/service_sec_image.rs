@@ -2371,7 +2371,7 @@ unsafe fn reply_component_native_continuation(
         }
         client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0)
     } else {
-        reply_parked_syscall(continuation.reply_cap, continuation.reply, status)
+        reply_parked_syscall(continuation.reply_cap, status)
     }
 }
 
@@ -10969,7 +10969,6 @@ pub(crate) unsafe fn service_sec_image(
                 nt_syscall_abi::ParkedSyscallReply::native_call()
             } else {
                 nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                    syscall_reply_context.regs,
                     resume_ip,
                     sp,
                     flags,
@@ -11121,7 +11120,7 @@ pub(crate) unsafe fn service_sec_image(
                             b"[user-callback] unable to defer out-of-order NtCallbackReturn -> STATUS_INSUFFICIENT_RESOURCES\n",
                         );
                         let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                        reply_parked_syscall(reply_main, parked_syscall_reply, 0xC000_009A);
+                        reply_parked_syscall(reply_main, 0xC000_009A);
                         let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
                         badge = nb;
                         mi = nmi;
@@ -11989,16 +11988,10 @@ pub(crate) unsafe fn service_sec_image(
                         pending.sync_lock_owner_tid = nt_handler.current_tid;
                         nt_handler.current_synchronous_file_lock = 0;
                     }
-                    let mut pending = nt_handler
+                    let pending = nt_handler
                         .pending_file_io_transfer
                         .take()
                         .expect("pending File transfer disappeared");
-                    if nt_handler.pending_file_io_wait {
-                        pending.native_call_transport = native_call_transport;
-                        if !native_call_transport {
-                            pending.reply_mrs = syscall_reply_context.regs;
-                        }
-                    }
                     let reservation = nt_handler
                         .pending_file_io_reservation
                         .take()
@@ -12053,28 +12046,17 @@ pub(crate) unsafe fn service_sec_image(
                         result = nt_io_completion::STATUS_INSUFFICIENT_RESOURCES as u64;
                     }
                 }
-                if let Some((mut pending, reservation)) = nt_handler.pending_file_irp_drain.take() {
-                    pending.reply_mrs = syscall_reply_context.regs;
-                    pending.resume_ip = resume_ip;
-                    pending.resume_sp = sp;
-                    pending.resume_flags = flags;
+                if let Some((pending, reservation)) = nt_handler.pending_file_irp_drain.take() {
                     transfer_file_irp_drain = Some((pending, reservation));
                 }
                 if let Some((file_id, reservation)) = nt_handler.pending_file_cleanup_wait.take() {
-                    let mut pending = nt_io_manager::PendingFileCleanupWait {
+                    let pending = nt_io_manager::PendingFileCleanupWait {
                         file_id,
                         pi: pi as u32,
                         tid: nt_handler.current_tid,
                         badge,
-                        native_call_transport,
-                        resume_ip,
-                        resume_sp: sp,
-                        resume_flags: flags,
                         ..nt_io_manager::PendingFileCleanupWait::default()
                     };
-                    if !native_call_transport {
-                        pending.reply_mrs = syscall_reply_context.regs;
-                    }
                     transfer_file_cleanup_wait = Some((pending, reservation));
                 }
                 if let Some(stale_grant) = nt_handler.active_synchronous_file_retry.take() {
@@ -20842,7 +20824,7 @@ pub(crate) unsafe fn service_sec_image(
                             break;
                         }
                         // ═══ FAULT 3 — UnknownSyscall: the SYSCALL flavour ═══════════════
-                        let (_fb, f3_mi, f3_m0, f3_m1, f3_m2, f3_m3) =
+                        let (_fb, f3_mi, f3_m0, _f3_m1, f3_m2, _f3_m3) =
                             recv_full_r12(client_ep, reply_c);
                         // The service loop's own derivation: for an UnknownSyscall the resume IP is
                         // RCX (MR2) — the address `syscall` pushed — NOT the message's FaultIP slot.
@@ -20850,7 +20832,6 @@ pub(crate) unsafe fn service_sec_image(
                         let f3_sp = get_recv_mr(16);
                         let f3_flags = get_recv_mr(17);
                         let f3_reply = nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                            SyscallReplyContext::capture(f3_m0, f3_m1, f3_m2, f3_m3).regs,
                             f3_ip,
                             f3_sp,
                             f3_flags,
@@ -20867,9 +20848,8 @@ pub(crate) unsafe fn service_sec_image(
                         }
                         // 0x0020 — the SYSCALL flavour. A real `DbgkMapViewOfSection` load-dll event
                         // posted from a SYSCALL blocks its reporter (NT queues it with flags 0), and
-                        // DBG_CONTINUE resumes it with the SYSCALL reply shape — status in MR0,
-                        // resume context in MR15/16/17 — so the syscall returns and the client runs
-                        // on.
+                        // DBG_CONTINUE supplies only status in MR0, preserving the canonical
+                        // continuation so the syscall returns and the client runs on.
                         nt_handler.current_tid = main_tid as u64;
                         let module_posted = nt_handler.dbgk_module_load(
                             blk_test_pi,
@@ -21065,19 +21045,15 @@ pub(crate) unsafe fn service_sec_image(
                     // distinctive SSN, so the assertion below is unchanged in strength.
                     let mut w_mi = 0u64;
                     let mut w_m0 = 0u64;
-                    let mut w_m1 = 0u64;
                     let mut w_m2 = 0u64;
-                    let mut w_m3 = 0u64;
                     let mut select_guard = 0;
                     while dphase_ready && select_guard < 8 {
                         select_guard += 1;
-                        let (_wb, mi_r, m0_r, m1_r, m2_r, m3_r) =
+                        let (_wb, mi_r, m0_r, _m1_r, m2_r, _m3_r) =
                             recv_full_r12(fault_ep, REPLY_MAIN_SLOT.load(Ordering::Relaxed));
                         w_mi = mi_r;
                         w_m0 = m0_r;
-                        w_m1 = m1_r;
                         w_m2 = m2_r;
-                        w_m3 = m3_r;
                         if (mi_r >> 12) == 2 && m0_r == 0xD1 {
                             break;
                         }
@@ -21087,7 +21063,6 @@ pub(crate) unsafe fn service_sec_image(
                     let w_sp = get_recv_mr(16);
                     let w_flags = get_recv_mr(17);
                     let w_reply = nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                        SyscallReplyContext::capture(w_m0, w_m1, w_m2, w_m3).regs,
                         w_ip,
                         w_sp,
                         w_flags,
@@ -23450,7 +23425,6 @@ unsafe fn lpc_receive_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         };
         let replied = reply_parked_syscall(
             completed.continuation.reply_cap,
-            completed.continuation.reply,
             status as u64,
         );
         release_reply_pool_cap(completed.continuation.reply_cap);
@@ -23598,7 +23572,6 @@ unsafe fn lpc_request_wait_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         };
         let replied = reply_parked_syscall(
             completed.continuation.reply_cap,
-            completed.continuation.reply,
             status as u64,
         );
         release_reply_pool_cap(completed.continuation.reply_cap);
@@ -23745,7 +23718,6 @@ unsafe fn lpc_connect_wait_complete(
     };
     let replied = reply_parked_syscall(
         completed.continuation.reply_cap,
-        completed.continuation.reply,
         status as u64,
     );
     release_reply_pool_cap(completed.continuation.reply_cap);
@@ -24228,7 +24200,7 @@ unsafe fn gui_message_wait_redrive_event(
         core::ptr::copy_nonoverlapping(arg as *const u8, output.as_mut_ptr(), output.len());
         let copy_ok = nt_handler.xas_try_write_buf(waiter.msg_ptr, &output);
         let status = if copy_ok { get.0 } else { u64::MAX };
-        reply_parked_syscall(waiter.reply_cap, waiter.reply, status);
+        reply_parked_syscall(waiter.reply_cap, status);
         release_reply_pool_cap(waiter.reply_cap);
         thread_wait_state_clear_badge_ready(nt_handler, waiter.badge);
         assert!(gui_message_waiter_clear_slot(
@@ -24408,7 +24380,6 @@ unsafe fn io_completion_deliver(nt_handler: &mut ExecNtHandler) -> bool {
 
     reply_parked_syscall(
         waiter.reply_cap,
-        waiter.reply,
         if copied { 0 } else { 0xC000_0005 },
     );
     release_reply_pool_cap(waiter.reply_cap);
@@ -24819,21 +24790,7 @@ unsafe fn file_cleanup_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
         }
         nt_handler.release_file_cleanup_reference(file_id);
         if let Some(pending) = continuation {
-            if pending.native_call_transport {
-                let _ = client_reply_on(pending.reply_cap, 1, 0, 0, 0, 0);
-            } else {
-                for index in 4..pending.reply_mrs.len() {
-                    set_reply_mr(index, pending.reply_mrs[index]);
-                }
-                let _ = client_reply_on(
-                    pending.reply_cap,
-                    18,
-                    0,
-                    pending.reply_mrs[1],
-                    pending.reply_mrs[2],
-                    pending.reply_mrs[3],
-                );
-            }
+            let _ = reply_parked_syscall(pending.reply_cap, 0);
             release_reply_pool_cap(pending.reply_cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
         }
@@ -24911,11 +24868,10 @@ unsafe fn pending_pnp_operation_transfer(
 unsafe fn pending_driver_start_reply_owner(
     nt_handler: &mut ExecNtHandler,
     cap: u64,
-    reply: nt_syscall_abi::ParkedSyscallReply,
     badge: u64,
     status: u32,
 ) -> bool {
-    let delivered = reply_parked_syscall(cap, reply, status as u64);
+    let delivered = reply_parked_syscall(cap, status as u64);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_badge_ready(nt_handler, badge);
     delivered
@@ -25012,7 +24968,6 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                             let delivered = pending_driver_start_reply_owner(
                                 nt_handler,
                                 reply.reply_cap,
-                                reply.reply,
                                 reply.badge,
                                 status,
                             );
@@ -25087,7 +25042,6 @@ unsafe fn pending_driver_start_redrive_all(nt_handler: &mut ExecNtHandler) -> u6
                         let delivered = pending_driver_start_reply_owner(
                             nt_handler,
                             reply.reply_cap,
-                            reply.reply,
                             reply.badge,
                             status,
                         );
@@ -25121,7 +25075,6 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
                     pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
-                        reply.reply,
                         reply.badge,
                         status,
                     );
@@ -25137,7 +25090,6 @@ unsafe fn pending_pnp_operation_redrive_all(nt_handler: &mut ExecNtHandler) -> u
                     pending_driver_start_reply_owner(
                         nt_handler,
                         reply.reply_cap,
-                        reply.reply,
                         reply.badge,
                         status,
                     );
@@ -25365,11 +25317,6 @@ unsafe fn pending_file_io_transfer(
     pending.resume_ip = resume_ip;
     pending.resume_sp = sp;
     pending.resume_flags = flags;
-    if !pending.native_call_transport {
-        pending.reply_mrs[15] = resume_ip;
-        pending.reply_mrs[16] = sp;
-        pending.reply_mrs[17] = flags;
-    }
     let table = &mut *core::ptr::addr_of_mut!(PENDING_FILE_IO);
     commit_or_panic(table, reservation, pending, true);
     wait_reply_pool_mark_used(fresh_index);
@@ -25388,11 +25335,6 @@ unsafe fn file_irp_drain_transfer(
     let (fresh_index, fresh) = wait_reply_pool_find_free()
         .expect("File IRP drain reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
-    if !pending.native_call_transport {
-        pending.reply_mrs[15] = pending.resume_ip;
-        pending.reply_mrs[16] = pending.resume_sp;
-        pending.reply_mrs[17] = pending.resume_flags;
-    }
     (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))
         .park_reserved(reservation, pending)
         .expect("reserved File IRP drain owner rejected its exact continuation");
@@ -25423,11 +25365,6 @@ unsafe fn file_cleanup_wait_transfer(
     let (fresh_index, fresh) = wait_reply_pool_find_free()
         .expect("File cleanup reply-pool claim disappeared after preflight");
     pending.reply_cap = stolen;
-    if !pending.native_call_transport {
-        pending.reply_mrs[15] = pending.resume_ip;
-        pending.reply_mrs[16] = pending.resume_sp;
-        pending.reply_mrs[17] = pending.resume_flags;
-    }
     table
         .park_reserved(reservation, pending)
         .expect("reserved File cleanup owner rejected its exact continuation");
@@ -26228,22 +26165,8 @@ unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .expect("pending File reply cap was claimed without publication");
             if pending.user_apc_interrupt_requested {
                 let _ = client_reply_on(cap, 0, 0, 0, 0, 0);
-            } else if pending.native_call_transport {
-                let _ = client_reply_on(cap, 1, terminal_status as u64, 0, 0, 0);
             } else {
-                let mut index = 4;
-                while index < pending.reply_mrs.len() {
-                    set_reply_mr(index, pending.reply_mrs[index]);
-                    index += 1;
-                }
-                let _ = client_reply_on(
-                    cap,
-                    18,
-                    terminal_status as u64,
-                    pending.reply_mrs[1],
-                    pending.reply_mrs[2],
-                    pending.reply_mrs[3],
-                );
+                let _ = reply_parked_syscall(cap, terminal_status as u64);
             }
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
@@ -26375,21 +26298,7 @@ unsafe fn file_irp_drain_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
                 .claim_reply_cap_exact(slot, pending.file_id, pending.tid)
                 .expect("File IRP drain reply owner disappeared")
                 .expect("File IRP drain reply claimed without publication");
-            if pending.native_call_transport {
-                let _ = client_reply_on(cap, 1, 0, 0, 0, 0);
-            } else {
-                for index in 4..pending.reply_mrs.len() {
-                    set_reply_mr(index, pending.reply_mrs[index]);
-                }
-                let _ = client_reply_on(
-                    cap,
-                    18,
-                    0,
-                    pending.reply_mrs[1],
-                    pending.reply_mrs[2],
-                    pending.reply_mrs[3],
-                );
-            }
+            let _ = reply_parked_syscall(cap, 0);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_badge_ready(nt_handler, pending.badge);
             (&mut *core::ptr::addr_of_mut!(PENDING_FILE_IRP_DRAINS))

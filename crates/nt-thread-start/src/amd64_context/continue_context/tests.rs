@@ -1,4 +1,5 @@
 use super::*;
+use crate::amd64_context::debug_context::DEBUG_REGISTERS;
 use crate::amd64_context::{
     CONTEXT_FLOATING_POINT, CONTEXT_MXCSR_OFFSET, FLOAT_SAVE_OFFSET, FX_MXCSR_OFFSET, NT5_FCW_MASK,
     NT5_MXCSR_MASK,
@@ -209,8 +210,10 @@ fn compatibility_cs_is_rejected_even_when_control_is_not_requested() {
 
 #[test]
 fn debug_test_alert_and_selected_ac_are_not_silently_dropped() {
+    let mut unsupported = context(DEBUG_REGISTERS);
+    crate::put_u64(&mut unsupported.bytes, 0x70, 2 << 16);
     assert_eq!(
-        prepare(&context(DEBUG_REGISTERS)),
+        prepare(&unsupported),
         Err(CodecError::UnsupportedDebugRegisters)
     );
     let partial = context_without_control();
@@ -237,6 +240,7 @@ fn rejection_statuses_and_input_bytes_are_preserved() {
         CodecError::InvalidArchitecture,
         CodecError::InvalidInstructionPointer,
         CodecError::InvalidStackPointer,
+        CodecError::InvalidDebugRegisters,
     ] {
         assert_eq!(error.status(), 0xc000_000d);
     }
@@ -248,11 +252,88 @@ fn rejection_statuses_and_input_bytes_are_preserved() {
     ] {
         assert_eq!(error.status(), 0xc000_00bb);
     }
-    let context = context(CONTROL | DEBUG_REGISTERS);
+    let mut context = context(CONTROL | DEBUG_REGISTERS);
+    crate::put_u64(&mut context.bytes, 0x70, 2 << 16);
     let original = context.bytes;
     assert_eq!(
         prepare(&context),
         Err(CodecError::UnsupportedDebugRegisters)
     );
     assert_eq!(context.bytes, original);
+}
+
+#[test]
+fn self_set_preserves_requested_control_but_returns_success_in_rax() {
+    let mut context = context(CONTROL | INTEGER);
+    crate::put_u64(&mut context.bytes, CONTEXT_RAX_OFFSET as usize, 0xdead);
+    crate::put_u64(&mut context.bytes, CONTEXT_RBX_OFFSET as usize, 0xbeef);
+    let before = context.bytes;
+    let plan = context
+        .prepare_self_set(0, u64::MAX, EFLAGS_AC, HIGHEST)
+        .unwrap();
+    assert_eq!(&plan.registers[..5], &[0x1234, 0x5679, 0x202, 0, 0xbeef]);
+    assert_eq!(plan.register_mask, (1 << 18) - 1);
+    assert_eq!(plan.debug, None);
+    assert_eq!(context.bytes, before);
+}
+
+#[test]
+fn self_set_without_control_uses_canonical_service_return_not_fault_pc() {
+    let mut context = context(INTEGER);
+    crate::put_u64(&mut context.bytes, CONTEXT_RIP_OFFSET as usize, 0x1000);
+    crate::put_u64(&mut context.bytes, CONTEXT_RSP_OFFSET as usize, 0);
+    context.bytes[EFLAGS_OFFSET..EFLAGS_OFFSET + 4].fill(0xff);
+    let plan = context
+        .prepare_self_set(0x1002, 0x5678, 0x246, HIGHEST)
+        .unwrap();
+    assert_eq!(&plan.registers[..4], &[0x1002, 0x5678, 0x246, 0]);
+    assert_eq!(plan.register_mask, (1 << 18) - 1);
+}
+
+#[test]
+fn self_set_only_adds_status_and_continuation_to_unrequested_gpr_groups() {
+    for flags in [
+        CONTEXT_AMD64,
+        CONTROL,
+        CONTEXT_AMD64 | 4,
+        CONTEXT_FLOATING_POINT,
+    ] {
+        let context = context(flags);
+        let base = context.prepare_set(HIGHEST).unwrap();
+        let plan = context
+            .prepare_self_set(0x4321, 0x8765, 0x202, HIGHEST)
+            .unwrap();
+        assert_eq!(plan.register_mask, 0xf);
+        assert_eq!(&plan.registers[3..], &[0; 17]);
+        assert_eq!(plan.floating_point, base.floating_point);
+        assert_eq!(plan.debug, base.debug);
+    }
+}
+
+#[test]
+fn self_set_rejects_invalid_fallback_without_mutating_capture() {
+    let context = context(INTEGER);
+    let before = context.bytes;
+    for (ip, sp, flags, error) in [
+        (0, 1, 0x202, CodecError::InvalidInstructionPointer),
+        (HIGHEST + 1, 1, 0x202, CodecError::InvalidInstructionPointer),
+        (1, 0, 0x202, CodecError::InvalidStackPointer),
+        (1, HIGHEST + 1, 0x202, CodecError::InvalidStackPointer),
+        (1, 1, EFLAGS_AC, CodecError::UnsupportedAlignmentCheck),
+    ] {
+        assert_eq!(context.prepare_self_set(ip, sp, flags, HIGHEST), Err(error));
+        assert_eq!(context.bytes, before);
+    }
+}
+
+#[test]
+fn self_set_keeps_selected_debug_and_fp_in_the_same_restore() {
+    let mut context = context(CONTEXT_FLOATING_POINT | DEBUG_REGISTERS);
+    context.bytes[0x48..0x78].fill(0);
+    crate::put_u64(&mut context.bytes, 0x48, 0x4000);
+    crate::put_u64(&mut context.bytes, 0x70, 1);
+    let plan = context.prepare_self_set(1, 2, 0x202, HIGHEST).unwrap();
+    assert_eq!(plan.register_mask, 0xf);
+    assert_eq!(plan.debug, Some([0x4000, 0, 0, 0, 0, 1]));
+    assert!(plan.floating_point.is_some());
 }

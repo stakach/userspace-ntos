@@ -210,7 +210,6 @@ mod tests {
             sequence: 99,
             reply_cap: thread_id + 100,
             reply: nt_syscall_abi::ParkedSyscallReply::unknown_syscall(
-                [0; nt_syscall_abi::ParkedSyscallReply::UNKNOWN_SYSCALL_REGISTER_COUNT],
                 1,
                 2,
                 3,

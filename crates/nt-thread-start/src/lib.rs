@@ -60,7 +60,6 @@ pub const INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET: u64 = 0x20;
 
 pub const CALL_TRAMPOLINE_LEN: usize = 42;
 pub const AMD64_HW_BREAKPOINT_SLOTS: usize = 4;
-pub const AMD64_DR6_INITIAL: u64 = 0xFFFF_0FF0;
 pub const AMD64_DR7_RESERVED_ONE: u64 = 0x0000_0400;
 pub const DEBUG_BREAKPOINT_DATA: u64 = 0;
 pub const DEBUG_BREAKPOINT_INSTRUCTION: u64 = 1;
@@ -152,13 +151,6 @@ pub struct Amd64DebugBreakpoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Amd64DebugRegisterState {
-    pub dr: [u64; AMD64_HW_BREAKPOINT_SLOTS],
-    pub dr6: u64,
-    pub dr7: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Amd64DebugRegisterError {
     UnsupportedControlBits,
     UnsupportedIoBreakpoint,
@@ -223,28 +215,6 @@ pub fn plan_amd64_debug_registers(
     Ok(slots)
 }
 
-/// Synthesize the NT-visible debug-register image from seL4-style breakpoint slots.
-pub fn synthesize_amd64_debug_registers(
-    slots: &[Option<Amd64DebugBreakpoint>; AMD64_HW_BREAKPOINT_SLOTS],
-) -> Result<Amd64DebugRegisterState, Amd64DebugRegisterError> {
-    let mut state = Amd64DebugRegisterState {
-        dr: [0; AMD64_HW_BREAKPOINT_SLOTS],
-        dr6: AMD64_DR6_INITIAL,
-        dr7: AMD64_DR7_RESERVED_ONE,
-    };
-    for (slot, maybe_breakpoint) in slots.iter().copied().enumerate() {
-        let Some(breakpoint) = maybe_breakpoint else {
-            continue;
-        };
-        validate_amd64_debug_breakpoint(breakpoint)?;
-        state.dr[slot] = breakpoint.address;
-        state.dr7 |= 1u64 << (slot * 2);
-        state.dr7 |= amd64_dr7_type_bits(breakpoint)? << (16 + slot * 4);
-        state.dr7 |= amd64_dr7_len_bits(breakpoint)? << (18 + slot * 4);
-    }
-    Ok(state)
-}
-
 fn validate_amd64_debug_breakpoint(
     breakpoint: Amd64DebugBreakpoint,
 ) -> Result<(), Amd64DebugRegisterError> {
@@ -274,31 +244,6 @@ fn validate_amd64_debug_breakpoint(
         _ => return Err(Amd64DebugRegisterError::InvalidBreakpointType),
     }
     Ok(())
-}
-
-fn amd64_dr7_type_bits(breakpoint: Amd64DebugBreakpoint) -> Result<u64, Amd64DebugRegisterError> {
-    match breakpoint.breakpoint_type {
-        DEBUG_BREAKPOINT_INSTRUCTION => Ok(0),
-        DEBUG_BREAKPOINT_DATA => match breakpoint.access {
-            DEBUG_ACCESS_WRITE => Ok(1),
-            DEBUG_ACCESS_READ | DEBUG_ACCESS_READWRITE => Ok(3),
-            _ => Err(Amd64DebugRegisterError::InvalidBreakpointAccess),
-        },
-        _ => Err(Amd64DebugRegisterError::InvalidBreakpointType),
-    }
-}
-
-fn amd64_dr7_len_bits(breakpoint: Amd64DebugBreakpoint) -> Result<u64, Amd64DebugRegisterError> {
-    if breakpoint.breakpoint_type == DEBUG_BREAKPOINT_INSTRUCTION {
-        return Ok(0);
-    }
-    match breakpoint.size {
-        1 => Ok(0),
-        2 => Ok(1),
-        8 => Ok(2),
-        4 => Ok(3),
-        _ => Err(Amd64DebugRegisterError::InvalidDataBreakpointSize),
-    }
 }
 
 /// Build the initialized portion of an AMD64 user thread `CONTEXT` using the same stack and
@@ -552,10 +497,6 @@ mod tests {
                 access: DEBUG_ACCESS_READ,
             })
         );
-        let state = synthesize_amd64_debug_registers(&plan).expect("synthesize");
-        assert_eq!(state.dr[0], 0x401000);
-        assert_eq!(state.dr6, AMD64_DR6_INITIAL);
-        assert_eq!(state.dr7, AMD64_DR7_RESERVED_ONE | 1);
     }
 
     #[test]
@@ -572,15 +513,6 @@ mod tests {
                 size: 4,
                 access: DEBUG_ACCESS_WRITE,
             })
-        );
-        let state = synthesize_amd64_debug_registers(&plan).expect("synthesize");
-        assert_eq!(state.dr[slot], 0x402000);
-        assert_eq!(
-            state.dr7,
-            AMD64_DR7_RESERVED_ONE
-                | (1u64 << (slot * 2))
-                | (1u64 << (16 + slot * 4))
-                | (3u64 << (18 + slot * 4))
         );
     }
 

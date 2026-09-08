@@ -16337,27 +16337,13 @@ unsafe fn client_reply_on(
     label == 0
 }
 
-/// Resume a parked NT syscall without borrowing register words from the caller currently being
-/// serviced. Hosted `syscall` faults require the complete saved register file; native seL4 calls
-/// require only the terminal status word.
+/// Complete through the retained Reply capability with only the terminal status. The canonical
+/// TCB owns the continuation; replaying a parked snapshot would undo later context edits.
 unsafe fn reply_parked_syscall(
     reply_cptr: u64,
-    continuation: nt_syscall_abi::ParkedSyscallReply,
     status: u64,
 ) -> bool {
-    let registers = continuation.registers_with_status(status);
-    let length = continuation.message_length();
-    for (index, value) in registers.iter().copied().enumerate().take(length).skip(4) {
-        set_reply_mr(index, value);
-    }
-    client_reply_on(
-        reply_cptr,
-        length as u64,
-        registers[0],
-        registers[1],
-        registers[2],
-        registers[3],
-    )
+    client_reply_on(reply_cptr, 1, status, 0, 0, 0)
 }
 
 #[inline]
@@ -17119,7 +17105,7 @@ unsafe fn delay_wake_due(
         DELAY_WOKEN_COUNT.fetch_add(1, Ordering::Relaxed);
         DELAY_WAKE_LAST_BADGE.store(waiter.badge, Ordering::Relaxed);
         let reply_started = disk_census_ticks();
-        reply_parked_syscall(waiter.reply_cap, waiter.reply, 0);
+        reply_parked_syscall(waiter.reply_cap, 0);
         let reply_done = disk_census_ticks();
         DELAY_WAKE_REPLY_TICKS.fetch_add(reply_done.wrapping_sub(reply_started), Ordering::Relaxed);
         release_reply_pool_cap(waiter.reply_cap);
@@ -17164,7 +17150,6 @@ unsafe fn io_completion_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         }
         reply_parked_syscall(
             waiter.reply_cap,
-            waiter.reply,
             nt_io_completion::STATUS_TIMEOUT as u64,
         );
         release_reply_pool_cap(waiter.reply_cap);
@@ -17796,8 +17781,8 @@ unsafe fn dbgk_reporter_park(
 ///
 /// ★ The reply SHAPE is per fault flavour — this is the whole reason target-side blocking needed its
 /// own machinery. The kernel's `apply_fault_reply` transfers different registers per `pending_fault`:
-/// * **UnknownSyscall** (a syscall reporter) — slots 0=RAX … 15=FaultIP, 16=SP, 17=FLAGS: the
-///   ordinary syscall reply (status in MR0, resume context in MR15/16/17), length 18.
+/// * **UnknownSyscall** (a syscall reporter) — one status word updates RAX while preserving
+///   the canonical TCB continuation, including acknowledged debugger edits.
 /// * **UserException** — slots 0=FaultIP, 1=SP, 2=FLAGS, length 3. Sending the *syscall* shape here
 ///   would write the status into the faulter's FaultIP and resume it at garbage.
 /// * **VMFault / DebugException** — no register transfer at all; a length-0, label-0 reply restarts
@@ -17813,7 +17798,7 @@ unsafe fn dbgk_reporter_resume(
     }
     match block.kind {
         DBGK_BLOCK_SYSCALL => {
-            reply_parked_syscall(block.reply_cap, block.syscall_reply, block.resume_status);
+            reply_parked_syscall(block.reply_cap, block.resume_status);
         }
         DBGK_BLOCK_USER_EXCEPTION => {
             client_reply_on(
@@ -17961,7 +17946,7 @@ unsafe fn keyed_wait_wake_one(handler: &mut ExecNtHandler, key: u64, status: u64
         keyed_wait_clear_slot(slot);
         return false;
     }
-    reply_parked_syscall(cap, record.reply, status);
+    reply_parked_syscall(cap, status);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_tid_ready(handler, record.tid);
     keyed_wait_clear_slot(slot);
@@ -18020,7 +18005,7 @@ unsafe fn keyed_release_wake_one(handler: &mut ExecNtHandler, key: u64, status: 
         keyed_release_wait_clear_slot(slot);
         return false;
     }
-    reply_parked_syscall(cap, record.reply, status);
+    reply_parked_syscall(cap, status);
     release_reply_pool_cap(cap);
     thread_wait_state_clear_tid_ready(handler, record.tid);
     keyed_release_wait_clear_slot(slot);
@@ -18040,7 +18025,7 @@ unsafe fn keyed_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            reply_parked_syscall(cap, record.reply, 0x102);
+            reply_parked_syscall(cap, 0x102);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
@@ -18062,7 +18047,7 @@ unsafe fn keyed_release_wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> 
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            reply_parked_syscall(cap, record.reply, 0x102);
+            reply_parked_syscall(cap, 0x102);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;
@@ -19053,9 +19038,8 @@ unsafe fn wait_wake_dispatcher(
         };
         let cap = record.reply_cap;
         if cap != 0 {
-            // Resume with the exact wait status. UnknownSyscall replies restore the exact retained
-            // register file with only RAX replaced; native seL4 calls receive a one-word status.
-            reply_parked_syscall(cap, record.reply, wake_index);
+            // Complete the wait without replacing the canonical thread continuation.
+            reply_parked_syscall(cap, wake_index);
             // Return this reply object to the pool (clear its used bit).
             release_reply_pool_cap(cap);
             let trace = WAIT_WAKE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -19106,7 +19090,7 @@ unsafe fn wait_wake_due(handler: &mut ExecNtHandler, now: u64) -> u64 {
         }
         let cap = record.reply_cap;
         if cap != 0 {
-            reply_parked_syscall(cap, record.reply, 0x102);
+            reply_parked_syscall(cap, 0x102);
             release_reply_pool_cap(cap);
             thread_wait_state_clear_tid_ready(handler, record.tid);
             woken += 1;

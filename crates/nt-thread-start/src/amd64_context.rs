@@ -25,8 +25,12 @@ const CONTEXT_FLAGS_OFFSET: usize = 0x30;
 const EXTENDED_STATE_GROUPS: u32 = 0x40 | 0x80; // XSTATE and CET
 
 mod continue_context;
+mod debug_context;
 mod floating_point;
-pub use continue_context::{LegacyContextRestore, NT_NATIVE_CODE_SELECTOR, PLATFORM_NATIVE_CODE_SELECTOR};
+mod register_publication;
+pub use continue_context::{
+    LegacyContextRestore, NT_NATIVE_CODE_SELECTOR, PLATFORM_NATIVE_CODE_SELECTOR,
+};
 mod initial_trampoline;
 pub use initial_trampoline::{
     initial_context_trampoline, InitialContextTrampoline, INITIAL_CONTEXT_TRAMPOLINE_CAPACITY,
@@ -41,6 +45,7 @@ pub enum CodecError {
     InvalidInstructionPointer,
     InvalidContextAddress,
     InvalidStackPointer,
+    InvalidDebugRegisters,
     UnsupportedCompatibilityMode,
     UnsupportedDebugRegisters,
     UnsupportedTestAlert,
@@ -53,7 +58,8 @@ impl CodecError {
             Self::InvalidArchitecture
             | Self::InvalidInstructionPointer
             | Self::InvalidContextAddress
-            | Self::InvalidStackPointer => 0xc000_000d,
+            | Self::InvalidStackPointer
+            | Self::InvalidDebugRegisters => 0xc000_000d,
             Self::UnsupportedExtendedState
             | Self::UnsupportedCompatibilityMode
             | Self::UnsupportedDebugRegisters
@@ -109,6 +115,13 @@ impl CapturedAmd64Context {
             return Err(CodecError::UnsupportedExtendedState);
         }
         Ok(())
+    }
+
+    fn validate_native_groups(&self) -> Result<(), CodecError> {
+        if self.flags() & CONTEXT_AMD64 == 0 {
+            return Err(CodecError::InvalidArchitecture);
+        }
+        self.validate_legacy_state()
     }
 
     /// Extract a legacy hardware image only when the AMD64 floating-point group was requested.

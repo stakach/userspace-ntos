@@ -303,6 +303,13 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   RtlCaptureContext capture and validate the built DLL's machine code (host and native build
   checkpoint). First-process-thread creation, live loader startup, APC delivery and full
   exception/restore semantics remain separate acceptance items.
+- [x] Include raw debug registers in coherent snapshot and atomic selected installation; replace
+  native NtSetContextThread read/merge and separate breakpoint writes (tranche 150). Retain real
+  debug-fault status and microkernel stepping ownership; validate selected state before restart.
+- [~] Replace native-call stub geometry with captured per-thread application continuations
+  (tranche 151). The host wire-record codec is tested. Native producer/consumer migration, exact
+  nested callback and suspended-wait ownership, and removal of unsupported GPR SET boundaries
+  remain open; ordinary status-only parked completion no longer replays saved registers.
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30408,6 +30415,84 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Get/Set/Continue without the old separate breakpoint reconstruction/write loops, and use
     that coherent complete snapshot for APC construction. Do not call a GPR/FP-only snapshot a
     complete APC context.
+
+    B3 atomic debug-context tranche 150 (accepted mechanism/adapter checkpoint): extend the shared private legacy context
+    protocol to exact 90-word read and 91-word write payloads, appending DR0-3/DR6/DR7 with a
+    separate selected-group bit. Old-sized writes are rejected, not accepted as partial payloads.
+    A generic microkernel validator stages legal raw debug state before quiescence; installation
+    preserves counted single-stepping metadata and deferred events. Actual debug fault status
+    must be saved into the exact TCB for both normal and adopted remote faults. Local/global
+    enable bits and per-thread disabled debug state must be honored by the hardware loader.
+    NT-specific DR7/address sanitization and ignoring input DR6 belong in the host codec. Native
+    Get/Set then use the coherent operation with exact user capture/output errors, removing
+    separate breakpoint reconstruction and mutation. The private read returns the canonical
+    resume PC, not the upstream ReadRegisters fault-instruction projection. Restart acknowledges
+    a consumed DebugException's DR6 only when DEBUG is unselected; selected raw status wins and
+    ordinary writes, VM faults and retained deferred debug events are not acknowledged implicitly.
+
+    Serialized validation passes 1,380 host unit tests, 49 integration tests and 13 compile-fail
+    tests (`.tmp/test-debug-context-20260909.log`), three shared-protocol tests, the final four-CPU
+    microkernel spec run and all 12 userspace microtests
+    (`.tmp/run-debug-context-microtest-final-20260909.log`), x86 production and ARM compile-only
+    builds, and the native executive release build. The rebuilt ntdll passes its export/import
+    verifier and the actual-PE RtlCaptureContext machine-code probe
+    (`.tmp/test-debug-context-ntdll-artifact-20260909.log`). Original NT boot staging is restored
+    byte-for-byte after standalone microtests. No new NT desktop acceptance is claimed; the
+    strict 27-import frontier remains. APC dispatch is unchanged until its whole contract lands.
+
+    Self-SET review: the ordinary hosted fault reply rewrites its saved GPR/control tuple, so
+    returning success after directly installing a current-thread context can silently undo it.
+    Fault-transport self SET of INTEGER/CONTROL must instead use the acknowledged restart
+    postaction, canonical syscall continuation for an unrequested CONTROL group, and NT5's
+    STATUS_SUCCESS in RAX. The native-call IPC stub also restores private saved registers and
+    lacks a checked full application continuation record; self INTEGER/CONTROL requests there must
+    fail explicitly before mutation until that record replaces the implicit stub geometry.
+    FP/debug-only self SET remains valid because neither return path overwrites those groups.
+    Complete the shared native-call continuation contract before claiming full self SET or APC
+    delivery across both transports; do not identify stub instructions by executable address.
+
+    Remote-SET review found the same stale-register replay in ordinary delay, object, keyed,
+    IOCP, LPC, IRP, PnP and debugger syscall completion. Ordinary parked completion now uses the
+    retained Reply capability with one status word: the microkernel preserves canonical target
+    state and returns the real donated SC. Remove the redundant 18-word ParkedSyscallReply restore
+    image and retain only the coordinates still required by deferred handling/reporting. Explicit
+    retries and callback/APC redirects remain separate operations, not ordinary completion.
+    The real fault-delivery/private-edit/Reply regression passes in
+    `.tmp/run-debug-context-terminal-reply-20260909.log`: all 18 edited GPR/control words survive
+    except terminal RAX, the exact donated SC returns once, and a duplicate reply is rejected.
+    That four-CPU run passes all kernel specs and 12 userspace microtests. The microkernel changes
+    are committed and pushed as `2e002a8`; original NT staging was again restored byte-for-byte.
+    Three direct terminal File paths now share the same status-only completion; their replay-only
+    fields and cleanup/IRP-drain resume geometry are removed. All 375 I/O Manager unit tests and
+    four compile-fail tests pass (`.tmp/test-debug-context-file-completion-20260909.log`).
+    The final native release build passes after that cleanup
+    (`.tmp/build-debug-context-terminal-executive-20260909.log`).
+
+    Remote INTEGER/CONTROL SET is explicitly unsupported before mutation until exact target-side
+    application-continuation ownership is installed. The caller's transport and PM Waiting state
+    cannot prove that the remote target is outside a native Call epilogue. FP/debug selection still
+    uses the atomic operation. This closes a false-success path, not the remote-context feature.
+
+    Next tranche 151: define a checked, versioned native-call application continuation in the
+    shared syscall ABI, captured before IPC register clobbers and retained by the exact thread
+    across parking. Migrate both generated naked exports and the internal marshalled-call bridge,
+    then the executive ingress, retry and terminal-completion owners in one native cutover. Delete
+    the old implicit stub geometry and legacy producer format. Preserve all arguments across retry
+    without rereading mutable caller memory. Base native Get/Set/APC on that owned application state
+    plus coherent hardware FP/debug, not IPC-clobbered TCB registers. Only then remove the explicit
+    unsupported self/remote GPR boundaries and validate real resumed execution on both transports.
+
+    Tranche 151 host-record checkpoint: `nt-syscall-abi::native_context` now defines the 176-byte
+    version-1 record with all 18 application GPR/control words, entry RSP and explicit zero reserved
+    fields. Capture validates exact service arity and message envelope, the complete aligned user
+    span, canonical user IP/SP and post-RET stack relation before returning an owned value. It reads
+    once and propagates precise partial-copy errors. No retained user pointer or executable/stub
+    address is authority. Nine new test groups pass, including all service arities and malformed
+    framing; the broader serialized run passes 1,420 unit, 49 integration and 13 compile-fail tests
+    (`.tmp/test-debug-context-completion-20260909.log`). This is a host-only ABI checkpoint: label
+    0x4e55 is deliberately not yet emitted or accepted by native execution. The microkernel's
+    current hosted-call admission test explicitly rejects that label and must change with both
+    producers and the executive consumer, not as an isolated permissive classifier change.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
