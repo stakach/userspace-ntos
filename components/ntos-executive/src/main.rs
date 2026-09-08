@@ -15102,6 +15102,7 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
 
 mod thread_sched_context;
 mod root_slot_recycle;
+mod ps_object_paging;
 mod frame_acquisition;
 mod frame_recycle;
 mod client_frame_cleanup;

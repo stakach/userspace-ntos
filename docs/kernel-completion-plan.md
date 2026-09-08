@@ -29631,19 +29631,22 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/run-x86-map-bounds-microtest-20260908.log,
     .tmp/build-x86-map-bounds-production-20260908.log.
 
-    B3 x86 frame mapping authority tranche 129 (2026-09-08, in progress): replace the already-mapped
-    same-address success shortcut with genuine validated leaf installation and permission updates.
-    Authenticate the exact mapped root/ASID and invoked source capability before any mutation;
-    preserve capability rights while masking effective leaf permissions. Decode upstream cache
-    attributes separately from the project's compressed NX flag. Permit same-size leaf replacement
-    as seL4 does, reject a conflicting lower-level subtree, and invalidate the exact VSpace after
-    changes. Tests must inspect real PTE flags and unchanged cap/PTE state on failure. Frame rights
-    attenuation in CNode Copy/Mint is an adjacent prerequisite, not implicitly completed by Map.
+    B3 x86 frame mapping authority tranche 129 (2026-09-08, complete): the already-mapped
+    same-address success shortcut is removed. Map authenticates the exact mapped root/ASID and
+    invoked source capability before real leaf installation or permission changes. Capability
+    rights remain immutable while effective leaf permissions are masked. Upstream cache attributes
+    are distinct from the custom NX flag; same-size leaf replacement is allowed, lower subtrees
+    are protected, and the exact VSpace is invalidated. Frame encoding retains real zero-VA
+    mappings through their ASID provenance. Superseded size-specific mapping helpers are deleted.
+    Final review also fixed 4 KiB unmap confusing PAT bit 7 with a large-page PS bit; a direct
+    PAT map/unmap regression now covers that lifecycle, with parent checks preserved.
 
-    B3 frame capability derivation tranche 130 (2026-09-08, in progress): Copy/Mint must retain
-    source authority, attenuate the derived frame rights, and clear only the derived mapping
-    metadata. Truncated upstream messages or absent staged source roots must not fall back to the
-    caller's CSpace. Validate all sizes/rights, occupied destinations and repeated derivation.
+    B3 frame capability derivation tranche 130 (2026-09-08, complete): Copy/Mint retain source
+    authority, attenuate the derived frame rights, and clear only the derived mapping metadata.
+    Truncated upstream messages and absent staged source roots no longer fall back to the caller's
+    CSpace. A complete size/rights matrix, occupied-destination rejection and two-generation
+    attenuation tests verify both capability contents and derivation metadata without mutation
+    on failure. Legacy requests retain only source authority, never an enlarged permission set.
 
     B3 retained paging construction tranche 131 (2026-09-08, host mechanism complete):
     nt-memory-manager::owned_paging_structure retains every reserved slot, retyped table and mapped
@@ -29657,12 +29660,47 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     native activation. Reuse AliasTransition for copied root/provider frame mappings rather than
     adding a second alias state machine; the native paging ledger and Ps publication remain below.
 
-    B3 paging-table admission tranche 132 (2026-09-08, in progress): authenticate exact source CTE
-    and mapped root/ASID before installing PDPT/PD/PT entries, preserve upstream cache attributes,
-    and commit mapping provenance without a fallible post-write lookup. Delete the spec-only
-    current-root success bypass and replace its alias test with real registered page-table
-    fixtures. Upstream addresses select the containing table; the custom ABI retains page
-    alignment validation. Repeated mapping of an already-mapped table is InvalidCapability.
+    B3 paging-table admission tranche 132 (2026-09-08, complete): exact source CTE and mapped
+    root/ASID validation precede PDPT/PD/PT installation. Upstream cache attributes are installed
+    and provenance commits without a fallible post-write lookup. The spec-only current-root
+    success bypass and its fake alias test are deleted; registered hardware-table fixtures cover
+    all levels, attributes, stale/missing roots, malformed requests, missing parents, occupied
+    entries and exact invoked-alias updates. Upstream addresses select the containing table;
+    the custom ABI retains page alignment validation. Already-mapped tables return
+    InvalidCapability. The existing order of errors for multiply-invalid addresses is retained;
+    that is not permission to skip root/capability validation for successful requests.
+
+    Tranches 129/130/132 pass all kernel specs and the 12/12 userspace microtests, with sentinel
+    and QEMU exit 0, including a second full run after the PAT correction. Production kernel build
+    passes in 1.25 seconds with 239 warnings. Submodule commit b60cde0 is pushed before the parent
+    pointer. Logs: .tmp/build-x86-map-authority-final-20260908.log,
+    .tmp/run-x86-map-authority-final-20260908.log,
+    .tmp/build-x86-map-authority-production-final-20260908.log. Original NT rootserver and disk
+    staging are restored; these are standalone microkernel results, not an NT desktop boot.
+
+    B3 native Ps paging ledger tranche 133 (2026-09-08, prepared; activation pending): the focused
+    ps_object_paging module binds each nonclone tree to a caller's existing exact VSpace lifetime
+    and root capability, restricted to the dedicated branch 129. Missing PDPT/PD/PT rows are
+    reserved and published before any capability operation; only retained ledger entries can be
+    reused. Checked synchronous map/unmap/delete and separate retyped/unretyped recycling use
+    tranche 131's owner. Explicit descendant-drained retirement blocks admission and drains every
+    PT before PDs and every PD before the PDPT. There is no new Ps allocation, alias grant or PM
+    publication yet. The native executive build passes in 35.83 seconds (278 warnings, including
+    the unused preparatory adapter), .tmp/build-ps-object-paging-20260908.log. The broader 26-crate
+    regression passes 2,924 tests in 59 suites, .tmp/test-mapping-ownership-regression-20260908.log.
+
+    B3 canonical ASID lifetime tranche 134 (next, required before provider-root expansion): remove
+    the initial-pool wrapping allocator and the parallel per-pool used counters. A checked pool
+    identity and the canonical live ASID catalog must select free slots without recycling zero or
+    a live root. Capability copies may account for an already registered exact identity, not
+    republish missing/stale roots; deleting a stale cap must not decrement a replacement root's
+    count. Pool aliases retain the physical pool and its assignments until final deletion, and
+    Assign authenticates both the invoked pool and the exact supplied unassigned root CTE before
+    effects. MakePool must retain exact source-Untyped/MDB authority rather than searching the
+    destination CNode for a same-address cap. Keep ARM and x86 lifecycle contracts coherent.
+    Include TCB-held VSpace references in final-root lifetime: deleting the last CNode alias alone
+    must not invalidate a still-referenced root. Pool finalization separately invalidates all of
+    that exact pool's assignments, with the required architecture-specific TLB handling.
 
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
