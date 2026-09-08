@@ -10,7 +10,13 @@ use nt_memory_manager::retained_alias::AliasRetirementIo;
 #[derive(Debug)]
 pub struct ThreadPrefetchJournal {
     id: ThreadRollbackId,
-    journal: PrefetchJournal<4>,
+    journal: Ranges,
+}
+
+#[derive(Debug)]
+enum Ranges {
+    WithStack(PrefetchJournal<4>),
+    WithoutStack(PrefetchJournal<3>),
 }
 
 fn process(id: ThreadRollbackId) -> Option<PrefetchProcess> {
@@ -33,21 +39,46 @@ impl ThreadPrefetchJournal {
         if current != process(id) {
             return Err(PrefetchJournalError::OwnerChanged);
         }
-        let journal = PrefetchJournal::prepare(
-            id.identity().pi as u64,
-            current.map(|p| p.generation),
-            layout.ranges().map(|range| (range.base, range.size)),
-            frames,
-        )?;
+        let pi = id.identity().pi as u64;
+        let generation = current.map(|p| p.generation);
+        let journal = if layout.stack().size == 0 {
+            Ranges::WithoutStack(PrefetchJournal::prepare(
+                pi,
+                generation,
+                [layout.ipc(), layout.teb(), layout.trampoline()]
+                    .map(|range| (range.base, range.size)),
+                frames,
+            )?)
+        } else {
+            Ranges::WithStack(PrefetchJournal::prepare(
+                pi,
+                generation,
+                layout.ranges().map(|range| (range.base, range.size)),
+                frames,
+            )?)
+        };
         Ok(Self { id, journal })
     }
 
     pub fn original_capabilities(&self) -> impl Iterator<Item = u64> + '_ {
-        self.journal.original_capabilities()
+        let (with, without) = match &self.journal {
+            Ranges::WithStack(journal) => (Some(journal), None),
+            Ranges::WithoutStack(journal) => (None, Some(journal)),
+        };
+        with.into_iter()
+            .flat_map(|journal| journal.original_capabilities())
+            .chain(
+                without
+                    .into_iter()
+                    .flat_map(|journal| journal.original_capabilities()),
+            )
     }
 
     pub fn is_complete(&self) -> bool {
-        self.journal.is_complete()
+        match &self.journal {
+            Ranges::WithStack(journal) => journal.is_complete(),
+            Ranges::WithoutStack(journal) => journal.is_complete(),
+        }
     }
 
     pub fn revalidate(
@@ -59,7 +90,10 @@ impl ThreadPrefetchJournal {
         if id != self.id || current != process(self.id) {
             return Err(PrefetchJournalError::OwnerChanged);
         }
-        self.journal.revalidate(frames)
+        match &self.journal {
+            Ranges::WithStack(journal) => journal.revalidate(frames),
+            Ranges::WithoutStack(journal) => journal.revalidate(frames),
+        }
     }
 
     pub fn claim(
@@ -69,7 +103,10 @@ impl ThreadPrefetchJournal {
         frames: &mut PrefetchFrames,
     ) -> Result<(), PrefetchJournalError> {
         self.revalidate(id, current, frames)?;
-        self.journal.claim(frames)
+        match &self.journal {
+            Ranges::WithStack(journal) => journal.claim(frames),
+            Ranges::WithoutStack(journal) => journal.claim(frames),
+        }
     }
 
     /// Only after complete disjoint ownership, exclusions and execution quiescence are retained.
@@ -81,7 +118,10 @@ impl ThreadPrefetchJournal {
         io: &mut impl AliasRetirementIo,
     ) -> Result<(), PrefetchJournalError> {
         self.revalidate(id, current, frames)?;
-        self.journal.retire(frames, io)
+        match &self.journal {
+            Ranges::WithStack(journal) => journal.retire(frames, io),
+            Ranges::WithoutStack(journal) => journal.retire(frames, io),
+        }
     }
 }
 

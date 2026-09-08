@@ -12,6 +12,7 @@ mod memory_retirement;
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
+    registered_memory: Option<nt_user_host::thread_construction::RegisteredThreadMemory>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
     alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasCleanup>,
     prefetch_preparation: core::cell::OnceCell<client_prefetch::ThreadPrefetchCleanup>,
@@ -25,6 +26,7 @@ impl HostedThreadRuntimeOwner {
         Self {
             runtime,
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
+            registered_memory: None,
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
             alias_preparation: core::cell::OnceCell::new(),
             prefetch_preparation: core::cell::OnceCell::new(),
@@ -307,6 +309,39 @@ impl HostedThreadRuntimeTable {
     pub(crate) unsafe fn reconcile_failed_spawn(
         &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
     ) -> Result<(), ThreadReconciliationError> {
+        if !self.entries.iter().filter_map(RuntimeSlot::pending)
+            .any(|pending| pending.id() == id && pending.construction_retirement().is_some())
+        {
+            return Err(ThreadReconciliationError::OwnerChanged);
+        }
+        self.reconcile_pending_memory(id)
+    }
+
+    /// Retain the exact published mechanism bundle before preparing any registered memory cleanup.
+    /// This only transfers ownership metadata; it neither stops execution nor invokes a backend.
+    /// Caller must have completed retained GUI obligations and validated PM/process/reservation
+    /// identity before this handoff closes lifecycle dispatch admission. No component reentry.
+    pub(crate) unsafe fn reconcile_registered_runtime(
+        &mut self, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), ThreadReconciliationError> {
+        let slot = self.entries.iter_mut()
+            .find(|slot| slot.pending().is_some_and(|pending| pending.id() == id))
+            .ok_or(ThreadReconciliationError::OwnerChanged)?;
+        let pending = slot.pending().ok_or(ThreadReconciliationError::OwnerChanged)?;
+        let owner = pending.runtime();
+        if pending.construction_retirement().is_some()
+            || !owner.registered_memory.as_ref().is_some_and(|registered| registered.matches(&owner.resources))
+        {
+            return Err(ThreadReconciliationError::OwnerChanged);
+        }
+        slot.handoff_registered_mechanisms(id)
+            .map_err(|_| ThreadReconciliationError::OwnerChanged)?;
+        self.reconcile_pending_memory(id)
+    }
+
+    unsafe fn reconcile_pending_memory(
+        &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), ThreadReconciliationError> {
         let _durable = allocator::enter_durable();
         if !temporary_frame_alias::backing_release_available()
             || !service_sec_image::section_scratch_is_quiescent()
@@ -317,15 +352,29 @@ impl HostedThreadRuntimeTable {
             .find(|pending| pending.id() == id)
             .ok_or(ThreadReconciliationError::OwnerChanged)?;
         let owner = pending.runtime();
-        let retirement = pending.construction_retirement()
+        let construction_retirement = pending.construction_retirement();
+        let retirement = construction_retirement.or_else(|| pending.registered_mechanism_retirement())
             .ok_or(ThreadReconciliationError::OwnerChanged)?;
-        let construction = retirement.inventory();
+        let mechanisms = retirement.inventory();
         let registry = &*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY);
-        let snapshot = owner.registry_preparation.reconcile(
-            id, &owner.resources, &owner.memory_coverage, retirement, registry,
-        ).map_err(ThreadReconciliationError::Registry)?;
-        for cap in construction.entries().filter_map(|(_, state)| state.slot()) {
-            if owner.memory_coverage.empty_slot() == Some(cap)
+        let snapshot = if construction_retirement.is_some() {
+            owner.registry_preparation.reconcile(
+                id, &owner.resources, &owner.memory_coverage, retirement, registry,
+            )
+        } else {
+            let registered = owner.registered_memory.as_ref()
+                .filter(|registered| registered.matches(&owner.resources))
+                .ok_or(ThreadReconciliationError::OwnerChanged)?;
+            let mut pages = [0u64; TP_WORKER_STACK_FRAME_COUNT + 2];
+            let mut len = 0;
+            for page in registered.pages() {
+                *pages.get_mut(len).ok_or(ThreadReconciliationError::OwnershipConflict)? = page;
+                len += 1;
+            }
+            owner.registry_preparation.reconcile_registered(id, &owner.resources, &pages[..len], registry)
+        }.map_err(ThreadReconciliationError::Registry)?;
+        for cap in mechanisms.entries().filter_map(|(_, state)| state.slot()) {
+            if (construction_retirement.is_some() && owner.memory_coverage.empty_slot() == Some(cap))
                 || snapshot.rollback_resources().iter().any(|resource| resource.cap == cap)
                 || registry.records().iter().any(|record|
                     [record.frame, record.alias_cap, record.source_cap].contains(&cap))
@@ -367,7 +416,7 @@ impl HostedThreadRuntimeTable {
         prefetch.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
         provider.revalidate(id).map_err(ThreadReconciliationError::Aliases)?;
         for cap in snapshot.rollback_resources().iter().map(|resource| resource.cap)
-            .chain(construction.entries().filter_map(|(_, state)| state.slot()))
+            .chain(mechanisms.entries().filter_map(|(_, state)| state.slot()))
             .chain(retirement.pending_memory_slot())
         {
             if client_prefetch::owns_cap(cap) || win32k_glue::attachment_owns_cap(cap)
@@ -420,6 +469,7 @@ impl HostedThreadRuntimeTable {
             && entry.tcb == 1 && entry.teb_alias == 0 && key == spawn.binding()
             && key == *prepared.ticket.owner() && spawn.resources().client_pi == key.pi
             && spawn.tcb() > 1 && spawn.mechanism().is_live() && spawn.resources().is_live()
+            && spawn.registered_memory().is_ok()
     }
 
     pub(crate) fn commit_spawn(
@@ -438,6 +488,7 @@ impl HostedThreadRuntimeTable {
         );
         assert!(spawn.tcb() > 1 && spawn.mechanism().is_live() && spawn.resources().is_live());
         assert_eq!(spawn.resources().client_pi, key.pi);
+        let registered = spawn.registered_memory().expect("validated complete constructor registration");
         entry
             .runtime
             .publication
@@ -447,6 +498,7 @@ impl HostedThreadRuntimeTable {
         entry.runtime.mechanism = spawn.mechanism();
         entry.runtime.teb_alias = spawn.teb_alias();
         entry.runtime.resources = spawn.resources();
+        entry.registered_memory = Some(registered);
     }
 
     pub(crate) fn reserve(
@@ -907,6 +959,12 @@ impl HostedThreadRuntimes {
         (&*self.table).reconcile_failed_spawn(id)
     }
 
+    pub(crate) unsafe fn reconcile_registered_runtime(
+        &mut self, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), ThreadReconciliationError> {
+        (&mut *self.table).reconcile_registered_runtime(id)
+    }
+
     pub(crate) fn validate_spawn(
         &mut self, prepared: &PreparedHostedThreadRuntime, spawn: &HostedThreadSpawn,
     ) -> bool {
@@ -1128,6 +1186,37 @@ impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
             return Err(nt_address_space::STATUS_INVALID_PARAMETER);
         }
         self.runtime.tcb = 1;
+        Ok(())
+    }
+}
+
+impl nt_user_host::thread_slot::RuntimeMechanismHandoff for HostedThreadRuntimeOwner {
+    fn registered_mechanism_slots(&self) -> Result<[u64; 4], u32> {
+        if self.runtime.tcb <= 1 || !self.runtime.mechanism.is_live() {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+        }
+        Ok([
+            self.runtime.mechanism.raw_cnode,
+            self.runtime.mechanism.cnode,
+            self.runtime.tcb,
+            self.runtime.mechanism.sched_context,
+        ])
+    }
+
+    fn clear_registered_mechanism_projections(
+        &mut self, id: nt_user_host::thread_rollback::ThreadRollbackId, expected: [u64; 4],
+    ) -> Result<(), u32> {
+        // The enclosing pending owner validates the opaque attempt and reservation tuple before
+        // this callback. Recheck every locally held identity and source slot before the first clear.
+        let identity = id.identity();
+        if self.runtime.pi != identity.pi || self.runtime.process.pid != identity.pid
+            || self.runtime.process.generation != identity.process_generation
+            || self.runtime.tid != identity.tid || self.runtime.publication.is_busy()
+            || self.registered_mechanism_slots()? != expected
+        {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+        }
+        self.runtime.mechanism = HostedThreadMechanismCaps::empty();
         Ok(())
     }
 }

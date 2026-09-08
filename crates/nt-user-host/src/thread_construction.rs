@@ -89,6 +89,29 @@ pub struct MemoryConstructionCoverage<const STACK: usize> {
     teb_registered: [bool; 2],
 }
 
+/// Complete registration observed by the successful constructor. This is immutable geometry,
+/// not capability ownership or a failed-construction cleanup attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegisteredThreadMemory {
+    client_pi: usize,
+    layout: crate::thread_resources::ThreadMemoryLayout,
+}
+
+impl RegisteredThreadMemory {
+    pub fn matches<const STACK: usize>(
+        &self,
+        resources: &crate::thread_resources::ThreadMemoryResources<STACK>,
+    ) -> bool {
+        resources.client_pi == self.client_pi && resources.layout() == Some(self.layout)
+    }
+
+    pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
+        let stack = self.layout.stack();
+        (0..stack.size / 4096).map(move |index| stack.base + index * 4096)
+            .chain((0..2).map(|index| self.layout.teb().base + index * 4096))
+    }
+}
+
 impl<const STACK: usize> MemoryConstructionCoverage<STACK> {
     pub const fn empty() -> Self {
         Self {
@@ -142,6 +165,26 @@ impl<const STACK: usize> MemoryConstructionProgress<STACK> {
 
     pub fn empty_slot(&self) -> Option<u64> {
         self.empty_slot.as_ref().map(FailedMemorySlot::slot)
+    }
+
+    /// Capture actual complete publication before the successful construction owner is dropped.
+    /// No allocation, mutation or capability duplication occurs, including for client PI zero.
+    pub fn completed_registration(
+        &self,
+        resources: &crate::thread_resources::ThreadMemoryResources<STACK>,
+    ) -> Result<RegisteredThreadMemory, crate::thread_registry::ThreadRegistryError> {
+        let layout = resources.layout()
+            .ok_or(crate::thread_registry::ThreadRegistryError::InvalidCoverage)?;
+        let count = usize::try_from(layout.stack().size / 4096)
+            .map_err(|_| crate::thread_registry::ThreadRegistryError::InvalidCoverage)?;
+        if self.empty_slot.is_some() || count > STACK
+            || self.stack_registered.iter().enumerate().any(|(index, value)| *value != (index < count))
+            || self.teb_registered != [true; 2]
+            || resources.has_unlocated_capabilities()
+        {
+            return Err(crate::thread_registry::ThreadRegistryError::InvalidCoverage);
+        }
+        Ok(RegisteredThreadMemory { client_pi: resources.client_pi, layout })
     }
 
     /// Allocation-free separation of immutable provenance from sole recycling authority.

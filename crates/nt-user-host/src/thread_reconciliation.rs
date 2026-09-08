@@ -1,4 +1,4 @@
-//! Read-only registry preparation retained once for an exact pending construction attempt.
+//! Read-only registry preparation retained once for an exact pending thread retirement.
 use alloc::vec::Vec;
 use core::cell::OnceCell;
 use nt_memory_manager::ClientFrameRegistry;
@@ -12,6 +12,7 @@ use crate::thread_rollback::ThreadRollbackId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconciliationError {
     AttemptChanged,
+    ProvenanceChanged,
     ProgressChanged,
     Registry(ThreadRegistryError),
 }
@@ -20,7 +21,13 @@ pub enum ReconciliationError {
 struct Prepared<const STACK: usize> {
     id: ThreadRollbackId,
     snapshot: ThreadRegistrySnapshot<STACK>,
-    empty_slot: Option<u64>,
+    provenance: Provenance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provenance {
+    Construction { empty_slot: Option<u64> },
+    Registered,
 }
 
 /// Store inside the non-cloneable pending runtime owner. OnceCell permits attaching immutable
@@ -76,7 +83,10 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
             if prepared.id != id {
                 return Err(ReconciliationError::AttemptChanged);
             }
-            if prepared.empty_slot != progress.empty_slot()
+            let Provenance::Construction { empty_slot } = prepared.provenance else {
+                return Err(ReconciliationError::ProvenanceChanged);
+            };
+            if empty_slot != progress.empty_slot()
                 || !registered_pages(resources, progress)?.eq(prepared
                     .snapshot
                     .records()
@@ -103,7 +113,9 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
         let prepared = Prepared {
             id,
             snapshot,
-            empty_slot: progress.empty_slot(),
+            provenance: Provenance::Construction {
+                empty_slot: progress.empty_slot(),
+            },
         };
         // No backend calls or reentrancy occur between the empty check and publication.
         assert!(self.prepared.set(prepared).is_ok());
@@ -111,6 +123,63 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
             .prepared
             .get()
             .expect("published registry preparation")
+            .snapshot)
+    }
+
+    /// Reconcile an actually completed constructor's exhaustive registration evidence. The caller
+    /// retains that evidence from publication, rather than reconstructing it from PI or accepting
+    /// whichever registry rows happen to remain. Every described backing page must have an owner;
+    /// this entry cannot substitute for partial construction or its empty-slot retirement actor.
+    ///
+    /// First match `id` to the protected registered pending runtime and close all memory admission.
+    /// This read-only preparation does not prove mechanism or provider execution quiescence. The
+    /// normal checked handoff must establish those prerequisites before releasing any capability.
+    pub fn reconcile_registered(
+        &self,
+        id: ThreadRollbackId,
+        resources: &ThreadMemoryResources<STACK>,
+        registered_pages: &[u64],
+        registry: &ClientFrameRegistry,
+    ) -> Result<&ThreadRegistrySnapshot<STACK>, ReconciliationError> {
+        if resources.client_pi != id.identity().pi {
+            return Err(ReconciliationError::AttemptChanged);
+        }
+        if let Some(prepared) = self.prepared.get() {
+            if prepared.id != id {
+                return Err(ReconciliationError::AttemptChanged);
+            }
+            if prepared.provenance != Provenance::Registered {
+                return Err(ReconciliationError::ProvenanceChanged);
+            }
+            let records = prepared.snapshot.records();
+            if registered_pages.len() != records.len()
+                || registered_pages.iter().enumerate().any(|(index, page)| {
+                    registered_pages[..index].contains(page)
+                        || !records.iter().any(|record| record.page == *page)
+                })
+            {
+                return Err(ReconciliationError::ProgressChanged);
+            }
+            prepared
+                .snapshot
+                .revalidate(resources, registry)
+                .map_err(ReconciliationError::Registry)?;
+            return Ok(&prepared.snapshot);
+        }
+        let snapshot = ThreadRegistrySnapshot::capture(resources, registry, registered_pages)
+            .map_err(ReconciliationError::Registry)?;
+        assert!(self
+            .prepared
+            .set(Prepared {
+                id,
+                snapshot,
+                provenance: Provenance::Registered,
+            })
+            .is_ok());
+        Ok(&self
+            .prepared
+            .get()
+            .expect("published registered preparation")
             .snapshot)
     }
 }

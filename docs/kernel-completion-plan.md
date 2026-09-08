@@ -30163,6 +30163,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     not be treated as an existing private VAD or as proof of absent backing. Fix that ownership
     boundary before the main-thread cutover. These are prerequisites, not absent-memory fallbacks.
 
+    B3 registered memory provenance tranche 144 (2026-09-09, accepted): successful constructors
+    now capture complete, observed stack/TEB registration geometry before their construction
+    payload is dropped. Store it separately from failed-construction progress. Native publication
+    requires all actual registry publications; PI zero no longer skips stack or TEB registration.
+    Registered reconciliation uses exhaustive complete capture and a distinct retained provenance
+    discriminator. Reject changed attempts, coverage, resources, registry rows or cross-mode retry;
+    post-transfer snapshots remain immutable evidence, never release authority for reused cap IDs.
+
+    Share native external-alias preparation and all cross-owner checks between the two genuine
+    origins. Registered preparation uses exact sealed mechanism handoff and the bounded observed
+    page list, not a fake failed construction. The active failed-construction adapter retains its
+    original semantics. Ordinary teardown has not yet been switched over.
+
+    Add explicit transport geometry with no fixed mechanism stack. Its three real ranges cover
+    IPC, TEB/ACS and trampoline; MM prefetch journals keep their strict nonempty-range validation.
+    No dummy stack address is introduced. Host tests show private user-stack registry/prefetch
+    ownership remains outside this transport journal, and stray stack caps are rejected.
+    Main constructors are not yet transferred to this representation.
+
+    Validation passes 1,093 unit tests, 49 integration tests and 11 compile-fail checks in
+    .tmp/test-registered-thread-provenance-20260909.log; native release build passes in
+    .tmp/build-registered-thread-provenance-20260909.log. No NT desktop run was performed.
+
+    Main-thread review adjustment: the advertised initial growth reservation overlaps the fixed
+    third worker/listener window. It is not a valid exclusive VAD merely because its endpoints are
+    aligned. The foreign first NtCreateThread path also resumes the precreated main mechanism
+    without reading its supplied CONTEXT/InitialTeb. Resolve real first-thread creation/activation
+    and collision-free user-stack ownership together; do not hide these gaps by reserving the old
+    overlapping range or treating the caller's stack metadata as irrelevant. The geometry-only
+    guard-growth work uses caller-supplied layouts and does not move ntdll sizing policy into Mm.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

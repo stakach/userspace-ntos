@@ -107,3 +107,32 @@ fn complete_empty_journal_keeps_its_exact_attempt_boundary() {
         Err(PrefetchJournalError::OwnerChanged)
     );
 }
+
+#[test]
+fn main_transport_journal_retires_only_real_ranges_not_private_stack() {
+    let owner = id(ProcessGeneration::Hosted(7));
+    let layout = ThreadMemoryLayout::without_stack(0x4000, 0x6000, 0xa000).unwrap();
+    let mut frames = PrefetchFrames::new();
+    for (index, page) in [0x1000, 0x4000, 0x6000, 0x7000, 0x8000, 0xa000]
+        .into_iter()
+        .enumerate()
+    {
+        frames
+            .reserve(PROCESS, page, |_| Some(0x100000 + index as u64 * 4096))
+            .unwrap();
+    }
+    let journal = ThreadPrefetchJournal::prepare(owner, layout, Some(PROCESS), &frames).unwrap();
+    assert_eq!(journal.original_capabilities().count(), 0);
+    journal.claim(owner, Some(PROCESS), &mut frames).unwrap();
+    journal
+        .retire(owner, Some(PROCESS), &mut frames, &mut NoEffects)
+        .unwrap();
+    assert!(journal.is_complete());
+    for page in [0x4000, 0x6000, 0x7000, 0x8000, 0xa000] {
+        assert_eq!(frames.lookup(PROCESS, page).unwrap(), None);
+    }
+    // The distinct private-stack reservation remains held, not selected or released.
+    assert!(frames.lookup(PROCESS, 0x1000).is_err());
+    assert!(frames.reserve(PROCESS, 0x1000, |_| Some(0x200000)).is_err());
+    journal.revalidate(owner, Some(PROCESS), &frames).unwrap();
+}

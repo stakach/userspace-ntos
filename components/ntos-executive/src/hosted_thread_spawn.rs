@@ -55,6 +55,13 @@ impl HostedThreadSpawn {
         self.construction.resources
     }
 
+    pub(crate) fn registered_memory(&self) -> Result<
+        nt_user_host::thread_construction::RegisteredThreadMemory,
+        nt_user_host::thread_registry::ThreadRegistryError,
+    > {
+        self.construction.memory_progress.completed_registration(&self.construction.resources)
+    }
+
     pub(crate) fn binding(&self) -> nt_user_host::thread_binding::ThreadBinding<HostedThreadRole> {
         self.construction.binding
     }

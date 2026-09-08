@@ -50,11 +50,36 @@ impl ThreadMemoryLayout {
             Some(size) if size != 0 => size,
             _ => return None,
         };
-        let ranges = [
+        Self::with_stack_range(
             ThreadMemoryRange {
                 base: stack_base,
                 size: stack_size,
             },
+            ipc_base,
+            teb_base,
+            trampoline_base,
+        )
+    }
+
+    /// Main-thread transport memory when its real user stack belongs to the private VAD.
+    /// No stack backing or address range is transferred into this layout.
+    pub const fn without_stack(ipc_base: u64, teb_base: u64, trampoline_base: u64) -> Option<Self> {
+        Self::with_stack_range(
+            ThreadMemoryRange { base: 0, size: 0 },
+            ipc_base,
+            teb_base,
+            trampoline_base,
+        )
+    }
+
+    const fn with_stack_range(
+        stack: ThreadMemoryRange,
+        ipc_base: u64,
+        teb_base: u64,
+        trampoline_base: u64,
+    ) -> Option<Self> {
+        let ranges = [
+            stack,
             ThreadMemoryRange {
                 base: ipc_base,
                 size: PAGE_SIZE,
@@ -71,13 +96,17 @@ impl ThreadMemoryLayout {
         let mut i = 0;
         while i < ranges.len() {
             let a = ranges[i];
+            if i == 0 && a.base == 0 && a.size == 0 {
+                i += 1;
+                continue;
+            }
             if a.base == 0 || a.base % PAGE_SIZE != 0 || a.base.checked_add(a.size).is_none() {
                 return None;
             }
             let mut j = 0;
             while j < i {
                 let b = ranges[j];
-                if a.base < b.base + b.size && b.base < a.base + a.size {
+                if b.size != 0 && a.base < b.base + b.size && b.base < a.base + a.size {
                     return None;
                 }
                 j += 1;

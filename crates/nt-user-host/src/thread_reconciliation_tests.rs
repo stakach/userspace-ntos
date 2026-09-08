@@ -311,3 +311,198 @@ fn coverage_cannot_borrow_another_failed_slots_retirement_phase() {
     ));
     assert!(state.is_prepared());
 }
+
+fn registered_fixture() -> (ThreadMemoryResources<2>, ClientFrameRegistry) {
+    let (mut resources, _, registry) = fixture();
+    resources.stack_owner[1] = 30;
+    resources.stack_target[1] = 31;
+    resources.teb2_owner = 40;
+    resources.teb2_target = 41;
+    resources.acs_owner = 50;
+    resources.acs_target = 51;
+    resources.ipc_owner = 60;
+    resources.tramp_owner = 70;
+    resources.tramp_target = 71;
+    (resources, registry)
+}
+
+#[test]
+fn registered_complete_capture_replays_same_page_set_without_construction_evidence() {
+    let (resources, registry) = registered_fixture();
+    let state = ThreadRegistryReconciliation::empty();
+    let id = attempt();
+    let snapshot = state
+        .reconcile_registered(id, &resources, &[0x5000, 0x1000], &registry)
+        .unwrap();
+    assert!(core::ptr::eq(
+        snapshot,
+        state
+            .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
+            .unwrap()
+    ));
+    for cap in [10, 20, 30, 40, 50, 60, 70] {
+        assert!(snapshot
+            .rollback_resources()
+            .iter()
+            .any(|entry| entry.cap == cap
+                && entry.kind == crate::thread_rollback::ThreadRollbackResourceKind::Frame));
+    }
+    assert_eq!(registry.records().len(), 2);
+}
+
+#[test]
+fn registered_capture_requires_complete_physical_ownership_and_exact_coverage() {
+    let (mut resources, registry) = registered_fixture();
+    let id = attempt();
+    for pages in [
+        &[0x1000][..],
+        &[0x1000, 0x1000][..],
+        &[0x1000, 0x5000, 0x6000][..],
+    ] {
+        let state = ThreadRegistryReconciliation::empty();
+        assert!(state
+            .reconcile_registered(id, &resources, pages, &registry)
+            .is_err());
+        assert!(!state.is_prepared());
+    }
+    resources.acs_owner = 0;
+    resources.acs_target = 0;
+    let state = ThreadRegistryReconciliation::empty();
+    assert!(matches!(
+        state.reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry),
+        Err(ReconciliationError::Registry(
+            ThreadRegistryError::Resources(_)
+        ))
+    ));
+    assert!(!state.is_prepared());
+    resources.acs_owner = 50;
+    resources.acs_target = 51;
+    state
+        .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
+        .unwrap();
+}
+
+#[test]
+fn registered_and_construction_preparation_cannot_change_provenance() {
+    let (resources, registry) = registered_fixture();
+    let id = attempt();
+    let (progress, retirement) = seal(fixture().1, id);
+    let registered = ThreadRegistryReconciliation::empty();
+    registered
+        .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
+        .unwrap();
+    assert!(matches!(
+        registered.reconcile(id, &resources, &progress, &retirement, &registry),
+        Err(ReconciliationError::ProvenanceChanged)
+    ));
+    let construction = ThreadRegistryReconciliation::empty();
+    construction
+        .reconcile(id, &resources, &progress, &retirement, &registry)
+        .unwrap();
+    assert!(matches!(
+        construction.reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry),
+        Err(ReconciliationError::ProvenanceChanged)
+    ));
+}
+
+#[test]
+fn registered_retry_rejects_changed_attempt_coverage_resources_and_registry() {
+    let (resources, mut registry) = registered_fixture();
+    let id = attempt();
+    let state = ThreadRegistryReconciliation::empty();
+    state
+        .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
+        .unwrap();
+    assert!(matches!(
+        state.reconcile_registered(attempt(), &resources, &[0x1000, 0x5000], &registry),
+        Err(ReconciliationError::AttemptChanged)
+    ));
+    for pages in [&[0x1000][..], &[0x1000, 0x1000][..], &[0x1000, 0x6000][..]] {
+        assert!(matches!(
+            state.reconcile_registered(id, &resources, pages, &registry),
+            Err(ReconciliationError::ProgressChanged)
+        ));
+    }
+    let mut changed = resources;
+    changed.stack_target[1] = 32;
+    assert!(matches!(
+        state.reconcile_registered(id, &changed, &[0x1000, 0x5000], &registry),
+        Err(ReconciliationError::Registry(
+            ThreadRegistryError::StaleResources
+        ))
+    ));
+    registry.take(7, 0x5000).unwrap();
+    registry.insert(7, 0x5000, 21, 0, 24, 25, false).unwrap();
+    assert!(matches!(
+        state.reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry),
+        Err(ReconciliationError::Registry(
+            ThreadRegistryError::StaleRecord { page: 0x5000 }
+        ))
+    ));
+    assert_eq!(
+        state.retained_snapshot(id).unwrap().records()[1].alias_cap,
+        22
+    );
+}
+
+#[test]
+fn registered_terminal_provenance_survives_transfer_and_numeric_cap_reuse() {
+    let (resources, mut registry) = registered_fixture();
+    let id = attempt();
+    let state = ThreadRegistryReconciliation::empty();
+    let snapshot = state
+        .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
+        .unwrap();
+    let transfer = snapshot
+        .prepare_transfer(&resources, &mut registry)
+        .unwrap()
+        .unwrap();
+    assert!(state
+        .reconcile_registered(id, &resources, &[0x1000, 0x5000], &registry)
+        .is_err());
+    registry.finish_transfer(transfer).unwrap();
+    registry.insert(8, 0xa000, 10, 0, 12, 13, false).unwrap();
+    assert!(core::ptr::eq(
+        snapshot,
+        state.retained_snapshot(id).unwrap()
+    ));
+    assert!(state.retained_snapshot(attempt()).is_err());
+    assert_eq!(registry.get(8, 0xa000).unwrap().frame, 10);
+}
+
+#[test]
+fn registered_coverage_is_explicit_even_for_pi_zero_and_empty_registration() {
+    let (mut resources, _) = registered_fixture();
+    resources.client_pi = 0;
+    let mut identity = attempt().identity();
+    identity.pi = 0;
+    let id = new_rollback_id(identity).unwrap();
+    let state = ThreadRegistryReconciliation::empty();
+    let mut registry = ClientFrameRegistry::new();
+    assert!(matches!(
+        state.reconcile_registered(attempt(), &resources, &[], &registry),
+        Err(ReconciliationError::AttemptChanged)
+    ));
+    assert!(!state.is_prepared());
+    let snapshot = state
+        .reconcile_registered(id, &resources, &[], &registry)
+        .unwrap();
+    assert!(snapshot.records().is_empty());
+    assert!(!snapshot.rollback_resources().is_empty());
+    registry.insert(0, 0x1000, 10, 0, 12, 13, false).unwrap();
+    assert!(matches!(
+        state.reconcile_registered(id, &resources, &[], &registry),
+        Err(ReconciliationError::Registry(
+            ThreadRegistryError::UnexpectedRecord { page: 0x1000 }
+        ))
+    ));
+    let with_row = ThreadRegistryReconciliation::empty();
+    assert_eq!(
+        with_row
+            .reconcile_registered(id, &resources, &[0x1000], &registry)
+            .unwrap()
+            .records()
+            .len(),
+        1
+    );
+}

@@ -6,6 +6,68 @@ use crate::thread_rollback::{
 
 const REGISTERED: [u64; 4] = [0x10000, 0x11000, 0x13000, 0x14000];
 
+#[test]
+fn main_transport_transfer_leaves_private_stack_in_registry() {
+    let layout = ThreadMemoryLayout::without_stack(0x12000, 0x13000, 0x16000).unwrap();
+    let mut main = ThreadMemoryResources::<3>::new(27, layout).unwrap();
+    main.teb_owner = 30;
+    main.teb_target = 31;
+    main.teb_scratch = 32;
+    main.teb2_owner = 40;
+    main.teb2_target = 41;
+    main.teb2_scratch = 42;
+    main.acs_owner = 50;
+    main.acs_target = 51;
+    main.ipc_owner = 60;
+    main.tramp_owner = 70;
+    main.tramp_target = 71;
+    let mut progress = crate::thread_construction::MemoryConstructionProgress::<3>::empty();
+    progress.record_teb(0);
+    progress.record_teb(1);
+    let registered = progress.completed_registration(&main).unwrap();
+    assert!(registered.matches(&main));
+    assert_eq!(registered.pages().collect::<Vec<_>>(), [0x13000, 0x14000]);
+    let mut registry = ClientFrameRegistry::new();
+    registry
+        .insert(27, 0x10000, 11, 0x100000, 12, 10, true)
+        .unwrap();
+    registry
+        .insert(
+            27,
+            0x13000,
+            main.teb_target,
+            0x101000,
+            main.teb_scratch,
+            main.teb_owner,
+            true,
+        )
+        .unwrap();
+    registry
+        .insert(
+            27,
+            0x14000,
+            main.teb2_target,
+            0x102000,
+            main.teb2_scratch,
+            main.teb2_owner,
+            true,
+        )
+        .unwrap();
+    let stack = registry.get(27, 0x10000).unwrap();
+    let snapshot = ThreadRegistrySnapshot::capture(&main, &registry, &[0x13000, 0x14000]).unwrap();
+    assert_eq!(snapshot.records().len(), 2);
+    assert!(!snapshot
+        .rollback_resources()
+        .iter()
+        .any(|item| [10, 11, 12].contains(&item.cap)));
+    let transfer = snapshot
+        .prepare_transfer(&main, &mut registry)
+        .unwrap()
+        .unwrap();
+    assert_eq!(transfer.records().len(), 2);
+    assert_eq!(registry.get(27, 0x10000), Some(stack));
+}
+
 fn partial() -> ThreadMemoryResources<3> {
     ThreadMemoryResources::new(27, resources(27).layout().unwrap()).unwrap()
 }

@@ -350,3 +350,56 @@ fn duplicate_teb_references_never_create_a_second_release_owner() {
         assert_eq!(inventory.iter().filter(|entry| entry.cap == cap).count(), 1);
     }
 }
+
+#[test]
+fn main_transport_layout_has_no_fixed_stack_or_placeholder_range() {
+    let layout = ThreadMemoryLayout::without_stack(0x12000, 0x13000, 0x16000).unwrap();
+    assert_eq!(layout.stack(), ThreadMemoryRange { base: 0, size: 0 });
+    assert!(!layout.overlaps(0x10000, 0x2000));
+    assert!(!layout.overlaps(0, 4096));
+    for page in (0x12000..0x17000).step_by(4096) {
+        assert!(layout.overlaps(page, 4096));
+    }
+    assert!(ThreadMemoryResources::<0>::new(27, layout).is_some());
+    assert!(ThreadMemoryLayout::new(0x10000, 0, 0x12000, 0x13000, 0x16000).is_none());
+    for bases in [
+        [0, 0x13000, 0x16000],
+        [0x12001, 0x13000, 0x16000],
+        [0x13000, 0x13000, 0x16000],
+        [0x12000, 0x13000, 0x15000],
+        [0x12000, 0x13000, u64::MAX & !4095],
+    ] {
+        assert!(ThreadMemoryLayout::without_stack(bases[0], bases[1], bases[2]).is_none());
+    }
+}
+
+#[test]
+fn main_transport_inventory_excludes_private_stack_and_rejects_stray_stack_caps() {
+    let mut main = resources();
+    main.layout = ThreadMemoryLayout::without_stack(0x12000, 0x13000, 0x16000);
+    main.stack_owner = [0; 3];
+    main.stack_target = [0; 3];
+    main.stack_mirror = [0; 3];
+    assert_eq!(main.stack_frames(), 0);
+    assert_eq!(main.backing_pages().count(), 5);
+    let inventory = main.rollback_resources().unwrap();
+    assert_eq!(
+        inventory
+            .iter()
+            .filter(|item| item.kind == ThreadRollbackResourceKind::Frame)
+            .map(|item| item.cap)
+            .collect::<Vec<_>>(),
+        [30, 40, 50, 60, 70]
+    );
+    assert!(!main.retains_page_backing(0x10000));
+    assert!(!main.has_unlocated_capabilities());
+    for page in (0x12000..0x17000).step_by(4096) {
+        assert!(main.retains_page_backing(page));
+    }
+    main.stack_owner[0] = 10;
+    assert!(main.has_unlocated_capabilities());
+    assert_eq!(
+        main.rollback_resources(),
+        Err(ThreadRollbackError::InvalidIdentity)
+    );
+}

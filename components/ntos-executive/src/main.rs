@@ -26066,8 +26066,8 @@ unsafe fn spawn_hosted_thread_mechanism(
                 CAP_INIT_THREAD_VSPACE,
             );
         }
-        let registered = t.client_pi == 0 || csrss_frame_put(t.client_pi, page, f);
-        if registered && t.client_pi != 0 { memory_progress.record_stack(index); }
+        let registered = csrss_frame_put(t.client_pi, page, f);
+        if registered { memory_progress.record_stack(index); }
         if target_map != 0 || mirror_map != 0 || !registered {
             print_str(b"[thread-life] stack publication failed pi=");
             print_u64(t.client_pi);
@@ -26120,7 +26120,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"\n");
         return failed!();
     }
-    if t.client_pi != 0 {
+    {
         let registered = csrss_frame_put_at_cap_source_backing(
                 t.client_pi,
                 t.teb_va,
@@ -26213,7 +26213,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     }
     // DeallocationStack is in TEB page 2; write only after scratch mapping succeeded.
     core::ptr::write_volatile((scr + 0x1478) as *mut u64, deallocation_stack);
-    if t.client_pi != 0 {
+    {
         let registered = csrss_frame_put_at_cap_source_backing(
                 t.client_pi,
                 t.teb_va + 0x1000,

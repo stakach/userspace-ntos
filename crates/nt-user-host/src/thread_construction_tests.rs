@@ -37,6 +37,54 @@ fn registry_publication_coverage_is_independent_of_remaining_registry_rows() {
 }
 
 #[test]
+fn completed_registration_requires_every_observed_stack_and_teb_publication() {
+    use crate::thread_resources::{ThreadMemoryLayout, ThreadMemoryResources};
+    let layout = ThreadMemoryLayout::new(0x10000, 2, 0x20000, 0x30000, 0x40000).unwrap();
+    for pi in [0, 5] {
+        let resources = ThreadMemoryResources::<4>::new(pi, layout).unwrap();
+        let mut progress = MemoryConstructionProgress::<4>::empty();
+        for index in 0..2 {
+            assert!(progress.completed_registration(&resources).is_err());
+            progress.record_stack(index);
+        }
+        for index in 0..2 {
+            assert!(progress.completed_registration(&resources).is_err());
+            progress.record_teb(index);
+        }
+        let complete = progress.completed_registration(&resources).unwrap();
+        assert!(complete.matches(&resources));
+        assert_eq!(complete.pages().collect::<Vec<_>>(), [0x10000, 0x11000, 0x30000, 0x31000]);
+        assert_eq!(progress.completed_registration(&resources).unwrap(), complete);
+        let mut changed = resources;
+        changed.client_pi = pi + 1;
+        assert!(!complete.matches(&changed));
+        let changed = ThreadMemoryResources::<4>::new(pi,
+            ThreadMemoryLayout::new(0x10000, 1, 0x20000, 0x30000, 0x40000).unwrap()).unwrap();
+        assert!(!complete.matches(&changed));
+    }
+}
+
+#[test]
+fn failed_slot_extra_coverage_and_missing_geometry_cannot_be_successful_registration() {
+    use crate::thread_resources::{ThreadMemoryLayout, ThreadMemoryResources};
+    let layout = ThreadMemoryLayout::new(0x10000, 2, 0x20000, 0x30000, 0x40000).unwrap();
+    let resources = ThreadMemoryResources::<4>::new(0, layout).unwrap();
+    let complete = || {
+        let mut progress = MemoryConstructionProgress::<4>::empty();
+        for index in 0..2 { progress.record_stack(index); progress.record_teb(index); }
+        progress
+    };
+    let mut progress = complete();
+    progress.retain_empty_slot(123).unwrap();
+    assert!(progress.completed_registration(&resources).is_err());
+    assert_eq!(progress.empty_slot(), Some(123));
+    let mut progress = complete();
+    progress.record_stack(2);
+    assert!(progress.completed_registration(&resources).is_err());
+    assert!(complete().completed_registration(&ThreadMemoryResources::<4>::empty()).is_err());
+}
+
+#[test]
 fn completed_mechanism_inventory_transfers_every_live_slot() {
     let mut inventory = ThreadConstructionInventory::empty();
     for (index, role) in ROLES.into_iter().enumerate() {
