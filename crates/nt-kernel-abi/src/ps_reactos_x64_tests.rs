@@ -23,6 +23,205 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+#[test]
+fn activation_refresh_preserves_all_bytes_except_teb_and_system_thread_bit() {
+    let init = thread();
+    let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
+    initialize_thread(&mut bytes, init).unwrap();
+    for &offset in THREAD_LIST_HEADS {
+        expected_u64(&mut bytes, offset, 0x11_0000 + offset as u64);
+        expected_u64(&mut bytes, offset + 8, 0x22_0000 + offset as u64);
+    }
+    bytes[KTHREAD_PREVIOUS_MODE] = 1;
+    expected_u64(&mut bytes, KTHREAD_WIN32_THREAD, 0x50_0000);
+    expected_u64(&mut bytes, ETHREAD_THREAD_NAME, 0x60_0000);
+    let old_flags = 0xabcd_ffffu32;
+    bytes[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
+        .copy_from_slice(&old_flags.to_le_bytes());
+    let mut expected = bytes;
+    expected_u64(&mut expected, KTHREAD_TEB, 0x70_0000);
+    expected[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
+        .copy_from_slice(&(old_flags & !ETHREAD_SYSTEM_THREAD).to_le_bytes());
+    let fields = ThreadInitialization {
+        teb: GuestAddr(0x70_0000),
+        system_thread: false,
+        ..init
+    };
+    let before_validation = bytes;
+    validate_thread_activation(&bytes, fields).unwrap();
+    assert_eq!(bytes, before_validation);
+    refresh_thread_activation(&mut bytes, fields).unwrap();
+    assert_eq!(bytes, expected);
+    refresh_thread_activation(&mut bytes, fields).unwrap();
+    assert_eq!(bytes, expected, "repeated exact refresh must be idempotent");
+    refresh_thread_activation(
+        &mut bytes,
+        ThreadInitialization {
+            teb: GuestAddr::NULL,
+            system_thread: true,
+            ..init
+        },
+    )
+    .unwrap();
+    expected_u64(&mut expected, KTHREAD_TEB, 0);
+    expected[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
+        .copy_from_slice(&old_flags.to_le_bytes());
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn activation_refresh_rejects_wrong_stored_identity_before_writes() {
+    let init = thread();
+    let fields = ThreadInitialization {
+        teb: GuestAddr(0x70_0000),
+        system_thread: false,
+        ..init
+    };
+    for offset in [
+        0,
+        ETHREAD_CLIENT_ID_PROCESS,
+        ETHREAD_CLIENT_ID_THREAD,
+        KTHREAD_PROCESS,
+        ETHREAD_THREADS_PROCESS,
+        KTHREAD_APC_STATE_PROCESS,
+        KTHREAD_APC_STATE_POINTERS,
+        KTHREAD_APC_STATE_POINTERS + 8,
+    ] {
+        let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
+        initialize_thread(&mut bytes, init).unwrap();
+        bytes[offset] ^= 1;
+        let before = bytes;
+        assert_eq!(
+            validate_thread_activation(&bytes, fields),
+            Err(ProjectionError::IdentityMismatch)
+        );
+        assert_eq!(bytes, before);
+        assert_eq!(
+            refresh_thread_activation(&mut bytes, fields),
+            Err(ProjectionError::IdentityMismatch)
+        );
+        assert_eq!(bytes, before);
+    }
+}
+
+#[test]
+fn activation_refresh_cannot_relabel_a_body_or_change_its_owner() {
+    let init = thread();
+    for fields in [
+        ThreadInitialization {
+            body: GuestAddr(init.body.0 + 0x1000),
+            ..init
+        },
+        ThreadInitialization {
+            process_body: GuestAddr(init.process_body.0 + 0x1000),
+            ..init
+        },
+        ThreadInitialization {
+            process_id: init.process_id + 4,
+            ..init
+        },
+        ThreadInitialization {
+            thread_id: init.thread_id + 4,
+            ..init
+        },
+    ] {
+        let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
+        initialize_thread(&mut bytes, init).unwrap();
+        let before = bytes;
+        assert_eq!(
+            refresh_thread_activation(&mut bytes, fields),
+            Err(ProjectionError::IdentityMismatch)
+        );
+        assert_eq!(bytes, before);
+    }
+}
+
+#[test]
+fn activation_refresh_validates_all_input_extents_without_partial_write() {
+    let init = thread();
+    for (fields, error) in [
+        (
+            ThreadInitialization {
+                body: GuestAddr::NULL,
+                ..init
+            },
+            ProjectionError::NullBody,
+        ),
+        (
+            ThreadInitialization {
+                process_body: GuestAddr::NULL,
+                ..init
+            },
+            ProjectionError::NullBody,
+        ),
+        (
+            ThreadInitialization {
+                body: GuestAddr(init.body.0 + 1),
+                ..init
+            },
+            ProjectionError::UnalignedAddress,
+        ),
+        (
+            ThreadInitialization {
+                process_body: GuestAddr(init.process_body.0 + 1),
+                ..init
+            },
+            ProjectionError::UnalignedAddress,
+        ),
+        (
+            ThreadInitialization {
+                teb: GuestAddr(1),
+                ..init
+            },
+            ProjectionError::UnalignedAddress,
+        ),
+        (
+            ThreadInitialization {
+                body: GuestAddr(u64::MAX - 7),
+                ..init
+            },
+            ProjectionError::AddressOverflow,
+        ),
+        (
+            ThreadInitialization {
+                process_body: GuestAddr(u64::MAX - 7),
+                ..init
+            },
+            ProjectionError::AddressOverflow,
+        ),
+        (
+            ThreadInitialization {
+                process_id: 0,
+                ..init
+            },
+            ProjectionError::InvalidProcessId,
+        ),
+        (
+            ThreadInitialization {
+                thread_id: 0,
+                ..init
+            },
+            ProjectionError::InvalidThreadId,
+        ),
+    ] {
+        let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
+        initialize_thread(&mut bytes, init).unwrap();
+        let before = bytes;
+        assert_eq!(refresh_thread_activation(&mut bytes, fields), Err(error));
+        assert_eq!(bytes, before);
+    }
+    let mut bytes = [0xa5; ETHREAD_BODY_BYTES + 16];
+    initialize_thread(&mut bytes, init).unwrap();
+    for len in [0, KTHREAD_TEB + 8, ETHREAD_BODY_BYTES - 1] {
+        let before = bytes;
+        assert_eq!(
+            refresh_thread_activation(&mut bytes[..len], init),
+            Err(ProjectionError::BufferTooSmall)
+        );
+        assert_eq!(bytes, before);
+    }
+}
+
 fn expected_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }

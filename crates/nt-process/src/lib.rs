@@ -1022,6 +1022,20 @@ pub struct ThreadActivationPlan {
 }
 
 impl ThreadActivationPlan {
+    /// The dormant activation this plan must still match before committing a new generation.
+    pub const fn expected_lifetime(self) -> ThreadLifetime {
+        ThreadLifetime {
+            thread_id: self.tid,
+            process_id: self.process_id,
+            generation: self.generation,
+        }
+    }
+
+    /// The actual TEB selected for the prepared activation, not a provider projection substitute.
+    pub const fn teb_base(self) -> u64 {
+        self.teb_base
+    }
+
     pub const fn thread_id(self) -> ThreadId {
         self.tid
     }
@@ -2149,6 +2163,14 @@ impl ProcessManager {
     /// pointer is idempotent; zero, an unknown process, replacement, or an address already owned
     /// by another process or thread is rejected without mutation.
     pub fn publish_process_kernel_object(&mut self, pid: ProcessId, eprocess: u64) -> bool {
+        if !self.can_publish_process_kernel_object(pid, eprocess) {
+            return false;
+        }
+        self.processes.get_mut(&pid).unwrap().kernel_process_object = Some(eprocess);
+        true
+    }
+
+    fn can_publish_process_kernel_object(&self, pid: ProcessId, eprocess: u64) -> bool {
         if eprocess == 0
             || self.retired_kernel_body_is_reserved(eprocess)
             || self.processes.iter().any(|(&owner, process)| {
@@ -2161,14 +2183,8 @@ impl ProcessManager {
         {
             return false;
         }
-        match self.processes.get_mut(&pid) {
-            Some(p) if p.kernel_process_object.is_none() => {
-                p.kernel_process_object = Some(eprocess);
-                true
-            }
-            Some(p) => p.kernel_process_object == Some(eprocess),
-            None => false,
-        }
+        self.processes.get(&pid).is_some_and(|process|
+            process.kernel_process_object.is_none() || process.kernel_process_object == Some(eprocess))
     }
 
     /// Read back the parked `EPROCESS` body pointer.
@@ -2288,6 +2304,14 @@ impl ProcessManager {
     /// pointer is idempotent; zero, an unknown thread, replacement, or an address already owned
     /// by another thread or process is rejected without mutation.
     pub fn publish_thread_kernel_object(&mut self, tid: ThreadId, ethread: u64) -> bool {
+        if !self.can_publish_thread_kernel_object(tid, ethread) {
+            return false;
+        }
+        self.threads.get_mut(&tid).unwrap().kernel_thread_object = Some(ethread);
+        true
+    }
+
+    fn can_publish_thread_kernel_object(&self, tid: ThreadId, ethread: u64) -> bool {
         if ethread == 0
             || self.retired_kernel_body_is_reserved(ethread)
             || self.threads.iter().any(|(&owner, thread)| {
@@ -2300,14 +2324,33 @@ impl ProcessManager {
         {
             return false;
         }
-        match self.threads.get_mut(&tid) {
-            Some(t) if t.kernel_thread_object.is_none() => {
-                t.kernel_thread_object = Some(ethread);
-                true
-            }
-            Some(t) => t.kernel_thread_object == Some(ethread),
-            None => false,
+        self.threads.get(&tid).is_some_and(|thread|
+            thread.kernel_thread_object.is_none() || thread.kernel_thread_object == Some(ethread))
+    }
+
+    /// Atomically publish both canonical bodies for this exact activation in this manager.
+    /// The caller must already own initialized backing for both addresses. This operation
+    /// transfers no mechanism ownership and invokes no external code. A failed validation
+    /// leaves both body slots unchanged, including when only one was already published.
+    pub fn publish_kernel_object_pair(
+        &mut self,
+        lifetime: ThreadLifetime,
+        eprocess: u64,
+        ethread: u64,
+    ) -> bool {
+        if eprocess == ethread
+            || !self.validate_thread_lifetime(lifetime)
+            || !self.processes.get(&lifetime.process_id).is_some_and(|process|
+                process.process_id == lifetime.process_id
+                    && process.threads.iter().filter(|&&tid| tid == lifetime.thread_id).count() == 1)
+            || !self.can_publish_process_kernel_object(lifetime.process_id, eprocess)
+            || !self.can_publish_thread_kernel_object(lifetime.thread_id, ethread)
+        {
+            return false;
         }
+        self.processes.get_mut(&lifetime.process_id).unwrap().kernel_process_object = Some(eprocess);
+        self.threads.get_mut(&lifetime.thread_id).unwrap().kernel_thread_object = Some(ethread);
+        true
     }
 
     /// Read back the parked `ETHREAD` body pointer.

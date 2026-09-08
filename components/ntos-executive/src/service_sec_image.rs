@@ -21702,10 +21702,9 @@ pub(crate) unsafe fn service_sec_image(
                             Ok(spawned) => {
                                 spawned_tcb = spawned.tcb();
                                 nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
-                                if request.resume {
-                                    assert_eq!(tcb_resume(spawned_tcb), 0);
-                                }
-                                nt_handler.commit_hosted_thread_publication(request.publication);
+                                nt_handler.finish_hosted_thread_publication(
+                                    request.publication, spawned_tcb, request.resume,
+                                ).expect("debugger fixture activates before first resume and handle publication");
                                 for k in 0..nt_handler.out_writes_n {
                                     let (ptr, val) = nt_handler.out_writes[k];
                                     assert!(nt_handler.xas_write_u64(ptr, val));
@@ -22378,12 +22377,7 @@ unsafe fn spawn_requested_multiplexed_thread(
     };
     let tcb = spawned.tcb();
     nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
-    if resume && tcb_resume(tcb) != 0 {
-        let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
-        nt_handler.abort_hosted_thread_publication(publication);
-        return Err(nt_process::STATUS_UNSUCCESSFUL);
-    }
-    nt_handler.commit_hosted_thread_publication(publication);
+    nt_handler.finish_hosted_thread_publication(publication, tcb, resume)?;
 
     print_str(spec.spawned_prefix);
     print_hex(tcb as u32);
@@ -23070,12 +23064,7 @@ unsafe fn spawn_requested_local_thread(
             };
             let tcb = spawned.tcb();
             nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
-            if !suspended && tcb_resume(tcb) != 0 {
-                let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
-                nt_handler.abort_hosted_thread_publication(publication);
-                return Err(nt_process::STATUS_UNSUCCESSFUL);
-            }
-            nt_handler.commit_hosted_thread_publication(publication);
+            nt_handler.finish_hosted_thread_publication(publication, tcb, !suspended)?;
             if slot == 0 {
                 let mapped_low = initial_teb
                     .stack_limit
@@ -23194,13 +23183,7 @@ unsafe fn spawn_requested_tp_worker(
     };
     let tcb = spawned.tcb();
     nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
-    if !suspended && tcb_resume(tcb) != 0 {
-        let _ = nt_handler.abort_registered_hosted_thread_spawn(tid);
-        nt_handler.clear_hosted_tp_worker_window_slot(pi, worker_slot);
-        nt_handler.abort_hosted_thread_publication(publication);
-        return Err(nt_process::STATUS_UNSUCCESSFUL);
-    }
-    nt_handler.commit_hosted_thread_publication(publication);
+    nt_handler.finish_hosted_thread_publication(publication, tcb, !suspended)?;
 
     print_str(if rpc_worker {
         b"[rpc-worker] spawned pi="
@@ -23286,13 +23269,7 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     };
     let tcb = spawned.tcb();
     nt_handler.commit_hosted_thread_runtime_publication(runtime_publication, spawned);
-    if request.resume && tcb_resume(tcb) != 0 {
-        let _ = nt_handler.abort_registered_hosted_thread_spawn(request.cid_thread);
-        nt_handler.clear_hosted_tp_worker_window_slot(request.target_pi, request.slot);
-        nt_handler.abort_hosted_thread_publication(request.publication);
-        return Err(nt_process::STATUS_UNSUCCESSFUL);
-    }
-    nt_handler.commit_hosted_thread_publication(request.publication);
+    nt_handler.finish_hosted_thread_publication(request.publication, tcb, request.resume)?;
     PM_REMOTE_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
     print_str(b"[remote-thread] spawned target_pi=");
     print_u64(request.target_pi as u64);

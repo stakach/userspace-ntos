@@ -174,6 +174,183 @@ fn page() -> OwnedObjectPage<u64, Target> {
 }
 
 #[test]
+fn exact_target_retirement_preserves_root_backing_and_other_targets() {
+    let mut page = page();
+    let mut io = Backend::default();
+    assert!(page.non_root_aliases_drained());
+    page.construct(&mut io).unwrap();
+    assert!(page.non_root_aliases_drained());
+    page.map_alias(A, 1, &mut io).unwrap();
+    page.map_alias(B, 3, &mut io).unwrap();
+    assert!(!page.non_root_aliases_drained());
+    let root = page.live_alias(ROOT);
+    let other = page.live_alias(B);
+    let cap = page.live_alias(A).unwrap().0;
+    io.bytes = 123;
+    page.retire_alias(A, &mut io).unwrap();
+    assert!(
+        !page.non_root_aliases_drained(),
+        "sibling target remains live"
+    );
+    assert_eq!(page.live_alias(A), None);
+    assert!(!page.owns_cap(cap));
+    assert_eq!(page.live_alias(ROOT), root);
+    assert_eq!(page.live_alias(B), other);
+    assert_eq!(page.frame_cap(), Some(FRAME));
+    assert!(page.is_initialized() && io.backing);
+    assert_eq!(io.bytes, 123);
+    assert_eq!(io.count("release"), 0);
+    let calls = io.calls.len();
+    page.retire_alias(A, &mut io).unwrap();
+    page.retire_alias(
+        Target {
+            generation: A.generation + 1,
+            ..A
+        },
+        &mut io,
+    )
+    .unwrap();
+    assert_eq!(io.calls.len(), calls);
+    page.map_alias(A, 3, &mut io).unwrap();
+    assert_ne!(page.live_alias(A).unwrap().0, cap);
+    assert_eq!(io.count("initialize"), 1);
+    page.retire(&mut io).unwrap();
+}
+
+#[test]
+fn target_retirement_rejects_root_even_before_construction_without_effects() {
+    let mut page = page();
+    let mut io = Backend::default();
+    assert_eq!(page.retire_alias(ROOT, &mut io), Err(INVALID));
+    page.retire_alias(A, &mut io).unwrap();
+    assert!(io.calls.is_empty());
+    page.construct(&mut io).unwrap();
+    let calls = io.calls.len();
+    assert_eq!(page.retire_alias(ROOT, &mut io), Err(INVALID));
+    assert_eq!(io.calls.len(), calls);
+    assert!(page.live_alias(ROOT).is_some());
+}
+
+#[test]
+fn target_retirement_retains_each_failed_cleanup_stage_without_replay() {
+    for failed in ["unmap", "delete", "recycle"] {
+        let mut page = page();
+        let mut io = Backend::default();
+        page.construct(&mut io).unwrap();
+        page.map_alias(A, 3, &mut io).unwrap();
+        page.map_alias(B, 1, &mut io).unwrap();
+        let root = page.live_alias(ROOT);
+        let other = page.live_alias(B);
+        let cap = page.live_alias(A).unwrap().0;
+        io.fail.push((failed, A));
+        assert_eq!(page.retire_alias(A, &mut io), Err(FAILED));
+        assert!(!page.non_root_aliases_drained());
+        assert!(page.owns_cap(cap));
+        assert_eq!(page.live_alias(A), None);
+        assert_eq!(page.live_alias(ROOT), root);
+        assert_eq!(page.live_alias(B), other);
+        assert!(page.is_initialized() && io.backing);
+        page.retire_alias(B, &mut io).unwrap();
+        assert!(
+            !page.non_root_aliases_drained(),
+            "failed target alone prevents drain"
+        );
+        io.fail.clear();
+        page.retire_alias(A, &mut io).unwrap();
+        assert!(page.non_root_aliases_drained());
+        for operation in ["unmap", "delete", "recycle"] {
+            let calls = io
+                .calls
+                .iter()
+                .filter(|call| call.0 == operation && call.2 == A)
+                .count();
+            assert_eq!(calls, if operation == failed { 2 } else { 1 });
+        }
+        assert!(!page.owns_cap(cap));
+        assert_eq!(io.count("release"), 0);
+        page.retire(&mut io).unwrap();
+    }
+}
+
+#[test]
+fn target_retirement_drains_failed_copy_and_map_candidates() {
+    for failed in ["copy", "map"] {
+        let mut page = page();
+        let mut io = Backend::default();
+        page.construct(&mut io).unwrap();
+        io.fail = vec![(failed, A), ("recycle", A)];
+        assert_eq!(page.map_alias(A, 3, &mut io), Err(FAILED));
+        assert!(
+            !page.non_root_aliases_drained(),
+            "failed candidate still owns a slot"
+        );
+        let cap = io
+            .caps
+            .iter()
+            .find(|(_, cap)| cap.target == A)
+            .map(|(&slot, _)| slot)
+            .unwrap();
+        assert!(page.owns_cap(cap));
+        io.fail.clear();
+        page.retire_alias(A, &mut io).unwrap();
+        assert!(!page.owns_cap(cap));
+        assert!(page.non_root_aliases_drained());
+        assert!(page.live_alias(ROOT).is_some());
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|call| call.0 == "unmap" && call.2 == A)
+                .count(),
+            0
+        );
+        assert_eq!(
+            io.calls
+                .iter()
+                .filter(|call| call.0 == "delete" && call.2 == A)
+                .count(),
+            usize::from(failed == "map")
+        );
+        page.retire(&mut io).unwrap();
+    }
+}
+
+#[test]
+fn per_target_cleanup_during_whole_retirement_never_reopens_admission() {
+    let mut page = page();
+    let mut io = Backend::default();
+    page.construct(&mut io).unwrap();
+    page.map_alias(A, 3, &mut io).unwrap();
+    page.map_alias(B, 1, &mut io).unwrap();
+    io.fail.push(("unmap", A));
+    assert_eq!(page.retire(&mut io), Err(FAILED));
+    io.fail.clear();
+    page.retire_alias(A, &mut io).unwrap();
+    page.retire_alias(B, &mut io).unwrap();
+    assert!(
+        page.non_root_aliases_drained(),
+        "root mapping need not be drained"
+    );
+    assert_eq!(page.map_alias(A, 3, &mut io), Err(INVALID));
+    assert_eq!(
+        page.map_alias(
+            Target {
+                generation: 17,
+                ..A
+            },
+            3,
+            &mut io
+        ),
+        Err(INVALID)
+    );
+    assert!(io.backing && io.caps.values().any(|cap| cap.target == ROOT && cap.mapped));
+    page.retire(&mut io).unwrap();
+    assert!(page.is_released());
+    let calls = io.calls.len();
+    page.retire_alias(A, &mut io).unwrap();
+    assert_eq!(io.calls.len(), calls);
+}
+
+#[test]
 fn initializes_once_through_rw_alias_without_mapping_original_frame() {
     let mut page = page();
     let mut io = Backend::default();

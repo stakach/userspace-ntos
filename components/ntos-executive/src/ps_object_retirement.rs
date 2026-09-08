@@ -10,20 +10,25 @@ struct Row {
     candidate: ProcessDeletionCandidate,
     owner: Option<ProcessObjectRetirement>,
     provider: ProviderFinalization,
+    backing: Option<crate::ps_object_backing::ProcessBackingRetirement>,
+    deletion: Option<ProcessObjectDeletion>,
 }
 
 #[derive(Default)]
 pub(crate) struct Retirements {
     rows: Vec<Row>,
-    last_census: [usize; 6],
+    last_census: [usize; 8],
 }
 
 impl Retirements {
     pub(crate) fn print_census_changes(&mut self) {
-        let mut counts = [0usize; 6];
+        crate::ps_object_backing::print_census_changes();
+        let mut counts = [0usize; 8];
         for row in &self.rows {
             counts[0] += 1;
-            counts[1] += usize::from(row.owner.is_none());
+            counts[1] += usize::from(row.owner.is_none() && row.deletion.is_none());
+            counts[6] += usize::from(row.backing.is_some());
+            counts[7] += usize::from(row.deletion.is_some());
             let phase = match row.provider.phase() {
                 ProviderFinalizationPhase::Pending => 2,
                 ProviderFinalizationPhase::Invoking => 3,
@@ -44,6 +49,8 @@ impl Retirements {
             (b" invoking=".as_slice(), counts[3]),
             (b" accepted=".as_slice(), counts[4]),
             (b" indeterminate=".as_slice(), counts[5]),
+            (b" backing-drained=".as_slice(), counts[6]),
+            (b" pm-finished=".as_slice(), counts[7]),
         ] {
             crate::print_str(label);
             crate::print_u64(count as u64);
@@ -82,11 +89,13 @@ impl Retirements {
                     candidate,
                     owner: None,
                     provider: ProviderFinalization::new(candidate.provider_objects),
+                    backing: None,
+                    deletion: None,
                 });
                 index
             }
         };
-        if self.rows[index].owner.is_none() {
+        if self.rows[index].owner.is_none() && self.rows[index].deletion.is_none() {
             // This call cannot enter a provider. The prepared native row receives the
             // sole ticket before any subsequent operation may invoke external code.
             self.rows[index].owner =
@@ -160,19 +169,47 @@ impl Retirements {
         let index = self
             .index(candidate)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        let owner = self.rows[index]
-            .owner
-            .take()
-            .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
-        match pm.finish_process_object_retirement(owner) {
-            Ok(deletion) => {
-                self.rows.swap_remove(index);
-                Ok(deletion)
-            }
-            Err((status, owner)) => {
-                self.rows[index].owner = Some(owner);
-                Err(status)
+        if self.rows[index].backing.is_none() {
+            let owner = self.rows[index]
+                .owner
+                .as_ref()
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            self.rows[index].backing = Some(unsafe {
+                crate::ps_object_backing::retire_withdrawn(
+                    pm,
+                    owner,
+                    crate::ACTIVE_SCRATCH_BASE.load(core::sync::atomic::Ordering::Relaxed),
+                )?
+            });
+        }
+        if self.rows[index].deletion.is_none() {
+            let owner = self.rows[index]
+                .owner
+                .take()
+                .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+            match pm.finish_process_object_retirement(owner) {
+                Ok(deletion) => self.rows[index].deletion = Some(deletion),
+                Err((status, owner)) => {
+                    self.rows[index].owner = Some(owner);
+                    return Err(status);
+                }
             }
         }
+        let receipt = self.rows[index]
+            .backing
+            .take()
+            .expect("physical retirement precedes PM finish");
+        if let Err((status, receipt)) =
+            unsafe { crate::ps_object_backing::release_retired_addresses(receipt) }
+        {
+            self.rows[index].backing = Some(receipt);
+            return Err(status);
+        }
+        let deletion = self.rows[index]
+            .deletion
+            .take()
+            .expect("PM payload remains retained until address release");
+        self.rows.swap_remove(index);
+        Ok(deletion)
     }
 }

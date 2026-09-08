@@ -52152,6 +52152,7 @@ pub(crate) struct HostedVideoRouteInfo {
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
     if !hosted_file_owners::instance_quiesced(i)
         || !unsafe { hosted_add_device_rollback::instance_quiesced(i) }
+        || instance(i).is_some_and(|inst| ps_object_backing::references_provider_vspace(inst.pml4))
     {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }

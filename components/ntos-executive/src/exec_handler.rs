@@ -15801,15 +15801,55 @@ impl ExecNtHandler {
         }
     }
 
-    pub(crate) fn commit_hosted_thread_publication(
+    /// Complete a freshly constructed, still-suspended runtime before exposing its handle.
+    pub(crate) unsafe fn finish_hosted_thread_publication(
+        &mut self,
+        publication: PreparedHostedThreadPublication,
+        tcb: u64,
+        resume: bool,
+    ) -> Result<(), u32> {
+        let tid = publication.activation.thread_id();
+        let runtime = self.thread_runtime.get_by_tid(u64::from(tid))
+            .expect("registered construction retains its runtime until publication");
+        assert_eq!(runtime.tcb, tcb, "publication resumes its exact registered TCB");
+        let window_slot = runtime.role.worker_window_slot();
+        let activation = crate::ps_object_backing::commit_thread_activation(
+            &mut self.pm, publication.activation, publication.handle,
+        );
+        let failure = match activation {
+            Err(status) => Some(status),
+            Ok(()) => {
+                let lifetime = self.pm.thread_lifetime(tid)
+                    .expect("successful activation retains its exact thread");
+                if resume && tcb_resume(tcb) != 0 {
+                    // Construction's compact WriteRegisters never resumes. The Resume invocation
+                    // has no failure after making a TCB runnable, so this target never ran.
+                    assert!(self.pm.validate_thread_lifetime(lifetime));
+                    self.pm.exit_thread_at(tid, nt_process::STATUS_UNSUCCESSFUL,
+                        crate::monotonic_time_100ns() as i64)
+                        .expect("failed first resume exits the exact new activation");
+                    Some(nt_process::STATUS_UNSUCCESSFUL)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(status) = failure {
+            let _ = self.abort_registered_hosted_thread_spawn(u64::from(tid));
+            if let Some(slot) = window_slot {
+                self.clear_hosted_tp_worker_window_slot(publication.owner_pi, slot);
+            }
+            self.abort_hosted_thread_publication(publication);
+            return Err(status);
+        }
+        self.publish_hosted_thread_caller_handle(publication);
+        Ok(())
+    }
+
+    fn publish_hosted_thread_caller_handle(
         &mut self,
         publication: PreparedHostedThreadPublication,
     ) {
-        self.pm
-            .commit_thread_activation_with_handle(publication.activation, publication.handle)
-            .expect(
-                "serialized hosted ETHREAD activation remains current through mechanism admission",
-            );
         let handle = self
             .pm
             .publish_reserved_handle(publication.handle)

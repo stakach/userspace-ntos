@@ -1,6 +1,6 @@
 # Kernel Completion Plan
 
-Last updated: 2026-09-07
+Last updated: 2026-09-09
 
 ## Objective
 
@@ -38,9 +38,10 @@ in SCM, user-mode system processes, and our ntdll where possible.
 
 ### Current Desktop Frontier
 
-Latest checkpoint (2026-09-07): B3 provider exception work is active. The complete win32k import
-gate still has 33 unresolved code imports and blocks desktop acceptance. The older desktop proofs
-below are historical baselines, not acceptance of the current provider cutover.
+Latest measured NT boot (2026-09-07): B3 provider exception work is active. The complete win32k
+import gate has 27 unresolved code imports and blocks desktop acceptance. Subsequent host and
+standalone microkernel validation is recorded below; it is not a new NT desktop proof. The older
+desktop proofs are historical baselines, not acceptance of the current provider cutover.
 
 - [x] Correct secured-memory ownership and native VM protection/lifetime enforcement (tranche 19).
 - [x] Extract and harden the shared AMD64 unwind interpreter (tranche 20).
@@ -29920,6 +29921,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     introduce an explicit published/retiring state and connect the PM withdrawal ticket to the
     exact body owner. PM lookup absence alone cannot authorize freeing a formerly published body.
     No QEMU run or new desktop proof was produced by this ownership tranche.
+
+    B3 canonical Ps publication and provider ownership tranche 137 (2026-09-09, host/native
+    integration accepted; ordinary provider allocation cutover remains pending):
+    PM atomically preflights and publishes the exact activation's process/thread body pair, with
+    no partial pointer publication on collision, stale lifetime or mismatched membership. Native
+    rows retain Prepared/Published/Retiring provenance independently of PM lookup visibility.
+    The withdrawal journal now retains physical-retirement receipts through PM finish and retains
+    PM deletion payloads until every virtual-address reservation is released. Unmap/delete/recycle
+    failures preserve progress rather than making a formerly published body abortable.
+
+    Provider VSpace registration owns a copied PML4 capability, not a raw cap-number observation.
+    The exact catalog/provider generation and original root assignment authenticate registration;
+    table creation and body aliases use the retained copy. Failed copy attempts own their empty
+    slots. Provider teardown closes alias admission, drains individual non-root body aliases,
+    then tables bottom-up and the held root. Original VSpace teardown is refused while any such
+    owner remains. Bootstrap registers this owner before win32k DriverEntry. Ordinary body grants
+    and provider allocation replacement remain inactive pending the complete cutover below.
+
+    All five hosted secondary-thread creation paths now use one finish boundary: commit the exact
+    PM/body activation while the new TCB is suspended, optionally resume, then publish the caller's
+    bound handle. A rejected first resume exits only the new activation without a process-exit
+    cascade or generation rollback, and cancels the still-unpublished handle. Stable ETHREAD rows
+    track current activation separately from immutable construction evidence; activation refuses
+    live or failed non-root alias candidates. The neutral ABI preflight checks the stable identity
+    before PM mutation, then refreshes only TEB/SystemThread under exclusive ownership. Lists,
+    unrelated flags, PreviousMode and GUI fields are not reset. Published-body retirement also
+    requires the exact current activation, not just a matching TID/body address.
+    Main-thread creation bypasses ThreadActivationPlan and must publish its real runtime TEB before
+    ordinary body preparation. Retained callback/wait resumes must validate their original lifetime
+    and grants, never prepare a replacement body to make a stale continuation appear current.
+
+    Serialized validation: 1,084 unit tests (PM 240, MM 410, ABI 21, PnP 16, user-host 359,
+    component-suspension 38), 43 integration tests and six compile-fail ownership checks pass in
+    .tmp/test-ps-publication-checkpoint-20260909.log. Native integration builds in
+    .tmp/build-ps-provider-activation-final-20260909.log. The ownership census reports retained
+    body/frame/alias/provider rows and PM-finalization progress only when changed; it does not
+    infer boot success. No QEMU run, newly resolved import count or desktop acceptance is claimed.
+
+    Next cleanup review: registered-spawn failure still reaches the legacy void-return destructor
+    that ignores TCB deletion failures before memory release. Keep the completed constructor's
+    nonclone mechanism inventory and memory progress through PM activation/first resume instead
+    of discarding them at construction success. On rejection, transfer those original owners into
+    the existing protected runtime slot with the original publication ticket, not a reconstructed
+    cap list or a second cleanup ledger. Native checked retirement must then drive the existing
+    host-tested actors; ordinary teardown is not yet such a backend. Retain window/pool/commitment
+    ownership through every failure, and remove the unchecked spawn destructor at this cutover.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

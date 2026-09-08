@@ -13,6 +13,21 @@ fn prepare(pm: &ProcessManager, tid: ThreadId) -> Result<ThreadActivationPlan, u
 }
 
 #[test]
+fn activation_plan_exposes_expected_lifetime_and_intended_teb_without_mutation() {
+    let (mut pm, _, tid) = dormant();
+    let lifetime = pm.thread_lifetime(tid).unwrap();
+    let before_teb = pm.thread(tid).unwrap().teb_base;
+    let plan = prepare(&pm, tid).unwrap();
+    assert_eq!(plan.expected_lifetime(), lifetime);
+    assert_eq!(plan.teb_base(), 0x7000);
+    assert_eq!(pm.thread(tid).unwrap().teb_base, before_teb);
+    assert_eq!(pm.thread_lifetime(tid), Some(lifetime));
+    pm.commit_thread_activation(plan).unwrap();
+    assert_eq!(pm.thread(tid).unwrap().teb_base, plan.teb_base());
+    assert_ne!(pm.thread_lifetime(tid), Some(plan.expected_lifetime()));
+}
+
+#[test]
 fn snapshot_is_read_only_and_distinguishes_threads_and_processes() {
     let (mut pm, pid, tid) = dormant();
     let snapshot = pm.thread_lifetime(tid).unwrap();
@@ -139,4 +154,70 @@ fn activation_rejection_preserves_lifetime_and_prepared_plan() {
     pm.close_handle(pid, handle).unwrap();
     pm.commit_thread_activation(plan).unwrap();
     assert!(!pm.validate_thread_lifetime(before));
+}
+
+#[test]
+fn failed_first_resume_retires_unpublished_activation_without_rewinding_identity() {
+    let (mut pm, pid, tid) = dormant();
+    let main_tid = pm.process(pid).unwrap().main_thread.unwrap();
+    pm.exit_thread_at(main_tid, 0, 100).unwrap();
+    let body = 0x20_0000;
+    assert!(pm.publish_thread_kernel_object(tid, body));
+    assert!(!pm.thread(tid).unwrap().is_system_thread);
+    let dormant_lifetime = pm.thread_lifetime(tid).unwrap();
+    let plan = pm
+        .prepare_thread_activation(tid, 0x4000, 0x55, false, 0x7000, 123, true)
+        .unwrap();
+    let reservation = pm.try_reserve_handle_slot(pid).unwrap();
+    pm.bind_reserved_handle(reservation, HandleObject::Thread(tid), THREAD_ALL_ACCESS)
+        .unwrap();
+    pm.commit_thread_activation_with_handle(plan, reservation)
+        .unwrap();
+    let failed_lifetime = pm.thread_lifetime(tid).unwrap();
+    assert_eq!(failed_lifetime.generation(), dormant_lifetime.generation() + 1);
+    assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Running);
+    assert_eq!(pm.thread_kernel_object(tid), Some(body));
+    assert_eq!(pm.lookup_handle(pid, reservation.handle), None);
+    assert_eq!(pm.handle_count(pid), 0);
+    assert_eq!(pm.handle_reservation_count(pid), 1);
+
+    // The first native resume failed after the PM commit. Exit only this activation,
+    // even though it is the process's last live thread, and retain the bound handle owner.
+    pm.exit_thread_at(tid, STATUS_INSUFFICIENT_RESOURCES, 456)
+        .unwrap();
+    assert_eq!(pm.process(pid).unwrap().state, ProcessState::Running);
+    assert_eq!(pm.process(pid).unwrap().exit_status, None);
+    assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Terminated);
+    assert_eq!(pm.thread(tid).unwrap().exit_status, Some(STATUS_INSUFFICIENT_RESOURCES));
+    assert_eq!(pm.thread(tid).unwrap().exit_time_100ns, 456);
+    assert_eq!(pm.thread_lifetime(tid), Some(failed_lifetime));
+    assert_eq!(pm.thread_kernel_object(tid), Some(body));
+    assert!(!pm.can_reclaim_thread(tid));
+    assert_eq!(prepare(&pm, tid), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(pm.lookup_handle(pid, reservation.handle), None);
+
+    assert_eq!(pm.cancel_bound_handle(reservation), Ok(HandleObject::Thread(tid)));
+    assert_eq!(pm.handle_reservation_count(pid), 0);
+    assert!(pm.can_reclaim_thread(tid));
+    assert_eq!(pm.thread_lifetime(tid), Some(failed_lifetime));
+    assert_eq!(pm.commit_thread_activation(plan), Err(STATUS_INVALID_PARAMETER));
+    assert_eq!(pm.thread_lifetime(tid), Some(failed_lifetime));
+    assert_eq!(pm.thread(tid).unwrap().state, ThreadState::Terminated);
+
+    let next_plan = prepare(&pm, tid).unwrap();
+    let next_reservation = pm.try_reserve_handle_slot(pid).unwrap();
+    pm.bind_reserved_handle(next_reservation, HandleObject::Thread(tid), THREAD_ALL_ACCESS)
+        .unwrap();
+    pm.commit_thread_activation_with_handle(next_plan, next_reservation)
+        .unwrap();
+    assert_eq!(pm.thread_lifetime(tid).unwrap().generation(), failed_lifetime.generation() + 1);
+    assert!(!pm.validate_thread_lifetime(failed_lifetime));
+    assert_eq!(pm.thread_kernel_object(tid), Some(body));
+    assert_eq!(pm.tid_for_kernel_thread_object(body), Some(tid));
+    assert_eq!(pm.thread(tid).unwrap().exit_status, None);
+    assert_eq!(pm.thread(tid).unwrap().exit_time_100ns, 0);
+    assert_eq!(pm.lookup_handle(pid, next_reservation.handle), None);
+    let handle = pm.publish_reserved_handle(next_reservation).unwrap();
+    assert_eq!(pm.lookup_handle(pid, handle), Some(HandleObject::Thread(tid)));
+    pm.close_handle(pid, handle).unwrap();
 }

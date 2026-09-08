@@ -15110,6 +15110,7 @@ unsafe fn sched_context_bind_r(sc: u64, tcb: u64) -> u64 {
 mod thread_sched_context;
 mod root_slot_recycle;
 mod ps_object_paging;
+mod ps_object_provider;
 mod ps_object_backing;
 mod frame_acquisition;
 mod frame_recycle;
@@ -30930,6 +30931,14 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
             // remains unpublished until its completion sentinel arrives.
             driver_launch::win32k_device_consumer::register_consumer(host_pml4)
                 .expect("win32k I/O consumer domain registration failed");
+            let ps_provider = ps_object_provider::ProviderRoot::new(
+                (&*core::ptr::addr_of!(PROVIDER_WAIT_DOMAINS)).identity()
+                    .expect("win32k requires a provider catalog"),
+                current_win32k_provider_domain().expect("win32k requires a current provider domain"),
+                host_pml4,
+            ).expect("win32k Ps provider identity registration failed");
+            ps_object_backing::register_provider(ps_provider)
+                .expect("win32k Ps provider VSpace retention failed");
             assert!(
                 win32k_glue::register_primary_win32k_physical_lane(
                     init_ch.tcb,

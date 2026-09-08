@@ -61,6 +61,7 @@ pub enum ProjectionError {
     AddressOverflow,
     InvalidProcessId,
     InvalidThreadId,
+    IdentityMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,18 +146,7 @@ pub fn initialize_thread(
     output: &mut [u8],
     init: ThreadInitialization,
 ) -> Result<(), ProjectionError> {
-    if output.len() < ETHREAD_BODY_BYTES {
-        return Err(ProjectionError::BufferTooSmall);
-    }
-    body_range(init.body, ETHREAD_BODY_BYTES)?;
-    body_range(init.process_body, EPROCESS_BODY_BYTES)?;
-    aligned(init.teb)?;
-    if init.process_id == 0 {
-        return Err(ProjectionError::InvalidProcessId);
-    }
-    if init.thread_id == 0 {
-        return Err(ProjectionError::InvalidThreadId);
-    }
+    validate_thread_fields(output, init)?;
     let output = &mut output[..ETHREAD_BODY_BYTES];
     output.fill(0);
     output[0] = 6; // ThreadObject; the remaining dispatcher union bytes are flags, not Size.
@@ -184,6 +174,80 @@ pub fn initialize_thread(
     };
     output[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
         .copy_from_slice(&flags.to_le_bytes());
+    Ok(())
+}
+
+fn validate_thread_fields(
+    output: &[u8],
+    init: ThreadInitialization,
+) -> Result<(), ProjectionError> {
+    if output.len() < ETHREAD_BODY_BYTES {
+        return Err(ProjectionError::BufferTooSmall);
+    }
+    body_range(init.body, ETHREAD_BODY_BYTES)?;
+    body_range(init.process_body, EPROCESS_BODY_BYTES)?;
+    aligned(init.teb)?;
+    if init.process_id == 0 {
+        return Err(ProjectionError::InvalidProcessId);
+    }
+    if init.thread_id == 0 {
+        return Err(ProjectionError::InvalidThreadId);
+    }
+    Ok(())
+}
+
+/// Refresh activation-specific fields on an existing, unattached ETHREAD projection. The
+/// caller must first drain old execution, pointer references and provider aliases, and serialize
+/// this update with its authoritative activation-generation commit. Byte identity checks do not
+/// establish that lifetime authority or prove the supplied body is actually mapped here.
+///
+/// Only TEB and the SystemThread bit change. PreviousMode is execution-context state, not a
+/// property inferred from a nonzero TEB. Lists, APC state, GUI pointers, other cross-thread flags
+/// and all trailing storage remain untouched. No successful or failed call initializes storage.
+pub fn refresh_thread_activation(
+    output: &mut [u8],
+    fields: ThreadInitialization,
+) -> Result<(), ProjectionError> {
+    validate_thread_activation(output, fields)?;
+    let old_flags = u32::from_le_bytes(
+        output[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let flags = (old_flags & !ETHREAD_SYSTEM_THREAD)
+        | if fields.system_thread {
+            ETHREAD_SYSTEM_THREAD
+        } else {
+            0
+        };
+    write_u64(output, KTHREAD_TEB, fields.teb.0);
+    output[ETHREAD_CROSS_THREAD_FLAGS..ETHREAD_CROSS_THREAD_FLAGS + 4]
+        .copy_from_slice(&flags.to_le_bytes());
+    Ok(())
+}
+
+/// Read-only preflight for [`refresh_thread_activation`]. To rely on success across an
+/// authoritative PM commit, the caller must retain the same mapping, bytes and supplied fields
+/// under its exclusive, nonreentrant owner until the subsequent refresh has completed.
+pub fn validate_thread_activation(
+    output: &[u8],
+    fields: ThreadInitialization,
+) -> Result<(), ProjectionError> {
+    validate_thread_fields(output, fields)?;
+    let read_u64 =
+        |offset: usize| u64::from_le_bytes(output[offset..offset + 8].try_into().unwrap());
+    if output[0] != 6
+        || read_u64(ETHREAD_CLIENT_ID_PROCESS) != fields.process_id
+        || read_u64(ETHREAD_CLIENT_ID_THREAD) != fields.thread_id
+        || read_u64(KTHREAD_PROCESS) != fields.process_body.0
+        || read_u64(ETHREAD_THREADS_PROCESS) != fields.process_body.0
+        || read_u64(KTHREAD_APC_STATE_PROCESS) != fields.process_body.0
+        || read_u64(KTHREAD_APC_STATE_POINTERS) != fields.body.0 + KTHREAD_APC_STATE as u64
+        || read_u64(KTHREAD_APC_STATE_POINTERS + 8)
+            != fields.body.0 + KTHREAD_SAVED_APC_STATE as u64
+    {
+        return Err(ProjectionError::IdentityMismatch);
+    }
     Ok(())
 }
 

@@ -128,6 +128,14 @@ impl<D, L: Copy + Eq> OwnedObjectPage<D, L> {
             .live()
     }
 
+    /// True only when every nonroot transition is empty, including failed construction and
+    /// cleanup candidates. This observation does not itself close grant/execution admission.
+    pub fn non_root_aliases_drained(&self) -> bool {
+        self.aliases
+            .iter()
+            .all(|row| row.target == self.root_target || row.transition.is_empty())
+    }
+
     pub fn stats(&self) -> ObjectPageStats {
         ObjectPageStats {
             backing_frames: usize::from(self.frame.is_some()),
@@ -227,6 +235,33 @@ impl<D, L: Copy + Eq> OwnedObjectPage<D, L> {
             Some(_) => transition.remap(rights, &mut adapter),
             None => transition.replace(rights, &mut adapter),
         }
+    }
+
+    /// Drain one exact nonroot target after the caller withdraws its pointer/execution admission.
+    /// Root initialization access, backing ownership and every other target remain unchanged.
+    /// Failed cleanup retains the target's exact transition for retry; absent or already empty
+    /// targets succeed without effects. This is also allowed during whole-owner retirement.
+    ///
+    /// The caller must close grant/execution admission and keep it closed until cleanup completes.
+    /// After successful drain it may explicitly authorize a fresh map_alias, but never after
+    /// whole-owner retirement starts.
+    pub fn retire_alias(&mut self, target: L, io: &mut impl ObjectPageIo<D, L>) -> Result<(), u32> {
+        if target == self.root_target {
+            return Err(INVALID);
+        }
+        let Some(row) = self.aliases.iter_mut().find(|row| row.target == target) else {
+            return Ok(());
+        };
+        if row.transition.is_empty() {
+            return Ok(());
+        }
+        let mut adapter = Io {
+            backend: io,
+            frame: self.frame.unwrap_or(0),
+            target,
+            descriptor: core::marker::PhantomData::<D>,
+        };
+        row.transition.retire(&mut adapter)
     }
 
     /// Caller first withdraws pointer/execution admission. This permanently withdraws alias
