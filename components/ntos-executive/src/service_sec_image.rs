@@ -11663,21 +11663,22 @@ pub(crate) unsafe fn service_sec_image(
                     ExecPostAction::ContinueCurrentThread {
                         tid,
                         tcb,
-                        registers,
+                        context,
                     } => {
-                        let reply_dropped = drop_current_hosted_reply();
-                        let write_error = if reply_dropped {
-                            crate::win32k_glue::tcb_write_regs20(tcb, &registers, true)
+                        // The kernel validates before mutation, then installs state and cancels
+                        // the old reply in the same restart. Never delete that reply beforehand.
+                        let applied = if nt_handler.hosted_thread_tcb(tid) == Some(tcb) {
+                            crate::thread_context::continue_thread(tcb, &context)
                         } else {
-                            1
+                            Err(u64::MAX)
                         };
-                        if reply_dropped && write_error == 0 {
+                        if applied.is_ok() {
                             print_str(b"[seh-continue] tid=");
                             print_u64(tid);
                             print_str(b" rip=0x");
-                            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RIP]);
+                            print_hex_u64(context.registers[nt_user_callback::USER_CONTEXT_RIP]);
                             print_str(b" rsp=0x");
-                            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RSP]);
+                            print_hex_u64(context.registers[nt_user_callback::USER_CONTEXT_RSP]);
                             print_str(b" -> recv without reply\n");
                             procs[pi].faults = faults;
                             procs[pi].first = first;
@@ -11696,32 +11697,11 @@ pub(crate) unsafe fn service_sec_image(
                         }
                         print_str(b"[seh-continue] failed tid=");
                         print_u64(tid);
-                        print_str(b" reply-dropped=");
-                        print_u64(reply_dropped as u64);
                         print_str(b" write=");
-                        print_u64(write_error);
+                        print_u64(applied.unwrap_err());
                         print_str(b"\n");
-                        if reply_dropped {
-                            let _ = terminate_hosted_thread_mechanism(
-                                tid,
-                                delay_queue,
-                                &mut nt_handler,
-                            );
-                            procs[pi].faults = faults;
-                            procs[pi].first = first;
-                            procs[pi].ntfaults = ntfaults;
-                            pfilled[pi] = *filled_pages;
-                            let _ = finalize_service_loop_state(&mut nt_handler);
-                            let new_reply = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
-                            let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, new_reply);
-                            badge = nb;
-                            mi = nmi;
-                            m0 = nm0;
-                            m1 = nm1;
-                            m2 = nm2;
-                            m3 = nm3;
-                            continue;
-                        }
+                        redirected_context_continue = false;
+                        nt_handler.context_continue_redirected = false;
                         result = 0xC000_0001;
                     }
                     ExecPostAction::TerminateCurrentThread { tid } => {

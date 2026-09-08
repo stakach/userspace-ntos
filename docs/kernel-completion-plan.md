@@ -293,6 +293,11 @@ desktop proofs are historical baselines, not acceptance of the current provider 
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
   through retained token leases. Replace fake provider-initialization identities with authenticated
   kernel caller registration. Complete shared Nt/Zw namespace migration and descriptor admission.
+- [x] Preserve genuine caller VAD stacks for additional threads and omit duplicate fixed-stack
+  allocation, charge and mirror shortcuts (tranche 147; host tests and executive build).
+- [x] Add coherent GPR/legacy-FP snapshot and selected atomic install/restart to the microkernel;
+  wire checked native context query and supported NtContinue groups without deleting the reply
+  before a fallible restore (tranche 148; host tests, four-CPU kernel specs and executive build).
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30300,6 +30305,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/build-caller-stack-startup-final-20260909.log (292 warnings). Independent source review
     found no new constructor ownership or zero-stack cleanup issue. Live debugger, guard growth,
     and desktop acceptance remain open.
+
+    B3 legacy context tranche 148 (2026-09-09, accepted legacy-state slice): add a complete captured AMD64 wire
+    context and host-tested legacy floating-point conversion. The ReactOS/current layout has a
+    512-byte FloatSave at 0x100; the older NT5 reference supplies restore policy, not that layout.
+    SET extraction honors the authoritative top-level MxCsr and NT5 FCW/MXCSR masks. GET publication
+    preserves actual saved hardware FCW/MXCSR (including supported DAZ) and all x87/XMM0-15 bytes.
+    Extended-state requests are explicitly unsupported, never silently treated as legacy FP.
+
+    A generic microkernel context extension provides a coherent 20-word GPR plus
+    512-byte FXSAVE snapshot. Selected GPR/FP installation must occur under one target quiescence
+    interval with full input validation before mutation; independent read/merge/write invocations
+    could otherwise overwrite live unrequested registers or execute mixed context. Capability
+    and directional retained-IPC-frame checks, local/remote FPU-owner flushing and live rejection
+    tests cover those boundaries. The native NtGetContextThread adapter uses the checked
+    snapshot and preserves capture/output faults. Native NtContinue now prepares a tested selected
+    CONTROL/INTEGER/FP payload and uses the same atomic installation with restart. The restart
+    cancels the bound reply only after validation succeeds; remove the old delete-reply-first and
+    terminate-on-write-failure path. Rejection returns an actual failure through the intact old
+    reply and clears redirect bookkeeping. Partial contexts use canonical syscall return IP/SP/
+    flags, not the fault reporter's SYSCALL address. Unselected integer/TLS/FP state remains live.
+
+    This is deliberately not complete NtContinue/startup: DEBUG requests, TestAlert, compatibility
+    mode, alignment-check exceptions and XSTATE/CET requests now fail explicitly instead of being
+    silently dropped. The raw ntdll RtlCaptureContext/RtlRestoreContext path and first-thread
+    context normalization still need cutover to the complete continuation mechanism. Reconcile
+    the NT context selector contract with the microkernel's actual user GDT before claiming
+    support for contexts captured by foreign assembly. Guard/user exception delivery remains open.
+
+    Parent host validation passes 1,353 unit tests, 49 integration tests and 12 compile-fail checks
+    in .tmp/test-legacy-context-final-20260909.log. Three pure microkernel protocol tests pass in
+    .tmp/test-micro-legacy-context-protocol-20260909.log. The standalone sel4-rt cargo test is not
+    host-portable on this ARM machine because of its existing x86 syscall assembly; the protocol
+    tests compile the actual shared source directly with rustc --test, not a duplicate model.
+    Independent review corrected unselected continuation-IP preservation and quiesced the real
+    reciprocal donated-SC owner before cancellation withdraws its execution authority. A real
+    donated-SC fixture verifies rejection leaves ownership/reply intact and accepted restart
+    returns the SC. The distinct remote mailbox path is exercised by existing live AP tests;
+    this slice does not claim a new end-to-end remote-donation workload.
+
+    The reviewed four-CPU image passes all kernel specs, including actual hardware XMM15 capture,
+    selected-state rejection, live FPU-owner invalidation and restart reply cancellation, followed
+    by all 12 userspace microtests, expected sentinel and QEMU exit zero under the 600-second
+    deadline: .tmp/build-legacy-context-microtest-reviewed-20260909.log and
+    .tmp/run-legacy-context-microtest-reviewed-20260909.log. Production x86 and standalone ARM spec
+    builds pass in .tmp/build-legacy-context-production-20260909.log and
+    .tmp/build-legacy-context-aarch64-20260909.log. The native executive release build passes in
+    .tmp/build-legacy-context-executive-20260909.log (292 warnings). Original NT rootserver/disk
+    staging was restored byte-for-byte. Microkernel commit effca42 is the matching submodule
+    revision. No fresh NT desktop or 27-import gate acceptance is claimed.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

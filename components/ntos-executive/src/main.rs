@@ -42,6 +42,7 @@ pub(crate) use service_sec_image::*;
 mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
+mod thread_context;
 mod executive_va;
 mod fs_loader;
 mod mounted_volume;
@@ -24854,7 +24855,7 @@ enum ExecPostAction {
     ContinueCurrentThread {
         tid: u64,
         tcb: u64,
-        registers: [u64; 20],
+        context: nt_thread_start::amd64_context::LegacyContextRestore,
     },
     TerminateCurrentThread {
         tid: u64,

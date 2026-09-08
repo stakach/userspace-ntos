@@ -9978,17 +9978,30 @@ impl ExecNtHandler {
         let Some(tcb) = self.hosted_thread_tcb(tid as u64).filter(|tcb| *tcb > 1) else {
             return STATUS_INVALID_HANDLE;
         };
-        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
-        if !self.xas_read(context_ptr, &mut context) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let context_flags = read_le_u32_at(&context, AMD64_CONTEXT_FLAGS_OFFSET);
+        let mut captured = match nt_thread_start::amd64_context::CapturedAmd64Context::capture(
+            |address, bytes| self.process_memory_read_status(self.pi, address, bytes),
+            context_ptr,
+        ) {
+            Ok(context) => context,
+            Err(error) => return error.status(),
+        };
+        let context_flags = captured.flags();
         if context_flags & CONTEXT_AMD64 == 0 {
             return STATUS_INVALID_PARAMETER;
         }
-
-        let mut registers = [0u64; 20];
-        crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
+        // Refuse extended-state contracts before inspecting or publishing a partial legacy view.
+        if let Err(error) = captured.validate_legacy_state() {
+            return error.status();
+        }
+        let snapshot = match crate::thread_context::LegacyThreadContext::read(tcb) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return STATUS_UNSUCCESSFUL,
+        };
+        if let Err(error) = captured.publish_legacy_floating_point(&snapshot.floating_point) {
+            return error.status();
+        }
+        let mut context = *captured.as_bytes();
+        let registers = snapshot.registers;
         if context_flags & CONTEXT_CONTROL != 0 {
             write_le_u16_at(
                 &mut context,
@@ -10137,10 +10150,8 @@ impl ExecNtHandler {
             write_le_u64_at(&mut context, AMD64_CONTEXT_DR6_OFFSET, debug.dr6);
             write_le_u64_at(&mut context, AMD64_CONTEXT_DR7_OFFSET, debug.dr7);
         }
-        if !self.xas_try_write_buf(context_ptr, &context) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        0
+        self.process_memory_write_status(self.pi, context_ptr, &context)
+            .map(|_| 0).unwrap_or_else(|status| status)
     }
 
     unsafe fn nt_set_context_thread(&mut self, args: &[u64]) -> u32 {
@@ -10273,62 +10284,20 @@ impl ExecNtHandler {
         else {
             return STATUS_INVALID_HANDLE;
         };
-        let mut context = [0u8; nt_thread_start::AMD64_CONTEXT_SIZE];
-        if !self.xas_read(context_ptr, &mut context) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        let context_flags = read_le_u32_at(&context, AMD64_CONTEXT_FLAGS_OFFSET);
-        if context_flags & CONTEXT_AMD64 == 0 {
-            return STATUS_INVALID_PARAMETER;
-        }
-        let mut registers = [0u64; 20];
-        crate::win32k_glue::tcb_read_regs20(tcb, &mut registers);
-
-        if context_flags & CONTEXT_CONTROL != 0 {
-            registers[nt_user_callback::USER_CONTEXT_RIP] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RIP_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RSP] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RSP_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RFLAGS] =
-                read_le_u32_at(&context, AMD64_CONTEXT_EFLAGS_OFFSET) as u64;
-            if registers[nt_user_callback::USER_CONTEXT_RIP] == 0
-                || registers[nt_user_callback::USER_CONTEXT_RSP] == 0
-            {
-                return STATUS_INVALID_PARAMETER;
-            }
-        }
-        if context_flags & CONTEXT_INTEGER != 0 {
-            registers[nt_user_callback::USER_CONTEXT_RAX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RAX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RBX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RCX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RCX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RDX] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDX_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RSI] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RSI_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RDI] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RDI_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_RBP] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_RBP_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R8] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R8_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R9] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R9_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R10] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R10_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R11] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R11_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R12] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R12_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R13] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R13_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R14] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R14_OFFSET as usize);
-            registers[nt_user_callback::USER_CONTEXT_R15] =
-                read_le_u64_at(&context, nt_thread_start::CONTEXT_R15_OFFSET as usize);
-        }
+        let captured = match nt_thread_start::amd64_context::CapturedAmd64Context::capture(
+            |address, bytes| self.process_memory_read_status(self.pi, address, bytes),
+            context_ptr,
+        ) {
+            Ok(context) => context,
+            Err(error) => return error.status(),
+        };
+        let context = match captured.prepare_continue(
+            self.current_resume_ip, self.current_sp, self.current_flags,
+            HIGHEST_USER_ADDRESS, nt_boolean_arg(args.get(1).copied().unwrap_or(0)),
+        ) {
+            Ok(context) => context,
+            Err(error) => return error.status(),
+        };
 
         let trace = NT_CONTINUE_TRACE_N.fetch_add(1, Ordering::Relaxed);
         if trace < 16 {
@@ -10339,18 +10308,18 @@ impl ExecNtHandler {
             print_str(b" ctx=0x");
             print_hex_u64(context_ptr);
             print_str(b" flags=0x");
-            print_hex(context_flags);
+            print_hex(captured.flags());
             print_str(b" rip=0x");
-            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RIP]);
+            print_hex_u64(context.registers[nt_user_callback::USER_CONTEXT_RIP]);
             print_str(b" rsp=0x");
-            print_hex_u64(registers[nt_user_callback::USER_CONTEXT_RSP]);
+            print_hex_u64(context.registers[nt_user_callback::USER_CONTEXT_RSP]);
             print_str(b"\n");
         }
         self.context_continue_redirected = true;
         self.post_action = ExecPostAction::ContinueCurrentThread {
             tid: self.current_tid,
             tcb,
-            registers,
+            context,
         };
         0
     }
