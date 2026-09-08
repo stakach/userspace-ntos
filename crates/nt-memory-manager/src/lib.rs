@@ -27,6 +27,7 @@ mod commit;
 mod copy_context;
 pub mod data_section;
 pub mod image_section;
+pub mod owned_paging_structure;
 pub mod process_retirement;
 mod private_backing;
 pub mod prefetch;

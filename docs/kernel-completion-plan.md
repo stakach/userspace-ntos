@@ -29640,6 +29640,30 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     changes. Tests must inspect real PTE flags and unchanged cap/PTE state on failure. Frame rights
     attenuation in CNode Copy/Mint is an adjacent prerequisite, not implicitly completed by Map.
 
+    B3 frame capability derivation tranche 130 (2026-09-08, in progress): Copy/Mint must retain
+    source authority, attenuate the derived frame rights, and clear only the derived mapping
+    metadata. Truncated upstream messages or absent staged source roots must not fall back to the
+    caller's CSpace. Validate all sizes/rights, occupied destinations and repeated derivation.
+
+    B3 retained paging construction tranche 131 (2026-09-08, host mechanism complete):
+    nt-memory-manager::owned_paging_structure retains every reserved slot, retyped table and mapped
+    table through definitive mechanism failures. Construction and retirement resume only the first
+    unacknowledged operation; retirement irreversibly withdraws admission. Successful retype-byte
+    accounting survives deletion until checked recycling, while failed retype slots use the
+    unretyped recycler. The immutable descriptor belongs to a durable containing ledger, which must
+    authenticate the exact VSpace lifetime and drain descendants before retirement. Eleven focused
+    tests and one compile-fail ownership check pass in the 383-test memory-manager suite plus its
+    doctest (.tmp/test-owned-paging-20260908.log); independent source review is clear. This is not
+    native activation. Reuse AliasTransition for copied root/provider frame mappings rather than
+    adding a second alias state machine; the native paging ledger and Ps publication remain below.
+
+    B3 paging-table admission tranche 132 (2026-09-08, in progress): authenticate exact source CTE
+    and mapped root/ASID before installing PDPT/PD/PT entries, preserve upstream cache attributes,
+    and commit mapping provenance without a fallible post-write lookup. Delete the spec-only
+    current-root success bypass and replace its alias test with real registered page-table
+    fixtures. Upstream addresses select the containing table; the custom ABI retains page
+    alignment validation. Repeated mapping of an already-mapped table is InvalidCapability.
+
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
     Mapping those pool pages into unrelated providers would expose unrelated objects. Allocate
