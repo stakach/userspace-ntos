@@ -27864,7 +27864,6 @@ impl ExecNtHandler {
             in_bytes.extend_from_slice(&w.to_le_bytes());
         }
         in_bytes.extend_from_slice(ea);
-        let mut out = [0u8; 64];
         let dispatch = driver_launch::dispatch_hosted_file_create_irp_result_exact(
             canonical_file_id,
             major,
@@ -27879,7 +27878,6 @@ impl ExecNtHandler {
                 related_file: related_file_id.map(nt_io_manager::FileId),
             },
             &in_bytes,
-            &mut out,
         );
         let (status, information, pending_irp_id, file_context) = match dispatch {
             Ok(result) => result,

@@ -8,11 +8,15 @@ use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
 use core::cell::RefCell;
 use nt_types::{AccessMask, HandleValue, NtPath, UnicodeString};
 
+mod operations_tests;
+
 #[derive(Default)]
 struct Trace {
     calls: Vec<u8>,
     acknowledgements: Vec<IrpId>,
     ready: Vec<DriverCompletion>,
+    cancellations: Vec<IrpId>,
+    copies: Vec<IrpId>,
 }
 struct Backend {
     trace: Rc<RefCell<Trace>>,
@@ -20,7 +24,17 @@ struct Backend {
 }
 impl DriverDispatchBackend for Backend {
     fn cancel_irp(&mut self, id: IrpId) -> Result<(), NtStatus> {
+        self.trace.borrow_mut().cancellations.push(id);
         self.inner.cancel_irp(id)
+    }
+    fn copy_completion_output(
+        &mut self,
+        id: IrpId,
+        _offset: u64,
+        _output: &mut [u8],
+    ) -> Result<usize, NtStatus> {
+        self.trace.borrow_mut().copies.push(id);
+        Err(NtStatus::UNSUCCESSFUL)
     }
     fn dispatch_irp(
         &mut self,
@@ -115,6 +129,26 @@ fn read(f: &Fixture) -> ExternalFileIrpRequest {
 }
 fn buffers() -> ExternalFileIrpBuffers {
     ExternalFileIrpBuffers::new(vec![], vec![7; 4])
+}
+fn capture_and_ack(
+    f: &mut Fixture,
+    completion: ExternalFileIrpCompletionInvocation,
+) -> ExternalFileIrpAckInvocation {
+    let completion = if completion.capture_complete() {
+        completion
+    } else {
+        let mut copy =
+            f.io.begin_external_file_irp_copy(completion, usize::MAX)
+                .unwrap();
+        let length = copy.requested_len();
+        copy.staging_mut().copy_from_slice(&[5, 6, 7, 8][..length]);
+        f.io.finish_external_file_irp_copy(
+            copy.returned(ExternalFileIrpCopyOutcome::Copied { bytes: length }),
+        )
+        .unwrap()
+    };
+    f.io.begin_external_file_irp_acknowledgement(completion)
+        .unwrap()
 }
 fn create_file(f: &mut Fixture, related: bool) -> FileId {
     if related {
@@ -406,12 +440,8 @@ fn pending_completion_requires_detached_ack_and_keeps_accepted_ack_on_wrong_mana
         NtStatus::DELETE_PENDING
     );
     assert!(f.trace.borrow().acknowledgements.is_empty());
-    let mut invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
-    invocation
-        .buffers_mut()
-        .split()
-        .1
-        .copy_from_slice(&[5, 6, 7, 8]);
+    let invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    let invocation = capture_and_ack(&mut f, invocation);
     let report = invocation.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged);
     let report = foreign
         .io
@@ -431,6 +461,7 @@ fn rejected_ack_can_retry_but_unknown_ack_cannot_be_replayed() {
     let owner = pending(&mut f, false);
     complete(&mut f, owner.irp_id());
     let invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    let invocation = capture_and_ack(&mut f, invocation);
     let report = invocation.acknowledged(ExternalFileIrpAcknowledgement::Rejected {
         status: NtStatus::DEVICE_BUSY,
     });
@@ -460,6 +491,7 @@ fn indeterminate_outer_return_retains_owner_and_accepts_real_late_completion() {
     );
     complete(&mut f, owner.irp_id());
     let invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    let invocation = capture_and_ack(&mut f, invocation);
     f.io.finish_external_file_irp_completion(
         invocation.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
     )
@@ -486,6 +518,7 @@ fn actual_reentrant_completion_is_not_replaced_by_outer_return() {
     };
     let invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
     assert_eq!(invocation.completion().status, NtStatus::SUCCESS);
+    let invocation = capture_and_ack(&mut f, invocation);
     f.io.finish_external_file_irp_completion(
         invocation.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
     )
@@ -612,6 +645,7 @@ fn pending_transport_fault_cannot_fabricate_terminal_completion() {
             .into_owner();
     complete(&mut f, id);
     let invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    let invocation = capture_and_ack(&mut f, invocation);
     f.io.finish_external_file_irp_completion(
         invocation.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
     )
@@ -668,6 +702,7 @@ fn async_wrong_file_reference_set_cannot_consume_original_owner() {
     assert_eq!(f.io.file(f.file).unwrap().outstanding_irp_refs, 1);
     f.io.irp_mut(id).unwrap().file_id = original;
     let invocation = f.io.prepare_external_file_irp_completion(owner).unwrap();
+    let invocation = capture_and_ack(&mut f, invocation);
     f.io.finish_external_file_irp_completion(
         invocation.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged),
     )

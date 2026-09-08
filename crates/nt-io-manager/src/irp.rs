@@ -530,6 +530,7 @@ pub struct IrpRecord {
     pub(crate) external_pnp_terminal_receipt_claimed: bool,
     /// A detached dispatch owns retirement; ordinary free/ACK cannot consume it across IPC.
     pub(crate) detached_file_owner: bool,
+    pub(crate) detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent,
     pub stack: Vec<IoStackLocation>,
     pub current_location: u8,
     pub buffer: Option<IoBufferRef>,
@@ -564,6 +565,7 @@ impl IrpRecord {
             completion_origin: None,
             external_pnp_terminal_receipt_claimed: false,
             detached_file_owner: false,
+            detached_file_intent: crate::detached_file_irp::ExternalFileIrpIntent::default(),
             stack: Vec::new(),
             current_location: 0,
             buffer: None,

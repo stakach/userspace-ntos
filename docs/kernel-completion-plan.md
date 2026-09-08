@@ -29498,7 +29498,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/test-detached-file-irp-20260908.log, .tmp/test-detached-file-regression-20260908.log and
     .tmp/build-detached-file-irp-20260908.log.
 
-    B3 native detached File owner tranche 125 (planned):
+    B3 native detached File owner tranche 125 (2026-09-08, complete):
 
     Publish a durable native owner before the first detached provider invocation. Keep the exact
     prepared/returned/pending/indeterminate/completion-ACK owner and original delivery reservation
@@ -29517,6 +29517,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     completion snapshot; it can retry a lost read reply while ACK is excluded. Copy required output
     before destructive ACK, or explicitly record abandoned delivery. Abandonment never fabricates
     STATUS_CANCELLED and never relinquishes File ownership before genuine completion and ACK.
+
+    The generic File dispatch boundary now publishes a durable, re-entrant native owner before
+    provider entry and routes completion observation, checked output copy, cancellation and ACK
+    through that owner. The old borrowed generic dispatch machinery and fictitious CREATE output
+    buffers are removed. Pending and uncertain invocations preserve the canonical IrpId and the
+    caller's outstanding delivery reservation. Raw manager copy/cancel/ACK paths reject detached
+    owners before contacting a backend; they are not alternate execution paths on owner failure.
+
+    Canonical cancellation intent is sticky across an invocation, with separate queued, invoking,
+    accepted and indeterminate attempt states. Completion copy commits only a verified complete
+    chunk into owned output. Accepted ACK evidence survives local finish rejection, while unknown
+    destructive ACK cannot be replayed. Abandonment suppresses delivery only; it still requires
+    genuine completion and ACK. Native COPY scratch is reachable only through the active root
+    transfer row, which is withdrawn before every transport return. Thus an uncertain read may
+    discard uncommitted staging without relying on successful provider suspension; the provider's
+    IRP graph remains independently retained. Suspension syscall failures are still only logged
+    by the existing pump and are not proof of a stopped provider.
+
+    Each native owner pins its captured Device/Driver stack, provider domains and exact dependent/
+    physical completion-storage choice. Device, instance and route retirement/publication refuse
+    destructive changes while an owner remains. A host-tested cyclic selector bounds cancellation/
+    abandonment work fairly despite arena removal and reordering. Retry timer source 17 only
+    latches work; provider calls remain in the outer drain. Due copy/ACK retries transfer once to
+    the existing delivery loop, completion polling preserves cancellation cooldown, and a changed
+    provider route blocks its exact retained owner instead of issuing repeated IPC.
+
+    Generic `[hosted-file-owners]` periodic/final instrumentation reports current phase counts,
+    pending/indeterminate owners, completion/copy/ACK evidence, retry deadlines and retained errors.
+    These are observations, not fabricated success or boot-readiness gates. All three independent
+    reviews are clear after the retry fixes. Serialized validation passes 2,871 tests in 59 suites
+    across 26 crates, including 12 owned-operation tests and 10 cyclic-selection tests. Native
+    release build passes in 35.88 seconds with 266 warnings (262 existing plus four intentionally
+    retained, currently non-retried blocked-owner payload fields). Logs:
+    .tmp/test-detached-file-delivery-20260908.log,
+    .tmp/test-detached-file-owner-regression-20260908.log and
+    .tmp/build-detached-file-owners-final-20260908.log. No desktop run or new native import binding
+    is claimed. Canonical requestor backing, File pointer projection and detached CLEANUP/CLOSE
+    remain prerequisites for the next I/O-family admission step.
 
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.

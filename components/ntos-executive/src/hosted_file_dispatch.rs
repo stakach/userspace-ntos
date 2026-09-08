@@ -5,9 +5,10 @@
 
 use super::*;
 use nt_io_manager::detached_file_irp::{
-    ExternalFileIrpAcknowledgement, ExternalFileIrpCompletionInvocation,
-    ExternalFileIrpCompletionReturn, ExternalFileIrpInvocation, ExternalFileIrpOutcome,
-    ExternalFileIrpReturn,
+    ExternalFileIrpAckInvocation, ExternalFileIrpAcknowledgement, ExternalFileIrpCancelInvocation,
+    ExternalFileIrpCancelOutcome, ExternalFileIrpCancelReturn, ExternalFileIrpCompletionReturn,
+    ExternalFileIrpCopyInvocation, ExternalFileIrpCopyOutcome, ExternalFileIrpCopyReturn,
+    ExternalFileIrpInvocation, ExternalFileIrpOutcome, ExternalFileIrpReturn,
 };
 
 pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation) -> ExternalFileIrpReturn {
@@ -50,7 +51,7 @@ pub(super) fn invoke(mut invocation: ExternalFileIrpInvocation) -> ExternalFileI
 }
 
 pub(super) fn acknowledge(
-    invocation: ExternalFileIrpCompletionInvocation,
+    invocation: ExternalFileIrpAckInvocation,
 ) -> ExternalFileIrpCompletionReturn {
     let Some((instance_index, _)) = instance_by_driver_id(invocation.route().driver_id().raw())
     else {
@@ -66,6 +67,87 @@ pub(super) fn acknowledge(
         &mut [],
     ));
     invocation.acknowledged(outcome)
+}
+
+pub(super) fn cancel(invocation: ExternalFileIrpCancelInvocation) -> ExternalFileIrpCancelReturn {
+    let Some((instance_index, _)) = instance_by_driver_id(invocation.route().driver_id().raw())
+    else {
+        return invocation.returned(ExternalFileIrpCancelOutcome::NotEntered {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        });
+    };
+    let result = control(
+        instance_index,
+        invocation.irp_id(),
+        FSD_DISPATCH_CANCEL_IRP,
+        0,
+        &mut [],
+    );
+    let outcome = match result {
+        HostedIrpTransportResult::NotDispatched { status } => {
+            ExternalFileIrpCancelOutcome::NotEntered { status }
+        }
+        HostedIrpTransportResult::Returned {
+            status: nt_status::NtStatus::SUCCESS,
+            information: 1,
+            file_context: 0,
+        } => ExternalFileIrpCancelOutcome::Accepted,
+        HostedIrpTransportResult::Returned {
+            status,
+            information: 0,
+            file_context: 0,
+        } if status.is_error() => ExternalFileIrpCancelOutcome::Rejected { status },
+        HostedIrpTransportResult::Indeterminate { transport_status } => {
+            ExternalFileIrpCancelOutcome::Indeterminate { transport_status }
+        }
+        HostedIrpTransportResult::Returned { .. } => ExternalFileIrpCancelOutcome::Indeterminate {
+            transport_status: nt_status::NtStatus::INVALID_PARAMETER,
+        },
+    };
+    invocation.returned(outcome)
+}
+
+pub(super) fn copy(mut invocation: ExternalFileIrpCopyInvocation) -> ExternalFileIrpCopyReturn {
+    let Some((instance_index, _)) = instance_by_driver_id(invocation.route().driver_id().raw())
+    else {
+        return invocation.returned(ExternalFileIrpCopyOutcome::NotEntered {
+            status: nt_status::NtStatus::DEVICE_NOT_CONNECTED,
+        });
+    };
+    let irp_id = invocation.irp_id();
+    let offset = invocation.offset() as u64;
+    let requested_len = invocation.requested_len();
+    let result = control(
+        instance_index,
+        irp_id,
+        FSD_DISPATCH_COPY_COMPLETION,
+        offset,
+        invocation.staging_mut(),
+    );
+    let outcome = match result {
+        HostedIrpTransportResult::NotDispatched { status } => {
+            ExternalFileIrpCopyOutcome::NotEntered { status }
+        }
+        HostedIrpTransportResult::Returned {
+            status: nt_status::NtStatus::SUCCESS,
+            information,
+            file_context: 0,
+        } if information <= requested_len as u64 => ExternalFileIrpCopyOutcome::Copied {
+            bytes: information as usize,
+        },
+        HostedIrpTransportResult::Returned {
+            status,
+            information: 0,
+            file_context: 0,
+        } if status.is_error() => ExternalFileIrpCopyOutcome::Rejected { status },
+        HostedIrpTransportResult::Indeterminate { transport_status } => {
+            ExternalFileIrpCopyOutcome::Indeterminate { transport_status }
+        }
+        HostedIrpTransportResult::Returned { .. } => ExternalFileIrpCopyOutcome::Indeterminate {
+            transport_status: nt_status::NtStatus::INVALID_PARAMETER,
+        },
+    };
+    invocation.returned(outcome)
 }
 
 fn acknowledgement_result(result: HostedIrpTransportResult) -> ExternalFileIrpAcknowledgement {

@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod completion;
+mod cyclic_ids;
 pub mod dbg;
 mod dispatcher_wait;
 mod dpc;
@@ -49,6 +50,7 @@ mod work_item;
 pub mod x86_io;
 
 pub use completion::{CancelResult, CompleteResult, CompletionState, CompletionTracker};
+pub use cyclic_ids::{select_cyclic_ids, CyclicIdSelection};
 pub use dispatcher_wait::{
     classify_dispatcher_wait_timeout, consume_dispatcher, dispatcher_ready,
     oldest_dispatcher_wait_source, poll_dispatchers, signal_dispatcher_for_wait,

@@ -51,6 +51,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             irp.client_id == client
                 && irp.file_id == Some(file_id)
                 && irp.requestor_tid == requestor_tid
+                && !irp.detached_file_owner
                 && matches!(irp.state, IrpState::Pending | IrpState::CancelRequested)
         }) {
             self.driver_backend_index(
@@ -67,8 +68,21 @@ impl<P: ObjectManagerPort> IoManager<P> {
                     (irp.client_id == client
                         && irp.file_id == Some(file_id)
                         && irp.requestor_tid == requestor_tid
-                        && irp.state == IrpState::Pending)
-                        .then_some(irp_id)
+                        && if irp.detached_file_owner {
+                            irp.detached_file_intent.cancel
+                                == crate::detached_file_irp::ExternalFileIrpCancelPhase::None
+                                && matches!(
+                                    irp.state,
+                                    IrpState::Initialized
+                                        | IrpState::Dispatched
+                                        | IrpState::Pending
+                                        | IrpState::CancelRequested
+                                        | IrpState::Indeterminate
+                                )
+                        } else {
+                            irp.state == IrpState::Pending
+                        })
+                    .then_some(irp_id)
                 })
             };
             let Some(irp_id) = next else {
@@ -97,7 +111,12 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 continue;
             }
             state.total += 1;
-            state.cancel_requested += usize::from(irp.state == IrpState::CancelRequested);
+            state.cancel_requested += usize::from(
+                irp.state == IrpState::CancelRequested
+                    || irp.detached_file_owner
+                        && irp.detached_file_intent.cancel
+                            != crate::detached_file_irp::ExternalFileIrpCancelPhase::None,
+            );
             state.terminal_unacknowledged += usize::from(irp.state.is_final());
         }
         state
@@ -107,6 +126,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// already-terminal requests are successful no-ops; a different owner is
     /// denied.
     pub fn cancel(&mut self, client: ClientId, irp_id: IrpId) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return self
+                .queue_detached_file_irp_intent(client, irp_id, false)
+                .map(|_| ());
+        }
         let (state, driver_id, owner) = match self.irp(irp_id) {
             Some(irp) => (
                 irp.state,
@@ -152,6 +176,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
     /// already-terminal generation, and an existing CancelRequested owner is
     /// not redispatched to its backend.
     pub fn cancel_if_pending(&mut self, client: ClientId, irp_id: IrpId) -> Result<bool, NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return self.queue_detached_file_irp_intent(client, irp_id, false);
+        }
         let (owner, state) = match self.irp(irp_id) {
             Some(irp) => (irp.client_id, irp.state),
             None => return Ok(false),
@@ -177,6 +204,11 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         irp_id: IrpId,
     ) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return self
+                .queue_detached_file_irp_intent(client, irp_id, true)
+                .map(|_| ());
+        }
         self.claim_manager_owned_irp(client, irp_id)?;
         self.cancel(client, irp_id)?;
         self.reap_manager_owned_completions();
@@ -191,6 +223,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         client: ClientId,
         irp_id: IrpId,
     ) -> Result<(), NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         let owner = match self.irp(irp_id) {
             Some(irp) => irp.client_id,
             None => return Ok(()),

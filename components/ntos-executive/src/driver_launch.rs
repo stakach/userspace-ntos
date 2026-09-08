@@ -37,6 +37,9 @@ pub(crate) mod win32k_device_pointers;
 pub(crate) mod hosted_add_device_rollback;
 #[path = "hosted_file_dispatch.rs"]
 mod hosted_file_dispatch;
+#[path = "hosted_file_owners.rs"]
+mod hosted_file_owners;
+pub(crate) use hosted_file_owners::Stats as HostedFileOwnerStats;
 #[path = "hosted_video_dispatch.rs"]
 mod hosted_video_dispatch;
 use hosted_video_dispatch::dispatch_video_irp_for_binding_exact;
@@ -18537,6 +18540,11 @@ unsafe fn begin_hosted_provider_dependency_retirement_for_instance(
     instance_index: usize,
     domain: HostedDomainIdentity,
 ) -> u64 {
+    if !hosted_file_owners::instance_quiesced(instance_index)
+        || !hosted_file_owners::domain_quiesced(domain)
+    {
+        return 1;
+    }
     let Some(dependencies) =
         (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DOMAIN_DEPENDENCIES)).as_mut()
     else {
@@ -19100,6 +19108,11 @@ unsafe fn hosted_provider_callback_records_reference_dependency(
 unsafe fn teardown_hosted_provider_domain_dependency(
     dependency: HostedProviderDomainDependency,
 ) -> Result<(), nt_status::NtStatus> {
+    if !hosted_file_owners::domain_quiesced(dependency.dependent_domain)
+        || !hosted_file_owners::domain_quiesced(dependency.provider_domain)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if !dependency.present
         || !dependency.retiring
         || dependency.in_flight != 0
@@ -19228,6 +19241,11 @@ unsafe fn retain_or_clear_failed_hosted_provider_dispatch_route(
 unsafe fn teardown_hosted_provider_dispatch_route(
     route: &mut HostedProviderDispatchRoute,
 ) -> Result<(), nt_status::NtStatus> {
+    if !hosted_file_owners::domain_quiesced(route.dependent_domain)
+        || !hosted_file_owners::domain_quiesced(route.provider_domain)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     if !route.used
         || route.construction_state != HostedProviderConstructionState::Published
         || !route.retiring
@@ -19286,6 +19304,11 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(
     instance_index: usize,
     domain: HostedDomainIdentity,
 ) -> u64 {
+    if !hosted_file_owners::instance_quiesced(instance_index)
+        || !hosted_file_owners::domain_quiesced(domain)
+    {
+        return 1;
+    }
     let Some(routes) = (*core::ptr::addr_of_mut!(HOSTED_PROVIDER_DISPATCH_ROUTES)).as_mut() else {
         return 0;
     };
@@ -19296,6 +19319,12 @@ unsafe fn clear_hosted_provider_dispatch_routes_for_instance(
             && (route.dependent_instance == instance_index
                 || route.provider_instance == instance_index)
         {
+            if !hosted_file_owners::domain_quiesced(route.dependent_domain)
+                || !hosted_file_owners::domain_quiesced(route.provider_domain)
+            {
+                failures += 1;
+                continue;
+            }
             if route.construction_state != HostedProviderConstructionState::Published {
                 if !hosted_provider_object_owner_matches_instance(
                     route.owner,
@@ -19423,6 +19452,10 @@ unsafe fn register_hosted_provider_driver_object_shadow(
     else {
         return Err(STATUS_DEVICE_NOT_READY);
     };
+    let publication_quiesced = hosted_file_owners::instance_quiesced(dependent_instance)
+        && hosted_file_owners::instance_quiesced(provider_instance)
+        && hosted_file_owners::domain_quiesced(dependent_domain)
+        && hosted_file_owners::domain_quiesced(provider_domain);
     if let Some((index, route)) = hosted_provider_dispatch_routes().and_then(|routes| {
         routes
             .iter()
@@ -19442,6 +19475,9 @@ unsafe fn register_hosted_provider_driver_object_shadow(
                 return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
             }
             if route.construction_state != HostedProviderConstructionState::RollingBack {
+                return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
+            }
+            if !publication_quiesced {
                 return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
             }
             let routes = hosted_provider_dispatch_routes_mut();
@@ -19464,6 +19500,9 @@ unsafe fn register_hosted_provider_driver_object_shadow(
         } else {
             return Err(nt_status::NtStatus::OBJECT_NAME_COLLISION.raw());
         }
+    }
+    if !publication_quiesced {
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
     }
     let route = HostedProviderDispatchRoute {
         used: true,
@@ -19579,6 +19618,12 @@ unsafe fn set_hosted_provider_route_wrapper(
     };
     if !hosted_provider_dispatch_route_is_live(*route) {
         return Err(STATUS_DEVICE_NOT_READY);
+    }
+    if route.provider_wrapper_handle != provider_wrapper_handle
+        && (!hosted_file_owners::domain_quiesced(route.dependent_domain)
+            || !hosted_file_owners::domain_quiesced(route.provider_domain))
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY.raw());
     }
     route.provider_wrapper_handle = provider_wrapper_handle;
     Ok(())
@@ -25358,6 +25403,11 @@ unsafe fn clear_hosted_provider_ndis_miniport_block_mirrors_for_instance(
 }
 
 unsafe fn clear_hosted_provider_state_for_device(binding: HostedDeviceBinding) -> u64 {
+    if !hosted_file_owners::device_quiesced(binding.device_id)
+        || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
+    {
+        return 1;
+    }
     if hosted_device_binding_by_device_id(binding.device_id) != Some(binding) {
         return 1;
     }
@@ -37587,9 +37637,12 @@ fn copy_completed_external_irp_by_id(
     irp_id: IrpId,
     with_output: bool,
 ) -> Option<(nt_io_manager::CompletedIrp, Vec<u8>)> {
-    let io = io_manager_mut();
-    pump_io_manager(io);
-    let completion = io.completed_irp(irp_id)?;
+    pump_io_manager(io_manager_mut());
+    let completion = if hosted_file_owners::contains(irp_id) {
+        hosted_file_owners::completion(irp_id).ok()?
+    } else {
+        io_manager_mut().completed_irp(irp_id)?
+    };
     let length = if with_output {
         usize::try_from(completion.information).ok()?
     } else {
@@ -37598,8 +37651,13 @@ fn copy_completed_external_irp_by_id(
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(length).ok()?;
     bytes.resize(length, 0);
-    if length != 0 && io.copy_completed_irp_output(irp_id, 0, &mut bytes).ok()? != length {
-        return None;
+    if length != 0 {
+        let copied = if hosted_file_owners::contains(irp_id) {
+            hosted_file_owners::copy_output(irp_id, 0, &mut bytes).ok()?
+        } else {
+            io_manager_mut().copy_completed_irp_output(irp_id, 0, &mut bytes).ok()?
+        };
+        if copied != length { return None; }
     }
     Some((completion, bytes))
 }
@@ -37632,9 +37690,12 @@ pub(crate) unsafe fn completed_irp_exact(irp_id: u64) -> Option<HostedCompletedI
     if irp_id == 0 {
         return None;
     }
-    let io = io_manager_mut();
-    pump_io_manager(io);
-    let completion = io.completed_irp(IrpId(irp_id))?;
+    pump_io_manager(io_manager_mut());
+    let completion = if hosted_file_owners::contains(IrpId(irp_id)) {
+        hosted_file_owners::completion(IrpId(irp_id)).ok()?
+    } else {
+        io_manager_mut().completed_irp(IrpId(irp_id))?
+    };
     Some(HostedCompletedIrp {
         file_id: completion.file_id?.raw(),
         requestor_tid: completion.requestor_tid,
@@ -37654,10 +37715,12 @@ pub(crate) unsafe fn copy_completed_irp_output_exact(
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    let io = io_manager_mut();
-    pump_io_manager(io);
-    io.copy_completed_irp_output(IrpId(irp_id), offset, output)
-        .map_err(|status| status.raw() as u32)
+    pump_io_manager(io_manager_mut());
+    if hosted_file_owners::contains(IrpId(irp_id)) {
+        hosted_file_owners::copy_output(IrpId(irp_id), offset, output)
+    } else {
+        io_manager_mut().copy_completed_irp_output(IrpId(irp_id), offset, output)
+    }.map_err(|status| status.raw() as u32)
 }
 
 pub(crate) unsafe fn completed_irp_copy_requires_retry(irp_id: u64) -> bool {
@@ -37674,22 +37737,23 @@ pub(crate) unsafe fn acknowledge_completed_irp(irp_id: u64) -> Result<(), u32> {
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    let io = io_manager_mut();
-    pump_io_manager(io);
-    io.acknowledge_completed_irp(IrpId(irp_id))
-        .map(|_| ())
-        .map_err(|status| status.raw() as u32)
+    pump_io_manager(io_manager_mut());
+    if hosted_file_owners::contains(IrpId(irp_id)) {
+        hosted_file_owners::acknowledge(IrpId(irp_id))
+    } else {
+        io_manager_mut().acknowledge_completed_irp(IrpId(irp_id)).map(|_| ())
+    }.map_err(|status| status.raw() as u32)
 }
 
 pub(crate) unsafe fn cancel_irp_if_pending(irp_id: u64) -> Result<bool, u32> {
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    let io = io_manager_mut();
-    let selected = io
+    let selected = io_manager_mut()
         .cancel_if_pending(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
         .map_err(|status| status.raw() as u32)?;
-    pump_io_manager(io);
+    pump_io_manager(io_manager_mut());
+    hosted_file_owners::drain();
     Ok(selected)
 }
 
@@ -37702,15 +37766,15 @@ pub(crate) unsafe fn cancel_file_thread_io(
     if file_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    let io = io_manager_mut();
-    io.cancel_file_thread_io(
+    io_manager_mut().cancel_file_thread_io(
         ClientId(IO_MANAGER_COMPONENT_ID),
         FileId(file_id),
         requestor_tid,
     )
     .map_err(|status| status.raw() as u32)?;
-    pump_io_manager(io);
-    Ok(io.file_thread_io_drain_state(
+    pump_io_manager(io_manager_mut());
+    hosted_file_owners::drain();
+    Ok(io_manager_mut().file_thread_io_drain_state(
         ClientId(IO_MANAGER_COMPONENT_ID),
         FileId(file_id),
         requestor_tid,
@@ -41602,6 +41666,7 @@ unsafe fn drain_hosted_filter_requirements_transactions() -> usize {
 pub(crate) fn pump_hosted_io_completions() -> usize {
     let pumped = pump_io_manager(io_manager_mut());
     pumped
+        .saturating_add(hosted_file_owners::drain())
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_indeterminate_irps() })
         .saturating_add(unsafe { drain_hosted_device_retirements() })
         .saturating_add(unsafe { hosted_add_device_rollback::drain() })
@@ -41611,6 +41676,18 @@ pub(crate) fn pump_hosted_io_completions() -> usize {
         .saturating_add(unsafe { drain_hosted_acpi_pci_route_query() })
         .saturating_add(unsafe { start_hosted_device_relation_query() })
         .saturating_add(unsafe { start_hosted_acpi_pci_route_query() })
+}
+
+pub(crate) fn hosted_file_retry_deadline() -> Option<u64> {
+    hosted_file_owners::retry_deadline()
+}
+
+pub(crate) fn hosted_file_owner_stats() -> HostedFileOwnerStats {
+    hosted_file_owners::stats()
+}
+
+pub(crate) fn hosted_file_retry_wake_due(now_100ns: u64) -> u64 {
+    hosted_file_owners::retry_wake_due(now_100ns)
 }
 
 pub(crate) fn hosted_bus_reported_device_id(instance_id: &str) -> Option<u64> {
@@ -42082,10 +42159,10 @@ pub(crate) unsafe fn abandon_pending_irp(irp_id: u64) -> Result<(), u32> {
     if irp_id == 0 {
         return Err(STATUS_INVALID_PARAMETER as u32);
     }
-    let io = io_manager_mut();
-    io.abandon_irp_delivery(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
+    io_manager_mut().abandon_irp_delivery(ClientId(IO_MANAGER_COMPONENT_ID), IrpId(irp_id))
         .map_err(|status| status.raw() as u32)?;
-    pump_io_manager(io);
+    pump_io_manager(io_manager_mut());
+    hosted_file_owners::drain();
     Ok(())
 }
 
@@ -42707,7 +42784,7 @@ fn dispatch_external_irp_to_device_record_result_exact(
     stack_flags: StackFlags,
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     let major = external_major(major).ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let (input_len, output_len, system_buffer_len) =
+    let (input_len, output_len, _) =
         external_dispatch_buffer_lengths(in_data.len(), out.len())?;
     let params = external_irp_parameters(
         major,
@@ -42723,69 +42800,33 @@ fn dispatch_external_irp_to_device_record_result_exact(
         read_write,
     )
     .ok_or(STATUS_INVALID_PARAMETER as u32)?;
-    let separate_output = (matches!(major, major::IRP_MJ_QUERY_EA | major::IRP_MJ_QUERY_QUOTA)
-        || matches!(
-            control_transfer_method(major as u64, fsctl),
-            Some(ioctl::METHOD_IN_DIRECT | ioctl::METHOD_OUT_DIRECT | ioctl::METHOD_NEITHER)
-        ))
-        && !out.is_empty();
-    let output_offset = if separate_output { in_data.len() } else { 0 };
-    let system_buffer_len = if separate_output {
-        in_data
-            .len()
-            .checked_add(out.len())
-            .ok_or(STATUS_INVALID_BUFFER_SIZE)?
-    } else {
-        system_buffer_len
-    };
-    let mut system_buffer = Vec::new();
-    system_buffer
-        .try_reserve_exact(system_buffer_len)
-        .map_err(|_| 0xC000_009Au32)?; // STATUS_INSUFFICIENT_RESOURCES
-    system_buffer.resize(system_buffer_len, 0);
-    if matches!(
-        major,
-        major::IRP_MJ_QUERY_INFORMATION
-            | major::IRP_MJ_QUERY_EA
-            | major::IRP_MJ_QUERY_QUOTA
-            | major::IRP_MJ_QUERY_VOLUME_INFORMATION
-            | major::IRP_MJ_DIRECTORY_CONTROL
-    ) {
-        system_buffer[..out.len()].copy_from_slice(out);
-    }
-    system_buffer[..in_data.len()].copy_from_slice(in_data);
-    if separate_output {
-        system_buffer[output_offset..output_offset + out.len()].copy_from_slice(out);
-    }
-    let result = io_manager_mut()
-        .build_and_dispatch_external_to_device_with_stack_flags(
-            ClientId(IO_MANAGER_COMPONENT_ID),
-            nt_io_manager::DeviceId(device_id),
-            canonical_file_id,
-            file_id,
+    let result = hosted_file_owners::dispatch(
+        nt_io_manager::detached_file_irp::ExternalFileIrpRequest {
+            client: ClientId(IO_MANAGER_COMPONENT_ID),
+            device_id: nt_io_manager::DeviceId(device_id),
+            file_id: canonical_file_id,
+            user_data: file_id,
             requestor_tid,
             major,
-            params,
+            parameters: params,
             stack_flags,
-            input_len,
-            output_len,
-            &mut system_buffer,
-        )
-        .map_err(|status| status.raw() as u32)?;
+        },
+        in_data,
+        out,
+    ).map_err(|status| status.raw() as u32)?;
     match result {
-        ExternalDispatchResult::Completed {
+        hosted_file_owners::DispatchResult::Returned {
             status,
             information,
             file_context,
+            buffers,
         } => {
-            let copy_len = (information as usize)
-                .min(out.len())
-                .min(system_buffer.len());
-            out[..copy_len]
-                .copy_from_slice(&system_buffer[output_offset..output_offset + copy_len]);
+            assert_eq!(buffers.output().len(), out.len());
+            let copy_len = nt_io_manager::completion_output_transfer_len(information, out.len() as u64) as usize;
+            out[..copy_len].copy_from_slice(&buffers.output()[..copy_len]);
             Ok((status.raw(), information, None, file_context))
         }
-        ExternalDispatchResult::Pending { irp_id } => {
+        hosted_file_owners::DispatchResult::Outstanding { irp_id } => {
             Ok((STATUS_PENDING as i32, 0, Some(irp_id), None))
         }
     }
@@ -46155,6 +46196,11 @@ unsafe fn finish_hosted_stop_publication(irp_id: IrpId) -> Result<(), nt_status:
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let binding = transaction.binding;
+    if !hosted_file_owners::device_quiesced(binding.device_id)
+        || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let resource_projection_released = transaction.resource_projection_released;
     let resource_assignment_released = transaction.resource_assignment_released;
     let power_stop_published = transaction.power_stop_published;
@@ -46204,6 +46250,11 @@ unsafe fn finish_hosted_remove_quiescence(irp_id: IrpId) -> Result<(), nt_status
         return Err(nt_status::NtStatus::INVALID_DEVICE_REQUEST);
     }
     let binding = transaction.binding;
+    if !hosted_file_owners::device_quiesced(binding.device_id)
+        || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     let final_remove = transaction.minor == nt_pnp_manager::PnpMinor::RemoveDevice;
     let interfaces_released = transaction.interfaces_released;
     let provider_state_released = transaction.provider_state_released;
@@ -48551,6 +48602,11 @@ unsafe fn clear_hosted_resource_projection(
     binding: HostedDeviceBinding,
     sh: u64,
 ) -> Result<(), nt_status::NtStatus> {
+    if !hosted_file_owners::device_quiesced(binding.device_id)
+        || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     // Mask and retire the physical route before revoking the generation's resource assignment or
     // component mappings. A live device must never target a stale ISR projection.
     retire_hosted_irq_connections_for_binding(binding)?;
@@ -50544,6 +50600,11 @@ pub(crate) fn hosted_interrupt_delivery_evidence() -> HostedInterruptDeliveryEvi
 }
 
 fn teardown_hosted_device_binding(binding: HostedDeviceBinding) -> bool {
+    if !hosted_file_owners::device_quiesced(binding.device_id)
+        || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
+    {
+        return false;
+    }
     if unsafe { retire_hosted_irq_connections_for_binding(binding) }.is_err() {
         return false;
     }
@@ -50670,6 +50731,10 @@ unsafe fn drain_hosted_device_retirements() -> usize {
             return progress;
         };
         if retirement.barrier_status.is_some() {
+            index += 1;
+            continue;
+        }
+        if !hosted_file_owners::device_quiesced(retirement.device_id.raw()) {
             index += 1;
             continue;
         }
@@ -51541,6 +51606,9 @@ unsafe fn hosted_driver_device_lifetime_quiesced(
     driver_id: u64,
     domain: HostedDomainIdentity,
 ) -> bool {
+    if !hosted_file_owners::lifetime_quiesced(instance, driver_id, domain) {
+        return false;
+    }
     let bindings_quiesced = hosted_device_bindings().is_none_or(|bindings| {
         bindings.iter().all(|binding| {
             !binding.used
@@ -52082,7 +52150,9 @@ pub(crate) struct HostedVideoRouteInfo {
 }
 
 fn clear_instance(i: usize) -> Result<(), nt_status::NtStatus> {
-    if !unsafe { hosted_add_device_rollback::instance_quiesced(i) } {
+    if !hosted_file_owners::instance_quiesced(i)
+        || !unsafe { hosted_add_device_rollback::instance_quiesced(i) }
+    {
         return Err(nt_status::NtStatus::DEVICE_BUSY);
     }
     let mut teardown_blocked = false;
@@ -57235,6 +57305,11 @@ pub(crate) unsafe fn rollback_hosted_device_start(
 ) -> Result<(), nt_status::NtStatus> {
     let binding = hosted_device_binding_by_device_id(device_id)
         .ok_or(nt_status::NtStatus::INVALID_PARAMETER)?;
+    if !hosted_file_owners::device_quiesced(binding.device_id)
+        || !hosted_file_owners::device_quiesced(binding.pdo_device_id)
+    {
+        return Err(nt_status::NtStatus::DEVICE_BUSY);
+    }
     hosted_pnp_manager_mut()
         .clear_resource_assignment(binding.pdo_device_id)
         .map_err(hosted_pnp_status)?;
@@ -58971,7 +59046,6 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
     requestor_tid: u64,
     parameters: CreateParameters,
     in_data: &[u8],
-    out: &mut [u8],
 ) -> Result<(i32, u64, Option<IrpId>, Option<u64>), u32> {
     if !matches!(
         major,
@@ -58995,7 +59069,7 @@ pub(crate) unsafe fn dispatch_hosted_file_create_irp_result_exact(
         0,
         requestor_tid,
         in_data,
-        out,
+        &mut [],
         Some(parameters),
         None,
         None,

@@ -130,25 +130,17 @@ pub struct ExternalFileIrpTerminal {
     completion: CompletedIrp,
 }
 #[derive(Debug)]
-#[must_use = "acknowledge outside the manager and return the exact invocation"]
-/// The same completion invocation cannot be acknowledged twice.
-///
-/// ```compile_fail
-/// use nt_io_manager::detached_file_irp::{ExternalFileIrpCompletionInvocation,
-///     ExternalFileIrpAcknowledgement};
-/// fn duplicate(owner: ExternalFileIrpCompletionInvocation) {
-///     let first = owner.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged);
-///     let second = owner.acknowledged(ExternalFileIrpAcknowledgement::Acknowledged);
-/// }
-/// ```
+#[must_use = "capture output or abandon delivery before requesting acknowledgement"]
 pub struct ExternalFileIrpCompletionInvocation {
     owner: Owner,
     completion: CompletedIrp,
+    captured: usize,
+    capture_len: usize,
 }
 #[derive(Debug)]
 #[must_use = "finish acknowledgement through the issuing I/O Manager"]
 pub struct ExternalFileIrpCompletionReturn {
-    invocation: ExternalFileIrpCompletionInvocation,
+    invocation: ExternalFileIrpAckInvocation,
     acknowledgement: ExternalFileIrpAcknowledgement,
 }
 
@@ -252,6 +244,9 @@ owner_accessors!(RetainedExternalFileIrp, owner);
 owner_accessors!(ExternalFileIrpTerminal, owner);
 owner_accessors!(ExternalFileIrpCompletionInvocation, owner);
 
+mod operations;
+pub use operations::*;
+
 impl ExternalFileIrpInvocation {
     pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {
         ExternalFileIrpBufferView {
@@ -280,26 +275,20 @@ impl ExternalFileIrpCompletionInvocation {
     pub fn completion(&self) -> &CompletedIrp {
         &self.completion
     }
-    pub fn buffers_mut(&mut self) -> ExternalFileIrpBufferView<'_> {
-        ExternalFileIrpBufferView {
-            input: &self.owner.buffers.input,
-            output: &mut self.owner.buffers.output,
-        }
+    pub fn captured_len(&self) -> usize {
+        self.captured
     }
-    pub fn acknowledged(
-        self,
-        acknowledgement: ExternalFileIrpAcknowledgement,
-    ) -> ExternalFileIrpCompletionReturn {
-        ExternalFileIrpCompletionReturn {
-            invocation: self,
-            acknowledgement,
-        }
+    pub fn capture_len(&self) -> usize {
+        self.capture_len
+    }
+    pub fn capture_complete(&self) -> bool {
+        self.captured == self.capture_len
     }
 }
 
 impl ExternalFileIrpCompletionReturn {
     /// Only a failed ACK can be executed again. An accepted ACK remains durable for local retry.
-    pub fn retry(self) -> Result<ExternalFileIrpCompletionInvocation, Self> {
+    pub fn retry(self) -> Result<ExternalFileIrpAckInvocation, Self> {
         if matches!(
             self.acknowledgement,
             ExternalFileIrpAcknowledgement::NotEntered { .. }
@@ -571,6 +560,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
             let record = self
                 .irp(prepared.irp_id())
                 .ok_or(NtStatus::INVALID_HANDLE)?;
+            if record.detached_file_intent.cancel != ExternalFileIrpCancelPhase::None {
+                return Err(NtStatus::CANCELLED);
+            }
             if record.state != IrpState::Initialized
                 || IrpProjection::from_record(record)? != prepared.0.projection
             {
@@ -744,6 +736,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
                 let record = self.irp_mut(id).unwrap();
                 record.status = NtStatus::PENDING;
                 assert!(record.transition(IrpState::Pending));
+                if record.detached_file_intent.cancel != ExternalFileIrpCancelPhase::None {
+                    assert!(record.transition(IrpState::CancelRequested));
+                }
                 ExternalFileIrpResult::Pending(RetainedExternalFileIrp {
                     owner,
                     indeterminate: false,
@@ -839,6 +834,20 @@ impl<P: ObjectManagerPort> IoManager<P> {
         ExternalFileIrpCompletionInvocation,
         ExternalFileIrpRejection<RetainedExternalFileIrp>,
     > {
+        self.prepare_external_file_irp_completion_with_capture(
+            retained,
+            ExternalFileIrpOutputCapture::Information,
+        )
+    }
+
+    pub fn prepare_external_file_irp_completion_with_capture(
+        &mut self,
+        retained: RetainedExternalFileIrp,
+        capture: ExternalFileIrpOutputCapture,
+    ) -> Result<
+        ExternalFileIrpCompletionInvocation,
+        ExternalFileIrpRejection<RetainedExternalFileIrp>,
+    > {
         let result = self.validate_detached_owner(&retained.owner).and_then(|_| {
             let completed = self
                 .completed_irp_snapshot(retained.irp_id())
@@ -848,12 +857,15 @@ impl<P: ObjectManagerPort> IoManager<P> {
             {
                 return Err(NtStatus::INVALID_PARAMETER);
             }
-            Ok(completed)
+            let capture_len = capture.required_len(&retained.owner, &completed)?;
+            Ok((completed, capture_len))
         });
         match result {
-            Ok(completion) => Ok(ExternalFileIrpCompletionInvocation {
+            Ok((completion, capture_len)) => Ok(ExternalFileIrpCompletionInvocation {
                 owner: retained.owner,
                 completion,
+                captured: 0,
+                capture_len,
             }),
             Err(status) => Err(ExternalFileIrpRejection {
                 status,
@@ -897,7 +909,7 @@ impl<P: ObjectManagerPort> IoManager<P> {
             });
         }
         let invocation = returned.invocation;
-        let ExternalFileIrpCompletionInvocation { owner, completion } = invocation;
+        let ExternalFileIrpAckInvocation { owner, completion } = invocation;
         let index = self
             .completed_irps
             .iter()

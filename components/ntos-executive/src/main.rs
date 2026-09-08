@@ -3395,6 +3395,7 @@ const DELAY_TIMER_SOURCE_PROVIDER_TIMER: u64 = 13;
 const DELAY_TIMER_SOURCE_REGISTRY_CLOSE: u64 = 14;
 const DELAY_TIMER_SOURCE_CM_KEY_CLEANUP: u64 = 15;
 const DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP: u64 = 16;
+const DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY: u64 = 17;
 const JOB_TIME_SAMPLE_INTERVAL_100NS: u64 = 100_000;
 const LBL_TCB_BIND_NOTIFICATION: u64 = 14;
 const LBL_IRQ_ACK: u64 = 31;
@@ -7419,7 +7420,7 @@ pub(crate) static DRAIN_DUE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SCHED_RUNTIME_READ_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Per-sub-drain cost. `delay_timer_drain_due_work` fans out to independently timed wake paths;
 /// one of them owns the whole boot, so they are timed individually.
-pub(crate) const SUBDRAIN_N: usize = 16;
+pub(crate) const SUBDRAIN_N: usize = 17;
 pub(crate) static SUBDRAIN_TICKS: [AtomicU64; SUBDRAIN_N] =
     [const { AtomicU64::new(0) }; SUBDRAIN_N];
 pub(crate) static SUBDRAIN_WOKEN: [AtomicU64; SUBDRAIN_N] =
@@ -7910,6 +7911,7 @@ pub(crate) fn census_tick_static(now: u64) {
     print_periodic_census_heartbeat(n, now);
     print_native_ssn_time();
     print_add_device_rollback_census(b"periodic", false);
+    print_hosted_file_owner_census(b"periodic", false);
 }
 
 fn print_add_device_rollback_census(tag: &[u8], include_empty: bool) {
@@ -7931,6 +7933,36 @@ fn print_add_device_rollback_census(tag: &[u8], include_empty: bool) {
     print_u64(stats.devices as u64);
     print_str(b" retired-projections=");
     print_u64(stats.retired_devices as u64);
+    print_str(b"\n");
+}
+
+fn print_hosted_file_owner_census(tag: &[u8], include_empty: bool) {
+    let stats = driver_launch::hosted_file_owner_stats();
+    if !include_empty && stats.live == 0 {
+        return;
+    }
+    print_str(b"[hosted-file-owners] ");
+    print_str(tag);
+    for (name, count) in [
+        (b" live=".as_slice(), stats.live),
+        (b" preparing=".as_slice(), stats.preparing),
+        (b" dispatching=".as_slice(), stats.dispatching),
+        (b" copying=".as_slice(), stats.copying),
+        (b" cancelling=".as_slice(), stats.cancelling),
+        (b" acknowledging=".as_slice(), stats.acknowledging),
+        (b" idle=".as_slice(), stats.idle),
+        (b" blocked=".as_slice(), stats.blocked),
+        (b" pending=".as_slice(), stats.pending),
+        (b" indeterminate=".as_slice(), stats.indeterminate),
+        (b" completions=".as_slice(), stats.completions),
+        (b" copy-returns=".as_slice(), stats.copy_returns),
+        (b" ack-returns=".as_slice(), stats.ack_returns),
+        (b" retry-deadlines=".as_slice(), stats.retry_deadlines),
+        (b" retained-errors=".as_slice(), stats.retained_errors),
+    ] {
+        print_str(name);
+        print_u64(count as u64);
+    }
     print_str(b"\n");
 }
 
@@ -8053,6 +8085,7 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_u64(writable_fs::OVERLAY_CLOSES.load(Ordering::Relaxed));
     print_str(b"\n");
     print_add_device_rollback_census(tag, true);
+    print_hosted_file_owner_census(tag, true);
     print_pool_census(tag);
 }
 
@@ -17319,6 +17352,7 @@ unsafe fn delay_timer_next_deadline(
     let registry_close_deadline = driver_launch::driver_registry_close_retry_deadline();
     let cm_key_cleanup_deadline = cm_key_ownership::next_deadline();
     let cm_snapshot_cleanup_deadline = cm_snapshot_ownership::next_deadline();
+    let hosted_file_retry_deadline = driver_launch::hosted_file_retry_deadline();
     let deadman_deadline = watchdog_deadline();
     let deadline = delay_deadline
         .into_iter()
@@ -17336,6 +17370,7 @@ unsafe fn delay_timer_next_deadline(
         .chain(registry_close_deadline)
         .chain(cm_key_cleanup_deadline)
         .chain(cm_snapshot_cleanup_deadline)
+        .chain(hosted_file_retry_deadline)
         .chain(deadman_deadline)
         .min()?;
     let source = if delay_deadline == Some(deadline) {
@@ -17368,6 +17403,8 @@ unsafe fn delay_timer_next_deadline(
         DELAY_TIMER_SOURCE_CM_KEY_CLEANUP
     } else if cm_snapshot_cleanup_deadline == Some(deadline) {
         DELAY_TIMER_SOURCE_CM_SNAPSHOT_CLEANUP
+    } else if hosted_file_retry_deadline == Some(deadline) {
+        DELAY_TIMER_SOURCE_HOSTED_FILE_RETRY
     } else {
         DELAY_TIMER_SOURCE_WATCHDOG
     };
@@ -17596,6 +17633,7 @@ unsafe fn delay_timer_drain_due_work(
         + subdrain!(13, driver_launch::driver_registry_close_retry_wake_due(now_100ns))
         + subdrain!(14, cm_key_ownership::wake_due(now_100ns))
         + subdrain!(15, cm_snapshot_ownership::wake_due(now_100ns))
+        + subdrain!(16, driver_launch::hosted_file_retry_wake_due(now_100ns))
         + watchdog_tick
 }
 
@@ -31490,7 +31528,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     b's' as u16,
                     b't' as u16,
                 ];
-                let mut out = [0u8; 16];
                 let npfs_device_id = driver_launch::device_id_by_name("\\Device\\NamedPipe");
                 let r = npfs_device_id
                     .and_then(|device_id| {
@@ -31518,7 +31555,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                 related_file: None,
                             },
                             &name16,
-                            &mut out,
                         ) {
                             Ok((status, information, _, context)) => {
                                 Some((status, information, file_id, context.unwrap_or(0)))
@@ -31549,7 +31585,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                     );
                     // C-a: create-then-CONNECT — a client IRP_MJ_CREATE(\ntstest) must find the FCB via the
                     // real prefix tree and return a connected client-end FILE_OBJECT (proves Insert+Find work).
-                    let mut cout = [0u8; 16];
                     let client_create = npfs_device_id
                         .and_then(|device_id| {
                             driver_launch::allocate_hosted_file(
@@ -31576,7 +31611,6 @@ unsafe extern "C" fn _start(bootinfo: *const BootInfo) -> ! {
                                     related_file: None,
                                 },
                                 &name16,
-                                &mut cout,
                             ) {
                                 Ok((status, information, _, context)) => {
                                     Some((status, information, file_id, context.unwrap_or(0)))

@@ -142,6 +142,10 @@ impl<P: ObjectManagerPort> IoManager<P> {
         let mut index = 0;
         while index < self.cancel_dispatch_retries.len() {
             let irp_id = self.cancel_dispatch_retries[index];
+            if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+                self.cancel_dispatch_retries.swap_remove(index);
+                continue;
+            }
             let (state, driver_id) = match self.irp(irp_id) {
                 Some(irp) => match irp.current_stack() {
                     Some(stack) => (irp.state, stack.driver_id),
@@ -400,6 +404,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         let (driver_id, information, output_capacity) = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
             if irp.state != IrpState::Completed {
@@ -456,6 +463,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         let (driver_id, output_capacity) = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
             if irp.state != IrpState::Completed
@@ -516,6 +526,9 @@ impl<P: ObjectManagerPort> IoManager<P> {
         offset: u64,
         output: &mut [u8],
     ) -> Result<usize, NtStatus> {
+        if self.irp(irp_id).is_some_and(|irp| irp.detached_file_owner) {
+            return Err(NtStatus::DELETE_PENDING);
+        }
         let (driver_id, payload_len) = {
             let irp = self.irp(irp_id).ok_or(NtStatus::INVALID_PARAMETER)?;
             if irp.state != IrpState::Completed
