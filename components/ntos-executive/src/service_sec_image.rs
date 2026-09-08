@@ -9096,25 +9096,8 @@ pub(crate) unsafe fn service_sec_image(
         // Route the shared stack helpers (smss_stack_read/write) to THIS process's stack mirror, so
         // its syscall out-params (e.g. NtAllocateVirtualMemory's base for RtlCreateHeap) land on its
         // own stack, not the other process's.
-        let (active_stack_base, active_stack_frames) = if let Some(slot) = tp_worker_slot {
-            (tp_worker_stack_base(slot), TP_WORKER_STACK_FRAMES)
-        } else if is_svc_listener {
-            (SVC_LISTENER_STACK_BASE, SVC_LISTENER_STACK_FRAMES)
-        } else if is_lsass_listener {
-            (LSASS_LISTENER_STACK_BASE, LSASS_LISTENER_STACK_FRAMES)
-        } else if is_lsass_listener2 {
-            (LSASS_LISTENER2_STACK_BASE, LSASS_LISTENER2_STACK_FRAMES)
-        } else if is_lsass_listener3 {
-            (LSASS_LISTENER3_STACK_BASE, LSASS_LISTENER3_STACK_FRAMES)
-        } else if is_wl_worker {
-            match badge {
-                WINLOGON_WORKER2_BADGE => (WL_WORKER2_STACK_BASE, WL_WORKER2_STACK_FRAMES),
-                WINLOGON_WORKER3_BADGE => (WL_WORKER3_STACK_BASE, WL_WORKER3_STACK_FRAMES),
-                _ => (WL_LISTENER_STACK_BASE, WL_LISTENER_STACK_FRAMES),
-            }
-        } else {
-            (STACK_BASE, STACK_FRAMES)
-        };
+        let (active_stack_base, active_stack_frames) =
+            crate::hosted_thread_runtime::hosted_thread_fixed_stack_geometry(pi, badge);
         ACTIVE_STACK_BASE.store(active_stack_base, Ordering::Relaxed);
         ACTIVE_STACK_SIZE.store(active_stack_frames * 0x1000, Ordering::Relaxed);
         ACTIVE_STACK_MIRROR.store(
@@ -21311,6 +21294,11 @@ pub(crate) unsafe fn service_sec_image(
             const A_CALLER_SP: u64 = STACK_BASE + 0x420; // the "client stack" NtCreateThread reads
             const A_CONTEXT: u64 = STACK_BASE + 0x500; // the caller's CONTEXT record
             const A_INITIAL_TEB: u64 = STACK_BASE + 0xa00;
+            const A_STACK_BASE: u64 = STACK_BASE + 0xa30;
+            const A_STACK_SIZE: u64 = STACK_BASE + 0xa38;
+            // Outside the fixed worker windows and the executive's automatic heap mirror.
+            const CALLER_STACK_BASE: u64 = SMSS_ALLOC_VA + 0x0200_0000;
+            const CALLER_STACK_SIZE: u64 = 0x1_0000;
                                                        // Executive scratch inside the SAME proven-resident 2 MiB page table the other post-loop
                                                        // self-tests use (SMSS_SCRATCH_BASE + 3000*0x1000, PT index 5).
             let write_scratch = SMSS_SCRATCH_BASE + 3020 * 0x1000;
@@ -21409,6 +21397,28 @@ pub(crate) unsafe fn service_sec_image(
             let test_pi = brk_test_claim
                 .map(TemporaryProcessSlotClaim::pi)
                 .unwrap_or(MAX_PI);
+            // The real VM allocator consumes the target's ProcExec, not merely its Ps VSpace
+            // lookup. Keep the previous empty slot until all caller VM ownership is retired.
+            let saved_target_proc = if brk_test_claim.is_some() {
+                nt_handler.loop_ctx.and_then(|ctx| {
+                    let previous = (&*ctx.procs).get(test_pi).copied()?;
+                    if previous.pid != 0 || previous.pml4 != 0
+                        || !process_vm_region_map(test_pi).is_some_and(|map| map.extent_count() == 0)
+                        || process_user_page_table_commit_bytes(test_pi) != 0
+                    {
+                        return None;
+                    }
+                    (&mut *ctx.procs)[test_pi] = ProcExec {
+                        pid: u64::from(target),
+                        pml4: target_pml4,
+                        scratch_base: SMSS_SCRATCH_BASE + 3023 * 0x1000,
+                        ..ProcExec::empty()
+                    };
+                    Some(previous)
+                })
+            } else {
+                None
+            };
             // The target's PEB page: mapped in ITS VSpace first, then windowed into the executive
             // (a frame capability carries its own mapping — map the original before any copy), and
             // registered with that window as its permanent alias, exactly as `spawn_sec_image`
@@ -21496,7 +21506,7 @@ pub(crate) unsafe fn service_sec_image(
                 .insert_handle(
                     debugger_pid,
                     nt_process::HandleObject::Process(target),
-                    PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD,
+                    PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD | 0x0008, // PROCESS_VM_OPERATION
                 )
                 .map(u64::from)
                 .unwrap_or(0);
@@ -21514,6 +21524,16 @@ pub(crate) unsafe fn service_sec_image(
             let args_ready = img_spawn::smss_copyout(A_HANDLE, &[0u8; 0x100])
                 && img_spawn::smss_copyout(A_CONTEXT, &[0u8; nt_thread_start::AMD64_CONTEXT_SIZE])
                 && img_spawn::smss_copyout(A_TIMEOUT, &0i64.to_le_bytes());
+            let caller_stack_allocated = saved_target_proc.is_some()
+                && args_ready
+                && h_target != 0
+                && img_spawn::smss_copyout(A_STACK_BASE, &CALLER_STACK_BASE.to_le_bytes())
+                && img_spawn::smss_copyout(A_STACK_SIZE, &CALLER_STACK_SIZE.to_le_bytes())
+                && sysc!(SSN_NT_ALLOCATE_VM, &[
+                    h_target, A_STACK_BASE, 0, A_STACK_SIZE,
+                    u64::from(nt_address_space::MEM_RESERVE | nt_address_space::MEM_COMMIT),
+                    u64::from(nt_address_space::PAGE_READWRITE),
+                ]) == 0;
             let setup_ok = peb_registered
                 && mark_win_ok
                 && code_mapped
@@ -21524,6 +21544,9 @@ pub(crate) unsafe fn service_sec_image(
                 && h_target != 0
                 && h_target_no_create != 0
                 && args_ready
+                && caller_stack_allocated
+                && smss_stack_read(A_STACK_BASE) == CALLER_STACK_BASE
+                && smss_stack_read(A_STACK_SIZE) == CALLER_STACK_SIZE
                 && debugger_pid != 0;
 
             let mut spawned_breakin_tid = 0u64;
@@ -21605,12 +21628,12 @@ pub(crate) unsafe fn service_sec_image(
                         &mut context,
                         selftests::DBGK_BREAKIN_CODE_VA,
                         selftests::DBGK_BREAKIN_PARAM,
-                        tp_worker_stack_top(0),
+                        CALLER_STACK_BASE + CALLER_STACK_SIZE,
                     );
                     let mut initial_teb = [0u8; nt_thread_start::INITIAL_TEB64_SIZE];
-                    initial_teb[0x10..0x18].copy_from_slice(&tp_worker_stack_top(0).to_le_bytes());
-                    initial_teb[0x18..0x20].copy_from_slice(&tp_worker_stack_base(0).to_le_bytes());
-                    initial_teb[0x20..0x28].copy_from_slice(&tp_worker_stack_base(0).to_le_bytes());
+                    initial_teb[0x10..0x18].copy_from_slice(&(CALLER_STACK_BASE + CALLER_STACK_SIZE).to_le_bytes());
+                    initial_teb[0x18..0x20].copy_from_slice(&CALLER_STACK_BASE.to_le_bytes());
+                    initial_teb[0x20..0x28].copy_from_slice(&CALLER_STACK_BASE.to_le_bytes());
                     let ctx_ok = img_spawn::smss_copyout(A_CONTEXT, &context)
                         && img_spawn::smss_copyout(A_INITIAL_TEB, &initial_teb)
                         && img_spawn::smss_copyout(A_CALLER_SP + 0x28, &A_CID_OUT.to_le_bytes())
@@ -21690,6 +21713,7 @@ pub(crate) unsafe fn service_sec_image(
                                 slot: request.slot,
                                 pml4: request.pml4,
                                 start: request.start,
+                                stack_origin: request.stack_origin,
                                 cid_proc: request.cid_proc,
                                 cid_thread: request.cid_thread,
                                 fault_ep: ThreadFaultEndpoint::Borrowed(brk_ep),
@@ -21939,7 +21963,8 @@ pub(crate) unsafe fn service_sec_image(
                         )
                         .unwrap_or(0);
                     if brk_tcb > 1 {
-                        let _ = tcb_suspend_r(brk_tcb);
+                        assert_eq!(tcb_suspend_r(brk_tcb), 0,
+                            "diagnostic caller stack remains owned until its TCB is suspended");
                     }
                 }
             }
@@ -21974,6 +21999,25 @@ pub(crate) unsafe fn service_sec_image(
                     nt_handler.release_hosted_thread_commitment(runtime.resources);
                     release_hosted_thread_mechanism_cnodes(runtime);
                 }
+            }
+            if caller_stack_allocated {
+                assert!(img_spawn::smss_copyout(A_STACK_BASE, &CALLER_STACK_BASE.to_le_bytes())
+                    && img_spawn::smss_copyout(A_STACK_SIZE, &0u64.to_le_bytes()));
+                assert_eq!(sysc!(SSN_NT_FREE_VM, &[
+                    h_target, A_STACK_BASE, A_STACK_SIZE, u64::from(nt_address_space::MEM_RELEASE),
+                ]), 0, "diagnostic retains target context until real caller VAD release succeeds");
+            }
+            if let Some(previous) = saved_target_proc {
+                assert!(process_vm_region_map(test_pi).is_some_and(|map| map.extent_count() == 0));
+                let (_, failed) = process_user_page_tables_release(test_pi, &mut nt_handler);
+                assert_eq!(failed, 0, "diagnostic retains charged target page tables on failure");
+                if let Some(accounting) = nt_handler.process_commit.accounting(target) {
+                    assert_eq!(accounting.current_bytes, 0);
+                    assert_eq!(nt_handler.process_commit.unregister(target), Some(accounting));
+                }
+                let ctx = nt_handler.loop_ctx.expect("diagnostic target retains its paging context");
+                assert_eq!((&*ctx.procs)[test_pi].pml4, target_pml4);
+                (&mut *ctx.procs)[test_pi] = previous;
             }
             if let Some(claim) = brk_test_claim {
                 let _ = csrss_frame_take(test_pi as u64, SMSS_PEB_VA);
@@ -22957,6 +23001,21 @@ unsafe fn spawn_requested_local_thread(
     procs: &[ProcExec],
     fault_ep: u64,
 ) -> Result<(), u32> {
+    let (publication, start, stack_origin) = match request {
+        HostedThreadSpawnRequest::Multiplexed { publication, start, initial_teb, .. }
+        | HostedThreadSpawnRequest::Winlogon { publication, start, initial_teb, .. } =>
+            (publication, start, ThreadStackOrigin::Caller(initial_teb)),
+        HostedThreadSpawnRequest::TpWorker { publication, start, stack_origin, .. } =>
+            (publication, start, stack_origin),
+    };
+    if let ThreadStackOrigin::Caller(initial_teb) = stack_origin {
+        if let Err(status) = nt_handler.validate_hosted_caller_stack(
+            publication.owner_pi, start, initial_teb,
+        ) {
+            nt_handler.abort_unbuilt_hosted_thread_request(publication);
+            return Err(status);
+        }
+    }
     match request {
         HostedThreadSpawnRequest::Multiplexed {
             kind,
@@ -23105,6 +23164,7 @@ unsafe fn spawn_requested_local_thread(
             pi,
             slot,
             start,
+            stack_origin,
             publication,
         } => {
             if pi < MAX_PI && slot < TP_WORKER_SLOT_COUNT {
@@ -23114,6 +23174,7 @@ unsafe fn spawn_requested_local_thread(
                     slot,
                     procs[pi].pml4,
                     start,
+                    stack_origin,
                     publication,
                     fault_ep,
                 )
@@ -23133,6 +23194,7 @@ unsafe fn spawn_requested_tp_worker(
     worker_slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    stack_origin: ThreadStackOrigin,
     publication: PreparedHostedThreadPublication,
     fault_ep: u64,
 ) -> Result<(), u32> {
@@ -23168,6 +23230,7 @@ unsafe fn spawn_requested_tp_worker(
         worker_slot,
         pml4,
         start,
+        stack_origin,
         cid_proc,
         tid,
         fault_ep,
@@ -23234,6 +23297,16 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
     }
     let badge = tp_worker_badge(request.target_pi, request.slot);
     let role = HostedThreadRole::TpWorker { slot: request.slot };
+    if let ThreadStackOrigin::Caller(initial_teb) = request.stack_origin {
+        if let Err(status) = nt_handler.validate_hosted_caller_stack(
+            request.target_pi, request.start, initial_teb,
+        ) {
+            nt_handler.abort_unbuilt_hosted_thread_publication(
+                request.publication, request.target_pi, badge, role,
+            );
+            return Err(status);
+        }
+    }
     let runtime_publication = match nt_handler.prepare_hosted_thread_runtime_publication(
         request.target_pi, request.cid_thread, badge, role,
     ) {
@@ -23250,6 +23323,7 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
             slot: request.slot,
             pml4: request.pml4,
             start: request.start,
+            stack_origin: request.stack_origin,
             cid_proc: request.cid_proc,
             cid_thread: request.cid_thread,
             fault_ep: ThreadFaultEndpoint::Badged { source: fault_ep, badge },
@@ -23285,58 +23359,24 @@ pub(crate) unsafe fn spawn_requested_remote_thread(
 /// loop makes. Parked-I/O delivery temporarily switches to the parked thread's context.
 #[inline]
 fn mirror_ctx_for(badge: u64, pi: usize) -> (u64, u64, u64, u64, u64) {
-    let (stack_base, stack_frames, stack_mirror) =
+    let (stack_base, stack_frames) =
+        crate::hosted_thread_runtime::hosted_thread_fixed_stack_geometry(pi, badge);
+    let stack_mirror =
         if let Some((tp_pi, tp_slot)) = tp_worker_identity_from_badge(badge) {
             debug_assert_eq!(tp_pi, pi);
-            (
-                tp_worker_stack_base(tp_slot),
-                TP_WORKER_STACK_FRAMES,
-                tp_worker_stack_mirror_va(tp_pi, tp_slot),
-            )
+            tp_worker_stack_mirror_va(tp_pi, tp_slot)
         } else {
             match badge {
-                SVC_LISTENER_BADGE => (
-                    SVC_LISTENER_STACK_BASE,
-                    SVC_LISTENER_STACK_FRAMES,
-                    SVC_LISTENER_STACK_MIRROR_VA,
-                ),
-                LSASS_LISTENER_BADGE => (
-                    LSASS_LISTENER_STACK_BASE,
-                    LSASS_LISTENER_STACK_FRAMES,
-                    LSASS_LISTENER_STACK_MIRROR_VA,
-                ),
-                LSASS_LISTENER2_BADGE => (
-                    LSASS_LISTENER2_STACK_BASE,
-                    LSASS_LISTENER2_STACK_FRAMES,
-                    LSASS_LISTENER2_STACK_MIRROR_VA,
-                ),
-                LSASS_LISTENER3_BADGE => (
-                    LSASS_LISTENER3_STACK_BASE,
-                    LSASS_LISTENER3_STACK_FRAMES,
-                    LSASS_LISTENER3_STACK_MIRROR_VA,
-                ),
-                WINLOGON_WORKER2_BADGE => (
-                    WL_WORKER2_STACK_BASE,
-                    WL_WORKER2_STACK_FRAMES,
-                    WINLOGON_WORKER2_STACK_MIRROR_VA,
-                ),
-                WINLOGON_WORKER3_BADGE => (
-                    WL_WORKER3_STACK_BASE,
-                    WL_WORKER3_STACK_FRAMES,
-                    WINLOGON_WORKER3_STACK_MIRROR_VA,
-                ),
-                WINLOGON_WORKER_BADGE => (
-                    WL_LISTENER_STACK_BASE,
-                    WL_LISTENER_STACK_FRAMES,
-                    WINLOGON_WORKER_STACK_MIRROR_VA,
-                ),
+                SVC_LISTENER_BADGE => SVC_LISTENER_STACK_MIRROR_VA,
+                LSASS_LISTENER_BADGE => LSASS_LISTENER_STACK_MIRROR_VA,
+                LSASS_LISTENER2_BADGE => LSASS_LISTENER2_STACK_MIRROR_VA,
+                LSASS_LISTENER3_BADGE => LSASS_LISTENER3_STACK_MIRROR_VA,
+                WINLOGON_WORKER2_BADGE => WINLOGON_WORKER2_STACK_MIRROR_VA,
+                WINLOGON_WORKER3_BADGE => WINLOGON_WORKER3_STACK_MIRROR_VA,
+                WINLOGON_WORKER_BADGE => WINLOGON_WORKER_STACK_MIRROR_VA,
                 _ => {
                     // A top-level process MAIN thread — keyed by pi like the loop's default arm.
-                    (
-                        STACK_BASE,
-                        STACK_FRAMES,
-                        hosted_main_stack_mirror_for_pi(pi),
-                    )
+                    hosted_main_stack_mirror_for_pi(pi)
                 }
             }
         };

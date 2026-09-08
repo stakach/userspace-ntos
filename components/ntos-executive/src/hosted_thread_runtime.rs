@@ -791,6 +791,32 @@ impl HostedThreadRuntimeTable {
 
 static mut HOSTED_THREAD_RUNTIME_WORK: HostedThreadRuntimeTable = HostedThreadRuntimeTable::new();
 
+/// Read-only shortcut geometry from an executable runtime's actual fixed-stack inventory.
+/// Missing, pending, unmirrored and caller-stack runtimes expose no fixed mirror range. As with
+/// the memory exclusion queries, no allocation, IPC or callbacks may occur during this borrow.
+pub(crate) fn hosted_thread_fixed_stack_geometry(pi: usize, badge: u64) -> (u64, u64) {
+    let table = unsafe { &*core::ptr::addr_of!(HOSTED_THREAD_RUNTIME_WORK) };
+    let Some(runtime) = table.executable_by_badge(badge)
+        .filter(|runtime| runtime.pi == pi && runtime.resources.client_pi == pi)
+    else {
+        return (0, 0);
+    };
+    let resources = &runtime.resources;
+    let Some(layout) = resources.layout() else {
+        return (0, 0);
+    };
+    let frames = resources.stack_frames();
+    if frames == 0 || resources.has_unlocated_capabilities()
+        || (0..frames as usize).any(|index| {
+            resources.stack_owner[index] <= 1 || resources.stack_target[index] <= 1
+                || resources.stack_mirror[index] <= 1
+        })
+    {
+        return (0, 0);
+    }
+    (layout.stack().base, frames)
+}
+
 /// Deny-only query for ordinary memory paths, including copies already borrowing ExecNtHandler.
 /// No allocation, IPC or callbacks may occur during this short table borrow. Cleanup backends
 /// holding a mutable slot must use retained capabilities directly, never recurse through here.

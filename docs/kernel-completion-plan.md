@@ -301,9 +301,9 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   release before replacing its legacy destructor. The NT5 opt-in policy is now enforced by both
   the native entry and prepared charge owner. Validate those boundaries with live failures;
   host tests and a successful build are not runtime acceptance.
-- [~] Correct thread startup and stack semantics. Checked startup capture and host stack-VAD
-  planning are implemented. Preserve full caller context and existing stack through additional and
-  first-thread creation; remove fixed-stack substitution, old first-thread PI-bit tracking and both
+- [~] Correct thread startup and stack semantics. Checked startup capture, host stack-VAD planning,
+  and preservation of existing caller stacks for additional threads are implemented. Preserve full
+  caller context and wire first-thread creation; remove old first-thread PI-bit tracking and both
   adjacent-page growth branches at their proper cutovers. Implement guarded VAD growth with exact
   accounting, TEB publication, retained failure state and genuine user exception delivery.
 - [ ] Replace native image unmap with transactional detach and fault/native-copy exclusion while
@@ -30266,6 +30266,40 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     identity bypass. The active legacy caller reports a failed optional MEM_RELEASE once and leaves
     remaining VAD/backing ownership with the process; it does not yet retain an ordinary teardown
     retry owner. The prepared charge engine does retain its request. No new NT boot or desktop proof.
+
+    B3 caller-stack startup tranche 147 (2026-09-09, accepted startup slice): carry explicit caller
+    versus constructor stack origin through local, role-specific and remote additional-thread
+    requests. Validate the target's real private VAD before publication and revalidate before
+    construction. Failure to retain supplied stack bounds aborts the exact unbuilt publication.
+    Remove the unconditional generic-worker RSP/INITIAL_TEB substitution. Caller entries allocate
+    only new transport/TEB resources, with zero stack frames in their physical inventory and no
+    second stack commitment. Reject any new transport geometry overlapping an existing VAD,
+    including reserved pages. Constructor-owned NtCreateThreadEx/internal entries remain explicit;
+    they are not a fallback for invalid or absent caller stacks.
+
+    Preserve existing TEB alias placement independently of owned stack size. Fixed stack mirror
+    shortcuts now require the exact executable runtime's backing and alias capabilities; absent,
+    pending, caller-stack and mismatched runtimes expose no shortcut range. Their memory is resolved
+    through recorded backing and checked VM residency instead. Release skips the empty constructor
+    stack range and leaves caller VAD ownership with its process until an authorized MEM_RELEASE.
+
+    Loader entry runs on the caller's stack and restores the original four-register projection
+    afterward; a missing required loader export fails construction. Explicit diagnostic direct
+    entry uses a tested jump trampoline that preserves exact RSP and does not push a return address
+    or reserve home space. The remote-breakin diagnostic now publishes its real temporary paging
+    context, allocates a stack through NtAllocateVirtualMemory, and releases it through
+    NtFreeVirtualMemory before retiring charged page tables and the temporary context. There is no
+    fabricated VAD or caller-to-constructor downgrade. Its broader legacy teardown remains pending.
+
+    This is not full CONTEXT restoration or first-child activation. Loader guard faults still need
+    the planned native guarded-VAD cutover and genuine exception delivery. The strict 27-import
+    boot frontier is unchanged; no NT boot has been performed for this slice.
+
+    Serialized validation passes 1,333 unit tests, 49 integration tests and 12 compile-fail checks
+    in .tmp/test-caller-stack-startup-20260909.log. Native release build passes in
+    .tmp/build-caller-stack-startup-final-20260909.log (292 warnings). Independent source review
+    found no new constructor ownership or zero-stack cleanup issue. Live debugger, guard growth,
+    and desktop acceptance remain open.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

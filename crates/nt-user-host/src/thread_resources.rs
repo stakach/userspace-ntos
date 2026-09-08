@@ -61,7 +61,7 @@ impl ThreadMemoryLayout {
         )
     }
 
-    /// Main-thread transport memory when its real user stack belongs to the private VAD.
+    /// Thread transport memory when its real user stack belongs to the private VAD.
     /// No stack backing or address range is transferred into this layout.
     pub const fn without_stack(ipc_base: u64, teb_base: u64, trampoline_base: u64) -> Option<Self> {
         Self::with_stack_range(

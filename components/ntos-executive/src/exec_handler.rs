@@ -15269,23 +15269,29 @@ impl ExecNtHandler {
         }
         status
     }
-    /// ★ CROSS-VSPACE `NtCreateThread` — a genuine ADDITIONAL thread inside a FOREIGN process
-    /// (`RtlCreateUserThread(ProcessHandle != NtCurrentProcess)`; `DbgUiIssueRemoteBreakin`'s
-    /// break-in thread is the first real user). This is the POLICY half of `PspCreateThread`:
-    ///
-    /// 1. **Access check** — creating a thread in another process is a privileged capability
-    ///    operation, so the `ProcessHandle` is re-resolved through `resolve_process_for_access`
-    ///    demanding `PROCESS_CREATE_THREAD` (0x0002). A handle without it is `STATUS_ACCESS_DENIED`,
-    ///    an unknown handle `STATUS_INVALID_HANDLE` — never an ambient side effect.
-    /// 2. The target must be ALIVE with a published hosted VSpace, and not exiting.
-    /// 3. The start context (`CONTEXT.Rip` = start routine, `.Rcx` = parameter) is read out of the
-    ///    caller's `ThreadContext` argument — this is what makes the created thread the RIGHT
-    ///    thread rather than "some thread somewhere".
-    /// 4. A real ETHREAD is claimed from the **TARGET's** pool (the thread belongs to the target),
-    ///    its TEB VA bound, and a TYPED `Thread(tid)` handle minted in the **CALLER's** table.
-    /// 5. `*ThreadHandle` / `*ClientId {target pid, new tid}` out-params are queued.
-    /// 6. The MECHANISM (the seL4 thread in the target's VSpace) is requested from the loop, which
-    ///    owns the main fault endpoint the new thread is badged onto.
+    /// Admission validates the target's existing private VAD without acquiring stack ownership.
+    pub(crate) unsafe fn validate_hosted_caller_stack(
+        &self,
+        target_pi: usize,
+        start: nt_thread_start::Amd64ThreadContext,
+        initial_teb: nt_thread_start::InitialTeb64,
+    ) -> Result<(), u32> {
+        let pid = self.pm_pid_for_pi(target_pi).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        let process = self.pm.process(pid).ok_or(nt_process::STATUS_INVALID_HANDLE)?;
+        if matches!(process.state,
+            nt_process::ProcessState::Exiting | nt_process::ProcessState::Terminated)
+            || self.hosted_process_vspace(target_pi).is_none()
+        {
+            return Err(nt_process::STATUS_PROCESS_IS_TERMINATING);
+        }
+        let map = process_vm_region_map(target_pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        nt_thread_start::stack_vad::validate_existing(map, initial_teb, start.rsp)
+            .map(|_| ())
+            .map_err(|_| nt_process::STATUS_INVALID_PARAMETER)
+    }
+
+    /// Prepare an additional thread in the access-checked target. Its existing caller stack is
+    /// preserved; the service loop constructs only the thread's new mechanism and TEB resources.
     unsafe fn create_remote_thread(
         &mut self,
         args: &[u64],
@@ -15339,6 +15345,9 @@ impl ExecNtHandler {
         if start.rip == 0 {
             reject!(b"null-start-address", STATUS_INVALID_PARAMETER);
         }
+        if let Err(status) = self.validate_hosted_caller_stack(target_pi, start, initial_teb) {
+            reject!(b"caller-stack", status);
+        }
         let create_suspended = nt_boolean_arg(args[NT_CREATE_THREAD_CREATE_SUSPENDED_ARG]);
         // The bounded per-process thread windows are a shared resource with the ntdll thread-pool
         // workers — one window per extra thread of that process.
@@ -15365,12 +15374,16 @@ impl ExecNtHandler {
             self.abort_hosted_thread_publication(publication);
             reject!(b"reserve-thread-slot", STATUS_INSUFFICIENT_RESOURCES);
         }
-        let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
+        if !self.remember_hosted_thread_user_stack(tid, initial_teb) {
+            self.abort_unbuilt_hosted_thread_request(publication);
+            return nt_process::STATUS_INVALID_PARAMETER;
+        }
         self.remote_thread_request = Some(RemoteThreadRequest {
             target_pi,
             slot,
             pml4,
             start,
+            stack_origin: ThreadStackOrigin::Caller(initial_teb),
             cid_proc: target_pid as u64,
             cid_thread: tid,
             resume: !create_suspended,
@@ -15515,6 +15528,7 @@ impl ExecNtHandler {
             pi: target_pi,
             slot,
             start,
+            stack_origin: ThreadStackOrigin::ConstructorStack,
             publication,
         });
 
@@ -15889,7 +15903,10 @@ impl ExecNtHandler {
             self.abort_hosted_thread_publication(publication);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        let _ = self.remember_hosted_thread_user_stack(publication.tid(), initial_teb);
+        if !self.remember_hosted_thread_user_stack(publication.tid(), initial_teb) {
+            self.abort_unbuilt_hosted_thread_request(publication);
+            return nt_process::STATUS_INVALID_PARAMETER;
+        }
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::Multiplexed {
             kind: spec.spawn_kind,
             start,
@@ -16121,11 +16138,15 @@ impl ExecNtHandler {
             self.abort_hosted_thread_publication(publication);
             return Some(0xC000_009A);
         }
-        let _ = self.remember_hosted_thread_user_stack(tid, initial_teb);
+        if !self.remember_hosted_thread_user_stack(tid, initial_teb) {
+            self.abort_unbuilt_hosted_thread_request(publication);
+            return Some(nt_process::STATUS_INVALID_PARAMETER);
+        }
         self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
             pi: self.pi,
             slot: tp_slot,
             start,
+            stack_origin: ThreadStackOrigin::Caller(initial_teb),
             publication,
         });
         print_str(b"[tp-worker] claimed pi=");
@@ -17765,18 +17786,9 @@ impl ExecNtHandler {
     pub(crate) unsafe fn prepare_hosted_thread_commitment(
         &mut self,
         pi: usize,
-        stack_base: u64,
-        stack_frames: u64,
-        teb_va: u64,
+        layout: nt_user_host::thread_resources::ThreadMemoryLayout,
     ) -> Result<PreparedHostedThreadCommitment, u32> {
-        let stack_size = stack_frames
-            .checked_mul(nt_address_space::PAGE_SIZE)
-            .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
-        if pi >= MAX_PI
-            || stack_size == 0
-            || stack_base & (nt_address_space::PAGE_SIZE - 1) != 0
-            || teb_va & (nt_address_space::PAGE_SIZE - 1) != 0
-        {
+        if pi >= MAX_PI {
             return Err(nt_process::STATUS_INVALID_PARAMETER);
         }
         let pid = self
@@ -17784,17 +17796,31 @@ impl ExecNtHandler {
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
         let mut mappings = process_committed_mapping_snapshot(pi as u64)
             .ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        // Transport geometry must not replace any caller VAD, including reserved pages.
+        let vad = process_vm_region_map(pi).ok_or(nt_process::STATUS_INVALID_PARAMETER)?;
+        for range in layout.ranges() {
+            if range.size != 0 && (vad.extent_at(range.base).is_some()
+                || vad.next_extent_base_after(range.base)
+                    .is_some_and(|next| next < range.base + range.size))
+            {
+                return Err(nt_address_space::STATUS_CONFLICTING_ADDRESSES);
+            }
+        }
+        let stack = layout.stack();
+        if stack.size != 0 {
+            mappings.register(nt_address_space::VmCommittedRange::private(
+                stack.base,
+                stack.size,
+                nt_address_space::PAGE_READWRITE,
+            ))?;
+        }
+        let teb = layout.teb();
         mappings.register(nt_address_space::VmCommittedRange::private(
-            stack_base,
-            stack_size,
+            teb.base,
+            teb.size,
             nt_address_space::PAGE_READWRITE,
         ))?;
-        mappings.register(nt_address_space::VmCommittedRange::private(
-            teb_va,
-            3 * nt_address_space::PAGE_SIZE,
-            nt_address_space::PAGE_READWRITE,
-        ))?;
-        let bytes = stack_size + 3 * nt_address_space::PAGE_SIZE;
+        let bytes = stack.size + teb.size;
         let charge = self.prepare_process_commit_charge(pid, pi, bytes)?;
         Ok(PreparedHostedThreadCommitment { charge, mappings })
     }
@@ -17826,7 +17852,7 @@ impl ExecNtHandler {
         };
         let mut after = before;
         let stack_size = resources.stack_frames() * nt_address_space::PAGE_SIZE;
-        let stack_removed = after
+        let stack_removed = stack_size != 0 && after
             .unregister_range(resources.stack_base(), stack_size)
             .is_ok_and(|count| count != 0);
         let teb_removed = after
@@ -37295,6 +37321,16 @@ impl ExecNtHandler {
                     Ok(stack) => stack,
                     Err(error) => return error.status(),
                 };
+                // Existing caller VADs are validated without reservation or a second charge.
+                // Foreign additional threads validate against their resolved target below; the
+                // pre-created foreign main-thread path remains a separate activation gap.
+                if args[3] == u64::MAX {
+                    if let Err(status) = unsafe {
+                        self.validate_hosted_caller_stack(self.pi, start, initial_stack)
+                    } {
+                        return status;
+                    }
+                }
                 // CSRSS creates two suspended server workers during initialization. Back both with
                 // real ETHREADs and typed handles so ReactOS's NtResumeThread calls control their
                 // actual TCBs. Slot 0 is CsrApiRequestThread; slot 1 is CsrSbApiRequestThread.
@@ -37337,11 +37373,15 @@ impl ExecNtHandler {
                                 self.abort_hosted_thread_publication(publication);
                                 return 0xC000_009A;
                             }
-                            let _ = self.remember_hosted_thread_user_stack(tid, initial_stack);
+                            if !self.remember_hosted_thread_user_stack(tid, initial_stack) {
+                                self.abort_unbuilt_hosted_thread_request(publication);
+                                return nt_process::STATUS_INVALID_PARAMETER;
+                            }
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::TpWorker {
                                 pi: self.pi,
                                 slot,
                                 start,
+                                stack_origin: ThreadStackOrigin::Caller(initial_stack),
                                 publication,
                             });
                             print_str(b"[csr-thread] create slot=");
@@ -37530,7 +37570,10 @@ impl ExecNtHandler {
                                 self.abort_hosted_thread_publication(publication);
                                 return 0xC000_009A;
                             }
-                            let _ = self.remember_hosted_thread_user_stack(tid, initial_stack);
+                            if !self.remember_hosted_thread_user_stack(tid, initial_stack) {
+                                self.abort_unbuilt_hosted_thread_request(publication);
+                                return nt_process::STATUS_INVALID_PARAMETER;
+                            }
                             self.thread_spawn_request = Some(HostedThreadSpawnRequest::Winlogon {
                                 slot,
                                 start,

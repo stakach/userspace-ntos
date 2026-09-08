@@ -58,6 +58,7 @@ pub const INITIAL_TEB_STACK_LIMIT_OFFSET: u64 = 0x18;
 pub const INITIAL_TEB_ALLOCATED_STACK_BASE_OFFSET: u64 = 0x20;
 
 pub const CALL_TRAMPOLINE_LEN: usize = 42;
+pub const JUMP_TRAMPOLINE_LEN: usize = 42;
 pub const LOADER_TRAMPOLINE_LEN: usize = 93;
 pub const AMD64_HW_BREAKPOINT_SLOTS: usize = 4;
 pub const AMD64_DR6_INITIAL: u64 = 0xFFFF_0FF0;
@@ -156,6 +157,23 @@ impl Amd64ThreadContext {
         code[34..36].copy_from_slice(&[0xff, 0xd0]);
         code[36..40].copy_from_slice(&[0x48, 0x83, 0xc4, 0x20]);
         code[40..42].copy_from_slice(&[0xeb, 0xfe]);
+        code
+    }
+
+    /// Enter the captured four-register projection directly, preserving its exact stack pointer.
+    /// RAX is the jump scratch register; this does not restore a complete native CONTEXT.
+    /// Unlike constructor entry, this neither pushes a return address nor reserves home space.
+    pub fn jump_trampoline(self) -> [u8; JUMP_TRAMPOLINE_LEN] {
+        let mut code = [0u8; JUMP_TRAMPOLINE_LEN];
+        code[0..2].copy_from_slice(&[0x48, 0xb9]); // movabs rcx
+        code[2..10].copy_from_slice(&self.rcx.to_le_bytes());
+        code[10..12].copy_from_slice(&[0x48, 0xba]); // movabs rdx
+        code[12..20].copy_from_slice(&self.rdx.to_le_bytes());
+        code[20..22].copy_from_slice(&[0x48, 0xbc]); // movabs rsp
+        code[22..30].copy_from_slice(&self.rsp.to_le_bytes());
+        code[30..32].copy_from_slice(&[0x48, 0xb8]); // movabs rax
+        code[32..40].copy_from_slice(&self.rip.to_le_bytes());
+        code[40..42].copy_from_slice(&[0xff, 0xe0]); // jmp rax
         code
     }
 
@@ -765,6 +783,47 @@ mod tests {
             7,
             8,
         ));
+    }
+
+    #[test]
+    fn jump_trampoline_restores_exact_registers_without_call_or_stack_adjustment() {
+        let context = Amd64ThreadContext {
+            rip: 0x8877_6655_4433_2211,
+            rsp: 0x1234_5678_9abc_def3,
+            rcx: 0x1020_3040_5060_7080,
+            rdx: 0xfeed_face_cafe_beef,
+        };
+        let code = context.jump_trampoline();
+        assert_eq!(code.len(), 42);
+        for (offset, opcode, value) in [
+            (0, [0x48, 0xb9], context.rcx),
+            (10, [0x48, 0xba], context.rdx),
+            (20, [0x48, 0xbc], context.rsp),
+            (30, [0x48, 0xb8], context.rip),
+        ] {
+            assert_eq!(&code[offset..offset + 2], &opcode);
+            assert_eq!(
+                u64::from_le_bytes(code[offset + 2..offset + 10].try_into().unwrap()),
+                value
+            );
+        }
+        assert_eq!(&code[40..], &[0xff, 0xe0]);
+    }
+
+    #[test]
+    fn jump_trampoline_encodes_zero_and_full_width_fields_without_policy() {
+        for value in [0, u64::MAX] {
+            let code = Amd64ThreadContext {
+                rip: value,
+                rsp: value,
+                rcx: value,
+                rdx: value,
+            }.jump_trampoline();
+            for offset in [2, 12, 22, 32] {
+                assert_eq!(&code[offset..offset + 8], &value.to_le_bytes());
+            }
+            assert_eq!(&code[40..], &[0xff, 0xe0]);
+        }
     }
 
     #[test]

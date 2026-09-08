@@ -58,7 +58,7 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
-            loader_context: Some(loader_context),
+            user_context: Some(loader_context),
             scr,
             teb_va,
             stack_base,
@@ -81,25 +81,24 @@ pub(crate) unsafe fn spawn_wl_listener_thread(
 fn hosted_loader_thread_context(
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
-) -> Option<LoaderThreadContext> {
+) -> Option<HostedUserThreadContext> {
     let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
-    (loader_rva != 0).then_some(LoaderThreadContext {
-        loader_va: NTDLL_BASE + loader_rva,
+    (loader_rva != 0).then_some(HostedUserThreadContext {
+        loader_va: Some(NTDLL_BASE + loader_rva),
         start,
         initial_teb,
+        stack_origin: ThreadStackOrigin::Caller(initial_teb),
     })
 }
 
-/// Spawn the one bounded generic ntdll thread-pool worker assigned to `pi`. The caller-supplied
-/// stack allocation is not mapped into this userspace kernel, so normalize both INITIAL_TEB and
-/// CONTEXT.Rsp to the fixed 16-page worker stack before entering LdrInitializeThunk. The original
-/// RIP/RCX/RDX remain intact and are restored by the loader trampoline.
+/// Spawn a generic worker with the stack ownership selected at syscall admission.
 pub(crate) unsafe fn spawn_tp_worker_thread(
     handler: &mut ExecNtHandler,
     pi: usize,
     worker_slot: usize,
     pml4: u64,
     start: nt_thread_start::Amd64ThreadContext,
+    stack_origin: ThreadStackOrigin,
     cid_proc: u64,
     cid_thread: u64,
     main_fault_ep: u64,
@@ -117,6 +116,7 @@ pub(crate) unsafe fn spawn_tp_worker_thread(
             slot: worker_slot,
             pml4,
             start,
+            stack_origin,
             cid_proc,
             cid_thread,
             fault_ep: ThreadFaultEndpoint::Badged {
@@ -140,6 +140,7 @@ pub(crate) struct RemoteThreadSpawn {
     pub pml4: u64,
     /// Caller-supplied start context: `rip` = the start routine, `rcx` = its parameter.
     pub start: nt_thread_start::Amd64ThreadContext,
+    pub stack_origin: ThreadStackOrigin,
     /// The `ClientId` stamped into the new thread's TEB.
     pub cid_proc: u64,
     pub cid_thread: u64,
@@ -179,6 +180,7 @@ pub(crate) unsafe fn spawn_slot_thread(
         slot,
         pml4,
         mut start,
+        stack_origin,
         cid_proc,
         cid_thread,
         fault_ep,
@@ -188,24 +190,32 @@ pub(crate) unsafe fn spawn_slot_thread(
     if target_pi >= MAX_PI || slot >= TP_WORKER_SLOT_COUNT || pml4 == 0 || !fault_ep.is_valid() {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
-    let loader_context = if use_loader {
+    let loader_va = if use_loader {
         let loader_rva = img_spawn::OUR_LDR_INITIALIZE_THUNK_RVA.load(Ordering::Relaxed);
         if loader_rva == 0 {
             return Err(HostedThreadSpawnFailure::Unstarted);
         }
-        // The caller-supplied stack allocation is not mapped into this userspace kernel, so
-        // normalize both INITIAL_TEB and CONTEXT.Rsp to the fixed 16-page slot stack before entering
-        // LdrInitializeThunk. The original RIP/RCX/RDX remain intact and are restored by the loader
-        // trampoline. ReactOS amd64 RtlInitializeContext: (StackBase - 6 pointers), align 16, -8.
-        start.rsp = tp_worker_context_rsp(slot);
-        Some(LoaderThreadContext {
-            loader_va: NTDLL_BASE + loader_rva,
+        Some(NTDLL_BASE + loader_rva)
+    } else {
+        None
+    };
+    let user_context = if use_loader || matches!(stack_origin, ThreadStackOrigin::Caller(_)) {
+        let initial_teb = match stack_origin {
+            ThreadStackOrigin::Caller(initial_teb) => initial_teb,
+            ThreadStackOrigin::ConstructorStack => {
+                start.rsp = tp_worker_context_rsp(slot);
+                nt_thread_start::InitialTeb64 {
+                    stack_base: tp_worker_stack_top(slot),
+                    stack_limit: tp_worker_stack_base(slot),
+                    allocated_stack_base: tp_worker_stack_base(slot),
+                }
+            }
+        };
+        Some(HostedUserThreadContext {
+            loader_va,
             start,
-            initial_teb: nt_thread_start::InitialTeb64 {
-                stack_base: tp_worker_stack_top(slot),
-                stack_limit: tp_worker_stack_base(slot),
-                allocated_stack_base: tp_worker_stack_base(slot),
-            },
+            initial_teb,
+            stack_origin,
         })
     } else {
         None
@@ -218,7 +228,7 @@ pub(crate) unsafe fn spawn_slot_thread(
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
-            loader_context,
+            user_context,
             scr: tp_worker_env_scratch_va(target_pi, slot),
             teb_va: tp_worker_teb_va(slot),
             stack_base: tp_worker_stack_base(slot),
@@ -260,7 +270,7 @@ pub(crate) unsafe fn spawn_svc_listener_thread(
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
-            loader_context: Some(loader_context),
+            user_context: Some(loader_context),
             scr: SVC_LISTENER_ENV_SCRATCH_VA,
             teb_va: SVC_LISTENER_TEB_VA,
             stack_base: SVC_LISTENER_STACK_BASE,
@@ -305,7 +315,7 @@ pub(crate) unsafe fn spawn_lsass_listener_thread(
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
-            loader_context: Some(loader_context),
+            user_context: Some(loader_context),
             scr: LSASS_LISTENER_ENV_SCRATCH_VA,
             teb_va: LSASS_LISTENER_TEB_VA,
             stack_base: LSASS_LISTENER_STACK_BASE,
@@ -350,7 +360,7 @@ pub(crate) unsafe fn spawn_lsass_listener2_thread(
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
-            loader_context: Some(loader_context),
+            user_context: Some(loader_context),
             scr: LSASS_LISTENER2_ENV_SCRATCH_VA,
             teb_va: LSASS_LISTENER2_TEB_VA,
             stack_base: LSASS_LISTENER2_STACK_BASE,
@@ -394,7 +404,7 @@ pub(crate) unsafe fn spawn_lsass_listener3_thread(
             entry_rip: start.rip,
             arg0: start.rcx,
             arg1: start.rdx,
-            loader_context: Some(loader_context),
+            user_context: Some(loader_context),
             scr: LSASS_LISTENER3_ENV_SCRATCH_VA,
             teb_va: LSASS_LISTENER3_TEB_VA,
             stack_base: LSASS_LISTENER3_STACK_BASE,

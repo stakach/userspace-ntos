@@ -23116,6 +23116,7 @@ pub(crate) struct RemoteThreadRequest {
     pub pml4: u64,
     /// The caller-supplied start context (`rip` = start routine, `rcx` = parameter).
     pub start: nt_thread_start::Amd64ThreadContext,
+    pub stack_origin: ThreadStackOrigin,
     /// The new thread's `ClientId` — the TARGET's pid + the ETHREAD's tid.
     pub cid_proc: u64,
     pub cid_thread: u64,
@@ -23166,6 +23167,13 @@ enum HostedMultiplexedThreadKind {
     LsassListener { slot: usize },
 }
 
+/// Stack ownership is a creation policy, never inferred from a missing or zero RSP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ThreadStackOrigin {
+    Caller(nt_thread_start::InitialTeb64),
+    ConstructorStack,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedThreadSpawnRequest {
     Winlogon {
@@ -23184,6 +23192,7 @@ enum HostedThreadSpawnRequest {
         pi: usize,
         slot: usize,
         start: nt_thread_start::Amd64ThreadContext,
+        stack_origin: ThreadStackOrigin,
         publication: PreparedHostedThreadPublication,
     },
 }
@@ -25865,10 +25874,11 @@ unsafe fn spawn_thread_in(pml4: u64, entry: u64) -> u64 {
 /// `*_va`/`*_base` fields live in the TARGET process's VSpace (`pml4`) except `scr` and
 /// `stack_mirror_va`, which are in the EXECUTIVE's VSpace (`CAP_INIT_THREAD_VSPACE`).
 #[derive(Clone, Copy)]
-struct LoaderThreadContext {
-    loader_va: u64,
+struct HostedUserThreadContext {
+    loader_va: Option<u64>,
     start: nt_thread_start::Amd64ThreadContext,
     initial_teb: nt_thread_start::InitialTeb64,
+    stack_origin: ThreadStackOrigin,
 }
 
 /// Initial seL4 priority for every hosted Windows user thread.
@@ -25883,19 +25893,20 @@ struct HostedThread {
     /// The target process's VSpace (PML4) cap — the thread runs here, sharing the main thread's
     /// image/ntdll/PEB/KUSER mappings.
     pml4: u64,
-    /// Hosted-process index owning this address space. Non-zero GUI clients publish their stack
-    /// frames for win32k's per-client identity attach; zero is smss and has no win32k attachment.
+    /// Hosted-process index owning this address space and its client-frame registrations.
     client_pi: u64,
     /// The thread's instruction pointer and first two Windows x64 argument registers.
     entry_rip: u64,
     arg0: u64,
     arg1: u64,
-    /// Native loader initialization state. `None` retains the direct-entry trampoline.
-    loader_context: Option<LoaderThreadContext>,
+    /// Captured user entry; a missing loader selects explicit direct context restoration.
+    /// No user context denotes an internal constructor-stack entry.
+    user_context: Option<HostedUserThreadContext>,
     /// Executive-side scratch base (≥ 3 pages: TEB, TEB2/ACS, trampoline) used to write the env
     /// before the frames are mapped into `pml4`.
     scr: u64,
-    /// TEB base VA (2 pages), stack base VA + frame count, IPC buffer VA, trampoline VA — all in `pml4`.
+    /// Target geometry. Stack fields describe the constructor window; caller-stack entries do
+    /// not allocate it. Its size still determines the existing executive TEB alias placement.
     teb_va: u64,
     stack_base: u64,
     stack_frames: u64,
@@ -25925,14 +25936,7 @@ struct HostedThread {
     diag: bool,
 }
 
-/// Spawn a REAL 2nd (or Nth) thread in a hosted process's VSpace — the GENERAL hosted-thread
-/// mechanism behind `NtCreateThread`. It builds the full hosted-Windows-thread env (own TEB + GS
-/// base, StaticUnicodeString, an ACTIVATION_CONTEXT_STACK, an IPC buffer, the hosted-syscalls flag,
-/// a dedicated fault EP, a stack, an SC) — a trimmed `spawn_sec_image` (the image/ntdll/PEB/KUSER are
-/// already mapped, shared with the main thread) — then a trampoline that restores RCX/RDX and
-/// `call`s the context RIP (`call` keeps rsp ≡ 8 mod 16 at entry; the trailing jmp$ is a net).
-/// Returns an explicit construction outcome. This is the single path the SM-loop / CSR-API / RPC-listener
-/// spawns all express (see the thin wrappers below).
+/// Prepare executive paging for constructor scratch and the stable TEB alias window.
 unsafe fn ensure_hosted_thread_exec_alias_paging(t: &HostedThread, scr: u64) -> bool {
     let mut ok = true;
     if t.stack_mirror_va != 0 {
@@ -25955,12 +25959,9 @@ unsafe fn ensure_hosted_thread_exec_alias_paging(t: &HostedThread, scr: u64) -> 
     ok
 }
 
-fn hosted_thread_client_frame_keys_available(t: &HostedThread) -> bool {
-    if t.client_pi == 0 {
-        return true;
-    }
-    let mut page = t.stack_base;
-    for _ in 0..t.stack_frames {
+fn hosted_thread_client_frame_keys_available(t: &HostedThread, layout: ThreadMemoryLayout) -> bool {
+    let mut page = layout.stack().base;
+    for _ in 0..layout.stack().size / nt_address_space::PAGE_SIZE {
         if unsafe { (&*core::ptr::addr_of!(CLIENT_FRAME_REGISTRY)).get(t.client_pi, page) }
             .is_some()
         {
@@ -25988,6 +25989,8 @@ fn hosted_thread_client_frame_keys_available(t: &HostedThread) -> bool {
     true
 }
 
+/// Construct an additional thread's TEB, transport and mechanism. Caller stacks remain private
+/// VAD allocations; only explicitly constructor-owned entries allocate a fixed stack here.
 unsafe fn spawn_hosted_thread(
     handler: &mut ExecNtHandler,
     t: &HostedThread,
@@ -25995,9 +25998,24 @@ unsafe fn spawn_hosted_thread(
     if !t.fault_ep.is_valid() {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
-    let Some(layout) = ThreadMemoryLayout::new(
-        t.stack_base, t.stack_frames, t.ipcbuf_va, t.teb_va, t.tramp_va,
-    ) else {
+    let caller_stack = t.user_context.filter(|context| {
+        matches!(context.stack_origin, ThreadStackOrigin::Caller(_))
+    });
+    if let Some(context) = caller_stack {
+        if handler.validate_hosted_caller_stack(
+            t.client_pi as usize, context.start, context.initial_teb,
+        ).is_err() {
+            return Err(HostedThreadSpawnFailure::Unstarted);
+        }
+    }
+    let layout = if caller_stack.is_some() {
+        ThreadMemoryLayout::without_stack(t.ipcbuf_va, t.teb_va, t.tramp_va)
+    } else {
+        ThreadMemoryLayout::new(
+            t.stack_base, t.stack_frames, t.ipcbuf_va, t.teb_va, t.tramp_va,
+        )
+    };
+    let Some(layout) = layout else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
     let Some(resources) = HostedThreadResources::new(t.client_pi as usize, layout) else {
@@ -26008,14 +26026,12 @@ unsafe fn spawn_hosted_thread(
     ) else {
         return Err(HostedThreadSpawnFailure::Unstarted);
     };
-    if !hosted_thread_client_frame_keys_available(t) {
+    if !hosted_thread_client_frame_keys_available(t, layout) {
         return Err(HostedThreadSpawnFailure::Unstarted);
     }
     let prepared = match handler.prepare_hosted_thread_commitment(
         t.client_pi as usize,
-        t.stack_base,
-        t.stack_frames,
-        t.teb_va,
+        layout,
     ) {
         Ok(prepared) => prepared,
         Err(_) => return Err(HostedThreadSpawnFailure::Unstarted),
@@ -26062,11 +26078,11 @@ unsafe fn spawn_hosted_thread_mechanism(
     // rendezvous's out-param copyout. GUI-client stacks must also be discoverable by win32k's
     // KeStackAttachProcess model. Without this registration, a pointer to a worker's stack local
     // faults in win32k and is incorrectly backed by a fresh unrelated page.
-    for i in 0..t.stack_frames {
+    for i in 0..resources.stack_frames() {
         let index = i as usize;
         let f = memory_cap!(alloc_frame_r());
         resources.stack_owner[index] = f;
-        let page = t.stack_base + i * 0x1000;
+        let page = resources.stack_base() + i * 0x1000;
         let target_cap = memory_cap!(copy_thread_construction_cap(f));
         resources.stack_target[index] = target_cap;
         let target_map = page_map_r(target_cap, page, RW_NX, t.pml4);
@@ -26164,7 +26180,7 @@ unsafe fn spawn_hosted_thread_mechanism(
     core::ptr::write_volatile((scr + 0x40) as *mut u64, t.cid_proc);
     core::ptr::write_volatile((scr + 0x48) as *mut u64, t.cid_thread);
     core::ptr::write_volatile((scr + 0x60) as *mut u64, t.peb_va);
-    let (teb_stack_base, teb_stack_limit, deallocation_stack) = match t.loader_context {
+    let (teb_stack_base, teb_stack_limit, deallocation_stack) = match t.user_context {
         Some(loader) => (
             loader.initial_teb.stack_base,
             loader.initial_teb.stack_limit,
@@ -26293,7 +26309,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"\n");
         return failed!();
     }
-    // Trampoline: restore the Windows x64 thread-entry ABI, then call CONTEXT.Rip.
+    // User entry restores the captured context; internal entry calls a constructor function.
     let tramp = memory_cap!(alloc_frame_r());
     resources.tramp_owner = tramp;
     let e_tramp_exec_map = page_map_r(tramp, scr + 0x2000, RW_NX, CAP_INIT_THREAD_VSPACE);
@@ -26303,7 +26319,7 @@ unsafe fn spawn_hosted_thread_mechanism(
         print_str(b"\n");
         return failed!();
     }
-    if let Some(loader) = t.loader_context {
+    if let Some(loader) = t.user_context.filter(|context| context.loader_va.is_some()) {
         const CONTEXT_OFFSET: u64 = 0x1900;
         let context_scratch = scr + CONTEXT_OFFSET;
         let context_target = t.teb_va + CONTEXT_OFFSET;
@@ -26324,10 +26340,15 @@ unsafe fn spawn_hosted_thread_mechanism(
             loader.start.rip,
         );
         let tb = nt_thread_start::Amd64ThreadContext::loader_trampoline(
-            loader.loader_va,
+            loader.loader_va.expect("loader entry selected"),
             NTDLL_BASE,
             context_target,
         );
+        for (j, &b) in tb.iter().enumerate() {
+            core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
+        }
+    } else if let Some(context) = t.user_context {
+        let tb = context.start.jump_trampoline();
         for (j, &b) in tb.iter().enumerate() {
             core::ptr::write_volatile((scr + 0x2000 + j as u64) as *mut u8, b);
         }
@@ -26392,7 +26413,10 @@ unsafe fn spawn_hosted_thread_mechanism(
         return failed!();
     };
     construction.adopt_empty(Role::Tcb, tcb).expect("new TCB slot");
-    let new_sp = t.stack_base + t.stack_frames * 0x1000 - 16;
+    let new_sp = match t.user_context {
+        Some(context) => context.start.rsp & !15,
+        None => t.stack_base + t.stack_frames * 0x1000 - 16,
+    };
     let e_tcb = untyped_retype_r(CAP_INIT_UNTYPED, OBJ_TCB, 0, 1, tcb);
     if e_tcb != 0 { return failed!(); }
     construction.acknowledge_object(Role::Tcb, tcb).expect("retyped TCB");
