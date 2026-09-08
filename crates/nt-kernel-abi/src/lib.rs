@@ -15,6 +15,7 @@ mod device;
 mod driver;
 mod irp;
 pub mod ps_reactos_x64;
+pub mod security_client_x64;
 mod string;
 
 pub use device::{device_flags, device_type, DeviceObject};

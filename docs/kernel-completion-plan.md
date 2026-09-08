@@ -29280,7 +29280,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     real Device pointer broker outcomes and distinguish absent registration from zero caller refs.
     No desktop acceptance or completed native IRP bridge is claimed.
 
-    B3 producer device publication tranche 121 (2026-09-08, in progress):
+    B3 producer device publication tranche 121 (2026-09-08, complete):
 
     Pre-admit producer Device pointer registrations at canonical IoCreateDevice publication, imported
     PDO projection publication before AddDevice, and exact FDO binding replay. Retire drained
@@ -29289,11 +29289,104 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     a tracked rollback owner rather than an unpublished device or mapping. Use existing authenticated
     driver domain/address bindings, not a second identity table or executable-specific routing.
 
+    Review adjustment: AddDevice rollback currently continues to free native PDO/FDO projections
+    after failed unbinding or canonical deletion. Replace that error-accumulating cleanup with a
+    retained, pre-admitted rollback owner. Record exact registration generations and completed
+    phases; caller-reference blockers are retryable, but an ambiguous provider free reply must
+    remain owned and blocked rather than replaying a possibly completed free. Normal retirement
+    must release its registration anchor before checking canonical destruction readiness.
+
+    Implemented atomic binding/registration and checked retirement in nt-io-manager. Seven focused
+    tests cover replay generations, failed admission rollback, independent providers, caller and
+    detached references, collisions and multi-device detach ordering. Producer CREATE and imported
+    PDO publication now pre-admit anchors; FDO replay validates both exact registrations. Normal
+    retirement retains its original registration token across phases and retires the anchor before
+    canonical destruction. Replaced the raw driver bind/unbind paths.
+
+    Replaced rollback_uncommitted_add_device with the focused hosted_add_device_rollback module.
+    It reserves an owner before PDO acquisition and each created-device entry before canonical
+    acquisition, records every created FDO, and detaches all owned edges before attempting deletion.
+    CREATE attribution validates the actual primary channel and unbadged sender; conflicting worker
+    mutation is rejected rather than attributed by domain alone. Retained registry, power and shared
+    metadata survive uncertain dispatch. Same-provider/PDO/driver admission and retained global
+    dispatch-context fences prevent a subsequent attempt from overwriting outstanding authority.
+    Both ordinary unload and clear_instance refuse to reclaim a provider with a live rollback owner,
+    including uncertain PDO creation before a canonical pointer registration exists.
+
+    The real rollback census reports live, prepared, retiring and blocked attempts plus created and
+    retired projections. Unknown mutating outcomes remain blocked without replay; receipt-based
+    recovery is still required before those owners can be reclaimed. Device service request framing
+    is exact before mutation. A tested scalar reply decoder validates status width, reserved words
+    and operation-specific device identity shape; malformed replies must fail-stop before a CREATE
+    caller frees an already anchored projection or another mutator rewrites local state.
+
+    Serialized validation passes 325 I/O Manager tests and one ownership doctest in
+    `.tmp/test-producer-device-publication-20260908.log`, plus 22 I/O ABI tests including four new
+    mutation reply tests in `.tmp/test-device-mutation-replies-20260908.log`. The final 26-crate
+    regression passes 2,807 tests in `.tmp/test-producer-security-regression-20260908.log`. Native
+    release passes with unchanged 262 warnings in `.tmp/build-producer-security-20260908.log`.
+    Independent final review found no additional concrete ownership or framing blocker. These
+    checks do not constitute a desktop boot or complete producer Object Manager reference routing.
+
     Do not replace the generic hosted Obf reference no-ops with a Device-only success path. NPFS
     actually references File, Event and client Token objects; its current client-security constructor
     also returns a zeroed successful context. Those owners and exact caller authority must be wired
     before the generic producer reference export cutover. New producer pointer messages also need
     exact framing and worker authority, not just an instance lookup which ignores the sender badge.
+
+    B3 client-security ownership prerequisite tranche 122 (2026-09-08, complete):
+
+    Implement a non-clone, host-tested client-security context over the existing TokenStore. Carry
+    the authenticated effective source's thread role separately from the underlying token type:
+    dynamic impersonation can retain a primary token. Static tracking duplicates the complete token
+    and applies QoS EffectiveOnly at impersonation; dynamic tracking retains the original token and
+    combines source-thread and QoS EffectiveOnly. Enforce source-level and remote delegation rules,
+    capture real remote token-control identifiers, and retain independent ownership for prepared
+    server impersonation. Failed release must preserve the owner, including foreign-store errors.
+
+    This does not authorize the native security export cutover. NPFS passes IRP.Tail.Overlay.Thread
+    to SeCreateClientSecurity, but the producer currently fills that field with the same process
+    placeholder used by PsGetCurrentThread. Wire the retained ProviderIrpRequestor and genuine token
+    pointer lifetime/impersonation publication before replacing the zeroed-success context. The
+    native x64 SECURITY_CLIENT_CONTEXT is 0x48 bytes; the old stub only clears 0x40. Context deletion
+    and server-thread impersonation own separate token references. Keep primary-token dynamic
+    impersonation support explicit rather than silently weakening CapturedSubjectContext checks.
+
+    Implemented ClientSecurityContext and the independent ClientImpersonationReference with exact
+    TokenStore identity, static full duplication, dynamic original-token retention, source-role
+    validation, remote delegation restrictions and actual immutable token-control snapshots. The
+    local impersonation planner now uses QoS-only EffectiveOnly for static tracking. Existing native
+    static duplication callers already request the complete token and need no filtering change.
+    Ten focused tests and two non-clone doctests cover lifetime separation and failed ownership
+    operations. No prepared owner implies authorized server-thread assignment.
+
+    Added the separate nt-kernel-abi x64 context encoder with compile-time size/alignment/offset
+    assertions and five boundary tests. It writes all 72 bytes, requires real remote dynamic control
+    fields, and preserves the entire destination on invalid input or insufficient capacity. Focused
+    security/ABI validation passes 211 tests in `.tmp/test-client-security-abi-20260908.log`; combined
+    26-crate validation passes 2,807 tests in `.tmp/test-producer-security-regression-20260908.log`.
+    Native release passes with unchanged 262 warnings in `.tmp/build-producer-security-20260908.log`.
+    Existing TokenStore infallible clone/allocation and LUID-allocation limitations are not claimed
+    closed by this work.
+
+    Native requestor publication must retain actual provider-visible mappings as well as the Ps
+    reference. A root ETHREAD address is not proof that a dynamic thread's frames are mapped in the
+    provider; keep those mappings through pending IRP completion, requestor-list unlink and retirement.
+
+    Next review target: canonical File pointer references, independent of handle and IRP ownership.
+    NPFS waitsup.c retains WaitEntry->FileObject, completes the IRP in its timer callback, and only
+    then dereferences that File. Current deferred-close logic fences IRP references alone, so IRP
+    completion cannot be the final File lifetime authority. Add exact-manager, non-clone FileReference
+    ownership and gate CLOSE/record removal on both reference classes. Last-handle release must still
+    deliver CLEANUP; final pointer release queues allocation-safe outer-pump close work instead of
+    re-entering a driver synchronously from an Ob dereference broker.
+
+    Native File publication needs exact domain/address/FileId binding and allocation identity before
+    driver entry. Replace unchecked fo_release pool frees with checked retirement after canonical
+    CLOSE completion. Do not count a projection registration anchor as a semantic File reference:
+    registration survives until CLOSE, so using that anchor to gate CLOSE would deadlock lifetime
+    retirement. Keep projection/mapping pins distinct from caller pointer references. This is another
+    prerequisite, not permission to route generic File/Event/Token references as Device references.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

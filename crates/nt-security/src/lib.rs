@@ -12,6 +12,7 @@
 extern crate alloc;
 
 mod access;
+mod client_security;
 pub mod create_token;
 mod job_token;
 mod native_acl;
@@ -42,6 +43,10 @@ pub use create_token::{
     capture_token, luid_for_privilege_name, CapturedToken, ClientMemory, CreateTokenArgs,
     MAX_CAPTURED_GROUPS, MAX_CAPTURED_PRIVILEGES, TOKEN_GROUPS_ARRAY_OFFSET,
     TOKEN_PRIVILEGES_ARRAY_OFFSET,
+};
+pub use client_security::{
+    ClientImpersonationReference, ClientSecurityContext, ClientTokenControl,
+    EffectiveClientTokenSource,
 };
 pub use job_token::{
     encode_job_security_limit_information, JobTokenFilter, JobTokenPolicyStore,

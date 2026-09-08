@@ -75,6 +75,48 @@ impl HostedDevicePointerStore {
 }
 
 impl<P> IoManager<P> {
+    /// Bind and anchor a projection as one publication transaction. On failure a binding created
+    /// here is removed; an existing exact binding is left unchanged for its original owner.
+    pub fn bind_hosted_device_pointer(
+        &mut self,
+        domain: HostedDomainIdentity,
+        address: u64,
+        device: DeviceId,
+    ) -> Result<HostedDevicePointerRegistration, NtStatus> {
+        let existing = self.hosted_device_by_identity(domain, address);
+        self.bind_hosted_device_identity(domain, address, device)?;
+        match self.register_hosted_device_pointer(domain, address) {
+            Ok(registration) => Ok(registration),
+            Err(status) => {
+                if existing.is_none() {
+                    // Registration has no fallible operation after acquiring its anchor. Thus a
+                    // failed registration cannot retain this new binding, and no callback ran.
+                    assert!(self.unbind_hosted_device_identity(domain, address, device));
+                }
+                Err(status)
+            }
+        }
+    }
+
+    /// Observe only an exact live binding with a retained registration anchor. The returned token
+    /// carries its original registration generation and grants no additional owned reference.
+    pub fn hosted_device_pointer_registration(
+        &self,
+        domain: HostedDomainIdentity,
+        address: u64,
+    ) -> Option<HostedDevicePointerRegistration> {
+        let device = self.hosted_device_by_identity(domain, address)?;
+        self.hosted_device_pointers
+            .rows
+            .iter()
+            .find(|row| {
+                row.registration.domain == domain
+                    && row.registration.address == address
+                    && row.registration.device == device
+            })
+            .map(|row| row.registration)
+    }
+
     /// Admit before publishing a native projection. Repeating the exact live registration is
     /// idempotent, while the canonical anchor survives zero outstanding caller references.
     pub fn register_hosted_device_pointer(
@@ -268,6 +310,25 @@ impl<P> IoManager<P> {
         })?;
         let index = self.pointer_row_index(registration)?;
         self.hosted_device_pointers.rows.swap_remove(index);
+        Ok(())
+    }
+
+    /// Retire the exact anchor and identity binding together after native pointers and mappings
+    /// have been retired. Outstanding caller references reject the operation without mutation.
+    /// Detached reference owners remain independent and continue to block device destruction.
+    pub fn retire_hosted_device_pointer(
+        &mut self,
+        registration: HostedDevicePointerRegistration,
+    ) -> Result<(), NtStatus> {
+        self.live_pointer_row_index(registration)?;
+        self.unregister_hosted_device_pointer(registration)?;
+        // The live preflight proved the exact binding; its only unbind barrier was this anchor.
+        // No allocation, callback, or other fallible operation may intervene after its retirement.
+        assert!(self.unbind_hosted_device_identity(
+            registration.domain,
+            registration.address,
+            registration.device,
+        ));
         Ok(())
     }
 }

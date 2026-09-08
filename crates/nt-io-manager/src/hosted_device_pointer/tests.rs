@@ -248,3 +248,231 @@ fn deletion_pending_keeps_existing_pointer_lifetime_but_rejects_new_registration
     io.unregister_hosted_device_pointer(registration).unwrap();
     assert_eq!(io.device_reference_count(device), 0);
 }
+
+#[test]
+fn atomic_publication_and_retirement_preserve_exact_registration_generation() {
+    let (mut io, _, device, domain) = setup();
+    assert!(io.unbind_hosted_device_identity(domain, 0x1000, device));
+    assert_eq!(io.hosted_device_pointer_registration(domain, 0x1000), None);
+    let first = io
+        .bind_hosted_device_pointer(domain, 0x1000, device)
+        .unwrap();
+    assert_eq!(io.hosted_device_by_identity(domain, 0x1000), Some(device));
+    assert_eq!(
+        io.hosted_device_pointer_registration(domain, 0x1000),
+        Some(first)
+    );
+    assert_eq!(
+        io.bind_hosted_device_pointer(domain, 0x1000, device),
+        Ok(first)
+    );
+    assert_eq!(io.device_reference_count(device), 1);
+    io.retire_hosted_device_pointer(first).unwrap();
+    assert_eq!(io.hosted_device_by_identity(domain, 0x1000), None);
+    assert_eq!(io.hosted_device_pointer_registration(domain, 0x1000), None);
+    assert_eq!(io.device_reference_count(device), 0);
+    let second = io
+        .bind_hosted_device_pointer(domain, 0x1000, device)
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        io.retire_hosted_device_pointer(first),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.hosted_device_pointer_registration(domain, 0x1000),
+        Some(second)
+    );
+    assert_eq!(io.device_reference_count(device), 1);
+    io.retire_hosted_device_pointer(second).unwrap();
+    io.unregister_hosted_domain(domain).unwrap();
+}
+
+#[test]
+fn failed_atomic_registration_rolls_back_only_its_new_binding() {
+    let (mut io, driver, existing_device, domain) = setup();
+    let new_device = add_device(&mut io, driver);
+    io.hosted_device_pointers.sequence = u64::MAX;
+    assert_eq!(
+        io.bind_hosted_device_pointer(domain, 0x2000, new_device),
+        Err(NtStatus::INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(io.hosted_device_by_identity(domain, 0x2000), None);
+    assert_eq!(io.hosted_device_pointer_registration(domain, 0x2000), None);
+    assert_eq!(io.device_reference_count(new_device), 0);
+    assert_eq!(
+        io.bind_hosted_device_pointer(domain, 0x1000, existing_device),
+        Err(NtStatus::INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(
+        io.hosted_device_by_identity(domain, 0x1000),
+        Some(existing_device)
+    );
+    assert_eq!(io.device_reference_count(existing_device), 0);
+    assert_eq!(
+        io.hosted_domain(domain.domain_id)
+            .unwrap()
+            .device_binding_count(),
+        1
+    );
+}
+
+#[test]
+fn failed_anchor_acquisition_rolls_back_new_binding_and_preserves_existing_owner() {
+    let (mut io, _, device, domain) = setup();
+    let existing = io
+        .bind_hosted_device_pointer(domain, 0x1000, device)
+        .unwrap();
+    assert_eq!(
+        io.delete_device(device).err(),
+        Some(NtStatus::DELETE_PENDING)
+    );
+    let other_domain = io.register_hosted_domain();
+    assert_eq!(
+        io.bind_hosted_device_pointer(other_domain, 0x2000, device),
+        Err(NtStatus::DELETE_PENDING)
+    );
+    assert_eq!(io.hosted_device_by_identity(other_domain, 0x2000), None);
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(
+        io.bind_hosted_device_pointer(domain, 0x1000, device),
+        Ok(existing)
+    );
+    io.unregister_hosted_domain(other_domain).unwrap();
+    io.retire_hosted_device_pointer(existing).unwrap();
+    assert!(io.delete_device(device).is_ok());
+}
+
+#[test]
+fn caller_references_block_atomic_retirement_and_device_destruction() {
+    let (mut io, _, device, domain) = setup();
+    let registration = io
+        .bind_hosted_device_pointer(domain, 0x1000, device)
+        .unwrap();
+    io.reference_hosted_device_pointer(registration).unwrap();
+    assert_eq!(
+        io.retire_hosted_device_pointer(registration),
+        Err(NtStatus::DEVICE_BUSY)
+    );
+    assert_eq!(
+        io.hosted_device_pointer_registration(domain, 0x1000),
+        Some(registration)
+    );
+    assert_eq!(io.hosted_device_by_identity(domain, 0x1000), Some(device));
+    assert_eq!(io.device_reference_count(device), 2);
+    assert_eq!(io.can_delete_device(device), Err(NtStatus::DELETE_PENDING));
+    let mut detached = io
+        .take_hosted_device_pointer_reference(registration)
+        .unwrap();
+    io.retire_hosted_device_pointer(registration).unwrap();
+    io.unregister_hosted_domain(domain).unwrap();
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.can_delete_device(device), Err(NtStatus::DELETE_PENDING));
+    detached.release(&mut io).unwrap();
+    assert!(io.delete_device(device).is_ok());
+}
+
+#[test]
+fn atomic_publication_rejects_collisions_and_stale_domains_without_mutation() {
+    let (mut io, driver, device, domain) = setup();
+    let registration = io
+        .bind_hosted_device_pointer(domain, 0x1000, device)
+        .unwrap();
+    let other = add_device(&mut io, driver);
+    for (address, target) in [(0x1000, other), (0x2000, device)] {
+        assert_eq!(
+            io.bind_hosted_device_pointer(domain, address, target),
+            Err(NtStatus::OBJECT_NAME_COLLISION)
+        );
+    }
+    assert_eq!(
+        io.bind_hosted_device_pointer(domain, 0, other),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.bind_hosted_device_pointer(domain, 0x2000, DeviceId::NULL),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    let stale = HostedDomainIdentity {
+        cookie: domain.cookie + 1,
+        ..domain
+    };
+    assert_eq!(io.hosted_device_pointer_registration(stale, 0x1000), None);
+    assert_eq!(
+        io.bind_hosted_device_pointer(stale, 0x2000, other),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.hosted_device_pointer_registration(domain, 0x1000),
+        Some(registration)
+    );
+    assert_eq!(
+        io.hosted_domain(domain.domain_id)
+            .unwrap()
+            .device_binding_count(),
+        1
+    );
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.device_reference_count(other), 0);
+}
+
+#[test]
+fn provider_registrations_at_matching_addresses_retire_independently() {
+    let (mut io, _, device, first_domain) = setup();
+    let second_domain = io.register_hosted_domain();
+    let first = io
+        .bind_hosted_device_pointer(first_domain, 0x1000, device)
+        .unwrap();
+    let second = io
+        .bind_hosted_device_pointer(second_domain, 0x1000, device)
+        .unwrap();
+    io.reference_hosted_device_pointer(second).unwrap();
+    assert_eq!(io.device_reference_count(device), 3);
+    io.retire_hosted_device_pointer(first).unwrap();
+    io.unregister_hosted_domain(first_domain).unwrap();
+    assert_eq!(
+        io.hosted_device_pointer_registration(first_domain, 0x1000),
+        None
+    );
+    assert_eq!(
+        io.hosted_device_pointer_registration(second_domain, 0x1000),
+        Some(second)
+    );
+    assert_eq!(io.device_reference_count(device), 2);
+    io.dereference_hosted_device_pointer(second).unwrap();
+    io.retire_hosted_device_pointer(second).unwrap();
+    io.unregister_hosted_domain(second_domain).unwrap();
+    assert_eq!(io.device_reference_count(device), 0);
+}
+
+#[test]
+fn multi_device_rollback_detaches_all_owned_edges_before_destroying_lower_device() {
+    let (mut io, driver, pdo, domain) = setup();
+    let lower = add_device(&mut io, driver);
+    let upper = add_device(&mut io, driver);
+    let lower_pointer = io
+        .bind_hosted_device_pointer(domain, 0x2000, lower)
+        .unwrap();
+    let upper_pointer = io
+        .bind_hosted_device_pointer(domain, 0x3000, upper)
+        .unwrap();
+    assert_eq!(io.attach_device_to_stack(lower, pdo), Ok(pdo));
+    assert_eq!(io.attach_device_to_stack(upper, pdo), Ok(lower));
+
+    io.detach_device_from_stack(lower).unwrap();
+    io.retire_hosted_device_pointer(lower_pointer).unwrap();
+    assert_eq!(
+        io.destroy_device(lower).err(),
+        Some(NtStatus::DELETE_PENDING)
+    );
+    assert!(io.device(lower).is_some());
+
+    // The next owned attachment must make progress even while lower deletion is pending.
+    io.detach_device_from_stack(upper).unwrap();
+    io.retire_hosted_device_pointer(upper_pointer).unwrap();
+    io.destroy_device(lower).unwrap();
+    io.destroy_device(upper).unwrap();
+    assert_eq!(io.device(pdo).unwrap().top_of_stack, pdo);
+    assert_eq!(io.hosted_device_by_identity(domain, 0x1000), Some(pdo));
+    assert_eq!(io.device_reference_count(pdo), 0);
+}

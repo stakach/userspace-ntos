@@ -2823,9 +2823,13 @@ unsafe fn component_pump_loop(
             && ch.caps.kind == ReqKind::Irp
         {
             let (status, required_len, transfer_token, chunk_len) =
-                crate::driver_launch::service_hosted_device(
-                    ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap,
-                );
+                if msg.mi != ((crate::driver_launch::FSD_SERVICE_DEVICE_LABEL << 12) | 4) {
+                    (0xc000_000du32 as i32, 0, 0, 0)
+                } else {
+                    crate::driver_launch::service_hosted_device(
+                        ch, msg.m0, msg.m1, msg.m2, msg.m3, *reply_cap, msg.badge,
+                    )
+                };
             pump_reply_recv4_into!(
                 ch,
                 *reply_cap,

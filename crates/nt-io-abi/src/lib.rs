@@ -10,6 +10,7 @@
 #![no_std]
 
 pub mod device_pointer;
+pub mod device_mutation;
 pub mod ioctl;
 pub mod major;
 pub mod opcodes;

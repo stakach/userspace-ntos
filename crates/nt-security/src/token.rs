@@ -102,7 +102,8 @@ pub fn plan_client_impersonation(
     Ok(ClientImpersonationPlan {
         level: qos.impersonation_level,
         effective_only: qos.effective_only
-            || (source_type == TokenType::Impersonation && source_effective_only),
+            || (qos.tracking_mode == SecurityContextTrackingMode::Dynamic
+                && source_type == TokenType::Impersonation && source_effective_only),
         static_tracking: qos.tracking_mode == SecurityContextTrackingMode::Static,
     })
 }

@@ -7909,6 +7909,29 @@ pub(crate) fn census_tick_static(now: u64) {
     let n = CENSUS_PERIODIC_DUMPS.fetch_add(1, Ordering::Relaxed);
     print_periodic_census_heartbeat(n, now);
     print_native_ssn_time();
+    print_add_device_rollback_census(b"periodic", false);
+}
+
+fn print_add_device_rollback_census(tag: &[u8], include_empty: bool) {
+    let stats = unsafe { driver_launch::hosted_add_device_rollback::stats() };
+    if !include_empty && stats.live == 0 {
+        return;
+    }
+    print_str(b"[add-device-rollback] ");
+    print_str(tag);
+    print_str(b" live=");
+    print_u64(stats.live as u64);
+    print_str(b" prepared=");
+    print_u64(stats.prepared as u64);
+    print_str(b" retiring=");
+    print_u64(stats.retiring as u64);
+    print_str(b" blocked=");
+    print_u64(stats.blocked as u64);
+    print_str(b" created-devices=");
+    print_u64(stats.devices as u64);
+    print_str(b" retired-projections=");
+    print_u64(stats.retired_devices as u64);
+    print_str(b"\n");
 }
 
 /// The 16 win32k SSNs that cost the most WALL-CLOCK (ms), plus the average per dispatch.
@@ -8029,6 +8052,7 @@ pub(crate) fn print_census_counters(tag: &[u8]) {
     print_str(b" closes=");
     print_u64(writable_fs::OVERLAY_CLOSES.load(Ordering::Relaxed));
     print_str(b"\n");
+    print_add_device_rollback_census(tag, true);
     print_pool_census(tag);
 }
 
