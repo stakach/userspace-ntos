@@ -66,6 +66,7 @@ pub enum StackVadOutcome {
 pub enum StackVadError {
     InvalidGeometry,
     InvalidProtection,
+    InvalidStackPointer,
     NotStackGuard,
     AllocationChanged,
     CommitLimit,
@@ -217,6 +218,42 @@ fn check_allocation<const N: usize>(
         return Err(StackVadError::AllocationChanged);
     }
     Ok(())
+}
+
+/// Validate a caller's existing private stack without changing its VAD, accounting or RSP.
+///
+/// The supplied INITIAL_TEB must describe the complete allocation and its committed suffix.
+/// A guard is inferred only from the actual page immediately below StackLimit, within this
+/// allocation, and must use the managed growth model's RW or executable-RW protection. RSP
+/// must identify a writable, non-guard byte in [StackLimit, StackBase). Other committed-page
+/// protections are preserved, not normalized. This validates metadata in the supplied map;
+/// the caller still owns process identity, physical mapping and concurrent-mutation checks.
+pub fn validate_existing<const N: usize>(
+    map: &VmRegionMap<N>,
+    initial_teb: crate::InitialTeb64,
+    rsp: u64,
+) -> Result<StackGeometry, StackVadError> {
+    let mut geometry = StackGeometry {
+        allocation_base: initial_teb.allocated_stack_base,
+        stack_base: initial_teb.stack_base,
+        stack_limit: initial_teb.stack_limit,
+        guard_base: None,
+    };
+    geometry.validate()?;
+    if geometry.stack_limit > geometry.allocation_base {
+        let page = geometry.stack_limit - PAGE_SIZE;
+        if let Some(protection) = map.protection_at(page) {
+            if protection & PAGE_GUARD != 0 {
+                check_protection(protection & !PAGE_GUARD)?;
+                geometry.guard_base = Some(page);
+            }
+        }
+    }
+    check_allocation(map, geometry)?;
+    if rsp < geometry.stack_limit || rsp >= geometry.stack_base || !map.permits_write(rsp) {
+        return Err(StackVadError::InvalidStackPointer);
+    }
+    Ok(geometry)
 }
 
 /// Prepare one native NT5 guard fault from the still-guarded VAD state.

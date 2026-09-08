@@ -25,6 +25,9 @@ mod virtual_memory_flush;
 #[path = "exec_virtual_memory_commit.rs"]
 mod virtual_memory_commit;
 
+#[path = "exec_thread_stack_exit.rs"]
+mod thread_stack_exit;
+
 const INTERNAL_DISPATCHER_EVENT_BASE: u64 = 1 << 40;
 pub(crate) const FSCTL_PIPE_LISTEN: u32 = 0x0011_0008;
 pub(crate) const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
@@ -10568,77 +10571,6 @@ impl ExecNtHandler {
         self.thread_runtime
             .set_user_stack(tid, allocation_base, stack_base)
             .is_some()
-    }
-
-    pub(crate) unsafe fn release_hosted_thread_user_stack_vad(
-        &mut self,
-        runtime: HostedThreadRuntime,
-    ) {
-        if runtime.pi >= MAX_PI || runtime.user_stack_allocation_base == 0 {
-            return;
-        }
-        let Some(pid) = self.pm_pid_for_pi(runtime.pi) else {
-            return;
-        };
-        let Some(vm_map) = process_vm_region_map_mut(runtime.pi) else {
-            return;
-        };
-        let before = &mut *core::ptr::addr_of_mut!(VM_MAP_BEFORE);
-        let after = &mut *core::ptr::addr_of_mut!(VM_MAP_AFTER);
-        *before = *vm_map;
-        *after = *before;
-        let plan = match after.free(
-            runtime.user_stack_allocation_base,
-            0,
-            nt_address_space::MEM_RELEASE,
-        ) {
-            Ok(plan) => plan,
-            Err(status) => {
-                if USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed) < 8 {
-                    print_str(b"[thread-term] user-stack VAD release skipped pi=");
-                    print_u64(runtime.pi as u64);
-                    print_str(b" tid=");
-                    print_u64(runtime.tid);
-                    print_str(b" base=0x");
-                    print_hex((runtime.user_stack_allocation_base >> 32) as u32);
-                    print_hex(runtime.user_stack_allocation_base as u32);
-                    print_str(b" status=0x");
-                    print_hex(status);
-                    print_str(b"\n");
-                }
-                return;
-            }
-        };
-        let Some((ownership_base, ownership_size)) = plan.ownership_range(before) else {
-            USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        if hosted_thread_memory_retirement_access(runtime.pi as u64, ownership_base, ownership_size).is_err() {
-            USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let released_commit = before
-            .private_committed_bytes()
-            .saturating_sub(after.private_committed_bytes());
-        let _ = vm_page_lock_retire_range(runtime.pi as u64, plan.base, plan.size);
-        let mut page = plan.base;
-        while page < plan.base + plan.size {
-            let old = before.extent_at(page);
-            let new = after.extent_at(page);
-            if old.is_some_and(|extent| extent.state == nt_address_space::VmExtentState::Committed)
-                && new
-                    .is_none_or(|extent| extent.state != nt_address_space::VmExtentState::Committed)
-            {
-                if !vm_unmap_private_page(runtime.pi, page) {
-                    USER_STACK_VAD_RELEASE_FAILS.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            }
-            page += nt_address_space::PAGE_SIZE;
-        }
-        *vm_map = *after;
-        self.release_process_commit(pid, released_commit);
-        USER_STACK_VAD_RELEASES.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn hosted_main_thread_tcb_for_pi(&self, pi: usize) -> Option<u64> {

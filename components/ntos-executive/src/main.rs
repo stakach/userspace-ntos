@@ -18609,7 +18609,18 @@ unsafe fn terminate_hosted_thread_mechanism(
         print_u64(abandoned_mutants);
         print_str(b"\n");
     }
+    if handler.hosted_thread_tcb(tid) != Some(tcb) {
+        return false;
+    }
     let suspend = tcb_suspend_r(tcb);
+    let stack_release = if suspend == 0 {
+        match handler.capture_hosted_thread_stack_release(tid, tcb) {
+            Ok(request) => request,
+            Err(_) => return false,
+        }
+    } else {
+        None
+    };
     let delete = if suspend == 0 {
         cnode_delete_recycle_r(tcb)
     } else {
@@ -18627,7 +18638,11 @@ unsafe fn terminate_hosted_thread_mechanism(
     if suspend == 0 && delete == 0 {
         let runtime = handler.release_hosted_thread_runtime(tid);
         if let Some(runtime) = runtime {
-            handler.release_hosted_thread_user_stack_vad(runtime);
+            if let Some(request) = stack_release {
+                if let Err(status) = handler.release_requested_thread_user_stack(runtime, request) {
+                    handler.trace_thread_stack_release_failure(runtime, status, b"release");
+                }
+            }
             release_hosted_thread_resources(runtime.resources);
             handler.release_hosted_thread_commitment(runtime.resources);
             release_hosted_thread_mechanism_cnodes(runtime);

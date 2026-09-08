@@ -83,9 +83,29 @@ impl Fixture {
             self.thread,
             &[FIXED],
             Some(STACK),
+            &mut Some(self.request(STACK.base)),
             &self.fixed,
             &self.private,
         )
+        .unwrap()
+    }
+
+    fn request(&self, base: u64) -> ThreadStackReleaseRequest {
+        ThreadStackReleaseRequest::capture(
+            self.process,
+            self.thread,
+            Some(0xa0000),
+            crate::thread_stack_release::ThreadStackExitKind::RegisteredThread,
+            |_, bytes| {
+                if bytes.len() == 1 {
+                    bytes[0] = 1;
+                } else {
+                    bytes.copy_from_slice(&base.to_le_bytes());
+                }
+                Ok(())
+            },
+        )
+        .unwrap()
         .unwrap()
     }
 
@@ -310,8 +330,16 @@ fn capture_rejects_missing_overlapping_misaligned_overflow_and_partial_allocatio
         ),
         (vec![FIXED], Some(FIXED)),
     ] {
+        let mut request = dynamic.map(|range| f.request(range.base));
         assert!(ThreadChargeRetirement::prepare(
-            f.id, f.process, f.thread, &fixed, dynamic, &f.fixed, &f.private
+            f.id,
+            f.process,
+            f.thread,
+            &fixed,
+            dynamic,
+            &mut request,
+            &f.fixed,
+            &f.private
         )
         .is_err());
     }
@@ -410,6 +438,7 @@ fn no_dynamic_stack_is_explicit_and_fixed_cleanup_still_requires_ack() {
         f.thread,
         &[FIXED],
         None,
+        &mut None,
         &f.fixed,
         &f.private,
     )
@@ -467,4 +496,101 @@ fn mm_refusal_preserves_job_and_ranges_until_exact_retry() {
     f.mm.commit_charge(charge).unwrap();
     f.commit(&mut owner).unwrap();
     assert_eq!(f.pm.job_memory_usage(f.process.pid), Ok((0, 0)));
+}
+
+#[test]
+fn dynamic_release_requires_opt_in_and_failed_prepare_preserves_request() {
+    let f = Fixture::new();
+    let mut absent = None;
+    assert!(ThreadChargeRetirement::prepare(
+        f.id,
+        f.process,
+        f.thread,
+        &[FIXED],
+        Some(STACK),
+        &mut absent,
+        &f.fixed,
+        &f.private
+    )
+    .is_err());
+    let mut wrong_base = Some(f.request(STACK.base + PAGE_SIZE));
+    assert!(ThreadChargeRetirement::prepare(
+        f.id,
+        f.process,
+        f.thread,
+        &[FIXED],
+        Some(STACK),
+        &mut wrong_base,
+        &f.fixed,
+        &f.private
+    )
+    .is_err());
+    assert_eq!(
+        wrong_base.as_ref().unwrap().deallocation_stack(),
+        STACK.base + PAGE_SIZE
+    );
+    let foreign_process = ProcessIdentity {
+        generation: ProcessGeneration::Hosted(99),
+        ..f.process
+    };
+    let mut foreign = ThreadStackReleaseRequest::capture(
+        foreign_process,
+        f.thread,
+        Some(0xa0000),
+        crate::thread_stack_release::ThreadStackExitKind::RegisteredThread,
+        |_, bytes| {
+            if bytes.len() == 1 {
+                bytes[0] = 1;
+            } else {
+                bytes.copy_from_slice(&STACK.base.to_le_bytes());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(ThreadChargeRetirement::prepare(
+        f.id,
+        f.process,
+        f.thread,
+        &[FIXED],
+        Some(STACK),
+        &mut foreign,
+        &f.fixed,
+        &f.private,
+    )
+    .is_err());
+    assert!(foreign.is_some());
+    let mut request = Some(f.request(STACK.base));
+    let short = ThreadMemoryRange {
+        size: STACK.size - PAGE_SIZE,
+        ..STACK
+    };
+    assert!(ThreadChargeRetirement::prepare(
+        f.id,
+        f.process,
+        f.thread,
+        &[FIXED],
+        Some(short),
+        &mut request,
+        &f.fixed,
+        &f.private
+    )
+    .is_err());
+    assert!(request.is_some());
+    let owner = ThreadChargeRetirement::prepare(
+        f.id,
+        f.process,
+        f.thread,
+        &[FIXED],
+        Some(STACK),
+        &mut request,
+        &f.fixed,
+        &f.private,
+    )
+    .unwrap();
+    assert!(request.is_none());
+    assert_eq!(
+        owner.release_request().unwrap().deallocation_stack(),
+        STACK.base
+    );
 }

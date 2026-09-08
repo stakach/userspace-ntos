@@ -2,6 +2,7 @@
 use crate::process_identity::ProcessIdentity;
 use crate::thread_resources::ThreadMemoryRange;
 use crate::thread_rollback::{ThreadRollback, ThreadRollbackId, ThreadRollbackStage};
+use crate::thread_stack_release::ThreadStackReleaseRequest;
 use alloc::vec::Vec;
 use nt_address_space::{
     VmBasicInformation, VmCommittedRangeTable, VmRegionMap, MEM_COMMIT, MEM_PRIVATE, MEM_RELEASE,
@@ -50,6 +51,7 @@ pub struct ThreadChargeRetirement {
     fixed_ranges: Vec<ThreadMemoryRange>,
     fixed_witnesses: Vec<VmBasicInformation>,
     dynamic_range: Option<ThreadMemoryRange>,
+    release_request: Option<ThreadStackReleaseRequest>,
     dynamic_witnesses: Vec<VmBasicInformation>,
     fixed_bytes: u64,
     dynamic_bytes: u64,
@@ -148,13 +150,16 @@ fn validate_witnesses(
 impl ThreadChargeRetirement {
     /// Capture only ranges actually owned by the runtime, after pending admission has closed
     /// their geometry. Main-thread and worker layouts need not charge the same TEB span.
-    /// Missing fixed ranges are errors; no dynamic stack is represented explicitly by None.
+    /// Missing fixed ranges are errors. Dynamic release additionally requires a captured NT5 opt-in
+    /// request for the same thread and allocation base, never merely INITIAL_TEB geometry. The
+    /// request stays with the caller on every failure and transfers only on successful preparation.
     pub fn prepare<const F: usize, const V: usize>(
         id: ThreadRollbackId,
         process: ProcessIdentity,
         thread: ThreadLifetime,
         fixed_ranges: &[ThreadMemoryRange],
         dynamic_range: Option<ThreadMemoryRange>,
+        release_request: &mut Option<ThreadStackReleaseRequest>,
         fixed: &VmCommittedRangeTable<F>,
         private: &VmRegionMap<V>,
     ) -> Result<Self, u32> {
@@ -166,6 +171,13 @@ impl ThreadChargeRetirement {
             || thread.process_id() != process.pid
         {
             return Err(STATUS_INVALID_PARAMETER);
+        }
+        match (dynamic_range, release_request.as_ref()) {
+            (None, None) => {}
+            (Some(range), Some(request))
+                if request.matches_thread(process, thread)
+                    && request.deallocation_stack() == range.base => {}
+            _ => return Err(STATUS_INVALID_PARAMETER),
         }
         if let Some(range) = dynamic_range {
             end(range)?;
@@ -187,6 +199,7 @@ impl ThreadChargeRetirement {
             fixed_ranges: Vec::new(),
             fixed_witnesses: Vec::new(),
             dynamic_range,
+            release_request: None,
             dynamic_witnesses: Vec::new(),
             fixed_bytes: 0,
             dynamic_bytes: 0,
@@ -232,11 +245,15 @@ impl ThreadChargeRetirement {
             .fixed_bytes
             .checked_add(owner.dynamic_bytes)
             .ok_or(STATUS_INVALID_PARAMETER)?;
+        owner.release_request = release_request.take();
         Ok(owner)
     }
 
     pub fn owner(&self) -> ThreadRollbackId {
         self.id
+    }
+    pub fn release_request(&self) -> Option<&ThreadStackReleaseRequest> {
+        self.release_request.as_ref()
     }
     pub fn charged_bytes(&self) -> u64 {
         self.fixed_bytes + self.dynamic_bytes

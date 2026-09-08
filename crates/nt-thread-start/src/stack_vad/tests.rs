@@ -564,3 +564,281 @@ fn insufficient_vad_capacity_cannot_publish_partial_initial_reservation() {
     ));
     assert_eq!(before.extent_count(), 0);
 }
+
+fn initial_teb(shape: StackGeometry) -> crate::InitialTeb64 {
+    crate::InitialTeb64 {
+        stack_base: shape.stack_base,
+        stack_limit: shape.stack_limit,
+        allocated_stack_base: shape.allocation_base,
+    }
+}
+
+#[test]
+fn existing_stack_derives_actual_guard_and_preserves_all_metadata() {
+    let shape = geometry(11);
+    for protection in [PAGE_READWRITE, PAGE_EXECUTE_READWRITE] {
+        let mut map = initialized(shape, protection);
+        map.protect(shape.stack_limit, PAGE_SIZE, PAGE_READONLY)
+            .unwrap();
+        map.allocate(
+            Some(OTHER),
+            PAGE_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READONLY,
+        )
+        .unwrap();
+        let original = map;
+        let commitment = map.committed_bytes();
+        assert_eq!(
+            validate_existing(&map, initial_teb(shape), TOP - 1),
+            Ok(shape)
+        );
+        assert!(map == original);
+        assert_eq!(map.committed_bytes(), commitment);
+        assert_eq!(map.protection_at(shape.stack_limit), Some(PAGE_READONLY));
+        assert_eq!(map.protection_at(OTHER), Some(PAGE_READONLY));
+    }
+}
+
+#[test]
+fn existing_stack_without_guard_accepts_actual_committed_suffix() {
+    for limit in [BASE, BASE + 12 * PAGE_SIZE] {
+        let shape = StackGeometry {
+            allocation_base: BASE,
+            stack_base: TOP,
+            stack_limit: limit,
+            guard_base: None,
+        };
+        let map = initialized(shape, PAGE_READWRITE);
+        assert_eq!(
+            validate_existing(&map, initial_teb(shape), limit),
+            Ok(shape)
+        );
+        assert_eq!(
+            validate_existing(&map, initial_teb(shape), TOP - 1),
+            Ok(shape)
+        );
+    }
+}
+
+#[test]
+fn existing_stack_does_not_adopt_neighboring_allocation_guard() {
+    let shape = StackGeometry {
+        allocation_base: BASE,
+        stack_base: TOP,
+        stack_limit: BASE,
+        guard_base: None,
+    };
+    let mut map = initialized(shape, PAGE_READWRITE);
+    map.allocate(
+        Some(BASE - ALLOCATION_GRANULARITY),
+        ALLOCATION_GRANULARITY,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    map.protect(BASE - PAGE_SIZE, PAGE_SIZE, PAGE_READWRITE | PAGE_GUARD)
+        .unwrap();
+    assert_eq!(validate_existing(&map, initial_teb(shape), BASE), Ok(shape));
+}
+
+#[test]
+fn existing_stack_accepts_guard_at_its_own_reservation_base() {
+    let shape = geometry(0);
+    let map = initialized(shape, PAGE_READWRITE);
+    assert_eq!(
+        validate_existing(&map, initial_teb(shape), shape.stack_limit),
+        Ok(shape)
+    );
+}
+
+#[test]
+fn existing_stack_rejects_rsp_outside_usable_suffix() {
+    let shape = geometry(11);
+    let map = initialized(shape, PAGE_READWRITE);
+    for rsp in [
+        0,
+        BASE,
+        shape.guard_base.unwrap(),
+        shape.stack_limit - 1,
+        TOP,
+        u64::MAX,
+    ] {
+        assert_eq!(
+            validate_existing(&map, initial_teb(shape), rsp),
+            Err(StackVadError::InvalidStackPointer)
+        );
+    }
+}
+
+#[test]
+fn existing_stack_requires_writable_non_guard_rsp_page() {
+    let shape = geometry(11);
+    for protection in [
+        PAGE_READONLY,
+        nt_address_space::PAGE_NOACCESS,
+        PAGE_READWRITE | PAGE_GUARD,
+    ] {
+        let mut map = initialized(shape, PAGE_READWRITE);
+        map.protect(TOP - PAGE_SIZE, PAGE_SIZE, protection).unwrap();
+        let original = map;
+        assert_eq!(
+            validate_existing(&map, initial_teb(shape), TOP - 8),
+            Err(StackVadError::InvalidStackPointer)
+        );
+        assert!(map == original);
+    }
+}
+
+#[test]
+fn existing_stack_rejects_unsupported_guard_protection() {
+    let shape = geometry(11);
+    let mut map = initialized(shape, PAGE_READWRITE);
+    map.protect(
+        shape.guard_base.unwrap(),
+        PAGE_SIZE,
+        PAGE_READONLY | PAGE_GUARD,
+    )
+    .unwrap();
+    assert_eq!(
+        validate_existing(&map, initial_teb(shape), TOP - 8),
+        Err(StackVadError::InvalidProtection)
+    );
+}
+
+#[test]
+fn existing_stack_rejects_inexact_initial_teb_geometry() {
+    let shape = geometry(11);
+    let map = initialized(shape, PAGE_READWRITE);
+    let valid = initial_teb(shape);
+    for teb in [
+        crate::InitialTeb64 {
+            allocated_stack_base: 0,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            allocated_stack_base: BASE + PAGE_SIZE,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_limit: valid.stack_limit + 1,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_limit: TOP,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_base: TOP + 1,
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            validate_existing(&map, teb, TOP - 8),
+            Err(StackVadError::InvalidGeometry)
+        );
+    }
+    for teb in [
+        crate::InitialTeb64 {
+            allocated_stack_base: BASE - ALLOCATION_GRANULARITY,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_base: TOP - PAGE_SIZE,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_base: TOP + PAGE_SIZE,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_limit: valid.stack_limit + PAGE_SIZE,
+            ..valid
+        },
+        crate::InitialTeb64 {
+            stack_limit: valid.stack_limit - 2 * PAGE_SIZE,
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            validate_existing(&map, teb, TOP - 2 * PAGE_SIZE),
+            Err(StackVadError::AllocationChanged)
+        );
+    }
+}
+
+#[test]
+fn existing_stack_rejects_missing_vad_holes_and_unexpected_prefix_commit() {
+    let shape = geometry(11);
+    assert_eq!(
+        validate_existing(&empty(), initial_teb(shape), TOP - 8),
+        Err(StackVadError::AllocationChanged)
+    );
+    for change in 0..3 {
+        let mut map = initialized(shape, PAGE_READWRITE);
+        match change {
+            0 => {
+                map.free(TOP - 2 * PAGE_SIZE, PAGE_SIZE, MEM_DECOMMIT)
+                    .unwrap();
+            }
+            1 => {
+                map.allocate(Some(BASE), PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE)
+                    .unwrap();
+            }
+            _ => {
+                map.protect(shape.guard_base.unwrap(), PAGE_SIZE, PAGE_READWRITE)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            validate_existing(&map, initial_teb(shape), TOP - 8),
+            Err(StackVadError::AllocationChanged)
+        );
+    }
+}
+
+#[test]
+fn existing_stack_cannot_span_two_allocations_or_use_a_mapped_vad() {
+    let mut map = empty();
+    map.allocate(
+        Some(BASE),
+        ALLOCATION_GRANULARITY,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    map.allocate(
+        Some(TOP),
+        ALLOCATION_GRANULARITY,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    )
+    .unwrap();
+    let teb = crate::InitialTeb64 {
+        allocated_stack_base: BASE,
+        stack_limit: BASE,
+        stack_base: TOP + ALLOCATION_GRANULARITY,
+    };
+    assert_eq!(
+        validate_existing(&map, teb, TOP - 8),
+        Err(StackVadError::AllocationChanged)
+    );
+    let mut map = empty();
+    map.allocate_mapped_between(
+        Some(BASE),
+        ALLOCATION_GRANULARITY,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+        BASE,
+        TOP,
+    )
+    .unwrap();
+    let teb = crate::InitialTeb64 {
+        stack_base: TOP,
+        ..teb
+    };
+    assert_eq!(
+        validate_existing(&map, teb, TOP - 8),
+        Err(StackVadError::AllocationChanged)
+    );
+}

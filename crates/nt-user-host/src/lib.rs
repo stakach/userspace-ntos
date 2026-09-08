@@ -37,6 +37,7 @@ pub mod thread_pending;
 pub mod thread_memory_access;
 pub mod thread_memory_retirement_access;
 pub mod thread_charge_retirement;
+pub mod thread_stack_release;
 pub mod thread_resources;
 pub mod thread_registry;
 pub mod thread_reconciliation;

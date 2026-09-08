@@ -297,8 +297,9 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
   construction now retains distinct complete registration provenance. Ordinary teardown still needs
-  native retained GUI EXIT dispatch, main transport ownership, and the NT5 opt-in user-stack release
-  contract before replacing its legacy destructor. Validate those boundaries with live failures;
+  native retained GUI EXIT dispatch, main transport ownership, and retained optional user-stack
+  release before replacing its legacy destructor. The NT5 opt-in policy is now enforced by both
+  the native entry and prepared charge owner. Validate those boundaries with live failures;
   host tests and a successful build are not runtime acceptance.
 - [~] Correct thread startup and stack semantics. Checked startup capture and host stack-VAD
   planning are implemented. Preserve full caller context and existing stack through additional and
@@ -30233,6 +30234,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/build-stack-startup-capture-final-20260909.log (291 warnings). The debugger create-thread
     fixture now supplies initialized, aligned CONTEXT/INITIAL_TEB records instead of a null stack
     pointer. It has build coverage only; no QEMU or desktop acceptance was performed in this slice.
+
+    B3 opt-in stack release tranche 146 (2026-09-09, accepted policy slice): introduce a non-clone
+    request captured from the exact process/thread/TEB. Read FreeStackOnTermination first and only
+    read DeallocationStack when requested. Preserve exact reader failures; absent TEB and failed
+    construction perform no user read. The charge-retirement owner requires this request for any
+    dynamic range, validates its process/lifetime/base, and transfers it only after successful
+    preparation. Rejection leaves the request with its original owner. Geometry alone no longer
+    admits dynamic VAD or commitment release.
+
+    Native ordinary teardown revalidates the TCB projection after GUI/provider work, suspends it,
+    and captures the request before deletion of either the TCB or TEB. Runtime/identity refusal
+    stops mechanism deletion. A caught TEB-read exception is reported and preserves process-owned
+    user memory, matching NT5 PspExitThread's exception boundary. Remove the unconditional
+    recorded-stack-bounds destructor and move explicit request handling into exec_thread_stack_exit.rs.
+    Only the captured live DeallocationStack is passed to process MEM_RELEASE; no request leaves
+    VAD and commitment intact. The constructor's fixed transport memory remains separately owned.
+    This fixes policy admission, not the still-open retained ordinary destructor/GUI cutover.
+
+    Add read-only validation of an existing caller stack VAD: exact whole private allocation,
+    reserved prefix and committed suffix, optional actual adjacent guard, and writable non-guard
+    RSP inside the supplied usable range. No sizing, allocation, charge or RSP substitution occurs.
+    Native additional-thread startup will use this at its later caller-stack cutover. Request-based
+    release and recorded growth geometry are independent: a process MEM_RELEASE request may name
+    an allocation other than the recorded stack. Pending-range exceptions must remain exact and
+    must not turn this user opt-in into blanket backing or foreign-owner release authority.
+
+    Serialized validation passes 1,331 unit tests, 49 integration tests and 12 compile-fail checks
+    in .tmp/test-stack-exit-policy-20260909.log. Native release build passes in
+    .tmp/build-stack-exit-policy-20260909.log (291 warnings). Source review found no new policy or
+    identity bypass. The active legacy caller reports a failed optional MEM_RELEASE once and leaves
+    remaining VAD/backing ownership with the process; it does not yet retain an ordinary teardown
+    retry owner. The prepared charge engine does retain its request. No new NT boot or desktop proof.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
