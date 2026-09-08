@@ -29725,7 +29725,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/build-asid-lifetime-executive-20260908.log. Original NT rootserver/disk staging is restored.
     These are microkernel results, not a new NT desktop boot or proof of TCB physical derivation.
 
-    B3 TCB capability derivation tranche 135 (required before Ps backing activation): ASID
+    B3 TCB capability derivation tranche 135 (2026-09-08, in progress; required before Ps backing activation): ASID
     reference accounting alone does not protect physical backing. TCB-held VSpace capabilities
     currently have no MDB edge, while Untyped revoke resets its allocation watermark after
     deleting only CNode descendants. Represent the TCB's actual derived capability ownership,
@@ -29740,6 +29740,28 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     IPC-buffer, fault-handler and timeout-handler capabilities in this boundary as well as CSpace
     and VSpace. Drain those slots through state-owned finalization before freeing the TCB; a
     destructor must not reacquire mutable global kernel state while its slab is borrowed.
+
+    Integration now replaces the five raw held-capability fields with private internal CTEs and
+    a tagged CNode/TCB MDB cursor. Bootstrap and capability-bearing fixtures derive only after
+    TCB admission from published source CTEs. CNode and TCB destruction share a registry-bounded
+    iterative finalization queue. IPC-buffer access derives the physical offset from the held
+    Frame and its direction-specific rights: read-only sends are valid, receive writes require
+    read/write authority, and the complete 1 KiB IPC buffer must be aligned. The MCS Configure
+    wire layout is three words plus three extra capabilities; it does not change fault handlers.
+    Source review also found old managed fixture publications bypassing reference accounting
+    through whole-CTE assignment; those are being converted to counted writes and checked cleanup,
+    not hidden by recounting between operations. These changes are not yet build/runtime verified.
+
+    Pre-runtime review found a further mechanism prerequisite: remote_tcb_stall drops/reacquires
+    BKL while callers retain mutable kernel-state borrows and capability snapshots. The new
+    finalization queue cannot cross that gap, and revalidating a reused numeric TCB identity is
+    insufficient. Replace it with lock-preserving remote architectural quiescence, capturing
+    registers/FPU and entry origin before acknowledgement and servicing translation retirement
+    while parked; a pending syscall must neither disappear nor execute twice. Mapping detach
+    and replacement also require completed remote translation invalidation before physical reuse,
+    not the old queued IPI. Reuse the synchronous retirement mailbox introduced in tranche 134.
+    Compile-only integration initially found three missing fixture imports (corrected); no passing
+    runtime result is claimed for tranche 135 yet.
 
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
@@ -29789,6 +29811,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `exec_handler.rs`, and post-SAS service code must not bypass it. Stack Event activations and
     callback return eligibility must become lane-local before enabling worker dispatch. Restore
     request-local shared fields and the bounded argument snapshot before every exact-lane resume.
+
+    Explicit Windows concurrency acceptance (2026-09-08): preserve multiple logical NT threads
+    entering the same loaded win32k.sys image. KeUserModeCallback suspends only its owning
+    request/thread continuation; other eligible queued requests must run on independently owned
+    execution lanes while that user callback remains outstanding. Existing on-demand physical
+    lanes share the provider VSpace and own separate stacks/IPC pages. Audit their active dispatch
+    and resume wiring rather than equating older single-TCB nested re-entry with full concurrency.
+    A single global continuation stack or shared request bank must not force unrelated requests
+    into LIFO completion order. NT/win32k resources and critical sections still govern which code
+    may actually execute concurrently; do not bypass those locks or release locks on the driver's
+    behalf merely to satisfy a progress check.
+
+    Source audit: acquire_or_provision_win32k_execution_lane already selects/provisions an idle
+    physical TCB in the same VSpace; secondary entries share DriverEntry's image/DRIVER_OBJECT
+    rather than initializing a second driver. Callback suspension retains its lane/token and
+    permits another lane to acquire execution. Existing host cases cover external callback
+    parking, selected-lane resume past an unrelated permanent waiter, exact callback/provider-wait
+    transfer, per-lane nesting and stale generations. ComponentSuspensionLanes.running still
+    admits only one executing lane because the request page and current context are shared.
+    That is cooperative overlap of outstanding requests, not simultaneous SMP driver execution.
+    Keep this distinction explicit in instrumentation and acceptance claims.
+
+    Host regression checkpoint: independent_callback_lanes_unwind_in_either_completion_order
+    parks two separate lanes, nests callbacks on both, and fully unwinds either lane while the
+    other's stack remains intact. Cross-lane reply/token rejection and exhausted lane capacity
+    preserve both owners. All 38 nt-component-suspension tests pass, with no ignored cases,
+    .tmp/test-independent-callback-lanes-20260908.log. This validates the scheduler contract,
+    not native PID/TID projection or a fresh desktop boot.
+
+    - [ ] Audit and close the lane-local request, callback, reply-capability and execution-context
+      ownership path for every win32k entry, including client/process identity, attach/APC/IRQL
+      state, callback payload/results, and cancellation or process/provider termination.
+    - [ ] Prove eligible queued work is admitted while a different client's user callback is
+      parked, with fair scheduling and checked resource exhaustion rather than global serialization
+      or unbounded worker creation. Reuse the existing provider execution-lane mechanism.
+    - [ ] Add host tests for two unrelated threads, nested callbacks on each, out-of-order returns,
+      stale/cross-lane return rejection, and cancellation without corrupting the surviving thread.
+      Then instrument a genuine runtime overlap: distinct NT thread/lane identities, an outstanding
+      callback, another request admitted/completed, and exact-owner callback resumption. Include
+      the instrumented desktop run and screenshot proof; lane allocation or nested depth alone
+      is not completion evidence.
+    - [ ] Remove the transport's single-running-lane restriction only after request storage,
+      KPCR/current-thread projection, attach/APC/IRQL state and reply/callback ownership are
+      genuinely per-executing-thread. Validate simultaneous entries on distinct CPUs where the
+      driver's own locks allow them, while proving shared NT resources still serialize correctly.
+      Do not substitute a second driver instance or an executive-wide driver lock for Windows
+      thread semantics.
 
 ## NTFS System-Volume Workstream
 

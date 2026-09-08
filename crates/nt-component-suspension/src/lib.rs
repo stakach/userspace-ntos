@@ -1908,6 +1908,49 @@ mod tests {
     }
 
     #[test]
+    fn independent_callback_lanes_unwind_in_either_completion_order() {
+        for order in [[0, 1], [1, 0]] {
+            let mut lanes = ComponentSuspensionLanes::<u64, u32>::new(2, 2);
+            let handles = [lanes.allocate(binding(1)).unwrap(), lanes.allocate(binding(2)).unwrap()];
+            let replies = [binding(1).reply_object, binding(2).reply_object];
+            let outer = [0xA1, 0xB1];
+            let inner = [0xA2, 0xB2];
+            for i in 0..2 {
+                lanes.begin_dispatch(handles[i], replies[i]).unwrap();
+                lanes.suspend_running(handles[i], replies[i], outer[i]).unwrap();
+            }
+            assert_eq!(lanes.allocate(binding(3)), Err(LaneError::NoCapacity));
+            assert_eq!(lanes.next_idle(), None);
+
+            for i in 0..2 {
+                lanes.resume_external(handles[i], replies[i], outer[i]).unwrap();
+                lanes.suspend_running(handles[i], replies[i], inner[i]).unwrap();
+            }
+            for i in order {
+                let peer = 1 - i;
+                assert!(lanes.resume_external(handles[i], replies[peer], inner[i]).is_err());
+                assert_eq!(
+                    lanes.resume_external(handles[i], replies[i], inner[peer]),
+                    Err(LaneError::InvalidPhase)
+                );
+                assert_eq!(lanes.external_top(handles[i]), Ok(Some(inner[i])));
+                assert_eq!(lanes.external_depth(handles[i]), Ok(2));
+                let peer_top = lanes.external_top(handles[peer]).unwrap();
+                let peer_depth = lanes.external_depth(handles[peer]).unwrap();
+                for token in [inner[i], outer[i]] {
+                    lanes.resume_external(handles[i], replies[i], token).unwrap();
+                    lanes.complete_external(handles[i], replies[i], token).unwrap();
+                    assert_eq!(lanes.external_top(handles[peer]), Ok(peer_top));
+                    assert_eq!(lanes.external_depth(handles[peer]), Ok(peer_depth));
+                }
+                assert_eq!(lanes.phase(handles[i]), Ok(LanePhase::Idle));
+            }
+            assert_eq!(lanes.external_depth(handles[0]), Ok(0));
+            assert_eq!(lanes.external_depth(handles[1]), Ok(0));
+        }
+    }
+
+    #[test]
     fn component_completion_preserves_an_outer_callback_suspension() {
         let mut lanes = ComponentSuspensionLanes::new(1, 3);
         let lane = lanes.allocate(binding(1)).unwrap();
