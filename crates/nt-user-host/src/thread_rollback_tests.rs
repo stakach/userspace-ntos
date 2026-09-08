@@ -71,7 +71,10 @@ enum Event {
     Delete(u64),
     Revoke,
     Unmap(ThreadRollbackResource),
+    DeleteResource(ThreadRollbackResource),
+    // Final allocator transfer, separate from capability deletion.
     Release(ThreadRollbackResource),
+    FinishTransfers,
     Commit,
 }
 
@@ -153,9 +156,19 @@ impl ThreadRollbackIo for Backend {
         self.attempt(Event::Unmap(resource))
     }
 
-    fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+    fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        assert!(self.tcb_deleted && self.excluded && self.pool_held && self.window_held);
+        assert_ne!(resource.kind, ThreadRollbackResourceKind::Frame);
+        assert!(resource.kind == ThreadRollbackResourceKind::Mechanism
+            || self.successes.contains(&Event::Unmap(resource)));
+        self.attempt(Event::DeleteResource(resource))
+    }
+
+    fn recycle_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
         assert!(self.tcb_deleted && self.excluded && self.pool_held && self.window_held);
         assert_eq!(self.charge, 8192);
+        assert!(resource.kind == ThreadRollbackResourceKind::Frame
+            || self.successes.contains(&Event::DeleteResource(resource)));
         assert!(
             resource.kind == ThreadRollbackResourceKind::Mechanism
                 || self.successes.contains(&Event::Unmap(resource))
@@ -163,9 +176,16 @@ impl ThreadRollbackIo for Backend {
         self.attempt(Event::Release(resource))
     }
 
+    fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
+        assert_eq!(id, self.current);
+        assert!(self.pool_held && self.window_held && self.commits == 0);
+        self.attempt(Event::FinishTransfers)
+    }
+
     fn commit_rollback(&mut self, id: ThreadRollbackId) {
         assert_eq!(id, self.current);
         assert!(self.tcb_deleted && self.excluded);
+        assert!(self.successes.contains(&Event::FinishTransfers));
         self.attempt(Event::Commit).unwrap();
         self.pool_held = false;
         self.window_held = false;
@@ -181,17 +201,23 @@ fn expected_events() -> Vec<Event> {
         Event::Delete(10),
         Event::Revoke,
         Event::Unmap(resource(100, Alias)),
+        Event::DeleteResource(resource(100, Alias)),
         Event::Release(resource(100, Alias)),
         Event::Unmap(resource(101, Alias)),
+        Event::DeleteResource(resource(101, Alias)),
         Event::Release(resource(101, Alias)),
         Event::Unmap(resource(102, Alias)),
+        Event::DeleteResource(resource(102, Alias)),
         Event::Release(resource(102, Alias)),
+        Event::DeleteResource(resource(300, Mechanism)),
         Event::Release(resource(300, Mechanism)),
+        Event::DeleteResource(resource(301, Mechanism)),
         Event::Release(resource(301, Mechanism)),
         Event::Unmap(resource(200, Frame)),
         Event::Release(resource(200, Frame)),
         Event::Unmap(resource(201, Frame)),
         Event::Release(resource(201, Frame)),
+        Event::FinishTransfers,
         Event::Commit,
     ]
 }
@@ -220,7 +246,7 @@ fn alias_unmap_failure_blocks_all_backing_and_preserves_completed_cap_progress()
 }
 
 #[test]
-fn failed_alias_delete_and_frame_recycle_never_replay_acknowledged_unmap() {
+fn failed_alias_and_frame_recycle_never_replay_acknowledged_unmap() {
     use ThreadRollbackResourceKind::*;
     for failed in [resource(101, Alias), resource(201, Frame)] {
         let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
@@ -241,6 +267,47 @@ fn failed_alias_delete_and_frame_recycle_never_replay_acknowledged_unmap() {
         io.fail = None;
         owner.advance(&mut io).unwrap();
         assert_eq!(io.successes, expected_events());
+    }
+}
+
+#[test]
+fn delete_failure_retains_resource_and_blocks_recycle_until_acknowledged() {
+    use ThreadRollbackResourceKind::*;
+    for failed in [resource(101, Alias), resource(300, Mechanism)] {
+        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut io = Backend::new(owner.id());
+        io.fail = Some(Event::DeleteResource(failed));
+        for _ in 0..3 { assert!(owner.advance(&mut io).is_err()); }
+        assert!(!io.calls.contains(&Event::Release(failed)));
+        assert!(owner.pending_resources().any(|entry| entry == failed));
+        assert_eq!(io.calls.iter().filter(|&&e| e == Event::Unmap(failed)).count(),
+            usize::from(failed.kind == Alias));
+        io.fail = None;
+        owner.advance(&mut io).unwrap();
+        assert_eq!(io.successes, expected_events());
+        assert_eq!(io.commits, 1);
+    }
+}
+
+#[test]
+fn recycle_failure_does_not_repeat_delete_or_unmap_for_any_resource_kind() {
+    use ThreadRollbackResourceKind::*;
+    for failed in [resource(101, Alias), resource(300, Mechanism), resource(200, Frame)] {
+        let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+        let mut io = Backend::new(owner.id());
+        io.fail = Some(Event::Release(failed));
+        for _ in 0..3 { assert!(owner.advance(&mut io).is_err()); }
+        assert_eq!(io.calls.iter().filter(|&&e| e == Event::DeleteResource(failed)).count(),
+            usize::from(failed.kind != Frame));
+        assert_eq!(io.calls.iter().filter(|&&e| e == Event::Unmap(failed)).count(),
+            usize::from(failed.kind != Mechanism));
+        assert!(owner.pending_resources().any(|entry| entry == failed));
+        assert!(io.pool_held && io.window_held && io.commits == 0);
+        io.fail = None;
+        owner.advance(&mut io).unwrap();
+        assert_eq!(io.successes, expected_events());
+        assert!(!io.calls.iter().any(|event| matches!(event,
+            Event::DeleteResource(ThreadRollbackResource { kind: Frame, .. }))));
     }
 }
 
@@ -271,16 +338,25 @@ fn partial_registry_transfer_survives_failed_cap_cleanup_until_final_acknowledge
         fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
             self.base.unmap_resource(resource)
         }
-        fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
             assert!(self.transfer.is_some());
-            self.base.release_resource(resource)
+            self.base.delete_resource(resource)
         }
-        fn commit_rollback(&mut self, id: ThreadRollbackId) {
+        fn recycle_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+            assert!(self.transfer.is_some());
+            self.base.recycle_resource(resource)
+        }
+        fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
             assert!(self.base.pool_held && self.base.window_held);
+            self.base.finish_memory_transfers(id)?;
             self.registry
                 .finish_transfer(self.transfer.take().unwrap())
                 .unwrap();
             assert!(self.registry.is_process_empty(id.identity().pi as u64));
+            Ok(())
+        }
+        fn commit_rollback(&mut self, id: ThreadRollbackId) {
+            assert!(self.transfer.is_none());
             self.base.commit_rollback(id);
         }
     }
@@ -342,15 +418,18 @@ fn stage_for(event: Event) -> ThreadRollbackStage {
         Event::Delete(_) => ThreadRollbackStage::DeleteTcb,
         Event::Revoke => ThreadRollbackStage::RevokeMemoryAccess,
         Event::Release(ThreadRollbackResource { kind: Alias, .. })
+        | Event::DeleteResource(ThreadRollbackResource { kind: Alias, .. })
         | Event::Unmap(ThreadRollbackResource { kind: Alias, .. }) => ThreadRollbackStage::Aliases,
         Event::Release(ThreadRollbackResource { kind: Frame, .. })
         | Event::Unmap(ThreadRollbackResource { kind: Frame, .. }) => ThreadRollbackStage::Frames,
         Event::Unmap(ThreadRollbackResource {
             kind: Mechanism, ..
         }) => panic!("mechanism unmap"),
+        Event::DeleteResource(ThreadRollbackResource { kind: Frame, .. }) => panic!("frame deletion"),
         Event::Release(ThreadRollbackResource {
             kind: Mechanism, ..
-        }) => ThreadRollbackStage::Mechanism,
+        }) | Event::DeleteResource(ThreadRollbackResource { kind: Mechanism, .. }) => ThreadRollbackStage::Mechanism,
+        Event::FinishTransfers => ThreadRollbackStage::FinishMemoryTransfers,
         Event::Commit => ThreadRollbackStage::Commit,
     }
 }
@@ -542,6 +621,7 @@ fn empty_resource_set_still_requires_tcb_deletion_and_memory_exclusion() {
             Event::Suspend(10),
             Event::Delete(10),
             Event::Revoke,
+            Event::FinishTransfers,
             Event::Commit
         ]
     );
@@ -574,7 +654,7 @@ fn released_alias_slots_are_not_deleted_again_after_later_failure() {
     owner.advance(&mut io).unwrap();
     assert_eq!(
         io.calls[boundary..],
-        [Event::Release(resource(201, Frame)), Event::Commit]
+        [Event::Release(resource(201, Frame)), Event::FinishTransfers, Event::Commit]
     );
 }
 
@@ -643,6 +723,55 @@ fn mechanism_failure_preserves_all_physical_frame_owners() {
 }
 
 #[test]
+fn terminal_transfer_failure_retains_owner_without_replaying_released_resources() {
+    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut io = Backend::new(owner.id());
+    io.fail = Some(Event::FinishTransfers);
+    for attempt in 1..=3 {
+        assert_eq!(owner.advance(&mut io), Err(ThreadRollbackError::Backend {
+            stage: ThreadRollbackStage::FinishMemoryTransfers,
+            status: 0xc000_009a,
+        }));
+        assert_eq!(owner.stage(), ThreadRollbackStage::FinishMemoryTransfers);
+        assert_eq!(owner.pending_resources().count(), 0);
+        assert_eq!(owner.pending_tcb(), None);
+        assert!(io.pool_held && io.window_held && io.charge == 8192);
+        assert_eq!(io.commits, 0);
+        assert_eq!(io.calls.iter().filter(|&&event| event == Event::FinishTransfers).count(), attempt);
+        for event in expected_events().into_iter().filter(|event|
+            !matches!(event, Event::FinishTransfers | Event::Commit))
+        {
+            assert_eq!(io.calls.iter().filter(|&&actual| actual == event).count(), 1);
+        }
+    }
+    io.fail = None;
+    owner.advance(&mut io).unwrap();
+    assert_eq!(io.successes, expected_events());
+    let calls = io.calls.len();
+    owner.advance(&mut io).unwrap();
+    assert_eq!(io.calls.len(), calls);
+    assert_eq!(io.commits, 1);
+}
+
+#[test]
+fn stale_terminal_retry_cannot_finish_transfers_or_commit_replacement() {
+    let mut owner = ThreadRollback::prepare(identity(), 10, &resources()).unwrap();
+    let mut io = Backend::new(owner.id());
+    io.fail = Some(Event::FinishTransfers);
+    owner.advance(&mut io).unwrap_err();
+    let calls = io.calls.len();
+    io.current = ThreadRollback::prepare(identity(), 11, &[]).unwrap().id();
+    io.fail = None;
+    assert_eq!(owner.advance(&mut io), Err(ThreadRollbackError::StaleOwner));
+    assert_eq!(io.calls.len(), calls);
+    assert_eq!(owner.stage(), ThreadRollbackStage::FinishMemoryTransfers);
+    assert!(io.pool_held && io.window_held && io.commits == 0);
+    io.current = owner.id();
+    owner.advance(&mut io).unwrap();
+    assert_eq!(&io.calls[calls..], &[Event::FinishTransfers, Event::Commit]);
+}
+
+#[test]
 fn backend_failure_status_is_preserved() {
     struct Failing;
     impl ThreadRollbackIo for Failing {
@@ -661,7 +790,13 @@ fn backend_failure_status_is_preserved() {
         fn unmap_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
             panic!()
         }
-        fn release_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+        fn delete_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+            panic!()
+        }
+        fn recycle_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+            panic!()
+        }
+        fn finish_memory_transfers(&mut self, _: ThreadRollbackId) -> Result<(), u32> {
             panic!()
         }
         fn commit_rollback(&mut self, _: ThreadRollbackId) {

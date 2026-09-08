@@ -20,6 +20,16 @@ struct Runtime {
     top: u64,
 }
 
+impl crate::thread_pending::RuntimeMemoryHandoff for Runtime {
+    fn clear_memory_projections(
+        &mut self,
+        _: crate::thread_rollback::ThreadRollbackId,
+        _: &[crate::thread_rollback::ThreadRollbackResource],
+    ) -> Result<(), u32> {
+        Ok(())
+    }
+}
+
 impl RuntimeIdentity for Runtime {
     type Role = ();
     fn binding(&self) -> ThreadBinding<()> {
@@ -318,6 +328,7 @@ fn journal_preparation_failure_retains_the_same_exclusion() {
         Err(ThreadMemoryAccessError::Excluded(id))
     );
     slots[0].prepare_cleanup(id, &[]).unwrap();
+    slots[0].commit_memory_handoff(id).unwrap();
     assert_eq!(
         check(&slots, 2, 0x1000, 1),
         Err(ThreadMemoryAccessError::Excluded(id))
@@ -343,9 +354,13 @@ impl ThreadRollbackIo for Backend {
     fn unmap_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
         panic!("empty journal")
     }
-    fn release_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+    fn delete_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
         panic!("empty journal")
     }
+    fn recycle_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+        panic!("empty journal")
+    }
+    fn finish_memory_transfers(&mut self, _: ThreadRollbackId) -> Result<(), u32> { Ok(()) }
     fn commit_rollback(&mut self, _: ThreadRollbackId) {}
 }
 
@@ -354,6 +369,7 @@ fn failed_and_completed_cleanup_preserve_exclusions_until_retirement() {
     let mut slots = [pending(runtime(2, ProcessGeneration::Hosted(7)))];
     let id = slots[0].pending().unwrap().id();
     slots[0].prepare_cleanup(id, &[]).unwrap();
+    slots[0].commit_memory_handoff(id).unwrap();
     let mut backend = Backend { id, fail: true };
     assert!(slots[0].advance_cleanup(id, &mut backend).is_err());
     assert_eq!(

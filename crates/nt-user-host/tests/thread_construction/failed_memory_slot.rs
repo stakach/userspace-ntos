@@ -291,6 +291,7 @@ fn journal_oom_after_empty_slot_recycling_never_reconstructs_ownership() {
     );
     assert_protected(&mut slot, id);
     slot.prepare_cleanup(id, &resources).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
     assert_eq!(backend.events, [Event::MemoryRecycle(601)]);
     assert_eq!(slot.owner().unwrap().coverage.empty_slot(), Some(601));

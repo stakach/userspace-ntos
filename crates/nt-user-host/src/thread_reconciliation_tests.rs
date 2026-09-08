@@ -79,6 +79,37 @@ fn partial_coverage_captures_registry_only_aliases_without_transferring_rows() {
 }
 
 #[test]
+fn exact_provenance_survives_transfer_without_revalidating_recycled_cap_numbers() {
+    let (resources, progress, mut registry) = fixture();
+    let state = ThreadRegistryReconciliation::empty();
+    let id = attempt();
+    assert!(state.retained_snapshot(id).is_err());
+    let (progress, retirement) = seal(progress, id);
+    let snapshot = state
+        .reconcile(id, &resources, &progress, &retirement, &registry)
+        .unwrap();
+    let transfer = snapshot
+        .prepare_transfer(&resources, &mut registry)
+        .unwrap()
+        .unwrap();
+    let cleared =
+        ThreadMemoryResources::new(resources.client_pi, resources.layout().unwrap()).unwrap();
+    assert!(snapshot.matches_resources(&resources));
+    assert!(!snapshot.matches_resources(&cleared));
+    assert!(state
+        .reconcile(id, &resources, &progress, &retirement, &registry)
+        .is_err());
+    registry.finish_transfer(transfer).unwrap();
+    registry.insert(8, 0xa000, 10, 0, 12, 13, false).unwrap();
+    assert!(core::ptr::eq(
+        snapshot,
+        state.retained_snapshot(id).unwrap()
+    ));
+    assert!(state.retained_snapshot(attempt()).is_err());
+    assert_eq!(registry.get(8, 0xa000).unwrap().frame, 10);
+}
+
+#[test]
 fn missing_published_page_is_not_inferred_away_and_preparation_can_retry() {
     let (resources, progress, mut registry) = fixture();
     registry.take(7, 0x5000).unwrap();

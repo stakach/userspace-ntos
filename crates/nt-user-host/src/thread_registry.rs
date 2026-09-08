@@ -145,6 +145,11 @@ impl<const STACK: usize> ThreadRegistrySnapshot<STACK> {
         &self.inventory
     }
 
+    /// Compare copied projections before their allocation-free handoff to a cleanup journal.
+    pub fn matches_resources(&self, resources: &ThreadMemoryResources<STACK>) -> bool {
+        resources == &self.resources
+    }
+
     /// Allocation-free validation of both selected records and expected absence, plus cap sharing
     /// outside the selection. Selected-row equality alone cannot detect a new external alias.
     pub fn revalidate(

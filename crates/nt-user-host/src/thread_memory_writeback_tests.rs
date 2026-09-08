@@ -68,6 +68,7 @@ fn excluded_alias_preserves_writeback(file_wide: bool) {
     let mut slots = [pending(runtime(2, ProcessGeneration::Hosted(7)))];
     let id = slots[0].pending().unwrap().id();
     slots[0].prepare_cleanup(id, &[]).unwrap();
+    slots[0].commit_memory_handoff(id).unwrap();
 
     // Both failed and completed-but-not-retired cleanup retain the writeback exclusion.
     let mut cleanup = Backend { id, fail: true };

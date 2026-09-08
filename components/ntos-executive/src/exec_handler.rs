@@ -22286,7 +22286,7 @@ impl ExecNtHandler {
     /// mechanism can discard only an untouched candidate. Once cleanup begins, its exact owner
     /// survives even an inconsistent mechanism generation and must not affect its replacement.
     pub(crate) fn drain_hosted_process_deletion_candidates(&mut self) -> usize {
-        self.drain_failed_thread_construction_mechanisms();
+        self.drain_failed_thread_constructions();
         let mut deleted = 0usize;
         for pi in 0..MAX_PI {
             let Some(candidate) = self.process_deletion_candidates.get(pi) else {
@@ -22321,7 +22321,7 @@ impl ExecNtHandler {
         deleted
     }
 
-    fn drain_failed_thread_construction_mechanisms(&mut self) {
+    fn drain_failed_thread_constructions(&mut self) {
         for index in 0..self.thread_runtime.slot_count() {
             let Some((id, runtime)) = self.thread_runtime.pending_construction_at(index) else {
                 continue;
@@ -22331,10 +22331,20 @@ impl ExecNtHandler {
                     runtime.pi, runtime.tid, runtime.badge, runtime.role,
                 ) != runtime.reservations
             { continue; }
-            if unsafe { self.thread_runtime.advance_construction_mechanisms(index, id) }.is_ok() {
-                print_str(b"[thread-mechanisms] retired pending tid=");
+            let Some(reservations) = runtime.reservations else { continue; };
+            if reservations.window_slot.is_some_and(|window| {
+                Self::tp_worker_slot_bit(window)
+                    .is_none_or(|bit| self.tp_worker_window_used[runtime.pi] & bit == 0)
+            }) { continue; }
+            if let Ok(retired) = unsafe { self.thread_runtime.advance_failed_construction(index, id) } {
+                assert_eq!(retired.reservations, Some(reservations));
+                assert!(self.release_pool_usage_slot(runtime.pi, reservations.pool_slot));
+                if let Some(window) = reservations.window_slot {
+                    self.clear_hosted_tp_worker_window_slot(runtime.pi, window);
+                }
+                print_str(b"[thread-retirement] retired pending tid=");
                 print_u64(runtime.tid);
-                print_str(b"; memory and reservations retained\n");
+                print_str(b"; mechanisms, memory and reservations released\n");
             }
         }
     }

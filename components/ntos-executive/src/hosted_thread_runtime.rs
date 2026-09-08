@@ -3,6 +3,9 @@ use nt_user_host::thread_slot::{RuntimeConstruction, RuntimeIdentity, ThreadRunt
 
 type RuntimeSlot = ThreadRuntimeSlot<HostedThreadRuntimeOwner>;
 
+#[path = "thread_memory_retirement.rs"]
+mod memory_retirement;
+
 /// Durable memory/progress ownership is distinct from copied routing/diagnostic metadata.
 /// Mechanism inventory stays alongside this payload in the pending row's sealed retirement actor.
 #[derive(Debug)]
@@ -13,6 +16,7 @@ pub(crate) struct HostedThreadRuntimeOwner {
     alias_preparation: core::cell::OnceCell<win32k_glue::ThreadAliasCleanup>,
     prefetch_preparation: core::cell::OnceCell<client_prefetch::ThreadPrefetchCleanup>,
     provider_preparation: core::cell::OnceCell<win32k_glue::ThreadProviderAliasCleanup>,
+    memory_retirement: core::cell::OnceCell<memory_retirement::MemoryRetirement>,
     retirement_error: core::cell::Cell<Option<u32>>,
 }
 
@@ -25,6 +29,7 @@ impl HostedThreadRuntimeOwner {
             alias_preparation: core::cell::OnceCell::new(),
             prefetch_preparation: core::cell::OnceCell::new(),
             provider_preparation: core::cell::OnceCell::new(),
+            memory_retirement: core::cell::OnceCell::new(),
             retirement_error: core::cell::Cell::new(None),
         }
     }
@@ -34,6 +39,7 @@ impl HostedThreadRuntimeOwner {
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
             && self.prefetch_preparation.get().is_none()
             && self.provider_preparation.get().is_none()
+            && self.memory_retirement.get().is_none()
     }
 
     fn into_legacy_runtime(self) -> HostedThreadRuntime {
@@ -915,27 +921,41 @@ impl HostedThreadRuntimes {
         nt_user_host::thread_rollback::ThreadRollbackId, HostedThreadRuntime,
     )> {
         let pending = unsafe { (&*self.table).entries.get(index)?.pending()? };
-        (!pending.construction_retirement()?.is_complete())
-            .then(|| (pending.id(), pending.runtime().runtime))
+        pending.construction_retirement()?;
+        Some((pending.id(), pending.runtime().runtime))
     }
 
     /// # Safety
     /// Caller has validated current PM/process identity and held pool/window reservations.
-    /// This drives mechanisms only; memory, journals and reservations remain in the pending row.
-    pub(crate) unsafe fn advance_construction_mechanisms(
+    /// Direct kernel operations only. Completed bookkeeping is returned for immediate, allocation-
+    /// free reservation release. Failed construction never committed an MM/job charge.
+    pub(crate) unsafe fn advance_failed_construction(
         &mut self, index: usize, id: nt_user_host::thread_rollback::ThreadRollbackId,
-    ) -> Result<(), u32> {
+    ) -> Result<HostedThreadRuntime, u32> {
+        let _durable = allocator::enter_durable();
         let table = &mut *self.table;
         let result = (|| {
             if table.entries.get(index).and_then(RuntimeSlot::pending)
                 .is_none_or(|pending| pending.id() != id)
             { return Err(nt_address_space::STATUS_INVALID_PARAMETER); }
-            table.reconcile_failed_spawn(id).map_err(|error| error.status())?;
+            // Original cap numbers are only pre-handoff provenance. Once a registry transfer
+            // exists, retries validate the exact retained owners, never recycled numeric slots.
+            if table.entries[index].pending().unwrap().runtime().memory_retirement.get().is_none() {
+                table.reconcile_failed_spawn(id).map_err(|error| error.status())?;
+            }
             let slot = table.entries.get_mut(index).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
             if slot.pending().is_none_or(|pending| pending.id() != id) {
                 return Err(nt_address_space::STATUS_INVALID_PARAMETER);
             }
-            crate::thread_construction_retirement::advance(slot, id)
+            if !slot.pending().and_then(|pending| pending.construction_retirement())
+                .is_some_and(|owner| owner.is_complete())
+            {
+                crate::thread_construction_retirement::advance(slot, id)?;
+            }
+            memory_retirement::prepare(slot, id)?;
+            memory_retirement::advance(slot, id)?;
+            let owner = slot.take_retired_payload(id).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+            Ok(owner.runtime)
         })();
         if let Some(pending) = table.entries.get(index).and_then(RuntimeSlot::pending)
             .filter(|pending| pending.id() == id)
@@ -943,7 +963,7 @@ impl HostedThreadRuntimes {
             let current = result.as_ref().err().copied();
             if pending.runtime().retirement_error.replace(current) != current {
                 if let Some(status) = current {
-                    print_str(b"[thread-mechanisms] retained tid=");
+                    print_str(b"[thread-retirement] retained tid=");
                     print_u64(id.identity().tid);
                     print_str(b" status=0x");
                     print_hex(status);

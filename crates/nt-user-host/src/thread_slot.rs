@@ -72,6 +72,7 @@ pub enum SlotError {
     Publication(crate::thread_publication::PublicationError),
     Cleanup(ThreadRollbackError),
     Retirement(crate::thread_retirement::RetirementError),
+    MemoryHandoff(crate::thread_pending::MemoryHandoffError),
 }
 
 impl<R: RuntimeConstruction> ThreadRuntimeSlot<R> {
@@ -350,6 +351,25 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
     ) -> Result<(), SlotError> {
         self.pending_mut_exact(expected)?
             .advance(io)
+            .map_err(SlotError::Cleanup)
+    }
+
+    pub fn commit_memory_handoff(&mut self, expected: ThreadRollbackId) -> Result<(), SlotError>
+    where
+        R: crate::thread_pending::RuntimeMemoryHandoff,
+    {
+        self.pending_mut_exact(expected)?
+            .commit_memory_handoff(expected)
+            .map_err(SlotError::MemoryHandoff)
+    }
+
+    pub fn advance_cleanup_with<'a, T: ThreadRollbackIo>(
+        &'a mut self,
+        expected: ThreadRollbackId,
+        factory: impl FnOnce(&'a R) -> T,
+    ) -> Result<(), SlotError> {
+        self.pending_mut_exact(expected)?
+            .advance_with(factory)
             .map_err(SlotError::Cleanup)
     }
 

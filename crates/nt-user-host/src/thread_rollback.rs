@@ -91,6 +91,7 @@ pub enum ThreadRollbackStage {
     Aliases,
     Mechanism,
     Frames,
+    FinishMemoryTransfers,
     Commit,
     Complete,
 }
@@ -129,16 +130,24 @@ pub trait ThreadRollbackIo {
     /// rollback owner records acknowledgement separately from deletion/recycling so release retry
     /// never repeats a successful unmap. Mechanism resources do not pass through this callback.
     fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32>;
-    /// Release exactly this capability. Alias and mechanism deletion precede frame recycling.
-    /// Alias/Frame unmapping has already been acknowledged. Frame cleanup must reserve free-list
-    /// bookkeeping before losing ownership metadata. A successful
-    /// release also clears every mutable registry/runtime release reference to that capability.
+    /// Delete an Alias or Mechanism capability only, never its allocator slot. Alias unmapping
+    /// has already been acknowledged. Frame owners never enter this callback. Err must retain
+    /// the populated capability; successful deletion is acknowledged before recycling is attempted.
+    fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32>;
+    /// Transfer an empty Alias/Mechanism slot or an unmapped Frame backing owner to its allocator.
+    /// Frame cleanup must reserve free-list bookkeeping before losing ownership metadata. A
+    /// successful transfer also clears every mutable registry/runtime release reference.
     /// Immutable terminal transfer snapshots keep their captured cap numbers until final transfer
     /// acknowledgement, but must expose neither ordinary access nor a second release authority.
-    /// Failure retains the capability and any sub-operation progress in the backend's exact owner.
-    fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32>;
-    /// Finish exact terminal registry transfers before releasing retained commitment and target
-    /// pool/window reservations once, then retire the
+    /// Failure retains exact input ownership. Do not repeat deletion here: it has already been
+    /// acknowledged for Alias/Mechanism, and a Frame cap must remain populated in its frame pool.
+    fn recycle_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32>;
+    /// Finish exact terminal registry transfers after all resources have been released. Failure
+    /// retains the transfer owners and their completed substeps for retry; it cannot restore access
+    /// or authorize release of captured numeric capabilities again. No reservation/accounting
+    /// release belongs here. Successful completion is acknowledged before the infallible commit.
+    fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32>;
+    /// Release retained commitment and target pool/window reservations once, then retire the
     /// runtime. This is an allocation-free target-side commit: never write caller output pointers,
     /// repeat caller handle cancellation, or synthesize activation/termination of the unpublished
     /// ETHREAD. The outer owner must keep this rollback object alive through the callback's return.
@@ -165,6 +174,7 @@ pub struct ThreadRollback {
 struct OwnedResource {
     resource: ThreadRollbackResource,
     unmapped: bool,
+    deleted: bool,
 }
 
 impl ThreadRollback {
@@ -218,6 +228,7 @@ impl ThreadRollback {
                 owned.push(OwnedResource {
                     resource,
                     unmapped: false,
+                    deleted: false,
                 });
             }
         }
@@ -294,7 +305,7 @@ impl ThreadRollback {
                         ),
                         ThreadRollbackStage::Frames => (
                             ThreadRollbackResourceKind::Frame,
-                            ThreadRollbackStage::Commit,
+                            ThreadRollbackStage::FinishMemoryTransfers,
                         ),
                         _ => (
                             ThreadRollbackResourceKind::Mechanism,
@@ -310,12 +321,23 @@ impl ThreadRollback {
                                 })?;
                                 entry.unmapped = true;
                             }
-                            io.release_resource(resource)
+                            if kind != ThreadRollbackResourceKind::Frame && !entry.deleted {
+                                io.delete_resource(resource).map_err(|status| {
+                                    ThreadRollbackError::Backend { stage, status }
+                                })?;
+                                entry.deleted = true;
+                            }
+                            io.recycle_resource(resource)
                                 .map_err(|status| ThreadRollbackError::Backend { stage, status })?;
                             entry.resource.cap = 0;
                         }
                     }
                     next
+                }
+                ThreadRollbackStage::FinishMemoryTransfers => {
+                    io.finish_memory_transfers(self.id)
+                        .map_err(|status| ThreadRollbackError::Backend { stage, status })?;
+                    ThreadRollbackStage::Commit
                 }
                 ThreadRollbackStage::Commit => {
                     io.commit_rollback(self.id);

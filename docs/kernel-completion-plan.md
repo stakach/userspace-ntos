@@ -30019,6 +30019,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     retired numeric slot no longer participates as a live TCB in binding admission. No desktop
     result or full failed-thread memory reclamation is claimed by this checkpoint.
 
+    B3 pending-construction memory retirement tranche 140 (2026-09-09, host/native validation):
+    replace the mechanism-only native drain with the complete failed-construction owner. Prepare
+    the memory journal while its original resource projections and reservations remain protected,
+    acquire the exact terminal registry transfer, then perform a one-time allocation-free handoff
+    that clears copied cap fields while preserving the full excluded address geometry. Cleanup
+    cannot run before this handoff; a readonly-runtime backend factory keeps native attribution
+    separate from mutable journal progress without exposing mutable pending runtime access.
+
+    External client-to-win32k, root-prefetch and provider-to-client mappings retire through their
+    existing disjoint journals. Actual provider mappings require physical execution lanes to be
+    idle and retained callback/VM continuations to be absent during the no-reentry cleanup window.
+    Include child-only provider bank mappings in that gate, not just temporary root scratch caps.
+    Retries validate current claimed rows; original cap numbers are immutable provenance and may
+    already have been recycled into unrelated owners. Never rerun original inventory cross-owner
+    checks after memory handoff. Provider backing and permanent segment CNodes remain owned.
+
+    Alias unmap, capability deletion and allocator publication have separate acknowledgments.
+    Physical frame owners are unmapped and returned to the frame pool, never deleted. A fallible
+    terminal registry-transfer stage precedes final commit; failure retains its receipt without
+    repeating any acknowledged release. Only then remove the pending slot and release the exact
+    prevalidated pool/window reservations without IPC. Failed construction never committed its
+    prepared MM/job charge, so this path must not release commitment a second time.
+
+    Host validation passes 611 unit tests, 47 integration tests and three compile-fail checks in
+    .tmp/test-thread-memory-retirement-20260909.log. The underlying MM registry/ownership suite
+    passes 410 tests and three compile-fail checks in .tmp/test-thread-memory-transfer-mm-20260909.log.
+    Native release build passes in .tmp/build-thread-memory-retirement-20260909.log.
+    Review adjustment: this closes failed-construction memory cleanup, not ordinary running-thread
+    teardown. The latter still needs retained charged commitment, execution/GUI lifetime draining,
+    and checked TCB deletion/recycling before its legacy release chain can be removed. Canonical
+    provider Ps-body allocation/grant cutover and the strict 27-import frontier remain open; no
+    new NT boot or desktop result is claimed.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

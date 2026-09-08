@@ -116,6 +116,16 @@ struct Runtime {
     projection_override: Option<u64>,
 }
 
+impl nt_user_host::thread_pending::RuntimeMemoryHandoff for Runtime {
+    fn clear_memory_projections(
+        &mut self,
+        _: nt_user_host::thread_rollback::ThreadRollbackId,
+        _: &[nt_user_host::thread_rollback::ThreadRollbackResource],
+    ) -> Result<(), u32> {
+        Ok(())
+    }
+}
+
 impl RuntimeIdentity for Runtime {
     type Role = u32;
     fn binding(&self) -> ThreadBinding<u32> {
@@ -609,6 +619,7 @@ enum Event {
     Revoke,
     Unmap(u64),
     Release(u64),
+    FinishTransfers,
     Commit,
 }
 
@@ -646,8 +657,16 @@ impl ThreadRollbackIo for Backend {
     fn unmap_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
         self.record(Event::Unmap(resource.cap))
     }
-    fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+    fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        assert_ne!(resource.kind, Kind::Frame);
+        self.record(Event::Delete(resource.cap))
+    }
+    fn recycle_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
         self.record(Event::Release(resource.cap))
+    }
+    fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
+        assert_eq!(id, self.current);
+        self.record(Event::FinishTransfers)
     }
     fn commit_rollback(&mut self, _: ThreadRollbackId) {
         self.events.push(Event::Commit);
@@ -680,9 +699,11 @@ fn absent_and_real_tcb_cleanup_retry_every_operation_without_releasing_holds() {
         expected.extend([
             Event::Revoke,
             Event::Unmap(100),
+            Event::Delete(100),
             Event::Release(100),
             Event::Unmap(200),
             Event::Release(200),
+            Event::FinishTransfers,
             Event::Commit,
         ]);
         for fail in 0..expected.len() - 1 {
@@ -704,6 +725,7 @@ fn absent_and_real_tcb_cleanup_retry_every_operation_without_releasing_holds() {
             } else {
                 without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
                 slot.prepare_cleanup(id, &inventory).unwrap();
+                slot.commit_memory_handoff(id).unwrap();
                 assert_eq!(slot.pending().unwrap().cleanup().unwrap().pending_tcb(), None);
                 assert!(slot.advance_cleanup(id, &mut backend).is_err());
             }
@@ -714,6 +736,7 @@ fn absent_and_real_tcb_cleanup_retry_every_operation_without_releasing_holds() {
             without_allocation(|| slot.advance_construction_retirement(id, &mut backend)).unwrap();
             if slot.pending().unwrap().cleanup().is_none() {
                 slot.prepare_cleanup(id, &inventory).unwrap();
+                slot.commit_memory_handoff(id).unwrap();
             }
             slot.advance_cleanup(id, &mut backend).unwrap();
             slot.advance_cleanup(id, &mut backend).unwrap();
@@ -882,12 +905,13 @@ fn memory_journal_oom_after_retirement_never_resurrects_tcb_operations() {
     assert_protected(&mut slot, id);
     assert_eq!(drops.get(), 0);
     slot.prepare_cleanup(id, &resources).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     assert_eq!(slot.pending().unwrap().cleanup().unwrap().pending_tcb(), None);
     assert_eq!(slot.pending().unwrap().cleanup().unwrap().stage(), ThreadRollbackStage::RevokeMemoryAccess);
     slot.advance_construction_retirement(id, &mut backend).unwrap();
     slot.advance_cleanup(id, &mut backend).unwrap();
     assert_eq!(backend.events, [Event::Suspend(400), Event::Delete(400), Event::Recycle(400),
-        Event::Revoke, Event::Unmap(100), Event::Release(100), Event::Unmap(200), Event::Release(200), Event::Commit]);
+        Event::Revoke, Event::Unmap(100), Event::Delete(100), Event::Release(100), Event::Unmap(200), Event::Release(200), Event::FinishTransfers, Event::Commit]);
 }
 
 #[test]

@@ -43,6 +43,19 @@ impl<const STACK: usize> ThreadRegistryReconciliation<STACK> {
         self.prepared.get().is_some()
     }
 
+    /// Immutable provenance after ownership handoff. This does not revalidate mutable registry
+    /// rows: terminal transfers and acknowledged releases intentionally change those rows.
+    pub fn retained_snapshot(
+        &self,
+        id: ThreadRollbackId,
+    ) -> Result<&ThreadRegistrySnapshot<STACK>, ReconciliationError> {
+        self.prepared
+            .get()
+            .filter(|prepared| prepared.id == id)
+            .map(|prepared| &prepared.snapshot)
+            .ok_or(ReconciliationError::AttemptChanged)
+    }
+
     /// The caller must first match `id` to the protected pending row. Capture failures leave
     /// preparation empty; retries after successful capture revalidate the original snapshot.
     /// Complete access exclusions must remain active throughout preparation and revalidation.

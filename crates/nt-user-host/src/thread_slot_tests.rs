@@ -11,6 +11,16 @@ struct Runtime {
     drops: Rc<Cell<usize>>,
 }
 
+impl crate::thread_pending::RuntimeMemoryHandoff for Runtime {
+    fn clear_memory_projections(
+        &mut self,
+        _: crate::thread_rollback::ThreadRollbackId,
+        _: &[crate::thread_rollback::ThreadRollbackResource],
+    ) -> Result<(), u32> {
+        Ok(())
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.drops.set(self.drops.get() + 1);
@@ -178,6 +188,7 @@ fn ingress_stays_rejected_through_failed_and_completed_cleanup() {
     let binding = slot.owner().unwrap().binding;
     let id = slot.begin_pending(binding).unwrap();
     slot.prepare_cleanup(id, &[]).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     let mut backend = Backend {
         current: id,
         drops: drops.clone(),
@@ -243,8 +254,15 @@ impl ThreadRollbackIo for Backend {
     fn unmap_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
         panic!("empty journal")
     }
-    fn release_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+    fn delete_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
         panic!("empty inventory")
+    }
+    fn recycle_resource(&mut self, _: ThreadRollbackResource) -> Result<(), u32> {
+        panic!("empty inventory")
+    }
+    fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
+        assert_eq!(id, self.current);
+        Ok(())
     }
     fn commit_rollback(&mut self, id: ThreadRollbackId) {
         assert_eq!(id, self.current);
@@ -424,6 +442,7 @@ fn invalid_cleanup_inventory_preserves_pending_owner_for_retry() {
     assert!(slot.pending().unwrap().cleanup().is_none());
     assert_eq!(drops.get(), 0);
     slot.prepare_cleanup(id, &[]).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     assert_eq!(slot.pending().unwrap().cleanup().unwrap().id(), id);
 }
 
@@ -443,6 +462,7 @@ fn failed_cleanup_retains_slot_and_completed_cleanup_retires_once() {
         Err(SlotError::Cleanup(ThreadRollbackError::NotPrepared))
     );
     slot.prepare_cleanup(id, &[]).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     assert!(slot.advance_cleanup(id, &mut io).is_err());
     assert_eq!(io.effects, 2);
     assert!(slot.take_retired_payload(id).is_none());
@@ -474,6 +494,7 @@ fn stale_cleanup_backend_cannot_affect_the_retained_slot() {
     let binding = slot.owner().unwrap().binding;
     let id = slot.begin_pending(binding).unwrap();
     slot.prepare_cleanup(id, &[]).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     let other = crate::thread_rollback::ThreadRollback::prepare(id.identity(), 100, &[]).unwrap();
     let mut io = Backend {
         current: other.id(),
@@ -545,6 +566,7 @@ fn stale_attempt_cannot_prepare_drive_or_retire_a_replacement_owner() {
         slot.prepare_cleanup(foreign, &[]),
         Err(SlotError::OwnerChanged)
     );
+    assert_eq!(slot.commit_memory_handoff(foreign), Err(SlotError::OwnerChanged));
     assert_eq!(
         slot.advance_cleanup(foreign, &mut io),
         Err(SlotError::OwnerChanged)
@@ -552,6 +574,7 @@ fn stale_attempt_cannot_prepare_drive_or_retire_a_replacement_owner() {
     assert_eq!(io.effects, 0);
     assert!(slot.pending().unwrap().cleanup().is_none());
     slot.prepare_cleanup(id, &[]).unwrap();
+    slot.commit_memory_handoff(id).unwrap();
     slot.advance_cleanup(id, &mut io).unwrap();
     assert!(slot.take_retired_payload(foreign).is_none());
     assert_eq!(slot.pending().unwrap().id(), id);

@@ -24,6 +24,16 @@ struct Runtime {
     drops: Rc<Cell<usize>>,
 }
 
+impl crate::thread_pending::RuntimeMemoryHandoff for Runtime {
+    fn clear_memory_projections(
+        &mut self,
+        _: crate::thread_rollback::ThreadRollbackId,
+        _: &[crate::thread_rollback::ThreadRollbackResource],
+    ) -> Result<(), u32> {
+        Ok(())
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.drops.set(self.drops.get() + 1);
@@ -131,7 +141,14 @@ impl ThreadRollbackIo for Backend {
         Ok(())
     }
 
-    fn release_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+    fn delete_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
+        assert_ne!(resource.kind, ThreadRollbackResourceKind::Frame);
+        assert!(resource.kind == ThreadRollbackResourceKind::Mechanism
+            || self.unmapped.contains(&resource.cap));
+        Ok(())
+    }
+
+    fn recycle_resource(&mut self, resource: ThreadRollbackResource) -> Result<(), u32> {
         assert!(
             resource.kind == ThreadRollbackResourceKind::Mechanism
                 || self.unmapped.contains(&resource.cap)
@@ -145,9 +162,15 @@ impl ThreadRollbackIo for Backend {
         self.effect(step)
     }
 
+    fn finish_memory_transfers(&mut self, id: ThreadRollbackId) -> Result<(), u32> {
+        assert_eq!(id, self.current);
+        assert!(self.held);
+        self.effect(6)
+    }
+
     fn commit_rollback(&mut self, id: ThreadRollbackId) {
         assert_eq!(id, self.current);
-        self.effect(6).unwrap();
+        self.effect(7).unwrap();
         self.held = false;
     }
 }
@@ -229,6 +252,7 @@ fn preparation_preserves_retained_attempt_identity() {
     let (mut owner, _) = owner();
     let id = owner.id();
     owner.prepare_journal(&resources()).unwrap();
+    owner.commit_memory_handoff(owner.id()).unwrap();
     assert_eq!(owner.id(), id);
     assert_eq!(owner.cleanup().unwrap().id(), id);
     assert_eq!(owner.cleanup().unwrap().pending_tcb(), Some(10));
@@ -255,6 +279,7 @@ fn journal_allocation_failure_preserves_owner_for_same_attempt_retry() {
         assert_eq!(drops.get(), 0);
     }
     owner.prepare_journal(&resources()).unwrap();
+    owner.commit_memory_handoff(owner.id()).unwrap();
     assert_eq!(owner.cleanup().unwrap().id(), id);
 }
 
@@ -273,6 +298,7 @@ fn invalid_inventory_preserves_owner_for_retry() {
     assert_eq!(owner.reservations(), reservations());
     assert_eq!(drops.get(), 0);
     owner.prepare_journal(&resources()).unwrap();
+    owner.commit_memory_handoff(owner.id()).unwrap();
     assert_eq!(owner.cleanup().unwrap().id(), id);
 }
 
@@ -296,9 +322,10 @@ fn unprepared_owner_cannot_advance_or_release_payload() {
 
 #[test]
 fn every_cleanup_failure_retains_payload_reservations_and_retry_progress() {
-    for failure in 0..6 {
+    for failure in 0..7 {
         let (mut owner, drops) = owner();
         owner.prepare_journal(&resources()).unwrap();
+        owner.commit_memory_handoff(owner.id()).unwrap();
         let mut io = Backend::new(&owner, drops.clone());
         io.fail = Some(failure);
         for _ in 0..3 {
@@ -318,7 +345,7 @@ fn every_cleanup_failure_retains_payload_reservations_and_retry_progress() {
         }
         io.fail = None;
         owner.advance(&mut io).unwrap();
-        assert_eq!(io.successes, (0..7).collect::<Vec<_>>());
+        assert_eq!(io.successes, (0..8).collect::<Vec<_>>());
         assert!(!io.held);
         let runtime = match owner.try_into_retired_payload() {
             Ok(runtime) => runtime,
@@ -334,6 +361,7 @@ fn every_cleanup_failure_retains_payload_reservations_and_retry_progress() {
 fn duplicate_preparation_cannot_reset_partial_progress() {
     let (mut owner, drops) = owner();
     owner.prepare_journal(&resources()).unwrap();
+    owner.commit_memory_handoff(owner.id()).unwrap();
     let mut io = Backend::new(&owner, drops);
     io.fail = Some(4);
     assert!(owner.advance(&mut io).is_err());
@@ -367,6 +395,7 @@ fn reused_identity_cannot_drive_an_older_attempt() {
     assert_eq!(old.id().identity(), new.id().identity());
     assert_ne!(old.id(), new.id());
     old.prepare_journal(&resources()).unwrap();
+    old.commit_memory_handoff(old.id()).unwrap();
     let mut io = Backend::new(&new, drops);
     assert_eq!(old.advance(&mut io), Err(ThreadRollbackError::StaleOwner));
     assert!(io.calls.is_empty());
@@ -377,6 +406,7 @@ fn reused_identity_cannot_drive_an_older_attempt() {
 fn missing_reservation_rejects_cleanup_without_effects() {
     let (mut owner, drops) = owner();
     owner.prepare_journal(&resources()).unwrap();
+    owner.commit_memory_handoff(owner.id()).unwrap();
     let mut io = Backend::new(&owner, drops);
     io.held = false;
     assert_eq!(owner.advance(&mut io), Err(ThreadRollbackError::StaleOwner));
@@ -387,6 +417,7 @@ fn missing_reservation_rejects_cleanup_without_effects() {
 fn completion_is_idempotent_and_retains_payload_through_commit() {
     let (mut owner, drops) = owner();
     owner.prepare_journal(&resources()).unwrap();
+    owner.commit_memory_handoff(owner.id()).unwrap();
     let mut io = Backend::new(&owner, drops.clone());
     owner.advance(&mut io).unwrap();
     let calls = io.calls.clone();
@@ -411,9 +442,10 @@ fn completion_is_idempotent_and_retains_payload_through_commit() {
 
 #[test]
 fn stale_owner_at_each_partial_stage_preserves_progress_for_exact_owner_retry() {
-    for failure in 0..6 {
+    for failure in 0..7 {
         let (mut owner, drops) = owner();
         owner.prepare_journal(&resources()).unwrap();
+        owner.commit_memory_handoff(owner.id()).unwrap();
         let mut io = Backend::new(&owner, drops.clone());
         io.fail = Some(failure);
         assert!(owner.advance(&mut io).is_err());
@@ -443,6 +475,6 @@ fn stale_owner_at_each_partial_stage_preserves_progress_for_exact_owner_retry() 
         assert_eq!(drops.get(), 0);
         io.current = exact;
         owner.advance(&mut io).unwrap();
-        assert_eq!(io.successes, (0..7).collect::<Vec<_>>());
+        assert_eq!(io.successes, (0..8).collect::<Vec<_>>());
     }
 }
