@@ -29203,6 +29203,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     them to the receiving projection ledger before publishing a relation result. The enduring
     consumer projection reference cannot substitute for each caller's returned object reference.
 
+    B3 canonical device pointer ownership tranche 119 (2026-09-08, complete):
+
+    Extend the existing manager-bound DeviceReference with counted ownership, allocation-free
+    reference increments through an already held owner, checked single/all release and exact
+    split/merge transfer. No Clone or new identity namespace is needed. Build a pre-admitted hosted
+    pointer-reference ledger over the existing domain/address bindings: registration owns its own
+    base reference, independent caller references have exact counts, and returned references can move
+    to another registered projection without a release/reacquire gap. Failed admission, transfer or
+    release must preserve ownership. Domain/device retirement must not bypass live pointer owners.
+
+    Native publication must pre-admit rows before exposing pointers; repeated Ob references must not
+    allocate. This is the prerequisite for replacing hosted-driver reference no-ops and transferring
+    actual TargetDeviceRelation results. The host ledger alone does not complete native Object
+    Manager pointer dispatch, or authorize substituting a PDO for an FDO.
+
+    Implemented counted DeviceReference ownership using the existing canonical count store and
+    manager identity. Retain through held ownership, one/all release, split and merge prevalidate
+    every count; repeated operations allocate nothing. Eight focused tests cover overflow, foreign
+    managers/devices, allocation-capacity stability, split/merge and deletion/unload barriers.
+
+    The I/O manager now owns the hosted pointer ledger. An exact registration has a retained base
+    reference and independent counted caller references; non-clone transfer owners can be adopted
+    by another live same-device projection without changing the canonical count. Failed adoption
+    and release preserve the owner. Nine tests cover registration ABA, reference/transfer rollback,
+    detached owners, sequence exhaustion, pending deletion and unbind/domain-retirement guards.
+    Win32k consumer registration now uses this ledger anchor instead of its replaced standalone
+    DeviceReference. Exact registration observations travel in DeviceAccess; incomplete admission
+    cannot authenticate. Checked quiescent cleanup retires registrations before unbinding. Consumer
+    registration and projection binding establish durable allocation scope locally.
+
+    Focused I/O validation passes 318 unit tests and one doctest in
+    `.tmp/test-device-pointer-ownership-20260908.log`. The 25-crate regression passes 2,760 tests in
+    `.tmp/test-device-pointer-regression-20260908.log`; native release passes with unchanged 262
+    warnings in `.tmp/build-device-pointer-ownership-20260908.log`. Independent review found no
+    count, registration-ABA or failure-ownership blocker. Validation was serialized. Native pointer
+    broker routing and removal of the video Device-to-File reference alias are the next cutover;
+    hosted-driver generic Ob reference no-ops remain a separate required producer-side conversion.
+
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5
     accepts DEVICE/DRIVER with optional CURRENT_HWPROFILE (1, 2, 5, 6), resolves actual hardware-profile

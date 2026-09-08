@@ -40,6 +40,7 @@ mod fault;
 mod file;
 mod file_information;
 mod hosted_domain;
+mod hosted_device_pointer;
 mod irp;
 mod lock_control;
 mod mock_driver;
@@ -74,6 +75,7 @@ pub use completion_unwind::{
 };
 pub use device::{DeviceCharacteristics, DeviceFlags, DeviceRecord, DeviceType};
 pub use device_reference::DeviceReference;
+pub use hosted_device_pointer::{HostedDevicePointerReference, HostedDevicePointerRegistration};
 pub use device_property_query::{
     query_device_property, PropertyQueryReply, PropertyQueryRequest, PropertyQueryResult,
     PropertyQueryTransport, PROPERTY_QUERY_CHUNK_BYTES,
@@ -208,6 +210,7 @@ pub struct IoManager<P> {
     drivers: GenStore<DriverId, DriverRecord>,
     devices: GenStore<DeviceId, DeviceRecord>,
     device_references: device_reference::DeviceReferenceStore,
+    hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore,
     files: GenStore<FileId, FileRecord>,
     irps: GenStore<IrpId, IrpRecord>,
     hosted_domains: GenStore<HostedDomainId, HostedDomainRecord>,
@@ -228,6 +231,7 @@ impl<P> IoManager<P> {
             drivers: GenStore::new(),
             devices: GenStore::new(),
             device_references: device_reference::DeviceReferenceStore::default(),
+            hosted_device_pointers: hosted_device_pointer::HostedDevicePointerStore::default(),
             files: GenStore::new(),
             irps: GenStore::new(),
             hosted_domains: GenStore::new(),

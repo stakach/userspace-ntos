@@ -299,3 +299,221 @@ fn device_record_updates_cannot_reset_private_reference_count() {
     assert_eq!(io.device_reference_count(device), 1);
     io.release_device_reference(&mut reference).unwrap();
 }
+
+#[test]
+fn counted_owner_releases_one_or_all_without_retiring_other_owners() {
+    let (mut io, _, device) = setup(false);
+    let mut counted = io.retain_device_reference(device).unwrap();
+    let mut independent = io.retain_device_reference(device).unwrap();
+    io.retain_device_reference_owned(&mut counted).unwrap();
+    io.retain_device_reference_owned(&mut counted).unwrap();
+    assert_eq!(counted.count(), 3);
+    assert_eq!(io.device_reference_count(device), 4);
+    io.release_device_reference_one(&mut counted).unwrap();
+    assert_eq!(counted.count(), 2);
+    assert_eq!(io.device_reference_count(device), 3);
+    io.release_device_reference(&mut counted).unwrap();
+    assert_eq!(counted.count(), 0);
+    assert!(!counted.is_held());
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.can_delete_device(device), Err(NtStatus::DELETE_PENDING));
+    io.release_device_reference_one(&mut independent).unwrap();
+    assert_eq!(io.device_reference_count(device), 0);
+    assert_eq!(io.can_delete_device(device), Ok(()));
+}
+
+#[test]
+fn existing_owner_can_grow_after_delete_and_unload_requests_without_allocation() {
+    let (mut io, driver, device) = setup(false);
+    let mut reference = io.retain_device_reference(device).unwrap();
+    let pointer = io.device_references.counts.as_ptr();
+    let capacity = io.device_references.counts.capacity();
+    io.device_mut(device).unwrap().delete_pending = true;
+    io.driver_mut(driver).unwrap().unload_state = DriverUnloadState::UnloadRequested;
+    assert_eq!(
+        io.retain_device_reference(device).err(),
+        Some(NtStatus::DELETE_PENDING)
+    );
+    for _ in 0..100 {
+        io.retain_device_reference_owned(&mut reference).unwrap();
+    }
+    assert_eq!(reference.count(), 101);
+    assert_eq!(io.device_reference_count(device), 101);
+    assert_eq!(io.device_references.counts.as_ptr(), pointer);
+    assert_eq!(io.device_references.counts.capacity(), capacity);
+    assert!(io.remove_device(device).is_none());
+    assert!(io.remove_driver(driver).is_none());
+    io.release_device_reference_one(&mut reference).unwrap();
+    assert!(io.remove_device(device).is_none());
+    io.release_device_reference(&mut reference).unwrap();
+    assert_eq!(io.device_reference_count(device), 0);
+}
+
+#[test]
+fn split_and_merge_transfer_counts_without_changing_canonical_ownership() {
+    let (mut io, _, device) = setup(false);
+    let mut source = io.retain_device_reference(device).unwrap();
+    io.retain_device_reference_owned(&mut source).unwrap();
+    let mut transfer = io.split_device_reference_one(&mut source).unwrap();
+    assert_eq!(source.count(), 1);
+    assert_eq!(transfer.count(), 1);
+    assert_eq!(io.device_reference_count(device), 2);
+    io.merge_device_references(&mut source, &mut transfer)
+        .unwrap();
+    assert_eq!(source.count(), 2);
+    assert_eq!(transfer.count(), 0);
+    assert_eq!(io.device_reference_count(device), 2);
+    assert_eq!(
+        io.release_device_reference_one(&mut transfer),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    io.release_device_reference(&mut source).unwrap();
+    assert_eq!(io.device_reference_count(device), 0);
+}
+
+#[test]
+fn splitting_last_reference_preserves_device_and_empty_owner_cannot_resurrect() {
+    let (mut io, _, device) = setup(false);
+    let mut source = io.retain_device_reference(device).unwrap();
+    let mut transfer = io.split_device_reference_one(&mut source).unwrap();
+    assert!(!source.is_held());
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.can_delete_device(device), Err(NtStatus::DELETE_PENDING));
+    assert_eq!(
+        io.retain_device_reference_owned(&mut source),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.split_device_reference_one(&mut source).err(),
+        Some(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.merge_device_references(&mut source, &mut transfer),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(transfer.count(), 1);
+    io.release_device_reference(&mut transfer).unwrap();
+    assert_eq!(io.can_delete_device(device), Ok(()));
+}
+
+#[test]
+fn counted_operations_reject_foreign_manager_and_different_device_atomically() {
+    let (mut io, driver, device) = setup(false);
+    let second_device = add_device(&mut io, driver);
+    let mut first = io.retain_device_reference(device).unwrap();
+    let mut second = io.retain_device_reference(second_device).unwrap();
+    let (mut foreign, _, foreign_device) = setup(false);
+    let mut foreign_reference = foreign.retain_device_reference(foreign_device).unwrap();
+    assert_eq!(device, foreign_device);
+    assert_eq!(
+        foreign.retain_device_reference_owned(&mut first),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        foreign.release_device_reference_one(&mut first),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        foreign.split_device_reference_one(&mut first).err(),
+        Some(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        foreign.merge_device_references(&mut foreign_reference, &mut first),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.merge_device_references(&mut first, &mut second),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(first.count(), 1);
+    assert_eq!(second.count(), 1);
+    assert_eq!(foreign_reference.count(), 1);
+    assert_eq!(io.device_reference_count(device), 1);
+    assert_eq!(io.device_reference_count(second_device), 1);
+    assert_eq!(foreign.device_reference_count(foreign_device), 1);
+    io.release_device_reference(&mut first).unwrap();
+    io.release_device_reference(&mut second).unwrap();
+    foreign
+        .release_device_reference(&mut foreign_reference)
+        .unwrap();
+}
+
+#[test]
+fn counted_increment_and_merge_overflow_preserve_every_owner() {
+    let (mut io, _, device) = setup(false);
+    let mut first = io.retain_device_reference(device).unwrap();
+    let mut second = io.retain_device_reference(device).unwrap();
+    io.device_references.counts[0].count = u64::MAX;
+    assert_eq!(
+        io.retain_device_reference_owned(&mut first),
+        Err(NtStatus::INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(first.count(), 1);
+    first.count = u64::MAX;
+    assert_eq!(
+        io.retain_device_reference_owned(&mut first),
+        Err(NtStatus::INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(
+        io.merge_device_references(&mut first, &mut second),
+        Err(NtStatus::INSUFFICIENT_RESOURCES)
+    );
+    assert_eq!(first.count(), u64::MAX);
+    assert_eq!(second.count(), 1);
+    assert_eq!(io.device_reference_count(device), u64::MAX);
+    first.count = 1;
+    io.device_references.counts[0].count = 2;
+    io.release_device_reference(&mut first).unwrap();
+    io.release_device_reference(&mut second).unwrap();
+}
+
+#[test]
+fn inconsistent_canonical_counts_do_not_allow_partial_release_or_transfer() {
+    let (mut io, _, device) = setup(false);
+    let mut first = io.retain_device_reference(device).unwrap();
+    io.retain_device_reference_owned(&mut first).unwrap();
+    let mut second = io.retain_device_reference(device).unwrap();
+    io.device_references.counts[0].count = 1;
+    assert_eq!(
+        io.release_device_reference_one(&mut first),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.release_device_reference(&mut first),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(
+        io.split_device_reference_one(&mut first).err(),
+        Some(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(first.count(), 2);
+    io.device_references.counts[0].count = 2;
+    assert_eq!(
+        io.merge_device_references(&mut first, &mut second),
+        Err(NtStatus::INVALID_PARAMETER)
+    );
+    assert_eq!(first.count(), 2);
+    assert_eq!(second.count(), 1);
+    assert_eq!(io.device_reference_count(device), 2);
+    io.device_references.counts[0].count = 3;
+    io.release_device_reference(&mut first).unwrap();
+    io.release_device_reference(&mut second).unwrap();
+}
+
+#[test]
+fn counted_owner_survives_manager_move_and_domain_unbinding() {
+    let (mut io, _, device) = setup(false);
+    let domain = io.register_hosted_domain();
+    io.bind_hosted_device_identity(domain, 0x1000, device)
+        .unwrap();
+    let mut owner = io.retain_hosted_device_reference(domain, 0x1000).unwrap();
+    io.retain_device_reference_owned(&mut owner).unwrap();
+    assert!(io.unbind_hosted_device_identity(domain, 0x1000, device));
+    io.unregister_hosted_domain(domain).unwrap();
+    let mut moved = io;
+    let mut transfer = moved.split_device_reference_one(&mut owner).unwrap();
+    moved.release_device_reference(&mut owner).unwrap();
+    assert_eq!(moved.device_reference_count(device), 1);
+    moved.release_device_reference(&mut transfer).unwrap();
+    assert_eq!(moved.device_reference_count(device), 0);
+}

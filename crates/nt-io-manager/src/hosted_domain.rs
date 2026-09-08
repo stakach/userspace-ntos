@@ -166,6 +166,7 @@ impl<P> IoManager<P> {
             || !record.files.is_empty()
             || record.provider.is_some()
             || has_inbound_provider_link
+            || self.hosted_device_pointers.retains_domain(identity)
         {
             return Err(NtStatus::DEVICE_BUSY);
         }
@@ -385,6 +386,9 @@ impl<P> IoManager<P> {
         address: u64,
         device: DeviceId,
     ) -> bool {
+        if self.hosted_device_pointers.retains_address(identity, address) {
+            return false;
+        }
         let Some(domain) = self.hosted_domains.get_mut(identity.domain_id) else {
             return false;
         };

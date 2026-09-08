@@ -6,7 +6,8 @@ use nt_provider_wait::{CatalogIdentity, ProviderDomainIdentity};
 
 struct Projection {
     address: u64,
-    reference: nt_io_manager::DeviceReference,
+    device: nt_io_manager::DeviceId,
+    registration: Option<nt_io_manager::HostedDevicePointerRegistration>,
     bound: bool,
     pdo_identity: Option<nt_pnp_manager::DevnodeIdentity>,
 }
@@ -40,7 +41,7 @@ pub(crate) unsafe fn stats() -> ConsumerStats {
         references: consumer
             .projections
             .iter()
-            .filter(|p| p.reference.is_held())
+            .filter(|p| p.registration.is_some())
             .count(),
         retiring: consumer.retiring,
         domain: consumer.domain.domain_id.raw(),
@@ -68,6 +69,7 @@ unsafe fn live_consumer() -> Result<&'static mut Consumer, i32> {
 
 /// Root-only registration before the genuine primary DriverEntry dispatch starts.
 pub(crate) unsafe fn register_consumer(pml4: u64) -> Result<(), i32> {
+    let _durable = crate::allocator::enter_durable();
     if pml4 == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -98,12 +100,13 @@ pub(crate) unsafe fn register_consumer(pml4: u64) -> Result<(), i32> {
     Ok(())
 }
 
-/// Failed binding retains the exact canonical reference for retry. This domain never borrows a
-/// driver's identity; a local pointer is valid only while its own reference and binding agree.
+/// Admit the pointer ledger before native publication. Partial binding remains recorded for retry;
+/// only the registered ledger anchor grants lifetime, independently of caller pointer references.
 pub(crate) unsafe fn bind_projection(
     address: u64,
     device: nt_io_manager::DeviceId,
 ) -> Result<(), i32> {
+    let _durable = crate::allocator::enter_durable();
     if address == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -113,29 +116,23 @@ pub(crate) unsafe fn bind_projection(
         .iter()
         .position(|p| p.address == address)
     {
-        if consumer.projections[index].reference.device_id() != device {
+        if consumer.projections[index].device != device {
             return Err(STATUS_ACCESS_DENIED);
         }
         index
     } else {
-        if consumer
-            .projections
-            .iter()
-            .any(|p| p.reference.device_id() == device)
-        {
+        if consumer.projections.iter().any(|p| p.device == device) {
             return Err(STATUS_ACCESS_DENIED);
         }
         consumer
             .projections
             .try_reserve(1)
             .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-        let reference = io_manager_mut()
-            .retain_device_reference(device)
-            .map_err(|e| e.raw())?;
         let pdo_identity = hosted_pnp_manager_mut().devnode_identity_for_pdo(device.raw());
         consumer.projections.push(Projection {
             address,
-            reference,
+            device,
+            registration: None,
             bound: false,
             pdo_identity,
         });
@@ -145,6 +142,16 @@ pub(crate) unsafe fn bind_projection(
         .bind_hosted_device_identity(consumer.domain, address, device)
         .map_err(|e| e.raw())?;
     consumer.projections[index].bound = true;
+    if let Some(registration) = consumer.projections[index].registration {
+        io_manager_mut()
+            .hosted_device_pointer_count(registration)
+            .map_err(|e| e.raw())?;
+    } else {
+        let registration = io_manager_mut()
+            .register_hosted_device_pointer(consumer.domain, address)
+            .map_err(|e| e.raw())?;
+        consumer.projections[index].registration = Some(registration);
+    }
     Ok(())
 }
 
@@ -158,6 +165,7 @@ pub(crate) struct DeviceAccess {
     domain: HostedDomainIdentity,
     address: u64,
     device: nt_io_manager::DeviceId,
+    registration: nt_io_manager::HostedDevicePointerRegistration,
 }
 
 impl DeviceAccess {
@@ -187,10 +195,13 @@ impl DeviceAccess {
         if !consumer.projections.iter().any(|p| {
             p.address == self.address
                 && p.bound
-                && p.reference.is_held()
-                && p.reference.device_id() == self.device
+                && p.registration == Some(self.registration)
+                && p.device == self.device
         }) || io_manager_mut().hosted_device_by_identity(self.domain, self.address)
             != Some(self.device)
+            || io_manager_mut()
+                .hosted_device_pointer_count(self.registration)
+                .is_err()
         {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
@@ -242,7 +253,7 @@ pub(crate) unsafe fn authenticate(
     let projection = consumer
         .projections
         .iter()
-        .find(|p| p.address == address && p.bound && p.reference.is_held())
+        .find(|p| p.address == address && p.bound && p.registration.is_some())
         .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     let access = DeviceAccess {
         catalog: consumer.catalog,
@@ -250,7 +261,10 @@ pub(crate) unsafe fn authenticate(
         dispatch,
         domain: consumer.domain,
         address,
-        device: projection.reference.device_id(),
+        device: projection.device,
+        registration: projection
+            .registration
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
     };
     access.validate()?;
     Ok(access)
@@ -267,19 +281,22 @@ pub(crate) unsafe fn retire_quiescent_projections() -> Result<(), i32> {
     }
     super::win32k_device_properties::retire_quiescent_transfers(consumer.domain)?;
     while let Some(row) = consumer.projections.last_mut() {
+        if let Some(registration) = row.registration {
+            io_manager_mut()
+                .unregister_hosted_device_pointer(registration)
+                .map_err(|e| e.raw())?;
+            row.registration = None;
+        }
         if row.bound {
             if !io_manager_mut().unbind_hosted_device_identity(
                 consumer.domain,
                 row.address,
-                row.reference.device_id(),
+                row.device,
             ) {
                 return Err(STATUS_ACCESS_DENIED);
             }
             row.bound = false;
         }
-        io_manager_mut()
-            .release_device_reference(&mut row.reference)
-            .map_err(|e| e.raw())?;
         consumer.projections.pop();
     }
     io_manager_mut()
