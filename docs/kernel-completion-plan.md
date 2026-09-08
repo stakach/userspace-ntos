@@ -29725,7 +29725,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     .tmp/build-asid-lifetime-executive-20260908.log. Original NT rootserver/disk staging is restored.
     These are microkernel results, not a new NT desktop boot or proof of TCB physical derivation.
 
-    B3 TCB capability derivation tranche 135 (2026-09-08, in progress; required before Ps backing activation): ASID
+    B3 TCB capability derivation tranche 135 (2026-09-08, accepted; Ps backing activation remains next): ASID
     reference accounting alone does not protect physical backing. TCB-held VSpace capabilities
     currently have no MDB edge, while Untyped revoke resets its allocation watermark after
     deleting only CNode descendants. Represent the TCB's actual derived capability ownership,
@@ -29762,6 +29762,91 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     not the old queued IPI. Reuse the synchronous retirement mailbox introduced in tranche 134.
     Compile-only integration initially found three missing fixture imports (corrected); no passing
     runtime result is claimed for tranche 135 yet.
+
+    The integrated x86 spec build now passes after correcting fixture imports, an object-type
+    name, ping-spec exports and the still-required local-idle FPU flush helper. Remote withdrawal
+    retains BKL and captures the actual entry/FPU owner through a per-CPU mailbox. A syscall
+    captured before dispatch resumes at its original instruction; post-instruction debug traps
+    retain normalized event data and are delivered exactly once before user return instead of
+    replaying the instruction. X86 and ARM entry paths use the same ownership protocol. The old
+    remote-stall handshake and numeric TCB fault-handler field/lookup fallback are removed.
+    New runtime specs cover register/FPU capture from a real IF-clear AP syscall waiter, pending
+    syscall resumption, source-inside-CNode revoke cycles, mapped physical retype after actual
+    remote invalidation acknowledgement, and retained capability authority. Runtime and ARM
+    validation remain pending; .tmp/build-tcb-capability-quiescence-retry-20260908.log records
+    the passing x86 compile only.
+
+    First runtime attempt .tmp/run-tcb-capability-runtime-20260908.log failed before specs
+    (QEMU exit 255): IOAPIC_COUNT's BSS page was absent. The large-page regression fixture
+    raised ELF PT_LOAD alignment to 2 MiB, exposing the linker's incongruent file-offset-zero
+    origin at 0xfffffffffe002000. Stripping rounded the segment origin down without extending
+    MemSiz and excluded the final two BSS pages. This is an invalid image-layout bug, not VM
+    memory exhaustion or a reason to enlarge a fixed boot limit. The linker now starts at
+    aligned 0xfffffffffe000000; packaging validation is being added before the next run.
+    With that fix, the x86 spec, production x86 and supported standalone ARM configurations
+    compile, and the native executive builds. Logs: .tmp/build-tcb-aligned-image-20260908.log,
+    .tmp/build-tcb-capability-production-20260908.log,
+    .tmp/build-tcb-capability-aarch64-20260908.log,
+    .tmp/build-tcb-capability-executive-20260908.log. Remote debug configuration changes also
+    stop/capture the old execution state before mutating saved breakpoint/single-step metadata.
+    No passing tranche-135 runtime or fresh NT desktop result is claimed yet.
+
+    Image-layout guard checkpoint: the text section now also honors its declared alignment,
+    and Cargo tracks both linker scripts. A structured ELF64 validator runs before stripping
+    and compares allocated sections, initialized bytes, zero-fill ranges, permissions, physical
+    placement and executable entry afterward. All 17 host regressions pass, including the exact
+    incongruent origin, lost BSS tail, malformed extents and metadata-only relocation cases:
+    .tmp/test-elf-load-layout-final-20260908.log. The corrected image reaches architecture and
+    exception specs. Its next failure was trusted retirement constructing a nonzero public
+    Thread cap for valid internal TCB slot zero; retirement now checks that actual slot's
+    reference count directly before the unchanged finalization path. The large-frame IPC
+    fixture also verifies shared physical bytes through linked and linear aliases rather than
+    incorrectly requiring equal virtual addresses. These fixes compile; the next full runtime
+    attempt is pending. .tmp/run-tcb-capability-runtime-retry-20260908.log remains a failed
+    result, not an accepted kernel run.
+
+    Runtime review advances through all invocation tests, including real TCB-source revoke,
+    mapped physical reuse and cycle cleanup. Older diagnostic/fault fixtures now supply real
+    IPC authority and assert the owned-capability error contract. Rootserver launch holds
+    IRQ-masked BKL across shared-state creation and source-capability publication, releasing
+    only at initial user entry. SMP fixture snapshots/ownership assertions also take the lock.
+    The sixth run reaches the live AP probe and exposes a production configuration defect:
+    default/extern-rootserver builds start four CPUs but omit the optional smp feature, leaving
+    AP FPU setup and remote-TCB withdrawal safeguards compiled out. QMP reports AP1 CR4=0xe0
+    (no OSFXSR/OSXMMEXCPT) versus BSP CR4=0x668; the real SSE probe raises #UD and cannot progress.
+    This is not resolved by disabling the probe or adding a test-only feature flag. Remove
+    the alternate non-SMP paths and make correctness follow the discovered online CPU set;
+    retain smp as a no-op compatibility alias, matching the existing mcs policy. Keep x86
+    FPU storage architecture-specific. .tmp/run-tcb-capability-runtime-sixth-20260908.log
+    ends in panic/exit 255 and remains failed evidence pending that correction.
+
+    Default-build SMP safeguards now compile for both architectures. The seventh runtime found
+    three older direct-syscall fixtures deriving capabilities outside BKL; their setup and teardown
+    now use the existing guard contract without nesting the dispatcher lock. The eighth run
+    reaches the real AP syscall probe, then raises kernel #GP. Source/disassembly review finds
+    a concrete x86 SysV entry defect: bootstrap jumps into ordinary Rust with call-site rather
+    than callee-entry stack alignment. The new stack-local FXSAVE exposes that misalignment.
+    Correct the bootstrap, kernel-thread trampoline and exception Rust entry boundaries; retain
+    explicit syscall-stack alignment assertions and generic kernel #GP RIP/RSP/CPU diagnostics.
+    Neither .tmp/run-tcb-capability-runtime-seventh-20260908.log nor
+    .tmp/run-tcb-capability-runtime-eighth-20260908.log is passing evidence. Full runtime acceptance
+    remains pending; do not suppress the FPU probe or substitute a static save area to hide an
+    invalid calling convention.
+
+    Accepted validation: the corrected default four-CPU image completes all standalone kernel
+    specs, including actual C callee-entry alignment in both context-switch roundtrips, TCB
+    source-capability move/delete/revoke, cyclic object finalization, physical retype after real
+    remote translation acknowledgement, and the live AP register/FPU capture with exact pending
+    syscall replay while BKL remains held. All 12 userspace microtests then pass, the expected
+    sentinel is matched, and QEMU exits zero under the 600-second external deadline:
+    .tmp/build-tcb-capability-runtime-ninth-20260908.log and
+    .tmp/run-tcb-capability-runtime-ninth-20260908.log. No SMP test-only feature switch was used.
+    Final production x86, supported standalone ARM and native executive builds also pass:
+    .tmp/build-tcb-capability-production-final-20260908.log,
+    .tmp/build-tcb-capability-aarch64-final-20260908.log,
+    .tmp/build-tcb-capability-executive-final-20260908.log. NT rootserver/disk staging is restored.
+    This closes the TCB capability-derivation prerequisite, not canonical Ps backing activation,
+    simultaneous win32k execution, the native import frontier or a fresh NT desktop boot.
 
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
@@ -29839,6 +29924,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     preserve both owners. All 38 nt-component-suspension tests pass, with no ignored cases,
     .tmp/test-independent-callback-lanes-20260908.log. This validates the scheduler contract,
     not native PID/TID projection or a fresh desktop boot.
+    The combined nt-user-callback and nt-component-suspension regression run also passes all
+    97 tests (59 + 38), with no ignored cases, in
+    .tmp/test-callback-lane-regression-20260908.log.
 
     - [ ] Audit and close the lane-local request, callback, reply-capability and execution-context
       ownership path for every win32k entry, including client/process identity, attach/APC/IRQL
