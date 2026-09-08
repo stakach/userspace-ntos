@@ -24,6 +24,7 @@ pub mod job;
 pub mod job_abi;
 mod initial_system;
 pub mod native_handle;
+pub mod process_object_retirement;
 
 pub use initial_system::InitialSystemIdentity;
 
@@ -1069,6 +1070,8 @@ pub struct Win32Callouts {
 pub struct ProcessManager {
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
+    /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
+    process_object_retirements: Vec<Option<process_object_retirement::RetiredProcessObjects>>,
     sections: Vec<Option<ImageSection>>,
     next_cid: u32,
     next_asid: u32,
@@ -2147,6 +2150,7 @@ impl ProcessManager {
     /// by another process or thread is rejected without mutation.
     pub fn publish_process_kernel_object(&mut self, pid: ProcessId, eprocess: u64) -> bool {
         if eprocess == 0
+            || self.retired_kernel_body_is_reserved(eprocess)
             || self.processes.iter().any(|(&owner, process)| {
                 owner != pid && process.kernel_process_object == Some(eprocess)
             })
@@ -2285,6 +2289,7 @@ impl ProcessManager {
     /// by another thread or process is rejected without mutation.
     pub fn publish_thread_kernel_object(&mut self, tid: ThreadId, ethread: u64) -> bool {
         if ethread == 0
+            || self.retired_kernel_body_is_reserved(ethread)
             || self.threads.iter().any(|(&owner, thread)| {
                 owner != tid && thread.kernel_thread_object == Some(ethread)
             })
@@ -3826,6 +3831,9 @@ impl ProcessManager {
     }
 
     pub fn remove_process_job_reference(&mut self, pid: ProcessId) -> Option<job::JobId> {
+        if self.process_object_is_withdrawn(pid) {
+            return None;
+        }
         self.jobs.remove_process_reference(pid)
     }
 

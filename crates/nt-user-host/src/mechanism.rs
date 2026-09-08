@@ -36,10 +36,11 @@ pub struct ProcessDeletionCandidate {
     pub pid: u32,
     pub generation: u64,
     /// The process published provider-owned EPROCESS/ETHREAD backing that must be finalized after
-    /// the Process delete procedure. False means no provider destructor is part of this identity.
+    /// canonical lookup withdrawal and before final Process retirement. False means no provider
+    /// destructor is part of this identity.
     pub provider_objects: bool,
     pub phase: ProcessDeletionPhase,
-    /// Payload returned exactly once by the Process delete procedure. Zero means that no external
+    /// Payload returned exactly once by final Process retirement. Zero means that no external
     /// reference of that kind remains to be returned by the executive.
     pub pending_primary_token: u32,
     pub pending_exception_port: u64,
@@ -55,8 +56,8 @@ pub enum ProcessDeletionPhase {
     AwaitingReferences = 0,
     ReclaimingVm = 1,
     DeletingProcessObject = 2,
-    ReleasingExecutiveReferences = 3,
-    FinalizingProviderObjects = 4,
+    FinalizingProviderObjects = 3,
+    ReleasingExecutiveReferences = 4,
     RetiringMechanism = 5,
 }
 
@@ -65,9 +66,9 @@ impl ProcessDeletionPhase {
         match self {
             Self::AwaitingReferences => Some(Self::ReclaimingVm),
             Self::ReclaimingVm => Some(Self::DeletingProcessObject),
-            Self::DeletingProcessObject => Some(Self::ReleasingExecutiveReferences),
-            Self::ReleasingExecutiveReferences => Some(Self::FinalizingProviderObjects),
-            Self::FinalizingProviderObjects => Some(Self::RetiringMechanism),
+            Self::DeletingProcessObject => Some(Self::FinalizingProviderObjects),
+            Self::FinalizingProviderObjects => Some(Self::ReleasingExecutiveReferences),
+            Self::ReleasingExecutiveReferences => Some(Self::RetiringMechanism),
             Self::RetiringMechanism => None,
         }
     }
@@ -137,18 +138,31 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         }
     }
 
-    pub fn clear(&mut self) {
+    /// Reset only an empty table. Live retry owners must pass exact final removal or untouched
+    /// stale-candidate discard; a bulk reset cannot prove either condition.
+    pub fn clear(&mut self) -> Result<(), MechanismError> {
+        if self.slots.iter().any(|slot| slot.is_live()) {
+            return Err(MechanismError::SlotOccupied);
+        }
         for slot in self.slots.iter_mut() {
             *slot = ProcessDeletionCandidate::empty();
         }
+        Ok(())
     }
 
-    /// Queue an exact identity. `Ok(false)` means that identity was already pending.
+    /// Queue a fresh exact identity. `Ok(false)` means that identity was already pending;
+    /// requeueing its fresh snapshot never resets ongoing work.
     pub fn queue(&mut self, candidate: ProcessDeletionCandidate) -> Result<bool, MechanismError> {
         if candidate.pi >= N {
             return Err(MechanismError::SlotOutOfRange);
         }
-        if candidate.pid == 0 || candidate.generation == 0 {
+        if candidate.pid == 0
+            || candidate.generation == 0
+            || candidate.phase != ProcessDeletionPhase::AwaitingReferences
+            || candidate.pending_primary_token != 0
+            || candidate.pending_exception_port != 0
+            || candidate.deleted_threads != 0
+        {
             return Err(MechanismError::InvalidIdentity);
         }
         let slot = &mut self.slots[candidate.pi];
@@ -181,6 +195,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
             return Err(MechanismError::InvalidIdentity);
         };
         if expected.phase == ProcessDeletionPhase::DeletingProcessObject
+            || expected.phase == ProcessDeletionPhase::FinalizingProviderObjects
             || (expected.phase == ProcessDeletionPhase::ReleasingExecutiveReferences
                 && (expected.pending_primary_token != 0 || expected.pending_exception_port != 0))
         {
@@ -190,8 +205,28 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         Ok(*slot)
     }
 
-    /// Commit the exact output of the one-shot Process delete procedure and enter external
-    /// reference release. This is the only transition out of `DeletingProcessObject`.
+    /// Record canonical lookup withdrawal while the caller retains the PM retirement ticket.
+    /// Provider objects must finalize before that ticket may yield external-reference ownership.
+    /// This is the only transition out of `DeletingProcessObject`.
+    pub fn record_process_object_withdrawal_exact(
+        &mut self,
+        expected: ProcessDeletionCandidate,
+    ) -> Result<ProcessDeletionCandidate, MechanismError> {
+        let Some(slot) = self.slots.get_mut(expected.pi) else {
+            return Err(MechanismError::SlotOutOfRange);
+        };
+        if !slot.is_live() || *slot != expected {
+            return Err(MechanismError::StaleIdentity);
+        }
+        if expected.phase != ProcessDeletionPhase::DeletingProcessObject {
+            return Err(MechanismError::InvalidIdentity);
+        }
+        slot.phase = ProcessDeletionPhase::FinalizingProviderObjects;
+        Ok(*slot)
+    }
+
+    /// Commit the exact output of finalized PM retirement after provider finalization and enter
+    /// external-reference release. This is the only transition out of `FinalizingProviderObjects`.
     pub fn record_process_object_deletion_exact(
         &mut self,
         expected: ProcessDeletionCandidate,
@@ -205,7 +240,7 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         if !slot.is_live() || *slot != expected {
             return Err(MechanismError::StaleIdentity);
         }
-        if expected.phase != ProcessDeletionPhase::DeletingProcessObject {
+        if expected.phase != ProcessDeletionPhase::FinalizingProviderObjects {
             return Err(MechanismError::InvalidIdentity);
         }
         slot.pending_primary_token = primary_token;
@@ -259,6 +294,8 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         self.slots.get(pi).copied().filter(|slot| slot.is_live())
     }
 
+    /// Discard an untouched candidate or remove a fully retired mechanism. Intermediate phases
+    /// retain VM, PM, provider, or external-reference work even when their payload is still zero.
     pub fn remove_exact(
         &mut self,
         expected: ProcessDeletionCandidate,
@@ -271,6 +308,17 @@ impl<const N: usize> ProcessDeletionCandidateTable<N> {
         }
         if *slot != expected {
             return Err(MechanismError::StaleIdentity);
+        }
+        if expected.pending_primary_token != 0
+            || expected.pending_exception_port != 0
+            || !matches!(
+                expected.phase,
+                ProcessDeletionPhase::AwaitingReferences | ProcessDeletionPhase::RetiringMechanism
+            )
+            || (expected.phase == ProcessDeletionPhase::AwaitingReferences
+                && expected.deleted_threads != 0)
+        {
+            return Err(MechanismError::InvalidIdentity);
         }
         let removed = *slot;
         *slot = ProcessDeletionCandidate::empty();
@@ -876,8 +924,22 @@ mod tests {
             table.advance_exact(deleting),
             Err(MechanismError::InvalidIdentity)
         );
+        let finalizing = table
+            .record_process_object_withdrawal_exact(deleting)
+            .unwrap();
+        assert_eq!(
+            finalizing.phase,
+            ProcessDeletionPhase::FinalizingProviderObjects
+        );
+        assert_eq!(finalizing.pending_primary_token, 0);
+        assert_eq!(finalizing.pending_exception_port, 0);
+        assert_eq!(finalizing.deleted_threads, 0);
+        assert_eq!(
+            table.advance_exact(finalizing),
+            Err(MechanismError::InvalidIdentity)
+        );
         let releasing = table
-            .record_process_object_deletion_exact(deleting, 9, 17, 2)
+            .record_process_object_deletion_exact(finalizing, 9, 17, 2)
             .unwrap();
         assert_eq!(
             table.advance_exact(releasing),
@@ -886,14 +948,372 @@ mod tests {
         let releasing = table.release_primary_token_exact(releasing).unwrap();
         let releasing = table.release_exception_port_exact(releasing).unwrap();
         assert_eq!(releasing.deleted_threads, 2);
-        let finalizing = table.advance_exact(releasing).unwrap();
-        let retiring = table.advance_exact(finalizing).unwrap();
+        let retiring = table.advance_exact(releasing).unwrap();
         assert_eq!(retiring.phase, ProcessDeletionPhase::RetiringMechanism);
         assert_eq!(
             table.advance_exact(retiring),
             Err(MechanismError::InvalidIdentity)
         );
         assert_eq!(table.remove_exact(retiring), Ok(retiring));
+    }
+
+    fn queued_deletion_candidate(
+        provider_objects: bool,
+    ) -> (ProcessDeletionCandidateTable<2>, ProcessDeletionCandidate) {
+        let candidate = ProcessDeletionCandidate::from_mechanism(
+            ProcessMechanism {
+                pi: 1,
+                pid: 12,
+                main_tid: 20,
+                top_badge: 2,
+                generation: 7,
+            },
+            provider_objects,
+        );
+        let mut table = ProcessDeletionCandidateTable::new();
+        table.queue(candidate).unwrap();
+        (table, candidate)
+    }
+
+    #[test]
+    fn deletion_phase_order_keeps_references_through_provider_finalization() {
+        use ProcessDeletionPhase::*;
+        let phases = [
+            AwaitingReferences,
+            ReclaimingVm,
+            DeletingProcessObject,
+            FinalizingProviderObjects,
+            ReleasingExecutiveReferences,
+            RetiringMechanism,
+        ];
+        for pair in phases.windows(2) {
+            assert_eq!(pair[0].next(), Some(pair[1]));
+            assert!(pair[0] < pair[1]);
+        }
+        assert_eq!(RetiringMechanism.next(), None);
+    }
+
+    #[test]
+    fn deletion_queue_rejects_advanced_snapshots_without_resetting_work() {
+        let (mut table, initial) = queued_deletion_candidate(true);
+        let reclaiming = table.advance_exact(initial).unwrap();
+        for phase in [
+            ProcessDeletionPhase::ReclaimingVm,
+            ProcessDeletionPhase::DeletingProcessObject,
+            ProcessDeletionPhase::FinalizingProviderObjects,
+            ProcessDeletionPhase::ReleasingExecutiveReferences,
+            ProcessDeletionPhase::RetiringMechanism,
+        ] {
+            let advanced = ProcessDeletionCandidate { phase, ..initial };
+            assert_eq!(table.queue(advanced), Err(MechanismError::InvalidIdentity));
+            assert_eq!(table.get(initial.pi), Some(reclaiming));
+            let mut empty = ProcessDeletionCandidateTable::<2>::new();
+            assert_eq!(empty.queue(advanced), Err(MechanismError::InvalidIdentity));
+            assert_eq!(empty.live_len(), 0);
+        }
+        assert_eq!(table.queue(initial), Ok(false));
+        assert_eq!(table.get(initial.pi), Some(reclaiming));
+    }
+
+    #[test]
+    fn withdrawal_and_deletion_cannot_skip_preceding_work() {
+        let (mut table, initial) = queued_deletion_candidate(true);
+        let mut current = initial;
+        for _ in 0..2 {
+            assert_eq!(
+                table.record_process_object_withdrawal_exact(current),
+                Err(MechanismError::InvalidIdentity)
+            );
+            assert_eq!(
+                table.record_process_object_deletion_exact(current, 9, 17, 2),
+                Err(MechanismError::InvalidIdentity)
+            );
+            assert_eq!(table.get(current.pi), Some(current));
+            current = table.advance_exact(current).unwrap();
+        }
+        assert_eq!(current.phase, ProcessDeletionPhase::DeletingProcessObject);
+        assert_eq!(
+            table.record_process_object_deletion_exact(current, 9, 17, 2),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(table.get(current.pi), Some(current));
+        let finalizing = table
+            .record_process_object_withdrawal_exact(current)
+            .unwrap();
+        assert_eq!(
+            table.record_process_object_withdrawal_exact(finalizing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(
+            table.release_primary_token_exact(finalizing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(
+            table.release_exception_port_exact(finalizing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(table.get(finalizing.pi), Some(finalizing));
+    }
+
+    #[test]
+    fn exact_withdrawal_rejects_stale_or_modified_snapshots_without_effects() {
+        let (mut table, initial) = queued_deletion_candidate(true);
+        let reclaiming = table.advance_exact(initial).unwrap();
+        let deleting = table.advance_exact(reclaiming).unwrap();
+        for stale in [
+            initial,
+            reclaiming,
+            ProcessDeletionCandidate {
+                generation: 8,
+                ..deleting
+            },
+            ProcessDeletionCandidate {
+                pid: 13,
+                ..deleting
+            },
+            ProcessDeletionCandidate {
+                provider_objects: false,
+                ..deleting
+            },
+            ProcessDeletionCandidate {
+                pending_primary_token: 9,
+                ..deleting
+            },
+        ] {
+            assert_eq!(
+                table.record_process_object_withdrawal_exact(stale),
+                Err(MechanismError::StaleIdentity)
+            );
+            assert_eq!(table.get(deleting.pi), Some(deleting));
+        }
+        assert_eq!(
+            table.record_process_object_withdrawal_exact(ProcessDeletionCandidate {
+                pi: 2,
+                ..deleting
+            }),
+            Err(MechanismError::SlotOutOfRange)
+        );
+        let finalizing = table
+            .record_process_object_withdrawal_exact(deleting)
+            .unwrap();
+        assert_eq!(
+            table.record_process_object_withdrawal_exact(deleting),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(table.get(finalizing.pi), Some(finalizing));
+    }
+
+    #[test]
+    fn finalized_deletion_publishes_reference_payload_only_once() {
+        let (mut table, initial) = queued_deletion_candidate(true);
+        let reclaiming = table.advance_exact(initial).unwrap();
+        let deleting = table.advance_exact(reclaiming).unwrap();
+        let finalizing = table
+            .record_process_object_withdrawal_exact(deleting)
+            .unwrap();
+        assert_eq!(
+            table.advance_exact(ProcessDeletionCandidate {
+                phase: ProcessDeletionPhase::ReleasingExecutiveReferences,
+                ..finalizing
+            }),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(
+            table.record_process_object_deletion_exact(deleting, 5, 6, 7),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(
+            table.record_process_object_deletion_exact(
+                ProcessDeletionCandidate {
+                    pi: 2,
+                    ..finalizing
+                },
+                5,
+                6,
+                7
+            ),
+            Err(MechanismError::SlotOutOfRange)
+        );
+        let releasing = table
+            .record_process_object_deletion_exact(finalizing, 9, 17, 2)
+            .unwrap();
+        assert_eq!(
+            table.record_process_object_deletion_exact(finalizing, 5, 6, 7),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(
+            table.record_process_object_deletion_exact(releasing, 5, 6, 7),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(
+            table.record_process_object_withdrawal_exact(releasing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(table.get(releasing.pi), Some(releasing));
+        let without_port = table.release_exception_port_exact(releasing).unwrap();
+        assert_eq!(
+            table.advance_exact(without_port),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(
+            table.release_primary_token_exact(releasing),
+            Err(MechanismError::StaleIdentity)
+        );
+        let released = table.release_primary_token_exact(without_port).unwrap();
+        assert_eq!(
+            table.advance_exact(released).unwrap().phase,
+            ProcessDeletionPhase::RetiringMechanism
+        );
+    }
+
+    #[test]
+    fn no_provider_objects_still_requires_exact_withdrawal_and_final_retirement() {
+        let (mut table, initial) = queued_deletion_candidate(false);
+        let reclaiming = table.advance_exact(initial).unwrap();
+        let deleting = table.advance_exact(reclaiming).unwrap();
+        assert_eq!(
+            table.advance_exact(deleting),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let finalizing = table
+            .record_process_object_withdrawal_exact(deleting)
+            .unwrap();
+        assert_eq!(
+            table.advance_exact(finalizing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let releasing = table
+            .record_process_object_deletion_exact(finalizing, 0, 0, 0)
+            .unwrap();
+        let retiring = table.advance_exact(releasing).unwrap();
+        assert!(!retiring.provider_objects);
+        table.remove_exact(retiring).unwrap();
+        assert_eq!(
+            table.record_process_object_withdrawal_exact(deleting),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(
+            table.record_process_object_deletion_exact(finalizing, 9, 17, 2),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(table.live_len(), 0);
+    }
+
+    #[test]
+    fn deletion_removal_retains_every_started_phase() {
+        let (mut table, initial) = queued_deletion_candidate(true);
+        let reclaiming = table.advance_exact(initial).unwrap();
+        assert_eq!(
+            table.remove_exact(reclaiming),
+            Err(MechanismError::InvalidIdentity)
+        );
+        assert_eq!(table.get(initial.pi), Some(reclaiming));
+        let deleting = table.advance_exact(reclaiming).unwrap();
+        assert_eq!(
+            table.remove_exact(deleting),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let finalizing = table
+            .record_process_object_withdrawal_exact(deleting)
+            .unwrap();
+        assert_eq!(
+            table.remove_exact(finalizing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let releasing = table
+            .record_process_object_deletion_exact(finalizing, 9, 17, 2)
+            .unwrap();
+        assert_eq!(
+            table.remove_exact(releasing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let releasing = table.release_primary_token_exact(releasing).unwrap();
+        assert_eq!(
+            table.remove_exact(releasing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let releasing = table.release_exception_port_exact(releasing).unwrap();
+        assert_eq!(
+            table.remove_exact(releasing),
+            Err(MechanismError::InvalidIdentity)
+        );
+        let retiring = table.advance_exact(releasing).unwrap();
+        assert_eq!(
+            table.remove_exact(releasing),
+            Err(MechanismError::StaleIdentity)
+        );
+        assert_eq!(table.get(initial.pi), Some(retiring));
+        assert_eq!(table.remove_exact(retiring), Ok(retiring));
+    }
+
+    #[test]
+    fn deletion_removal_rejects_pending_payload_in_otherwise_removable_phases() {
+        let (_, initial) = queued_deletion_candidate(false);
+        for candidate in [
+            ProcessDeletionCandidate {
+                pending_primary_token: 9,
+                ..initial
+            },
+            ProcessDeletionCandidate {
+                pending_exception_port: 17,
+                ..initial
+            },
+            ProcessDeletionCandidate {
+                deleted_threads: 2,
+                ..initial
+            },
+            ProcessDeletionCandidate {
+                phase: ProcessDeletionPhase::RetiringMechanism,
+                pending_primary_token: 9,
+                ..initial
+            },
+            ProcessDeletionCandidate {
+                phase: ProcessDeletionPhase::RetiringMechanism,
+                pending_exception_port: 17,
+                ..initial
+            },
+        ] {
+            let mut table = ProcessDeletionCandidateTable::<2>::new();
+            assert_eq!(table.queue(candidate), Err(MechanismError::InvalidIdentity));
+            assert_eq!(table.live_len(), 0);
+            table.slots[candidate.pi] = candidate;
+            assert_eq!(
+                table.remove_exact(candidate),
+                Err(MechanismError::InvalidIdentity)
+            );
+            assert_eq!(table.get(candidate.pi), Some(candidate));
+        }
+    }
+
+    #[test]
+    fn deletion_clear_refuses_all_live_phases_atomically() {
+        let (_, initial) = queued_deletion_candidate(true);
+        for phase in [
+            ProcessDeletionPhase::AwaitingReferences,
+            ProcessDeletionPhase::ReclaimingVm,
+            ProcessDeletionPhase::DeletingProcessObject,
+            ProcessDeletionPhase::FinalizingProviderObjects,
+            ProcessDeletionPhase::ReleasingExecutiveReferences,
+            ProcessDeletionPhase::RetiringMechanism,
+        ] {
+            let mut table = ProcessDeletionCandidateTable::<2>::new();
+            assert_eq!(table.clear(), Ok(()));
+            let candidate = ProcessDeletionCandidate { phase, ..initial };
+            if phase == ProcessDeletionPhase::AwaitingReferences {
+                table.queue(candidate).unwrap();
+            } else {
+                assert_eq!(table.queue(candidate), Err(MechanismError::InvalidIdentity));
+                assert_eq!(table.live_len(), 0);
+                table.slots[candidate.pi] = candidate;
+            }
+            let before = table.clone();
+            assert_eq!(table.clear(), Err(MechanismError::SlotOccupied));
+            assert_eq!(table, before);
+        }
+        let (mut table, initial) = queued_deletion_candidate(false);
+        table.remove_exact(initial).unwrap();
+        assert_eq!(table.clear(), Ok(()));
+        assert_eq!(table.live_len(), 0);
     }
 
     #[test]

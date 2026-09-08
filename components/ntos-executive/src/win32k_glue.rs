@@ -6027,14 +6027,17 @@ pub(crate) unsafe fn win32k_dispatch_ps_provider_command(
     )
 }
 
-/// Complete provider-owned process backing after Ps has run the Object Manager delete procedure.
+pub(crate) use nt_user_host::provider_finalization::ProviderFinalizationResult as PsProviderFinalization;
+
+/// Complete provider-owned process backing after Ps has withdrawn it from ordinary lookup.
 /// The client VSpace is already gone at this boundary, and this command is forbidden from attaching
 /// or faulting client pages; it can touch only provider-owned context and pool state.
 pub(crate) unsafe fn win32k_finalize_ps_provider_process_objects(
     client: Win32kClientContext,
-) -> (u64, bool) {
+) -> PsProviderFinalization {
     let command = win32k_subsystem::PS_WIN32_PROVIDER_FINALIZE_PROCESS_OBJECTS;
-    win32k_dispatch_wide_with_completion_args_and_kind(
+    let mut entered = false;
+    let (status, completed) = win32k_dispatch_wide_observed(
         0,
         command,
         0,
@@ -6047,7 +6050,15 @@ pub(crate) unsafe fn win32k_finalize_ps_provider_process_objects(
         client,
         win32k_subsystem::WIN32K_REQUEST_PS_PROVIDER,
         false,
-    )
+        Some(&mut entered),
+    );
+    if completed {
+        PsProviderFinalization::Returned(status as u32)
+    } else if entered {
+        PsProviderFinalization::Indeterminate(status as u32)
+    } else {
+        PsProviderFinalization::NotEntered(status as u32)
+    }
 }
 
 unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
@@ -6063,6 +6074,27 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     client: Win32kClientContext,
     request_kind: u64,
     attach_client: bool,
+) -> (u64, bool) {
+    win32k_dispatch_wide_observed(
+        ssn, a0, a1, a2, a3, caller_sp, stack_args, completion_args,
+        output_stage, client, request_kind, attach_client, None,
+    )
+}
+
+unsafe fn win32k_dispatch_wide_observed(
+    ssn: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    caller_sp: u64,
+    stack_args: &[u64],
+    completion_args: [u64; 4],
+    output_stage: Option<nt_user_callback::DispatchOutputStage>,
+    client: Win32kClientContext,
+    request_kind: u64,
+    attach_client: bool,
+    entered: Option<&mut bool>,
 ) -> (u64, bool) {
     if !win32k_client_context_is_admitted(client) {
         return (0xC000_000Du64, false);
@@ -6295,6 +6327,9 @@ unsafe fn win32k_dispatch_wide_with_completion_args_and_kind(
     ) else {
         panic!("selected win32k lane is absent from the physical catalog");
     };
+    if let Some(entered) = entered {
+        *entered = true;
+    }
     let pr = crate::spawn_hosts::component_pump(&ch);
     if attach_client {
         for watch_pi in 1..5usize {

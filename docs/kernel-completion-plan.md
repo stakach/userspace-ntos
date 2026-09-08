@@ -29574,6 +29574,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     release build passes in 35.89 seconds with the same 266 warnings. Independent review is clear.
     Logs: .tmp/test-paired-requestor-20260908.log and .tmp/build-paired-requestor-20260908.log.
 
+    B3 retained Ps withdrawal tranche 127 (2026-09-08, complete): move delete-ready process and
+    thread records out of active lookup into PM-owned retirement storage. Keep their body addresses
+    reserved and their token/port/job references owned until an exact non-clone ticket is finished
+    after provider cleanup. Preallocate storage before withdrawal; reject new blockers without
+    partially deleting records. The native deletion candidate must own that ticket before IPC,
+    retain accepted provider-finalizer evidence across local retries, distinguish pre-entry refusal
+    from uncertain execution, and never discard started cleanup on a mechanism-generation mismatch.
+
+    The PM now owns withdrawn NtProcess/NtThread records in hidden retirement storage. Ordinary
+    process/thread lookup, new references and handles cannot reacquire them, while both body
+    publication APIs reserve their addresses until exact ticket completion. Admission checks all
+    references, cleared Win32 state, thread ownership and duplicate thread IDs before preallocating
+    and moving records. A wrong manager or outstanding job-memory charge preserves the ticket;
+    token/port/job deletion payload is transferred only at finalization. Existing job accounting
+    can drain through the validated retired owner, not an absent public PID.
+
+    The executive prepublishes a durable native ticket row before withdrawal. Its phase order is
+    VM reclaim, Ps withdrawal, provider finalization, executive-reference release, then mechanism
+    retirement. New deletion blockers now return Pending rather than triggering the old deletion
+    assertion. Provider finalization uses a host-tested non-clone Pending/Invoking/Accepted/
+    Indeterminate owner. Invoking is published before IPC, so nested drains cannot issue another
+    destructor. The dispatch entry observer distinguishes pre-pump refusal from uncertain execution;
+    accepted evidence survives local PM-finish failure and unknown outcomes cannot replay. Due to
+    the current provider contract, negative completed rejection can retry; a nonzero informational
+    return is indeterminate, not successful destruction.
+
+    Candidate enqueue rejects advanced or payload-bearing snapshots; bulk reset refuses live
+    work; removal permits only untouched or fully completed candidates. Missing/replaced mechanism
+    slots cannot erase started VM/Ps cleanup, and private creation rollback cannot release a slot
+    owned by retirement. `[ps-retirements]` logs only changes to actual prepared/pending/invoking/
+    accepted/indeterminate owner counts. No replacement Ps body or new native import is claimed.
+    The existing body-presence heuristic for provider context must be replaced with actual context
+    admission evidence when executive-owned body publication activates.
+
+    Twelve PM retirement tests, nine phase/retention tests, eight provider-finalizer tests and one
+    compile-fail ownership test cover this tranche. Focused validation passes 636 tests in seven
+    suites; the serialized 26-crate regression passes 2,912 tests in 59 suites. Native release build
+    passes in 34.77 seconds with the unchanged 266 warnings. An initial fixture expected Running
+    rather than the actual Ready state and was corrected to assert unchanged state; a native field
+    initialization macro error was fixed before final validation. Independent reviews are clear.
+    Logs: .tmp/test-ps-retirement-20260908.log, .tmp/test-ps-retirement-regression-20260908.log,
+    .tmp/build-ps-retirement-final-20260908.log. No desktop boot was attempted.
+
+    B3 x86 mapping-boundary tranche 128 (next): public rust-micro frame/table map invocations must
+    reject noncanonical and upper-half user addresses before same-address shortcuts or hardware
+    effects. Existing masked index extraction is not address validation. Test lower-user bounds,
+    full mapping extents, supported frame/table sizes, noncanonical aliases and overflow; preserve
+    internal kernel-only mapping helpers. This precedes a new dedicated canonical Ps VA arena.
+
     B3 canonical Ps body backing review (next requestor prerequisite): ordinary ETHREAD/EPROCESS
     bodies currently originate in win32k's shared pool, unlike the dedicated initial-System pages.
     Mapping those pool pages into unrelated providers would expose unrelated objects. Allocate
@@ -29583,12 +29632,21 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and alias retirement, with prepublished ownership for failed map/cap cleanup, not the existing
     resource-map helper's ignored delete errors or unproven borrowed paging caps.
     Preserve the PM's stable ThreadId body across dormant-thread activation; ThreadLifetime guards
-    activation-specific contents and retained requestors forbid reuse while referenced. Process
-    deletion also needs a withdrawal phase: currently PM records disappear before provider object
-    finalization. Merely reversing the calls would expose freed bodies to nested pointer lookups.
-    Fence new references, retain exact body/thread identities through checked provider detachment,
-    then delete canonical records and retire their backing. Remove win32k's synthetic EPROCESS
+    activation-specific contents and retained requestors forbid reuse while referenced. The retained
+    withdrawal design above removes records from lookup rather than adding a second retiring-state
+    policy to every acquisition API. Their storage and body-address reservation survive provider
+    detachment; subsequent backing owners must retain every alias until checked cleanup completes.
+    Remove win32k's synthetic EPROCESS
     initializer, not just its allocation branch, at the body-publication cutover.
+    Reserve a dedicated lower-half PML4 branch, index 129
+    [0x0000_4080_0000_0000, 0x0000_4100_0000_0000), using the existing private
+    AddressSlotAllocator with page stride. This is VA reservation only, not physical preallocation.
+    Retain every new PDPT/PD/PT capability and reject unexpected DELETE_FIRST as a collision. Do not
+    adopt the existing executive seen-set helper: Simpleboot currently publishes no boot paging
+    capabilities, and those uncapped boot levels plus raw startup maps require a separate provenance
+    cutover before that older helper can be replaced. Canonical Ps mappings need exact provider
+    lifetime admission and RW/NX aliases; arbitrary addresses in this arena must never fall through
+    to attached-user or generic fault mapping.
 
     IoOpenDeviceRegistryKey remains part of the canonical Key/security-family cutover, not a wrapper
     forwarding exercise. The current driver wrapper drops both key type and requested access. NT5

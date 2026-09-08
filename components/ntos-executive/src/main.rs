@@ -56,6 +56,7 @@ mod hosted_process_runtime;
 pub(crate) use hosted_process_runtime::*;
 mod process_vm_retirement;
 mod ps_bootstrap;
+mod ps_object_retirement;
 mod provider_ps;
 mod sec_image_diagnostic;
 use process_vm_retirement::reclaim_final_process_vm;
@@ -24094,6 +24095,7 @@ struct ExecNtHandler {
     /// can precede the last process/thread handle or dispatcher reference; this bounded table keeps
     /// that final delete work owned until the common service-loop boundary observes zero refs.
     process_deletion_candidates: nt_user_host::ProcessDeletionCandidateTable<MAX_PI>,
+    ps_object_retirements: ps_object_retirement::Retirements,
     /// Loop-owned hosted process identity catalog. The handler stores a pointer instead of owning a
     /// second catalog so process identity, image open, and spawn all consult the same runtime table.
     hosted_images: *const nt_exe_image::OwnedHostedImageCatalog<HOSTED_PROCESS_IMAGE_CAP>,

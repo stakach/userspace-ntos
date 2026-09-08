@@ -4257,6 +4257,7 @@ impl ExecNtHandler {
             process_deletion_candidates,
             nt_user_host::ProcessDeletionCandidateTable::new()
         );
+        write_field!(ps_object_retirements, crate::ps_object_retirement::Retirements::default());
         write_field!(hosted_images, hosted_images);
         write_field!(process_vspaces, zeroed_process_slot_u64_vec());
         write_field!(process_vspace_caps, empty_process_vspace_caps_vec());
@@ -11382,6 +11383,9 @@ impl ExecNtHandler {
     fn rollback_hosted_process_creation(&mut self, pi: usize, pid: nt_process::ProcessId) {
         // No user execution has been admitted, so this metadata-only rollback cannot own
         // transition backing. Detect a stale process-slot lifetime before releasing Ps ownership.
+        assert!(self.process_deletion_candidates.get(pi).is_none()
+            && !self.ps_object_retirements.owns_mechanism_slot(pi),
+            "creation rollback cannot discard process retirement ownership");
         unsafe { process_working_set_clear_metadata(pi) };
         while let Some(object) = self.pm.take_any_handle(pid) {
             self.release_handle_object(object);
@@ -21996,10 +22000,16 @@ impl ExecNtHandler {
         let pi = candidate.pi;
         let pid = candidate.pid;
         let Some(process_mechanism) = self.process_mechanisms.get(pi) else {
-            return HostedProcessDeletionOutcome::Stale;
+            return if candidate.phase == nt_user_host::ProcessDeletionPhase::AwaitingReferences
+                && !self.ps_object_retirements.contains(candidate)
+            {
+                HostedProcessDeletionOutcome::Stale
+            } else {
+                HostedProcessDeletionOutcome::Pending(candidate.phase)
+            };
         };
         if !candidate.matches_mechanism(process_mechanism) {
-            return HostedProcessDeletionOutcome::Stale;
+            return HostedProcessDeletionOutcome::Pending(candidate.phase);
         }
         loop {
             match candidate.phase {
@@ -22070,33 +22080,25 @@ impl ExecNtHandler {
                         .expect("reclaimed process VM must enter Ps deletion exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::DeletingProcessObject => {
+                    if self.ps_object_retirements.withdraw(candidate, &mut self.pm).is_err() {
+                        return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                    }
                     if let Some(accounting) = self.process_commit.accounting(pid) {
                         if accounting.current_bytes != 0 {
-                            self.pm
-                                .release_job_memory(pid, accounting.current_bytes)
-                                .expect(
-                                    "final MM commitment remains attached to the live Ps job member",
-                                );
+                            if self.ps_object_retirements.release_job_memory(
+                                candidate, &mut self.pm, accounting.current_bytes,
+                            ).is_err() {
+                                return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                            }
                         }
                         let removed = self.process_commit.unregister(pid);
                         debug_assert_eq!(removed, Some(accounting));
                     }
 
-                    let deletion = self
-                        .pm
-                        .delete_process_object_if_unreferenced(pid)
-                        .expect("preflighted Ps object acquired a new deletion blocker");
                     candidate = self
                         .process_deletion_candidates
-                        .record_process_object_deletion_exact(
-                            candidate,
-                            deletion.primary_token.map_or(0, nt_security::TokenId::raw),
-                            deletion
-                                .exception_port
-                                .map_or(0, nt_process::ExceptionPortEndpoint::get),
-                            deletion.deleted_threads,
-                        )
-                        .expect("Ps deletion payload must remain owned by its exact retry record");
+                        .record_process_object_withdrawal_exact(candidate)
+                        .expect("withdrawn Ps records retain their exact native owner");
                 }
                 nt_user_host::ProcessDeletionPhase::ReleasingExecutiveReferences => {
                     if candidate.pending_primary_token != 0 {
@@ -22134,10 +22136,14 @@ impl ExecNtHandler {
                     candidate = self
                         .process_deletion_candidates
                         .advance_exact(candidate)
-                        .expect("returned Ps references must enter provider finalization exactly");
+                        .expect("returned Ps references must enter mechanism retirement exactly");
                 }
                 nt_user_host::ProcessDeletionPhase::FinalizingProviderObjects => {
-                    if candidate.provider_objects {
+                    let provider_ready = match self.ps_object_retirements.provider_ready(candidate) {
+                        Ok(ready) => ready,
+                        Err(_) => return HostedProcessDeletionOutcome::Pending(candidate.phase),
+                    };
+                    if !provider_ready {
                         let finalizer_client = win32k_glue::Win32kClientContext {
                             logical_caller: None,
                             pi: pi as u32,
@@ -22158,12 +22164,16 @@ impl ExecNtHandler {
                             token_user_sid: [0; win32k_subsystem::WIN32K_TOKEN_USER_SID_MAX],
                             token_user_sid_len: 0,
                         };
-                        let (status, completed) = unsafe {
+                        if self.ps_object_retirements.begin_provider(candidate).is_err() {
+                            return HostedProcessDeletionOutcome::Pending(candidate.phase);
+                        }
+                        let outcome = unsafe {
                             win32k_glue::win32k_finalize_ps_provider_process_objects(
                                 finalizer_client,
                             )
                         };
-                        if !completed || status as u32 != 0 {
+                        self.ps_object_retirements.record_provider_result(candidate, outcome);
+                        if !matches!(outcome, win32k_glue::PsProviderFinalization::Returned(0)) {
                             print_str(b"[process-delete] provider finalizer pending pi=");
                             print_u64(pi as u64);
                             print_str(b" pid=");
@@ -22171,21 +22181,31 @@ impl ExecNtHandler {
                             print_str(b" generation=");
                             print_u64(candidate.generation);
                             print_str(b" status=0x");
-                            print_hex(if completed {
-                                status as u32
-                            } else {
-                                STATUS_DEVICE_NOT_READY
+                            print_hex(match outcome {
+                                win32k_glue::PsProviderFinalization::NotEntered(status)
+                                | win32k_glue::PsProviderFinalization::Returned(status)
+                                | win32k_glue::PsProviderFinalization::Indeterminate(status) => status,
                             });
                             print_str(b"\n");
                             return HostedProcessDeletionOutcome::Pending(candidate.phase);
                         }
                     }
+                    let deletion = match self.ps_object_retirements.finish(candidate, &mut self.pm) {
+                        Ok(deletion) => deletion,
+                        Err(_) => return HostedProcessDeletionOutcome::Pending(candidate.phase),
+                    };
                     candidate = self
                         .process_deletion_candidates
-                        .advance_exact(candidate)
-                        .expect("provider finalization must enter mechanism retirement exactly");
+                        .record_process_object_deletion_exact(
+                            candidate,
+                            deletion.primary_token.map_or(0, nt_security::TokenId::raw),
+                            deletion.exception_port.map_or(0, nt_process::ExceptionPortEndpoint::get),
+                            deletion.deleted_threads,
+                        )
+                        .expect("finalized Ps references must enter their exact release owner");
                 }
                 nt_user_host::ProcessDeletionPhase::RetiringMechanism => {
+                    assert!(!self.ps_object_retirements.contains(candidate));
                     let dynamic_retirement = self
                         .hosted_process_dynamic_retirement(pi, candidate.generation)
                         .expect("preflighted dynamic process retirement identity changed");
@@ -22226,8 +22246,8 @@ impl ExecNtHandler {
     }
 
     /// Retry every exact hosted-process deletion candidate once. A missing or replacement process
-    /// mechanism makes an old candidate stale and removes only that exact retry token; a still-live
-    /// Object Manager reference keeps the candidate queued for the next ownership boundary.
+    /// mechanism can discard only an untouched candidate. Once cleanup begins, its exact owner
+    /// survives even an inconsistent mechanism generation and must not affect its replacement.
     pub(crate) fn drain_hosted_process_deletion_candidates(&mut self) -> usize {
         let mut deleted = 0usize;
         for pi in 0..MAX_PI {
@@ -22236,6 +22256,11 @@ impl ExecNtHandler {
             };
             let current = self.process_mechanisms.get(pi);
             if !current.is_some_and(|mechanism| candidate.matches_mechanism(mechanism)) {
+                if candidate.phase != nt_user_host::ProcessDeletionPhase::AwaitingReferences
+                    || self.ps_object_retirements.contains(candidate)
+                {
+                    continue;
+                }
                 self.process_deletion_candidates
                     .remove_exact(candidate)
                     .expect("candidate remains exact until this serialized stale retirement");
@@ -22254,6 +22279,7 @@ impl ExecNtHandler {
                 deleted += 1;
             }
         }
+        self.ps_object_retirements.print_census_changes();
         deleted
     }
 
