@@ -31060,6 +31060,32 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     File/LPC cases and actual runtime execution remain separate open acceptance gates. Production
     BootExecute policy and desktop identities must remain unchanged by fixture preparation.
 
+    Native suspension fixture prepared (2026-09-09; static artifact acceptance only):
+    `tests/native/thread_suspend` now builds a freestanding AMD64 NT 5.2 native PE with exactly
+    twelve ntdll imports, no CRT, private dispatcher or TCB operations. Three cases cover
+    self-suspend's original Reply, object completion while held, and final resume before wait
+    completion. Both object cases verify zero-count resume preserves the wait. Initial
+    CREATE_SUSPENDED admission, prior counts, bounded waits, exactly-one entry/return, real worker
+    termination and handle closure are checked by the program, not synthetic kernel gate flags.
+    Production registry defaults and image identities are unchanged.
+
+    `bash tests/native/thread_suspend/build.sh` passes. The new `nt-native-test-verify` binary in
+    the existing verifier package parses/maps both artifacts at nonpreferred bases using
+    nt-pe-loader, resolves all twelve exports, binds and reads back the IAT, and rejects other
+    DLLs, forwarded/ordinal/delay imports, TLS and non-native/non-NT5.2 executable inputs. Negative
+    checks reject empty input and swapped EXE/DLL inputs. The original default ntdll verifier also
+    passes. Logs: `.tmp/build-native-thread-suspend-fixture-final-20260909.log`,
+    `.tmp/verify-native-fixture-reject-empty-20260909.log`,
+    `.tmp/verify-native-fixture-reject-dll-20260909.log`,
+    `.tmp/verify-native-fixture-reject-exe-provider-20260909.log` and
+    `.tmp/verify-ntdll-default-binary-20260909.log`. Fixture SHA256 is
+    `18affa604fc45a016b7fa3a75396232f88b7ce79bc7798ecbaad1c51893fb57d`;
+    input ntdll SHA256 is `c68be4a51ea491b4a07c34c2210cfd4d9e53ce85e09e7ad190b19d7bfc78919a`.
+    No guest execution or desktop acceptance is claimed. Run this fixture through real SMSS in a
+    diagnostic image only after strict provider admission is repaired, then extend it to File/LPC
+    completion while held. Runtime acceptance requires all three case PASS lines and genuine
+    successful process exit, not merely a static build or printed summary.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

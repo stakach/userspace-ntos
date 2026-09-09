@@ -1,0 +1,14 @@
+LIBRARY ntdll.dll
+EXPORTS
+    RtlCreateUserThread
+    NtCreateEvent
+    NtSuspendThread
+    NtResumeThread
+    NtWaitForSingleObject
+    NtSignalAndWaitForSingleObject
+    NtSetEvent
+    NtDelayExecution
+    NtClose
+    NtDisplayString
+    NtTerminateThread
+    NtTerminateProcess
