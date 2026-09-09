@@ -31490,7 +31490,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       identity; never blindly reappend a whole journal after partial append or return after dropping
       recovery state.
       Host storage support for already-existing snapshot-backed journals is complete below; native
-      reserve ownership, first-journal creation and retained caller integration remain open.
+      First-journal host ownership is added by the checkpoint below; native reserve ownership,
+      storage admission and retained caller integration remain open.
     - [ ] Retain complete caller publication state and exact COMMIT/ACK attempts. Once COMMIT is
       issued, disallow error-based truncate/ABORT; store its receipt before publishing local state,
       publish local generation/event/handle state once, and retry ACK without repeating publication.
@@ -31563,8 +31564,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     eventual exact COMMIT/local-publication/ACK owner. A supplied generic context retains its
     contents but does not prove that native callers captured every handle/PnP preparation. The
     prepared mutation opacity prerequisite is addressed by the composed-owner checkpoint below;
-    native admission must still consume the exact not-yet-published preparation. First-journal
-    creation remains a separate retained operation, not an implicit fallback in this append API.
+    native admission must still consume the exact not-yet-published preparation. The first-journal
+    checkpoint below adds explicit retained create admission, never an implicit open-error fallback.
 
     Native adapter requirements: reserve complete pending work before effects; retain real
     mount/device/store authority; serialize all writers to the actual snapshot reserve; and enter
@@ -31818,7 +31819,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
 
     Review adjustment: preparation ownership is now implemented; the handoff metadata warning is
     removed by its real consumer, not dummy access. Remaining native prerequisites are exact CM
-    authority-to-log/mount admission, retained first-journal creation and exclusive snapshot reserve
+    authority-to-log/mount admission, native first-journal admission and exclusive snapshot reserve
     ownership, followed by complete caller/PnP/Key publication and atomic deletion of historical
     one-shot APIs. Empty-journal volatile/no-op publication still needs a separate real path because
     the durable snapshot owner intentionally rejects empty journals. Before-submission BEGIN
@@ -31840,6 +31841,67 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     tests discarding preparation proofs; this checkpoint introduces no new warnings.
     Freestanding executive release passes in 38.07 seconds with 293 existing executive warnings;
     log: `.tmp/build-cm-upload-owner-executive-20260910.log`.
+
+    Retained first-journal checkpoint (2026-09-10): close explicit absent-log creation in the
+    host storage/publication owner without adding another persistence format or a one-shot create.
+    - [x] Add explicit SnapshotJournal::create admission. Capture a checked absent leaf, allocate
+      its immutable path and retain exact journal/caller/volume/device/store before any create.
+      Missing parents, wrong volumes, directories, existing files and empty journals are errors;
+      no failed open/create falls back to another disposition. Errors return original input owners.
+    - [x] Issue FILE_CREATE with read/write/delete authority and exclusive sharing from a retained
+      CreateInFlight state. Keep the exact handle and file identity through append and snapshot
+      retry. Returned creation errors allow retry only after checked absence; uncertain namespace
+      ownership stays blocked rather than adopting or deleting a file by name. No close/reopen
+      gap or intermediate empty-file snapshot is introduced.
+    - [x] Reuse existing exact-prefix append and ordered snapshot barriers for the first journal.
+      Snapshot failures retry only durability, never creation or append. Remove the misleading
+      FILE_SHARE_READ-as-attributes argument in existing-file admission while preserving its
+      actual exclusive-sharing behavior.
+    - [x] Retain the absent baseline through cancellation. Even before creation, persist checked
+      absence: a live deletion may not yet exist in the last snapshot. After creation, validate
+      exact tail/identity, mark deletion,
+      close once, verify checked namespace absence, then persist the deletion. A successful close
+      alone is not proof of unlink. Retain removal-flush state after errors so retry cannot recreate,
+      close a reused handle or delete by path; rollback never resumes append or publication.
+    - [x] Add explicit SnapshotSystemHivePublication::create and share the existing storage/CM
+      coordinator. CM COMMIT still requires successful snapshot durability, and prepared ABORT
+      still requires completed storage rollback before exact ACK can return the caller. Existing
+      log admission remains distinct. The full retained BEGIN/upload path now has host composition
+      cases for both existing and first journals, followed by real hive-log recovery.
+
+    Review adjustment: this closes the host first-journal lifecycle, not native mount selection or
+    raw-global exclusion. Next implement exact CM authority-to-SYSTEM-log/writable-mount admission
+    and serialize access to the actual physical snapshot reserve (restore and all writers), keeping
+    dirty/pending flags on refusal. A copied AhciSnapshotDevice wrapper is not exclusive authority.
+    Do not hold mutable global FileSystem borrows through executive re-entry. Then migrate complete
+    native caller/PnP/Key publication and delete the old one-shot wrappers and unconditional flush
+    success together. Empty-journal volatile/no-op publication remains separate; never create a
+    fake log payload. No native cutover, microkernel change or VM run is claimed. The 27 strict
+    missing win32k imports and desktop acceptance remain open.
+
+    Review found and corrected a pre-create cancellation gap: checked live absence alone was not
+    durable absence. The owner now runs the same snapshot barrier before completing that rollback,
+    with a regression for a previously persisted file deleted only in RAM. Returned create errors
+    with uncertain namespace effects still cannot recover without an exact acquired file handle;
+    they remain CreateInFlight and retain caller ownership. No name-based adoption/cleanup is
+    allowed. The tests simulate that uncertainty, not actual post-create allocation failure.
+    - [ ] Before native creation activation, retain exact namespace/file-object acquisition through
+      allocation failure, or make that acquisition failure-atomic. Do not resolve CreateInFlight
+      by inferring ownership from the path or treating an unavailable handle as successful cleanup.
+
+    Serialized host validation passes all 1,395 tests/doctests: nt-fs 172 plus one doctest,
+    nt-config-client 153 plus 18 doctests, nt-config-abi 9, nt-config-server 103,
+    nt-config-manager 35, nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two
+    doctests, and nt-user-host 494 plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-first-journal-full-final-20260910.log`. The 12 added cases cover explicit admission,
+    zero-copy first publication, create uncertainty, caller lifetime, dropped owners, exact
+    deletion/absence validation, every snapshot write/barrier failure in both partial-flush modes,
+    dirty-absence recovery, and real CM publication/cancellation with persisted-before-error and
+    lost ABORT/ACK replies. Two independent read-only reviews found no remaining issue after the
+    durable-absence correction. Only the root agent ran tests/builds, serially. Existing client
+    status-constant and two older discarded-preparation test warnings remain unchanged.
+    Freestanding executive release passes in 37.92 seconds with 293 existing executive warnings;
+    log: `.tmp/build-first-journal-executive-20260910.log`.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

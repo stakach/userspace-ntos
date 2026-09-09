@@ -1,6 +1,6 @@
 //! Concrete post-PREPARE storage/CM publication ownership. No receipt or mutable preparation is
-//! exposed while work is pending. Native first-journal creation and reserve serialization are
-//! separate admission responsibilities; this coordinator does not activate executive publication.
+//! exposed while work is pending. First-journal creation has explicit retained admission; native
+//! storage authority and reserve serialization still precede executive publication.
 
 use crate::{
     Backend, ConfigClient, PreparedSystemHiveMutation, SystemHiveMutationAbortReceipt,
@@ -93,11 +93,63 @@ impl<'a, B: Backend, D: SnapshotBlockDevice, C, R> SnapshotSystemHivePublication
         dev: &'a mut D,
         store: SnapshotBlockStore,
         log_path: &str,
-        mut prepared: PreparedSystemHiveMutation,
+        prepared: PreparedSystemHiveMutation,
         continuation: C,
     ) -> Result<Self, SnapshotSystemHivePublicationOpenError<C>> {
+        Self::admit(
+            client,
+            fs,
+            dev,
+            store,
+            log_path,
+            prepared,
+            continuation,
+            false,
+        )
+    }
+
+    /// Reserve explicit creation of a genuinely absent backing log before filesystem effects.
+    /// No collision/error falls back to open. The same retained owner creates, appends and makes
+    /// the first journal durable; pre-COMMIT cancellation restores durable absence before CM ABORT.
+    /// Native admission must still bind this exact path, mount and store to the CM authority.
+    pub fn create(
+        client: &'a mut ConfigClient<B>,
+        fs: &'a mut FileSystem,
+        dev: &'a mut D,
+        store: SnapshotBlockStore,
+        log_path: &str,
+        prepared: PreparedSystemHiveMutation,
+        continuation: C,
+    ) -> Result<Self, SnapshotSystemHivePublicationOpenError<C>> {
+        Self::admit(
+            client,
+            fs,
+            dev,
+            store,
+            log_path,
+            prepared,
+            continuation,
+            true,
+        )
+    }
+
+    fn admit(
+        client: &'a mut ConfigClient<B>,
+        fs: &'a mut FileSystem,
+        dev: &'a mut D,
+        store: SnapshotBlockStore,
+        log_path: &str,
+        mut prepared: PreparedSystemHiveMutation,
+        continuation: C,
+        create: bool,
+    ) -> Result<Self, SnapshotSystemHivePublicationOpenError<C>> {
         let journal = core::mem::take(&mut prepared.durable_journal);
-        let storage = match SnapshotJournal::open(fs, dev, store, log_path, journal, ()) {
+        let admitted = if create {
+            SnapshotJournal::create(fs, dev, store, log_path, journal, ())
+        } else {
+            SnapshotJournal::open(fs, dev, store, log_path, journal, ())
+        };
+        let storage = match admitted {
             Ok(storage) => storage,
             Err(error) => {
                 prepared.durable_journal = error.journal;

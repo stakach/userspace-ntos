@@ -8,6 +8,85 @@ use core::cell::Cell;
 use nt_config_abi::hive_mutation_commit_operation as operation;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+#[test]
+fn first_journal_cancellation_removes_file_durably_before_abort_and_ack() {
+    for persist in [false, true] {
+        for barrier in 1..=3 {
+            let mut client = client(1);
+            let prepared = prepare(&mut client, 1, "Child");
+            let (mut fs, mut dev, controls) = disk_without_log();
+            let drops = Rc::new(Cell::new(0));
+            let mut work = match Work::create(
+                &mut client,
+                &mut fs,
+                &mut dev,
+                SnapshotBlockStore::new(0, 64),
+                LOG,
+                prepared,
+                Caller {
+                    drops: drops.clone(),
+                    publications: 0,
+                },
+            ) {
+                Ok(work) => work,
+                Err(_) => panic!("creation admission failed"),
+            };
+            controls
+                .fail_flush
+                .set(Some(controls.flushes.get() + barrier));
+            controls.persist_before_error.set(persist);
+            assert!(work.make_durable().is_err());
+            assert!(work.commit().is_err());
+            let calls = work.client.backend.calls;
+            controls
+                .fail_flush
+                .set(Some(controls.flushes.get() + barrier));
+            assert!(work.rollback_storage().is_err());
+            assert!(work.abort().is_err());
+            assert!(work.make_durable().is_err());
+            assert!(work.take_cancelled().is_none());
+            assert_eq!(work.client.backend.calls, calls);
+            assert_eq!(drops.get(), 0);
+            controls.fail_flush.set(None);
+            work.rollback_storage().unwrap();
+            let writes = controls.writes.get();
+            work.client.backend.corrupt = Some((operation::ABORT, 0));
+            assert!(work.abort().is_err());
+            assert!(work.take_cancelled().is_none());
+            work.abort().unwrap();
+            work.client.backend.corrupt = Some((operation::ACKNOWLEDGE, 0));
+            assert!(work.acknowledge_abort().is_err());
+            assert!(work.take_cancelled().is_none());
+            work.acknowledge_abort().unwrap();
+            assert_eq!(controls.writes.get(), writes);
+            assert!(work.take_completion().is_none());
+            let caller = work.take_cancelled().unwrap();
+            assert_eq!(caller.publications, 0);
+            assert!(work.take_cancelled().is_none());
+            drop(work);
+            dev.cache.copy_from_slice(&dev.stable);
+            let (restored, _, _) = FileSystem::restore_volume_snapshot_from_store(
+                &SnapshotBlockStore::new(0, 64),
+                &mut dev,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(restored.try_file_len(LOG), Ok(None));
+            let hive = nt_hive_core::decode_image(
+                &restored.try_file_bytes_owned(PRIMARY).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert!(hive.open_key(r"ControlSet001\Services\Child").is_none());
+            assert!(client
+                .query_system_hive_key(&alloc::format!("{PARENT}\\Child"))
+                .is_err());
+            assert_eq!(drops.get(), 0);
+            drop(caller);
+            assert_eq!(drops.get(), 1);
+        }
+    }
+}
+
 fn recovered_without_mutation(dev: &mut Disk) {
     dev.cache.copy_from_slice(&dev.stable);
     let (fs, _, _) =

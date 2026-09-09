@@ -1,18 +1,22 @@
-//! Retained append and real snapshot barriers for an already-existing internal journal.
+//! Retained creation/append and real snapshot barriers for an internal journal.
 //!
 //! Exclusive volume/device borrows bind every retry to the same storage authority. Native adapters
 //! must retain this owner AND their complete caller continuation before any effect. This is not a
-//! CM protocol owner, a file-creation transaction, or an NTFS persistence implementation.
+//! CM protocol owner or an NTFS persistence implementation.
 
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotJournalPhase {
+    CreatePending,
+    CreateInFlight,
     AppendPending,
     FlushPending,
     Durable,
     PublicationStarted,
     RollbackPending,
+    RemoveInFlight,
+    RemoveFlushPending,
     RolledBack,
 }
 
@@ -86,12 +90,13 @@ pub struct SnapshotJournal<'a, D: SnapshotBlockDevice, C> {
     context: Option<C>,
     phase: SnapshotJournalPhase,
     durability: Option<SnapshotJournalDurability>,
+    creation_path: Option<String>,
 }
 
 impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
-    /// Admit an existing journal, excluding competing writers and deletion. File creation must be
-    /// completed by its own owner first. File admission and length arithmetic precede append;
-    /// snapshot/device errors can occur afterwards and retain the pending journal.
+    /// Admit an existing journal with exclusive sharing. Missing files require explicit `create`
+    /// admission, never an error-triggered fallback. File admission and length arithmetic precede
+    /// append; snapshot/device errors can occur afterwards and retain the pending journal.
     pub fn open(
         fs: &'a mut FileSystem,
         dev: &'a mut D,
@@ -113,7 +118,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
             let opened = fs.zw_create_file(
                 path,
                 FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE,
-                FILE_SHARE_READ,
+                0,
                 0,
                 FILE_OPEN,
                 FILE_NON_DIRECTORY_FILE,
@@ -146,6 +151,7 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
                 context: Some(context),
                 phase: SnapshotJournalPhase::AppendPending,
                 durability: None,
+                creation_path: None,
             }),
         }
     }
@@ -205,6 +211,9 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
     /// perform only the barrier. A clean-bit observation or an earlier generation is never proof.
     pub fn make_durable(&mut self) -> Result<(), SnapshotJournalError> {
         use SnapshotJournalPhase::*;
+        if self.phase == CreatePending {
+            self.create_file()?;
+        }
         if self.phase == Durable {
             return Ok(());
         }
@@ -259,8 +268,8 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         Ok(self.context.as_mut().expect("retained caller"))
     }
 
-    /// Before publication only: remove this tail and durably publish the rollback. An uncertain
-    /// truncation or snapshot leaves RollbackPending, which cannot return to append/publication.
+    /// Before publication only: restore the original EOF, or absence for a newly created journal,
+    /// and durably publish rollback. Errors retain cleanup direction, never append/publication.
     pub fn rollback(&mut self) -> Result<(), SnapshotJournalError> {
         use SnapshotJournalPhase::*;
         if self.phase == RolledBack {
@@ -268,6 +277,9 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
         }
         if self.phase == PublicationStarted {
             return Err(SnapshotJournalError::InvalidPhase);
+        }
+        if self.creation_path.is_some() {
+            return self.rollback_creation();
         }
         self.phase = RollbackPending;
         self.durability = None;
@@ -309,10 +321,15 @@ impl<'a, D: SnapshotBlockDevice, C> SnapshotJournal<'a, D, C> {
 impl<D: SnapshotBlockDevice, C> Drop for SnapshotJournal<'_, D, C> {
     fn drop(&mut self) {
         // The private handle is held in an exclusively borrowed table and is closed exactly once.
-        let status = self.fs.zw_close(self.handle);
-        debug_assert_eq!(status, STATUS_SUCCESS);
+        if self.handle != INVALID_HANDLE {
+            let status = self.fs.zw_close(self.handle);
+            debug_assert_eq!(status, STATUS_SUCCESS);
+        }
     }
 }
+
+#[path = "snapshot_journal/creation.rs"]
+mod creation;
 
 #[cfg(test)]
 #[path = "snapshot_journal/tests.rs"]

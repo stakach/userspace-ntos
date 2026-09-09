@@ -67,10 +67,20 @@ impl Drop for Caller {
 pub(super) type Work<'a> = SnapshotSystemHivePublication<'a, Direct, Disk, Caller, u64>;
 
 pub(super) fn disk() -> (FileSystem, Disk, Rc<Controls>) {
+    disk_with_log(true)
+}
+
+pub(super) fn disk_without_log() -> (FileSystem, Disk, Rc<Controls>) {
+    disk_with_log(false)
+}
+
+fn disk_with_log(existing: bool) -> (FileSystem, Disk, Rc<Controls>) {
     let mut fs = FileSystem::new(MemFs::new());
     assert!(fs.provision_directory(r"\??\C:\Config"));
     assert!(fs.provision_file(PRIMARY, &image()));
-    assert!(fs.provision_file(LOG, &[]));
+    if existing {
+        assert!(fs.provision_file(LOG, &[]));
+    }
     let controls = Rc::new(Controls::default());
     let mut dev = Disk {
         stable: vec![0; 64 * 512],

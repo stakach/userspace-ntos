@@ -10,6 +10,15 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[test]
 fn retained_begin_upload_and_durable_publication_preserve_one_caller() {
+    retained_begin_publication(false);
+}
+
+#[test]
+fn retained_begin_first_journal_and_durable_publication_preserve_one_caller() {
+    retained_begin_publication(true);
+}
+
+fn retained_begin_publication(first_journal: bool) {
     use crate::{
         CmMutationBeginAttempts, CmMutationBeginOperation as Begin,
         CmMutationPreparationOperation as Op, CmMutationPreparationPhase as Phase,
@@ -62,8 +71,17 @@ fn retained_begin_upload_and_durable_publication_preserve_one_caller() {
     assert!(preparing.begin_exchange(Op::Cancel).is_err());
     assert_eq!(drops.get(), 0);
     let expected = prepared.durable_journal().to_vec();
-    let (mut fs, mut dev, _) = disk();
-    let mut work = match Work::open(
+    let (mut fs, mut dev, _) = if first_journal {
+        disk_without_log()
+    } else {
+        disk()
+    };
+    let admit = if first_journal {
+        Work::create
+    } else {
+        Work::open
+    };
+    let mut work = match admit(
         &mut client,
         &mut fs,
         &mut dev,
