@@ -31189,9 +31189,12 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review adjustment for the next native cutover: do not put a universal target-DACL check in
     mint_registry_key. Existing opens, new creation and BACKUP_RESTORE have different grant rules,
     and that function currently runs after some durable creation effects. Resolve these in order:
-    - [ ] Establish real root descriptors and inherited/defaulted child descriptors; absence of
-      modeled security must not become a null-DACL fallback.
-      Root initialization is complete below; child assignment and generated-hive security remain open.
+    - [x] Establish real Machine/User root descriptors from the captured bootstrap subject, with
+      required owned security before native handler publication.
+    - [ ] Establish inherited/defaulted child descriptors and generated-hive security; absence of
+      modeled security must not become a null-DACL fallback. Remove the descendant substitutions.
+    - [x] Provide shared captured-subject fresh access checks and strict owned descriptor parsing,
+      preserving lowered impersonation levels and rejecting unsupported ACE semantics.
     - [ ] Capture the effective subject/mode and authorize ordinary parent creation before mutation.
       Existing-key opens check the target DACL. New-key handles use the authorized creation outcome,
       not a second target-DACL check. Implement BACKUP_RESTORE's privilege-derived grant independently
@@ -31248,6 +31251,38 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-registry-roots-executive-20260909.log`. Read-only independent review found no
     correctness issues. No VM was launched: the strict 27-import blocker remains unchanged, and
     this checkpoint does not claim native Key access admission or desktop execution.
+
+    Captured-subject access checkpoint (2026-09-09): nt-security now exposes strict owned
+    self-relative descriptor conversion for mounted object security, reusing the native capture
+    evaluator's borrowed ACL conversion rather than wrapping stored bytes in fake ClientMemory or
+    allocating another native ACL copy. Owner/group and both ACLs are validated; unsupported ACE
+    semantics reject authorization instead of disappearing. Valid absent/null DACLs retain NT
+    semantics; an absent object descriptor is not converted into an unrestricted descriptor.
+
+    CapturedSubjectTokens::check_access evaluates fresh access requests against the retained
+    effective token and captured impersonation level. The order follows SeAccessCheck: KernelMode
+    bypass, missing-object-security denial, low-client-level rejection, then ordinary access
+    evaluation. Its shared kernel-grant helper also backs existing access checks, with no dummy
+    descriptor or duplicate privilege policy. Privilege use is returned for caller audit. This is
+    not a full ACCESS_STATE implementation with previously granted rights, a backup/restore
+    creation decision, or native handle publication. Those remain in the ordered cutover above.
+
+    Review adjustment: root initialization and these shared access prerequisites are closed;
+    the next bounded step is parent-authorized single-child container assignment and transaction
+    ownership, including creator security, handle reservation, audit and copyout failure. Keep the
+    inherited/generated-descriptor and native access checkboxes open until that owner is wired.
+
+    Serialized host validation passes all 1,429 tests/doctests across nt-security (215), nt-user-host
+    (494 unit plus 49 integration) and nt-ntdll (657), with 14 doctests, in
+    `.tmp/test-captured-object-access-20260909.log`. Eight new tests cover capture/native parsing
+    parity, malformed security, null/empty DACL distinctions, unsupported ACEs in either ACL,
+    captured-level ordering, retained-token authority and reported privilege use. The privilege
+    success test explicitly enables SeSecurityPrivilege; the System token does not have it enabled
+    by default. Independent read-only review found no correctness issues. Native create/open
+    publication and desktop acceptance remain unclaimed.
+    The freestanding executive release build also passes with 293 existing warnings in
+    `.tmp/build-captured-object-access-executive-20260909.log`. No microkernel change or VM run
+    occurred; the strict missing-import frontier remains 27.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

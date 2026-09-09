@@ -267,6 +267,24 @@ impl AccessCheckResult {
     }
 }
 
+/// Shared SeAccessCheck kernel bypass; neither a descriptor nor token authority is consulted.
+pub(crate) fn kernel_access_grant(
+    desired_access: AccessMask,
+    mapping: &GenericMapping,
+) -> AccessCheckResult {
+    let want = mapping.map(desired_access & !MAXIMUM_ALLOWED);
+    AccessCheckResult {
+        status: STATUS_SUCCESS,
+        granted_access: want
+            | if desired_access & MAXIMUM_ALLOWED != 0 {
+                mapping.generic_all
+            } else {
+                0
+            },
+        privileges_used: Vec::new(),
+    }
+}
+
 /// The NT access-check algorithm (spec §9). Evaluates `desired_access` for `token` against `sd`,
 /// mapping generic rights, honouring `MAXIMUM_ALLOWED`, evaluating deny-before-allow in ACL order,
 /// applying owner rights + privilege overrides, and bypassing the DACL for `KernelMode`.
@@ -373,15 +391,7 @@ fn access_check_internal(
 
     // SeAccessCheck's kernel caller bypass precedes both the zero-access and privilege checks.
     if mode == ProcessorMode::KernelMode {
-        return AccessCheckResult {
-            status: STATUS_SUCCESS,
-            granted_access: if maximum {
-                mapping.generic_all | want
-            } else {
-                want
-            },
-            privileges_used,
-        };
+        return kernel_access_grant(desired_access, mapping);
     }
     if desired_access == 0 {
         return denied();

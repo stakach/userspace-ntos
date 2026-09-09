@@ -29,6 +29,36 @@ pub struct CapturedSubjectTokens<'a> {
 }
 
 impl CapturedSubjectTokens<'_> {
+    /// Evaluate a fresh object access request (no previously granted rights) against the captured
+    /// effective subject. SeAccessCheck's KernelMode bypass precedes missing-descriptor and client
+    /// level checks. Missing security is not a null DACL. A valid descriptor with an absent/null
+    /// DACL retains NT's unrestricted-DACL semantics. This returns privilege use for caller audit;
+    /// it does not publish a handle, implement backup/restore policy, or authorize new-object grants.
+    pub fn check_access(
+        &self,
+        descriptor: Option<&crate::SecurityDescriptor>,
+        desired_access: crate::AccessMask,
+        mapping: &crate::GenericMapping,
+        mode: crate::ProcessorMode,
+    ) -> crate::AccessCheckResult {
+        if mode == crate::ProcessorMode::KernelMode {
+            return crate::access::kernel_access_grant(desired_access, mapping);
+        }
+        let reject = |status| crate::AccessCheckResult {
+            status,
+            granted_access: 0,
+            privileges_used: alloc::vec::Vec::new(),
+        };
+        let Some(descriptor) = descriptor else {
+            return reject(crate::STATUS_ACCESS_DENIED);
+        };
+        let (token, level) = self.effective_token();
+        if level.is_some_and(|level| level < SecurityImpersonationLevel::Impersonation) {
+            return reject(STATUS_BAD_IMPERSONATION_LEVEL);
+        }
+        crate::access_check(descriptor, token, desired_access, mapping, mode)
+    }
+
     /// `None` denotes the primary subject. A client always carries its captured level alongside
     /// the token; using the token's potentially higher inherent level would elevate authority.
     pub fn effective_token(&self) -> (&AccessToken, Option<SecurityImpersonationLevel>) {
@@ -161,3 +191,7 @@ impl CapturedSubjectContext {
 #[cfg(test)]
 #[path = "subject_context_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "subject_access_tests.rs"]
+mod access_tests;

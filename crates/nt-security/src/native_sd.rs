@@ -25,6 +25,10 @@ pub use device_parameters_security::prepare_device_parameters_security;
 mod registry_root_security;
 pub use registry_root_security::{assign_registry_root_security, KEY_GENERIC_MAPPING};
 
+#[cfg(test)]
+#[path = "security_access_bytes_tests.rs"]
+mod security_access_bytes_tests;
+
 #[path = "security_assignment.rs"]
 mod security_assignment;
 pub use security_assignment::{
@@ -184,6 +188,26 @@ pub fn capture_security_descriptor_for_access(
     va: u64,
 ) -> Result<SecurityDescriptor, u32> {
     capture_descriptor(memory, va, true)
+}
+
+/// Parse an already owned self-relative descriptor for authorization, without fabricating a
+/// client-memory address. Validate both ACLs and reject unsupported ACE semantics just like strict
+/// native capture. Descriptor absence must be handled separately by the caller, not replaced by
+/// a default descriptor; a valid absent/null DACL remains distinct from missing object security.
+pub fn security_descriptor_bytes_for_access(bytes: &[u8]) -> Result<SecurityDescriptor, u32> {
+    let parsed = parse_self_relative_descriptor(bytes)?;
+    Ok(SecurityDescriptor {
+        owner: parsed.owner.map(Sid::from_native_bytes).transpose()?,
+        group: parsed.group.map(Sid::from_native_bytes).transpose()?,
+        dacl: parsed
+            .dacl
+            .map(|acl| convert_native_acl_bytes(acl, true))
+            .transpose()?,
+        sacl: parsed
+            .sacl
+            .map(|acl| convert_native_acl_bytes(acl, true))
+            .transpose()?,
+    })
 }
 
 fn capture_descriptor(
@@ -474,10 +498,11 @@ pub fn native_acl_to_access_acl(native: &NativeAcl) -> Result<Acl, u32> {
 }
 
 fn convert_native_acl(native: &NativeAcl, strict: bool) -> Result<Acl, u32> {
-    let bytes = native.as_bytes();
-    if bytes.len() < ACL_HEADER_SIZE {
-        return Err(STATUS_INVALID_ACL);
-    }
+    convert_native_acl_bytes(native.as_bytes(), strict)
+}
+
+fn convert_native_acl_bytes(bytes: &[u8], strict: bool) -> Result<Acl, u32> {
+    let bytes = NativeAcl::validated_prefix(bytes).map_err(|error| error.status())?;
     let ace_count = read_u16(bytes, 4) as usize;
     let mut aces = Vec::new();
     if aces.try_reserve_exact(ace_count).is_err() {
