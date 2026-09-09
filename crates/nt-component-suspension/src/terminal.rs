@@ -9,6 +9,7 @@ pub struct TerminalIdentity {
     binding: LaneBinding,
     key: SuspensionKey,
     owner: SuspensionOwner,
+    external_token: Option<u64>,
 }
 
 impl TerminalIdentity {
@@ -23,12 +24,17 @@ impl TerminalIdentity {
     pub const fn owner(self) -> SuspensionOwner {
         self.owner
     }
+
+    pub const fn external_token(self) -> Option<u64> {
+        self.external_token
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalStage {
     Output,
     Context,
+    Publication,
     Reply,
 }
 
@@ -95,6 +101,14 @@ pub(super) struct TerminalRecord<T> {
 }
 
 impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
+    /// Provider execution and entered terminal mechanisms share the same execution fence.
+    pub fn execution_busy(&self) -> bool {
+        self.running.is_some() || self.slots.iter().any(|slot| {
+            slot.lane.as_ref().and_then(|lane| lane.terminal.as_ref())
+                .is_some_and(|record| matches!(record.phase, TerminalPhase::Invoking { .. }))
+        })
+    }
+
     /// Publish the returned result without releasing its original suspension or native authority.
     /// The resume epoch was reserved before the provider ran; this transition cannot allocate.
     pub fn retain_terminal_running(
@@ -105,8 +119,66 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         owner: SuspensionOwner,
         payload: T,
     ) -> Result<TerminalIdentity, LaneError> {
+        self.retain_running(handle, reply_object, key, owner, None, payload)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Retain a callback transfer without releasing its original native reply or suspension.
+    /// begin_resume reserved the token capacity before entering the provider.
+    pub fn retain_external_terminal_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        token: u64,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
+        if token == 0 {
+            return Err((LaneError::InvalidIdentity, payload));
+        }
+        self.retain_running(handle, reply_object, key, owner, Some(token), payload)
+    }
+
+    fn retain_running(
+        &mut self,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        external_token: Option<u64>,
+        payload: T,
+    ) -> Result<TerminalIdentity, (LaneError, T)> {
+        let identity = match self.validate_terminal_retention(handle, reply_object, key, owner, external_token) {
+            Ok(identity) => identity,
+            Err(error) => return Err((error, payload)),
+        };
+        let lane = self.lane_mut(handle).unwrap();
+        lane.terminal = Some(TerminalRecord {
+            identity,
+            payload,
+            phase: TerminalPhase::Ready {
+                stage: TerminalStage::Output,
+                last_error: None,
+            },
+            next_attempt: 1,
+        });
+        lane.phase = LanePhase::Terminal;
+        self.running = None;
+        Ok(identity)
+    }
+
+    fn validate_terminal_retention(
+        &self,
+        handle: LaneHandle,
+        reply_object: u64,
+        key: SuspensionKey,
+        owner: SuspensionOwner,
+        external_token: Option<u64>,
+    ) -> Result<TerminalIdentity, LaneError> {
         self.validate_running(handle, reply_object)?;
-        let lane = self.lane_mut(handle)?;
+        let max_depth = self.max_depth_per_lane;
+        let lane = self.lane(handle)?;
         let frame = lane
             .suspensions
             .top()
@@ -123,25 +195,25 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         {
             return Err(LaneError::InvalidPhase);
         }
-        let identity = TerminalIdentity {
+        if let Some(token) = external_token {
+            if lane.external_tokens.contains(&token) {
+                return Err(LaneError::InvalidIdentity);
+            }
+            if lane.external_tokens.len() >= max_depth {
+                return Err(LaneError::Suspension(SuspensionError::Overflow));
+            }
+            if lane.external_tokens.len() >= lane.external_tokens.capacity() {
+                return Err(LaneError::NoCapacity);
+            }
+        }
+        Ok(TerminalIdentity {
             dispatch: lane.dispatch.ok_or(LaneError::InvalidPhase)?,
             resume_epoch: lane.resume_epoch,
             binding: lane.binding,
             key,
             owner,
-        };
-        lane.terminal = Some(TerminalRecord {
-            identity,
-            payload,
-            phase: TerminalPhase::Ready {
-                stage: TerminalStage::Output,
-                last_error: None,
-            },
-            next_attempt: 1,
-        });
-        lane.phase = LanePhase::Terminal;
-        self.running = None;
-        Ok(identity)
+            external_token,
+        })
     }
 
     pub fn terminal(
@@ -185,7 +257,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         &self,
         mut predicate: impl FnMut(TerminalIdentity, &TerminalView<'_, C, R, T>) -> bool,
     ) -> Option<TerminalIdentity> {
-        if self.running.is_some() {
+        if self.execution_busy() {
             return None;
         }
         self.slots
@@ -232,7 +304,7 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         reply_object: u64,
         expected: TerminalStage,
     ) -> Result<TerminalAttempt, LaneError> {
-        if self.running.is_some() {
+        if self.execution_busy() {
             return Err(LaneError::Busy);
         }
         self.terminal_record(identity, reply_object)?;
@@ -269,6 +341,20 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         record.phase = next_phase(attempt.stage, outcome);
         attempt.consumed = true;
         Ok(())
+    }
+
+    /// Access the retained payload only under the exact outstanding stage attempt. The closure
+    /// must perform local work only; release this borrow before invoking an external mechanism.
+    /// Taking an owned payload out does not change Invoking or authorize stage replay.
+    pub fn with_terminal_payload<O>(
+        &mut self,
+        attempt: &TerminalAttempt,
+        reply_object: u64,
+        access: impl FnOnce(&mut T) -> O,
+    ) -> Result<O, LaneError> {
+        self.validate_terminal_attempt(attempt, reply_object)?;
+        let record = self.lane_mut(attempt.identity.lane())?.terminal.as_mut().unwrap();
+        Ok(access(&mut record.payload))
     }
 
     /// Atomically acknowledge output processing and retain its final native status/payload.
@@ -364,6 +450,12 @@ impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
             .complete_dispatch(identity.key, identity.owner)
             .map_err(LaneError::Suspension)?;
         let record = lane.terminal.take().unwrap();
+        if let Some(token) = record.identity.external_token {
+            // Terminal phase excludes every other mutation of this lane's external stack.
+            // Capacity and uniqueness were checked before retaining the transfer.
+            assert!(lane.external_tokens.len() < lane.external_tokens.capacity());
+            lane.external_tokens.push(token);
+        }
         lane.phase = if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
             LanePhase::Idle
         } else {
@@ -387,6 +479,10 @@ fn next_phase(stage: TerminalStage, outcome: TerminalStageOutcome) -> TerminalPh
                 last_error: None,
             },
             TerminalStage::Context => TerminalPhase::Ready {
+                stage: TerminalStage::Publication,
+                last_error: None,
+            },
+            TerminalStage::Publication => TerminalPhase::Ready {
                 stage: TerminalStage::Reply,
                 last_error: None,
             },

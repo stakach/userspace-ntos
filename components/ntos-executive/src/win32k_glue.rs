@@ -6,7 +6,7 @@
 use crate::*;
 use alloc::vec::Vec;
 
-const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
+pub(crate) const WINDOWPROC_LPARAM_OFFSET: u64 = 0x28;
 const WINDOWPROC_PAYLOAD_OFFSET: u32 = 0x40;
 const WND_DWUSERDATA_OFFSET: u64 = 0x110;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -1244,17 +1244,19 @@ pub(crate) fn user_callback_stack_depths() -> (usize, usize) {
     }
 }
 
-pub(crate) unsafe fn pending_user_callback_token(
-    lane: nt_component_suspension::LaneHandle,
-    dispatch_id: u64,
-) -> Option<u64> {
-    let frame = (&*core::ptr::addr_of!(USER_CALLBACK_ACTIVE)).top()?;
-    let token = u64::from(frame.request().callback_id);
-    (!frame.is_redirected()
-        && frame.dispatch_context().lane == lane
-        && frame.dispatch_context().dispatch_id == dispatch_id
-        && token != 0)
-        .then_some(token)
+unsafe fn callback_frame_can_resume(frame: &nt_user_callback::ActiveCallbackFrame) -> bool {
+    crate::component_external_resume_ready(
+        frame.dispatch_context().lane,
+        u64::from(frame.request().callback_id),
+    )
+}
+
+unsafe fn callback_client_can_enter_nested(client: Win32kClientContext) -> bool {
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    active.top_for(&identity).is_none_or(|frame| {
+        frame.is_redirected() && callback_frame_can_resume(frame)
+    })
 }
 
 pub(crate) unsafe fn user_callback_return_readiness(
@@ -1272,7 +1274,8 @@ pub(crate) unsafe fn user_callback_return_readiness(
     }
     let correlation = nt_user_callback::CallbackCorrelation::from_request(frame.request());
     match active.is_lane_top(correlation) {
-        Ok(true) => UserCallbackReturnReadiness::Ready,
+        Ok(true) if callback_frame_can_resume(frame) => UserCallbackReturnReadiness::Ready,
+        Ok(true) => UserCallbackReturnReadiness::Deferred,
         Ok(false) => UserCallbackReturnReadiness::Deferred,
         Err(_) => UserCallbackReturnReadiness::Missing,
     }
@@ -1332,7 +1335,7 @@ pub(crate) unsafe fn begin_nested_user_callback_dispatch(
     let Some(parent) = active.top_for(&identity) else {
         return Ok(false);
     };
-    if !parent.is_redirected() {
+    if !parent.is_redirected() || !callback_frame_can_resume(parent) {
         return Err(nt_user_callback::ContinuationError::State);
     }
     let stack = &mut *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS);
@@ -2127,6 +2130,10 @@ unsafe fn restore_all_client_callback_windows() {
 }
 
 unsafe fn abort_controlled_user_callbacks() {
+    if crate::component_execution_is_busy() || crate::component_has_retained_terminal() {
+        print_str(b"[user-callback] global abort refused: execution or terminal owner retained\n");
+        return;
+    }
     restore_all_client_callback_windows();
     *core::ptr::addr_of_mut!(USER_CALLBACK_CONTINUATIONS) =
         nt_user_callback::ContinuationStack::new();
@@ -2805,6 +2812,132 @@ pub(crate) unsafe fn validate_active_callback_syscall_resume(
         return false;
     };
     validate_callback_resume_ip(client, &saved.registers, b"nested-syscall").is_some()
+}
+
+/// Immutable identity copied while the provider still owns the execution token. This describes
+/// one retained transfer; the terminal coordinator, not this copy, owns permission to enter it.
+#[derive(Clone, Copy)]
+pub(crate) struct CallbackTransferBinding {
+    request: nt_user_callback::CallbackHeader,
+    client: Win32kClientContext,
+    lane: nt_component_suspension::LaneHandle,
+    dispatcher: u64,
+}
+
+impl CallbackTransferBinding {
+    pub(crate) const fn request(self) -> nt_user_callback::CallbackHeader {
+        self.request
+    }
+
+    pub(crate) const fn client(self) -> Win32kClientContext {
+        self.client
+    }
+}
+
+pub(crate) unsafe fn validate_callback_transfer_binding(
+    binding: CallbackTransferBinding,
+) -> Result<(), u32> {
+    const INVALID: u32 = 0xC000_000D;
+    let client = binding.client;
+    if !win32k_client_context_is_admitted(client) || client.tcb <= 1 {
+        return Err(INVALID);
+    }
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let correlation = nt_user_callback::CallbackCorrelation::from_request(&binding.request);
+    let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+    let frame = active.top_for(&identity).ok_or(INVALID)?;
+    if frame.is_redirected()
+        || *frame.request() != binding.request
+        || frame.dispatch_context().lane != binding.lane
+        || frame.dispatch_context().dispatch_id != binding.request.dispatch_id
+        || frame.client_tcb() != client.tcb
+        || frame.client_pid() != client.pid
+        || frame.client_teb() != client.teb
+        || frame.client_eprocess() != client.eprocess
+        || frame.client_ethread() != client.ethread
+        || frame.client_scratch_base() != client.scratch_base
+        || active.is_lane_top(correlation) != Ok(true)
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+/// Capture the pending callback by exact client and physical lane before shared request memory can
+/// be reused. The caller reserved `input` before resuming the provider; this operation allocates
+/// nothing and performs no IPC.
+pub(crate) unsafe fn capture_callback_transfer(
+    client: Win32kClientContext,
+    lane: nt_component_suspension::LaneHandle,
+    dispatch_id: u64,
+    input: &mut [u8],
+) -> Result<CallbackTransferBinding, u32> {
+    const INVALID: u32 = 0xC000_000D;
+    if !lane.is_valid() || dispatch_id == 0 {
+        return Err(INVALID);
+    }
+    let identity = nt_user_callback::ClientThreadIdentity::new(client.pi, client.tid, client.badge);
+    let request = {
+        let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
+        *active.top_for(&identity).ok_or(INVALID)?.request()
+    };
+    nt_user_callback::validate_request(&request).map_err(|_| INVALID)?;
+    if request.dispatch_id != dispatch_id || request.callback_id == 0 {
+        return Err(INVALID);
+    }
+    let dispatcher = USER_CALLBACK_DISPATCHER.load(Ordering::Relaxed);
+    if dispatcher == 0 {
+        return Err(INVALID);
+    }
+    let binding = CallbackTransferBinding { request, client, lane, dispatcher };
+    validate_callback_transfer_binding(binding)?;
+    let shared = (win32k_subsystem::WIN32K_SHARED_VADDR + win32k_subsystem::SH_USER_CALLBACK)
+        as *const nt_user_callback::CallbackFrame;
+    if core::ptr::read_volatile(core::ptr::addr_of!((*shared).header)) != request {
+        return Err(INVALID);
+    }
+    let length = request.input_length as usize;
+    if length > input.len() || length > nt_user_callback::CALLBACK_PAYLOAD_MAX {
+        return Err(INVALID);
+    }
+    for (index, byte) in input[..length].iter_mut().enumerate() {
+        *byte = core::ptr::read_volatile(core::ptr::addr_of!((*shared).payload[index]));
+    }
+    Ok(binding)
+}
+
+pub(crate) unsafe fn validate_callback_transfer_parent(
+    binding: CallbackTransferBinding,
+    parent: &[u64; 20],
+) -> Result<u64, u32> {
+    const INVALID: u32 = 0xC000_000D;
+    validate_callback_transfer_binding(binding)?;
+    validate_callback_resume_ip(binding.client, parent, b"retained-transfer").ok_or(INVALID)?;
+    let dispatcher = binding.dispatcher;
+    if dispatcher == 0 || !callback_resume_ip_executable(binding.client, dispatcher) {
+        return Err(INVALID);
+    }
+    Ok(dispatcher)
+}
+
+/// Publish only after the separate private context installation has acknowledged success. No
+/// active-stack borrow is retained across installation, and a rejection never cancels the frame.
+pub(crate) unsafe fn publish_callback_transfer(
+    binding: CallbackTransferBinding,
+    parent: [u64; 20],
+) -> Result<(), u32> {
+    validate_callback_transfer_binding(binding)?;
+    let correlation = nt_user_callback::CallbackCorrelation::from_request(&binding.request);
+    (&mut *core::ptr::addr_of_mut!(USER_CALLBACK_ACTIVE))
+        .record_redirect(correlation, parent)
+        .map_err(|_| 0xC000_000Du32)?;
+    USER_CALLBACK_REAL_REDIRECTS.fetch_add(1, Ordering::Relaxed);
+    print_str(b"[user-callback] retained client redirect published api=");
+    print_u64(binding.request.api_index as u64);
+    print_str(b" callback=");
+    print_u64(binding.request.callback_id as u64);
+    print_str(b"\n");
+    Ok(())
 }
 
 pub(crate) unsafe fn begin_controlled_user_callback_redirect(
@@ -3618,9 +3751,9 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     LpcWaitPumpCompletion::Completed(completed)
 }
 
-/// Cancel the callback that is PENDING (parked, not yet redirected into its client). A pending frame
-/// is necessarily the array's top whichever threads have chains open: it was pushed by the callback
-/// request the executive is still servicing, so no other client event has been able to run since.
+/// Cancel an immediately parked callback only after its lane publishes external resume ownership.
+/// Retained terminal handoffs require their own acknowledged cancellation path, not this legacy
+/// global-top adapter.
 pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
     const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
     let mut cancelled_count = 0u64;
@@ -3637,6 +3770,9 @@ pub(crate) unsafe fn cancel_suspended_user_callback() -> (i32, bool) {
                 }
                 return (last_status, false);
             };
+            if !callback_frame_can_resume(&active_frame) {
+                return (STATUS_UNSUCCESSFUL, false);
+            }
             if active_frame.is_redirected() {
                 if cancelled_count != 0 {
                     abort_controlled_user_callbacks();
@@ -3848,8 +3984,8 @@ pub(crate) unsafe fn dump_client_callback_crash_state(client_pi: usize, tcb: u64
 ///
 /// General (any client pi, any depth, nested frames unwound in order), bounded (each iteration pops
 /// exactly one of at most `MAX_ACTIVE_CALLBACK_DEPTH` frames), allocation-free, and reset-safe: any
-/// correlation failure falls back to [`abort_controlled_user_callbacks`], which resets the
-/// continuation stack to its initial state so the executive stays consistent either way.
+/// correlation failure requests legacy cleanup. Retained terminal ownership or executing lanes
+/// exclude that global cleanup; they require acknowledged, exact-owner recovery instead.
 ///
 /// Returns the number of callback frames unwound (0 when the client held none — the common case, so
 /// this is a cheap no-op at every crash-park site).
@@ -3872,6 +4008,10 @@ pub(crate) unsafe fn unwind_dead_client_user_callbacks(client_pi: u32) -> u64 {
         let Some(frame) = frame else {
             break;
         };
+        if !callback_frame_can_resume(&frame) {
+            print_str(b"[user-callback] dead-client unwind deferred: callback lane still owned\n");
+            break;
+        }
         let request = *frame.request();
         let Some(client) = callback_client_from_frame(request, frame) else {
             print_str(b"[user-callback] dead-client retained caller unavailable; frame retained\n");
@@ -4035,7 +4175,10 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
         let active_frame = active.top_for(&identity).copied()?;
         let correlation = nt_user_callback::CallbackCorrelation::from_request(active_frame.request());
-        if !active_frame.is_redirected() || active.is_lane_top(correlation) != Ok(true) {
+        if !active_frame.is_redirected()
+            || active.is_lane_top(correlation) != Ok(true)
+            || !callback_frame_can_resume(&active_frame)
+        {
             return None;
         }
         (active_frame, correlation)
@@ -4210,6 +4353,7 @@ pub(crate) unsafe fn complete_controlled_user_callback(
         let active = &*core::ptr::addr_of!(USER_CALLBACK_ACTIVE);
         active.top_for(&identity).copied() == Some(active_frame)
             && active.is_lane_top(correlation) == Ok(true)
+            && callback_frame_can_resume(&active_frame)
     };
     if !frame_still_current {
         return None;
@@ -5950,7 +6094,11 @@ unsafe fn win32k_dispatch_wide_observed(
     attach_client: bool,
     entered: Option<&mut bool>,
 ) -> (u64, bool) {
-    if !win32k_client_context_is_admitted(client) {
+    // Reject before attachment or shared request writes, not only at later lane acquisition.
+    if crate::component_execution_is_busy()
+        || !win32k_client_context_is_admitted(client)
+        || !callback_client_can_enter_nested(client)
+    {
         return (0xC000_000Du64, false);
     }
     let debug_flags = WIN32K_NEXT_DISPATCH_DEBUG_FLAGS.swap(0, Ordering::Relaxed);

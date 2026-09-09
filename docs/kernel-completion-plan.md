@@ -310,6 +310,10 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   (tranche 151). The host wire-record codec is tested. Native producer/consumer migration, exact
   nested callback and suspended-wait ownership, and removal of unsupported GPR SET boundaries
   remain open; ordinary status-only parked completion no longer replays saved registers.
+- [x] Retain provider/LPC-to-callback handoff input and original suspension through separate
+  preparation, context-install, publication and Reply ACKs, then exact local retirement (tranche
+  151, host/native build checkpoint). Failed handoffs retain indeterminate ownership; acknowledged
+  cancellation/quiescence recovery and desktop runtime acceptance remain open.
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30787,6 +30791,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     verifies floating slots remain untouched rather than claiming an emitted XMM-save fixture.
     No microkernel mechanisms, NT boot staging or desktop acceptance changed. The callback transfer,
     native application-record cutover, foreign-ABI SEH and strict 27-import frontier remain open.
+
+    Tranche 151 retained callback handoff (2026-09-09): provider/LPC resumption now reserves durable
+    callback input storage and external-token capacity before entering the provider. A real callback
+    captures its immutable input and exact client/lane/dispatch binding before yielding shared-bank
+    ownership. The original source suspension, native reply, callback bytes and canonical parent
+    remain owned through four distinct acknowledgements: preparation/copyout, private context
+    installation, active-frame publication and client Reply. Local reply-cap retirement publishes
+    the pre-reserved external token without allocation; callback return remains deferred until then.
+    This supersedes the immediate provider-to-callback transfer branch described in the earlier
+    audit. The old complete-and-suspend API, global-top token lookup, stack-owned terminal reply
+    helper and ignored cancellation-completion branch are removed.
+
+    Terminal mechanisms now hold the shared execution exclusion for their entire Invoking phase,
+    including IPC, while exact ACK recording remains legal. Native provider admission checks that
+    exclusion before changing attachment or shared state. Callback return and nested entry check
+    exact external ownership before mutating shared callback state. Legacy cancellation/dead-client
+    unwind cannot pop a callback still owned by a terminal; global callback reset refuses retained
+    terminal or active execution ownership. These are ownership exclusions, not cancellation
+    recovery. The focused native adapter is component_callback_transfer.rs; no synthetic result
+    or executable-specific policy is added. Provider-wait census now includes retained callback
+    transfers and successfully acknowledged handoffs.
+
+    Failure boundary remains explicit: partial copyout, context-write/publication failure, failed
+    Reply or abandoned native reply retains an Indeterminate terminal and its original owners.
+    There is no replay, fabricated completion or capability reuse. The legacy immediate/chained
+    callback cancellation paths still need an exact-owner physical completion/quiescence adapter;
+    they are not made safe merely by returning an error. Full native application-record ingress,
+    context editing, terminal/callback cutover and the strict 27-import desktop frontier remain open.
+
+    Serialized host validation passes 714 unit tests, 49 integration tests and 12 compile-fail
+    checks across component suspension, callback, user-host, thread-start and syscall ABI
+    (`.tmp/test-retained-callback-transfer-final-20260909.log`). Nine new coordinator cases cover
+    pre-entry refusal, all four ACK boundaries, failed local retirement, exact identity and ticket
+    checks, non-copy payload ownership across mechanism entry, interleaved immutable payloads,
+    ambiguous stages and execution exclusion. The executive release build passes with the existing
+    292 warnings (`.tmp/build-retained-callback-transfer-final-executive-20260909.log`). The full DLL
+    build/import/template/unwind gate also passes (`.tmp/build-retained-callback-transfer-ntdll-20260909.log`).
+    Actual-PE regression passes 32 producer cases and both old-producer negative controls,
+    1,764 RtlVirtualUnwind calls and both metadata/pointer negative controls, and the executable
+    RtlCaptureContext probe (`.tmp/test-retained-callback-transfer-producer-20260909.log`,
+    `.tmp/test-retained-callback-transfer-unwind-20260909.log`,
+    `.tmp/test-retained-callback-transfer-capture-20260909.log`). Final independent native review
+    confirms the pre-mutation cancellation guards preserve valid initial/chained legacy paths.
+    No new NT boot image or desktop runtime proof is claimed.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

@@ -5975,6 +5975,10 @@ fn provider_wait_transport_spec(passed: &mut u64) {
     print_u64(stats.terminal.retired);
     print_str(b" rejected-reparks=");
     print_u64(stats.terminal.rejected_reparks);
+    print_str(b" callback-transfers/handoffs=");
+    print_u64(stats.terminal.callback_transfers);
+    print_str(b"/");
+    print_u64(stats.terminal.callback_handoffs);
     print_str(b"\n");
     check(
         b"exec_provider_wait_transport_owned",

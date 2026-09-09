@@ -119,9 +119,14 @@ fn transfers_between_external_and_typed_waits_preserve_job() {
     assert_eq!(identity(&lanes, lane), job);
     lanes.select(key, 0).unwrap();
     lanes.begin_resume(lane, reply, key).unwrap();
-    lanes
-        .complete_running_and_suspend_external(lane, reply, key, owner(1), 2)
-        .unwrap();
+    let terminal = lanes.retain_external_terminal_running(lane, reply, key, owner(1), 2, ()).unwrap();
+    assert_eq!(identity(&lanes, lane), job);
+    for stage in [TerminalStage::Output, TerminalStage::Context,
+        TerminalStage::Publication, TerminalStage::Reply] {
+        let mut attempt = lanes.begin_terminal_stage(terminal, reply, stage).unwrap();
+        lanes.record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged).unwrap();
+    }
+    lanes.finish_terminal(terminal, reply, Ok(())).unwrap().unwrap();
     assert_eq!(identity(&lanes, lane), job);
     lanes.resume_external(lane, reply, 2).unwrap();
     lanes.complete_external(lane, reply, 2).unwrap();

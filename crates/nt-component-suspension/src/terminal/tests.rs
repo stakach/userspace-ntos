@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "handoff_tests.rs"]
+mod handoff_tests;
+
 type Lanes = ComponentSuspensionLanes<u64, u32, u64>;
 
 fn owner(id: u64) -> SuspensionOwner {
@@ -65,6 +68,7 @@ fn ack_all(lanes: &mut Lanes, identity: TerminalIdentity) {
     for stage in [
         TerminalStage::Output,
         TerminalStage::Context,
+        TerminalStage::Publication,
         TerminalStage::Reply,
     ] {
         ack(lanes, identity, stage);
@@ -72,7 +76,7 @@ fn ack_all(lanes: &mut Lanes, identity: TerminalIdentity) {
 }
 
 #[test]
-fn running_provider_excludes_terminal_entry_but_not_an_entered_stage_ack() {
+fn provider_and_terminal_entry_share_the_execution_fence() {
     let mut lanes = Lanes::new(2, 4);
     let identity = retained(&mut lanes, 1);
     let reply = binding(1).reply_object;
@@ -93,12 +97,10 @@ fn running_provider_excludes_terminal_entry_but_not_an_entered_stage_ack() {
     let mut attempt = lanes
         .begin_terminal_stage(identity, reply, TerminalStage::Output)
         .unwrap();
-    lanes.begin_dispatch(peer, peer_reply).unwrap();
+    assert_eq!(lanes.begin_dispatch(peer, peer_reply), Err(LaneError::Busy));
     lanes
         .record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged)
         .unwrap();
-    assert_eq!(lanes.next_terminal(), None);
-    lanes.finish_dispatch(peer, peer_reply).unwrap();
     assert_eq!(lanes.next_terminal(), Some(identity));
     ack(&mut lanes, identity, TerminalStage::Context);
 }
@@ -140,6 +142,7 @@ fn output_context_reply_and_local_retirement_retain_exact_original_frame() {
         .record_terminal_stage(&mut output, reply, TerminalStageOutcome::Acknowledged)
         .is_err());
     ack(&mut lanes, identity, TerminalStage::Context);
+    ack(&mut lanes, identity, TerminalStage::Publication);
     ack(&mut lanes, identity, TerminalStage::Reply);
     assert!(lanes.is_dispatch_identity_active(dispatch));
     assert_eq!(lanes.next_terminal(), Some(identity));
@@ -157,6 +160,7 @@ fn output_context_reply_and_local_retirement_retain_exact_original_frame() {
     for stage in [
         TerminalStage::Output,
         TerminalStage::Context,
+        TerminalStage::Publication,
         TerminalStage::Reply,
     ] {
         assert!(lanes.begin_terminal_stage(identity, reply, stage).is_err());
@@ -246,6 +250,7 @@ fn no_effects_retries_only_current_stage_with_new_ticket() {
     for stage in [
         TerminalStage::Output,
         TerminalStage::Context,
+        TerminalStage::Publication,
         TerminalStage::Reply,
     ] {
         let mut rejected = lanes.begin_terminal_stage(identity, reply, stage).unwrap();
@@ -281,6 +286,7 @@ fn indeterminate_stage_retains_authority_and_never_replays() {
     for uncertain_stage in [
         TerminalStage::Output,
         TerminalStage::Context,
+        TerminalStage::Publication,
         TerminalStage::Reply,
     ] {
         let mut lanes = Lanes::new(1, 2);
@@ -289,6 +295,7 @@ fn indeterminate_stage_retains_authority_and_never_replays() {
         for stage in [
             TerminalStage::Output,
             TerminalStage::Context,
+            TerminalStage::Publication,
             TerminalStage::Reply,
         ] {
             if stage == uncertain_stage {
@@ -388,9 +395,11 @@ fn terminal_lane_blocks_mutation_but_other_lanes_can_run_and_retire() {
 
     let other_identity = retained(&mut lanes, 2);
     assert_eq!(lanes.next_terminal(), Some(identity));
-    let _held = lanes
+    let mut held = lanes
         .begin_terminal_stage(identity, reply, TerminalStage::Output)
         .unwrap();
+    assert_eq!(lanes.next_terminal(), None);
+    lanes.record_terminal_stage(&mut held, reply, TerminalStageOutcome::Indeterminate(1)).unwrap();
     assert_eq!(lanes.next_terminal(), Some(other_identity));
     ack_all(&mut lanes, other_identity);
     lanes

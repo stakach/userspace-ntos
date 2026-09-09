@@ -1,13 +1,13 @@
-//! Retained provider results through client delivery and reply-cap retirement.
+//! Retained provider results and callback handoffs through client delivery and reply retirement.
 
 use super::*;
 use nt_component_suspension::{TerminalPhase, TerminalStage, TerminalStageOutcome};
 
-#[derive(Clone, Copy)]
 pub(super) struct NativeTerminal {
     dispatch: Option<win32k_glue::CompletedWin32kDispatch>,
     status: u64,
     rejected_repark: Option<PendingComponentDispatch>,
+    callback: Option<component_callback_transfer::CallbackTransfer>,
 }
 
 impl NativeTerminal {
@@ -16,6 +16,7 @@ impl NativeTerminal {
             dispatch: Some(dispatch),
             status: dispatch.status,
             rejected_repark: None,
+            callback: None,
         }
     }
 
@@ -24,7 +25,54 @@ impl NativeTerminal {
             dispatch: None,
             status: status as u64,
             rejected_repark: None,
+            callback: None,
         }
+    }
+
+    fn metadata(&self) -> Self {
+        Self {
+            dispatch: self.dispatch,
+            status: self.status,
+            rejected_repark: self.rejected_repark,
+            callback: None,
+        }
+    }
+}
+
+pub(super) unsafe fn retain_callback_transfer(
+    lane: nt_component_suspension::LaneHandle,
+    reply_object: u64,
+    key: nt_component_suspension::SuspensionKey,
+    owner: nt_component_suspension::SuspensionOwner,
+    callback: component_callback_transfer::CallbackTransfer,
+    captured: Result<u64, u32>,
+) {
+    let mut payload = NativeTerminal::blocked(0);
+    payload.callback = Some(callback);
+    let lanes = &mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS);
+    let (identity, failure) = match captured {
+        Ok(token) => match lanes.retain_external_terminal_running(
+            lane, reply_object, key, owner, token, payload,
+        ) {
+            Ok(identity) => (identity, None),
+            Err((_error, payload)) => (
+                lanes.retain_terminal_running(lane, reply_object, key, owner, payload)
+                    .expect("callback handoff rejection lost its source owner"),
+                Some(0xC000_000D),
+            ),
+        },
+        Err(status) => (
+            lanes.retain_terminal_running(lane, reply_object, key, owner, payload)
+                .expect("callback capture failure lost its source owner"),
+            Some(status),
+        ),
+    };
+    if let Some(status) = failure {
+        let mut attempt = lanes.begin_terminal_stage(identity, reply_object, TerminalStage::Output)
+            .expect("callback failure lost its delivery stage");
+        lanes.record_terminal_stage(&mut attempt, reply_object, TerminalStageOutcome::Indeterminate(status))
+            .expect("callback failure lost its retained payload");
+        report_retained_failure(lane);
     }
 }
 
@@ -59,6 +107,7 @@ pub(super) unsafe fn retain_incomplete_provider(
 
 static DELIVERY_FAILURES: AtomicU64 = AtomicU64::new(0);
 static RETIRED: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_HANDOFFS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Stats {
@@ -68,12 +117,15 @@ pub(crate) struct Stats {
     pub acknowledged: u64,
     pub retired: u64,
     pub rejected_reparks: u64,
+    pub callback_transfers: u64,
+    pub callback_handoffs: u64,
 }
 
 pub(super) unsafe fn stats() -> Stats {
     let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
     let mut stats = Stats {
         retired: RETIRED.load(Ordering::Relaxed),
+        callback_handoffs: CALLBACK_HANDOFFS.load(Ordering::Relaxed),
         ..Stats::default()
     };
     for identity in lanes.terminal_identities() {
@@ -83,6 +135,8 @@ pub(super) unsafe fn stats() -> Stats {
             .reply_object;
         let terminal = lanes.terminal(identity, reply).expect("terminal inventory");
         stats.rejected_reparks += terminal.payload.rejected_repark.is_some() as u64;
+        stats.callback_transfers += (identity.external_token().is_some()
+            || terminal.payload.callback.is_some()) as u64;
         match terminal.phase {
             TerminalPhase::Ready { .. } => stats.ready += 1,
             TerminalPhase::Invoking { .. } => stats.invoking += 1,
@@ -180,7 +234,7 @@ pub(super) unsafe fn drain(
                 .expect("selected terminal owner disappeared");
             (
                 terminal.frame.continuation,
-                *terminal.payload,
+                terminal.payload.metadata(),
                 terminal.phase,
                 (terminal.frame.admission_sequence, identity.lane().index),
             )
@@ -190,6 +244,53 @@ pub(super) unsafe fn drain(
                 let mut attempt = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
                     .begin_terminal_stage(identity, reply_object, stage)
                     .expect("terminal stage changed before entry");
+                if identity.external_token().is_some() {
+                    let mut callback = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                        .with_terminal_payload(&attempt, reply_object, |payload| payload.callback.take())
+                        .expect("callback stage lost its owner")
+                        .expect("callback stage lost its owned payload");
+                    // Only local payload ownership crosses IPC; the coordinator's Invoking
+                    // phase fences new execution and teardown without retaining a global borrow.
+                    let result = if continuation.abandon_native_reply {
+                        assert_eq!(continuation.reply_cap, 0);
+                        // Logical cancellation is not proof that the parked callback completed.
+                        // Retain it for acknowledged cancellation/quiescence, never fake a Reply.
+                        Err(0xC000_0120)
+                    } else {
+                        match stage {
+                            TerminalStage::Output => callback.prepare(),
+                            TerminalStage::Context => callback.install(),
+                            TerminalStage::Publication => callback.publish(),
+                            TerminalStage::Reply => {
+                                if callback.phase() != component_callback_transfer::TransferPhase::Published {
+                                    Err(0xC000_000D)
+                                } else if client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0) {
+                                    Ok(())
+                                } else {
+                                    Err(0xC000_0001)
+                                }
+                            }
+                        }
+                    };
+                    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                        .with_terminal_payload(&attempt, reply_object, |payload| {
+                            assert!(payload.callback.is_none());
+                            payload.callback = Some(callback);
+                        })
+                        .expect("callback stage could not retain its entered outcome");
+                    let outcome = match result {
+                        Ok(()) => TerminalStageOutcome::Acknowledged,
+                        Err(status) => TerminalStageOutcome::Indeterminate(status),
+                    };
+                    (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                        .record_terminal_stage(&mut attempt, reply_object, outcome)
+                        .expect("callback stage ACK lost its original suspension");
+                    if result.is_err() {
+                        report_retained_failure(identity.lane());
+                        cursor = Some(order);
+                    }
+                    continue;
+                }
                 if stage == TerminalStage::Output {
                     process_output(nt_handler, continuation, &mut payload, procs, pfilled);
                     (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
@@ -217,6 +318,7 @@ pub(super) unsafe fn drain(
                                 reply_parked_syscall(continuation.reply_cap, payload.status)
                             }
                         }
+                        TerminalStage::Publication => true,
                         TerminalStage::Output => unreachable!(),
                     }
                 };
@@ -250,6 +352,9 @@ pub(super) unsafe fn drain(
                     PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
                 }
                 COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
+                if identity.external_token().is_some() {
+                    CALLBACK_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+                }
                 RETIRED.fetch_add(1, Ordering::Relaxed);
                 retired += 1;
                 cursor = Some(order);

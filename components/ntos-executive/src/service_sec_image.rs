@@ -6,6 +6,8 @@ use crate::*;
 
 #[path = "component_terminal.rs"]
 mod component_terminal;
+#[path = "component_callback_transfer.rs"]
+mod component_callback_transfer;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -275,6 +277,17 @@ pub(crate) unsafe fn component_execution_lane_needs_capacity() -> bool {
     (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).needs_idle_lane()
 }
 
+pub(crate) unsafe fn component_execution_is_busy() -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).execution_busy()
+}
+
+pub(crate) unsafe fn component_has_retained_terminal() -> bool {
+    (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
+        .terminal_identities()
+        .next()
+        .is_some()
+}
+
 pub(crate) unsafe fn resume_external_component_execution_lane(
     lane: nt_component_suspension::LaneHandle,
     token: u64,
@@ -284,6 +297,17 @@ pub(crate) unsafe fn resume_external_component_execution_lane(
         return false;
     };
     lanes.resume_external(lane, reply_object, token).is_ok()
+}
+
+pub(crate) unsafe fn component_external_resume_ready(
+    lane: nt_component_suspension::LaneHandle,
+    token: u64,
+) -> bool {
+    let lanes = &*core::ptr::addr_of!(COMPONENT_SUSPENSIONS);
+    let Some(reply_object) = component_execution_lane_reply(lanes, lane) else {
+        return false;
+    };
+    lanes.can_resume_external(lane, reply_object, token) == Ok(true)
 }
 
 pub(crate) unsafe fn finish_component_execution_lane(
@@ -1653,7 +1677,6 @@ enum ComponentPumpCompletion {
 enum ComponentSuspensionRuntimeOutcome {
     Parked,
     Terminal,
-    UserCallbackSuspended(ComponentNativeContinuation),
 }
 
 unsafe fn component_suspension_resume_top(
@@ -1671,9 +1694,19 @@ unsafe fn component_suspension_resume_top(
             .frame(lane, resume.key)
             .ok()??
             .clone();
-        (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-            .begin_resume(lane, reply_object, resume.key)
-            .expect("provider wait top changed during synchronous resume");
+        // Reserve all handoff storage before entering a provider that may yield a callback.
+        // Refusal leaves the selected source wait and its reply authority unchanged.
+        let Ok(mut callback_transfer) = component_callback_transfer::CallbackTransfer::reserve() else {
+            return None;
+        };
+        let admitted = {
+            let _durable = allocator::enter_durable();
+            (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                .begin_resume(lane, reply_object, resume.key)
+        };
+        if admitted.is_err() {
+            return None;
+        }
         let provider_resume = matches!(
             frame.continuation.pending,
             PendingComponentDispatch::Provider(_)
@@ -1751,24 +1784,13 @@ unsafe fn component_suspension_resume_top(
                 return Some(ComponentSuspensionRuntimeOutcome::Terminal);
             }
             ComponentPumpCompletion::UserCallbackSuspended => {
-                let token =
-                    win32k_glue::pending_user_callback_token(lane, frame.owner.dispatch_id)?;
-                let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .complete_running_and_suspend_external(
-                        lane,
-                        reply_object,
-                        resume.key,
-                        frame.owner,
-                        token,
-                    )
-                    .ok()?;
-                if provider_resume {
-                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                }
-                COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Some(ComponentSuspensionRuntimeOutcome::UserCallbackSuspended(
-                    completed.continuation,
-                ));
+                let captured = callback_transfer.capture(
+                    frame.continuation.pending.client(), lane, frame.owner.dispatch_id,
+                );
+                component_terminal::retain_callback_transfer(
+                    lane, reply_object, resume.key, frame.owner, callback_transfer, captured,
+                );
+                return Some(ComponentSuspensionRuntimeOutcome::Terminal);
             }
             ComponentPumpCompletion::Failed(status) => {
                 // Failed includes pre-entry rejection, a still-parked provider, and uncertain
@@ -2215,22 +2237,6 @@ unsafe fn lpc_wait_admit_current(
     true
 }
 
-unsafe fn reply_component_native_continuation(
-    continuation: ComponentNativeContinuation,
-    status: u64,
-) -> bool {
-    // The coordinator has completed its provider phase. Callers must fail-stop on rejection
-    // before releasing reply authority; this stack-held terminal outcome is not retryable yet.
-    if let Some(context) = continuation.callback_context {
-        if !win32k_glue::complete_staged_user_callback_context(context, status) {
-            return false;
-        }
-        client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0)
-    } else {
-        reply_parked_syscall(continuation.reply_cap, status)
-    }
-}
-
 unsafe fn component_suspension_drain_ready(
     nt_handler: &mut ExecNtHandler,
     procs: &mut [ProcExec],
@@ -2248,30 +2254,6 @@ unsafe fn component_suspension_drain_ready(
             // coordinator reports that no resumable lane remains.
             ComponentSuspensionRuntimeOutcome::Parked
             | ComponentSuspensionRuntimeOutcome::Terminal => continue,
-            ComponentSuspensionRuntimeOutcome::UserCallbackSuspended(continuation) => {
-                if continuation.abandon_native_reply {
-                    assert_eq!(continuation.reply_cap, 0);
-                    let _ = win32k_glue::cancel_suspended_user_callback();
-                } else {
-                    let client = continuation.pending.client();
-                    if win32k_glue::begin_controlled_user_callback_redirect(
-                        client,
-                    ) {
-                        assert!(
-                            client_reply_on(continuation.reply_cap, 0, 0, 0, 0, 0),
-                            "callback redirect reply failed before reply authority release"
-                        );
-                    } else {
-                        let cancelled = win32k_glue::cancel_suspended_user_callback();
-                        assert!(reply_component_native_continuation(
-                            continuation,
-                            cancelled.0 as u32 as u64,
-                        ));
-                    }
-                    release_reply_pool_cap(continuation.reply_cap);
-                }
-                drained += 1;
-            }
         }
     }
     if nt_handler.lpc_endpoint_progress {
