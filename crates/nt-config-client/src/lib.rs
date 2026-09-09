@@ -39,6 +39,7 @@ mod mutation_commit;
 pub use mutation_commit::{
     SystemHiveMutationCommitReceipt, SystemHiveMutationAcknowledgement,
     SystemHiveMutationAcknowledgementDisposition,
+    SystemHiveMutationAbortReceipt, SystemHiveMutationAbortAcknowledgement,
 };
 
 mod snapshot_publication;

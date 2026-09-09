@@ -3,12 +3,14 @@
 //! separate admission responsibilities; this coordinator does not activate executive publication.
 
 use crate::{
-    Backend, ConfigClient, PreparedSystemHiveMutation, SystemHiveMutationCommitReceipt,
-    SystemHivePublishOutcome,
+    Backend, ConfigClient, PreparedSystemHiveMutation, SystemHiveMutationAbortReceipt,
+    SystemHiveMutationCommitReceipt, SystemHivePublishOutcome,
 };
 use nt_fs::{
     FileSystem, SnapshotBlockDevice, SnapshotBlockStore, SnapshotJournal, SnapshotJournalError,
 };
+
+mod cancellation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotSystemHivePublicationPhase {
@@ -22,6 +24,15 @@ pub enum SnapshotSystemHivePublicationPhase {
     AcknowledgeReady,
     AcknowledgeInFlight,
     AcknowledgeRetry,
+    RollbackInFlight,
+    RollbackRetry,
+    AbortReady,
+    AbortInFlight,
+    AbortRetry,
+    AbortAcknowledgeReady,
+    AbortAcknowledgeInFlight,
+    AbortAcknowledgeRetry,
+    Cancelled,
     Complete,
     Taken,
 }
@@ -67,6 +78,7 @@ pub struct SnapshotSystemHivePublication<'a, B: Backend, D: SnapshotBlockDevice,
     continuation: Option<C>,
     publication: Option<R>,
     receipt: Option<SystemHiveMutationCommitReceipt>,
+    abort_receipt: Option<SystemHiveMutationAbortReceipt>,
     phase: SnapshotSystemHivePublicationPhase,
 }
 
@@ -103,6 +115,7 @@ impl<'a, B: Backend, D: SnapshotBlockDevice, C, R> SnapshotSystemHivePublication
             continuation: Some(continuation),
             publication: None,
             receipt: None,
+            abort_receipt: None,
             phase: SnapshotSystemHivePublicationPhase::StoragePending,
         })
     }
@@ -204,9 +217,8 @@ impl<'a, B: Backend, D: SnapshotBlockDevice, C, R> SnapshotSystemHivePublication
         }
     }
 
-    /// Take completion once, after exact ACK. Drop the completed owner to release storage/client
-    /// borrows. No rollback-and-complete API exists: durable truncation would not acknowledge CM
-    /// preparation cleanup, whose current ABORT endpoint is best-effort.
+    /// Take published completion once, after exact ACK. Cancellation has a separate take_cancelled
+    /// result and cannot be mistaken for publication. Drop the owner to release storage/client borrows.
     pub fn take_completion(&mut self) -> Option<(C, R)> {
         if self.phase != SnapshotSystemHivePublicationPhase::Complete {
             return None;
@@ -223,3 +235,6 @@ impl<'a, B: Backend, D: SnapshotBlockDevice, C, R> SnapshotSystemHivePublication
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_support;

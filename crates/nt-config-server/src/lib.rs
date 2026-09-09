@@ -1022,7 +1022,7 @@ pub struct CmServer {
     next_hive_import_token: u64,
     system_mutation_leases: MutationLeaseBank,
     prepared_system_mutation: Option<PreparedSystemHiveMutation>,
-    system_mutation_commits: mutation_commit::CommitJournal,
+    system_mutation_outcomes: mutation_commit::MutationOutcomeJournal,
     prepared_system_checkpoint: Option<PreparedSystemHiveCheckpoint>,
     next_system_checkpoint_token: u64,
     system_key_leases: SystemKeyLeaseBank,
@@ -1080,7 +1080,7 @@ impl CmServer {
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(identities.clone()),
             prepared_system_mutation: None,
-            system_mutation_commits: mutation_commit::CommitJournal::default(),
+            system_mutation_outcomes: mutation_commit::MutationOutcomeJournal::default(),
             prepared_system_checkpoint: None,
             next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(identities.clone()),
@@ -1815,7 +1815,7 @@ impl CmServer {
                 }
                 if self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
-                    || self.system_mutation_commits.is_pending()
+                    || self.system_mutation_outcomes.is_pending()
                 {
                     return reply(STATUS_DEVICE_BUSY, 0);
                 }
@@ -1886,7 +1886,7 @@ impl CmServer {
                 }
                 if self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
-                    || self.system_mutation_commits.is_pending()
+                    || self.system_mutation_outcomes.is_pending()
                 {
                     return reply(STATUS_DEVICE_BUSY, 0);
                 }
@@ -2173,7 +2173,7 @@ impl CmServer {
                 }
                 if self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
-                    || self.system_mutation_commits.is_pending()
+                    || self.system_mutation_outcomes.is_pending()
                 {
                     return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
@@ -2326,7 +2326,7 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
-                if self.system_mutation_commits.is_pending() {
+                if self.system_mutation_outcomes.is_pending() {
                     return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
                 let (next_generation, has_pending_device_action) = match self
@@ -2415,7 +2415,7 @@ impl CmServer {
                 }
                 if self.prepared_system_checkpoint.is_some()
                     || self.prepared_system_mutation.is_some()
-                    || self.system_mutation_commits.is_pending()
+                    || self.system_mutation_outcomes.is_pending()
                     || self.system_mutation_leases.is_busy()
                     || !self.hive_imports.is_empty()
                 {

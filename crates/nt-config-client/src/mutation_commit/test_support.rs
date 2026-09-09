@@ -61,6 +61,8 @@ impl Backend for Direct {
                         body.receipt_generation += 1;
                         response.detail1 = body.receipt_generation;
                     }
+                    18 => body.disposition = disposition::RETAINED,
+                    19 => body.disposition = disposition::ABORTED,
                     _ => unreachable!(),
                 }
                 output.copy_from_slice(body.as_bytes());

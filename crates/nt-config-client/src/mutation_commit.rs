@@ -1,4 +1,4 @@
-//! Exact replay of publication and explicit receipt acknowledgement. Neither operation infers
+//! Exact replay of publication/prepared cleanup and explicit receipt acknowledgement. No operation infers
 //! success from a transport failure, a newer mount generation, or a missing server identity.
 
 use crate::{
@@ -49,6 +49,41 @@ pub struct SystemHiveMutationAcknowledgement {
 
 impl SystemHiveMutationAcknowledgement {
     pub const fn receipt(self) -> SystemHiveMutationCommitReceipt {
+        self.receipt
+    }
+    pub const fn disposition(self) -> SystemHiveMutationAcknowledgementDisposition {
+        self.disposition
+    }
+}
+
+/// Evidence of exact prepared cleanup, never a published hive generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "retain the abort receipt until its exact acknowledgement"]
+pub struct SystemHiveMutationAbortReceipt {
+    mutation_token: u64,
+    expected_generation: u64,
+    semantic_journal_len: u32,
+    bank: u64,
+    generation: u64,
+}
+
+/// Typed proof that this abort result was acknowledged; commit receipts cannot substitute for it.
+///
+/// ```compile_fail
+/// use nt_config_client::{Backend, ConfigClient, SystemHiveMutationCommitReceipt};
+/// fn wrong<B: Backend>(client: &mut ConfigClient<B>, receipt: SystemHiveMutationCommitReceipt) {
+///     client.acknowledge_system_hive_mutation_abort(receipt);
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct SystemHiveMutationAbortAcknowledgement {
+    receipt: SystemHiveMutationAbortReceipt,
+    disposition: SystemHiveMutationAcknowledgementDisposition,
+}
+
+impl SystemHiveMutationAbortAcknowledgement {
+    pub const fn receipt(self) -> SystemHiveMutationAbortReceipt {
         self.receipt
     }
     pub const fn disposition(self) -> SystemHiveMutationAcknowledgementDisposition {
@@ -108,14 +143,75 @@ impl<B: Backend> ConfigClient<B> {
         &mut self,
         receipt: SystemHiveMutationCommitReceipt,
     ) -> Result<SystemHiveMutationAcknowledgement, i32> {
+        let disposition = self.acknowledge_mutation_receipt(receipt.bank, receipt.generation)?;
+        Ok(SystemHiveMutationAcknowledgement {
+            receipt,
+            disposition,
+        })
+    }
+
+    /// Call only after durable rollback and before any COMMIT attempt. Every error is uncertain:
+    /// retain the preparation/caller and repeat the exact request, never infer cleanup from absence.
+    pub fn abort_prepared_system_hive_mutation_retained(
+        &mut self,
+        prepared: &PreparedSystemHiveMutation,
+    ) -> Result<SystemHiveMutationAbortReceipt, i32> {
+        if prepared.lease_token == 0
+            || prepared.expected_generation == 0
+            || prepared.semantic_journal_len == 0
+            || prepared.expected_generation.checked_add(1) != Some(prepared.next_generation)
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
         let body = self.exchange_system_hive_mutation_commit(CmHiveMutationCommitRequest {
-            operation: operation::ACKNOWLEDGE,
-            receipt_bank: receipt.bank,
-            receipt_generation: receipt.generation,
+            operation: operation::ABORT,
+            mutation_token: prepared.lease_token,
+            expected_generation: prepared.expected_generation,
+            semantic_journal_len: prepared.semantic_journal_len,
             ..CmHiveMutationCommitRequest::default()
         })?;
-        if body.receipt_bank != receipt.bank
-            || body.receipt_generation != receipt.generation
+        if body.disposition != disposition::ABORTED
+            || body.mutation_token != prepared.lease_token
+            || body.expected_generation != prepared.expected_generation
+            || body.semantic_journal_len != prepared.semantic_journal_len
+            || body.next_generation != 0
+            || body.has_pending_device_action != 0
+        {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        Ok(SystemHiveMutationAbortReceipt {
+            mutation_token: body.mutation_token,
+            expected_generation: body.expected_generation,
+            semantic_journal_len: body.semantic_journal_len,
+            bank: body.receipt_bank,
+            generation: body.receipt_generation,
+        })
+    }
+
+    pub fn acknowledge_system_hive_mutation_abort(
+        &mut self,
+        receipt: SystemHiveMutationAbortReceipt,
+    ) -> Result<SystemHiveMutationAbortAcknowledgement, i32> {
+        let disposition = self.acknowledge_mutation_receipt(receipt.bank, receipt.generation)?;
+        Ok(SystemHiveMutationAbortAcknowledgement {
+            receipt,
+            disposition,
+        })
+    }
+
+    fn acknowledge_mutation_receipt(
+        &mut self,
+        bank: u64,
+        generation: u64,
+    ) -> Result<SystemHiveMutationAcknowledgementDisposition, i32> {
+        let body = self.exchange_system_hive_mutation_commit(CmHiveMutationCommitRequest {
+            operation: operation::ACKNOWLEDGE,
+            receipt_bank: bank,
+            receipt_generation: generation,
+            ..CmHiveMutationCommitRequest::default()
+        })?;
+        if body.receipt_bank != bank
+            || body.receipt_generation != generation
             || body.mutation_token != 0
             || body.expected_generation != 0
             || body.next_generation != 0
@@ -131,10 +227,7 @@ impl<B: Backend> ConfigClient<B> {
             }
             _ => return Err(STATUS_INVALID_PARAMETER),
         };
-        Ok(SystemHiveMutationAcknowledgement {
-            receipt,
-            disposition,
-        })
+        Ok(disposition)
     }
 
     fn exchange_system_hive_mutation_commit(
@@ -174,6 +267,9 @@ impl<B: Backend> ConfigClient<B> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod abort_tests;
 
 #[cfg(test)]
 pub(crate) mod test_support;

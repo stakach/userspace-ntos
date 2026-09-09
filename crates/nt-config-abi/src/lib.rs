@@ -128,7 +128,7 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_KEY_CLOSE: u16 = 0x215d;
     /// Query retained-OPEN authority, acquire/replay one exact open attempt, or acknowledge it.
     pub const CM_OP_SYSTEM_HIVE_KEY_OPEN: u16 = 0x215e;
-    /// Retained mutation publication and explicit acknowledgement.
+    /// Retained mutation publication/prepared cleanup and explicit acknowledgement.
     pub const CM_OP_SYSTEM_HIVE_MUTATION_COMMIT: u16 = 0x215f;
     /// Register a requester bank, capture/replay a retained snapshot, read it, or acknowledge it.
     pub const CM_OP_RETAINED_SNAPSHOT: u16 = 0x2160;
@@ -727,15 +727,17 @@ pub struct CmHiveMutationRequest {
 pub mod hive_mutation_commit_operation {
     pub const COMMIT: u16 = 1;
     pub const ACKNOWLEDGE: u16 = 2;
+    pub const ABORT: u16 = 3;
 }
 
 pub mod hive_mutation_commit_disposition {
     pub const RETAINED: u16 = 1;
     pub const ACKNOWLEDGED: u16 = 2;
     pub const ALREADY_ACKNOWLEDGED: u16 = 3;
+    pub const ABORTED: u16 = 4;
 }
 
-/// COMMIT repeats the exact prepared identity after an uncertain reply. ACK carries only the
+/// COMMIT/ABORT repeat the exact prepared identity after an uncertain reply. ACK carries only the
 /// receipt bank/generation and remains valid independently of the current mount generation.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -753,7 +755,8 @@ pub struct CmHiveMutationCommitRequest {
 }
 
 /// A retained success contains the original outcome, not a projection of later device-action
-/// state. ACK replies zero all mutation/outcome fields and explicitly acknowledge one receipt.
+/// state. ABORTED echoes the prepared identity with zero next-generation and device-action fields.
+/// ACK replies zero all mutation/outcome fields and explicitly acknowledge one receipt.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmHiveMutationCommitReply {
@@ -935,6 +938,44 @@ pub fn read_utf16(buf: &[u8], offset: u32, len_bytes: u32, out: &mut [u16]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_abort_uses_exact_identity_and_no_publication_outcome() {
+        assert_eq!(hive_mutation_commit_operation::ABORT, 3);
+        assert_eq!(hive_mutation_commit_disposition::ABORTED, 4);
+        let request = CmHiveMutationCommitRequest {
+            abi_size: 48,
+            abi_version: CM_ABI_VERSION,
+            operation: hive_mutation_commit_operation::ABORT,
+            mount: hive_mount::SYSTEM,
+            mutation_token: 9,
+            expected_generation: 3,
+            semantic_journal_len: 17,
+            ..CmHiveMutationCommitRequest::default()
+        };
+        assert_eq!(&request.as_bytes()[4..6], &3u16.to_le_bytes());
+        assert_eq!(
+            CmHiveMutationCommitRequest::from_bytes(request.as_bytes()),
+            Some(request)
+        );
+        let reply = CmHiveMutationCommitReply {
+            abi_size: 56,
+            abi_version: CM_ABI_VERSION,
+            disposition: hive_mutation_commit_disposition::ABORTED,
+            mutation_token: 9,
+            expected_generation: 3,
+            semantic_journal_len: 17,
+            receipt_bank: 23,
+            receipt_generation: 7,
+            ..CmHiveMutationCommitReply::default()
+        };
+        assert_eq!(&reply.as_bytes()[24..32], &[0; 8]);
+        assert_eq!(&reply.as_bytes()[36..40], &[0; 4]);
+        assert_eq!(
+            CmHiveMutationCommitReply::from_bytes(reply.as_bytes()),
+            Some(reply)
+        );
+    }
 
     #[test]
     fn mutation_commit_wire_layout_has_no_padding_and_stable_identity_offsets() {

@@ -31616,8 +31616,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     need a retained staged adapter, not an error-valued local result treated as completion. Recovery
     after an InFlight unwind is intentionally not synthesized. Volatile-only mutations remain a
     separate path to implement under the same semantic owner, not an empty fake disk transaction.
-    Durable rollback alone does not acknowledge CM preparation cleanup; add retained, acknowledged
-    ABORT before offering rollback-and-release. Lost BEGIN/PREPARE/upload replies remain open.
+    Durable rollback alone does not acknowledge CM preparation cleanup; the retained ABORT
+    checkpoint below now joins both proofs before rollback-and-release. Lost BEGIN/PREPARE/upload
+    replies remain open.
     The raw one-shot native APIs remain only until their atomic caller cutover; consuming an opaque
     preparation into this coordinator must not follow earlier publication via those legacy APIs.
 
@@ -31637,6 +31638,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     only migrate the opaque preparation accessors. No native durability/COMMIT activation,
     microkernel change or VM run occurred; the 27 strict missing win32k imports and desktop
     acceptance remain open.
+
+    Retained prepared-mutation cancellation checkpoint (2026-09-10): the post-PREPARE owner now
+    retains durable rollback, exact remote cleanup and acknowledgement as one cancellation path.
+    This completes host composition for an admitted existing journal, not native activation.
+    - [x] Extend the existing 0x215f fixed-layout protocol with ABORT and an explicit ABORTED
+      terminal outcome. Validate the exact prepared token/generation/semantic length, reserve the
+      receipt before releasing preparation, and retain cleanup independently of live mount state.
+      Abort does not advance hive generation, modify hive bytes or publish device actions.
+    - [x] Share one terminal-outcome journal and contiguous ACK sequence between COMMIT and ABORT.
+      Exact replay checks terminal kind as well as identity. Crossed outcomes fail; old ACKs cannot
+      discard newer work. Unacknowledged cleanup excludes other writers/remount/checkpoint exactly
+      as unacknowledged publication does. Rename the old commit-only journal rather than adding
+      competing result storage.
+    - [x] Add private, distinct client abort receipt/ACK-proof types. Validate zero publication
+      fields in ABORTED replies and the full exact envelope. Share the existing ACK validator;
+      never infer cleanup from missing preparation, changed generation or transport failure.
+    - [x] Add owned rollback, ABORT and abort-ACK phases in a focused cancellation module.
+      Successful durable rollback must precede ABORT; exact abort ACK must precede caller release.
+      Returned failures retain retry state; unwinds remain InFlight without implicit retries.
+      Every COMMIT attempt permanently forbids cancellation, including a failed/lost response.
+      Cancellation completion returns only the caller, never a fabricated publication result.
+    - [x] Share existing composed storage/caller fixtures between publication and cancellation
+      tests. Preserve the cache-versus-stable disk model and check cancellation by power-cut restore
+      of the original primary with an empty journal, not by inspecting RAM alone.
+
+    Review adjustment: do not redirect historical void/best-effort abort helpers into the retained
+    protocol. Their callers do not own ACK retries and would strand the terminal-result slot.
+    Delete those helpers together with the one-shot COMMIT/native wrapper at atomic caller cutover.
+    The next prerequisites remain complete request ownership across BEGIN/upload/PREPARE uncertainty,
+    exact CM-to-log/mount admission, retained first-journal creation and exclusive actual snapshot
+    reserve authority. Then compose fallible staged native Key/PnP publication while retaining every
+    caller reservation; an error-valued local FnOnce result does not implement that contract.
+    Volatile-only mutation ownership remains separate from real durable journal work. No legacy
+    caller is routed through this new protocol, and no runtime or desktop acceptance is implied.
+
+    Serialized validation passes all 1,323 tests/doctests: nt-config-abi 8, nt-config-client 121
+    plus 13 doctests, nt-config-server 79, nt-config-manager 35, nt-fs 162 plus one doctest,
+    nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two doctests, and nt-user-host
+    494 plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-cm-retained-abort-full-20260910.log`. Eleven new tests/doctests cover fixed wire
+    layout, malformed/lost replies, foreign/crossed identities, mixed terminal-outcome ACK order,
+    receipt exhaustion, all rollback barriers with repeat failures and persist-then-error, all
+    three cancellation unwind boundaries, cancellation after failed storage, and rejection after
+    uncertain COMMIT. Typed compile-fail coverage rejects using a commit receipt for abort ACK.
+    Both independent read-only protocol/owner reviews found no remaining correctness issue.
+    The freestanding executive release build passes in 42.08 seconds with 293 existing warnings;
+    log: `.tmp/build-cm-retained-abort-executive-20260910.log`. No native activation, microkernel
+    change or VM run occurred. Strict win32k admission still has 27 missing imports; desktop
+    acceptance remains open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

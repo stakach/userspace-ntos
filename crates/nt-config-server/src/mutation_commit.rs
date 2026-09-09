@@ -1,5 +1,5 @@
-//! One retained publication result for the sole SYSTEM writer. Receipt generations count only
-//! acknowledged successes, never upload tokens, failed commits, or aborted preparations.
+//! One retained terminal outcome for the sole SYSTEM writer. Receipt generations count acknowledged
+//! commits and prepared aborts, never upload tokens, failed attempts, or abandoned uploads.
 
 use super::*;
 use nt_config_abi::{
@@ -8,13 +8,13 @@ use nt_config_abi::{
 };
 
 #[derive(Default)]
-pub(crate) struct CommitJournal {
+pub(crate) struct MutationOutcomeJournal {
     bank: u64,
     acknowledged: u64,
     pending: Option<CmHiveMutationCommitReply>,
 }
 
-impl CommitJournal {
+impl MutationOutcomeJournal {
     pub(crate) fn is_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -67,7 +67,7 @@ impl CmServer {
             return reply(STATUS_INVALID_PARAMETER, 0);
         }
         match request.operation {
-            operation::COMMIT
+            operation::COMMIT | operation::ABORT
                 if request.mutation_token != 0
                     && request.expected_generation != 0
                     && request.semantic_journal_len != 0
@@ -92,7 +92,7 @@ impl CmServer {
         };
         if request.operation == operation::ACKNOWLEDGE {
             body.disposition = match self
-                .system_mutation_commits
+                .system_mutation_outcomes
                 .acknowledge(request.receipt_bank, request.receipt_generation)
             {
                 Ok(disposition) => disposition,
@@ -100,10 +100,16 @@ impl CmServer {
             };
             body.receipt_bank = request.receipt_bank;
             body.receipt_generation = request.receipt_generation;
-        } else if let Some(retained) = self.system_mutation_commits.pending {
-            // Publication already advanced the mount. Match the retained identity before looking
-            // at current authority, and return the original device-action outcome unchanged.
-            if retained.mutation_token != request.mutation_token
+        } else if let Some(retained) = self.system_mutation_outcomes.pending {
+            // Match the terminal kind as well as identity before inspecting current authority.
+            // Neither a committed mutation nor an aborted preparation can change its outcome.
+            let expected_disposition = if request.operation == operation::ABORT {
+                disposition::ABORTED
+            } else {
+                disposition::RETAINED
+            };
+            if retained.disposition != expected_disposition
+                || retained.mutation_token != request.mutation_token
                 || retained.expected_generation != request.expected_generation
                 || retained.semantic_journal_len != request.semantic_journal_len
             {
@@ -111,35 +117,49 @@ impl CmServer {
             }
             body = retained;
         } else {
-            if let Err(status) = self.validate_prepared_system_mutation(
-                request.mutation_token,
-                request.expected_generation,
-                request.semantic_journal_len as usize,
-            ) {
+            let validation = if request.operation == operation::ABORT {
+                self.validate_prepared_system_mutation_identity(
+                    request.mutation_token,
+                    request.expected_generation,
+                    request.semantic_journal_len as usize,
+                )
+            } else {
+                self.validate_prepared_system_mutation(
+                    request.mutation_token,
+                    request.expected_generation,
+                    request.semantic_journal_len as usize,
+                )
+            };
+            if let Err(status) = validation {
                 return reply(status, 0);
             }
-            // This fixed slot needs no allocation after the mutation becomes visible.
-            let (bank, generation) = match self.system_mutation_commits.reserve(&self.identities) {
+            // This fixed slot needs no allocation after publication or preparation release.
+            let (bank, generation) = match self.system_mutation_outcomes.reserve(&self.identities) {
                 Ok(identity) => identity,
                 Err(status) => return reply(status, 0),
             };
-            let (next_generation, pending_action) = match self.publish_prepared_system_mutation(
-                request.mutation_token,
-                request.expected_generation,
-                request.semantic_journal_len as usize,
-            ) {
-                Ok(outcome) => outcome,
-                Err(status) => return reply(status, 0),
-            };
-            body.disposition = disposition::RETAINED;
+            if request.operation == operation::ABORT {
+                self.prepared_system_mutation = None;
+                body.disposition = disposition::ABORTED;
+            } else {
+                let (next_generation, pending_action) = match self.publish_prepared_system_mutation(
+                    request.mutation_token,
+                    request.expected_generation,
+                    request.semantic_journal_len as usize,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(status) => return reply(status, 0),
+                };
+                body.disposition = disposition::RETAINED;
+                body.next_generation = next_generation;
+                body.has_pending_device_action = u32::from(pending_action);
+            }
             body.mutation_token = request.mutation_token;
             body.expected_generation = request.expected_generation;
-            body.next_generation = next_generation;
             body.semantic_journal_len = request.semantic_journal_len;
-            body.has_pending_device_action = u32::from(pending_action);
             body.receipt_bank = bank;
             body.receipt_generation = generation;
-            self.system_mutation_commits.pending = Some(body);
+            self.system_mutation_outcomes.pending = Some(body);
         }
         output[..size].copy_from_slice(body.as_bytes());
         reply_with_info(
@@ -164,6 +184,17 @@ impl CmServer {
         if expected != current {
             return Err(STATUS_REVISION_MISMATCH);
         }
+        self.validate_prepared_system_mutation_identity(token, expected, len)
+    }
+
+    // Cleanup must remain possible for the exact preparation even if live authority has moved.
+    // An absent preparation is not evidence of a successful abort.
+    fn validate_prepared_system_mutation_identity(
+        &self,
+        token: u64,
+        expected: u64,
+        len: usize,
+    ) -> Result<(), i32> {
         let prepared = self
             .prepared_system_mutation
             .as_ref()
@@ -199,3 +230,8 @@ impl CmServer {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod abort_tests;
+#[cfg(test)]
+mod test_support;

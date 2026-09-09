@@ -1,87 +1,5 @@
+use super::test_support::*;
 use super::*;
-
-fn server() -> CmServer {
-    let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
-    let mut hive = Hive::new(HiveKind::System);
-    let select = hive.create_key("Select");
-    hive.set_dword(select, "Current", 1);
-    hive.create_key(r"ControlSet001\Services");
-    let current_control_set = hive.current_control_set().unwrap();
-    let hardware_profile =
-        nt_hive_core::HardwareProfileAlias::capture(&hive, &current_control_set).unwrap();
-    server.cm = config_manager_from_system_hive(&hive, &current_control_set);
-    server.system_hive = Some(MountedSystemHive {
-        hive,
-        generation: 1,
-        current_control_set,
-        hardware_profile,
-    });
-    server
-}
-
-fn prepare(server: &mut CmServer, name: &str) -> CmHiveMutationCommitRequest {
-    let token = server.identities.take().unwrap();
-    let expected = server.system_hive.as_ref().unwrap().generation;
-    let mutations = alloc::vec![HiveMutation::CreateChild {
-        parent: String::from(r"\Registry\Machine\System\ControlSet001\Services"),
-        name: String::from(name),
-        class_name: Some(String::from("class")),
-        descriptor: alloc::vec![1, 2, 3],
-    }];
-    let durable_journal = server.prepare_system_hive_mutations(&mutations).unwrap();
-    server.prepared_system_mutation = Some(PreparedSystemHiveMutation {
-        token,
-        expected_generation: expected,
-        next_generation: expected + 1,
-        semantic_journal_len: 100,
-        mutations,
-        durable_journal,
-    });
-    CmHiveMutationCommitRequest {
-        abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
-        abi_version: CM_ABI_VERSION,
-        operation: operation::COMMIT,
-        mount: hive_mount::SYSTEM,
-        mutation_token: token,
-        expected_generation: expected,
-        semantic_journal_len: 100,
-        ..CmHiveMutationCommitRequest::default()
-    }
-}
-
-fn exchange(
-    server: &mut CmServer,
-    request: CmHiveMutationCommitRequest,
-) -> Result<CmHiveMutationCommitReply, i32> {
-    let mut out = [0; core::mem::size_of::<CmHiveMutationCommitReply>()];
-    let result = server.dispatch(
-        opcode::CM_OP_SYSTEM_HIVE_MUTATION_COMMIT,
-        request.as_bytes(),
-        &mut out,
-    );
-    if result.status != STATUS_SUCCESS {
-        return Err(result.status);
-    }
-    assert_eq!(result.information as usize, out.len());
-    let body = CmHiveMutationCommitReply::from_bytes(&out).unwrap();
-    assert_eq!(
-        (result.detail0, result.detail1),
-        (body.receipt_bank, body.receipt_generation)
-    );
-    Ok(body)
-}
-
-fn ack(receipt: CmHiveMutationCommitReply) -> CmHiveMutationCommitRequest {
-    CmHiveMutationCommitRequest {
-        abi_size: core::mem::size_of::<CmHiveMutationCommitRequest>() as u16,
-        abi_version: CM_ABI_VERSION,
-        mount: hive_mount::SYSTEM,
-        operation: operation::ACKNOWLEDGE,
-        receipt_bank: receipt.receipt_bank,
-        receipt_generation: receipt.receipt_generation,
-        ..CmHiveMutationCommitRequest::default()
-    }
-}
 
 #[test]
 fn commit_replays_before_generation_check_and_old_ack_cannot_release_next_result() {
@@ -125,7 +43,7 @@ fn commit_replays_before_generation_check_and_old_ack_cannot_release_next_result
         exchange(&mut server, ack(receipt)).unwrap().disposition,
         disposition::ALREADY_ACKNOWLEDGED
     );
-    assert!(server.system_mutation_commits.is_pending());
+    assert!(server.system_mutation_outcomes.is_pending());
     assert_eq!(exchange(&mut server, next_request), Ok(next));
     assert_eq!(
         exchange(&mut server, ack(next)).unwrap().disposition,
@@ -179,7 +97,7 @@ fn malformed_geometry_and_short_output_have_no_commit_or_ack_effect() {
     );
     assert_eq!(server.system_hive.as_ref().unwrap().generation, 1);
     assert!(server.prepared_system_mutation.is_some());
-    assert!(!server.system_mutation_commits.is_pending());
+    assert!(!server.system_mutation_outcomes.is_pending());
     let receipt = exchange(&mut server, good).unwrap();
     assert_eq!(
         server
@@ -187,7 +105,7 @@ fn malformed_geometry_and_short_output_have_no_commit_or_ack_effect() {
             .status,
         STATUS_BUFFER_TOO_SMALL
     );
-    assert!(server.system_mutation_commits.is_pending());
+    assert!(server.system_mutation_outcomes.is_pending());
     let wrong = CmHiveMutationCommitRequest {
         mutation_token: good.mutation_token,
         ..ack(receipt)
@@ -205,7 +123,7 @@ fn malformed_geometry_and_short_output_have_no_commit_or_ack_effect() {
     ] {
         assert_eq!(exchange(&mut server, wrong), Err(STATUS_INVALID_HANDLE));
     }
-    assert!(server.system_mutation_commits.is_pending());
+    assert!(server.system_mutation_outcomes.is_pending());
 }
 
 #[test]
@@ -235,14 +153,14 @@ fn failed_application_and_receipt_exhaustion_preserve_exact_preparation() {
         journal
     );
     assert_eq!(server.system_hive.as_ref().unwrap().generation, 1);
-    assert!(!server.system_mutation_commits.is_pending());
-    server.system_mutation_commits.acknowledged = u64::MAX;
+    assert!(!server.system_mutation_outcomes.is_pending());
+    server.system_mutation_outcomes.acknowledged = u64::MAX;
     assert_eq!(
         exchange(&mut server, request),
         Err(STATUS_INSUFFICIENT_RESOURCES)
     );
     assert!(server.prepared_system_mutation.is_some());
-    server.system_mutation_commits = CommitJournal::default();
+    server.system_mutation_outcomes = MutationOutcomeJournal::default();
     server.identities.next_sequence.set(0);
     assert_eq!(
         exchange(&mut server, request),
@@ -253,10 +171,18 @@ fn failed_application_and_receipt_exhaustion_preserve_exact_preparation() {
 }
 
 #[test]
-fn pending_commit_excludes_import_checkpoint_legacy_commit_and_abort() {
+fn pending_terminal_outcome_excludes_import_checkpoint_legacy_commit_and_abort() {
+    for op in [operation::COMMIT, operation::ABORT] {
+        assert_pending_outcome_excludes_writers(op);
+    }
+}
+
+fn assert_pending_outcome_excludes_writers(op: u16) {
     let mut server = server();
-    let request = prepare(&mut server, "Child");
+    let mut request = prepare(&mut server, "Child");
+    request.operation = op;
     let receipt = exchange(&mut server, request).unwrap();
+    let current_generation = server.system_hive.as_ref().unwrap().generation;
     let mut output = [0; 4096];
     for operation in [hive_import_transfer::BEGIN, hive_import_transfer::COMMIT] {
         let import = CmHiveImportRequest {
@@ -282,7 +208,7 @@ fn pending_commit_excludes_import_checkpoint_legacy_commit_and_abort() {
         abi_version: CM_ABI_VERSION,
         mount: hive_mount::SYSTEM,
         operation: hive_checkpoint_transfer::BEGIN,
-        expected_generation: 2,
+        expected_generation: current_generation,
         chunk_capacity: 1,
         ..CmHiveCheckpointRequest::default()
     };
@@ -303,7 +229,7 @@ fn pending_commit_excludes_import_checkpoint_legacy_commit_and_abort() {
             mount: hive_mount::SYSTEM,
             operation,
             expected_generation: if operation == hive_mutation_transfer::BEGIN {
-                2
+                current_generation
             } else {
                 1
             },
@@ -394,7 +320,7 @@ fn projection_failure_does_not_publish_device_action_and_exact_retry_can_commit(
     assert!(server.cm.registry_mut().delete_key(services, false));
     assert_eq!(exchange(&mut server, request), Err(STATUS_REGISTRY_CORRUPT));
     assert_eq!(server.device_action_journal.pending_len(), 0);
-    assert!(!server.system_mutation_commits.is_pending());
+    assert!(!server.system_mutation_outcomes.is_pending());
     assert_eq!(
         server
             .prepared_system_mutation
