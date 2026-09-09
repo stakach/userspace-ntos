@@ -15,8 +15,8 @@ use std::process::ExitCode;
 use nt_pe_loader::PeFile;
 use nt_syscall_abi::{NT_SYSCALLS, ZW_ALIASES};
 
-mod wine_spec;
 mod native_stub;
+mod wine_spec;
 
 // IMAGE_FILE_CHARACTERISTICS.IMAGE_FILE_DLL
 const IMAGE_FILE_DLL: u16 = 0x2000;
@@ -204,16 +204,29 @@ fn main() -> ExitCode {
     // retained argument vector, retry restaging, IPC selection and complete Win64 epilogue.
     let image = pe.map(pe.image_base()).expect("map emitted ntdll");
     let mut bad_native = Vec::new();
+    let mut bad_unwind = Vec::new();
+    let exception_directory = pe.headers().data_directory(3);
+    let pdata = pe
+        .bytes_at_rva(
+            exception_directory.virtual_address,
+            exception_directory.size as usize,
+        )
+        .unwrap_or(&[]);
     for syscall in NT_SYSCALLS {
         let Some(export) = exports.iter().find(|export| export.name == syscall.name) else {
             continue;
         };
         let argc = nt_syscall_abi::exact_argc_of(syscall.name)
             .expect("every canonical syscall has an exact argument count");
-        if !image.bytes.get(export.rva as usize..)
+        if !image
+            .bytes
+            .get(export.rva as usize..)
             .is_some_and(|stub| native_stub::matches(stub, syscall.ssn, argc))
         {
             bad_native.push(syscall.name);
+        }
+        if !native_stub::unwind_matches(pdata, &image.bytes, export.rva) {
+            bad_unwind.push(syscall.name);
         }
     }
     check(
@@ -225,6 +238,17 @@ fn main() -> ExitCode {
     );
     if !bad_native.is_empty() {
         eprintln!("   native instruction-template violations: {bad_native:?}");
+    }
+    check(
+        bad_unwind.is_empty(),
+        &format!(
+            "all {} native Nt* bodies have exact runtime-function/unwind coverage ({} violations)",
+            NT_SYSCALLS.len(),
+            bad_unwind.len()
+        ),
+    );
+    if !bad_unwind.is_empty() {
+        eprintln!("   native unwind-metadata violations: {bad_unwind:?}");
     }
 
     // Base relocations parse cleanly (the .reloc directory the loader will apply).

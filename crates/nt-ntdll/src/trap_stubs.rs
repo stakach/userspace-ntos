@@ -44,6 +44,16 @@ pub struct TrapStubAddress(*const ());
 #[cfg(target_arch = "x86_64")]
 unsafe impl Sync for TrapStubAddress {}
 
+#[cfg(all(target_arch = "x86_64", feature = "native_transport", target_os = "windows"))]
+macro_rules! native_seh {
+    ($($text:literal),+) => { concat!($($text),+) };
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "native_transport", not(target_os = "windows")))]
+macro_rules! native_seh {
+    ($($text:literal),+) => { "" };
+}
+
 macro_rules! define_stub_arity {
     ($fn:ident, $name:literal, $ssn:literal, 0) => {
         define_typed_stub!($fn, $name, $ssn, 0, ());
@@ -140,13 +150,21 @@ macro_rules! define_typed_stub {
         #[allow(unused_variables)]
         pub unsafe extern "win64" fn $fn($($arg: u64),*) -> u64 {
             core::arch::naked_asm!(
+                native_seh!(".seh_proc ", $name),
                 // The argument vector belongs to this invocation, not the mutable IPC buffer.
                 "push rdi",
+                native_seh!(".seh_pushreg rdi"),
                 "push rsi",
+                native_seh!(".seh_pushreg rsi"),
                 "push r15",
+                native_seh!(".seh_pushreg r15"),
                 "push r12",
+                native_seh!(".seh_pushreg r12"),
                 "push r13",
+                native_seh!(".seh_pushreg r13"),
                 "sub rsp, 128",
+                native_seh!(".seh_stackalloc 128"),
+                native_seh!(".seh_endprologue"),
                 "mov [rsp], rcx",
                 "mov [rsp + 8], rdx",
                 "mov [rsp + 16], r8",
@@ -208,6 +226,7 @@ macro_rules! define_typed_stub {
                 "pop rsi",
                 "pop rdi",
                 "ret",
+                native_seh!(".seh_endproc"),
                 sec_image_main_teb = const nt_syscall_abi::NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA,
                 pe_main_teb = const nt_syscall_abi::NT_NATIVE_PE_MAIN_TEB_VA,
                 main_ipc_buffer = const nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA,

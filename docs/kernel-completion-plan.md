@@ -30704,6 +30704,45 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     inside its producer before admission. Compiler-generated invoke_native_stub has metadata;
     that does not cover the naked exports it invokes.
 
+    Tranche 151 native-stub unwind checkpoint (2026-09-09, host/artifact validation accepted): generated
+    Windows native stubs now emit assembler-owned SEH records for their five nonvolatile pushes
+    and 128-byte allocation. The prologue ends after byte 15; the existing ADD/POP/RET epilogue
+    remains unchanged. Non-Windows assembly receives no COFF directives. The artifact verifier
+    checks exact begin/end coverage and all unwind bytes, including instruction-end offsets,
+    version, frame/handler flags, register identities and allocation size. Missing, truncated,
+    overlapping or incorrect records fail the build. Do not replace assembler-owned relocations
+    with manually generated runtime-function tables.
+
+    Accepted validation: the full DLL build passes with exact instruction and unwind coverage for
+    all 226 native Nt exports (`.tmp/build-ntdll-native-unwind-20260909.log`); the final gate rerun
+    passes (`.tmp/test-ntdll-native-unwind-gate-final-20260909.log`). Verifier tests pass 15 cases,
+    including all-bit metadata mutation, truncation, exact bounds, overlapping/unsorted rows and
+    valid neighboring functions (`.tmp/test-ntdll-native-unwind-verifier-final-20260909.log`).
+    nt-ntdll passes 657 tests (`.tmp/test-ntdll-native-unwind-host-20260909.log`); nt-unwind passes
+    156 tests plus two doctests (`.tmp/test-ntdll-native-unwind-core-20260909.log`). The actual
+    non-Windows x86-64 library build also passes (`.tmp/build-ntdll-native-unwind-elf-20260909.log`).
+
+    The actual-PE unwind oracle executes the DLL's own RtlVirtualUnwind against 882 interrupted
+    instruction-boundary contexts across all eight native arity fixtures, including partial
+    prologues, two destructive retries and every epilogue instruction. Caller RIP/RSP and
+    nonvolatiles, establisher frame, untouched volatile/FP/debug/context fields, physical unwinder
+    ABI state and stack/output canaries pass. The pre-metadata DLL fails the required missing-row
+    negative control (`.tmp/test-ntdll-native-unwind-artifact-final-20260909.log`), and is separately
+    rejected by the build verifier solely for its 226 missing native unwind records
+    (`.tmp/test-ntdll-native-unwind-negative-verifier-20260909.log`). The 32 producer execution cases,
+    two old-producer negative controls and RtlCaptureContext probe still pass on the rebuilt DLL
+    (`.tmp/test-ntdll-native-unwind-producer-20260909.log`,
+    `.tmp/test-ntdll-native-unwind-capture-20260909.log`). This closes native producer metadata and
+    direct one-frame unwind evidence, not the following exception boundaries or the desktop gate.
+
+    Scope still open after these metadata checks: executive hardware-fault delivery and foreign
+    SEH crossing Rust call boundaries. The generated entries currently declare extern win64, while
+    many exported RTL callers declare extern system and the DLL is compiled with immediate-abort
+    panic behavior. Audit unwind-capable ABI declarations and generated callers together before
+    claiming exceptions can cross those boundaries. Direct RtlVirtualUnwind frame recovery is
+    necessary evidence, not proof of a complete exception-dispatch/resume path. ContextPointers
+    output from RtlVirtualUnwind also remains a separate compatibility requirement.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a
