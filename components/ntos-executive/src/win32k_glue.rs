@@ -3238,7 +3238,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
     let Some(request) = pending.request.validate().ok() else {
-        release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     };
     if request.wait_id != wait_id
@@ -3248,7 +3247,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         || request.owner.client_badge != pending.client.badge
         || request.owner.dispatch_id != pending.dispatch.dispatch_id
     {
-        release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
 
@@ -3290,7 +3288,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
     }
     let arg_snapshot_len = pending.arg_snapshot_len as usize;
     if arg_snapshot_len > pending.arg_snapshot.len() {
-        release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
     if arg_snapshot_len != 0 {
@@ -3324,7 +3321,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         client.ethread,
         callback_process_role_code(client.process_role) as u64,
     ) {
-        release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
 
@@ -3358,7 +3354,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         return ProviderWaitPumpCompletion::UserCallbackSuspended;
     }
     if !pump.completed {
-        release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(pump.status);
     }
     if !complete_wait_resumed_user_callback_dispatch(
@@ -3366,7 +3361,6 @@ pub(crate) unsafe fn resume_suspended_provider_wait_component(
         pending.dispatch.dispatch_id,
         pending.nested_user_callback,
     ) {
-        release_dispatch_output_stage(pending.dispatch);
         return ProviderWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
     unregister_user_callback_client_for_dispatch(
@@ -3433,7 +3427,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
                 || u16::from_le_bytes(reply[4..6].try_into().unwrap())
                     != nt_lpc_abi::msg_type::LPC_REPLY))
     {
-        release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
 
@@ -3497,7 +3490,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
     }
     let arg_snapshot_len = pending.arg_snapshot_len as usize;
     if arg_snapshot_len > pending.arg_snapshot.len() {
-        release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
     if arg_snapshot_len != 0 {
@@ -3531,7 +3523,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         client.ethread,
         callback_process_role_code(client.process_role) as u64,
     ) {
-        release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(0xC000_000Du32 as i32);
     }
     let previous_dispatch = core::ptr::read(core::ptr::addr_of!(USER_CALLBACK_CURRENT_DISPATCH));
@@ -3576,7 +3567,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         return LpcWaitPumpCompletion::UserCallbackSuspended;
     }
     if !pump.completed {
-        release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(pump.status);
     }
     if !complete_wait_resumed_user_callback_dispatch(
@@ -3584,7 +3574,6 @@ pub(crate) unsafe fn resume_suspended_lpc_wait_component(
         pending.dispatch.dispatch_id,
         pending.nested_user_callback,
     ) {
-        release_dispatch_output_stage(pending.dispatch);
         return LpcWaitPumpCompletion::Failed(0xC000_0001u32 as i32);
     }
     unregister_user_callback_client_for_dispatch(

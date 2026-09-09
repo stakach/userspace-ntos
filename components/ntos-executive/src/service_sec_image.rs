@@ -4,6 +4,9 @@
 use crate::exec_handler::{HostedCreatePublication, ProviderLocalEventTransfer};
 use crate::*;
 
+#[path = "component_terminal.rs"]
+mod component_terminal;
+
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -209,6 +212,7 @@ static mut PROVIDER_WAIT_ARBITER: nt_provider_wait::ProviderDispatcherWaitArbite
 static mut COMPONENT_SUSPENSIONS: nt_component_suspension::ComponentSuspensionLanes<
     ComponentNativeContinuation,
     ComponentSuspensionCompletion,
+    component_terminal::NativeTerminal,
 > = nt_component_suspension::ComponentSuspensionLanes::new(
     COMPONENT_EXECUTION_LANE_CAPACITY,
     COMPONENT_SUSPENSION_MAX_DEPTH,
@@ -226,6 +230,7 @@ fn component_execution_lane_reply(
     lanes: &nt_component_suspension::ComponentSuspensionLanes<
         ComponentNativeContinuation,
         ComponentSuspensionCompletion,
+        component_terminal::NativeTerminal,
     >,
     lane: nt_component_suspension::LaneHandle,
 ) -> Option<u64> {
@@ -381,6 +386,7 @@ pub(crate) struct ProviderWaitRuntimeStats {
     pub active_component_continuations: usize,
     pub active_waiters: usize,
     pub active_dispatcher_leases: usize,
+    pub terminal: component_terminal::Stats,
 }
 
 pub(crate) fn provider_wait_record_dispatcher_lease_acquired() {
@@ -422,6 +428,7 @@ pub(crate) fn provider_wait_runtime_stats() -> ProviderWaitRuntimeStats {
                 .total_suspensions(),
             active_waiters: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).len(),
             active_dispatcher_leases: (&*core::ptr::addr_of!(PROVIDER_WAIT_ARBITER)).lease_count(),
+            terminal: component_terminal::stats(),
         }
     }
 }
@@ -1645,15 +1652,8 @@ enum ComponentPumpCompletion {
 
 enum ComponentSuspensionRuntimeOutcome {
     Parked,
-    Completed {
-        continuation: ComponentNativeContinuation,
-        dispatch: win32k_glue::CompletedWin32kDispatch,
-    },
+    Terminal,
     UserCallbackSuspended(ComponentNativeContinuation),
-    Failed {
-        continuation: ComponentNativeContinuation,
-        status: i32,
-    },
 }
 
 unsafe fn component_suspension_resume_top(
@@ -1739,18 +1739,16 @@ unsafe fn component_suspension_resume_top(
         };
         match pump_completion {
             ComponentPumpCompletion::Completed(dispatch) => {
-                let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .complete_running(lane, reply_object, resume.key, frame.owner)
-                    .ok()?;
-                crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-                if provider_resume {
-                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                }
-                COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Some(ComponentSuspensionRuntimeOutcome::Completed {
-                    continuation: completed.continuation,
-                    dispatch,
-                });
+                (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
+                    .retain_terminal_running(
+                        lane,
+                        reply_object,
+                        resume.key,
+                        frame.owner,
+                        component_terminal::NativeTerminal::completed(dispatch),
+                    )
+                    .expect("completed component lost its terminal owner");
+                return Some(ComponentSuspensionRuntimeOutcome::Terminal);
             }
             ComponentPumpCompletion::UserCallbackSuspended => {
                 let token =
@@ -1773,60 +1771,31 @@ unsafe fn component_suspension_resume_top(
                 ));
             }
             ComponentPumpCompletion::Failed(status) => {
-                let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                    .complete_running(lane, reply_object, resume.key, frame.owner)
-                    .ok()?;
-                crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-                if provider_resume {
-                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                }
-                COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                return Some(ComponentSuspensionRuntimeOutcome::Failed {
-                    continuation: completed.continuation,
-                    status,
-                });
+                // Failed includes pre-entry rejection, a still-parked provider, and uncertain
+                // post-entry cleanup. Only Completed carries proof of an actual provider return.
+                component_terminal::retain_incomplete_provider(
+                    lane, reply_object, resume.key, frame.owner, None, status as u32,
+                );
+                return Some(ComponentSuspensionRuntimeOutcome::Terminal);
             }
             ComponentPumpCompletion::Reparked(next) => {
                 if matches!(next, PendingComponentDispatch::Provider(_)) {
                     PROVIDER_WAIT_REARMS.fetch_add(1, Ordering::Relaxed);
                 }
                 let Some(next_owner) = component_expected_owner(next) else {
-                    let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                        .abort_running(
-                            lane,
-                            reply_object,
-                            resume.key,
-                            frame.owner,
-                            ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32),
-                        )
-                        .expect("invalid component re-wait lost its active continuation");
-                    crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    return Some(ComponentSuspensionRuntimeOutcome::Failed {
-                        continuation: completed.continuation,
-                        status: 0xC000_000Du32 as i32,
-                    });
+                    component_terminal::retain_incomplete_provider(
+                        lane, reply_object, resume.key, frame.owner, Some(next), 0xC000_000D,
+                    );
+                    return Some(ComponentSuspensionRuntimeOutcome::Terminal);
                 };
                 let lpc_reservation = if matches!(next, PendingComponentDispatch::Lpc(_)) {
                     match (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS)).reserve() {
                         Ok(reservation) => Some(reservation),
                         Err(_) => {
-                            let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                                .abort_running(
-                                    lane,
-                                    reply_object,
-                                    resume.key,
-                                    frame.owner,
-                                    ComponentSuspensionCompletion::provider(0xC000_009Au32 as i32),
-                                )
-                                .expect("LPC readiness reservation failure lost its continuation");
-                            crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-                            COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                            return Some(ComponentSuspensionRuntimeOutcome::Failed {
-                                continuation: completed.continuation,
-                                status: 0xC000_009Au32 as i32,
-                            });
+                            component_terminal::retain_incomplete_provider(
+                                lane, reply_object, resume.key, frame.owner, Some(next), 0xC000_009A,
+                            );
+                            return Some(ComponentSuspensionRuntimeOutcome::Terminal);
                         }
                     }
                 } else {
@@ -1852,22 +1821,10 @@ unsafe fn component_suspension_resume_top(
                         let _ = (&mut *core::ptr::addr_of_mut!(LPC_COMPONENT_WAITS))
                             .cancel(reservation);
                     }
-                    let completed = (&mut *core::ptr::addr_of_mut!(COMPONENT_SUSPENSIONS))
-                        .abort_running(
-                            lane,
-                            reply_object,
-                            resume.key,
-                            frame.owner,
-                            ComponentSuspensionCompletion::provider(0xC000_000Du32 as i32),
-                        )
-                        .expect("rejected component re-wait lost its active continuation");
-                    crate::driver_launch::win32k_device_properties::retire_completed_transfers();
-                    PROVIDER_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    COMPONENT_WAIT_DISPATCH_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
-                    return Some(ComponentSuspensionRuntimeOutcome::Failed {
-                        continuation: completed.continuation,
-                        status: 0xC000_000Du32 as i32,
-                    });
+                    component_terminal::retain_incomplete_provider(
+                        lane, reply_object, resume.key, frame.owner, Some(next), 0xC000_000D,
+                    );
+                    return Some(ComponentSuspensionRuntimeOutcome::Terminal);
                 }
                 match next {
                     PendingComponentDispatch::Provider(next) => {
@@ -2281,6 +2238,7 @@ unsafe fn component_suspension_drain_ready(
 ) -> u64 {
     let mut drained = 0;
     loop {
+        drained += component_terminal::drain(nt_handler, procs, pfilled);
         let Some(outcome) = component_suspension_resume_top(nt_handler) else {
             break;
         };
@@ -2288,42 +2246,8 @@ unsafe fn component_suspension_drain_ready(
             // This lane yielded the execution token while re-arming a new provider/LPC wait.
             // Another lane may already have a selected completion, so keep draining until the
             // coordinator reports that no resumable lane remains.
-            ComponentSuspensionRuntimeOutcome::Parked => continue,
-            ComponentSuspensionRuntimeOutcome::Completed {
-                continuation,
-                dispatch,
-            } => {
-                if continuation.abandon_native_reply {
-                    assert_eq!(continuation.reply_cap, 0);
-                } else {
-                    let client = continuation.pending.client();
-                    let pi = client.pi as usize;
-                    let copied = if let Some(process) = procs.get(pi) {
-                        process.pml4 != 0
-                            && process_completed_user_callback_outer_dispatch(
-                                nt_handler,
-                                pi,
-                                process.pml4,
-                                client.badge,
-                                client.tid,
-                                dispatch,
-                                &mut pfilled[pi],
-                                process.faults as usize,
-                                process.scratch_base,
-                            )
-                    } else {
-                        false
-                    };
-                    let status = if copied {
-                        dispatch.status
-                    } else {
-                        0xC000_0001u32 as u64
-                    };
-                    assert!(reply_component_native_continuation(continuation, status));
-                    release_reply_pool_cap(continuation.reply_cap);
-                }
-                drained += 1;
-            }
+            ComponentSuspensionRuntimeOutcome::Parked
+            | ComponentSuspensionRuntimeOutcome::Terminal => continue,
             ComponentSuspensionRuntimeOutcome::UserCallbackSuspended(continuation) => {
                 if continuation.abandon_native_reply {
                     assert_eq!(continuation.reply_cap, 0);
@@ -2348,21 +2272,6 @@ unsafe fn component_suspension_drain_ready(
                 }
                 drained += 1;
             }
-            ComponentSuspensionRuntimeOutcome::Failed {
-                continuation,
-                status,
-            } => {
-                if continuation.abandon_native_reply {
-                    assert_eq!(continuation.reply_cap, 0);
-                } else {
-                    assert!(reply_component_native_continuation(
-                        continuation,
-                        status as u32 as u64,
-                    ));
-                    release_reply_pool_cap(continuation.reply_cap);
-                }
-                drained += 1;
-            }
         }
     }
     if nt_handler.lpc_endpoint_progress {
@@ -2377,6 +2286,11 @@ unsafe fn component_suspension_drain_ready(
 unsafe fn component_suspension_prepare_abandoned_replies(
     scope: nt_component_suspension::SuspensionScope,
 ) -> bool {
+    // Terminal delivery owns the reply through its final local ACK. Teardown must not delete
+    // or retype that capability while a copyout, context write, or reply is in flight.
+    if (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS)).has_terminal_in_scope(scope) {
+        return false;
+    }
     loop {
         let target = (&*core::ptr::addr_of!(COMPONENT_SUSPENSIONS))
             .frames()

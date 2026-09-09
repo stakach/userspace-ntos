@@ -13,6 +13,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_DISPATCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+mod terminal;
+pub use terminal::{
+    RetiredTerminal, TerminalAttempt, TerminalIdentity, TerminalPhase, TerminalStage,
+    TerminalStageOutcome, TerminalView,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SuspensionKind {
     ProviderWait,
@@ -284,6 +290,7 @@ pub enum LanePhase {
     Idle,
     Running,
     Suspended,
+    Terminal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,17 +313,19 @@ pub enum LaneError {
     Suspension(SuspensionError),
 }
 
-struct Lane<C, R> {
+struct Lane<C, R, T> {
     binding: LaneBinding,
     phase: LanePhase,
     dispatch: Option<LaneDispatchIdentity>,
     external_tokens: Vec<u64>,
     suspensions: ComponentSuspensionStack<C, R>,
+    terminal: Option<terminal::TerminalRecord<T>>,
+    resume_epoch: u64,
 }
 
-struct LaneSlot<C, R> {
+struct LaneSlot<C, R, T> {
     generation: u64,
-    lane: Option<Lane<C, R>>,
+    lane: Option<Lane<C, R, T>>,
 }
 
 /// Owns the physical execution lanes for one shared-state component.
@@ -324,8 +333,8 @@ struct LaneSlot<C, R> {
 /// The table serializes component execution while allowing independent lanes to retain physical
 /// stacks and reply objects. A suspended lane therefore never prevents a selected top frame on a
 /// different lane from resuming.
-pub struct ComponentSuspensionLanes<C, R> {
-    slots: Vec<LaneSlot<C, R>>,
+pub struct ComponentSuspensionLanes<C, R, T = ()> {
+    slots: Vec<LaneSlot<C, R, T>>,
     max_lanes: usize,
     max_depth_per_lane: usize,
     running: Option<LaneHandle>,
@@ -563,32 +572,9 @@ impl<C, R: Clone> ComponentSuspensionStack<C, R> {
             continuation: frame.continuation,
         })
     }
-
-    pub fn abort_resume(
-        &mut self,
-        key: SuspensionKey,
-        owner: SuspensionOwner,
-        completion: R,
-    ) -> Result<CompletedSuspension<C, R>, SuspensionError> {
-        let frame = self.frames.last_mut().ok_or(SuspensionError::NotFound)?;
-        if frame.key != key {
-            return Err(SuspensionError::NotTop);
-        }
-        if frame.owner != owner {
-            return Err(SuspensionError::InvalidIdentity);
-        }
-        if !matches!(frame.phase, SuspensionPhase::Resuming { .. }) {
-            return Err(SuspensionError::InvalidPhase);
-        }
-        frame.phase = SuspensionPhase::Resuming {
-            completion,
-            cancelled: true,
-        };
-        self.complete_dispatch(key, owner)
-    }
 }
 
-impl<C, R> ComponentSuspensionLanes<C, R> {
+impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
     pub const fn new(max_lanes: usize, max_depth_per_lane: usize) -> Self {
         Self {
             slots: Vec::new(),
@@ -666,6 +652,8 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
                 dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
+                terminal: None,
+                resume_epoch: 0,
             });
             return Ok(LaneHandle {
                 index: index as u32,
@@ -691,6 +679,8 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
                 dispatch: None,
                 external_tokens: Vec::new(),
                 suspensions: ComponentSuspensionStack::new(self.max_depth_per_lane),
+                terminal: None,
+                resume_epoch: 0,
             }),
         });
         Ok(handle)
@@ -791,7 +781,11 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         handle: LaneHandle,
         key: SuspensionKey,
     ) -> Result<Option<&mut SuspensionFrame<C, R>>, LaneError> {
-        Ok(self.lane_mut(handle)?.suspensions.get_mut(key))
+        let lane = self.lane_mut(handle)?;
+        if lane.terminal.is_some() {
+            return Err(LaneError::InvalidPhase);
+        }
+        Ok(lane.suspensions.get_mut(key))
     }
 
     pub fn locate(&self, key: SuspensionKey) -> Option<(LaneHandle, &SuspensionFrame<C, R>)> {
@@ -1089,8 +1083,11 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         let handle = self
             .lane_for_key(key)
             .ok_or(LaneError::Suspension(SuspensionError::NotFound))?;
-        self.lane_mut(handle)?
-            .suspensions
+        let lane = self.lane_mut(handle)?;
+        if lane.terminal.is_some() {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.suspensions
             .select(key, completion)
             .map_err(LaneError::Suspension)
     }
@@ -1099,8 +1096,11 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         let handle = self
             .lane_for_key(key)
             .ok_or(LaneError::Suspension(SuspensionError::NotFound))?;
-        self.lane_mut(handle)?
-            .suspensions
+        let lane = self.lane_mut(handle)?;
+        if lane.terminal.is_some() {
+            return Err(LaneError::InvalidPhase);
+        }
+        lane.suspensions
             .cancel(key, completion)
             .map_err(LaneError::Suspension)
     }
@@ -1119,6 +1119,9 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
     ) -> Option<(LaneHandle, SuspensionKey)> {
         self.slots.iter().enumerate().find_map(|(index, slot)| {
             let lane = slot.lane.as_ref()?;
+            if lane.terminal.is_some() {
+                return None;
+            }
             lane.suspensions
                 .next_cancellable_in_scope(scope)
                 .map(|key| {
@@ -1133,7 +1136,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         })
     }
 
-    fn lane(&self, handle: LaneHandle) -> Result<&Lane<C, R>, LaneError> {
+    fn lane(&self, handle: LaneHandle) -> Result<&Lane<C, R, T>, LaneError> {
         if !handle.is_valid() {
             return Err(LaneError::InvalidIdentity);
         }
@@ -1147,7 +1150,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
         slot.lane.as_ref().ok_or(LaneError::NotFound)
     }
 
-    fn lane_mut(&mut self, handle: LaneHandle) -> Result<&mut Lane<C, R>, LaneError> {
+    fn lane_mut(&mut self, handle: LaneHandle) -> Result<&mut Lane<C, R, T>, LaneError> {
         if !handle.is_valid() {
             return Err(LaneError::InvalidIdentity);
         }
@@ -1187,7 +1190,7 @@ impl<C, R> ComponentSuspensionLanes<C, R> {
     }
 }
 
-impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
+impl<C, R: Clone, T> ComponentSuspensionLanes<C, R, T> {
     pub fn next_resumable(&self) -> Option<LaneResume<R>> {
         self.next_resumable_if(|_| true)
     }
@@ -1250,10 +1253,15 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         if lane.phase != LanePhase::Suspended {
             return Err(LaneError::InvalidPhase);
         }
+        let resume_epoch = lane
+            .resume_epoch
+            .checked_add(1)
+            .ok_or(LaneError::NoCapacity)?;
         let resume = lane
             .suspensions
             .begin_resume(key)
             .map_err(LaneError::Suspension)?;
+        lane.resume_epoch = resume_epoch;
         lane.phase = LanePhase::Running;
         self.running = Some(handle);
         Ok(resume)
@@ -1292,31 +1300,6 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         Ok(())
     }
 
-    pub fn complete_running(
-        &mut self,
-        handle: LaneHandle,
-        reply_object: u64,
-        key: SuspensionKey,
-        owner: SuspensionOwner,
-    ) -> Result<CompletedSuspension<C, R>, LaneError> {
-        self.validate_running(handle, reply_object)?;
-        let lane = self.lane_mut(handle)?;
-        let completed = lane
-            .suspensions
-            .complete_dispatch(key, owner)
-            .map_err(LaneError::Suspension)?;
-        lane.phase = if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
-            LanePhase::Idle
-        } else {
-            LanePhase::Suspended
-        };
-        if lane.phase == LanePhase::Idle {
-            lane.dispatch = None;
-        }
-        self.running = None;
-        Ok(completed)
-    }
-
     pub fn complete_running_and_suspend_external(
         &mut self,
         handle: LaneHandle,
@@ -1346,31 +1329,30 @@ impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
         self.running = None;
         Ok(completed)
     }
+}
 
-    pub fn abort_running(
+#[cfg(test)]
+impl<C, R: Clone> ComponentSuspensionLanes<C, R> {
+    fn deliver_terminal_for_test(
         &mut self,
-        handle: LaneHandle,
-        reply_object: u64,
+        lane: LaneHandle,
+        reply: u64,
         key: SuspensionKey,
         owner: SuspensionOwner,
-        completion: R,
     ) -> Result<CompletedSuspension<C, R>, LaneError> {
-        self.validate_running(handle, reply_object)?;
-        let lane = self.lane_mut(handle)?;
-        let completed = lane
-            .suspensions
-            .abort_resume(key, owner, completion)
-            .map_err(LaneError::Suspension)?;
-        lane.phase = if lane.suspensions.is_empty() && lane.external_tokens.is_empty() {
-            LanePhase::Idle
-        } else {
-            LanePhase::Suspended
-        };
-        if lane.phase == LanePhase::Idle {
-            lane.dispatch = None;
+        let identity = self.retain_terminal_running(lane, reply, key, owner, ())?;
+        for stage in [
+            TerminalStage::Output,
+            TerminalStage::Context,
+            TerminalStage::Reply,
+        ] {
+            let mut attempt = self.begin_terminal_stage(identity, reply, stage)?;
+            self.record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged)?;
         }
-        self.running = None;
-        Ok(completed)
+        Ok(self
+            .finish_terminal(identity, reply, Ok(()))?
+            .unwrap()
+            .suspension)
     }
 }
 
@@ -1572,7 +1554,7 @@ mod tests {
 
     #[test]
     fn selected_lane_resumes_past_an_unrelated_permanent_waiter() {
-        let mut lanes = ComponentSuspensionLanes::new(4, 4);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(4, 4);
         let winlogon = lanes.allocate(binding(1)).unwrap();
         let desktop = lanes.allocate(binding(2)).unwrap();
         let lpc = SuspensionKey::lpc_request(1);
@@ -1603,7 +1585,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             lanes
-                .complete_running(winlogon, binding(1).reply_object, lpc, owner(1))
+                .deliver_terminal_for_test(winlogon, binding(1).reply_object, lpc, owner(1))
                 .unwrap()
                 .continuation,
             10
@@ -1615,7 +1597,7 @@ mod tests {
 
     #[test]
     fn eligibility_skips_rejected_oldest_and_keeps_oldest_valid_sibling() {
-        let mut lanes = ComponentSuspensionLanes::new(3, 2);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(3, 2);
         let mut handles = alloc::vec::Vec::new();
         // Allocation order differs from admission order to exercise sequence-based selection.
         for id in 1..=3 {
@@ -1641,7 +1623,7 @@ mod tests {
 
     #[test]
     fn eligibility_rejecting_every_top_preserves_frames_and_phases() {
-        let mut lanes = ComponentSuspensionLanes::new(2, 2);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(2, 2);
         let first = lanes.allocate(binding(1)).unwrap();
         let second = lanes.allocate(binding(2)).unwrap();
         for (id, lane) in [(1, first), (2, second)] {
@@ -1666,7 +1648,7 @@ mod tests {
 
     #[test]
     fn rejecting_inner_top_never_admits_eligible_outer_frame() {
-        let mut lanes = ComponentSuspensionLanes::new(1, 3);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(1, 3);
         let lane = lanes.allocate(binding(1)).unwrap();
         let reply = binding(1).reply_object;
         let outer = SuspensionKey::lpc_request(1);
@@ -1693,7 +1675,7 @@ mod tests {
 
     #[test]
     fn eligibility_does_not_run_while_any_lane_is_running() {
-        let mut lanes = ComponentSuspensionLanes::new(2, 2);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(2, 2);
         let suspended = lanes.allocate(binding(1)).unwrap();
         let running = lanes.allocate(binding(2)).unwrap();
         let key = SuspensionKey::lpc_request(1);
@@ -1710,7 +1692,7 @@ mod tests {
 
     #[test]
     fn reparked_lane_does_not_mask_a_selected_sibling() {
-        let mut lanes = ComponentSuspensionLanes::new(3, 3);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(3, 3);
         let first = lanes.allocate(binding(1)).unwrap();
         let sibling = lanes.allocate(binding(2)).unwrap();
         let first_wait = SuspensionKey::lpc_request(1);
@@ -1763,7 +1745,7 @@ mod tests {
 
     #[test]
     fn selected_outer_frame_still_waits_for_its_same_lane_top() {
-        let mut lanes = ComponentSuspensionLanes::new(2, 4);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(2, 4);
         let lane = lanes.allocate(binding(1)).unwrap();
         let outer = SuspensionKey::lpc_request(1);
         let inner = SuspensionKey::provider_wait(2);
@@ -1952,7 +1934,7 @@ mod tests {
 
     #[test]
     fn component_completion_preserves_an_outer_callback_suspension() {
-        let mut lanes = ComponentSuspensionLanes::new(1, 3);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(1, 3);
         let lane = lanes.allocate(binding(1)).unwrap();
         let outer = SuspensionKey::provider_wait(1);
 
@@ -2017,7 +1999,7 @@ mod tests {
 
     #[test]
     fn callback_return_transfers_directly_to_a_provider_wait() {
-        let mut lanes = ComponentSuspensionLanes::new(1, 3);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(1, 3);
         let lane = lanes.allocate(binding(1)).unwrap();
         let wait = SuspensionKey::provider_wait(0x77);
 
@@ -2049,7 +2031,7 @@ mod tests {
             .begin_resume(lane, binding(1).reply_object, wait)
             .unwrap();
         let completed = lanes
-            .complete_running(lane, binding(1).reply_object, wait, owner(1))
+            .deliver_terminal_for_test(lane, binding(1).reply_object, wait, owner(1))
             .unwrap();
         assert_eq!(completed.continuation, 42);
         assert_eq!(lanes.phase(lane), Ok(LanePhase::Idle));
@@ -2116,7 +2098,7 @@ mod tests {
 
     #[test]
     fn rearm_and_scope_teardown_remain_lane_exact() {
-        let mut lanes = ComponentSuspensionLanes::new(2, 2);
+        let mut lanes = ComponentSuspensionLanes::<_, _, ()>::new(2, 2);
         let lane = lanes.allocate(binding(1)).unwrap();
         let lpc = SuspensionKey::lpc_request(1);
         let provider = SuspensionKey::provider_wait(2);

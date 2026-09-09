@@ -5963,6 +5963,18 @@ fn provider_wait_transport_spec(passed: &mut u64) {
     print_u64(stats.cancellations);
     print_str(b"/");
     print_u64(stats.native_replies_abandoned);
+    print_str(b" terminal ready/invoking/uncertain/acked/retired=");
+    print_u64(stats.terminal.ready);
+    print_str(b"/");
+    print_u64(stats.terminal.invoking);
+    print_str(b"/");
+    print_u64(stats.terminal.indeterminate);
+    print_str(b"/");
+    print_u64(stats.terminal.acknowledged);
+    print_str(b"/");
+    print_u64(stats.terminal.retired);
+    print_str(b" rejected-reparks=");
+    print_u64(stats.terminal.rejected_reparks);
     print_str(b"\n");
     check(
         b"exec_provider_wait_transport_owned",
@@ -5975,6 +5987,10 @@ fn provider_wait_transport_spec(passed: &mut u64) {
                     .component_dispatch_completions
                     .saturating_add(stats.active_component_continuations as u64)
             && stats.active_waiters <= stats.active_continuations
+            && stats.terminal.ready == 0
+            && stats.terminal.invoking == 0
+            && stats.terminal.indeterminate == 0
+            && stats.terminal.acknowledged == 0
             && stats.active_dispatcher_leases >= stats.active_waiters
             && stats.dispatcher_leases_acquired
                 == stats

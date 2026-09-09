@@ -30621,6 +30621,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     (`.tmp/build-canonical-callback-cancellation-ntdll-20260909.log`,
     `.tmp/test-canonical-callback-cancellation-ntdll-artifact-20260909.log`).
 
+    Tranche 151 component terminal ownership checkpoint (2026-09-09, host/native build accepted):
+    the coordinator retains the original provider/LPC suspension and returned output snapshot
+    through distinct Output, Context and Reply acknowledgements, then local reply-cap retirement.
+    Exact non-clone stage tickets retain an entered operation across IPC. Explicit no-effects
+    evidence permits only the current stage to retry; ambiguous outcomes retain the lane without
+    replay. The terminal identity uses a resume epoch reserved before provider entry, so publishing
+    a returned result does not allocate or consume a new fallible identity. Other lanes can progress,
+    and a failed local retirement cannot starve younger terminal deliveries. Teardown scope checks
+    include buried frames in a terminal lane and refuse capability recycling while it owns delivery.
+
+    Native provider completion now counts completion after client Reply ACK and local retirement,
+    not after the physical provider return. The provider-wait instrumentation reports ready,
+    invoking, indeterminate, acknowledged and retired terminal states and rejects unfinished
+    terminal delivery at the gate. The native adapter lives in focused `component_terminal.rs`;
+    old immediate completion/abort lane APIs are removed at this cutover.
+
+    Review correction: a rejected repark is not a provider return. Both resume adapters also use
+    `Failed(status)` for pre-entry rejection, incomplete/walled execution and uncertain cleanup.
+    These outcomes now retain the lane, original native reply and any captured new parked request
+    as indeterminate. They do not fabricate terminal status delivery or make the lane idle. Output
+    stage leases are no longer released on those ambiguous failure paths. Genuine returned NT
+    failure statuses already arrive through `Completed(dispatch)` and use ordinary terminal
+    delivery. A later recovery adapter must prove physical completion or quiescence before retiring
+    an indeterminate owner.
+
+    Serialized validation passes 704 unit tests, 49 integration tests and 12 compile-fail checks
+    across component suspension, callback, user-host, thread-start and syscall-ABI crates, including
+    13 new terminal state/identity/failure tests
+    (`.tmp/test-component-terminal-final-20260909.log`). The executive release build passes
+    (`.tmp/build-component-terminal-final-executive-20260909.log`). No microkernel code or NT boot
+    staging changed in this checkpoint; this is not a new desktop runtime proof.
+
+    The provider-to-`UserCallbackSuspended` transfer remains a separate open boundary: reserve its
+    external token before provider entry, retain redirect and cancellation outcomes, distinguish
+    private context-write ACK from later callback bookkeeping, and acknowledge its client reply
+    before removing the old suspension. Do not describe that existing fail-stop path as recovered.
+    The strict 27-import desktop frontier and full native-call producer/consumer cutover remain open.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

@@ -96,7 +96,9 @@ fn typed_rollback_and_rearm_preserve_job_until_completion() {
     assert_eq!(identity(&lanes, lane), job);
     lanes.select(next, 0).unwrap();
     lanes.begin_resume(lane, reply, next).unwrap();
-    lanes.complete_running(lane, reply, next, owner(1)).unwrap();
+    lanes
+        .deliver_terminal_for_test(lane, reply, next, owner(1))
+        .unwrap();
     assert_eq!(lanes.active_dispatch_identity(lane), Ok(None));
     assert!(!lanes.is_dispatch_identity_active(job));
 }
@@ -128,7 +130,7 @@ fn transfers_between_external_and_typed_waits_preserve_job() {
 }
 
 #[test]
-fn completing_nested_external_and_aborting_typed_wait_keep_outer_job() {
+fn completing_nested_external_and_retiring_cancelled_wait_keep_outer_job() {
     let mut lanes = Lanes::new(1, 4);
     let lane = lanes.allocate(binding(1)).unwrap();
     let reply = binding(1).reply_object;
@@ -145,9 +147,11 @@ fn completing_nested_external_and_aborting_typed_wait_keep_outer_job() {
     lanes
         .admit_running(lane, reply, key, 1, owner(1), 9)
         .unwrap();
-    lanes.select(key, 0).unwrap();
+    lanes.cancel(key, 1).unwrap();
     lanes.begin_resume(lane, reply, key).unwrap();
-    lanes.abort_running(lane, reply, key, owner(1), 1).unwrap();
+    lanes
+        .deliver_terminal_for_test(lane, reply, key, owner(1))
+        .unwrap();
     assert_eq!(identity(&lanes, lane), job);
     lanes.resume_external(lane, reply, 1).unwrap();
     lanes.complete_external(lane, reply, 1).unwrap();
@@ -155,7 +159,7 @@ fn completing_nested_external_and_aborting_typed_wait_keep_outer_job() {
 }
 
 #[test]
-fn aborting_last_typed_wait_invalidates_job() {
+fn retiring_cancelled_last_wait_invalidates_job() {
     let mut lanes = Lanes::new(1, 4);
     let lane = lanes.allocate(binding(1)).unwrap();
     let reply = binding(1).reply_object;
@@ -165,9 +169,11 @@ fn aborting_last_typed_wait_invalidates_job() {
     lanes
         .admit_running(lane, reply, key, 1, owner(1), 9)
         .unwrap();
-    lanes.select(key, 0).unwrap();
+    lanes.cancel(key, 1).unwrap();
     lanes.begin_resume(lane, reply, key).unwrap();
-    lanes.abort_running(lane, reply, key, owner(1), 1).unwrap();
+    lanes
+        .deliver_terminal_for_test(lane, reply, key, owner(1))
+        .unwrap();
     assert_eq!(lanes.active_dispatch_identity(lane), Ok(None));
     assert!(!lanes.is_dispatch_identity_active(job));
 }
@@ -187,7 +193,9 @@ fn completing_typed_wait_preserves_retained_outer_callback_job() {
         .unwrap();
     lanes.select(key, 0).unwrap();
     lanes.begin_resume(lane, reply, key).unwrap();
-    lanes.complete_running(lane, reply, key, owner(1)).unwrap();
+    lanes
+        .deliver_terminal_for_test(lane, reply, key, owner(1))
+        .unwrap();
     assert_eq!(identity(&lanes, lane), job);
     assert_eq!(lanes.phase(lane), Ok(LanePhase::Suspended));
     lanes.resume_external(lane, reply, 1).unwrap();
