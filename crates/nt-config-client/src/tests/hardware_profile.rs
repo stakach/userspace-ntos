@@ -210,3 +210,72 @@ fn control_set_selection_does_not_transplant_the_profile_alias() {
         PHYSICAL
     );
 }
+
+#[test]
+fn device_key_policy_resolves_through_cm_and_persists_new_parameters_security() {
+    use nt_io_manager::device_registry::DeviceRegistryKeyType;
+    let mut client = client();
+    client.import_system_hive(&encode_image(&hive())).unwrap();
+    let instance: Vec<u16> = r"PCI\VEN_1234\0".encode_utf16().collect();
+    let driver: Vec<u16> = r"{1234}\0002".encode_utf16().collect();
+    for flags in [1, 2, 5, 6] {
+        let plan = DeviceRegistryKeyType::from_flags(flags)
+            .unwrap()
+            .plan(&instance, Some(&driver), 0x20019)
+            .unwrap();
+        let logical = String::from_utf16(&plan.absolute_path().unwrap()).unwrap();
+        let path = client
+            .resolve_system_hive_path(&logical)
+            .unwrap()
+            .physical_path;
+        let profile = if flags & 4 != 0 {
+            r"\Hardware Profiles\0007\System\CurrentControlSet"
+        } else {
+            ""
+        };
+        let tail = match flags {
+            1 => r"Enum\PCI\VEN_1234\0\Device Parameters",
+            5 => r"Enum\PCI\VEN_1234\0",
+            _ => r"Control\Class\{1234}\0002",
+        };
+        assert_eq!(
+            path,
+            format!(r"\Registry\Machine\System\ControlSet001{profile}\{tail}")
+        );
+    }
+
+    // This is a privileged host fixture transaction, not proof of native parent authorization.
+    // Exercise the actual CM mutation/log/lease path with the prepared security bytes.
+    let plan = DeviceRegistryKeyType::Device
+        .plan(&instance, None, 0x20019)
+        .unwrap();
+    let path = String::from_utf16(&plan.absolute_path().unwrap()).unwrap();
+    let sd = nt_security::prepare_device_parameters_security(
+        &nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR,
+    )
+    .unwrap();
+    let prepared = mutate(
+        &mut client,
+        1,
+        &[
+            SystemHiveMutation::CreateKey { path: &path },
+            SystemHiveMutation::SetKeySecurity {
+                path: &path,
+                descriptor: &sd,
+            },
+        ],
+    );
+    let opened = retained_test_keys::open(&mut client, &path);
+    let info = client
+        .query_leased_system_hive_key_information(opened.lease)
+        .unwrap();
+    assert_eq!(info.security_descriptor.as_deref(), Some(sd.as_slice()));
+    retained_test_keys::close(&mut client, opened.lease).unwrap();
+    let mut replayed = hive();
+    let base = replayed.sequence;
+    try_replay_log(&mut replayed, &prepared.durable_journal, base).unwrap();
+    let key = replayed
+        .open_key(r"ControlSet001\Enum\PCI\VEN_1234\0\Device Parameters")
+        .unwrap();
+    assert_eq!(replayed.key_security_descriptor(key), Some(sd.as_slice()));
+}

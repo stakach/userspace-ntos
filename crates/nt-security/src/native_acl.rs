@@ -61,7 +61,7 @@ impl NativeAcl {
         Ok(Self { bytes })
     }
 
-    fn validated_prefix(bytes: &[u8]) -> Result<&[u8], NativeAclError> {
+    pub(crate) fn validated_prefix(bytes: &[u8]) -> Result<&[u8], NativeAclError> {
         if bytes.len() < ACL_HEADER_SIZE {
             return Err(NativeAclError::TruncatedHeader);
         }

@@ -335,8 +335,10 @@ pub fn access_check_by_type(
         .fold(0, |union, result| union | result.granted_access);
     let maximum = desired_access & MAXIMUM_ALLOWED != 0;
     let wanted = mapping.map(desired_access & !MAXIMUM_ALLOWED);
-    let success = if maximum {
-        granted != 0
+    let success = if mode == ProcessorMode::KernelMode {
+        true
+    } else if maximum {
+        granted != 0 && wanted & !granted == 0
     } else {
         desired_access != 0 && wanted & !granted == 0
     };
@@ -365,23 +367,11 @@ fn access_check_internal(
     object: Option<(&[ObjectTypeEntry], usize)>,
     preserve_partial: bool,
 ) -> AccessCheckResult {
-    if desired_access == 0 {
-        return denied();
-    }
     let maximum = desired_access & MAXIMUM_ALLOWED != 0;
     let want = mapping.map(desired_access & !MAXIMUM_ALLOWED);
     let mut privileges_used: Vec<&'static str> = Vec::new();
 
-    // ACCESS_SYSTEM_SECURITY always requires SeSecurityPrivilege (spec §9.7).
-    if want & ACCESS_SYSTEM_SECURITY != 0 {
-        if token.has_privilege(SE_SECURITY) {
-            privileges_used.push(SE_SECURITY);
-        } else {
-            return denied();
-        }
-    }
-
-    // KernelMode bypasses the DACL for normal opens (spec §9.3).
+    // SeAccessCheck's kernel caller bypass precedes both the zero-access and privilege checks.
     if mode == ProcessorMode::KernelMode {
         return AccessCheckResult {
             status: STATUS_SUCCESS,
@@ -392,6 +382,18 @@ fn access_check_internal(
             },
             privileges_used,
         };
+    }
+    if desired_access == 0 {
+        return denied();
+    }
+
+    // User-mode ACCESS_SYSTEM_SECURITY requires SeSecurityPrivilege (spec §9.7).
+    if want & ACCESS_SYSTEM_SECURITY != 0 {
+        if token.has_privilege(SE_SECURITY) {
+            privileges_used.push(SE_SECURITY);
+        } else {
+            return denied();
+        }
     }
 
     let mut granted: AccessMask = 0;
@@ -482,14 +484,14 @@ fn access_check_internal(
     }
 
     if maximum {
-        if granted != 0 {
+        if granted != 0 && want & !granted == 0 {
             AccessCheckResult {
                 status: STATUS_SUCCESS,
                 granted_access: granted,
                 privileges_used,
             }
         } else {
-            denied()
+            denied_with_partial(granted, privileges_used, preserve_partial)
         }
     } else if want & !granted == 0 {
         AccessCheckResult {

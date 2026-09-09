@@ -17,6 +17,10 @@ use crate::create_token::{
 use crate::native_acl::{NativeAcl, STATUS_INVALID_ACL};
 use crate::sid::Sid;
 
+#[path = "device_parameters_security.rs"]
+mod device_parameters_security;
+pub use device_parameters_security::prepare_device_parameters_security;
+
 #[path = "security_assignment.rs"]
 mod security_assignment;
 pub use security_assignment::{

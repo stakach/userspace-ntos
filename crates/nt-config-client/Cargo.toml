@@ -14,6 +14,8 @@ nt-hive-core = { workspace = true }
 [dev-dependencies]
 nt-config-manager = { workspace = true }
 nt-config-server = { workspace = true }
+nt-io-manager = { workspace = true }
+nt-security = { workspace = true }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

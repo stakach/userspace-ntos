@@ -61,6 +61,7 @@ pub use native_sd::{
     capture_security_descriptor_bytes, capture_security_descriptor_for_access,
     native_acl_to_access_acl,
     query_security_descriptor_bytes, set_security_descriptor_bytes, ObjectSecurityAssignment,
+    prepare_device_parameters_security,
     SecurityAssignmentAudit, SecurityAssignmentClient, SecurityAssignmentInheritance,
     SecurityAssignmentPrivilegeOutcome, DACL_SECURITY_INFORMATION, DEFAULT_KEY_SECURITY_DESCRIPTOR,
     GROUP_SECURITY_INFORMATION, MAX_CAPTURED_OBJECT_TYPES, OWNER_SECURITY_INFORMATION,
@@ -112,3 +113,5 @@ pub use token_set::{
 mod tests;
 #[cfg(test)]
 mod native_access_conversion_tests;
+#[cfg(test)]
+mod access_admission_tests;

@@ -29,6 +29,7 @@ mod device_reference;
 mod device_control;
 mod device_property_query;
 mod device_property_transfer;
+pub mod device_registry;
 mod directory_control;
 mod dispatch;
 mod driver;

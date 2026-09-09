@@ -291,6 +291,9 @@ desktop proofs are historical baselines, not acceptance of the current provider 
 - [x] Capture the mounted SYSTEM hardware-profile alias from real CurrentConfig authority and use
   one resolver for leased opens, snapshots and durable mutation paths (2026-09-09). Ordinary selector
   writes do not move the captured alias; missing selection never defaults to another profile.
+- [x] Prepare exact device-key selection and newly-created Device Parameters DACL policy in shared
+  crates (2026-09-09; host core). Correct shared MAXIMUM_ALLOWED and KernelMode access admission.
+  Native Key authorization, creation ownership and handle publication remain open below.
 - [ ] Retain CM OPEN request/reply ownership through native path validation and publication
   (tranche 115). Pre-reserve ownership and remove ignored cleanup errors, including malformed replies.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
@@ -31153,6 +31156,64 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     the legacy wrapper and global lease-as-handle broker together; do not bind win32k around them.
     The strict missing-import frontier remains 27. Native suspension-fixture execution and genuine
     Explorer desktop acceptance remain open; no guest execution is claimed for this checkpoint.
+
+    Device-key policy/security checkpoint (2026-09-09): nt-io-manager/device_registry now decodes
+    exactly DEVICE, DRIVER and their CURRENT_HWPROFILE combinations (1, 2, 5, 6; both NT5 and
+    ReactOS headers define the profile flag as 4). Plans preserve counted UTF-16 names and requested
+    access without treating them as grants. They require an existing base with KEY_READ and, for
+    bare DEVICE, the existing Enum instance with KEY_WRITE. Only bare DEVICE selects its Device
+    Parameters child and adds READ_CONTROL | WRITE_DAC to the request. Profile DEVICE selects the
+    instance itself. The profile base includes the full Hardware Profiles\Current\System\CurrentControlSet
+    suffix from NT5 pnpioapi.c, not merely the profile root. CM retains authority over physical
+    profile selection; the planner does not invent profile numbers, PDO authority or handles.
+
+    nt-security/prepare_device_parameters_security implements the newly-created-key DACL policy
+    after ordinary container assignment: remove basic allow/deny Administrators ACEs and append
+    one container-inheritable Administrators KEY_ALL_ACCESS grant. Retain all other ACE bytes/order,
+    owner/group/SACL and unrelated descriptor control. Existing keys must not run this transformation.
+    Invalid descriptors, oversized ACLs and allocation failures return errors without modifying input.
+    A present null DACL is explicitly rejected instead of silently succeeding after the NT5 helper's
+    failed ACL query or narrowing unrestricted access to admin-only. This is a fail-closed incomplete
+    case for future native admission, not a claim to match NT5's swallowed error. No new native
+    IoOpenDeviceRegistryKey binding is advertised.
+
+    Fixed two real shared access-check defects: MAXIMUM_ALLOWED no longer discards additional
+    explicitly requested rights (including generic rights and by-type aggregate/result-list cases),
+    and KernelMode bypass precedes zero-access and privilege checks. The aggregate preserves a
+    successful zero grant for a kernel caller even with an empty generic mapping. These corrections
+    affect the existing shared access evaluator, not merely future registry adapters. The CM
+    composition test resolves all four plans through the mounted profile resolver and persists/replays
+    prepared Device Parameters security through the real mutation/lease protocol; it is explicitly
+    a privileged host fixture, not proof of native parent authorization.
+
+    Review adjustment for the next native cutover: do not put a universal target-DACL check in
+    mint_registry_key. Existing opens, new creation and BACKUP_RESTORE have different grant rules,
+    and that function currently runs after some durable creation effects. Resolve these in order:
+    - [ ] Establish real root descriptors and inherited/defaulted child descriptors; absence of
+      modeled security must not become a null-DACL fallback.
+    - [ ] Capture the effective subject/mode and authorize ordinary parent creation before mutation.
+      Existing-key opens check the target DACL. New-key handles use the authorized creation outcome,
+      not a second target-DACL check. Implement BACKUP_RESTORE's privilege-derived grant independently
+      of DesiredAccess and validate create options; preserve output/creation ownership on failure.
+    - [ ] Apply Key generic mapping and final valid-access masking at the correct stage. Strip
+      WOW64 view selectors before authorization; do not blindly turn MAXIMUM_ALLOWED into full rights
+      for existing opens. Preserve NT5 KernelMode and zero-access distinctions.
+    - [ ] Publish canonical Key handles through PM's existing reserved handle slots, with kernel
+      handles in the designated System table. Replace driver token handles and the lossy wrapper
+      together, retain exact CM/PDO/subject ownership, and run native/desktop acceptance afterward.
+
+    Native SYSTEM lease cleanup was re-audited: config_manager_retire_system_hive_key transfers
+    failed cleanup to the existing cm_key_ownership journal. Its caller taking the target Option
+    does not lose the lease on a backend error. Reuse that owner; do not add a duplicate close queue.
+
+    Serialized validation passes all 1,904 tests/doctests across nt-security (203 unit tests),
+    nt-io-manager (388), nt-ntdll (657), nt-user-host (488 plus 49 integration cases), and
+    nt-config-client (92), with 27 doctests. Sixteen new tests cover the selection, DACL, shared
+    access and CM composition contracts. Log: `.tmp/test-device-key-policy-final-20260909.log`.
+    The freestanding executive release build passes with 293 existing warnings; log:
+    `.tmp/build-device-key-policy-executive-20260909.log`. No VM or desktop run was performed.
+    These are host-policy/shared-evaluator and native-build results, not provider Key admission:
+    the strict win32k missing-import count remains 27 and native suspension acceptance remains open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
