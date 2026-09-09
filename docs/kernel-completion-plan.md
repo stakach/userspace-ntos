@@ -31561,9 +31561,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     Review adjustment: this is an existing-journal storage owner, not native activation or proof
     of CM acknowledgement. Its release_after_publication boundary must be called only by the
     eventual exact COMMIT/local-publication/ACK owner. A supplied generic context retains its
-    contents but does not prove that native callers captured every handle/PnP preparation. Make
-    prepared mutation identity opaque/non-Clone before claiming unique native prepared ownership;
-    the current public clonable PreparedSystemHiveMutation is not such an owner. First-journal
+    contents but does not prove that native callers captured every handle/PnP preparation. The
+    prepared mutation opacity prerequisite is addressed by the composed-owner checkpoint below;
+    native admission must still consume the exact not-yet-published preparation. First-journal
     creation remains a separate retained operation, not an implicit fallback in this append API.
 
     Native adapter requirements: reserve complete pending work before effects; retain real
@@ -31590,6 +31590,53 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     293 existing warnings; log: `.tmp/build-snapshot-journal-executive-20260909.log`. No native
     storage activation, microkernel change or VM run occurred. Strict win32k admission still has
     27 missing imports; no desktop acceptance is claimed.
+
+    Composed durable CM publication checkpoint (2026-09-09): nt-config-client now owns the real
+    snapshot barrier and retained CM protocol in one private SnapshotSystemHivePublication module.
+    It depends on nt-fs rather than adding another store format, fake durability proof or native
+    fallback. This is a post-PREPARE composition for existing nonempty journals, not native cutover.
+    - [x] Make PreparedSystemHiveMutation opaque and non-Clone, with read-only generation/journal
+      accessors. Migrate native callers and replace public cloning in malformed-identity tests with
+      private fixtures. Consume the exact preparation; move its bytes into SnapshotJournal without
+      another allocation, and restore those same bytes/owner on admission failure.
+    - [x] Pin the CM client and storage together. No mutable preparation, receipt, storage or client
+      escapes pending work. Only successful real snapshot publication enables COMMIT. Returned
+      storage errors retain the exact append owner; returned COMMIT errors permit exact COMMIT
+      replay only. The receipt is saved before local effects, with storage rollback disabled.
+    - [x] Invoke an infallible local FnOnce publisher once and retain both caller continuation and
+      result until exact ACK. ACK retry never republishes locally. Completion can be taken once
+      only after validated acknowledgement. Storage, COMMIT, local publication and ACK all enter
+      InFlight before external effects; unwinds leave them non-retryable rather than guessing that
+      nothing happened. Share the real CM server/faulting-reply fixture with the protocol tests.
+
+    Review adjustment: native activation still needs exact CM-to-log/mount admission, ownership of
+    first-journal creation and the actual snapshot reserve, and complete caller preparations before
+    any effect. The exclusive ConfigClient borrow prevents incidental CM queries from the local
+    closure; created-key lease acquisition and fallible/multi-step native handle/PnP publication
+    need a retained staged adapter, not an error-valued local result treated as completion. Recovery
+    after an InFlight unwind is intentionally not synthesized. Volatile-only mutations remain a
+    separate path to implement under the same semantic owner, not an empty fake disk transaction.
+    Durable rollback alone does not acknowledge CM preparation cleanup; add retained, acknowledged
+    ABORT before offering rollback-and-release. Lost BEGIN/PREPARE/upload replies remain open.
+    The raw one-shot native APIs remain only until their atomic caller cutover; consuming an opaque
+    preparation into this coordinator must not follow earlier publication via those legacy APIs.
+
+    Serialized host validation passes all 1,312 tests/doctests: nt-config-client 115 plus 12
+    doctests, nt-fs 162 plus one doctest, nt-config-abi 7, nt-config-server 76, nt-config-manager 35,
+    nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two doctests, nt-user-host 494
+    plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-cm-snapshot-publication-full-20260909.log`. Five new composed tests cover every
+    snapshot barrier with repeat failure (including persist-then-error), lost/malformed COMMIT/ACK
+    replies, all four unwind boundaries, no duplicate local/storage effects, no-copy admission
+    recovery, and drop-counted caller/result retention. Power-cut restore checks the exact journal
+    and replays the real child into the recovered hive. Four compile-fail cases cover preparation
+    construction/cloning/mutation and bypassing the retained client borrow. Independent reviews
+    found no remaining transition defect after strengthening the storage-unwind and barrier cases.
+    Freestanding executive release passes in 36.07 seconds with 293 existing warnings; log:
+    `.tmp/build-cm-snapshot-publication-executive-20260909.log`. Native changes in this checkpoint
+    only migrate the opaque preparation accessors. No native durability/COMMIT activation,
+    microkernel change or VM run occurred; the 27 strict missing win32k imports and desktop
+    acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

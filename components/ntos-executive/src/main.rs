@@ -15944,8 +15944,8 @@ pub(crate) unsafe fn config_manager_prepare_system_hive_mutation(
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let prepared = client.prepare_system_hive_mutation(expected_generation, mutations)?;
-    if prepared.expected_generation != expected_generation
-        || prepared.next_generation != expected_generation.checked_add(1).unwrap_or(0)
+    if prepared.expected_generation() != expected_generation
+        || prepared.next_generation() != expected_generation.checked_add(1).unwrap_or(0)
     {
         client.abort_prepared_system_hive_mutation(&prepared);
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
@@ -15957,14 +15957,14 @@ pub(crate) unsafe fn config_manager_publish_system_hive_mutation(
     prepared: &nt_config_client::PreparedSystemHiveMutation,
 ) -> Result<(u64, bool), i32> {
     let expected_generation = LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.load(Ordering::Acquire);
-    if expected_generation == 0 || prepared.expected_generation != expected_generation {
+    if expected_generation == 0 || prepared.expected_generation() != expected_generation {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     let client = CONFIG_CLIENT_PTR
         .as_mut()
         .ok_or(CONFIG_STATUS_DEVICE_NOT_READY)?;
     let outcome = client.publish_system_hive_mutation(prepared)?;
-    if outcome.generation != prepared.next_generation {
+    if outcome.generation != prepared.next_generation() {
         return Err(CONFIG_STATUS_DEVICE_NOT_READY);
     }
     LIVE_CONFIG_MANAGER_SYSTEM_GENERATION.store(outcome.generation, Ordering::Release);
@@ -16007,9 +16007,9 @@ pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
     let prepared =
         config_manager_prepare_system_hive_mutation(expected_generation, mutations)
             .map_err(|status| status as u32)?;
-    let journaled = !prepared.durable_journal.is_empty();
+    let journaled = !prepared.durable_journal().is_empty();
     let journal_result = if journaled {
-        nt_hive_core::HiveIoProvider::append_log_record(&mut provider, &prepared.durable_journal)
+        nt_hive_core::HiveIoProvider::append_log_record(&mut provider, prepared.durable_journal())
             .and_then(|()| nt_hive_core::HiveIoProvider::flush_log(&mut provider))
     } else {
         Ok(())

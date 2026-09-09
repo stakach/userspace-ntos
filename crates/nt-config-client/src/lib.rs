@@ -41,6 +41,12 @@ pub use mutation_commit::{
     SystemHiveMutationAcknowledgementDisposition,
 };
 
+mod snapshot_publication;
+pub use snapshot_publication::{
+    SnapshotSystemHivePublication, SnapshotSystemHivePublicationError,
+    SnapshotSystemHivePublicationOpenError, SnapshotSystemHivePublicationPhase,
+};
+
 mod broker_key_owner;
 pub use broker_key_owner::{
     BrokerKeyCloseTicket, BrokerKeyOwner, BrokerKeyOwnerError, BrokerKeyOwners,
@@ -225,15 +231,41 @@ mod value_upload_tests {
 }
 
 /// One fully validated SYSTEM mutation whose CM-owned replay records must be made durable before
-/// publication. The token and lengths are opaque protocol identity; callers persist
-/// `durable_journal` and pass the complete value back to [`ConfigClient::publish_system_hive_mutation`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// publication. Identity and journal bytes cannot be replaced or cloned into competing owners.
+///
+/// ```compile_fail
+/// fn duplicate(p: nt_config_client::PreparedSystemHiveMutation) { let _ = p.clone(); }
+/// ```
+/// ```compile_fail
+/// use nt_config_client::PreparedSystemHiveMutation;
+/// let p = PreparedSystemHiveMutation { expected_generation: 1, next_generation: 2,
+///     lease_token: 1, semantic_journal_len: 1, durable_journal: vec![1] };
+/// ```
+/// ```compile_fail
+/// fn replace(p: &mut nt_config_client::PreparedSystemHiveMutation) {
+///     p.durable_journal().fill(0);
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "retain the preparation until its publication or confirmed cleanup"]
 pub struct PreparedSystemHiveMutation {
-    pub expected_generation: u64,
-    pub next_generation: u64,
-    pub lease_token: u64,
-    pub semantic_journal_len: u32,
-    pub durable_journal: Vec<u8>,
+    expected_generation: u64,
+    next_generation: u64,
+    lease_token: u64,
+    semantic_journal_len: u32,
+    durable_journal: Vec<u8>,
+}
+
+impl PreparedSystemHiveMutation {
+    pub fn expected_generation(&self) -> u64 {
+        self.expected_generation
+    }
+    pub fn next_generation(&self) -> u64 {
+        self.next_generation
+    }
+    pub fn durable_journal(&self) -> &[u8] {
+        &self.durable_journal
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

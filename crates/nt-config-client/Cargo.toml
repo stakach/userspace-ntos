@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 nt-config-abi = { workspace = true }
 nt-hive-core = { workspace = true }
+nt-fs = { workspace = true }
 
 [dev-dependencies]
 nt-config-manager = { workspace = true }
