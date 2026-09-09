@@ -31688,6 +31688,56 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     change or VM run occurred. Strict win32k admission still has 27 missing imports; desktop
     acceptance remains open.
 
+    Mutation upload replay foundation checkpoint (2026-09-10): close the server-side retry gaps
+    before introducing requester-owned BEGIN identity and a retained client preparation owner.
+    The existing wire layout and mutation semantics are unchanged; no duplicate preparation path
+    or success fallback is introduced.
+    - [x] Accept exact byte-identical APPEND replay wholly inside an already accepted upload prefix.
+      Only an append at the current boundary may extend it. Reject altered bytes, wrong identity,
+      gaps, arithmetic overflow and extending overlap without changing the accepted extent.
+    - [x] Replace destructive pre-validation upload consumption with a checked complete-byte borrow.
+      Keep the exact upload through decoding, physical path resolution, transactional validation,
+      durable-journal encoding and size checks. Consume the original allocation only immediately
+      before installing successful prepared state. Failed PREPARE remains retryable or abortable.
+    - [x] Replay matching successful PREPARE from the retained token, expected generation, semantic
+      length, next generation and durable bytes. PULL likewise serves the captured journal without
+      checking a newer live generation. Neither operation re-runs mutation validation or allocates
+      another journal. Successful COMMIT/ABORT retirement cannot resurrect old preparation.
+    - [x] Remove request-driven upload invalidation from stale APPEND/PREPARE. A stale or foreign
+      request must not discard the sole live writer; exact stale cleanup remains possible.
+    - [x] Move the transfer handler out of the large server lib.rs into mutation_transfer.rs,
+      retaining the same namespace and dispatch boundary. Delete the old method body and consuming
+      bank commit API, and share the existing mounted-hive test fixture.
+
+    Review adjustment: this is known-token server replay, not a complete retained preparation
+    lifecycle. The client still best-effort-aborts and drops progress after preparation errors;
+    do not activate error retries there without owning the complete exchange. APPEND replay ends
+    when successful PREPARE consumes semantic bytes; a future owner must never rewind phases.
+    Historical whole-hive import still invalidates in-progress uploads. Decide retained remount
+    exclusion or acknowledged termination before claiming lifetime ownership across replacement.
+    Next, add service authority plus requester bank/slot/monotonic attempt identity before BEGIN,
+    using the existing retained-snapshot/OPEN ownership patterns. Equal generation and length do
+    not identify a caller or its mutation and must never deduplicate BEGIN. BEGIN acknowledgement
+    transfers responsibility to an owner that already retains the token; it must not free that
+    lease. Native first-journal/reserve ownership, complete caller migration and desktop acceptance
+    remain open.
+
+    Serialized validation passes all 1,332 tests/doctests: nt-config-server 88, nt-config-client
+    121 plus 13 doctests, nt-config-abi 8, nt-config-manager 35, nt-fs 162 plus one doctest,
+    nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two doctests, and nt-user-host
+    494 plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-cm-prepare-replay-full-final-20260910.log`. Nine new regressions cover exact prefix
+    replay and rejected overlap/identity/overflow, allocation-preserving complete-upload transfer,
+    incomplete/stale/foreign requests, decoding/path/validation/generation failure retention,
+    late semantic projection rollback followed by exact retry, immutable prepared PULL/replay,
+    distinct BEGIN admission, generation-drift cleanup, and retired requests leaving newer work
+    untouched after either COMMIT or ABORT. Independent read-only reviews found no correctness
+    issue; their additional lifetime cases are included. Arbitrary allocator-failure injection
+    was not run. Freestanding executive release passes in 36.50 seconds with 293 existing warnings;
+    log: `.tmp/build-cm-prepare-replay-executive-20260910.log`. No new native preparation owner,
+    microkernel change or VM run occurred. Strict win32k admission still has 27 missing imports;
+    desktop acceptance remains open.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

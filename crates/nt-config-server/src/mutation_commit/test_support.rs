@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn server() -> CmServer {
+pub(crate) fn server() -> CmServer {
     let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
     let mut hive = Hive::new(HiveKind::System);
     let select = hive.create_key("Select");

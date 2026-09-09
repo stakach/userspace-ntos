@@ -43,7 +43,8 @@ impl MountedSystemHive {
 
     /// Freeze alias addressing before validation, durable-log encoding and retained commit.
     /// No later selector edit can redirect a prepared mutation to another key. The decoded
-    /// unpublished journal is discarded by PREPARE on error; this method changes no CM state.
+    /// decoded mutations are discarded on PREPARE error, but the original upload remains owned.
+    /// This method changes no CM state.
     pub(super) fn resolve_mutation_paths(&self, mutations: &mut [HiveMutation]) -> Result<(), i32> {
         for mutation in mutations {
             let path = match mutation {

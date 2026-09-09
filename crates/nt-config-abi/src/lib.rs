@@ -709,6 +709,9 @@ pub struct CmLeasedHiveRecordRequest {
 /// semantic chunk; PREPARE validates it and materialises CM-owned replay records; PULL streams those
 /// records to the storage transport; COMMIT publishes one new generation only after storage has
 /// acknowledged durability; ABORT releases either an upload or a prepared mutation.
+/// APPEND may replay a fully accepted byte-identical range, but cannot extend an overlapping range.
+/// PREPARE retains the upload on failure and replays a matching prepared result without revalidation.
+/// BEGIN still requires separate requester identity before a lost acquisition reply can be retried.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmHiveMutationRequest {

@@ -90,7 +90,10 @@ impl MutationLeaseBank {
         journal
             .try_reserve_exact(total_len)
             .map_err(|_| MutationLeaseError::Exhausted)?;
-        let token = self.identities.take().ok_or(MutationLeaseError::Exhausted)?;
+        let token = self
+            .identities
+            .take()
+            .ok_or(MutationLeaseError::Exhausted)?;
         self.lease = Some(MutationLease {
             token,
             generation,
@@ -113,7 +116,6 @@ impl MutationLeaseBank {
             || lease.token != token
             || lease.generation != generation
             || lease.total_len != total_len
-            || lease.journal.len() != offset
             || chunk.is_empty()
             || offset
                 .checked_add(chunk.len())
@@ -121,16 +123,29 @@ impl MutationLeaseBank {
         {
             return Err(MutationLeaseError::Invalid);
         }
+        let end = offset + chunk.len();
+        if end <= lease.journal.len() {
+            return if lease.journal[offset..end] == *chunk {
+                Ok(())
+            } else {
+                Err(MutationLeaseError::Invalid)
+            };
+        }
+        if offset != lease.journal.len() {
+            return Err(MutationLeaseError::Invalid);
+        }
         lease.journal.extend_from_slice(chunk);
         Ok(())
     }
 
-    pub(crate) fn commit(
-        &mut self,
+    /// Borrow a complete upload through every fallible validation/encoding step. Only successful
+    /// preparation may consume it; an error leaves the exact bytes available for retry or abort.
+    pub(crate) fn complete_bytes(
+        &self,
         token: u64,
         generation: u64,
         total_len: usize,
-    ) -> Result<Vec<u8>, MutationLeaseError> {
+    ) -> Result<&[u8], MutationLeaseError> {
         let lease = self.lease.as_ref().ok_or(MutationLeaseError::Invalid)?;
         if token == 0
             || lease.token != token
@@ -142,6 +157,16 @@ impl MutationLeaseBank {
         if lease.journal.len() != total_len {
             return Err(MutationLeaseError::Incomplete);
         }
+        Ok(&lease.journal)
+    }
+
+    pub(crate) fn take_complete(
+        &mut self,
+        token: u64,
+        generation: u64,
+        total_len: usize,
+    ) -> Result<Vec<u8>, MutationLeaseError> {
+        self.complete_bytes(token, generation, total_len)?;
         Ok(self.lease.take().unwrap().journal)
     }
 
@@ -332,11 +357,11 @@ mod tests {
         );
         bank.append(token, 7, 4, 0, &[1, 2]).unwrap();
         assert_eq!(
-            bank.commit(token, 7, 4),
+            bank.take_complete(token, 7, 4),
             Err(MutationLeaseError::Incomplete)
         );
         bank.append(token, 7, 4, 2, &[3, 4]).unwrap();
-        assert_eq!(bank.commit(token, 7, 4), Ok(alloc::vec![1, 2, 3, 4]));
+        assert_eq!(bank.take_complete(token, 7, 4), Ok(alloc::vec![1, 2, 3, 4]));
     }
 
     #[test]
@@ -348,6 +373,69 @@ mod tests {
         let second = bank.begin(1, 1).unwrap();
         bank.invalidate();
         assert!(!bank.abort(second, 1, 1));
+    }
+
+    #[test]
+    fn append_replays_only_exact_accepted_ranges_without_changing_extent() {
+        let mut bank = bank();
+        let token = bank.begin(7, 8).unwrap();
+        bank.append(token, 7, 8, 0, &[0, 1, 2, 3]).unwrap();
+        for start in 0..4 {
+            for end in start + 1..=4 {
+                let bytes: alloc::vec::Vec<u8> = (start as u8..end as u8).collect();
+                bank.append(token, 7, 8, start, &bytes).unwrap();
+            }
+        }
+        for (offset, bytes) in [
+            (0, &[9][..]),
+            (3, &[3, 4][..]),
+            (5, &[5][..]),
+            (usize::MAX, &[0][..]),
+            (4, &[][..]),
+        ] {
+            assert_eq!(
+                bank.append(token, 7, 8, offset, bytes),
+                Err(MutationLeaseError::Invalid)
+            );
+            assert_eq!(bank.lease.as_ref().unwrap().journal, [0, 1, 2, 3]);
+        }
+        for (wrong_token, generation, len) in
+            [(0, 7, 8), (token + 1, 7, 8), (token, 8, 8), (token, 7, 9)]
+        {
+            assert_eq!(
+                bank.append(wrong_token, generation, len, 0, &[0]),
+                Err(MutationLeaseError::Invalid)
+            );
+        }
+        bank.append(token, 7, 8, 4, &[4, 5, 6, 7]).unwrap();
+        bank.append(token, 7, 8, 0, &[0, 1]).unwrap();
+        assert_eq!(
+            bank.take_complete(token, 7, 8).unwrap(),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn complete_borrow_and_failed_take_retain_exact_upload() {
+        let mut bank = bank();
+        let token = bank.begin(1, 2).unwrap();
+        bank.append(token, 1, 2, 0, &[4]).unwrap();
+        assert_eq!(
+            bank.complete_bytes(token, 1, 2),
+            Err(MutationLeaseError::Incomplete)
+        );
+        bank.append(token, 1, 2, 1, &[5]).unwrap();
+        let address = bank.complete_bytes(token, 1, 2).unwrap().as_ptr();
+        for (token, generation, len) in [(token + 1, 1, 2), (token, 2, 2), (token, 1, 3)] {
+            assert_eq!(
+                bank.take_complete(token, generation, len),
+                Err(MutationLeaseError::Invalid)
+            );
+        }
+        assert_eq!(bank.complete_bytes(token, 1, 2).unwrap(), [4, 5]);
+        let bytes = bank.take_complete(token, 1, 2).unwrap();
+        assert_eq!(bytes.as_ptr(), address);
+        assert!(!bank.is_busy());
     }
 }
 

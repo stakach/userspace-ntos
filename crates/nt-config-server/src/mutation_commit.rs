@@ -234,4 +234,4 @@ mod tests;
 #[cfg(test)]
 mod abort_tests;
 #[cfg(test)]
-mod test_support;
+pub(super) mod test_support;
