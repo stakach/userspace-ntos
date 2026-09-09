@@ -269,7 +269,11 @@ fn caller_validation_preserves_identity_across_move_and_live_thread_states() {
         ThreadState::Waiting,
         ThreadState::Suspended,
     ] {
-        moved.set_thread_state(tid, state).unwrap();
+        if state == ThreadState::Suspended {
+            moved.suspend_thread(tid).unwrap();
+        } else {
+            moved.set_thread_state(tid, state).unwrap();
+        }
         assert!(moved.validate_initial_system_caller(identity));
         assert_eq!(moved.initial_system_identity(), Some(identity));
         assert_eq!(references(&moved, pid, tid), (1, 1));

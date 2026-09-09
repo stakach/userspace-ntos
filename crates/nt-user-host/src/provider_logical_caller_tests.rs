@@ -40,6 +40,59 @@ fn captures_exact_logical_identity_and_validates_without_mutation() {
 }
 
 #[test]
+fn retained_wait_defers_blocked_ingress_without_losing_exact_identity() {
+    let (pm, binding, caller) = caller();
+    let thread = pm.thread_lifetime(binding.tid as u32);
+    let before = caller;
+    assert_eq!(
+        caller.retained_wait_admission(Some(binding), None, thread),
+        Ok(ProviderWaitAdmission::Deferred)
+    );
+    assert_eq!(
+        caller.validate::<()>(None, thread),
+        Err(ProviderCallerError::MissingRuntime),
+        "retained ownership must not grant fresh provider admission"
+    );
+    assert_eq!(
+        caller.retained_wait_admission(Some(binding), Some(binding), thread),
+        Ok(ProviderWaitAdmission::Ready)
+    );
+    assert_eq!(caller, before);
+}
+
+#[test]
+fn retained_wait_still_rejects_missing_retired_or_replaced_identity() {
+    let (mut pm, binding, caller) = caller();
+    let thread = pm.thread_lifetime(binding.tid as u32);
+    assert_eq!(
+        caller.retained_wait_admission(None, Some(binding), thread),
+        Err(ProviderCallerError::MissingRuntime)
+    );
+    assert_eq!(
+        caller.retained_wait_admission(Some(binding), None, None),
+        Err(ProviderCallerError::MissingThread)
+    );
+    let changed = ThreadBinding {
+        tcb: binding.tcb + 1,
+        ..binding
+    };
+    assert_eq!(
+        caller.retained_wait_admission(Some(changed), None, thread),
+        Err(ProviderCallerError::BindingChanged)
+    );
+    assert_eq!(
+        caller.retained_wait_admission(Some(binding), Some(changed), thread),
+        Err(ProviderCallerError::BindingChanged)
+    );
+    let other = pm
+        .create_thread(binding.process.pid, 0x3000, 0, false)
+        .unwrap();
+    assert!(caller
+        .retained_wait_admission(Some(binding), None, pm.thread_lifetime(other))
+        .is_err());
+}
+
+#[test]
 fn zero_badge_and_zero_process_slot_are_valid_when_real_identity_is_admitted() {
     let (pm, mut binding, _) = caller();
     binding.pi = 0;

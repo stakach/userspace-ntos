@@ -25,6 +25,7 @@ pub mod job_abi;
 mod initial_system;
 pub mod native_handle;
 pub mod process_object_retirement;
+pub mod thread_suspend;
 
 pub use initial_system::InitialSystemIdentity;
 
@@ -34,6 +35,7 @@ use dbgk::{DbgKmMessage, DebugEvent, DebugObjectId, DebugObjectStore};
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 pub const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
+pub const STATUS_DEVICE_BUSY: u32 = 0x8000_0011;
 pub const THREAD_NAME_MAX_UNITS: usize = 256;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
@@ -950,6 +952,8 @@ pub struct NtThread {
     pub win32_start_address: u64,
     pub parameter: u64,
     pub state: ThreadState,
+    /// Scheduling state beneath the suspend-count projection; only PM transitions update it.
+    scheduling_state: ThreadState,
     pub is_system_thread: bool,
     pub exit_status: Option<u32>,
     /// Dispatcher references held by parked waits independently of user handles.
@@ -975,6 +979,8 @@ pub struct NtThread {
     /// object descriptor that user-mode security setup can query or replace.
     security_descriptor: Vec<u8>,
     pub suspend_count: u32,
+    suspend_revision: u64,
+    pending_suspend_control: Option<u64>,
     /// `KTHREAD.FreezeCount`. Ordinary thread suspension is tracked separately.
     freeze_count: u32,
     /// Opaque `W32THREAD` pointer parked by win32k via `PsSetThreadWin32Thread`
@@ -1084,6 +1090,8 @@ pub struct Win32Callouts {
 /// The Process Manager: processes, threads, and image sections (spec §5, §9-§13).
 #[derive(Default)]
 pub struct ProcessManager {
+    /// Lazily assigned, move-stable identity for suspend-control plans.
+    suspend_manager_identity: u64,
     processes: IdTable<NtProcess>,
     threads: IdTable<NtThread>,
     /// Withdrawn Ps objects remain owned until their exact cleanup ticket is finished.
@@ -1405,6 +1413,9 @@ impl ProcessManager {
     /// caller. External handle owners must release their references and empty the new handle table
     /// first; Ps then removes job membership and the private process record.
     pub fn abort_process_creation(&mut self, pid: ProcessId) -> Option<ProcessObjectDeletion> {
+        if self.has_process_suspend_control(pid) {
+            return None;
+        }
         let Some(process) = self.processes.get(&pid) else {
             return None;
         };
@@ -2071,6 +2082,7 @@ impl ProcessManager {
                 win32_start_address: start_address,
                 parameter,
                 state,
+                scheduling_state: state,
                 is_system_thread,
                 exit_status: None,
                 wait_references: 0,
@@ -2085,6 +2097,8 @@ impl ProcessManager {
                 impersonation: None,
                 security_descriptor: Vec::from(&nt_security::DEFAULT_KEY_SECURITY_DESCRIPTOR[..]),
                 suspend_count: 0,
+                suspend_revision: 0,
+                pending_suspend_control: None,
                 freeze_count: 0,
                 win32_thread: None,
                 kernel_thread_object: None,
@@ -3164,6 +3178,7 @@ impl ProcessManager {
     ) -> bool {
         self.thread(tid).is_some_and(|thread| {
             thread.state == ThreadState::Terminated
+                && thread.pending_suspend_control.is_none()
                 && thread.wait_references == 0
                 && thread.kernel_pointer_references == 0
                 && thread.termination_ports.is_empty()
@@ -3188,6 +3203,9 @@ impl ProcessManager {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let thread = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if thread.pending_suspend_control.is_some() {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let process = self
             .processes
             .get(&thread.process_id)
@@ -3259,6 +3277,9 @@ impl ProcessManager {
         activation_handle: Option<HandleReservation>,
     ) -> Result<(), u32> {
         let current = self.threads.get(&plan.tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if current.pending_suspend_control.is_some() {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         if current.process_id != plan.process_id
             || current.activation_generation != plan.generation
             || current.state != plan.expected_state
@@ -3327,6 +3348,11 @@ impl ProcessManager {
         } else {
             ThreadState::Running
         };
+        thread.scheduling_state = if plan.create_suspended {
+            ThreadState::Ready
+        } else {
+            ThreadState::Running
+        };
         thread.exit_status = None;
         thread.create_time_100ns = plan.create_time_100ns;
         thread.exit_time_100ns = 0;
@@ -3334,6 +3360,8 @@ impl ProcessManager {
         thread.user_time_100ns = 0;
         thread.termination_ports.clear();
         thread.suspend_count = plan.create_suspended as u32;
+        thread.suspend_revision = 0;
+        thread.pending_suspend_control = None;
         thread.freeze_count = 0;
         thread.win32_thread = None;
         thread.teb_base = plan.teb_base;
@@ -3461,56 +3489,6 @@ impl ProcessManager {
         })
     }
 
-    /// A scheduling-state transition (spec §11.2), e.g. `Ready` → `Running` → `Waiting`.
-    pub fn set_thread_state(&mut self, tid: ThreadId, state: ThreadState) -> Result<(), u32> {
-        let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if t.state == ThreadState::Terminated {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        t.state = state;
-        if state == ThreadState::Initialized {
-            t.suspend_count = 0;
-        }
-        if state == ThreadState::Terminated {
-            t.user_apc_queue.clear();
-        }
-        Ok(())
-    }
-
-    /// Increment a thread's suspend count and return its previous value. The first suspension
-    /// removes the thread from the runnable set; nested suspensions retain that state until the
-    /// matching final resume.
-    pub fn suspend_thread(&mut self, tid: ThreadId) -> Result<u32, u32> {
-        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.state == ThreadState::Terminated {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let previous = thread.suspend_count;
-        thread.suspend_count = thread
-            .suspend_count
-            .checked_add(1)
-            .ok_or(STATUS_SUSPEND_COUNT_EXCEEDED)?;
-        thread.state = ThreadState::Suspended;
-        Ok(previous)
-    }
-
-    /// Decrement a thread's suspend count and return its previous value. A zero-count resume is a
-    /// successful no-op, matching `NtResumeThread`; the final resume makes the thread ready.
-    pub fn resume_thread(&mut self, tid: ThreadId) -> Result<u32, u32> {
-        let thread = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
-        if thread.state == ThreadState::Terminated {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let previous = thread.suspend_count;
-        if previous != 0 {
-            thread.suspend_count -= 1;
-            if thread.suspend_count == 0 {
-                thread.state = ThreadState::Ready;
-            }
-        }
-        Ok(previous)
-    }
-
     // --- termination + signalling (spec §12.3, §21) --------------------------
 
     /// Attach a referenced LPC port object to the current ETHREAD. Registrations are intentionally
@@ -3559,11 +3537,28 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
+        let target = self.threads.get(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if target.pending_suspend_control.is_some() {
+            return Err(STATUS_DEVICE_BUSY);
+        }
+        // The last user-thread exit cascades into process termination. Check that boundary before
+        // publishing this thread's exit, so a retained control on a system peer cannot split it.
+        if !target.is_system_thread
+            && !self.threads.values().any(|other| {
+                other.thread_id != tid && other.process_id == target.process_id
+                    && !other.is_system_thread
+                    && !matches!(other.state, ThreadState::Initialized | ThreadState::Terminated)
+            })
+            && self.has_process_suspend_control(target.process_id)
+        {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let (pid, was_system, transitioned) = {
             let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
             let transitioned = t.state != ThreadState::Terminated;
             if transitioned {
                 t.state = ThreadState::Terminated;
+                t.scheduling_state = ThreadState::Terminated;
                 t.exit_status = Some(exit_status);
                 t.user_apc_queue.clear();
                 if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
@@ -3613,10 +3608,14 @@ impl ProcessManager {
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
         let t = self.threads.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if t.pending_suspend_control.is_some() {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let transitioned = t.state != ThreadState::Terminated;
         let pid = t.process_id;
         if transitioned {
             t.state = ThreadState::Terminated;
+            t.scheduling_state = ThreadState::Terminated;
             t.exit_status = Some(exit_status);
             t.user_apc_queue.clear();
             if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
@@ -3643,6 +3642,9 @@ impl ProcessManager {
         exit_status: u32,
         exit_time_100ns: i64,
     ) -> Result<(), u32> {
+        if self.has_process_suspend_control(pid) {
+            return Err(STATUS_DEVICE_BUSY);
+        }
         let (thread_count, section) = {
             let proc = self.processes.get_mut(&pid).ok_or(STATUS_INVALID_HANDLE)?;
             if proc.state == ProcessState::Terminated {
@@ -3663,6 +3665,7 @@ impl ProcessManager {
             if let Some(t) = self.threads.get_mut(&tid) {
                 if t.state != ThreadState::Terminated {
                     t.state = ThreadState::Terminated;
+                    t.scheduling_state = ThreadState::Terminated;
                     t.exit_status = Some(exit_status);
                     t.user_apc_queue.clear();
                     if exit_time_100ns != 0 || t.exit_time_100ns == 0 {
@@ -3948,6 +3951,9 @@ impl ProcessManager {
     /// Whether only Ps-owned token/port references remain before the process delete procedure can
     /// run. The debug port is detached here once its final event has been continued.
     pub fn process_object_delete_ready(&mut self, pid: ProcessId) -> bool {
+        if self.has_process_suspend_control(pid) {
+            return false;
+        }
         let _ = self.clear_deleted_process_debug_object_if_unreferenced(pid);
         self.process_object_delete_blockers(pid)
             .is_some_and(ProcessObjectDeleteBlockers::delete_ready)

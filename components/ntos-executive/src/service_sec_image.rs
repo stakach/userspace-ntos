@@ -23758,8 +23758,28 @@ unsafe fn gui_message_wait_redrive_event(
             continue;
         }
         let pi = waiter.pi as usize;
+        let wait_admission = waiter.logical_caller.and_then(|caller| {
+            if caller.pi() != pi || u64::from(caller.thread().thread_id()) != waiter.tid
+                || caller.badge() != waiter.badge
+            {
+                return None;
+            }
+            // Ownership visibility is not fresh provider admission. A control-busy published
+            // runtime is still the live owner of this wait; do not cancel its bound Reply.
+            let published = (&*nt_handler.thread_runtime.table).entries.iter()
+                .filter(|slot| !slot.is_pending())
+                .filter_map(|slot| slot.owner())
+                .find(|owner| owner.badge == waiter.badge && !owner.publication.is_busy())
+                .map(|owner| owner.binding());
+            caller.retained_wait_admission(
+                published,
+                nt_handler.admit_hosted_thread_ingress(waiter.badge).ok()
+                    .map(|runtime| runtime.binding()),
+                nt_handler.pm.thread_lifetime(caller.thread().thread_id()),
+            ).ok()
+        });
         let live_identity = pi < MAX_PI
-            && waiter.logical_caller.is_some_and(|caller| nt_handler.validate_provider_logical_caller(caller))
+            && wait_admission.is_some()
             && nt_handler.hosted_process_generation(pi) == Some(waiter.process_generation)
             && nt_handler
                 .pm
@@ -23774,6 +23794,10 @@ unsafe fn gui_message_wait_redrive_event(
                 break;
             }
             continue;
+        }
+        if wait_admission == Some(nt_user_host::provider_logical_caller::ProviderWaitAdmission::Deferred) {
+            disposition = GuiEventRedriveDisposition::Retry;
+            break;
         }
         nt_handler.loop_ctx = saved_ctx.and_then(|ctx| ctx.for_process(pi));
         GUI_MESSAGE_WAIT_REDRIVES.fetch_add(1, Ordering::Relaxed);

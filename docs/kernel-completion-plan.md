@@ -319,7 +319,7 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   (tranche 151, host/native checkpoint). Full application-record retry and cancellation remain open.
 - [x] Implement exact MCS reply-chain ownership for Call/Reply/ReplyRecv, receive offers, deletion,
   restart and object reuse (tranche 151; four-CPU kernel specs and userspace microtests).
-- [ ] Implement NT wait-preserving suspension together with native suspension/completion admission,
+- [~] Implement NT wait-preserving suspension together with native suspension/completion admission,
   then atomically adopt upstream TCBSuspend cancellation and strict BlockedOnReply reply admission.
   Do not equate seL4 cancel-IPC Suspend with NT's suspend APC, or infer nested scheduling-context
   ownership from a receiver's latest reply target.
@@ -30984,6 +30984,50 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     suspend count of 0x7f, preserve selected state after final count copyout failure, and test
     self-suspend with its original service Reply still owned. This hold must not become an NT-only
     microkernel policy or silently alter upstream seL4 Suspend/Resume.
+
+    Accepted execution-hold checkpoint (2026-09-09, rust-micro `9c1b587`): added generic TCB-capability-authorized
+    Acquire/Release operations with exact, non-wrapping hold generations. Holds preserve the
+    underlying wait, Reply chain, context and SC while excluding physical dispatch. Ps now retains
+    the underlying scheduling state beneath its counted suspension projection and reserves exact
+    count transitions before native entry. The host runtime owns the hold token and pending
+    invocation until physical acknowledgment and local commit agree; uncertain outcomes cannot be
+    replayed or retired. Initial inactive construction is a distinct Dormant state, not a fabricated
+    hold. Native suspend/resume no longer use PM-first mutation followed by inverse rollback.
+
+    Review fixes: initial main-thread startup now uses the same retained admission before
+    its first Resume; GUI-wait liveness distinguishes a busy exact runtime from a dead caller;
+    process teardown rejects pending suspension before canceling waits or retiring peer TCBs.
+    Audit found no remaining explicit native TCBSuspend call that requires a resumable parked
+    continuation. Strict BlockedOnReply admission and exact outgoing-Reply unlink in terminal
+    TCBSuspend landed together; stale WALL comments claiming its Reply remains bound were removed.
+    Ordinary zero-count NtResume remains a no-op. Initial Start uses a separate retained action,
+    without inventing a suspend count, and malformed start acknowledgments remain indeterminate.
+
+    Serialized validation passed: 262 nt-process and 484 nt-user-host unit tests, their integration
+    tests and doctests, all four-CPU kernel specs (including 14 exact Reply-chain cases), and all
+    15 userspace microtests with zero failures and the explicit guest completion sentinel. The real
+    user-counter probe ran on CPU 1: started=347, held=3117 across 1024 stationary samples after
+    acquisition ACK, resumed=4170 after exact release. Production x86, AArch64 compile-only,
+    executive (292 existing warnings), and driver-host-ntdll builds pass. The first AArch64 check
+    exposed x86-only numeric label assertions; those are now correctly target-gated, while request
+    decoding uses architecture-generated labels. Logs are
+    `.tmp/test-thread-suspend-final-20260909.log`,
+    `.tmp/build-execution-hold-spec-20260909.log`,
+    `.tmp/run-execution-hold-spec-20260909.log`,
+    `.tmp/build-execution-hold-production-20260909.log`,
+    `.tmp/check-execution-hold-aarch64-20260909.log`,
+    `.tmp/build-thread-suspend-executive-final-20260909.log` and
+    `.tmp/build-thread-suspend-driver-host-20260909.log`. Pre-probe disk/rootserver staging was
+    restored byte-for-byte. No NT desktop boot was run; the strict 27-import win32k boundary remains
+    unresolved. Required native self-suspend, File/object/LPC completion, final resume without syscall
+    replay, and desktop validation remain open, not inferred from unit/spec tests. The application
+    continuation ABI and ordinary retained thread retirement remain separate prerequisites below.
+
+    Additional retirement debt found during the cutover: two driver cleanup paths still ignore
+    suspension/delete failure or release mappings after failed suspension. Migrate those paths to
+    retained checked retirement with the ordinary teardown work below; the IRQ-lane path already
+    preserves resources on suspension failure. Do not treat terminal TCB cancellation as proof
+    that the higher-level driver, callback or native-reply ownership has been safely retired.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

@@ -85,6 +85,9 @@ impl ProcessManager {
         &mut self,
         pid: ProcessId,
     ) -> Result<ProcessObjectRetirement, u32> {
+        if self.has_process_suspend_control(pid) {
+            return Err(STATUS_PENDING);
+        }
         let system = self
             .initial_system_identity()
             .ok_or(STATUS_INVALID_HANDLE)?;

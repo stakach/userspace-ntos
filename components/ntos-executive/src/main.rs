@@ -43,6 +43,7 @@ mod loader_trace_diag;
 pub(crate) use loader_trace_diag::*;
 mod exec_handler;
 mod thread_context;
+mod thread_suspend;
 mod executive_va;
 mod fs_loader;
 mod mounted_volume;
@@ -18590,6 +18591,9 @@ unsafe fn terminate_hosted_thread_mechanism(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> bool {
+    if handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId) {
+        return false;
+    }
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_retry_delivery_for_thread(tid) {
         return false;
     }
@@ -18610,6 +18614,9 @@ unsafe fn terminate_hosted_thread_mechanism(
     if !release_hosted_thread_win32_context(tid, handler) {
         return false;
     }
+    if handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId) {
+        return false;
+    }
     delay_cancel_thread(delay_queue, handler, tid);
     io_completion_cancel_thread(handler, tid);
     let _ = handler.user_timer_cancel_thread(tid);
@@ -18627,6 +18634,7 @@ unsafe fn terminate_hosted_thread_mechanism(
         print_str(b"\n");
     }
     if handler.hosted_thread_tcb(tid) != Some(tcb)
+        || handler.pm.has_thread_suspend_control(tid as nt_process::ThreadId)
         || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_retry_delivery_for_thread(tid)
     {
         return false;
@@ -18655,6 +18663,9 @@ unsafe fn terminate_hosted_thread_mechanism(
     print_u64(delete);
     print_str(b"\n");
     if suspend == 0 && delete == 0 {
+        if !crate::thread_suspend::tcb_deleted(handler, tid, tcb) {
+            return false;
+        }
         let runtime = handler.release_hosted_thread_runtime(tid);
         if let Some(runtime) = runtime {
             if let Some(request) = stack_release {
@@ -18686,6 +18697,12 @@ unsafe fn terminate_hosted_process_mechanisms(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> usize {
+    let Some(pid) = handler.pm_pid_for_pi(process_index as usize) else {
+        return 0;
+    };
+    if handler.pm.has_process_suspend_control(pid) {
+        return 0;
+    }
     if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
         .has_retry_delivery_for_pi(u32::from(process_index))
     {
@@ -18696,14 +18713,17 @@ unsafe fn terminate_hosted_process_mechanisms(
     if !crate::service_sec_image::provider_wait_cancel_client_process(handler, process_index) {
         return 0;
     }
+    if handler.pm.has_process_suspend_control(pid) {
+        return 0;
+    }
     let mut reclaimed = 0usize;
-    let pid = handler.pm_pid_for_pi(process_index as usize);
-    let thread_count = pid
-        .and_then(|pid| handler.pm.process(pid))
+    let thread_count = handler.pm.process(pid)
         .map_or(0, |process| process.threads.len());
     for index in 0..thread_count {
-        let Some(tid) = pid
-            .and_then(|pid| handler.pm.process(pid))
+        if handler.pm.has_process_suspend_control(pid) {
+            return reclaimed;
+        }
+        let Some(tid) = handler.pm.process(pid)
             .and_then(|process| process.threads.get(index))
             .copied()
             .map(u64::from)
@@ -18716,6 +18736,9 @@ unsafe fn terminate_hosted_process_mechanisms(
         if terminate_hosted_thread_mechanism(tid, delay_queue, handler) {
             reclaimed += 1;
         }
+    }
+    if handler.pm.has_process_suspend_control(pid) {
+        return reclaimed;
     }
     handler.clear_hosted_tp_worker_windows(process_index as usize);
     io_completion_cancel_process(handler, process_index);

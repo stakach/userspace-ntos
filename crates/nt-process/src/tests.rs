@@ -121,10 +121,12 @@ fn thread_suspend_count_overflow_is_reported_without_mutation() {
     let mut pm = ProcessManager::new();
     let pid = pm.create_process("overflow.exe", None, None);
     let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
-    pm.threads.get_mut(&tid).unwrap().suspend_count = u32::MAX;
+    for _ in 0..thread_suspend::MAXIMUM_SUSPEND_COUNT {
+        pm.suspend_thread(tid).unwrap();
+    }
 
     assert_eq!(pm.suspend_thread(tid), Err(STATUS_SUSPEND_COUNT_EXCEEDED));
-    assert_eq!(pm.thread(tid).unwrap().suspend_count, u32::MAX);
+    assert_eq!(pm.thread(tid).unwrap().suspend_count, thread_suspend::MAXIMUM_SUSPEND_COUNT);
 }
 
 #[test]

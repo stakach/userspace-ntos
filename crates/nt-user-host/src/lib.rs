@@ -45,6 +45,7 @@ pub mod thread_reconciliation;
 pub mod thread_retirement;
 pub mod thread_rollback;
 pub mod thread_slot;
+pub mod thread_suspend;
 pub mod thread_exit_dispatch;
 
 use alloc::vec::Vec;

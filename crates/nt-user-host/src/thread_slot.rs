@@ -11,6 +11,10 @@ pub trait RuntimeIdentity {
     type Role: Copy + Eq;
     fn binding(&self) -> ThreadBinding<Self::Role>;
     fn publication(&self) -> &ThreadPublicationSlot;
+    /// An in-flight native control operation retains this exact runtime and mechanism.
+    fn control_busy(&self) -> bool {
+        false
+    }
 }
 
 /// Adapter for moving a constructor's complete partial inventory into its original reservation.
@@ -208,13 +212,15 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
         self.is_pending()
             || self
                 .owner()
-                .is_some_and(|runtime| runtime.publication().is_busy())
+                .is_some_and(|runtime| runtime.publication().is_busy() || runtime.control_busy())
     }
 
     pub fn executable(&self) -> Option<&R> {
         match &self.state {
             State::Published(runtime)
-                if runtime.binding().tcb > 1 && !runtime.publication().is_busy() =>
+                if runtime.binding().tcb > 1
+                    && !runtime.publication().is_busy()
+                    && !runtime.control_busy() =>
             {
                 Some(runtime)
             }
@@ -237,7 +243,7 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
         if self.is_pending() {
             return Err(ThreadIngressError::Pending);
         }
-        if runtime.publication().is_busy() {
+        if runtime.publication().is_busy() || runtime.control_busy() {
             return Err(ThreadIngressError::Publishing);
         }
         if binding.tcb <= 1 {
@@ -251,7 +257,11 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
 
     pub fn ordinary_mut(&mut self) -> Option<&mut R> {
         match &mut self.state {
-            State::Published(runtime) if !runtime.publication().is_busy() => Some(runtime),
+            State::Published(runtime)
+                if !runtime.publication().is_busy() && !runtime.control_busy() =>
+            {
+                Some(runtime)
+            }
             _ => None,
         }
     }
@@ -260,7 +270,11 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
     /// empty reservation must consult the slot, not a copied runtime that hides pending state.
     pub fn releasable(&self) -> Option<&R> {
         match &self.state {
-            State::Published(runtime) if !runtime.publication().is_busy() => Some(runtime),
+            State::Published(runtime)
+                if !runtime.publication().is_busy() && !runtime.control_busy() =>
+            {
+                Some(runtime)
+            }
             _ => None,
         }
     }
@@ -315,7 +329,7 @@ impl<R: RuntimeIdentity> ThreadRuntimeSlot<R> {
             return Err(SlotError::AlreadyPending);
         }
         let runtime = self.owner().ok_or(SlotError::Vacant)?;
-        if runtime.publication().is_busy() {
+        if runtime.publication().is_busy() || runtime.control_busy() {
             return Err(SlotError::Busy);
         }
         let binding = runtime.binding();

@@ -26,6 +26,12 @@ pub enum ProviderCallerError {
     LifetimeChanged,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderWaitAdmission {
+    Ready,
+    Deferred,
+}
+
 impl ProviderLogicalCaller {
     /// The adapter must first admit the runtime using the authenticated ingress badge and current
     /// process authority. A caller-supplied binding or a pending/constructing row is not admission.
@@ -56,6 +62,35 @@ impl ProviderLogicalCaller {
     /// `None`; never substitute an ownership-visible pending row. This does not mutate the retained
     /// generation or select tokens. Resolve token references only after this check succeeds.
     pub fn validate<R>(
+        &self,
+        admitted: Option<ThreadBinding<R>>,
+        thread: Option<ThreadLifetime>,
+    ) -> Result<(), ProviderCallerError> {
+        self.validate_identity(admitted, thread)
+    }
+
+    /// Classify an already retained wait without confusing blocked ingress with identity loss.
+    /// `published` must exclude construction and retirement rows, but may include a published
+    /// runtime with an unresolved control operation. `admitted` still requires ordinary ingress.
+    /// Deferred preserves the waiter, selected event and Reply; it grants no provider execution.
+    /// Actual PM/process termination must be checked independently by the adapter.
+    pub fn retained_wait_admission<R: Copy>(
+        &self,
+        published: Option<ThreadBinding<R>>,
+        admitted: Option<ThreadBinding<R>>,
+        thread: Option<ThreadLifetime>,
+    ) -> Result<ProviderWaitAdmission, ProviderCallerError> {
+        self.validate_identity(published, thread)?;
+        match admitted {
+            Some(binding) => {
+                self.validate_identity(Some(binding), thread)?;
+                Ok(ProviderWaitAdmission::Ready)
+            }
+            None => Ok(ProviderWaitAdmission::Deferred),
+        }
+    }
+
+    fn validate_identity<R>(
         &self,
         admitted: Option<ThreadBinding<R>>,
         thread: Option<ThreadLifetime>,

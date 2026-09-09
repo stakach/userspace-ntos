@@ -9867,6 +9867,9 @@ impl ExecNtHandler {
         if thread.is_system_thread {
             return Err(nt_process::STATUS_INVALID_HANDLE);
         }
+        if self.pm.has_thread_suspend_control(tid) {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         Ok(tid)
     }
 
@@ -15462,6 +15465,10 @@ impl ExecNtHandler {
             return Err(status);
         }
         self.commit_hosted_thread_runtime_publication(prepared, spawn);
+        if !resume {
+            crate::thread_suspend::publish_dormant(self, u64::from(tid))
+                .expect("unresumed construction retains its exact startup ownership");
+        }
         self.publish_hosted_thread_caller_handle(publication);
         Ok(())
     }
@@ -17597,6 +17604,9 @@ impl ExecNtHandler {
             handle,
             THREAD_SUSPEND_RESUME,
         )?;
+        if self.pm.has_thread_suspend_control(tid) {
+            return Err(nt_process::STATUS_DEVICE_BUSY);
+        }
         let mechanism = self
             .hosted_thread_mechanism_for_tid(tid as u64)
             .ok_or(nt_process::STATUS_INVALID_HANDLE)?;
@@ -17635,7 +17645,6 @@ impl ExecNtHandler {
         memory: SyscallUserMemory,
     ) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
         let thread_handle = args[0];
         let previous_count = args[1];
@@ -17654,7 +17663,7 @@ impl ExecNtHandler {
         print_hex(previous_count as u32);
         print_str(b"\n");
 
-        let (tid, mechanism, tcb) = match self.resolve_hosted_thread_for_control(thread_handle) {
+        let (tid, mechanism, _) = match self.resolve_hosted_thread_for_control(thread_handle) {
             Ok((tid, mechanism, tcb)) => (tid as u64, mechanism, tcb),
             Err(status) => {
                 print_str(b"[thread-life] resume failed: handle resolution status=0x");
@@ -17663,16 +17672,13 @@ impl ExecNtHandler {
                 return status;
             }
         };
-        let previous = match self.pm.resume_thread(tid as nt_process::ThreadId) {
+        let previous = match crate::thread_suspend::control(
+            self, tid as nt_process::ThreadId,
+            nt_process::thread_suspend::ThreadSuspendOperation::Resume,
+        ) {
             Ok(previous) => previous,
             Err(status) => return status,
         };
-        if previous == 1 {
-            if tcb_resume(tcb) != 0 {
-                let _ = self.pm.suspend_thread(tid as nt_process::ThreadId);
-                return STATUS_UNSUCCESSFUL;
-            }
-        }
         print_str(b"[thread-life] resume tid=");
         print_u64(tid);
         print_str(b" pi=");
@@ -17694,7 +17700,6 @@ impl ExecNtHandler {
         memory: SyscallUserMemory,
     ) -> u32 {
         const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
-        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
         let previous_count = args[1];
         if previous_count != 0 && previous_count & 3 != 0 {
@@ -17703,20 +17708,17 @@ impl ExecNtHandler {
         if previous_count != 0 && !self.user_memory_probe_output(memory, previous_count, 4) {
             return STATUS_ACCESS_VIOLATION;
         }
-        let (tid, mechanism, tcb) = match self.resolve_hosted_thread_for_control(args[0]) {
+        let (tid, mechanism, _) = match self.resolve_hosted_thread_for_control(args[0]) {
             Ok((tid, mechanism, tcb)) => (tid as u64, mechanism, tcb),
             Err(status) => return status,
         };
-        let previous = match self.pm.suspend_thread(tid as nt_process::ThreadId) {
+        let previous = match crate::thread_suspend::control(
+            self, tid as nt_process::ThreadId,
+            nt_process::thread_suspend::ThreadSuspendOperation::Suspend,
+        ) {
             Ok(previous) => previous,
             Err(status) => return status,
         };
-        if previous == 0 {
-            if tcb_suspend_r(tcb) != 0 {
-                let _ = self.pm.resume_thread(tid as nt_process::ThreadId);
-                return STATUS_UNSUCCESSFUL;
-            }
-        }
         print_str(b"[thread-life] suspend tid=");
         print_u64(tid);
         print_str(b" pi=");
@@ -37129,20 +37131,11 @@ impl ExecNtHandler {
                             let _ = self.pm.cancel_reserved_handle(handle_reservation);
                             return status;
                         }
-                        if create_suspended {
-                            if let Err(status) = self.pm.suspend_thread(tid) {
-                                let _ = self.pm.cancel_bound_handle(handle_reservation);
-                                return status;
-                            }
-                        } else {
-                            let tcb = self.hosted_main_thread_tcb_for_pi(target_pi).unwrap_or(0);
-                            if tcb <= 1 || tcb_resume(tcb) != 0 {
-                                let _ = self.pm.cancel_bound_handle(handle_reservation);
-                                return 0xC000_0001;
-                            }
-                            let _ = self
-                                .pm
-                                .set_thread_state(tid, nt_process::ThreadState::Ready);
+                        if let Err(status) = crate::thread_suspend::create_initial_thread(
+                            self, tid, create_suspended,
+                        ) {
+                            let _ = self.pm.cancel_bound_handle(handle_reservation);
+                            return status;
                         }
                         let handle =
                             self.pm.publish_reserved_handle(handle_reservation).expect(

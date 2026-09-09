@@ -3097,9 +3097,11 @@ unsafe fn redirect_pending_user_callback(
 /// so. On a wall the component is left blocked in a fault `Call` with `R_win32k` STILL BOUND to it;
 /// a later `reply_on(R, request)` would be delivered as a FAULT reply (`apply_fault_reply` returns
 /// `restart = true` unconditionally for VMFault/CapFault), resuming win32k at the faulting
-/// instruction carrying a request it never asked for. The pump has already `TCB_Suspend`ed it; this
+/// instruction carrying a request it never asked for. The pump has already requested terminal
+/// `TCBSuspend`, which cancels the exact fault IPC/Reply binding on success; this
 /// is the win32k analogue of `dispatch_irp`'s `register_instance_ready(inst, false)` — retire the
-/// component so nothing can ever reply on that stale binding. Zero walls occur on a green boot, so
+/// component so no later request can resume it. Higher-level callback/transport owners stay retained
+/// for retirement independently of the canceled kernel Reply binding. Zero walls occur on a green boot, so
 /// this is defensive; if it ever fires, the boot says so loudly and every later win32k call fails
 /// cleanly instead of corrupting.
 pub(crate) static WIN32K_RETIRED: AtomicU64 = AtomicU64::new(0);
@@ -3144,7 +3146,7 @@ unsafe fn retire_win32k_on_wall(pr: &crate::spawn_hosts::PumpResult) {
     if WIN32K_RETIRED.swap(1, Ordering::Relaxed) == 0 {
         print_str(b"[w32disp] win32k WALLED (label=");
         print_u64(pr.wall_label);
-        print_str(b") -> component RETIRED; its reply object stays bound to a suspended thread\n");
+        print_str(b") -> component RETIRED; terminal cancellation requested, transport owners retained\n");
     }
 }
 

@@ -3565,13 +3565,13 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
     // `reply_on(R, request)`, `decode_reply` would see `pending_fault != 0` and route it through
     // `fault::apply_fault_reply`, which returns `restart = true` UNCONDITIONALLY for VMFault(6) and
     // CapFault(1) (`fault.rs`) — the component would resume at the faulting instruction carrying a
-    // request it never asked for, and immediately re-fault. There is no "park it via the reply"
-    // option and no kernel invocation to unbind a reply object.
+    // request it never asked for, and immediately re-fault. This fault is terminal, not a parked
+    // continuation that a later request may resume.
     //
-    // So we take the honest one: SUSPEND the component's TCB. It stops running, its reply object is
-    // left bound to a thread that will never run again, and the caller retires it so nothing ever
-    // pumps it a second time (`dispatch_irp` → `register_instance_ready(inst,false)`;
-    // `win32k_dispatch_wide` → `WIN32K_RETIRED`). A walled component is dead, and it now says so.
+    // TCBSuspend cancels the fault IPC and its exact Reply binding, then makes the TCB inactive.
+    // The caller retires the component so nothing pumps it a second time (`dispatch_irp` ->
+    // `register_instance_ready(inst,false)`; `win32k_dispatch_wide` -> `WIN32K_RETIRED`). Higher-level
+    // transport/resource owners remain retained for retirement; cancellation does not release them.
     // Zero walls occur on a green boot for EITHER substrate, so this path is defensive.
     if !outcome.completed
         && !outcome.callback_suspended
@@ -3605,9 +3605,7 @@ unsafe fn pump_suspend_walled_component(ch: &PumpChannel, outcome: PumpLoopOutco
         }
         crate::print_str(b" -> TCB_Suspend(component) e=");
         crate::print_u64(e);
-        crate::print_str(
-            b" (its reply object stays bound to a thread that will never run again)\n",
-        );
+        crate::print_str(b" (terminal IPC cancellation; component owners retained)\n");
     }
 }
 

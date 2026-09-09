@@ -10,6 +10,7 @@ struct Runtime {
     publication: ThreadPublicationSlot,
     drops: Rc<Cell<usize>>,
     mechanisms: [u64; 4],
+    control_busy: Cell<bool>,
 }
 
 impl RuntimeTcbProjection for Runtime {
@@ -62,6 +63,9 @@ impl RuntimeIdentity for Runtime {
     fn publication(&self) -> &ThreadPublicationSlot {
         &self.publication
     }
+    fn control_busy(&self) -> bool {
+        self.control_busy.get()
+    }
 }
 
 fn runtime(tcb: u64, drops: &Rc<Cell<usize>>) -> Runtime {
@@ -85,6 +89,7 @@ fn runtime(tcb: u64, drops: &Rc<Cell<usize>>) -> Runtime {
         publication: ThreadPublicationSlot::empty(),
         drops: drops.clone(),
         mechanisms: [9001, 9002, tcb, 9003],
+        control_busy: Cell::new(false),
     }
 }
 
@@ -208,6 +213,66 @@ fn ingress_stops_at_pending_entry_before_journal_preparation() {
     assert_eq!(slot.pending().unwrap().id(), id);
     assert_eq!(slot.owner().unwrap().binding, binding);
     assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn control_busy_fences_all_ordinary_access_without_losing_owner() {
+    let (mut slot, drops) = slot(100);
+    let binding = slot.owner().unwrap().binding;
+    slot.owner().unwrap().control_busy.set(true);
+    assert!(slot.is_protected());
+    assert!(!slot.is_pending());
+    assert!(slot.executable().is_none());
+    assert!(slot.ordinary_mut().is_none());
+    assert!(slot.releasable().is_none());
+    assert!(slot.release_published().is_none());
+    assert_eq!(slot.begin_pending(binding), Err(SlotError::Busy));
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::Publishing
+    );
+    assert_eq!(slot.owner().unwrap().binding, binding);
+    assert_eq!(slot.owner().unwrap().mechanisms, [9001, 9002, 100, 9003]);
+    assert_eq!(drops.get(), 0);
+
+    slot.owner().unwrap().control_busy.set(false);
+    assert!(!slot.is_protected());
+    assert_eq!(slot.executable().unwrap().binding, binding);
+    assert_eq!(slot.ordinary_mut().unwrap().binding, binding);
+    assert_eq!(slot.releasable().unwrap().binding, binding);
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap()
+            .binding,
+        binding
+    );
+    let released = slot.release_published().unwrap();
+    assert!(slot.is_empty());
+    assert_eq!(released.binding, binding);
+    assert_eq!(drops.get(), 0);
+    drop(released);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn clearing_control_busy_allows_exact_retirement_handoff() {
+    let (mut slot, drops) = slot(100);
+    let binding = slot.owner().unwrap().binding;
+    slot.owner().unwrap().control_busy.set(true);
+    assert_eq!(slot.begin_pending(binding), Err(SlotError::Busy));
+    assert!(slot.pending().is_none());
+    slot.owner().unwrap().control_busy.set(false);
+    let id = slot.begin_pending(binding).unwrap();
+    assert_eq!(slot.pending().unwrap().id(), id);
+    assert_eq!(slot.owner().unwrap().binding, binding);
+    assert_eq!(drops.get(), 0);
+    assert!(slot.is_protected());
+    assert_eq!(
+        slot.admit_ingress(binding.badge, Some(binding.process))
+            .unwrap_err(),
+        ThreadIngressError::Pending
+    );
 }
 
 #[test]

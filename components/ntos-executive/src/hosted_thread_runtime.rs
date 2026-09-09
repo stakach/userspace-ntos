@@ -11,6 +11,7 @@ mod memory_retirement;
 #[derive(Debug)]
 pub(crate) struct HostedThreadRuntimeOwner {
     runtime: HostedThreadRuntime,
+    pub(crate) suspension: crate::thread_suspend::HostedThreadSuspend,
     memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage<TP_WORKER_STACK_FRAME_COUNT>,
     registered_memory: Option<nt_user_host::thread_construction::RegisteredThreadMemory>,
     registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation<TP_WORKER_STACK_FRAME_COUNT>,
@@ -25,6 +26,7 @@ impl HostedThreadRuntimeOwner {
     fn new(runtime: HostedThreadRuntime) -> Self {
         Self {
             runtime,
+            suspension: crate::thread_suspend::HostedThreadSuspend::new(),
             memory_coverage: nt_user_host::thread_construction::MemoryConstructionCoverage::empty(),
             registered_memory: None,
             registry_preparation: nt_user_host::thread_reconciliation::ThreadRegistryReconciliation::empty(),
@@ -37,7 +39,7 @@ impl HostedThreadRuntimeOwner {
     }
 
     fn construction_is_empty(&self) -> bool {
-        self.memory_coverage.is_empty()
+        self.suspension.is_empty() && self.memory_coverage.is_empty()
             && !self.registry_preparation.is_prepared() && self.alias_preparation.get().is_none()
             && self.prefetch_preparation.get().is_none()
             && self.provider_preparation.get().is_none()
@@ -1169,6 +1171,10 @@ impl RuntimeIdentity for HostedThreadRuntimeOwner {
 
     fn publication(&self) -> &nt_user_host::thread_publication::ThreadPublicationSlot {
         &self.runtime.publication
+    }
+
+    fn control_busy(&self) -> bool {
+        self.suspension.is_pending()
     }
 }
 
