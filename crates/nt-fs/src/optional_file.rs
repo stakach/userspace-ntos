@@ -60,7 +60,7 @@ impl FileSystem {
 }
 
 impl FileData {
-    fn checked_len(&self, blobs: &[Vec<u8>]) -> Result<usize, u32> {
+    pub(super) fn checked_len(&self, blobs: &[Vec<u8>]) -> Result<usize, u32> {
         match self {
             Self::Bytes(bytes) => Ok(bytes.len()),
             Self::Extents(extents) => extents.iter().try_fold(0usize, |total, extent| {

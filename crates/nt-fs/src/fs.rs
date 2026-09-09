@@ -23,6 +23,10 @@ use crate::status::*;
 #[path = "optional_file.rs"]
 mod optional_file;
 
+#[path = "snapshot_journal.rs"]
+mod snapshot_journal;
+pub use snapshot_journal::*;
+
 /// A MemFs node (spec §12.3). File data and attributes belong to this shared identity; directory
 /// entries own names. Directories retain their single parent for `..`, while regular files may have
 /// any number of entries and a corresponding link count.

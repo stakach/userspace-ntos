@@ -31489,6 +31489,8 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     - [ ] Retain uncertain append/flush and failed truncate work with exact log extent and backend
       identity; never blindly reappend a whole journal after partial append or return after dropping
       recovery state.
+      Host storage support for already-existing snapshot-backed journals is complete below; native
+      reserve ownership, first-journal creation and retained caller integration remain open.
     - [ ] Retain complete caller publication state and exact COMMIT/ACK attempts. Once COMMIT is
       issued, disallow error-based truncate/ABORT; store its receipt before publishing local state,
       publish local generation/event/handle state once, and retry ACK without repeating publication.
@@ -31534,6 +31536,60 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-hive-checked-reads-executive-20260909.log`. Native wiring is compile-verified, not
     runtime proof. No microkernel change or VM run is part of this slice; the 27 strict missing
     win32k imports and native desktop acceptance remain open.
+
+    Retained snapshot-journal checkpoint (2026-09-09): nt-fs now has a non-Clone SnapshotJournal
+    owner for an existing internal journal, its exact bytes, admitted FILE_OBJECT and supplied
+    caller continuation. This uses the existing snapshot format and real ordered block barriers,
+    not HiveIoProvider's memory-only flush methods.
+    - [x] Bind retries to exclusive borrows of the same FileSystem and block-device object plus
+      the owned SnapshotBlockStore range. Admit the existing file against competing writers and
+      deletion, capture its stable file identity and checked original/final extent, and retain
+      all inputs on admission failure. Retry accepts no replacement path, backend or journal.
+    - [x] Reconcile every observed tail byte against the immutable journal prefix before appending
+      only the missing suffix. Invalid backing extents, changed identity, differing bytes, a
+      shortened original extent or excess tail fail without another write. Append uncertainty
+      preserves the owner; a complete append advances irreversibly to snapshot-flush retry.
+    - [x] Obtain borrowed, privately constructed durability evidence only from successful
+      commit_volume_snapshot. Neither a clean bit, old generation nor successful append counts.
+      Snapshot errors retain bytes, caller and FlushPending; retries do not append again. Once
+      publication starts, all rollback requests are refused, including after caller COMMIT errors.
+    - [x] Before publication, retain rollback intent across truncation/snapshot errors. Only a
+      successful snapshot of the original EOF permits releasing a rolled-back caller. Failed
+      rollback cannot return to append or publication. Reuse the existing cached-versus-stable
+      disk fixture across snapshot-store and journal tests instead of duplicating that model.
+
+    Review adjustment: this is an existing-journal storage owner, not native activation or proof
+    of CM acknowledgement. Its release_after_publication boundary must be called only by the
+    eventual exact COMMIT/local-publication/ACK owner. A supplied generic context retains its
+    contents but does not prove that native callers captured every handle/PnP preparation. Make
+    prepared mutation identity opaque/non-Clone before claiming unique native prepared ownership;
+    the current public clonable PreparedSystemHiveMutation is not such an owner. First-journal
+    creation remains a separate retained operation, not an implicit fallback in this append API.
+
+    Native adapter requirements: reserve complete pending work before effects; retain real
+    mount/device/store authority; serialize all writers to the actual snapshot reserve; and enter
+    the existing transient/writable-snapshot allocator scopes for the barrier. A locally borrowed
+    AhciSnapshotDevice wrapper does not exclude other wrappers using EXEC_FS_RAW. Do not retain
+    aliased static mutable FileSystem references across executive re-entry. This host owner keeps
+    its Rust borrows exclusive, but native raw-global access must obey the same ownership rule.
+    The unconditional WritableHiveIoProvider flushes and one-shot native CM wrapper remain open
+    and must be replaced together with complete recovery ownership, not activated piecemeal.
+
+    Validation: all 1,303 tests/doctests pass across nt-fs (162 plus one compile-fail borrow test),
+    nt-config-abi (7), nt-config-client (110), nt-config-server (76), nt-config-manager (35),
+    nt-hive-core (106 plus 18 generator cases), nt-security (223), nt-user-host (494 plus 49
+    integration cases), and 22 other doctests. Log: `.tmp/test-snapshot-journal-full-20260909.log`.
+    Nine new unit tests cover all 1,101 observed prefixes of a 1,100-byte journal, conflicting file
+    opens, wrong/short/excess tails, unavailable snapshot reads, retained caller resources and
+    phase exclusions. Both publication and rollback snapshots inject failure at every write and
+    barrier, in both partial-flush modes, then another barrier failure before successful retry.
+    Durable completion is checked by power-cut restore and exact file bytes, not RAM inspection
+    alone; immediate power loss at the original failure remains covered by snapshot-store tests.
+    The shared CachedDisk extraction preserves the existing fault model. Independent reviews found
+    no remaining defect in this scope. Freestanding executive release passes in 37.62 seconds with
+    293 existing warnings; log: `.tmp/build-snapshot-journal-executive-20260909.log`. No native
+    storage activation, microkernel change or VM run occurred. Strict win32k admission still has
+    27 missing imports; no desktop acceptance is claimed.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

@@ -23,6 +23,8 @@ mod partition;
 mod path;
 mod query;
 mod snapshot_store;
+#[cfg(test)]
+mod snapshot_test_device;
 mod status;
 mod volume;
 
@@ -38,6 +40,8 @@ pub use fs::{
     FileRenameRoot, FileShareAccess, FileSystem, InstalledFileOpenAction, MemFs,
     MemFsBlobCompactError, MemFsBlobCompaction, MemFsSnapshotError, MemFsSnapshotInfo,
     MoveClusterInformation, SetFileNameInformation, StandardInformation, INVALID_HANDLE,
+    SnapshotJournal, SnapshotJournalDurability, SnapshotJournalError, SnapshotJournalOpenError,
+    SnapshotJournalPhase,
 };
 pub use hive_provider::NtFileHiveIoProvider;
 pub use notify::*;
