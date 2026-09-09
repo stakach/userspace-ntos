@@ -3,7 +3,10 @@ use super::*;
 fn run(code: &[u8], frame: u8, ctx: &mut Context, stack: &dyn StackReader) -> Option<bool> {
     let mut image = img_with_unwind(&[], 1, 0, 0, frame);
     image.write(0x1050, code);
-    crate::epilogue::unwind_return(image.base, 0x1050, 0x1100, frame, ctx, &image, stack)
+    crate::epilogue::unwind_return(
+        image.base, 0x1050, 0x1100, frame, ctx, &image, stack,
+        &mut ContextPointers::default(),
+    )
 }
 
 #[test]
@@ -213,7 +216,8 @@ fn truncated_code_never_reads_past_the_covering_function() {
                 0,
                 &mut ctx,
                 &image,
-                &NoStackReads
+                &NoStackReads,
+                &mut ContextPointers::default(),
             ),
             None
         );
@@ -252,7 +256,8 @@ fn unreadable_instruction_inside_a_valid_function_is_a_failure() {
             0,
             &mut ctx,
             &image,
-            &NoStackReads
+            &NoStackReads,
+            &mut ContextPointers::default(),
         ),
         None
     );
@@ -269,7 +274,10 @@ fn return_needs_no_instruction_bytes_after_it() {
     let mut ctx = Context::default();
     ctx.set_rsp(0x9000);
     assert_eq!(
-        crate::epilogue::unwind_return(image.base, 0x1050, 0x1100, 0, &mut ctx, &image, &stack),
+        crate::epilogue::unwind_return(
+            image.base, 0x1050, 0x1100, 0, &mut ctx, &image, &stack,
+            &mut ContextPointers::default(),
+        ),
         Some(true)
     );
 }

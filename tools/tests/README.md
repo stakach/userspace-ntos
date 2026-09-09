@@ -57,8 +57,16 @@ without syscalls or external dependencies and must preserve its own Windows ABI 
 ```
 
 The default sweeps `NtMapViewOfSection`; `--all-services` sweeps all eight arity fixtures. Every
-prologue and epilogue instruction boundary must be covered. Assertions include caller nonvolatiles,
-RIP/RSP, establisher frame, untouched context fields, and stack/output canaries. For the metadata
-negative control, pass a DLL built at `91d99245` with `--negative-dll`: its missing native runtime
-records must fail explicitly. The test does not prove ContextPointers output, foreign SEH crossing
-Rust ABI boundaries, kernel hardware-fault delivery, or exception resume.
+prologue and epilogue instruction boundary must be covered, with both NULL and non-NULL
+ContextPointers. Assertions include caller nonvolatiles, RIP/RSP, establisher frame, untouched
+context fields, and stack/output canaries. Saved integer-register pointers must name the exact
+producer stack slots; unrestored integer and all floating slots retain their input values.
+The native stubs do not save XMM registers, so populated floating pointers are covered separately
+by the host `nt-unwind` tests rather than claimed by this artifact probe.
+
+For the metadata negative control, pass a DLL built at `91d99245` with `--negative-dll`: its
+missing native runtime records must fail explicitly. A DLL built at `6de2cd5d` can be passed with
+`--negative-pointers-dll`: it must have valid metadata and unwind correctly with NULL, then fail
+only because non-NULL ContextPointers remains untouched. Both controls can run in one invocation.
+The test does not prove foreign SEH crossing Rust ABI boundaries, kernel hardware-fault delivery,
+or exception resume.

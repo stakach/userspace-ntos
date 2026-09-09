@@ -373,10 +373,13 @@ unsafe fn pdata_row_ptr(base: u64, begin_rva: u32) -> *mut c_void {
 /// `RtlVirtualUnwind(HandlerType, ImageBase, ControlPc, FunctionEntry, ContextRecord, HandlerData*,
 /// EstablisherFrame*, ContextPointers) -> PEXCEPTION_ROUTINE`. Unwinds ONE frame in place through the
 /// live `.xdata`, updating `*ContextRecord`, writing `*EstablisherFrame` + `*HandlerData` (the SCOPE
-/// TABLE VA for `__C_specific_handler`), and returning the language-handler VA (or NULL).
+/// TABLE VA for `__C_specific_handler`), and returning the language-handler VA (or NULL). Optional
+/// ContextPointers slots receive the stack addresses used to restore their respective registers;
+/// slots not restored by this unwind retain their previous contents.
 ///
 /// # Safety
-/// `context_record` a valid CONTEXT; `function_entry` a `RUNTIME_FUNCTION*`; out-ptrs writable.
+/// `context_record` a valid CONTEXT; `function_entry` a `RUNTIME_FUNCTION*`; non-null out-ptrs writable,
+/// including the full 256-byte AMD64 KNONVOLATILE_CONTEXT_POINTERS when supplied.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn rtl_virtual_unwind(
     handler_type: u32,
@@ -386,7 +389,7 @@ pub unsafe fn rtl_virtual_unwind(
     context_record: *mut u8,
     handler_data_out: *mut *mut c_void,
     establisher_frame_out: *mut u64,
-    _context_pointers: *mut c_void,
+    context_pointers: *mut c_void,
 ) -> *mut c_void {
     if function_entry.is_null() || context_record.is_null() {
         return core::ptr::null_mut();
@@ -399,7 +402,8 @@ pub unsafe fn rtl_virtual_unwind(
             unwind_info: core::ptr::read_unaligned(function_entry.add(8) as *const u32),
         };
         let mut ctx = context_from_raw(context_record);
-        let res = ex::virtual_unwind(
+        let mut pointers = ex::ContextPointers::default();
+        let res = ex::virtual_unwind_with_pointers(
             handler_type as u8,
             image_base,
             control_pc,
@@ -407,10 +411,26 @@ pub unsafe fn rtl_virtual_unwind(
             &mut ctx,
             &LiveImage,
             &LiveStack,
+            &mut pointers,
         );
         match res {
             Some(r) => {
                 context_to_raw(&ctx, context_record);
+                if !context_pointers.is_null() {
+                    // AMD64 KNONVOLATILE_CONTEXT_POINTERS is FloatingContext[16] followed by
+                    // IntegerContext[16]. Untouched slots retain their caller-provided values.
+                    let output = context_pointers.cast::<u64>();
+                    for (index, address) in pointers.floating.iter().enumerate() {
+                        if let Some(address) = address {
+                            core::ptr::write_unaligned(output.add(index), *address);
+                        }
+                    }
+                    for (index, address) in pointers.integer.iter().enumerate() {
+                        if let Some(address) = address {
+                            core::ptr::write_unaligned(output.add(16 + index), *address);
+                        }
+                    }
+                }
                 if !establisher_frame_out.is_null() {
                     *establisher_frame_out = r.establisher_frame;
                 }

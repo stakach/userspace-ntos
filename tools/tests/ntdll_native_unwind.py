@@ -10,8 +10,9 @@ boundaries and stack bytes become inputs to the actual exported RtlVirtualUnwind
 No Python unwind implementation or substituted exception runtime is used. Any syscall made by
 the unwinder itself is a dependency failure, not a request the harness emulates.
 
-ContextPointers is NULL: its currently ignored output is not accepted by this test. Neither
-hardware fault delivery nor exception propagation across compiled extern ABI frames is proved.
+Each boundary is exercised with NULL and non-NULL ContextPointers. Only pointer slots for
+registers actually restored by this five-push frame may change. Neither hardware fault delivery
+nor exception propagation across compiled extern ABI frames is proved.
 """
 
 from __future__ import annotations
@@ -46,11 +47,27 @@ OUTPUT_BASE = STACK_BASE + 0x400000
 CONTEXT_ADDRESS = OUTPUT_BASE + 0x100
 HANDLER_DATA = OUTPUT_BASE + 0x700
 ESTABLISHER = OUTPUT_BASE + 0x740
+CONTEXT_POINTERS = OUTPUT_BASE + 0x800
+CONTEXT_POINTER_WORDS = tuple(0xFACE_0000_0000_0000 + index * 0x101 for index in range(32))
 MAX_UNWIND_INSTRUCTIONS = 100_000
 MAX_SNAPSHOTS = 1024
 MAX_SUITE_SECONDS = 120
 PROLOGUE_BOUNDARIES = frozenset((0, 1, 2, 4, 6, 8, 15))
 EPILOGUE_BOUNDARIES = frozenset((223, 230, 232, 234, 236, 237, 238))
+
+
+def expected_context_pointers(control_offset: int) -> tuple[int, ...]:
+    expected = list(CONTEXT_POINTER_WORDS)
+    # Golden addresses for the already-verified fixed producer prologue. At a prologue PC only
+    # completed pushes exist; at an epilogue PC only pops not yet executed restore a register.
+    for register, push_end, stack_offset, pop_pc in (
+        (7, 1, 8, 237), (6, 2, 16, 236), (15, 4, 24, 234),
+        (12, 6, 32, 232), (13, 8, 40, 230),
+    ):
+        restored = control_offset <= pop_pc if control_offset >= 223 else control_offset >= push_end
+        if restored:
+            expected[16 + register] = ENTRY_RSP - stack_offset
+    return tuple(expected)
 
 
 @dataclass(frozen=True)
@@ -202,15 +219,20 @@ class UnwindProbe(Probe):
         self.mu.mem_map(UNWIND_RETURN, PAGE, unicorn.UC_PROT_READ | unicorn.UC_PROT_EXEC)
         self.mu.mem_map(OUTPUT_BASE, PAGE, unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE)
 
-    def unwind_snapshot(self, entry: int, metadata: FunctionMetadata, snapshot: Snapshot) -> int:
+    def unwind_snapshot(
+        self, entry: int, metadata: FunctionMetadata, snapshot: Snapshot, *, with_pointers: bool = False,
+    ) -> int:
         self.failure = None
         self.unwind_instructions = 0
         self.mu.mem_write(STACK_BASE, snapshot.stack)
         self.mu.mem_write(UNWIND_STACK, bytes([0xA7]) * UNWIND_STACK_BYTES)
         self.mu.mem_write(OUTPUT_BASE, bytes([0xBC]) * PAGE)
         self.mu.mem_write(CONTEXT_ADDRESS, snapshot.context)
+        self.mu.mem_write(CONTEXT_POINTERS, words(CONTEXT_POINTER_WORDS))
         self.mu.mem_write(UNWIND_RSP, words((UNWIND_RETURN,)))
-        self.mu.mem_write(UNWIND_RSP + 40, words((CONTEXT_ADDRESS, HANDLER_DATA, ESTABLISHER, 0)))
+        self.mu.mem_write(UNWIND_RSP + 40, words((
+            CONTEXT_ADDRESS, HANDLER_DATA, ESTABLISHER, CONTEXT_POINTERS if with_pointers else 0,
+        )))
         for index, name in enumerate(CONTEXT_GPRS):
             self.write_reg(name, 0x2233_4455_6677_8800 + index)
         self.write_reg("RSP", UNWIND_RSP)
@@ -280,6 +302,8 @@ class UnwindProbe(Probe):
             require(actual[start:end] == snapshot.context[start:end], "unwind-context", f"context bytes {start:#x}..{end:#x} changed")
         output_after = bytes(self.mu.mem_read(OUTPUT_BASE, PAGE))
         mutable = ((0x100, 0x100 + CONTEXT_BYTES), (0x700, 0x708), (0x740, 0x748))
+        if with_pointers:
+            mutable += ((0x800, 0x900),)
         for offset, (before, after) in enumerate(zip(output_before, output_after)):
             if not any(start <= offset < end for start, end in mutable):
                 require(before == after, "unwind-canary", f"output canary changed at +{offset:#x}")
@@ -293,6 +317,15 @@ class UnwindProbe(Probe):
             and bytes(self.mu.mem_read(UNWIND_RSP + 72, 0x100)) == frame_tail_before,
             "unwind-canary", "unwinder crossed its own stack/argument canaries",
         )
+        if with_pointers:
+            pointers = struct.unpack("<32Q", self.mu.mem_read(CONTEXT_POINTERS, 256))
+            expected = expected_context_pointers(snapshot.pc - metadata.begin)
+            for index, (value, target) in enumerate(zip(pointers, expected)):
+                require(
+                    value == target, "unwind-context-pointers",
+                    f"{self.name} PC+{snapshot.pc - metadata.begin:#x}/after-call-{snapshot.completed_calls}: "
+                    f"{'floating' if index < 16 else 'integer'}[{index % 16}]={value:#x}, expected={target:#x}",
+                )
         return self.unwind_instructions
 
 
@@ -310,13 +343,15 @@ def sweep(artifact: Artifact, entry: int, metadata: FunctionMetadata, name: str,
     probe.prepare_unwinder()
     total_instructions = 0
     for snapshot in probe.snapshots.values():
-        require(time.monotonic() < deadline, "suite-limit", "unwind sweep deadline")
-        total_instructions += probe.unwind_snapshot(entry, metadata, snapshot)
+        for with_pointers in (False, True):
+            require(time.monotonic() < deadline, "suite-limit", "unwind sweep deadline")
+            total_instructions += probe.unwind_snapshot(entry, metadata, snapshot, with_pointers=with_pointers)
     print(
         f"PASS {name}/worker: actual RtlVirtualUnwind restored {len(probe.snapshots)} interrupted states "
-        f"(all prologue/body/retry/epilogue boundaries; {total_instructions} unwinder instructions)"
+        f"(NULL and non-NULL ContextPointers; all prologue/body/retry/epilogue boundaries; "
+        f"{total_instructions} unwinder instructions)"
     )
-    return len(probe.snapshots)
+    return len(probe.snapshots) * 2
 
 
 def negative_control(path: Path) -> None:
@@ -330,10 +365,37 @@ def negative_control(path: Path) -> None:
     raise OracleFailure("negative-control", "old DLL unexpectedly has complete native-stub unwind metadata")
 
 
+def negative_pointers_control(path: Path, current_digest: str) -> None:
+    old = Artifact.load(path)
+    require(old.digest != current_digest, "negative-control", "old pointer DLL must differ from current DLL")
+    entry, metadata = load_metadata(old)
+    name = "NtMapViewOfSection"
+    function = metadata[name]
+    probe = UnwindProbe(old, name)
+    probe.run()
+    snapshot = probe.snapshots.get((function.begin + function.prologue_bytes, 0))
+    require(snapshot is not None, "negative-control", "old artifact full-prologue body boundary missing")
+    probe.prepare_unwinder()
+    # The old artifact must have valid metadata and perform the actual unwind correctly first.
+    probe.unwind_snapshot(entry, function, snapshot)
+    try:
+        probe.unwind_snapshot(entry, function, snapshot, with_pointers=True)
+    except OracleFailure as error:
+        require(
+            error.category == "unwind-context-pointers"
+            and bytes(probe.mu.mem_read(CONTEXT_POINTERS, 256)) == words(CONTEXT_POINTER_WORDS),
+            "negative-control", f"expected ignored ContextPointers only, got: {error}",
+        )
+        print(f"PASS missing-ContextPointers negative control sha256={old.digest}: {error}")
+        return
+    raise OracleFailure("negative-control", "old DLL unexpectedly populated ContextPointers")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("dll", type=Path)
     parser.add_argument("--negative-dll", type=Path)
+    parser.add_argument("--negative-pointers-dll", type=Path, help="valid unwind metadata but old ignored ContextPointers implementation")
     parser.add_argument("--all-services", action="store_true", help="execute boundary sweeps for all eight producer fixtures")
     args = parser.parse_args()
     deadline = time.monotonic() + MAX_SUITE_SECONDS
@@ -347,7 +409,10 @@ def main() -> int:
         if args.negative_dll is not None:
             require(time.monotonic() < deadline, "suite-limit", "negative-control deadline")
             negative_control(args.negative_dll)
-        print(f"PASS {count} real RtlVirtualUnwind calls; ContextPointers, foreign-ABI SEH, and hardware fault delivery remain unproved")
+        if args.negative_pointers_dll is not None:
+            require(time.monotonic() < deadline, "suite-limit", "pointer-negative-control deadline")
+            negative_pointers_control(args.negative_pointers_dll, artifact.digest)
+        print(f"PASS {count} real RtlVirtualUnwind calls including exact ContextPointers; foreign-ABI SEH and hardware fault delivery remain unproved")
         return 0
     except (OracleFailure, OSError, pefile.PEFormatError, unicorn.UcError) as error:
         print(f"FAIL {error}", file=sys.stderr)

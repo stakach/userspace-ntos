@@ -1,4 +1,4 @@
-use crate::{Context, ImageReader, StackReader};
+use crate::{Context, ContextPointers, ImageReader, StackReader};
 
 struct Code<'a> {
     image: &'a dyn ImageReader,
@@ -131,6 +131,7 @@ fn decode(code: &Code<'_>, start: u32, frame_register: u8) -> Option<Option<Plan
 /// after full decoding. Failed reads/arithmetic never select a different unwind path or publish a
 /// partially restored context. Pop opcodes are replayed without allocating on the exception path.
 /// The image owner must keep instruction bytes stable for the duration of this call.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unwind_return(
     image_base: u64,
     control_rva: u32,
@@ -139,6 +140,7 @@ pub(crate) fn unwind_return(
     context: &mut Context,
     image: &dyn ImageReader,
     stack: &dyn StackReader,
+    pointers: &mut ContextPointers,
 ) -> Option<bool> {
     let code = Code {
         image,
@@ -149,6 +151,7 @@ pub(crate) fn unwind_return(
         return Some(false);
     };
     let mut next = *context;
+    let mut next_pointers = *pointers;
     match plan.adjustment {
         Adjustment::None => {}
         Adjustment::Add(value) => next.set_rsp(next.rsp().checked_add_signed(value)?),
@@ -170,6 +173,7 @@ pub(crate) fn unwind_return(
         let value = stack.read_u64(rsp)?;
         next.set_rsp(rsp.checked_add(8)?);
         next.gpr[register] = value;
+        next_pointers.integer[register] = Some(rsp);
     }
     next.rip = stack.read_u64(next.rsp())?;
     next.set_rsp(
@@ -177,5 +181,6 @@ pub(crate) fn unwind_return(
             .checked_add(8 + u64::from(plan.return_adjustment))?,
     );
     *context = next;
+    *pointers = next_pointers;
     Some(true)
 }

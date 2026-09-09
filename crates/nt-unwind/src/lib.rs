@@ -125,6 +125,18 @@ pub struct Context {
     pub xmm: [[u64; 2]; 16],
 }
 
+/// Saved-register locations for `KNONVOLATILE_CONTEXT_POINTERS`, indexed by ABI register number.
+/// A restored integer register points to its saved u64; an XMM register points to the beginning
+/// of its saved 128-bit value. Registers not restored by this unwind retain their input entries.
+/// These are observed addresses, not references or authority to access the underlying memory.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextPointers {
+    /// Saved locations for RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, and R8..R15.
+    pub integer: [Option<u64>; 16],
+    /// Saved locations for XMM0..XMM15.
+    pub floating: [Option<u64>; 16],
+}
+
 /// ABI register numbers (index into [`Context::gpr`]).
 pub const REG_RAX: usize = 0;
 /// `RCX`.
@@ -555,7 +567,35 @@ pub fn virtual_unwind(
     img: &dyn ImageReader,
     stack: &dyn StackReader,
 ) -> Option<UnwindResult> {
+    virtual_unwind_with_pointers(
+        handler_type,
+        image_base,
+        control_pc,
+        func,
+        ctx,
+        img,
+        stack,
+        &mut ContextPointers::default(),
+    )
+}
+
+/// [`virtual_unwind`] with saved-register locations. Only executed register restores update
+/// pointer entries; prologue skips, stack allocations, frame setup and the return-address pop do
+/// not. Chained levels accumulate into the same pointer set. Both outputs remain unchanged on
+/// any failure, including a late handler-data read or epilogue stack arithmetic overflow.
+#[allow(clippy::too_many_arguments)]
+pub fn virtual_unwind_with_pointers(
+    handler_type: HandlerType,
+    image_base: u64,
+    control_pc: u64,
+    func: RuntimeFunction,
+    ctx: &mut Context,
+    img: &dyn ImageReader,
+    stack: &dyn StackReader,
+    pointers: &mut ContextPointers,
+) -> Option<UnwindResult> {
     let mut next = *ctx;
+    let mut next_pointers = *pointers;
     let result = virtual_unwind_inner(
         handler_type,
         image_base,
@@ -564,11 +604,14 @@ pub fn virtual_unwind(
         &mut next,
         img,
         stack,
+        &mut next_pointers,
     )?;
     *ctx = next;
+    *pointers = next_pointers;
     Some(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn virtual_unwind_inner(
     handler_type: HandlerType,
     image_base: u64,
@@ -577,6 +620,7 @@ fn virtual_unwind_inner(
     ctx: &mut Context,
     img: &dyn ImageReader,
     stack: &dyn StackReader,
+    pointers: &mut ContextPointers,
 ) -> Option<UnwindResult> {
     let covering_func = func;
     let control_rva = u32::try_from(control_pc.checked_sub(image_base)?).ok()?;
@@ -607,6 +651,7 @@ fn virtual_unwind_inner(
             ctx,
             img,
             stack,
+            pointers,
         )?
     {
         return Some(UnwindResult {
@@ -626,6 +671,7 @@ fn virtual_unwind_inner(
             ctx,
             img,
             stack,
+            pointers,
         )?;
         if hdr.is_chained() {
             links_left = links_left.checked_sub(1)?;
@@ -729,6 +775,7 @@ fn unwind_codes(
     ctx: &mut Context,
     img: &dyn ImageReader,
     stack: &dyn StackReader,
+    pointers: &mut ContextPointers,
 ) -> Option<bool> {
     let count = hdr.count_of_codes as usize;
     let mut i = 0usize;
@@ -758,6 +805,7 @@ fn unwind_codes(
                 ctx,
                 img,
                 stack,
+                pointers,
             )? {
                 return Some(true);
             }
@@ -877,14 +925,17 @@ fn apply_code(
     ctx: &mut Context,
     img: &dyn ImageReader,
     stack: &dyn StackReader,
+    pointers: &mut ContextPointers,
 ) -> Option<bool> {
     let slot = |n: usize| unwind_rva + 4 + ((idx + n) as u32) * 2;
     match op {
         uwop::PUSH_NONVOL => {
             // A `push reg` was executed: the register's saved value sits at [RSP]; pop it, RSP += 8.
-            let v = stack.read_u64(ctx.rsp())?;
+            let address = ctx.rsp();
+            let v = stack.read_u64(address)?;
             ctx.gpr[op_info as usize] = v;
             ctx.set_rsp(ctx.rsp().checked_add(8)?);
+            pointers.integer[op_info as usize] = Some(address);
         }
         uwop::ALLOC_LARGE => {
             let size = if op_info == 0 {
@@ -907,27 +958,35 @@ fn apply_code(
         uwop::SAVE_NONVOL => {
             // The stored u16 is a count of 8-byte slots from the established frame base.
             let off = (img.read_u16(image_base, slot(1))? as u64) * 8;
-            let v = stack.read_u64(establisher_frame.checked_add(off)?)?;
+            let address = establisher_frame.checked_add(off)?;
+            let v = stack.read_u64(address)?;
             ctx.gpr[op_info as usize] = v;
+            pointers.integer[op_info as usize] = Some(address);
         }
         uwop::SAVE_NONVOL_FAR => {
             // The stored u32 is a raw byte offset from the established frame base.
             let off = img.read_u32(image_base, slot(1))? as u64;
-            let v = stack.read_u64(establisher_frame.checked_add(off)?)?;
+            let address = establisher_frame.checked_add(off)?;
+            let v = stack.read_u64(address)?;
             ctx.gpr[op_info as usize] = v;
+            pointers.integer[op_info as usize] = Some(address);
         }
         uwop::SAVE_XMM128 => {
             // The stored u16 is a count of 16-byte slots from the established frame base.
             let off = (img.read_u16(image_base, slot(1))? as u64) * 16;
-            let lo = stack.read_u64(establisher_frame.checked_add(off)?)?;
-            let hi = stack.read_u64(establisher_frame.checked_add(off + 8)?)?;
+            let address = establisher_frame.checked_add(off)?;
+            let lo = stack.read_u64(address)?;
+            let hi = stack.read_u64(address.checked_add(8)?)?;
             ctx.xmm[op_info as usize] = [lo, hi];
+            pointers.floating[op_info as usize] = Some(address);
         }
         uwop::SAVE_XMM128_FAR => {
             let off = img.read_u32(image_base, slot(1))? as u64;
-            let lo = stack.read_u64(establisher_frame.checked_add(off)?)?;
-            let hi = stack.read_u64(establisher_frame.checked_add(off + 8)?)?;
+            let address = establisher_frame.checked_add(off)?;
+            let lo = stack.read_u64(address)?;
+            let hi = stack.read_u64(address.checked_add(8)?)?;
             ctx.xmm[op_info as usize] = [lo, hi];
+            pointers.floating[op_info as usize] = Some(address);
         }
         6 | 7 => {
             // UWOP_EPILOG / UWOP_SPARE_CODE — no register effect during a virtual unwind.
@@ -1244,6 +1303,7 @@ mod tests {
     use std::vec;
 
     mod chain;
+    mod context_pointers;
     mod epilogue;
     mod scope;
 

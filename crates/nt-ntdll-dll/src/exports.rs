@@ -23167,7 +23167,8 @@ pub unsafe extern "system" fn rtl_unwind_ex(
 /// `RtlVirtualUnwind(HandlerType, ImageBase, ControlPc, FunctionEntry, ContextRecord, HandlerData*,
 /// EstablisherFrame*, ContextPointers) -> PEXCEPTION_ROUTINE` — BATCH 42: the REAL single-frame
 /// unwind ([`crate::seh::rtl_virtual_unwind`]): parse the `.xdata`, apply the unwind codes, update
-/// `*ContextRecord`, and return the language handler (+ `*HandlerData`) or NULL.
+/// `*ContextRecord` and the restored-register slots of optional `*ContextPointers`, and return the
+/// language handler (+ `*HandlerData`) or NULL.
 ///
 /// # Safety
 /// Called during exception dispatch; all pointers valid per the SEH ABI.

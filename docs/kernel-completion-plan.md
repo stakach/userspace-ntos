@@ -30666,6 +30666,24 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before removing the old suspension. Do not describe that existing fail-stop path as recovered.
     The strict 27-import desktop frontier and full native-call producer/consumer cutover remain open.
 
+    Callback-transfer audit refinement (2026-09-09): external-token reservation alone is not a
+    sufficient cutover. Pending callback input is still read from the shared win32k callback page
+    during redirect; the active frame retains its header but not those input bytes. Reserve bounded
+    payload storage before provider entry and capture the exact input before releasing shared-state
+    execution ownership. Deferred redirect/cancel must use exact callback correlation plus
+    client/lane/dispatch identity, replacing global-top selection. A retained source suspension must
+    cover preparation/copyout, checked context install, active-frame publication, Reply ACK and
+    local reply-cap retirement. Publish reserved external ownership before waking the client, but
+    defer callback-return processing until transfer acknowledgement/retirement is complete.
+
+    The current cancellation loop is not terminal evidence: it can remove callback tracking before
+    resuming the provider, then encounter another provider/LPC wait. Its status/boolean result must
+    not authorize ordinary client Reply or capability release after incomplete execution. The old
+    transfer branch ignores that completion boolean; replace this entire boundary together with
+    retained cancellation/quiescence outcomes, not a token-only patch. Required tests include
+    interleaved payloads, pre-entry capacity refusal, stale correlation, partial copyout/context ACK,
+    Reply failure, racing callback return, and cancellation without lane or capability reuse.
+
     Tranche 151 producer consolidation (2026-09-09, host/artifact validation accepted): internal ntdll callers
     now use the same generated, typed Windows-ABI entries as the exported Nt functions. The old
     compiler-framed native marshaler and separate IPC-buffer staging helpers are removed. Existing
@@ -30741,7 +30759,34 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     panic behavior. Audit unwind-capable ABI declarations and generated callers together before
     claiming exceptions can cross those boundaries. Direct RtlVirtualUnwind frame recovery is
     necessary evidence, not proof of a complete exception-dispatch/resume path. ContextPointers
-    output from RtlVirtualUnwind also remains a separate compatibility requirement.
+    output is addressed by the following checkpoint, not by native-stub metadata alone.
+
+    Tranche 151 ContextPointers checkpoint (2026-09-09, host/artifact validation accepted):
+    the host unwind core now retains optional saved-register addresses, including partial-prologue
+    filtering, epilogue pops, chained records and near/far integer/XMM saves. Context and pointer
+    changes publish together only after the full unwind succeeds, including late handler reads.
+    The DLL wrapper preserves every untouched in/out slot in the AMD64 floating[16]/integer[16]
+    pointer layout and writes only actual restored-register locations. No pointers are fabricated
+    from the final context. The original host API remains a compatible wrapper over the same core;
+    the formerly ignored native ContextPointers argument is now wired to it.
+
+    Accepted serialized validation: 168 nt-unwind tests (12 new pointer-focused cases), 657 ntdll
+    tests, 15 artifact-verifier tests and two compile-fail doctests pass
+    (`.tmp/test-context-pointers-host-20260909.log`). Full DLL build/import/template/unwind gates
+    pass (`.tmp/build-context-pointers-ntdll-20260909.log`), as does the non-Windows x86-64 library
+    build (`.tmp/build-context-pointers-elf-20260909.log`). The actual DLL's RtlVirtualUnwind passes
+    1,764 calls covering NULL/non-NULL pointer output at all captured prologue/body/retry/epilogue
+    boundaries across eight native arity fixtures. The metadata negative control still fails as
+    required; a separate pre-change DLL has valid metadata and successful NULL unwind, but fails
+    specifically because all non-NULL pointer slots remain untouched
+    (`.tmp/test-context-pointers-artifact-20260909.log`). The native producer's 32 cases/two negative
+    controls and RtlCaptureContext executable probe still pass
+    (`.tmp/test-context-pointers-producer-artifact-20260909.log`,
+    `.tmp/test-context-pointers-capture-artifact-20260909.log`). Populated XMM save pointers are
+    host-core evidence; these native stubs save only integer registers, so the artifact probe
+    verifies floating slots remain untouched rather than claiming an emitted XMM-save fixture.
+    No microkernel mechanisms, NT boot staging or desktop acceptance changed. The callback transfer,
+    native application-record cutover, foreign-ABI SEH and strict 27-import frontier remain open.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
