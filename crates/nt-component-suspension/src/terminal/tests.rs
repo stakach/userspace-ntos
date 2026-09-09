@@ -72,6 +72,38 @@ fn ack_all(lanes: &mut Lanes, identity: TerminalIdentity) {
 }
 
 #[test]
+fn running_provider_excludes_terminal_entry_but_not_an_entered_stage_ack() {
+    let mut lanes = Lanes::new(2, 4);
+    let identity = retained(&mut lanes, 1);
+    let reply = binding(1).reply_object;
+    let peer = lanes.allocate(binding(2)).unwrap();
+    let peer_reply = binding(2).reply_object;
+    let before = lanes.terminal(identity, reply).unwrap().phase;
+    lanes.begin_dispatch(peer, peer_reply).unwrap();
+    assert_eq!(
+        lanes.next_terminal_if(|_, _| panic!("running provider excludes terminal selection")),
+        None
+    );
+    assert!(matches!(
+        lanes.begin_terminal_stage(identity, reply, TerminalStage::Output),
+        Err(LaneError::Busy)
+    ));
+    assert_eq!(lanes.terminal(identity, reply).unwrap().phase, before);
+    lanes.finish_dispatch(peer, peer_reply).unwrap();
+    let mut attempt = lanes
+        .begin_terminal_stage(identity, reply, TerminalStage::Output)
+        .unwrap();
+    lanes.begin_dispatch(peer, peer_reply).unwrap();
+    lanes
+        .record_terminal_stage(&mut attempt, reply, TerminalStageOutcome::Acknowledged)
+        .unwrap();
+    assert_eq!(lanes.next_terminal(), None);
+    lanes.finish_dispatch(peer, peer_reply).unwrap();
+    assert_eq!(lanes.next_terminal(), Some(identity));
+    ack(&mut lanes, identity, TerminalStage::Context);
+}
+
+#[test]
 fn output_context_reply_and_local_retirement_retain_exact_original_frame() {
     let mut lanes = Lanes::new(2, 4);
     let identity = retained(&mut lanes, 1);

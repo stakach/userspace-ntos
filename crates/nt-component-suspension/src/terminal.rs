@@ -185,6 +185,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         &self,
         mut predicate: impl FnMut(TerminalIdentity, &TerminalView<'_, C, R, T>) -> bool,
     ) -> Option<TerminalIdentity> {
+        if self.running.is_some() {
+            return None;
+        }
         self.slots
             .iter()
             .filter_map(|slot| {
@@ -229,6 +232,9 @@ impl<C, R, T> ComponentSuspensionLanes<C, R, T> {
         reply_object: u64,
         expected: TerminalStage,
     ) -> Result<TerminalAttempt, LaneError> {
+        if self.running.is_some() {
+            return Err(LaneError::Busy);
+        }
         self.terminal_record(identity, reply_object)?;
         let record = self.lane_mut(identity.lane())?.terminal.as_mut().unwrap();
         if !matches!(record.phase, TerminalPhase::Ready { stage, .. } if stage == expected) {

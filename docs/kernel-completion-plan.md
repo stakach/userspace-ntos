@@ -30653,6 +30653,13 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     (`.tmp/build-component-terminal-final-executive-20260909.log`). No microkernel code or NT boot
     staging changed in this checkpoint; this is not a new desktop runtime proof.
 
+    Execution-token review: terminal selection and new stage entry also refuse while another
+    provider lane is running, because Output can refresh shared win32k client state. Recording an
+    already-entered stage's ACK remains legal, so this exclusion cannot discard an IPC outcome.
+    All 51 component-suspension tests plus its compile-fail ticket test pass
+    (`.tmp/test-component-terminal-execution-gate-20260909.log`), and the executive release rebuild
+    passes (`.tmp/build-component-terminal-execution-gate-20260909.log`).
+
     The provider-to-`UserCallbackSuspended` transfer remains a separate open boundary: reserve its
     external token before provider entry, retain redirect and cancellation outcomes, distinguish
     private context-write ACK from later callback bookkeeping, and acknowledge its client reply
