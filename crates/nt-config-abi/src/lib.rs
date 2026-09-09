@@ -128,6 +128,8 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_KEY_CLOSE: u16 = 0x215d;
     /// Query retained-OPEN authority, acquire/replay one exact open attempt, or acknowledge it.
     pub const CM_OP_SYSTEM_HIVE_KEY_OPEN: u16 = 0x215e;
+    /// Retained mutation publication and explicit acknowledgement.
+    pub const CM_OP_SYSTEM_HIVE_MUTATION_COMMIT: u16 = 0x215f;
     /// Register a requester bank, capture/replay a retained snapshot, read it, or acknowledge it.
     pub const CM_OP_RETAINED_SNAPSHOT: u16 = 0x2160;
 }
@@ -722,6 +724,52 @@ pub struct CmHiveMutationRequest {
     pub lease_token: u64,
 }
 
+pub mod hive_mutation_commit_operation {
+    pub const COMMIT: u16 = 1;
+    pub const ACKNOWLEDGE: u16 = 2;
+}
+
+pub mod hive_mutation_commit_disposition {
+    pub const RETAINED: u16 = 1;
+    pub const ACKNOWLEDGED: u16 = 2;
+    pub const ALREADY_ACKNOWLEDGED: u16 = 3;
+}
+
+/// COMMIT repeats the exact prepared identity after an uncertain reply. ACK carries only the
+/// receipt bank/generation and remains valid independently of the current mount generation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveMutationCommitRequest {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub operation: u16,
+    pub mount: u16,
+    pub mutation_token: u64,
+    pub expected_generation: u64,
+    pub semantic_journal_len: u32,
+    pub reserved: u32,
+    pub receipt_bank: u64,
+    pub receipt_generation: u64,
+}
+
+/// A retained success contains the original outcome, not a projection of later device-action
+/// state. ACK replies zero all mutation/outcome fields and explicitly acknowledge one receipt.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CmHiveMutationCommitReply {
+    pub abi_size: u16,
+    pub abi_version: u16,
+    pub disposition: u16,
+    pub reserved: u16,
+    pub mutation_token: u64,
+    pub expected_generation: u64,
+    pub next_generation: u64,
+    pub semantic_journal_len: u32,
+    pub has_pending_device_action: u32,
+    pub receipt_bank: u64,
+    pub receipt_generation: u64,
+}
+
 /// `checkpoint_system_hive`: a single-flight, generation-checked checkpoint export. BEGIN returns
 /// the first bytes of [`CmHiveCheckpointHeader`] followed by the encoded hive image; PULL continues
 /// at the exact byte offset; ACK marks the exported sequence clean only after storage made the image
@@ -862,6 +910,8 @@ wire!(CmLeasedHiveKeyRequest);
 wire!(CmHiveExportHeader);
 wire!(CmLeasedHiveRecordRequest);
 wire!(CmHiveMutationRequest);
+wire!(CmHiveMutationCommitRequest);
+wire!(CmHiveMutationCommitReply);
 wire!(CmHiveCheckpointRequest);
 wire!(CmHiveCheckpointHeader);
 wire!(CmHiveMutationRecord);
@@ -885,6 +935,41 @@ pub fn read_utf16(buf: &[u8], offset: u32, len_bytes: u32, out: &mut [u16]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_commit_wire_layout_has_no_padding_and_stable_identity_offsets() {
+        assert_eq!(opcode::CM_OP_SYSTEM_HIVE_MUTATION_COMMIT, 0x215f);
+        assert_eq!(core::mem::size_of::<CmHiveMutationCommitRequest>(), 48);
+        assert_eq!(core::mem::size_of::<CmHiveMutationCommitReply>(), 56);
+        let request = CmHiveMutationCommitRequest {
+            abi_size: 48, abi_version: CM_ABI_VERSION,
+            operation: hive_mutation_commit_operation::COMMIT, mount: hive_mount::SYSTEM,
+            mutation_token: 0x1122_3344_5566_7788, expected_generation: 3,
+            semantic_journal_len: 17, reserved: 0, receipt_bank: 0, receipt_generation: 0,
+        };
+        let mut bytes = [0; 48];
+        bytes[..2].copy_from_slice(&48u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&CM_ABI_VERSION.to_le_bytes());
+        bytes[4..6].copy_from_slice(&hive_mutation_commit_operation::COMMIT.to_le_bytes());
+        bytes[6..8].copy_from_slice(&hive_mount::SYSTEM.to_le_bytes());
+        bytes[8..16].copy_from_slice(&request.mutation_token.to_le_bytes());
+        bytes[16..24].copy_from_slice(&3u64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&17u32.to_le_bytes());
+        assert_eq!(request.as_bytes(), bytes);
+        assert_eq!(CmHiveMutationCommitRequest::from_bytes(&bytes), Some(request));
+        assert!(CmHiveMutationCommitRequest::from_bytes(&bytes[..47]).is_none());
+        let reply = CmHiveMutationCommitReply {
+            abi_size: 56, abi_version: CM_ABI_VERSION,
+            disposition: hive_mutation_commit_disposition::RETAINED,
+            mutation_token: request.mutation_token, expected_generation: 3, next_generation: 4,
+            semantic_journal_len: 17, has_pending_device_action: 1,
+            receipt_bank: 29, receipt_generation: 5, reserved: 0,
+        };
+        assert_eq!(&reply.as_bytes()[24..32], &4u64.to_le_bytes());
+        assert_eq!(&reply.as_bytes()[40..48], &29u64.to_le_bytes());
+        assert_eq!(&reply.as_bytes()[48..56], &5u64.to_le_bytes());
+        assert_eq!(CmHiveMutationCommitReply::from_bytes(reply.as_bytes()), Some(reply));
+    }
 
     #[test]
     fn device_property_request_has_stable_wire_layout() {

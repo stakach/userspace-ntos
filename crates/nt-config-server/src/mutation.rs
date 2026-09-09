@@ -1,5 +1,8 @@
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use crate::CmIdentitySource;
 
 use nt_config_abi::{
     device_action_kind, hive_mutation_flags, hive_mutation_kind, CmHiveMutationRecord,
@@ -61,14 +64,14 @@ struct MutationLease {
 
 pub(crate) struct MutationLeaseBank {
     lease: Option<MutationLease>,
-    next_token: u64,
+    identities: Rc<CmIdentitySource>,
 }
 
 impl MutationLeaseBank {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new(identities: Rc<CmIdentitySource>) -> Self {
         Self {
             lease: None,
-            next_token: 1,
+            identities,
         }
     }
 
@@ -83,15 +86,11 @@ impl MutationLeaseBank {
         if self.lease.is_some() {
             return Err(MutationLeaseError::Busy);
         }
-        let token = self.next_token;
-        if token == 0 {
-            return Err(MutationLeaseError::Exhausted);
-        }
         let mut journal = Vec::new();
         journal
             .try_reserve_exact(total_len)
             .map_err(|_| MutationLeaseError::Exhausted)?;
-        self.next_token = token.checked_add(1).unwrap_or(0);
+        let token = self.identities.take().ok_or(MutationLeaseError::Exhausted)?;
         self.lease = Some(MutationLease {
             token,
             generation,
@@ -316,9 +315,15 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
 mod tests {
     use super::{MutationLeaseBank, MutationLeaseError};
 
+    fn bank() -> MutationLeaseBank {
+        MutationLeaseBank::new(alloc::rc::Rc::new(crate::CmIdentitySource::new(
+            core::num::NonZeroU32::new(1).unwrap(),
+        )))
+    }
+
     #[test]
     fn lease_requires_ordered_complete_upload_and_exact_identity() {
-        let mut bank = MutationLeaseBank::new();
+        let mut bank = bank();
         let token = bank.begin(7, 4).unwrap();
         assert_eq!(bank.begin(7, 4), Err(MutationLeaseError::Busy));
         assert_eq!(
@@ -336,7 +341,7 @@ mod tests {
 
     #[test]
     fn abort_and_invalidate_retire_only_the_live_lease() {
-        let mut bank = MutationLeaseBank::new();
+        let mut bank = bank();
         let first = bank.begin(1, 1).unwrap();
         assert!(!bank.abort(first + 1, 1, 1));
         assert!(bank.abort(first, 1, 1));

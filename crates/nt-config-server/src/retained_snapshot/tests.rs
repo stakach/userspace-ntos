@@ -438,7 +438,7 @@ fn frame_validation_and_output_capacity_precede_journal_mutation() {
         .is_none());
     assert_eq!(ack(&mut server, identity).0.status, STATUS_SUCCESS);
     assert_eq!(
-        server.dispatch(0x215f, &[], &mut []).status,
+        server.dispatch(0x21ff, &[], &mut []).status,
         STATUS_INVALID_SYSTEM_SERVICE
     );
 }

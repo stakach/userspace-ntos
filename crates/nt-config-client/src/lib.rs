@@ -35,6 +35,12 @@ mod key_close;
 pub use key_close::{SystemHiveKeyCloseAcknowledgement, SystemHiveKeyCloseAcknowledgementDisposition,
     SystemHiveKeyCloseReceipt};
 
+mod mutation_commit;
+pub use mutation_commit::{
+    SystemHiveMutationCommitReceipt, SystemHiveMutationAcknowledgement,
+    SystemHiveMutationAcknowledgementDisposition,
+};
+
 mod broker_key_owner;
 pub use broker_key_owner::{
     BrokerKeyCloseTicket, BrokerKeyOwner, BrokerKeyOwnerError, BrokerKeyOwners,

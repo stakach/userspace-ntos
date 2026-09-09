@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod key_lease;
 mod key_close;
+mod mutation_commit;
 mod key_open;
 mod active_driver_service;
 mod retained_snapshot;
@@ -1021,6 +1022,7 @@ pub struct CmServer {
     next_hive_import_token: u64,
     system_mutation_leases: MutationLeaseBank,
     prepared_system_mutation: Option<PreparedSystemHiveMutation>,
+    system_mutation_commits: mutation_commit::CommitJournal,
     prepared_system_checkpoint: Option<PreparedSystemHiveCheckpoint>,
     next_system_checkpoint_token: u64,
     system_key_leases: SystemKeyLeaseBank,
@@ -1076,8 +1078,9 @@ impl CmServer {
             system_hive: None,
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
-            system_mutation_leases: MutationLeaseBank::new(),
+            system_mutation_leases: MutationLeaseBank::new(identities.clone()),
             prepared_system_mutation: None,
+            system_mutation_commits: mutation_commit::CommitJournal::default(),
             prepared_system_checkpoint: None,
             next_system_checkpoint_token: 1,
             system_key_leases: SystemKeyLeaseBank::new(identities.clone()),
@@ -1149,6 +1152,7 @@ impl CmServer {
             opcode::CM_OP_RESOLVE_SYSTEM_HIVE_PATH => self.op_resolve_system_hive_path(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_CLOSE => self.op_system_hive_key_close(in_buf, out_buf),
             opcode::CM_OP_SYSTEM_HIVE_KEY_OPEN => self.op_system_hive_key_open(in_buf, out_buf),
+            opcode::CM_OP_SYSTEM_HIVE_MUTATION_COMMIT => self.op_system_hive_mutation_commit(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_KEY => self.op_query_leased_hive_key(in_buf, out_buf),
             opcode::CM_OP_QUERY_LEASED_HIVE_RECORD => {
                 self.op_query_leased_hive_record(in_buf, out_buf)
@@ -1811,6 +1815,7 @@ impl CmServer {
                 }
                 if self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
+                    || self.system_mutation_commits.is_pending()
                 {
                     return reply(STATUS_DEVICE_BUSY, 0);
                 }
@@ -1881,6 +1886,7 @@ impl CmServer {
                 }
                 if self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
+                    || self.system_mutation_commits.is_pending()
                 {
                     return reply(STATUS_DEVICE_BUSY, 0);
                 }
@@ -2090,6 +2096,15 @@ impl CmServer {
         } else {
             None
         };
+        let mut registry = (previous_control_set == current_control_set)
+            .then(|| self.cm.registry_mut().begin_transaction());
+        let enum_changed = if let Some(registry) = registry.as_mut() {
+            project_system_hive_mutations(registry, &current_control_set, mutations)?
+        } else {
+            false
+        };
+        // Complete fallible projections before publishing device actions. Both registry and hive
+        // transactions still roll back if the journal refuses this action batch.
         if !actions.is_empty() {
             let publications = topology.as_mut().unwrap().devnode_publications();
             self.device_action_journal
@@ -2097,18 +2112,16 @@ impl CmServer {
                 .map_err(device_action_journal_status)?;
         }
 
-        if previous_control_set == current_control_set {
-            let mut registry = self.cm.registry_mut().begin_transaction();
-            let enum_changed =
-                project_system_hive_mutations(&mut registry, &current_control_set, mutations)?;
-            transaction.commit();
+        transaction.commit();
+        if let Some(registry) = registry.take() {
             registry.commit();
-            if enum_changed {
-                self.cm.refresh_registry_devnodes();
-            }
-        } else {
-            transaction.commit();
+        }
+        drop(registry);
+        if previous_control_set != current_control_set {
             self.cm = topology.unwrap();
+        }
+        if enum_changed {
+            self.cm.refresh_registry_devnodes();
         }
         mounted.generation = next_generation;
         mounted.current_control_set = current_control_set;
@@ -2160,6 +2173,7 @@ impl CmServer {
                 }
                 if self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
+                    || self.system_mutation_commits.is_pending()
                 {
                     return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
@@ -2312,33 +2326,20 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 }
-                if req.expected_generation != current_generation {
-                    return reply(STATUS_REVISION_MISMATCH, current_generation);
+                if self.system_mutation_commits.is_pending() {
+                    return reply(STATUS_DEVICE_BUSY, current_generation);
                 }
-                let Some(prepared) = self.prepared_system_mutation.take() else {
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                };
-                if prepared.token != req.lease_token
-                    || prepared.expected_generation != req.expected_generation
-                    || prepared.semantic_journal_len != journal_len
+                let (next_generation, has_pending_device_action) = match self
+                    .publish_prepared_system_mutation(req.lease_token, req.expected_generation, journal_len)
                 {
-                    self.prepared_system_mutation = Some(prepared);
-                    return reply(STATUS_INVALID_PARAMETER, current_generation);
-                }
-                let has_pending_device_action = match self
-                    .commit_system_hive_mutations(&prepared.mutations, prepared.next_generation)
-                {
-                    Ok(has_pending) => has_pending,
-                    Err(status) => {
-                        self.prepared_system_mutation = Some(prepared);
-                        return reply(status, current_generation);
-                    }
+                    Ok(outcome) => outcome,
+                    Err(status) => return reply(status, current_generation),
                 };
                 reply_with_info(
                     STATUS_SUCCESS,
                     u32::from(has_pending_device_action),
-                    prepared.next_generation,
-                    prepared.token,
+                    next_generation,
+                    req.lease_token,
                 )
             }
             hive_mutation_transfer::ABORT => {
@@ -2414,6 +2415,7 @@ impl CmServer {
                 }
                 if self.prepared_system_checkpoint.is_some()
                     || self.prepared_system_mutation.is_some()
+                    || self.system_mutation_commits.is_pending()
                     || self.system_mutation_leases.is_busy()
                     || !self.hive_imports.is_empty()
                 {

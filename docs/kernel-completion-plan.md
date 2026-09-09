@@ -31360,15 +31360,18 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     parent-lease authorization token. The positive composition retains the actual parent lease and
     captured subject and sends the information snapshot's physical path and generation. Native
     publication must retain those same owners and cannot recreate authority from these plain bytes.
-    Two existing native/protocol gaps now precede that activation:
+    The following native/protocol prerequisites precede that activation:
     - [ ] Give authorized native mutation preparation an explicit captured-generation input.
       main.rs config_manager_prepare_system_hive_mutation currently rereads the live generation;
       using that helper after authorization would permit stale parent policy at a newer generation.
-    - [ ] Retain successful COMMIT identity/outcome until acknowledgment and make retry/recovery
-      distinguish rejection from an uncertain successful commit. CM currently retains failed work
-      but discards success; the native persist/publish wrapper truncates its durable journal after
-      any publication error. A lost success reply must not erase storage for an already committed
-      child. Fix this ownership boundary before joining reserved PM handle publication and copyout.
+    - [x] Add retained successful COMMIT identity/outcome with explicit ACK and exact client replay
+      (host protocol checkpoint below). A Backend error status is conservatively uncertain, not
+      evidence that the server rejected the mutation before an effect.
+    - [ ] Cut native publication over to retained COMMIT/ACK with an owned durable journal and
+      complete caller continuation. The existing one-shot persist/publish wrapper still truncates
+      its durable journal after any publication error. A lost success reply must not erase storage
+      for an already committed child. Delete the one-shot COMMIT operation/client API at this
+      cutover, before joining reserved PM handle publication and copyout.
 
     Parent-retained native Key admission, audit delivery, backup/restore and link/volatile/options
     semantics, generated descriptors, and removal of the legacy Key handles and descendant-security
@@ -31385,6 +31388,52 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The freestanding executive release build passes with 293 existing warnings in
     `.tmp/build-cm-secured-child-executive-20260909.log`. No microkernel changes or VM run occurred;
     strict win32k admission still has 27 missing imports and native desktop acceptance remains open.
+
+    Retained CM publication checkpoint (2026-09-09): added a separate explicit COMMIT/ACK exchange
+    at 0x215f, sharing the existing transaction application rather than adding alternate mutation
+    semantics. This is a host-tested protocol checkpoint, not native reply-loss recovery.
+    - [x] Retain the exact prepared token, expected generation, semantic length, next generation,
+      and original device-action outcome in one allocation-free result slot. Exact COMMIT replay
+      precedes live-generation validation and never reapplies child creation or recomputes the
+      device-action bit. Failed application retains the preparation and durable bytes.
+    - [x] Reserve service-incarnation receipt identity and check generation capacity before effects.
+      ACK uses its own contiguous receipt generation, not mutation-token high-water marks. Old ACKs
+      remain explicitly AlreadyAcknowledged after slot reuse/remount and cannot release newer work.
+      Mutation upload tokens now use the shared CmIdentitySource across server reconstruction.
+    - [x] Block mutation BEGIN, one-shot COMMIT, import BEGIN/COMMIT, and checkpoint BEGIN while
+      success is unacknowledged. ABORT cannot discard the result. Validate fixed request geometry
+      and output capacity before any COMMIT/ACK effect; reject foreign banks and future receipts.
+    - [x] Add client receipt/outcome and private ACK-proof types with exact envelope validation.
+      Every error retains the journal and caller state conservatively; neither a transport status
+      nor a missing identity is treated as success or permission to abort/truncate. A Copy receipt
+      is evidence only, not an owner for native durability or local publication.
+    - [x] Move the fallible semantic registry projection before device-action publication. A
+      deterministic post-PREPARE projection failure now proves both hive rollback and zero emitted
+      events, then succeeds on exact retry after authority is repaired.
+
+    Review adjustment: native cutover must preserve PnP devnode/bus-relation/catalog preparations
+    and invalidation claims as well as future Key/PM handle publication. A global pending-CM slot
+    alone does not preserve those caller-owned continuations. Either reconcile synchronously before
+    returning or retain the complete caller continuation; do not introduce an error return that
+    drops local preparations after CM may have committed. Retain failed durable-log rollback as
+    owned work rather than ignoring truncate/flush failure. COMMIT replay must use its captured
+    identity even if the executive's live generation has already advanced. ACK evidence survives
+    remount in the same server identity domain, not a service crash; crash recovery remains a
+    durable-journal responsibility. The old one-shot native path is not a fallback for the new API
+    and must be removed atomically with its callers at cutover.
+
+    Serialized host validation passes all 1,136 tests/doctests: nt-config-abi 7, nt-config-client
+    106, nt-config-server 76, nt-config-manager 35, nt-hive-core 106 plus 18 generator cases,
+    nt-security 223, nt-user-host 494 plus 49 integration cases, and 22 doctests. Fourteen new
+    tests/doctests cover fixed wire layout, lost/malformed COMMIT and ACK replies, short buffers,
+    wrong identities, receipt reuse, token holes, reconstruction/incarnation isolation, identity
+    and generation exhaustion, pre-uploaded remount exclusion, and the late projection failure.
+    Log: `.tmp/test-cm-retained-commit-full-20260909.log`. Both independent protocol reviews found
+    no remaining issue in the completed scope. Arbitrary allocator-failure injection was not run.
+    The freestanding executive release build passes in 36.49 seconds with 293 existing warnings;
+    log: `.tmp/build-cm-retained-commit-executive-20260909.log`. No native publication activation,
+    microkernel change, VM run, or desktop proof is claimed by this slice. Strict win32k admission
+    still has 27 missing imports; native suspension and desktop acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
