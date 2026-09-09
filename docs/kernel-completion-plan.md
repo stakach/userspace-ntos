@@ -31191,6 +31191,7 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     and that function currently runs after some durable creation effects. Resolve these in order:
     - [ ] Establish real root descriptors and inherited/defaulted child descriptors; absence of
       modeled security must not become a null-DACL fallback.
+      Root initialization is complete below; child assignment and generated-hive security remain open.
     - [ ] Capture the effective subject/mode and authorize ordinary parent creation before mutation.
       Existing-key opens check the target DACL. New-key handles use the authorized creation outcome,
       not a second target-DACL check. Implement BACKUP_RESTORE's privilege-derived grant independently
@@ -31214,6 +31215,39 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-device-key-policy-executive-20260909.log`. No VM or desktop run was performed.
     These are host-policy/shared-evaluator and native-build results, not provider Key admission:
     the strict win32k missing-import count remains 27 and native suspension acceptance remains open.
+
+    Registry-root security checkpoint (2026-09-09): nt-security now constructs the NT5
+    CmpHiveRootSecurityDescriptor policy: ordered, container-inheritable System/Administrators
+    KEY_ALL_ACCESS and Everyone/Restricted Code KEY_READ ACEs. The explicit DACL is not defaulted;
+    ordinary container SeAssignSecurity supplies owner/group from the captured effective token.
+    The shared Key mapping excludes SYNCHRONIZE and WOW64 selectors. This template applies only
+    to system-created roots, never as a substitute for imported hive security or a missing child SD.
+
+    nt-user-host/registry_bootstrap validates the designated initial System process/thread and
+    captures their current primary and impersonation references from the original PM/TokenStore.
+    It prepares two independent descriptors and releases the captured references before returning
+    either root for publication. Missing designation, released bootstrap ownership, missing/wrong-type
+    primary tokens, invalid assignment and allocation errors fail initialization. No PID/name/SID
+    guess or reconstructed System token provides authority. Root assignment has no explicit owner
+    or SACL and uses no audited privileges; unexpected future audit obligations reject publication.
+    The native executive now installs those prepared descriptors before publishing its handler;
+    Machine/User root fields are required Vecs instead of optional absent-security state.
+
+    Review adjustment: this closes root initialization only. Generated CONFIG keys and native
+    child creation still need assigned/inherited descriptors; descendant query/set code still has
+    the historical DEFAULT_KEY_SECURITY_DESCRIPTOR substitution and must lose it with that cutover.
+    Next add captured-subject access evaluation (preserving lowered impersonation levels), strict
+    self-relative SD-to-access conversion, and a one-child creation transaction under an existing
+    authorized parent. Do not use HiveTransaction::create_key to manufacture missing ancestors
+    with one leaf authorization, and do not recheck a newly assigned child DACL as an existing open.
+
+    Validation: 763 tests/doctests passed across nt-security and nt-user-host in
+    `.tmp/test-registry-roots-20260909.log`; the additional post-capture assignment-failure case
+    and all six bootstrap cases pass in `.tmp/test-registry-root-failure-20260909.log`.
+    The freestanding executive release build passes with 293 existing warnings in
+    `.tmp/build-registry-roots-executive-20260909.log`. Read-only independent review found no
+    correctness issues. No VM was launched: the strict 27-import blocker remains unchanged, and
+    this checkpoint does not claim native Key access admission or desktop execution.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

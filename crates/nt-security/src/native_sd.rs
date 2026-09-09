@@ -21,6 +21,10 @@ use crate::sid::Sid;
 mod device_parameters_security;
 pub use device_parameters_security::prepare_device_parameters_security;
 
+#[path = "registry_root_security.rs"]
+mod registry_root_security;
+pub use registry_root_security::{assign_registry_root_security, KEY_GENERIC_MAPPING};
+
 #[path = "security_assignment.rs"]
 mod security_assignment;
 pub use security_assignment::{

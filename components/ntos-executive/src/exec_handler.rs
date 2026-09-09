@@ -4006,8 +4006,11 @@ impl ExecNtHandler {
             pool_tids: bootstrap_pool_tids,
         } = crate::ps_bootstrap::take();
         let nt_user_host::ps_bootstrap::PsBootstrapParts {
-            pm, token_store, anonymous_logon_tokens,
+            pm, mut token_store, anonymous_logon_tokens,
         } = ps.into_parts();
+        let root_security =
+            nt_user_host::registry_bootstrap::prepare_registry_root_security(&pm, &mut token_store)
+                .expect("initialize registry root security from bootstrap subject");
         macro_rules! write_field {
             ($field:ident, $value:expr) => {
                 unsafe {
@@ -4034,8 +4037,8 @@ impl ExecNtHandler {
             registry_value_copy_provenance,
             RegistryValueCopyProvenanceTable::with_capacity(64)
         );
-        write_field!(registry_machine_root_security_descriptor, None);
-        write_field!(registry_user_root_security_descriptor, None);
+        write_field!(registry_machine_root_security_descriptor, root_security.machine);
+        write_field!(registry_user_root_security_descriptor, root_security.user);
         write_field!(time_zone_information, time_zone_information);
         write_field!(real_time_is_universal, real_time_is_universal);
         write_field!(
@@ -7745,10 +7748,10 @@ impl ExecNtHandler {
         target: KeyRef,
     ) -> Result<Option<alloc::vec::Vec<u8>>, u32> {
         if target == MACHINE_ROOT_KEY {
-            return Ok(self.registry_machine_root_security_descriptor.clone());
+            return Ok(Some(self.registry_machine_root_security_descriptor.clone()));
         }
         if target == USER_ROOT_KEY {
-            return Ok(self.registry_user_root_security_descriptor.clone());
+            return Ok(Some(self.registry_user_root_security_descriptor.clone()));
         }
         if let Some(lease) = self.cm_system_key_target(target).map(|target| target.lease) {
             return unsafe { config_manager_query_leased_system_hive_key_information(lease) }
@@ -7787,11 +7790,11 @@ impl ExecNtHandler {
         descriptor: &[u8],
     ) -> Result<(), u32> {
         if target == MACHINE_ROOT_KEY {
-            self.registry_machine_root_security_descriptor = Some(descriptor.to_vec());
+            self.registry_machine_root_security_descriptor = descriptor.to_vec();
             return Ok(());
         }
         if target == USER_ROOT_KEY {
-            self.registry_user_root_security_descriptor = Some(descriptor.to_vec());
+            self.registry_user_root_security_descriptor = descriptor.to_vec();
             return Ok(());
         }
         // An explicit overlay handle retains overlay identity. A native CM lease likewise retains

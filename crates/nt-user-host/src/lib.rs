@@ -24,6 +24,7 @@ pub mod provider_logical_caller;
 pub mod provider_irp_requestor;
 pub mod provider_subject;
 pub mod ps_bootstrap;
+pub mod registry_bootstrap;
 mod services;
 pub mod sched_context;
 pub mod slot_recycle;

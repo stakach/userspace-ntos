@@ -23478,8 +23478,8 @@ struct ExecNtHandler {
     /// Security descriptors for virtual registry namespace roots. `\Registry\Machine` and
     /// `\Registry\User` are CM namespace sentinels, not hive cells and not overlay keys, but
     /// security queries/updates still target their handle identity.
-    registry_machine_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
-    registry_user_root_security_descriptor: Option<alloc::vec::Vec<u8>>,
+    registry_machine_root_security_descriptor: alloc::vec::Vec<u8>,
+    registry_user_root_security_descriptor: alloc::vec::Vec<u8>,
     /// Live system timezone state returned by class 44 and used to derive class 3's current bias.
     time_zone_information: nt_kernel_exec::timezone::TimeZoneInformation,
     /// SYSTEM-hive policy describing whether the platform RTC stores UTC rather than local time.
