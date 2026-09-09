@@ -317,9 +317,12 @@ desktop proofs are historical baselines, not acceptance of the current provider 
 - [x] Retain synchronous File retry delivery through exact Reply acknowledgement and local
   capability retirement, preserving the Busy grant and canonical route across uncertain delivery
   (tranche 151, host/native checkpoint). Full application-record retry and cancellation remain open.
-- [ ] Implement exact MCS reply-chain ownership and NT wait-preserving suspension together with
-  native suspension/completion admission. Do not equate seL4 cancel-IPC Suspend with NT's suspend
-  APC, or infer nested scheduling-context ownership from a receiver's latest reply target.
+- [x] Implement exact MCS reply-chain ownership for Call/Reply/ReplyRecv, receive offers, deletion,
+  restart and object reuse (tranche 151; four-CPU kernel specs and userspace microtests).
+- [ ] Implement NT wait-preserving suspension together with native suspension/completion admission,
+  then atomically adopt upstream TCBSuspend cancellation and strict BlockedOnReply reply admission.
+  Do not equate seL4 cancel-IPC Suspend with NT's suspend APC, or infer nested scheduling-context
+  ownership from a receiver's latest reply target.
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30909,6 +30912,78 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     The restored microkernel source also builds with spec,microtest
     (`.tmp/build-suspend-audit-restored-kernel-20260909.log`); no QEMU run was made for this audit.
     This review does not claim microkernel cancellation or NT suspension fixed.
+
+    Reply-chain implementation scope (2026-09-09, accepted prerequisite): make object-backed and existing
+    legacy replies use one exact node model, with reciprocal caller binding, predecessor/successor
+    links and scheduling-context head ownership. Legacy reply selection may choose a recipient,
+    but it must not manufacture scheduling-context return authority. Capture ownership at Call
+    pairing without allocation. Migrate normal/fault Reply, final Reply deletion, explicit restart,
+    SC retirement and TCB reuse together; preserve upstream distinctions between returning a head
+    donation, severing a middle chain and unlinking a cancelled caller without returning donation.
+    Offered receive ownership is also required: a pending receiver must not retain only a raw
+    reply-pool index that can be deleted/reused before a caller arrives. Keep TCBSuspend unchanged
+    in this prerequisite tranche to avoid activating the known native NT suspension mismatch.
+
+    Implementation review refinement: suspended-but-exactly-bound callers still retain the old
+    reply-admission behavior in this prerequisite. Strict BlockedOnReply validation must land with
+    wait-preserving NT holds and actual TCBSuspend cancellation, not as a partial change that
+    strands current native waits. This is an explicitly open semantic gap, not upstream suspension
+    acceptance. Normal and fault replies already require reciprocal node/caller ownership before
+    mutation; no receiver-local donation field can authorize SC return or x86 execution.
+
+    The first four-CPU spec run exposed a direct-handoff ordering bug after replacing the old
+    synthetic fixture donation with a real passive-server SC transfer: returning the SC clears the
+    invoker's current slot before the handoff check. The fix captures exact entry authorization and
+    head/holder identity before removing the Reply, then admits an empty current slot only when
+    that same SC was transferred to the caller. It never replaces a different current thread.
+    The first run stopped at this assertion; it is not a passing validation result.
+
+    Additional review fixes in the same tranche: queue-only endpoint operations without a Reply
+    offer do not access the global object registry; real offers require the exact kernel scheduler
+    and both sides are released on cancellation/notification wake. SysReplyRecv now selects the
+    caller from its supplied Reply capability, not the receiver's latest reply_to, and restores the
+    original invoker for the receive half after a direct handoff. Invalid nonzero Reply operands
+    stop before receive. The zero-operand legacy operation accepts only a genuine legacy node;
+    moving away an object Reply cannot leave an implicit latest-target route to invoke it.
+
+    Accepted Reply-chain checkpoint (2026-09-09, rust-micro `9e47084`): object and allocation-free legacy nodes now
+    retain reciprocal caller identity, predecessor/successor links and an exact SC head. Normal
+    and fault Reply, moved/aliased capabilities, receive offers, final deletion, explicit restart,
+    SC unbind/delete/configure and TCB retirement use that ownership. Removed the single-hop
+    return_donated_sc helper and receiver-local donation return authority; donated_sc remains a
+    diagnostic projection only. Actual SC return stalls its current physical holder before moving
+    the context. Three legacy receive/reply wrappers in driver-host-ntdll now explicitly set the
+    no-cap Reply operand instead of inheriting an unspecified register value.
+
+    Serialized validation passed: all kernel specs in a four-CPU QEMU run, all 14 userspace
+    microtests with zero failures, and the explicit guest completion sentinel. Added nine chain
+    cases, twelve receive-operand combinations, six exact-cap ReplyRecv cases, and real Reply
+    Copy/Move/non-final/final-alias lifetime coverage. Existing notification-wake checks now verify
+    both sides of offer retirement. Production x86, AArch64 compile-only, executive (292 existing
+    warnings), and driver-host-ntdll builds pass. Logs are
+    `.tmp/build-reply-chain-spec-accepted-20260909.log`,
+    `.tmp/run-reply-chain-spec-accepted-20260909.log`,
+    `.tmp/build-reply-chain-production-20260909.log`,
+    `.tmp/check-reply-chain-aarch64-20260909.log`,
+    `.tmp/build-reply-chain-executive-20260909.log` and
+    `.tmp/build-reply-chain-driver-host-20260909.log`. The first two VM runs stopped at assertions
+    described above; only the final run is acceptance. Pre-probe disk/rootserver staging was
+    restored byte-for-byte afterward. No NT desktop boot was run, and the strict 27-import win32k
+    boundary remains unresolved. The next step is the generic execution hold and native retained
+    suspend/resume transaction, followed by atomic TCBSuspend cancellation and strict state
+    admission; this checkpoint does not claim those semantics or full kernel completion.
+
+    NT suspension implementation refinement: add an orthogonal, capability-authorized execution
+    hold with exact acquisition/release generation. Underlying endpoint/reply/fault/notification
+    state must remain intact; completion may change it while the hold excludes dispatch. Releasing
+    a hold re-evaluates current schedulability and must not invent a wake. Include ready queues,
+    direct handoff, SC donation/binding, budget maturation and final architecture dispatch in the
+    exclusion. Native Ps needs an underlying state beneath its suspended projection, plus retained
+    exact-runtime control transactions rather than PM-first mutation and inverse rollback.
+    Only suspend-count transitions 0 -> 1 and 1 -> 0 enter the mechanism. Enforce the NT maximum
+    suspend count of 0x7f, preserve selected state after final count copyout failure, and test
+    self-suspend with its original service Reply still owned. This hold must not become an NT-only
+    microkernel policy or silently alter upstream seL4 Suspend/Resume.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

@@ -269,6 +269,8 @@ unsafe fn reply_recv(recv_ep: u64, reply_len: u64, r0: u64, r1: u64, r2: u64, r3
     core::arch::asm!(
         "syscall",
         in("rdx") SYS_REPLY_RECV as u64,
+        in("r12") 0u64,
+        in("r13") 0u64,
         inout("rdi") recv_ep => badge,
         inout("rsi") reply_len => msginfo,
         inout("r10") r0 => mr0,
@@ -302,6 +304,8 @@ unsafe fn reply_recv_full(
     core::arch::asm!(
         "syscall",
         in("rdx") SYS_REPLY_RECV as u64,
+        in("r12") 0u64,
+        in("r13") 0u64,
         inout("rdi") recv_ep => _,
         inout("rsi") reply_len => msginfo,
         inout("r10") r0 => mr0,
@@ -362,6 +366,8 @@ unsafe fn ep_recv_full(ep: u64) -> (u64, u64, u64, u64, u64, u64) {
     core::arch::asm!(
         "syscall",
         in("rdx") sel4_rt::SYS_RECV as u64,
+        in("r12") 0u64,
+        in("r13") 0u64,
         inout("rdi") ep => badge,
         lateout("rsi") msginfo,
         lateout("r10") mr0,
