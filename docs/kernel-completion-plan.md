@@ -31029,6 +31029,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     preserves resources on suspension failure. Do not treat terminal TCB cancellation as proof
     that the higher-level driver, callback or native-reply ownership has been safely retired.
 
+    Registered mechanism adapter checkpoint (2026-09-09, host/native build acceptance):
+    replaced the construction-only native backend with thread_mechanism_retirement, explicitly
+    selecting construction or registered provenance in the same sealed host actor. Registered
+    advancement requires exact prior mechanism handoff, a retained registry snapshot and all
+    external alias journals, then revalidates ownership before kernel effects. It stops with the
+    same pending row owning memory, accounting and reservations; it is not a second destructor or
+    permission to activate ordinary teardown before retained GUI and stack/charge prerequisites.
+    The TCB projection hook now consumes settled suspension ownership after Delete ACK and before
+    empty-slot recycling. Wrong binding or unfinished native control returns the original owner;
+    completed deletion never sends Release to a dead/reused capability.
+    Validation: all 488 nt-user-host tests, integration tests and doctests pass, including a
+    composition test that retains the hold across Delete/projection failure and consumes it once
+    before a failed Recycle is retried. Executive build passes (293 warnings; the new registered
+    entry remains deliberately inactive until ordinary teardown prerequisites are complete).
+    Logs: `.tmp/test-registered-retirement-final-20260909.log` and
+    `.tmp/build-registered-retirement-executive-20260909.log`. No VM or desktop run was made for
+    this adapter checkpoint. The old construction-only backend was removed, not left as a second
+    implementation. Next wire retained GUI EXIT and stack/charge ownership before activating the
+    common live-thread teardown path; do not drain registered rows based on mechanism completion alone.
+
+    Native suspension acceptance ordering review (2026-09-09): the strict 27-import win32k failure
+    precedes the sole ExecNtHandler initialization and native receive loop. The older
+    driver-host-ntdll harness embeds a different ntdll and dispatches through KernelServices, so it
+    cannot validate the new native adapter. Do not add a diagnostic executive or private dispatcher
+    to bypass this ordering. Prepare an ntdll-only native PE launched by real SMSS BootExecute in a
+    diagnostic image after strict provider admission is repaired. Its first cases should use real
+    RtlCreateUserThread, NtSuspendThread/NtResumeThread and an atomic signal-and-wait event handshake
+    to prove self-suspend, completion while held, nested counts and final resume without replay.
+    File/LPC cases and actual runtime execution remain separate open acceptance gates. Production
+    BootExecute policy and desktop identities must remain unchanged by fixture preparation.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

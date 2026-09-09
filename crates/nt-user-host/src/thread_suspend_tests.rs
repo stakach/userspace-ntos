@@ -95,6 +95,72 @@ fn duplicate(inv: &ThreadSuspendInvocation<()>) -> ThreadSuspendInvocation<()> {
 }
 
 #[test]
+fn deleted_tcb_consumes_settled_running_dormant_and_held_owners() {
+    for state in 0..3 {
+        let mut f = Fixture::new(state == 1);
+        if state == 2 {
+            f.acquire(47);
+        }
+        let before_count = f.count();
+        let binding = f.binding;
+        assert!(unsafe { f.owner.retire_deleted_tcb(binding) }.is_ok());
+        // Physical destruction consumes the hold without issuing Release or changing Ps counts.
+        assert_eq!(
+            f.pm.thread(f.lifetime.thread_id()).unwrap().suspend_count,
+            before_count
+        );
+    }
+}
+
+#[test]
+fn deleted_tcb_wrong_binding_returns_the_exact_held_owner() {
+    let mut f = Fixture::new(false);
+    f.acquire(53);
+    let mut replacement = f.binding;
+    replacement.tcb += 1;
+    let (error, owner) = unsafe { f.owner.retire_deleted_tcb(replacement) }.unwrap_err();
+    assert_eq!(error, ThreadSuspendError::OwnerChanged);
+    assert_eq!(
+        owner.execution_state(),
+        ThreadExecutionState::Held { generation: 53 }
+    );
+    assert_eq!(owner.phase(), ThreadSuspendPhase::Idle);
+    assert!(unsafe { owner.retire_deleted_tcb(f.binding) }.is_ok());
+}
+
+#[test]
+fn deleted_tcb_cannot_discard_any_unfinished_control_phase() {
+    for phase in 0..6 {
+        let mut f = Fixture::new(false);
+        f.prepare(ThreadSuspendOperation::Suspend);
+        if phase != 0 {
+            let invocation = f.owner.begin().unwrap();
+            if phase > 1 {
+                let outcome = match phase {
+                    2 => ThreadSuspendOutcome::Acknowledged {
+                        generation: Some(59),
+                    },
+                    3 => ThreadSuspendOutcome::Rejected { status: 123 },
+                    4 => ThreadSuspendOutcome::Indeterminate { status: 124 },
+                    _ => ThreadSuspendOutcome::Acknowledged { generation: None },
+                };
+                f.owner.record(invocation, outcome).unwrap();
+            }
+        }
+        let before = f.owner.phase();
+        let (error, owner) = unsafe { f.owner.retire_deleted_tcb(f.binding) }.unwrap_err();
+        assert_eq!(error, ThreadSuspendError::Busy);
+        assert_eq!(owner.phase(), before);
+        assert_eq!(owner.execution_state(), ThreadExecutionState::Running);
+        assert!(f.pm.has_thread_suspend_control(f.lifetime.thread_id()));
+        assert_eq!(
+            f.pm.thread(f.lifetime.thread_id()).unwrap().suspend_count,
+            0
+        );
+    }
+}
+
+#[test]
 fn acquire_and_exact_release_commit_only_after_ack() {
     let mut f = Fixture::new(false);
     assert_eq!(

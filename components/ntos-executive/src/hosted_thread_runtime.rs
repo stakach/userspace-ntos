@@ -341,6 +341,46 @@ impl HostedThreadRuntimeTable {
         self.reconcile_pending_memory(id)
     }
 
+    /// Advance only the already-handed-off registered mechanisms. The same pending row retains
+    /// memory, external cleanup journals, charges and reservations even after this returns Ok.
+    /// This is deliberately not an ordinary teardown entry point or a registered-memory drain.
+    ///
+    /// # Safety
+    /// Caller retains the exact PM/process/reservation identities and has finished lifecycle EXIT
+    /// prerequisites before registered handoff. No component IPC may reenter the table while this
+    /// exclusive borrow is held. Completion authorizes neither payload extraction nor charge release.
+    pub(crate) unsafe fn advance_registered_mechanisms(
+        &mut self, index: usize, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), u32> {
+        let _durable = allocator::enter_durable();
+        let pending = self.entries.get(index).and_then(RuntimeSlot::pending)
+            .filter(|pending| pending.id() == id)
+            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        let retirement = pending.registered_mechanism_retirement()
+            .ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        if retirement.is_complete() {
+            return Ok(());
+        }
+        let owner = pending.runtime();
+        // Do not manufacture initial reconciliation or handoff here. All three external journals
+        // and the immutable registry snapshot must already belong to this exact pending attempt.
+        if owner.registry_preparation.retained_snapshot(id).is_err()
+            || owner.alias_preparation.get().is_none()
+            || owner.prefetch_preparation.get().is_none()
+            || owner.provider_preparation.get().is_none()
+            || owner.memory_retirement.get().is_some()
+        {
+            return Err(nt_address_space::STATUS_INVALID_PARAMETER);
+        }
+        // Retry validation consults only still-owned mechanism slots, not original numbers that
+        // an earlier successful recycle may already have assigned to an unrelated owner.
+        self.reconcile_pending_memory(id).map_err(|error| error.status())?;
+        let slot = self.entries.get_mut(index).ok_or(nt_address_space::STATUS_INVALID_PARAMETER)?;
+        crate::thread_mechanism_retirement::advance(
+            slot, id, crate::thread_mechanism_retirement::Provenance::Registered,
+        )
+    }
+
     unsafe fn reconcile_pending_memory(
         &self, id: nt_user_host::thread_rollback::ThreadRollbackId,
     ) -> Result<(), ThreadReconciliationError> {
@@ -993,6 +1033,15 @@ impl HostedThreadRuntimes {
         (&mut *self.table).reconcile_registered_runtime(id)
     }
 
+    /// # Safety
+    /// Same exact lifecycle/PM/reservation and no-reentry contract as the table method. Only
+    /// mechanisms advance; retained memory, charges and all reservation ownership stay in place.
+    pub(crate) unsafe fn advance_registered_mechanisms(
+        &mut self, index: usize, id: nt_user_host::thread_rollback::ThreadRollbackId,
+    ) -> Result<(), u32> {
+        (&mut *self.table).advance_registered_mechanisms(index, id)
+    }
+
     pub(crate) fn validate_spawn(
         &mut self, prepared: &PreparedHostedThreadRuntime, spawn: &HostedThreadSpawn,
     ) -> bool {
@@ -1036,7 +1085,9 @@ impl HostedThreadRuntimes {
             if !slot.pending().and_then(|pending| pending.construction_retirement())
                 .is_some_and(|owner| owner.is_complete())
             {
-                crate::thread_construction_retirement::advance(slot, id)?;
+                crate::thread_mechanism_retirement::advance(
+                    slot, id, crate::thread_mechanism_retirement::Provenance::Construction,
+                )?;
             }
             memory_retirement::prepare(slot, id)?;
             memory_retirement::advance(slot, id)?;
@@ -1217,6 +1268,9 @@ impl RuntimeTcbProjection for HostedThreadRuntimeOwner {
         if expected_cap <= 1 || (self.runtime.tcb != expected_cap && self.runtime.tcb != 1) {
             return Err(nt_address_space::STATUS_INVALID_PARAMETER);
         }
+        // Delete has been acknowledged by the sealed actor; a failed empty-slot publication
+        // retries this local acknowledgment, never deletion or physical hold release.
+        unsafe { self.suspension.retire_deleted_tcb(self.binding())?; }
         self.runtime.tcb = 1;
         Ok(())
     }

@@ -14724,7 +14724,7 @@ mod thread_sched_context;
 mod root_slot_recycle;
 mod ps_object_paging;
 mod ps_object_provider;
-mod thread_construction_retirement;
+mod thread_mechanism_retirement;
 mod ps_object_backing;
 mod frame_acquisition;
 mod frame_recycle;

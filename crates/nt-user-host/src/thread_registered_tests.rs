@@ -149,6 +149,8 @@ struct Runtime {
     fail_clear: bool,
     fail_tcb_clear: bool,
     handoffs: usize,
+    suspension: Option<crate::thread_suspend::ThreadSuspendOwner<u32>>,
+    suspension_retirements: usize,
 }
 impl RuntimeIdentity for Runtime {
     type Role = u32;
@@ -166,6 +168,14 @@ impl RuntimeTcbProjection for Runtime {
         }
         if self.binding.tcb != expected && self.binding.tcb != 1 {
             return Err(125);
+        }
+        if let Some(suspension) = self.suspension.take() {
+            // The sealed actor calls this hook only after its Delete ACK, before recycling.
+            if let Err((_, suspension)) = unsafe { suspension.retire_deleted_tcb(self.binding) } {
+                self.suspension = Some(suspension);
+                return Err(127);
+            }
+            self.suspension_retirements += 1;
         }
         self.binding.tcb = 1;
         Ok(())
@@ -213,6 +223,8 @@ fn owner() -> PendingThreadRuntime<Runtime> {
         fail_clear: false,
         fail_tcb_clear: false,
         handoffs: 0,
+        suspension: None,
+        suspension_retirements: 0,
     };
     match PendingThreadRuntime::retain(
         ThreadRollbackIdentity {
@@ -412,6 +424,149 @@ fn tcb_projection_clears_after_delete_and_before_recycle_including_retry() {
         .advance_registered_mechanism_retirement(&mut io)
         .unwrap();
     assert_eq!(io.successes, expected());
+}
+
+#[test]
+fn settled_hold_retires_once_between_sealed_tcb_delete_and_recycle() {
+    use crate::thread_suspend::{
+        ThreadExecutionState, ThreadSuspendAction, ThreadSuspendOutcome, ThreadSuspendOwner,
+    };
+    use nt_process::thread_suspend::ThreadSuspendOperation;
+
+    let mut pm = nt_process::ProcessManager::new();
+    let pid = pm.create_process("held-retirement", None, None);
+    let tid = pm.create_thread(pid, 0x1000, 0, false).unwrap();
+    let lifetime = pm.thread_lifetime(tid).unwrap();
+    let binding = ThreadBinding {
+        pi: 4,
+        tid: u64::from(tid),
+        tcb: 12,
+        badge: 8,
+        role: 1,
+        process: ProcessIdentity {
+            pid,
+            generation: ProcessGeneration::Hosted(6),
+        },
+        reservations: None,
+    };
+    let mut suspension = ThreadSuspendOwner::running(binding, lifetime).unwrap();
+    suspension
+        .prepare(&mut pm, binding, lifetime, ThreadSuspendOperation::Suspend)
+        .unwrap();
+    let invocation = suspension.begin().unwrap();
+    assert_eq!(
+        invocation.action(),
+        ThreadSuspendAction::Acquire { tcb: 12 }
+    );
+    suspension
+        .record(
+            invocation,
+            ThreadSuspendOutcome::Acknowledged {
+                generation: Some(73),
+            },
+        )
+        .unwrap();
+    suspension.finish(&mut pm, binding, lifetime).unwrap();
+    let runtime = Runtime {
+        binding,
+        publication: ThreadPublicationSlot::empty(),
+        caps: [10, 11, 12, 13],
+        fail_clear: false,
+        fail_tcb_clear: true,
+        handoffs: 0,
+        suspension: Some(suspension),
+        suspension_retirements: 0,
+    };
+    let mut owner = match PendingThreadRuntime::retain(
+        ThreadRollbackIdentity {
+            pi: binding.pi,
+            pid,
+            process_generation: binding.process.generation,
+            tid: binding.tid,
+        },
+        binding.tcb,
+        None,
+        runtime,
+    ) {
+        Ok(owner) => owner,
+        Err(_) => panic!("exact registered owner admission"),
+    };
+    owner.handoff_registered_mechanisms(owner.id()).unwrap();
+    let mut io = Io::new(owner.id());
+    io.fail = Some(Event::Delete(Role::Tcb, 12));
+    assert!(owner
+        .advance_registered_mechanism_retirement(&mut io)
+        .is_err());
+    assert_eq!(io.successes, vec![Event::Suspend(12)]);
+    assert_eq!(owner.runtime.binding.tcb, 12);
+    assert_eq!(
+        owner.runtime.suspension.as_ref().unwrap().execution_state(),
+        ThreadExecutionState::Held { generation: 73 }
+    );
+    assert_eq!(owner.runtime.suspension_retirements, 0);
+
+    io.fail = None;
+    assert_eq!(
+        owner.advance_registered_mechanism_retirement(&mut io),
+        Err(RetirementError::Backend {
+            role: Role::Tcb,
+            operation: Operation::Recycle,
+            status: 124
+        })
+    );
+    assert_eq!(io.successes, expected()[..2]);
+    assert_eq!(owner.runtime.binding.tcb, 12);
+    assert_eq!(
+        owner.runtime.suspension.as_ref().unwrap().execution_state(),
+        ThreadExecutionState::Held { generation: 73 }
+    );
+    assert_eq!(owner.runtime.suspension_retirements, 0);
+
+    owner.runtime.fail_tcb_clear = false;
+    io.fail = Some(Event::Recycle(Role::Tcb, 12));
+    assert!(owner
+        .advance_registered_mechanism_retirement(&mut io)
+        .is_err());
+    assert_eq!(owner.runtime.binding.tcb, 1);
+    assert!(owner.runtime.suspension.is_none());
+    assert_eq!(owner.runtime.suspension_retirements, 1);
+    assert_eq!(io.successes, expected()[..2]);
+    let delete_attempts = io
+        .calls
+        .iter()
+        .filter(|event| **event == Event::Delete(Role::Tcb, 12))
+        .count();
+    assert_eq!(
+        delete_attempts, 2,
+        "one rejected delete and one acknowledged delete"
+    );
+
+    io.fail = None;
+    owner
+        .advance_registered_mechanism_retirement(&mut io)
+        .unwrap();
+    owner
+        .advance_registered_mechanism_retirement(&mut io)
+        .unwrap();
+    assert_eq!(io.successes, expected());
+    assert_eq!(
+        io.calls
+            .iter()
+            .filter(|event| **event == Event::Delete(Role::Tcb, 12))
+            .count(),
+        delete_attempts
+    );
+    assert_eq!(owner.runtime.suspension_retirements, 1);
+    assert!(
+        owner.runtime.suspension.is_none(),
+        "no owner remains to issue Release after deletion"
+    );
+    assert_eq!(
+        pm.thread(tid).unwrap().suspend_count,
+        1,
+        "mechanism deletion consumes physical ownership, not an NT count-resume transaction"
+    );
+    assert!(!pm.has_thread_suspend_control(tid));
 }
 
 #[test]

@@ -178,6 +178,26 @@ impl<R: Copy + Eq> ThreadSuspendOwner<R> {
         self.pending.is_none()
     }
 
+    /// Consume settled control ownership after deletion of this exact TCB. No Release is sent:
+    /// destruction has already retired the physical hold. Rejection preserves the entire owner.
+    ///
+    /// # Safety
+    /// The caller must retain the runtime and prove successful deletion of its TCB capability
+    /// before any slot recycling. The binding must be the original retained runtime, not a new
+    /// lookup through a reused TID or root slot. No unresolved operation may be discarded.
+    pub unsafe fn retire_deleted_tcb(
+        self,
+        binding: ThreadBinding<R>,
+    ) -> Result<(), (ThreadSuspendError, Self)> {
+        if self.binding != binding {
+            return Err((ThreadSuspendError::OwnerChanged, self));
+        }
+        if self.pending.is_some() {
+            return Err((ThreadSuspendError::Busy, self));
+        }
+        Ok(())
+    }
+
     /// Reserve the real first start without fabricating a suspend count. Ordinary zero-count
     /// NtResumeThread remains a local no-op; only the constructor may request this Start action.
     pub fn prepare_initial_start(

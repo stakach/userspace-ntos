@@ -36,6 +36,25 @@ impl HostedThreadSuspend {
             .try_borrow()
             .map_or(true, |owner| owner.as_ref().is_some_and(Owner::is_pending))
     }
+
+    /// The sealed retirement actor calls this after Delete ACK and before clearing/recycling
+    /// its TCB projection. All local failures leave the exact control owner in this runtime.
+    pub(crate) unsafe fn retire_deleted_tcb(
+        &self,
+        binding: nt_user_host::thread_binding::ThreadBinding<HostedThreadRole>,
+    ) -> Result<(), u32> {
+        let mut slot = self
+            .owner
+            .try_borrow_mut()
+            .map_err(|_| nt_process::STATUS_DEVICE_BUSY)?;
+        if let Some(owner) = slot.take() {
+            if let Err((error, owner)) = owner.retire_deleted_tcb(binding) {
+                *slot = Some(owner);
+                return Err(status(error));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn status(error: ThreadSuspendError) -> u32 {
@@ -152,18 +171,14 @@ pub(crate) unsafe fn create_initial_thread(
 }
 
 /// Called only after retirement has acknowledged deletion of this runtime's TCB.
-pub(crate) fn tcb_deleted(handler: &ExecNtHandler, tid: u64, tcb: u64) -> bool {
+pub(crate) unsafe fn tcb_deleted(handler: &ExecNtHandler, tid: u64, tcb: u64) -> bool {
     let Some(runtime) = entry(handler, tid).filter(|runtime| runtime.tcb == tcb) else {
         return false;
     };
-    let Ok(mut slot) = runtime.suspension.owner.try_borrow_mut() else {
-        return false;
-    };
-    if slot.as_ref().is_some_and(|owner| !owner.can_retire()) {
-        return false;
-    }
-    *slot = None;
-    true
+    runtime
+        .suspension
+        .retire_deleted_tcb(runtime.binding())
+        .is_ok()
 }
 
 pub(crate) unsafe fn control(

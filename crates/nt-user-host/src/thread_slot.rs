@@ -46,8 +46,9 @@ pub trait RuntimeConstruction: RuntimeIdentity + RuntimeTcbProjection {
 }
 
 pub trait RuntimeTcbProjection {
-    /// Clear only the copied TCB projection after the sealed actor acknowledges its deletion,
-    /// before the empty slot is recycled. Accept the exact expected cap or the already-cleared
+    /// Retire settled control ownership tied to the deleted TCB, then clear its copied projection
+    /// after the sealed actor acknowledges deletion and before the empty slot is recycled.
+    /// Accept the exact expected cap or the already-cleared
     /// reservation sentinel (1), and leave identity, reservations and memory untouched. Rejection
     /// must not mutate anything; retries after a failed recycle must be idempotent. No allocation,
     /// backend operation or reentry is allowed here.
