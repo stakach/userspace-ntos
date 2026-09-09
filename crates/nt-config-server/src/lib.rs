@@ -69,7 +69,7 @@ use nt_config_manager::{
     SERVICE_DEMAND_START, SERVICE_SYSTEM_START,
 };
 use nt_hive_core::{
-    collect_reactos_network_adapter_bindings, decode_image, encode_log_record, try_encode_image,
+    collect_reactos_network_adapter_bindings, decode_image, try_encode_image,
     try_encode_subtree_image, CellId, CurrentControlSet, Hive, HiveEncodeError, HiveKind,
     HiveLogOp, HiveSubtreeEncodeError, HiveTransaction, ReactOsNetworkAdapterBinding,
     SYSTEM_HIVE_PATH,
@@ -280,6 +280,8 @@ fn config_manager_from_system_hive(
     cm
 }
 
+mod child_creation;
+
 fn apply_system_hive_mutation(
     transaction: &mut HiveTransaction<'_>,
     current_control_set: &CurrentControlSet,
@@ -289,6 +291,13 @@ fn apply_system_hive_mutation(
         system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)
     };
     match mutation {
+        HiveMutation::CreateChild {
+            parent, name, class_name, descriptor,
+        } => {
+            child_creation::apply(
+                transaction, &relative(parent)?, name, class_name.as_deref(), descriptor,
+            )
+        }
         HiveMutation::CreateKey { path } => {
             transaction.create_key(&relative(&path)?);
             Ok(())
@@ -404,7 +413,12 @@ fn project_system_hive_mutations(
 ) -> Result<bool, i32> {
     let mut enum_changed = false;
     for mutation in mutations {
+        let child_path;
         let path = match mutation {
+            HiveMutation::CreateChild { parent, name, .. } => {
+                child_path = child_creation::path(parent, name)?;
+                &child_path
+            }
             HiveMutation::CreateKey { path }
             | HiveMutation::SetValue { path, .. }
             | HiveMutation::DeleteValue { path, .. }
@@ -419,7 +433,7 @@ fn project_system_hive_mutations(
         };
         enum_changed |= affects_enum;
         match mutation {
-            HiveMutation::CreateKey { .. } => {
+            HiveMutation::CreateKey { .. } | HiveMutation::CreateChild { .. } => {
                 registry.create_key(&path);
             }
             HiveMutation::SetValue {
@@ -1954,6 +1968,7 @@ impl CmServer {
         sequence: u64,
     ) -> Result<Vec<u8>, i32> {
         let path = match mutation {
+            HiveMutation::CreateChild { parent, .. } => parent,
             HiveMutation::CreateKey { path }
             | HiveMutation::SetValue { path, .. }
             | HiveMutation::DeleteValue { path, .. }
@@ -1964,10 +1979,16 @@ impl CmServer {
         };
         let relative =
             system_hive_relative_path(path, current_control_set).ok_or(STATUS_INVALID_PARAMETER)?;
-        let record = match mutation {
-            HiveMutation::CreateKey { .. } => {
-                encode_log_record(&HiveLogOp::CreateKey { path: &relative }, sequence)
-            }
+        let operation = match mutation {
+            HiveMutation::CreateChild {
+                name, class_name, descriptor, ..
+            } => HiveLogOp::CreateChild {
+                parent: &relative,
+                name,
+                class_name: class_name.as_deref(),
+                descriptor,
+            },
+            HiveMutation::CreateKey { .. } => HiveLogOp::CreateKey { path: &relative },
             HiveMutation::SetValue {
                 name,
                 value_type,
@@ -1976,43 +1997,32 @@ impl CmServer {
             } => {
                 let value_type =
                     RegistryValueType::from_u32(*value_type).ok_or(STATUS_INVALID_PARAMETER)?;
-                encode_log_record(
-                    &HiveLogOp::SetValue {
-                        path: &relative,
-                        name,
-                        value_type,
-                        data,
-                    },
-                    sequence,
-                )
-            }
-            HiveMutation::DeleteValue { name, .. } => encode_log_record(
-                &HiveLogOp::DeleteValue {
+                HiveLogOp::SetValue {
                     path: &relative,
                     name,
-                },
-                sequence,
-            ),
-            HiveMutation::DeleteKey { .. } => {
-                encode_log_record(&HiveLogOp::DeleteKey { path: &relative }, sequence)
+                    value_type,
+                    data,
+                }
             }
-            HiveMutation::SetKeyClass { class_name, .. } => encode_log_record(
-                &HiveLogOp::SetKeyClass {
-                    path: &relative,
-                    class_name: class_name.as_deref(),
-                },
-                sequence,
-            ),
-            HiveMutation::SetKeySecurity { descriptor, .. } => encode_log_record(
-                &HiveLogOp::SetKeySecurityDescriptor {
-                    path: &relative,
-                    descriptor,
-                },
-                sequence,
-            ),
+            HiveMutation::DeleteValue { name, .. } => HiveLogOp::DeleteValue {
+                path: &relative,
+                name,
+            },
+            HiveMutation::DeleteKey { .. } => HiveLogOp::DeleteKey { path: &relative },
+            HiveMutation::SetKeyClass { class_name, .. } => HiveLogOp::SetKeyClass {
+                path: &relative,
+                class_name: class_name.as_deref(),
+            },
+            HiveMutation::SetKeySecurity { descriptor, .. } => HiveLogOp::SetKeySecurityDescriptor {
+                path: &relative,
+                descriptor,
+            },
             HiveMutation::PublishDeviceAction { .. } => return Err(STATUS_INVALID_PARAMETER),
         };
-        Ok(record)
+        nt_hive_core::try_encode_log_record(&operation, sequence).map_err(|error| match error {
+            nt_hive_core::HiveEncodeError::OutOfMemory => STATUS_INSUFFICIENT_RESOURCES,
+            nt_hive_core::HiveEncodeError::SizeOverflow => STATUS_INVALID_PARAMETER,
+        })
     }
 
     fn prepare_system_hive_mutations(

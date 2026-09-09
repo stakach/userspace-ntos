@@ -106,6 +106,13 @@ pub struct QueryError {
 /// One operation in an atomic, generation-checked mutation of the CM-owned SYSTEM hive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemHiveMutation<'a> {
+    /// Caller must retain the exact parent and authorize at the generation passed to PREPARE.
+    CreateChild {
+        parent: &'a str,
+        name: &'a str,
+        class_name: Option<&'a str>,
+        descriptor: &'a [u8],
+    },
     CreateKey {
         path: &'a str,
     },
@@ -1023,6 +1030,22 @@ fn decode_network_adapter_plan(bytes: &[u8]) -> Option<NetworkAdapterPlanSnapsho
     })
 }
 
+mod child_creation;
+
+fn checked_mutation_utf16(s: &str, max_units: usize) -> Result<Vec<u8>, i32> {
+    let units = s.encode_utf16().count();
+    if units > max_units || s.contains('\0') {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let bytes = units.checked_mul(2).ok_or(STATUS_INVALID_PARAMETER)?;
+    let mut result = Vec::new();
+    result.try_reserve_exact(bytes).map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    for unit in s.encode_utf16() {
+        result.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(result)
+}
+
 fn utf16_bytes(s: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(s.len() * 2);
     for u in s.encode_utf16() {
@@ -1040,11 +1063,8 @@ fn append_hive_mutation_record(
     name: &str,
     data: &[u8],
 ) -> Result<(), i32> {
-    let path = utf16_bytes(path);
-    let name = utf16_bytes(name);
-    if path.len() > CM_MAX_HIVE_PATH_UNITS * 2 || name.len() > CM_MAX_HIVE_VALUE_NAME_UNITS * 2 {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
+    let path = checked_mutation_utf16(path, CM_MAX_HIVE_PATH_UNITS)?;
+    let name = checked_mutation_utf16(name, CM_MAX_HIVE_VALUE_NAME_UNITS)?;
     let path_len_bytes = u32::try_from(path.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
     let name_len_bytes = u32::try_from(name.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
     let data_len_bytes = u32::try_from(data.len()).map_err(|_| STATUS_INVALID_PARAMETER)?;
@@ -1079,6 +1099,11 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
     let mut journal = Vec::new();
     for mutation in mutations {
         match *mutation {
+            SystemHiveMutation::CreateChild {
+                parent, name, class_name, descriptor,
+            } => {
+                child_creation::append(&mut journal, parent, name, class_name, descriptor)?;
+            }
             SystemHiveMutation::CreateKey { path } => append_hive_mutation_record(
                 &mut journal,
                 hive_mutation_kind::CREATE_KEY,
@@ -1121,7 +1146,9 @@ fn encode_hive_mutation_journal(mutations: &[SystemHiveMutation<'_>]) -> Result<
                 &[],
             )?,
             SystemHiveMutation::SetKeyClass { path, class_name } => {
-                let class_data = class_name.map(utf16_bytes);
+                let class_data = class_name
+                    .map(|class| checked_mutation_utf16(class, CM_MAX_HIVE_VALUE_NAME_UNITS))
+                    .transpose()?;
                 append_hive_mutation_record(
                     &mut journal,
                     hive_mutation_kind::SET_KEY_CLASS,
@@ -3711,6 +3738,7 @@ impl<B: Backend> ConfigClient<B> {
 mod tests {
     mod hardware_profile;
     mod key_creation;
+    mod secured_child_cm;
     use super::*;
     use alloc::format;
     use alloc::string::String;

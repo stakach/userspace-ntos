@@ -31337,6 +31337,55 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-secured-child-executive-20260909.log`. No VM was launched; the 27 strict missing
     imports and native suspension/desktop acceptance remain open. No microkernel changes occurred.
 
+    CM secured-child transport checkpoint (2026-09-09): completed generation-bound CM integration
+    for the composite creation primitive, without activating native Key handle publication.
+    - [x] Added CREATE_CHILD mutation kind 8 with parent path, one child name, optional class and
+      nonempty assigned descriptor. The shared pointer-free metadata framing validates exact lengths
+      and explicit empty-class presence. Client encoding and server UTF-16 decoding use checked
+      allocation; unknown flags/types, malformed/truncated metadata and invalid names are rejected.
+    - [x] PREPARE resolves and retains the physical parent, validates the complete physical child
+      path against CM's reopen/query limit, and invokes checked single-child creation in a rollback
+      transaction. The path check runs after alias normalization, so valid logical-to-physical
+      shortening is preserved. COMMIT retries use checked copies of retained metadata, not unchecked
+      Vec/String clones. The semantic projection creates the full child path; class/security remain
+      authoritative in the mounted hive. All CM log emission now uses try_encode_log_record.
+    - [x] The CM-generated durable journal contains one composite CreateChild record. Multi-frame
+      metadata transfer, PREPARE invisibility, exact post-COMMIT lease metadata, semantic projection,
+      missing-parent/collision failures, later-operation rollback, explicit abort, competing mutation
+      and remount exclusion, physical profile recovery and every torn-record prefix are covered.
+      A still-live parent lease does not make an old security generation valid: the regression uses
+      captured information.mount_generation and rejects preparation after the parent SD changes.
+
+    Review adjustment: this is a privileged, generation-bound path mutation, not a new CM
+    parent-lease authorization token. The positive composition retains the actual parent lease and
+    captured subject and sends the information snapshot's physical path and generation. Native
+    publication must retain those same owners and cannot recreate authority from these plain bytes.
+    Two existing native/protocol gaps now precede that activation:
+    - [ ] Give authorized native mutation preparation an explicit captured-generation input.
+      main.rs config_manager_prepare_system_hive_mutation currently rereads the live generation;
+      using that helper after authorization would permit stale parent policy at a newer generation.
+    - [ ] Retain successful COMMIT identity/outcome until acknowledgment and make retry/recovery
+      distinguish rejection from an uncertain successful commit. CM currently retains failed work
+      but discards success; the native persist/publish wrapper truncates its durable journal after
+      any publication error. A lost success reply must not erase storage for an already committed
+      child. Fix this ownership boundary before joining reserved PM handle publication and copyout.
+
+    Parent-retained native Key admission, audit delivery, backup/restore and link/volatile/options
+    semantics, generated descriptors, and removal of the legacy Key handles and descendant-security
+    substitutions remain open. No IoOpenDeviceRegistryKey binding or desktop proof is claimed here.
+
+    Serialized validation passes 1,087 tests/doctests across nt-config-abi (6), nt-config-client
+    (101), nt-config-server (69), nt-hive-core (106 plus 18 generator cases), nt-security (223),
+    nt-user-host (494 plus 49 integration cases), and 21 doctests. Ten new cases cover wire framing,
+    malformed requests, the retained-parent pipeline and complete physical path limits. Log:
+    `.tmp/test-cm-secured-child-final-20260909.log`. The final path-boundary refinement uses non-BMP
+    UTF-16 names and all six pipeline tests pass again in `.tmp/test-cm-child-path-final-20260909.log`.
+    Both independent reviews identified the composed-path issue; it was fixed before acceptance.
+    Allocation checks were reviewed; arbitrary allocator-failure injection was not performed.
+    The freestanding executive release build passes with 293 existing warnings in
+    `.tmp/build-cm-secured-child-executive-20260909.log`. No microkernel changes or VM run occurred;
+    strict win32k admission still has 27 missing imports and native desktop acceptance remains open.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.

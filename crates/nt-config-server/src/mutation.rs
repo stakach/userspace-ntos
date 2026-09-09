@@ -8,6 +8,12 @@ use nt_config_abi::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HiveMutation {
+    CreateChild {
+        parent: String,
+        name: String,
+        class_name: Option<String>,
+        descriptor: Vec<u8>,
+    },
     CreateKey {
         path: String,
     },
@@ -166,15 +172,21 @@ fn decode_utf16(bytes: &[u8], max_units: usize) -> Option<String> {
     if bytes.len() % 2 != 0 || bytes.len() / 2 > max_units {
         return None;
     }
-    let mut units = Vec::new();
-    units.try_reserve_exact(bytes.len() / 2).ok()?;
-    for pair in bytes.chunks_exact(2) {
-        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    let mut text = String::new();
+    text.try_reserve_exact((bytes.len() / 2).checked_mul(3)?)
+        .ok()?;
+    for scalar in char::decode_utf16(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    ) {
+        let scalar = scalar.ok()?;
+        if scalar == '\0' {
+            return None;
+        }
+        text.push(scalar);
     }
-    if units.contains(&0) {
-        return None;
-    }
-    String::from_utf16(&units).ok()
+    Some(text)
 }
 
 pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>> {
@@ -200,6 +212,30 @@ pub(crate) fn decode_mutation_journal(bytes: &[u8]) -> Option<Vec<HiveMutation>>
         )?;
         let data = bytes.get(data_start..record_end)?;
         let mutation = match header.kind {
+            hive_mutation_kind::CREATE_CHILD
+                if header.flags & !hive_mutation_flags::CLASS_PRESENT == 0
+                    && header.value_type == 0
+                    && !name.is_empty()
+                    && !name.contains('\\') =>
+            {
+                let present = header.flags & hive_mutation_flags::CLASS_PRESENT != 0;
+                let (class, descriptor) =
+                    nt_config_abi::hive_create_child_metadata::split(data, present)?;
+                let class_name = if present {
+                    Some(decode_utf16(class, CM_MAX_HIVE_VALUE_NAME_UNITS)?)
+                } else {
+                    None
+                };
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(descriptor.len()).ok()?;
+                owned.extend_from_slice(descriptor);
+                HiveMutation::CreateChild {
+                    parent: path,
+                    name,
+                    class_name,
+                    descriptor: owned,
+                }
+            }
             hive_mutation_kind::CREATE_KEY
                 if header.flags == 0
                     && header.value_type == 0
@@ -309,3 +345,7 @@ mod tests {
         assert!(!bank.abort(second, 1, 1));
     }
 }
+
+#[cfg(test)]
+#[path = "child_mutation_tests.rs"]
+mod child_tests;

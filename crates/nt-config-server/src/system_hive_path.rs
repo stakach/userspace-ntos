@@ -47,6 +47,7 @@ impl MountedSystemHive {
     pub(super) fn resolve_mutation_paths(&self, mutations: &mut [HiveMutation]) -> Result<(), i32> {
         for mutation in mutations {
             let path = match mutation {
+                HiveMutation::CreateChild { parent, .. } => parent,
                 HiveMutation::CreateKey { path }
                 | HiveMutation::SetValue { path, .. }
                 | HiveMutation::DeleteValue { path, .. }
@@ -56,6 +57,9 @@ impl MountedSystemHive {
                 HiveMutation::PublishDeviceAction { .. } => continue,
             };
             *path = self.resolve_physical_path(path)?;
+            if let HiveMutation::CreateChild { parent, name, .. } = mutation {
+                super::child_creation::validate_path(parent, name)?;
+            }
         }
         Ok(())
     }

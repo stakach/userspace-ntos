@@ -241,7 +241,12 @@ pub mod hive_mutation_kind {
     /// Explicit bus/PnP publication intent. `path` carries the device instance and `value_type`
     /// carries one [`device_action_kind`] value; it does not directly mutate registry cells.
     pub const PUBLISH_DEVICE_ACTION: u16 = 7;
+    /// Exact-parent child creation: path=parent, name=child, value_type=0. Data uses
+    /// hive_create_child_metadata; CLASS_PRESENT is the only valid flag.
+    pub const CREATE_CHILD: u16 = 8;
 }
+
+pub mod hive_create_child_metadata;
 
 pub mod hive_mutation_flags {
     /// Distinguishes an explicitly present empty class from clearing the class metadata.
