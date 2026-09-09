@@ -735,6 +735,8 @@ pub mod hive_mutation_commit_operation {
     pub const COMMIT: u16 = 1;
     pub const ACKNOWLEDGE: u16 = 2;
     pub const ABORT: u16 = 3;
+    /// Retire an exact upload or preparation when PREPARE completion is uncertain.
+    pub const ABORT_UNPUBLISHED: u16 = 4;
 }
 
 pub mod hive_mutation_commit_disposition {
@@ -742,10 +744,13 @@ pub mod hive_mutation_commit_disposition {
     pub const ACKNOWLEDGED: u16 = 2;
     pub const ALREADY_ACKNOWLEDGED: u16 = 3;
     pub const ABORTED: u16 = 4;
+    pub const UNPUBLISHED_ABORTED: u16 = 5;
 }
 
-/// COMMIT/ABORT repeat the exact prepared identity after an uncertain reply. ACK carries only the
-/// receipt bank/generation and remains valid independently of the current mount generation.
+/// COMMIT/ABORT repeat the exact prepared identity after an uncertain reply. ABORT_UNPUBLISHED
+/// accepts an exact upload or prepared identity, but never an absent or committed mutation.
+/// ACK carries only the receipt bank/generation and remains valid independently of the current
+/// mount generation.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CmHiveMutationCommitRequest {
@@ -763,6 +768,8 @@ pub struct CmHiveMutationCommitRequest {
 
 /// A retained success contains the original outcome, not a projection of later device-action
 /// state. ABORTED echoes the prepared identity with zero next-generation and device-action fields.
+/// UNPUBLISHED_ABORTED echoes the exact upload or prepared identity with the same zero fields;
+/// it never acknowledges an absent or already committed mutation.
 /// ACK replies zero all mutation/outcome fields and explicitly acknowledge one receipt.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -952,6 +959,8 @@ mod tests {
     fn prepared_abort_uses_exact_identity_and_no_publication_outcome() {
         assert_eq!(hive_mutation_commit_operation::ABORT, 3);
         assert_eq!(hive_mutation_commit_disposition::ABORTED, 4);
+        assert_eq!(hive_mutation_commit_operation::ABORT_UNPUBLISHED, 4);
+        assert_eq!(hive_mutation_commit_disposition::UNPUBLISHED_ABORTED, 5);
         let request = CmHiveMutationCommitRequest {
             abi_size: 48,
             abi_version: CM_ABI_VERSION,

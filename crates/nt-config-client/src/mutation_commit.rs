@@ -210,24 +210,7 @@ impl<B: Backend> ConfigClient<B> {
             receipt_generation: generation,
             ..CmHiveMutationCommitRequest::default()
         })?;
-        if body.receipt_bank != bank
-            || body.receipt_generation != generation
-            || body.mutation_token != 0
-            || body.expected_generation != 0
-            || body.next_generation != 0
-            || body.semantic_journal_len != 0
-            || body.has_pending_device_action != 0
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let disposition = match body.disposition {
-            disposition::ACKNOWLEDGED => SystemHiveMutationAcknowledgementDisposition::Acknowledged,
-            disposition::ALREADY_ACKNOWLEDGED => {
-                SystemHiveMutationAcknowledgementDisposition::AlreadyAcknowledged
-            }
-            _ => return Err(STATUS_INVALID_PARAMETER),
-        };
-        Ok(disposition)
+        validate_acknowledgement(&body, bank, generation)
     }
 
     fn exchange_system_hive_mutation_commit(
@@ -243,25 +226,57 @@ impl<B: Backend> ConfigClient<B> {
             request.as_bytes(),
             &mut output,
         );
-        if response.status != STATUS_SUCCESS {
-            return Err(response.status);
+        decode_mutation_reply(response, &output)
+    }
+}
+
+pub(crate) fn decode_mutation_reply(
+    response: nt_config_abi::CmReply,
+    output: &[u8],
+) -> Result<CmHiveMutationCommitReply, i32> {
+    if response.status != STATUS_SUCCESS {
+        return Err(response.status);
+    }
+    if output.len() != core::mem::size_of::<CmHiveMutationCommitReply>()
+        || response.information as usize != output.len()
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let body = CmHiveMutationCommitReply::from_bytes(output).ok_or(STATUS_INVALID_PARAMETER)?;
+    if body.abi_size as usize != output.len()
+        || body.abi_version != CM_ABI_VERSION
+        || body.reserved != 0
+        || body.receipt_bank == 0
+        || body.receipt_generation == 0
+        || response.detail0 != body.receipt_bank
+        || response.detail1 != body.receipt_generation
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(body)
+}
+
+pub(crate) fn validate_acknowledgement(
+    body: &CmHiveMutationCommitReply,
+    bank: u64,
+    generation: u64,
+) -> Result<SystemHiveMutationAcknowledgementDisposition, i32> {
+    if body.receipt_bank != bank
+        || body.receipt_generation != generation
+        || body.mutation_token != 0
+        || body.expected_generation != 0
+        || body.next_generation != 0
+        || body.semantic_journal_len != 0
+        || body.has_pending_device_action != 0
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    match body.disposition {
+        disposition::ACKNOWLEDGED => Ok(SystemHiveMutationAcknowledgementDisposition::Acknowledged),
+        disposition::ALREADY_ACKNOWLEDGED => {
+            Ok(SystemHiveMutationAcknowledgementDisposition::AlreadyAcknowledged)
         }
-        if response.information as usize != output.len() {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let body =
-            CmHiveMutationCommitReply::from_bytes(&output).ok_or(STATUS_INVALID_PARAMETER)?;
-        if body.abi_size as usize != output.len()
-            || body.abi_version != CM_ABI_VERSION
-            || body.reserved != 0
-            || body.receipt_bank == 0
-            || body.receipt_generation == 0
-            || response.detail0 != body.receipt_bank
-            || response.detail1 != body.receipt_generation
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        Ok(body)
+        _ => Err(STATUS_INVALID_PARAMETER),
     }
 }
 

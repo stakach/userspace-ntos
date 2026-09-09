@@ -40,6 +40,8 @@ mod mutation_begin;
 pub use mutation_begin::{
     CmMutationBeginAttempt, CmMutationBeginAttempts, CmMutationBeginExchange,
     CmMutationBeginOperation, CmMutationBeginResponse, SystemHiveMutationUpload,
+    CmMutationPreparationExchange, CmMutationPreparationOperation, CmMutationPreparationPhase,
+    CmMutationPreparationResponse, SystemHiveMutationPreparation,
 };
 pub use mutation_commit::{
     SystemHiveMutationCommitReceipt, SystemHiveMutationAcknowledgement,

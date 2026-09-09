@@ -15,6 +15,12 @@ const REQUEST_BYTES: usize = core::mem::size_of::<Request>();
 const REPLY_BYTES: usize = core::mem::size_of::<Reply>();
 const DEFAULT_SLOTS: usize = 64;
 
+mod upload;
+pub use upload::{
+    CmMutationPreparationExchange, CmMutationPreparationOperation, CmMutationPreparationPhase,
+    CmMutationPreparationResponse, SystemHiveMutationPreparation,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CmMutationBeginOperation {
     Query,
@@ -137,7 +143,7 @@ impl CmMutationBeginResponse {
 
 /// Acknowledged BEGIN ownership, not a prepared mutation or a completed caller. The server still
 /// owns the live upload. No raw token or mutable journal is exposed, and dropping this value does
-/// not abort that upload. A retained APPEND/PREPARE owner must consume this handoff next.
+/// not abort that upload. Consume it with `into_preparation` to retain APPEND/PREPARE progress.
 ///
 /// ```compile_fail
 /// use nt_config_client::SystemHiveMutationUpload;

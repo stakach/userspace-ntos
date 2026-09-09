@@ -170,13 +170,17 @@ impl MutationLeaseBank {
         Ok(self.lease.take().unwrap().journal)
     }
 
-    pub(crate) fn abort(&mut self, token: u64, generation: u64, total_len: usize) -> bool {
-        let matches = self.lease.as_ref().is_some_and(|lease| {
+    pub(crate) fn matches_upload(&self, token: u64, generation: u64, total_len: usize) -> bool {
+        self.lease.as_ref().is_some_and(|lease| {
             token != 0
                 && lease.token == token
                 && lease.generation == generation
                 && lease.total_len == total_len
-        });
+        })
+    }
+
+    pub(crate) fn abort(&mut self, token: u64, generation: u64, total_len: usize) -> bool {
+        let matches = self.matches_upload(token, generation, total_len);
         if matches {
             self.lease = None;
         }

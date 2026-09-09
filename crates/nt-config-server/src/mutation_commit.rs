@@ -1,11 +1,16 @@
 //! One retained terminal outcome for the sole SYSTEM writer. Receipt generations count acknowledged
-//! commits and prepared aborts, never upload tokens, failed attempts, or abandoned uploads.
+//! commits and explicit cancellations, never upload tokens, failed attempts, or abandoned uploads.
 
 use super::*;
 use nt_config_abi::{
     hive_mutation_commit_disposition as disposition, hive_mutation_commit_operation as operation,
     CmHiveMutationCommitReply, CmHiveMutationCommitRequest,
 };
+
+enum UnpublishedMutationOwner {
+    Upload,
+    Prepared,
+}
 
 #[derive(Default)]
 pub(crate) struct MutationOutcomeJournal {
@@ -67,7 +72,7 @@ impl CmServer {
             return reply(STATUS_INVALID_PARAMETER, 0);
         }
         match request.operation {
-            operation::COMMIT | operation::ABORT
+            operation::COMMIT | operation::ABORT | operation::ABORT_UNPUBLISHED
                 if request.mutation_token != 0
                     && request.expected_generation != 0
                     && request.semantic_journal_len != 0
@@ -84,6 +89,13 @@ impl CmServer {
         let size = core::mem::size_of::<CmHiveMutationCommitReply>();
         if output.len() < size {
             return reply_with_info(STATUS_BUFFER_TOO_SMALL, size as u32, 0, 0);
+        }
+        if request.operation == operation::ABORT_UNPUBLISHED
+            && self
+                .system_mutation_begins
+                .blocks_transfer(request.mutation_token)
+        {
+            return reply(STATUS_DEVICE_BUSY, 0);
         }
         let mut body = CmHiveMutationCommitReply {
             abi_size: size as u16,
@@ -103,10 +115,10 @@ impl CmServer {
         } else if let Some(retained) = self.system_mutation_outcomes.pending {
             // Match the terminal kind as well as identity before inspecting current authority.
             // Neither a committed mutation nor an aborted preparation can change its outcome.
-            let expected_disposition = if request.operation == operation::ABORT {
-                disposition::ABORTED
-            } else {
-                disposition::RETAINED
+            let expected_disposition = match request.operation {
+                operation::ABORT => disposition::ABORTED,
+                operation::ABORT_UNPUBLISHED => disposition::UNPUBLISHED_ABORTED,
+                _ => disposition::RETAINED,
             };
             if retained.disposition != expected_disposition
                 || retained.mutation_token != request.mutation_token
@@ -117,7 +129,15 @@ impl CmServer {
             }
             body = retained;
         } else {
-            let validation = if request.operation == operation::ABORT {
+            let mut unpublished = None;
+            let validation = if request.operation == operation::ABORT_UNPUBLISHED {
+                self.validate_unpublished_system_mutation(
+                    request.mutation_token,
+                    request.expected_generation,
+                    request.semantic_journal_len as usize,
+                )
+                .map(|owner| unpublished = Some(owner))
+            } else if request.operation == operation::ABORT {
                 self.validate_prepared_system_mutation_identity(
                     request.mutation_token,
                     request.expected_generation,
@@ -138,7 +158,22 @@ impl CmServer {
                 Ok(identity) => identity,
                 Err(status) => return reply(status, 0),
             };
-            if request.operation == operation::ABORT {
+            if let Some(owner) = unpublished {
+                match owner {
+                    UnpublishedMutationOwner::Upload => {
+                        assert!(
+                            self.system_mutation_leases.abort(
+                                request.mutation_token,
+                                request.expected_generation,
+                                request.semantic_journal_len as usize,
+                            ),
+                            "validated unpublished upload must remain owned"
+                        );
+                    }
+                    UnpublishedMutationOwner::Prepared => self.prepared_system_mutation = None,
+                }
+                body.disposition = disposition::UNPUBLISHED_ABORTED;
+            } else if request.operation == operation::ABORT {
                 self.prepared_system_mutation = None;
                 body.disposition = disposition::ABORTED;
             } else {
@@ -187,6 +222,27 @@ impl CmServer {
         self.validate_prepared_system_mutation_identity(token, expected, len)
     }
 
+    fn validate_unpublished_system_mutation(
+        &self,
+        token: u64,
+        expected: u64,
+        len: usize,
+    ) -> Result<UnpublishedMutationOwner, i32> {
+        if self
+            .validate_prepared_system_mutation_identity(token, expected, len)
+            .is_ok()
+        {
+            return Ok(UnpublishedMutationOwner::Prepared);
+        }
+        if self
+            .system_mutation_leases
+            .matches_upload(token, expected, len)
+        {
+            return Ok(UnpublishedMutationOwner::Upload);
+        }
+        Err(STATUS_INVALID_PARAMETER)
+    }
+
     // Cleanup must remain possible for the exact preparation even if live authority has moved.
     // An absent preparation is not evidence of a successful abort.
     fn validate_prepared_system_mutation_identity(
@@ -233,5 +289,7 @@ mod tests;
 
 #[cfg(test)]
 mod abort_tests;
+#[cfg(test)]
+mod cancellation_tests;
 #[cfg(test)]
 pub(super) mod test_support;

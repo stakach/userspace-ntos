@@ -9,6 +9,90 @@ use nt_config_abi::hive_mutation_commit_operation as operation;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[test]
+fn retained_begin_upload_and_durable_publication_preserve_one_caller() {
+    use crate::{
+        CmMutationBeginAttempts, CmMutationBeginOperation as Begin,
+        CmMutationPreparationOperation as Op, CmMutationPreparationPhase as Phase,
+        SystemHiveMutation,
+    };
+    let mut client = client(1);
+    let mut attempts = CmMutationBeginAttempts::with_slot_limit(1).unwrap();
+    let drops = Rc::new(Cell::new(0));
+    let mut attempt = match attempts.reserve(
+        1,
+        &[SystemHiveMutation::CreateKey {
+            path: &alloc::format!("{PARENT}\\Child"),
+        }],
+        Caller {
+            drops: drops.clone(),
+            publications: 0,
+        },
+    ) {
+        Ok(attempt) => attempt,
+        Err(_) => panic!("caller admission failed"),
+    };
+    for op in [Begin::Query, Begin::Begin, Begin::Acknowledge] {
+        let mut ticket = attempts.begin_exchange(&mut attempt, op).unwrap();
+        let response = client.exchange_system_hive_mutation_begin(&ticket);
+        attempts
+            .complete_exchange(&mut attempt, &mut ticket, response)
+            .unwrap();
+    }
+    let mut preparing = attempts
+        .take_upload(&mut attempt)
+        .unwrap()
+        .into_preparation();
+    while preparing.phase() != Phase::Prepared {
+        let op = match preparing.phase() {
+            Phase::Appending => Op::Append,
+            Phase::Preparing => Op::Prepare,
+            Phase::Allocating => {
+                preparing.allocate_journal().unwrap();
+                continue;
+            }
+            Phase::Pulling => Op::Pull,
+            _ => panic!("unexpected preparation state"),
+        };
+        let mut ticket = preparing.begin_exchange(op).unwrap();
+        let response = client.exchange_system_hive_mutation_preparation(&ticket);
+        preparing.complete_exchange(&mut ticket, response).unwrap();
+    }
+    let (prepared, caller) = preparing.take_prepared().unwrap();
+    assert_eq!(preparing.phase(), Phase::Taken);
+    assert!(preparing.begin_exchange(Op::Cancel).is_err());
+    assert_eq!(drops.get(), 0);
+    let expected = prepared.durable_journal().to_vec();
+    let (mut fs, mut dev, _) = disk();
+    let mut work = match Work::open(
+        &mut client,
+        &mut fs,
+        &mut dev,
+        SnapshotBlockStore::new(0, 64),
+        LOG,
+        prepared,
+        caller,
+    ) {
+        Ok(work) => work,
+        Err(_) => panic!("storage admission failed"),
+    };
+    work.make_durable().unwrap();
+    work.commit().unwrap();
+    publish(&mut work);
+    work.acknowledge().unwrap();
+    let (caller, generation) = work.take_completion().unwrap();
+    assert_eq!(generation, 2);
+    assert_eq!(caller.publications, 1);
+    assert_eq!(drops.get(), 0);
+    drop(work);
+    recovered(&mut dev, &expected);
+    assert!(client
+        .query_system_hive_key(&alloc::format!("{PARENT}\\Child"))
+        .is_ok());
+    drop(caller);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
 fn repeated_storage_failure_blocks_commit_until_real_durability() {
     for (persist, barrier) in [false, true]
         .into_iter()

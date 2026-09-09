@@ -31762,9 +31762,9 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       silently cancels or restarts a submitted acquisition.
 
     Review adjustment: this handoff still owns a live writer, not a prepared mutation or completed
-    caller. The next slice must consume it into retained APPEND/PREPARE/PULL progress and provide
-    acknowledged upload cancellation; do not pass it into one-shot preparation or expose a raw
-    token to sidestep that owner. Full cancellation before/after uncertain acquisition must resolve
+    caller. The retained preparation checkpoint below consumes it into APPEND/PREPARE/PULL progress
+    and provides acknowledged upload cancellation; do not pass it into one-shot preparation or
+    expose a raw token to sidestep that owner. Full cancellation before/after uncertain acquisition must resolve
     BEGIN first, not acknowledge an unknown successful token away. Requester registrations and ACK
     watermarks survive slot reuse within one CM authority, not service crash/reconstruction.
     Native callers remain unchanged pending complete preparation/storage/caller integration and
@@ -31788,6 +31788,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     No dummy reads or public token accessor were added to suppress it. No native BEGIN cutover,
     microkernel change or VM run occurred; 27 strict missing win32k imports and desktop acceptance
     remain open.
+
+    Retained mutation preparation checkpoint (2026-09-10): consume acknowledged BEGIN ownership
+    through preparation or confirmed unpublished cancellation without releasing its caller early.
+    - [x] Add a non-Clone preparation owner with detached fixed-size APPEND/PREPARE/PULL exchanges.
+      Retain exact semantic bytes, authority, token, chunk offset and caller across uncertain
+      replies. Advance only after exact token/generation/count validation; never rewind a phase.
+    - [x] Retain the validated durable-journal manifest across local allocation failure. Retry only
+      allocation or cancel; do not repeat successful PREPARE. Collect exact immutable PULL chunks
+      into one reserved buffer and transfer the opaque preparation plus caller once, without a
+      journal copy. Accept genuine empty journals without issuing PULL or manufacturing bytes.
+    - [x] Add ABORT_UNPUBLISHED to the existing terminal-outcome protocol. Match an exact upload
+      or prepared identity, reserve receipt capacity before releasing either owner, and retain the
+      outcome until exact ACK. Refuse unacknowledged BEGIN, absent ownership and crossed terminal
+      kinds. A later live hive generation does not prevent exact cleanup; old ACK cannot free a
+      newer owner. Keep the existing prepared-only ABORT contract intact.
+    - [x] Latch cancellation before dispatch and return the caller only after validated ACK.
+      Errors retain cancellation direction and identity; COMMIT/storage are unavailable through
+      this owner. Share complete terminal-frame and ACK validation with existing client APIs,
+      deleting their duplicated checks rather than adding a second interpretation.
+    - [x] Bind every detached response to its originating authority, attempt, operation and ticket
+      epoch. Review found that a delayed response to full chunk A could otherwise satisfy a live
+      equally sized chunk B. Reject it without consuming B's ticket or advancing bytes, with
+      separate APPEND and PULL regressions that then complete the correct exchange successfully.
+    - [x] Compose retained BEGIN/ACK, preparation, real snapshot durability, CM COMMIT, local
+      publication and terminal ACK with one caller in a host test. Restore the persisted journal
+      after simulated power loss and verify the genuine child key and generation. This is host
+      composition evidence, not activation of a native adapter or a desktop boot.
+
+    Review adjustment: preparation ownership is now implemented; the handoff metadata warning is
+    removed by its real consumer, not dummy access. Remaining native prerequisites are exact CM
+    authority-to-log/mount admission, retained first-journal creation and exclusive snapshot reserve
+    ownership, followed by complete caller/PnP/Key publication and atomic deletion of historical
+    one-shot APIs. Empty-journal volatile/no-op publication still needs a separate real path because
+    the durable snapshot owner intentionally rejects empty journals. Before-submission BEGIN
+    cancellation is not added here; uncertain acquisition must resolve BEGIN and retain its token
+    before using this cancellation owner. Service restart/reconstruction remains outside the
+    same-authority replay contract. No native cutover, microkernel change or VM run occurred;
+    27 strict missing win32k imports and desktop acceptance remain open.
+
+    Serialized validation passes all 1,383 tests/doctests: nt-config-abi 9, nt-config-server 103,
+    nt-config-client 151 plus 18 doctests, nt-config-manager 35, nt-fs 162 plus one doctest,
+    nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two doctests, and nt-user-host
+    494 plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-cm-upload-owner-full-final-20260910.log`. The 24 added tests/doctests cover both
+    unpublished owner kinds, receipt exhaustion, malformed/crossed/stale replies, lost effects,
+    allocation failure, one-shot handoff, caller lifetime and full durable host composition.
+    Independent protocol review found no remaining issue after response binding was corrected.
+    Allocation failure uses a deterministic reserve seam; arbitrary allocator failure was not run.
+    Existing client warnings remain for one unused status constant and two older hardware-profile
+    tests discarding preparation proofs; this checkpoint introduces no new warnings.
+    Freestanding executive release passes in 38.07 seconds with 293 existing executive warnings;
+    log: `.tmp/build-cm-upload-owner-executive-20260910.log`.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
