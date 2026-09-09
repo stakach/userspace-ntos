@@ -30,55 +30,49 @@ impl<'a> NtFileHiveIoProvider<'a> {
         }
     }
 
-    /// Read a whole file's bytes (`None` if it doesn't exist / is empty).
-    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, HiveIoError> {
-        let mut fs = self.fs.borrow_mut();
-        let r = fs.zw_create_file(path, FILE_READ_DATA | SYNCHRONIZE, 0, 0, FILE_OPEN, 0);
-        if r.status != STATUS_SUCCESS {
-            return if r.status == STATUS_OBJECT_NAME_NOT_FOUND
-                || r.status == STATUS_OBJECT_PATH_NOT_FOUND
-                || r.status == STATUS_NO_SUCH_FILE
-            {
-                Ok(None)
-            } else {
-                Err(HiveIoError::Io)
-            };
-        }
-        let size = fs
-            .zw_query_standard_information(r.handle)
-            .map(|i| i.end_of_file)
-            .unwrap_or(0);
-        if size == 0 {
-            fs.zw_close(r.handle);
+    fn with_read_file<T>(
+        &self,
+        path: &str,
+        read: impl FnOnce(&FileSystem) -> Result<Option<T>, u32>,
+    ) -> Result<Option<T>, HiveIoError> {
+        let mut fs = self.fs.try_borrow_mut().map_err(|_| HiveIoError::Io)?;
+        // A missing parent is not an absent hive. Keep the checked probe and the admitted open
+        // under one exclusive volume borrow, including the subsequent extent copy and close.
+        if fs
+            .try_file_len(path)
+            .map_err(|_| HiveIoError::Io)?
+            .is_none()
+        {
             return Ok(None);
         }
-        let (st, bytes) = fs.zw_read_file(r.handle, Some(0), size as usize);
-        fs.zw_close(r.handle);
-        if st != STATUS_SUCCESS {
+        let opened = fs.zw_create_file(
+            path,
+            FILE_READ_DATA | SYNCHRONIZE,
+            0,
+            0,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+        );
+        if opened.status != STATUS_SUCCESS {
             return Err(HiveIoError::Io);
         }
-        Ok(Some(bytes))
+        let result = read(&fs).map_err(|_| HiveIoError::Io);
+        let close = fs.zw_close(opened.handle);
+        if close != STATUS_SUCCESS {
+            return Err(HiveIoError::Io);
+        }
+        result
+    }
+
+    /// Read a whole file without converting wrong-kind, allocation, or storage errors to absence.
+    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, HiveIoError> {
+        self.with_read_file(path, |fs| fs.try_file_bytes_owned(path))
     }
 
     fn file_size(&self, path: &str) -> Result<Option<usize>, HiveIoError> {
-        let mut fs = self.fs.borrow_mut();
-        let r = fs.zw_create_file(path, FILE_READ_DATA | SYNCHRONIZE, 0, 0, FILE_OPEN, 0);
-        if r.status != STATUS_SUCCESS {
-            return if r.status == STATUS_OBJECT_NAME_NOT_FOUND
-                || r.status == STATUS_OBJECT_PATH_NOT_FOUND
-                || r.status == STATUS_NO_SUCH_FILE
-            {
-                Ok(None)
-            } else {
-                Err(HiveIoError::Io)
-            };
-        }
-        let size = fs
-            .zw_query_standard_information(r.handle)
-            .map(|i| i.end_of_file as usize)
-            .unwrap_or(0);
-        fs.zw_close(r.handle);
-        Ok(Some(size))
+        self.with_read_file(path, |fs| fs.try_file_len(path))?
+            .map(|len| usize::try_from(len).map_err(|_| HiveIoError::Io))
+            .transpose()
     }
 
     fn rename_information(
@@ -129,7 +123,7 @@ impl HiveIoProvider for NtFileHiveIoProvider<'_> {
         HiveIoProviderKind::NtFile
     }
     fn read_primary_image(&mut self) -> Result<Option<Vec<u8>>, HiveIoError> {
-        self.read_file(&self.image_path.clone())
+        self.read_file(&self.image_path)
     }
     fn write_primary_image_atomic(&mut self, bytes: &[u8]) -> Result<(), HiveIoError> {
         let tmp_path = alloc::format!("{}.TMP", self.image_path);
@@ -153,7 +147,7 @@ impl HiveIoProvider for NtFileHiveIoProvider<'_> {
         Ok(())
     }
     fn read_log(&mut self) -> Result<Vec<u8>, HiveIoError> {
-        Ok(self.read_file(&self.log_path.clone())?.unwrap_or_default())
+        Ok(self.read_file(&self.log_path)?.unwrap_or_default())
     }
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), HiveIoError> {
         let mut fs = self.fs.borrow_mut();
@@ -184,12 +178,12 @@ impl HiveIoProvider for NtFileHiveIoProvider<'_> {
     fn flush_log(&mut self) -> Result<(), HiveIoError> {
         Ok(())
     }
-    fn get_status(&self) -> HiveIoStatus {
-        let image_len = self.file_size(&self.image_path).ok().flatten();
-        let log_len = self.file_size(&self.log_path).ok().flatten().unwrap_or(0);
-        HiveIoStatus {
-            image_present: image_len.is_some_and(|len| len != 0),
+    fn get_status(&self) -> Result<HiveIoStatus, HiveIoError> {
+        let image_len = self.file_size(&self.image_path)?;
+        let log_len = self.file_size(&self.log_path)?.unwrap_or(0);
+        Ok(HiveIoStatus {
+            image_present: image_len.is_some(),
             log_len,
-        }
+        })
     }
 }

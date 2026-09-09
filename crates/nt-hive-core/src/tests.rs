@@ -1614,7 +1614,7 @@ fn manager_live_apply_replays_repeated_setup_style_mutations() {
         }
     }
 
-    assert!(provider.get_status().log_len > 0);
+    assert!(provider.get_status().unwrap().log_len > 0);
     let booted = HiveManager::new(provider).boot(HiveKind::System).unwrap();
     let tcpip = booted
         .open_key(r"ControlSet001\Services\Tcpip")
@@ -1929,11 +1929,11 @@ impl HiveIoProvider for ReadFaultHiveIoProvider {
         Ok(())
     }
 
-    fn get_status(&self) -> HiveIoStatus {
-        HiveIoStatus {
+    fn get_status(&self) -> Result<HiveIoStatus, HiveIoError> {
+        Ok(HiveIoStatus {
             image_present: self.image.is_some(),
             log_len: self.log.len(),
-        }
+        })
     }
 }
 

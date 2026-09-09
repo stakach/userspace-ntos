@@ -4246,7 +4246,9 @@ impl ExecNtHandler {
             }
         }
         if crate::writable_fs::snapshot_restore_seen() {
-            handler.refresh_boot_hive_checkpoints_from_writable_config();
+            handler
+                .refresh_boot_hive_checkpoints_from_writable_config()
+                .expect("persisted boot hive recovery failed");
         }
         handler.refresh_process_manager_gates();
         reset_setup_provision_trace();
@@ -6503,16 +6505,22 @@ impl ExecNtHandler {
         });
     }
 
-    fn refresh_boot_hive_checkpoint_from_path(&mut self, hive_sel: u32, file_path: &str) -> bool {
+    fn refresh_boot_hive_checkpoint_from_path(
+        &mut self,
+        hive_sel: u32,
+        file_path: &str,
+    ) -> Result<bool, u32> {
+        const STATUS_REGISTRY_CORRUPT: u32 = 0xC000_014C;
+
         let mount_path = hive_mount(hive_sel);
-        let log_bytes = unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(file_path) }
+        let log_bytes = unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(file_path) }?
             .unwrap_or_default();
-        let Some(bytes) = (unsafe { crate::writable_fs::file_bytes_if_mounted(file_path) }) else {
+        let Some(bytes) = (unsafe { crate::writable_fs::file_bytes_owned_if_mounted(file_path) })? else {
             if log_bytes.is_empty() {
-                return false;
+                return Ok(false);
             }
             let Some(hive) = self.mutable_hives.hive_mut(hive_sel) else {
-                return false;
+                return Err(STATUS_REGISTRY_CORRUPT);
             };
             let base_sequence = hive.sequence;
             let last_sequence = nt_hive_core::replay_log(hive, &log_bytes, base_sequence);
@@ -6534,9 +6542,9 @@ impl ExecNtHandler {
             print_str(b"..");
             print_u64(last_sequence);
             print_str(b"\n");
-            return last_sequence > base_sequence;
+            return Ok(last_sequence > base_sequence);
         };
-        if let Ok(mut hive) = nt_hive_core::decode_image(bytes) {
+        if let Ok(mut hive) = nt_hive_core::decode_image(&bytes) {
             let base_sequence = hive.sequence;
             let last_sequence = nt_hive_core::replay_log(&mut hive, &log_bytes, base_sequence);
             let root_subkeys = hive.subkey_count(hive.root()) as u64;
@@ -6548,7 +6556,7 @@ impl ExecNtHandler {
                 print_str(b"[cm-restore] boot hive checkpoint rejected invalid SYSTEM selection ");
                 print_ascii_str(file_path);
                 print_str(b"\n");
-                return false;
+                return Err(STATUS_REGISTRY_CORRUPT);
             }
             self.mutable_hives.clear_hive_dirty(hive_sel);
             if hive_sel == HIVE_SEL_USER_DEFAULT {
@@ -6569,9 +6577,9 @@ impl ExecNtHandler {
             print_str(b"..");
             print_u64(last_sequence);
             print_str(b" format=core\n");
-            return true;
+            return Ok(true);
         }
-        if let Some(regf) = RegfHive::new(bytes) {
+        if let Some(regf) = RegfHive::new(&bytes) {
             let root_subkeys = regf.subkeys(regf.root()).len() as u64;
             if mount_mutable_regf_hive(&mut self.mutable_hives, hive_sel, mount_path, &regf)
                 .is_err()
@@ -6579,7 +6587,7 @@ impl ExecNtHandler {
                 print_str(b"[cm-restore] boot regf checkpoint rejected ");
                 print_ascii_str(file_path);
                 print_str(b"\n");
-                return false;
+                return Err(STATUS_REGISTRY_CORRUPT);
             }
             let base_sequence = self
                 .mutable_hives
@@ -6609,21 +6617,20 @@ impl ExecNtHandler {
             print_str(b"..");
             print_u64(last_sequence);
             print_str(b" format=regf\n");
-            return true;
+            return Ok(true);
         }
         print_str(b"[cm-restore] boot hive checkpoint rejected ");
         print_ascii_str(file_path);
         print_str(b" bytes=");
         print_u64(bytes.len() as u64);
         print_str(b"\n");
-        false
+        Err(STATUS_REGISTRY_CORRUPT)
     }
 
-    pub(crate) fn refresh_boot_hive_checkpoints_from_writable_config(&mut self) -> bool {
+    pub(crate) fn refresh_boot_hive_checkpoints_from_writable_config(&mut self) -> Result<bool, u32> {
         if self.boot_hive_checkpoints_refreshed {
-            return false;
+            return Ok(false);
         }
-        self.boot_hive_checkpoints_refreshed = true;
         let mut mounted = false;
         for (hive_sel, file_path) in [
             (
@@ -6640,12 +6647,13 @@ impl ExecNtHandler {
                 crate::writable_fs::CONFIG_DEFAULT_HIVE_PATH,
             ),
         ] {
-            mounted |= self.refresh_boot_hive_checkpoint_from_path(hive_sel, file_path);
+            mounted |= self.refresh_boot_hive_checkpoint_from_path(hive_sel, file_path)?;
         }
+        self.boot_hive_checkpoints_refreshed = true;
         if mounted {
             print_str(b"[cm-restore] boot hive checkpoints refreshed from writable config\n");
         }
-        mounted
+        Ok(mounted)
     }
 
     fn checkpoint_system_hive_from_config_manager(&mut self) -> u32 {
@@ -6849,8 +6857,22 @@ impl ExecNtHandler {
             if dirty == 0 {
                 continue;
             }
-            let image_len = unsafe { crate::writable_fs::hive_image_len_at(file_path) };
-            let log_len = unsafe { crate::writable_fs::hive_log_len_if_mounted(file_path) };
+            let lengths = unsafe {
+                crate::writable_fs::file_len_if_mounted(file_path).and_then(|image_len| {
+                    crate::writable_fs::hive_log_len_if_mounted(file_path)
+                        .map(|log_len| (image_len.unwrap_or(0), log_len))
+                })
+            };
+            let (image_len, log_len) = match lengths {
+                Ok(lengths) => lengths,
+                Err(status) => {
+                    REG_FLUSH_KEY_BOOT_HIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    print_str(b"[cm-flush] journal accounting retained after read error=0x");
+                    print_hex(status);
+                    print_str(b"\n");
+                    return;
+                }
+            };
             if log_len == 0 {
                 continue;
             }
@@ -7356,9 +7378,15 @@ impl ExecNtHandler {
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
             };
-            let log_bytes =
-                unsafe { crate::writable_fs::hive_log_bytes_owned_if_mounted(&file_name) }
-                    .unwrap_or_default();
+            let log_bytes = match unsafe {
+                crate::writable_fs::hive_log_bytes_owned_if_mounted(&file_name)
+            } {
+                Ok(bytes) => bytes.unwrap_or_default(),
+                Err(status) => {
+                    USER_HIVE_SLOT_USED.fetch_and(!(1u64 << slot), Ordering::Relaxed);
+                    return status;
+                }
+            };
             if !log_bytes.is_empty() {
                 let base_sequence = hive.sequence;
                 let last_sequence = nt_hive_core::replay_log(&mut hive, &log_bytes, base_sequence);

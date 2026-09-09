@@ -1088,14 +1088,7 @@ fn owned_file_before_publish(
     path: &str,
     read_error: BootSystemRestoreError,
 ) -> Result<Option<alloc::vec::Vec<u8>>, BootSystemRestoreError> {
-    let Some(expected_len) = fs.file_len(path) else {
-        return Ok(None);
-    };
-    let bytes = fs.file_bytes_owned(path).ok_or(read_error)?;
-    if bytes.len() as u64 != expected_len {
-        return Err(read_error);
-    }
-    Ok(Some(bytes))
+    fs.try_file_bytes_owned(path).map_err(|_| read_error)
 }
 
 /// Restore and classify persisted SYSTEM state before publishing or provisioning the writable FS.
@@ -1173,9 +1166,26 @@ pub(crate) unsafe fn file_bytes_if_mounted(path: &str) -> Option<&'static [u8]> 
 ///
 /// # Safety
 /// Single-threaded executive; borrows the mounted volume for the duration of the copy.
-pub(crate) unsafe fn file_bytes_owned_if_mounted(path: &str) -> Option<alloc::vec::Vec<u8>> {
-    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS)).as_ref()?;
-    fs.file_bytes_owned(path)
+pub(crate) unsafe fn file_bytes_owned_if_mounted(
+    path: &str,
+) -> Result<Option<alloc::vec::Vec<u8>>, u32> {
+    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
+        .as_ref()
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    fs.try_file_bytes_owned(path)
+}
+
+/// Inspect internal file metadata without treating unavailable storage as a missing file.
+///
+/// # Safety
+/// Single-threaded executive; borrows the mounted volume for the duration of the query.
+pub(crate) unsafe fn file_len_if_mounted(path: &str) -> Result<Option<usize>, u32> {
+    let fs = (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
+        .as_ref()
+        .ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    fs.try_file_len(path)?
+        .map(|len| usize::try_from(len).map_err(|_| nt_fs::STATUS_INSUFFICIENT_RESOURCES))
+        .transpose()
 }
 
 /// Copy a mounted boot-hive journal sidecar, including extent-backed append files.
@@ -1184,7 +1194,7 @@ pub(crate) unsafe fn file_bytes_owned_if_mounted(path: &str) -> Option<alloc::ve
 /// Single-threaded executive; borrows the mounted volume for the duration of the copy.
 pub(crate) unsafe fn hive_log_bytes_owned_if_mounted(
     image_path: &str,
-) -> Option<alloc::vec::Vec<u8>> {
+) -> Result<Option<alloc::vec::Vec<u8>>, u32> {
     let log_path = alloc::format!("{}.LOG", image_path);
     file_bytes_owned_if_mounted(&log_path)
 }
@@ -1194,12 +1204,9 @@ pub(crate) unsafe fn hive_log_bytes_owned_if_mounted(
 /// # Safety
 /// Single-threaded executive; callers must not mutate the writable volume while holding any
 /// separately borrowed slices.
-pub(crate) unsafe fn hive_log_len_if_mounted(image_path: &str) -> usize {
+pub(crate) unsafe fn hive_log_len_if_mounted(image_path: &str) -> Result<usize, u32> {
     let log_path = alloc::format!("{}.LOG", image_path);
-    (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
-        .as_ref()
-        .and_then(|fs| fs.file_len(&log_path))
-        .unwrap_or(0) as usize
+    Ok(file_len_if_mounted(&log_path)?.unwrap_or(0))
 }
 
 /// Consume the one-shot dirty bit set by the lazy writable-volume mount/materialisation.
@@ -1799,13 +1806,9 @@ impl WritableHiveIoProvider {
         }
     }
 
-    pub(crate) fn log_len(&self) -> usize {
-        unsafe {
-            (*core::ptr::addr_of!(EXEC_WRITABLE_FS))
-                .as_ref()
-                .and_then(|fs| fs.file_len(&self.log_path))
-                .unwrap_or(0) as usize
-        }
+    pub(crate) fn log_len(&self) -> Result<usize, nt_hive_core::HiveIoError> {
+        unsafe { hive_log_len_if_mounted(&self.image_path) }
+            .map_err(|_| nt_hive_core::HiveIoError::Io)
     }
 
     pub(crate) fn truncate_log_to(
@@ -1825,7 +1828,8 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     fn read_primary_image(
         &mut self,
     ) -> Result<Option<alloc::vec::Vec<u8>>, nt_hive_core::HiveIoError> {
-        Ok(unsafe { file_bytes_owned_if_mounted(&self.image_path) })
+        unsafe { file_bytes_owned_if_mounted(&self.image_path) }
+            .map_err(|_| nt_hive_core::HiveIoError::Io)
     }
 
     fn write_primary_image_atomic(
@@ -1843,7 +1847,9 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
     }
 
     fn read_log(&mut self) -> Result<alloc::vec::Vec<u8>, nt_hive_core::HiveIoError> {
-        Ok(unsafe { file_bytes_owned_if_mounted(&self.log_path).unwrap_or_default() })
+        Ok(unsafe { file_bytes_owned_if_mounted(&self.log_path) }
+            .map_err(|_| nt_hive_core::HiveIoError::Io)?
+            .unwrap_or_default())
     }
 
     fn append_log_record(&mut self, bytes: &[u8]) -> Result<(), nt_hive_core::HiveIoError> {
@@ -1862,13 +1868,15 @@ impl nt_hive_core::HiveIoProvider for WritableHiveIoProvider {
         Ok(())
     }
 
-    fn get_status(&self) -> nt_hive_core::HiveIoStatus {
-        let image_present = unsafe { file_bytes_if_mounted(&self.image_path).is_some() };
-        let log_len = self.log_len();
-        nt_hive_core::HiveIoStatus {
+    fn get_status(&self) -> Result<nt_hive_core::HiveIoStatus, nt_hive_core::HiveIoError> {
+        let image_present = unsafe { file_len_if_mounted(&self.image_path) }
+            .map_err(|_| nt_hive_core::HiveIoError::Io)?
+            .is_some();
+        let log_len = self.log_len()?;
+        Ok(nt_hive_core::HiveIoStatus {
             image_present,
             log_len,
-        }
+        })
     }
 }
 

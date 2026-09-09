@@ -31482,14 +31482,58 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
       performs AHCI-backed payload/header flush ordering, but mutation publication currently does
       not wait for that path. Reuse a real storage contract without claiming RAM coherence is
       durable or adding a second ad hoc persistence format.
-    - [ ] Distinguish an unavailable log/storage authority from a genuinely absent/empty log in
-      log_len/read_log and carry storage errors through preparation/recovery. Retain uncertain
-      append/flush and failed truncate work with exact log extent and backend identity; never
-      blindly reappend a whole journal after partial append or return after dropping recovery state.
+    - [x] Distinguish an unavailable log/storage authority from a genuinely absent/empty log in
+      log_len/read_log and carry storage errors through preparation/recovery. Checked metadata and
+      complete owned reads now preserve errors throughout the hive provider and native recovery
+      paths; see the checked-read checkpoint below.
+    - [ ] Retain uncertain append/flush and failed truncate work with exact log extent and backend
+      identity; never blindly reappend a whole journal after partial append or return after dropping
+      recovery state.
     - [ ] Retain complete caller publication state and exact COMMIT/ACK attempts. Once COMMIT is
       issued, disallow error-based truncate/ABORT; store its receipt before publishing local state,
       publish local generation/event/handle state once, and retry ACK without repeating publication.
       Remove the old one-shot operation/client API and native wrapper in the same caller cutover.
+
+    Checked hive-storage read checkpoint (2026-09-09): removed the error-to-absence conversions
+    from authoritative primary/log reads and status queries before activating durable publication.
+    - [x] Add focused nt-fs checked metadata and whole-file copy APIs. Only a missing leaf below an
+      existing directory on the selected volume is absent. Wrong volume, missing parent, directory,
+      invalid backing extent, aggregate-length overflow, short copy and allocation failure remain
+      errors. Present empty files remain present; a zero-byte primary fails hive decoding rather
+      than silently creating a fresh hive. Multi-extent and sparse files return every byte.
+    - [x] Make HiveIoProvider status fallible and preserve ordinary NT file-open admission in
+      NtFileHiveIoProvider. Sharing and delete-pending restrictions remain enforced; the temporary
+      FILE_OBJECT is closed after both successful and failed checked reads. Internal executive
+      storage inspection does not claim to replace those ordinary file-object rules.
+    - [x] Carry checked reads through pre-publication SYSTEM restore, mounted boot-hive refresh,
+      NtLoadKey sidecar replay and writable-provider primary/log/status methods. Initial boot
+      refresh fails closed on recovery errors, lazy refresh propagates status without marking
+      completion, and failed NtLoadKey sidecar reads release the reserved user-hive slot.
+    - [x] Explicitly mount writable storage before acquiring the native rollback baseline, then
+      obtain that checked baseline before CM PREPARE so read failure cannot abandon a new writer
+      preparation. Check both primary and log metadata before journal-checkpoint accounting clears
+      pending state; retain pending counters on errors rather than substituting zero lengths.
+
+    Review adjustment: this closes read/error classification only. WritableHiveIoProvider's
+    flush methods still do not wait for block-backed snapshot publication, and native one-shot
+    COMMIT still lacks complete retained recovery ownership. Do not wire a fallible disk barrier
+    into that wrapper without first retaining its uncertain append/flush, exact backend/extent and
+    caller continuation. Snapshot retry must not duplicate an already appended journal. The next
+    storage slice is the owned durability evidence/retained-work boundary, followed by atomic
+    native COMMIT/ACK cutover and removal of the replaced one-shot machinery.
+
+    Serialized host validation passes all 1,293 tests/doctests: nt-fs 153, nt-config-abi 7,
+    nt-config-client 110, nt-config-server 76, nt-config-manager 35, nt-hive-core 106 plus 18
+    generator cases, nt-security 223, nt-user-host 494 plus 49 integration cases, and 22 doctests.
+    The ten new cases cover absence versus empty/corrupt files, invalid paths and extents,
+    deterministic allocation failure, fragmented/sparse contents, unavailable provider access,
+    sharing and delete-pending admission. The old first-boot fixture now uses a genuinely absent
+    primary. Log: `.tmp/test-hive-checked-reads-full-20260909.log`. Independent review caught and
+    corrected lazy-mount ordering and ordinary FILE_OBJECT admission before acceptance. The final
+    freestanding executive release build passes in 34.98 seconds with 293 existing warnings; log:
+    `.tmp/build-hive-checked-reads-executive-20260909.log`. Native wiring is compile-verified, not
+    runtime proof. No microkernel change or VM run is part of this slice; the 27 strict missing
+    win32k imports and native desktop acceptance remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

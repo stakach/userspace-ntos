@@ -1738,7 +1738,9 @@ fn directory_rejects_data_ops() {
 #[test]
 fn hive_persists_through_file_apis() {
     // Spec §14.2 acceptance: HiveManager writes/reads a hive image through Zw* file APIs on MemFs.
-    let fs = RefCell::new(FileSystem::new(MemFs::with_fixture()));
+    let mut fs = FileSystem::new(MemFs::new());
+    assert!(fs.provision_directory(r"\SystemRoot\System32\Config"));
+    let fs = RefCell::new(fs);
 
     // First boot: fresh hive, seed via mutations, checkpoint to the file, journal one more write.
     {
@@ -2540,7 +2542,7 @@ fn ntfile_hive_provider_installs_primary_image_by_replace_rename() {
 
     provider.append_log_record(b"abc").unwrap();
     provider.append_log_record(b"de").unwrap();
-    assert_eq!(provider.get_status().log_len, 5);
+    assert_eq!(provider.get_status().unwrap().log_len, 5);
 
     provider.write_primary_image_atomic(b"new image").unwrap();
     assert_eq!(fs.borrow().file_bytes(SYSTEM_HIVE), Some(&b"new image"[..]));
@@ -2548,9 +2550,9 @@ fn ntfile_hive_provider_installs_primary_image_by_replace_rename() {
         .borrow()
         .query_attributes(r"\SystemRoot\System32\Config\SYSTEM.TMP")
         .is_none());
-    assert!(provider.get_status().image_present);
+    assert!(provider.get_status().unwrap().image_present);
     provider.truncate_log().unwrap();
-    assert_eq!(provider.get_status().log_len, 0);
+    assert_eq!(provider.get_status().unwrap().log_len, 0);
 }
 
 #[test]

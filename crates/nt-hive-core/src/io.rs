@@ -62,7 +62,8 @@ pub trait HiveIoProvider {
     fn truncate_log(&mut self) -> Result<(), HiveIoError>;
     fn flush_image(&mut self) -> Result<(), HiveIoError>;
     fn flush_log(&mut self) -> Result<(), HiveIoError>;
-    fn get_status(&self) -> HiveIoStatus;
+    /// Status queries must preserve backend errors; an unavailable log is not an empty log.
+    fn get_status(&self) -> Result<HiveIoStatus, HiveIoError>;
 }
 
 /// In-RAM image/log — unit tests + early seL4 boot before a filesystem exists (spec §10.3).
@@ -119,11 +120,11 @@ impl HiveIoProvider for MemoryHiveIoProvider {
     fn flush_log(&mut self) -> Result<(), HiveIoError> {
         Ok(())
     }
-    fn get_status(&self) -> HiveIoStatus {
-        HiveIoStatus {
+    fn get_status(&self) -> Result<HiveIoStatus, HiveIoError> {
+        Ok(HiveIoStatus {
             image_present: self.image.is_some(),
             log_len: self.log.len(),
-        }
+        })
     }
 }
 
@@ -191,7 +192,7 @@ impl HiveIoProvider for FaultInjectionHiveIoProvider {
     fn flush_log(&mut self) -> Result<(), HiveIoError> {
         self.inner.flush_log()
     }
-    fn get_status(&self) -> HiveIoStatus {
+    fn get_status(&self) -> Result<HiveIoStatus, HiveIoError> {
         self.inner.get_status()
     }
 }

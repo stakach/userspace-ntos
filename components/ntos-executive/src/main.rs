@@ -15999,12 +15999,14 @@ pub(crate) unsafe fn persist_and_publish_system_hive_mutation(
 ) -> Result<DurableSystemHiveMutationOutcome, u32> {
     const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 
+    writable_fs::writable_fs().ok_or(nt_fs::STATUS_DEVICE_NOT_READY)?;
+    let mut provider =
+        writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
+    // Establish a readable rollback baseline before acquiring CM's sole writer preparation.
+    let previous_log_len = provider.log_len().map_err(|_| STATUS_UNSUCCESSFUL)?;
     let prepared =
         config_manager_prepare_system_hive_mutation(expected_generation, mutations)
             .map_err(|status| status as u32)?;
-    let mut provider =
-        writable_fs::WritableHiveIoProvider::new(writable_fs::CONFIG_SYSTEM_HIVE_PATH);
-    let previous_log_len = provider.log_len();
     let journaled = !prepared.durable_journal.is_empty();
     let journal_result = if journaled {
         nt_hive_core::HiveIoProvider::append_log_record(&mut provider, &prepared.durable_journal)

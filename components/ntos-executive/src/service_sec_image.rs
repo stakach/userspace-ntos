@@ -3401,7 +3401,10 @@ fn finalize_service_loop_state(nt_handler: &mut ExecNtHandler) -> u32 {
         let _alloc_scope = allocator::enter_scope(b"service-loop-writable-fs");
         nt_handler.writable_fs_dirty = false;
         if crate::writable_fs::snapshot_restore_seen() {
-            let _ = nt_handler.refresh_boot_hive_checkpoints_from_writable_config();
+            if let Err(status) = nt_handler.refresh_boot_hive_checkpoints_from_writable_config() {
+                nt_handler.writable_fs_dirty = true;
+                return status;
+            }
         }
         if nt_handler.writable_fs_commit_required {
             let checkpoint_result = {
