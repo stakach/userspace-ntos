@@ -4676,6 +4676,7 @@ unsafe fn writable_overlay_spec(passed: &mut u64) {
     winlogon_profile_directories_spec(passed);
     unsafe { winlogon_profile_copied_spec(passed) };
     provider_wait_transport_spec(passed);
+    synchronous_file_retry_spec(passed);
     vspace_asid_unmap_spec(passed);
     working_set_transition_spec(passed);
     root_cap_ownership_spec(passed);
@@ -6002,6 +6003,29 @@ fn provider_wait_transport_spec(passed: &mut u64) {
                     .saturating_add(stats.active_dispatcher_leases as u64),
         passed,
     );
+}
+
+fn synchronous_file_retry_spec(passed: &mut u64) {
+    let (stats, delivered, retired, failures) = service_sec_image::synchronous_file_retry_stats();
+    print_str(b"[file-retry] waiting/ready/invoking/acked/uncertain/grants=");
+    for (index, count) in [stats.waiting, stats.ready, stats.invoking, stats.acknowledged,
+        stats.indeterminate, stats.retired_grants].into_iter().enumerate()
+    {
+        if index != 0 { print_str(b"/"); }
+        print_u64(count as u64);
+    }
+    print_str(b" delivered/retired/failures=");
+    print_u64(delivered);
+    print_str(b"/");
+    print_u64(retired);
+    print_str(b"/");
+    print_u64(failures);
+    print_str(b"\n");
+    check(b"exec_synchronous_file_retry_owned",
+        delivered == retired + stats.acknowledged as u64
+            && stats.ready == 0 && stats.invoking == 0 && stats.acknowledged == 0
+            && stats.indeterminate == 0 && failures == 0,
+        passed);
 }
 
 /// ═══ THE PROFILE SOURCE — the ISO's OWN `Profiles/` TREE, WHICH OUR STAGING WAS DROPPING ══════
@@ -18566,6 +18590,9 @@ unsafe fn terminate_hosted_thread_mechanism(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> bool {
+    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_retry_delivery_for_thread(tid) {
+        return false;
+    }
     let tcb = match handler.hosted_thread_tcb(tid) {
         Some(tcb) if tcb > 1 => tcb,
         None => return false,
@@ -18599,7 +18626,9 @@ unsafe fn terminate_hosted_thread_mechanism(
         print_u64(abandoned_mutants);
         print_str(b"\n");
     }
-    if handler.hosted_thread_tcb(tid) != Some(tcb) {
+    if handler.hosted_thread_tcb(tid) != Some(tcb)
+        || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_retry_delivery_for_thread(tid)
+    {
         return false;
     }
     let suspend = tcb_suspend_r(tcb);
@@ -18657,6 +18686,11 @@ unsafe fn terminate_hosted_process_mechanisms(
     delay_queue: &mut nt_delay_execution::Queue,
     handler: &mut ExecNtHandler,
 ) -> usize {
+    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
+        .has_retry_delivery_for_pi(u32::from(process_index))
+    {
+        return 0;
+    }
     // Cancel the complete process generation first. This drains nested waits in component LIFO
     // order and prevents partial thread teardown from stranding a buried native continuation.
     if !crate::service_sec_image::provider_wait_cancel_client_process(handler, process_index) {

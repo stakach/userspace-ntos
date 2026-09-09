@@ -10476,6 +10476,11 @@ impl ExecNtHandler {
         &mut self,
         tid: u64,
     ) -> Option<HostedThreadRuntime> {
+        if unsafe { (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
+            .has_retry_delivery_for_thread(tid) }
+        {
+            return None;
+        }
         self.thread_runtime.release_tid(tid)
     }
 

@@ -5,6 +5,14 @@
 //! cannot invalidate an operation that passed object-manager lookup before it blocked.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+mod retry;
+pub use retry::{SynchronousFileRetryAttempt, SynchronousFileRetryError,
+    SynchronousFileRetryIdentity, SynchronousFileRetryOutcome, SynchronousFileRetryPhase,
+    SynchronousFileRetryStats, SynchronousFileRetryView};
+
+static LAST_TABLE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SynchronousFileWaitState {
@@ -86,11 +94,31 @@ impl SynchronousFileWaiter {
 
 const DEFAULT_INITIAL_RESERVE: usize = 16;
 
-#[derive(Clone, Debug)]
+/// One owner of retained File grants and reply capabilities.
+///
+/// ```compile_fail
+/// use nt_io_manager::SynchronousFileWaitTable;
+/// fn duplicate(table: SynchronousFileWaitTable) { let _copy = table.clone(); }
+/// ```
+#[derive(Debug)]
 pub struct SynchronousFileWaitTable {
-    slots: Vec<Option<SynchronousFileWaiter>>,
+    slots: Vec<Option<WaitRecord>>,
     initial_reserve: usize,
     next_sequence: u64,
+    identity: u64,
+}
+
+#[derive(Debug)]
+struct WaitRecord {
+    waiter: SynchronousFileWaiter,
+    retry: Option<SynchronousFileRetryPhase>,
+    next_attempt: u64,
+}
+
+impl WaitRecord {
+    fn delivery_retained(&self) -> bool {
+        self.retry.is_some_and(|phase| phase != SynchronousFileRetryPhase::Retired)
+    }
 }
 
 impl Default for SynchronousFileWaitTable {
@@ -109,6 +137,7 @@ impl SynchronousFileWaitTable {
             slots: Vec::new(),
             initial_reserve,
             next_sequence: 1,
+            identity: 0,
         }
     }
 
@@ -127,8 +156,10 @@ impl SynchronousFileWaitTable {
     }
 
     pub fn reset(&mut self) -> bool {
+        if !self.is_empty() {
+            return false;
+        }
         self.slots.clear();
-        self.next_sequence = 1;
         if self.slots.capacity() < self.initial_reserve {
             let additional = self.initial_reserve - self.slots.capacity();
             if self.slots.try_reserve(additional).is_err() {
@@ -167,37 +198,45 @@ impl SynchronousFileWaitTable {
             || waiter.resume_sp == 0
             || waiter.state != SynchronousFileWaitState::Waiting
             || self.slots.iter().any(|slot| {
-                slot.is_some_and(|record| {
-                    record.tid == waiter.tid || record.reply_cap == waiter.reply_cap
+                slot.as_ref().is_some_and(|record| {
+                    record.waiter.tid == waiter.tid || record.waiter.reply_cap == waiter.reply_cap
                 })
             })
         {
             return None;
         }
+        if self.identity == 0 {
+            self.identity = LAST_TABLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                |last| last.checked_add(1)).ok()? + 1;
+        }
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.checked_add(1)?;
         waiter.sequence = sequence;
+        let record = WaitRecord { waiter, retry: None, next_attempt: 1 };
         if let Some((index, slot)) = self
             .slots
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(waiter);
+            *slot = Some(record);
             return Some(index);
         }
         if !self.grow_reservation() {
             return None;
         }
-        self.slots.push(Some(waiter));
+        self.slots.push(Some(record));
         Some(self.slots.len() - 1)
     }
 
     pub fn oldest_waiting_for_file(&self, file_id: u64) -> Option<(usize, SynchronousFileWaiter)> {
+        if self.has_promoted_for_file(file_id) {
+            return None;
+        }
         self.slots
             .iter()
             .enumerate()
-            .filter_map(|(slot, waiter)| waiter.map(|waiter| (slot, waiter)))
+            .filter_map(|(slot, record)| record.as_ref().map(|record| (slot, record.waiter)))
             .filter(|(_, waiter)| {
                 waiter.file_id == file_id && waiter.state == SynchronousFileWaitState::Waiting
             })
@@ -208,8 +247,8 @@ impl SynchronousFileWaitTable {
     /// APC may interrupt. A promoted record already owns Busy, so the File-lock
     /// wake wins and it is deliberately excluded.
     pub fn alertable_waiting_for_thread(&self, tid: u64) -> Option<(usize, SynchronousFileWaiter)> {
-        self.slots.iter().enumerate().find_map(|(slot, waiter)| {
-            waiter
+        self.slots.iter().enumerate().find_map(|(slot, record)| {
+            record.as_ref().map(|record| record.waiter)
                 .filter(|waiter| {
                     waiter.tid == tid
                         && waiter.alertable
@@ -225,7 +264,7 @@ impl SynchronousFileWaitTable {
         file_id: u64,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        let waiter = self.slots.get(slot)?.as_ref()?;
+        let waiter = &self.slots.get(slot)?.as_ref()?.waiter;
         if waiter.file_id != file_id
             || waiter.tid != tid
             || !waiter.alertable
@@ -233,7 +272,7 @@ impl SynchronousFileWaitTable {
         {
             return None;
         }
-        self.slots.get_mut(slot)?.take()
+        self.slots.get_mut(slot)?.take().map(|record| record.waiter)
     }
 
     /// Mark one exact FIFO waiter as the promoted Busy owner. Reply ownership remains on the
@@ -244,7 +283,11 @@ impl SynchronousFileWaitTable {
         file_id: u64,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        let waiter = self.slots.get_mut(slot)?.as_mut()?;
+        if self.has_promoted_for_file(file_id) {
+            return None;
+        }
+        let record = self.slots.get_mut(slot)?.as_mut()?;
+        let waiter = &mut record.waiter;
         if waiter.file_id != file_id
             || waiter.tid != tid
             || waiter.state != SynchronousFileWaitState::Waiting
@@ -253,20 +296,8 @@ impl SynchronousFileWaitTable {
             return None;
         }
         waiter.state = SynchronousFileWaitState::Promoted;
+        record.retry = Some(SynchronousFileRetryPhase::Ready { last_error: None });
         Some(*waiter)
-    }
-
-    pub fn mark_retry_replied_exact(&mut self, slot: usize, file_id: u64, tid: u64) -> Option<()> {
-        let waiter = self.slots.get_mut(slot)?.as_mut()?;
-        if waiter.file_id != file_id
-            || waiter.tid != tid
-            || waiter.state != SynchronousFileWaitState::Promoted
-            || waiter.reply_cap == 0
-        {
-            return None;
-        }
-        waiter.reply_cap = 0;
-        Some(())
     }
 
     /// Consume the canonical route retained for the promoted syscall. A mismatched service number
@@ -279,16 +310,18 @@ impl SynchronousFileWaitTable {
         service_number: u32,
     ) -> Option<SynchronousFileWaiter> {
         let slot = self.slots.iter_mut().find(|slot| {
-            slot.is_some_and(|waiter| {
+            slot.as_ref().is_some_and(|record| {
+                let waiter = &record.waiter;
                 waiter.pi == pi
                     && waiter.tid == tid
                     && waiter.badge == badge
                     && waiter.service_number == service_number
                     && waiter.state == SynchronousFileWaitState::Promoted
                     && waiter.reply_cap == 0
+                    && record.retry == Some(SynchronousFileRetryPhase::Retired)
             })
         })?;
-        slot.take()
+        slot.take().map(|record| record.waiter)
     }
 
     pub fn take_exact(
@@ -297,11 +330,12 @@ impl SynchronousFileWaitTable {
         file_id: u64,
         tid: u64,
     ) -> Option<SynchronousFileWaiter> {
-        let waiter = self.slots.get(slot)?.as_ref()?;
-        if waiter.file_id != file_id || waiter.tid != tid {
+        let record = self.slots.get(slot)?.as_ref()?;
+        let waiter = &record.waiter;
+        if waiter.file_id != file_id || waiter.tid != tid || record.delivery_retained() {
             return None;
         }
-        self.slots.get_mut(slot)?.take()
+        self.slots.get_mut(slot)?.take().map(|record| record.waiter)
     }
 
     pub fn take_thread_with<F>(&mut self, tid: u64, mut take: F) -> usize
@@ -310,8 +344,8 @@ impl SynchronousFileWaitTable {
     {
         let mut count = 0;
         for slot in self.slots.iter_mut() {
-            if slot.is_some_and(|waiter| waiter.tid == tid) {
-                take(slot.take().unwrap());
+            if slot.as_ref().is_some_and(|record| record.waiter.tid == tid && !record.delivery_retained()) {
+                take(slot.take().unwrap().waiter);
                 count += 1;
             }
         }
@@ -322,6 +356,13 @@ impl SynchronousFileWaitTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn acknowledge_retry(table: &mut SynchronousFileWaitTable, slot: usize, file_id: u64, tid: u64) {
+        let identity = table.retry_identity(slot, file_id, tid).unwrap();
+        let mut attempt = table.begin_retry(identity).unwrap();
+        table.record_retry(&mut attempt, SynchronousFileRetryOutcome::Acknowledged).unwrap();
+        assert!(table.finish_retry(identity, Ok(())).unwrap());
+    }
 
     fn waiter(file_id: u64, tid: u64, reply_cap: u64) -> SynchronousFileWaiter {
         SynchronousFileWaiter {
@@ -356,7 +397,7 @@ mod tests {
         assert_eq!(table.oldest_waiting_for_file(10).unwrap().1.tid, 1);
         let one = table.promote_exact(first, 10, 1).unwrap();
         assert_eq!(one.reply_cap, 101);
-        table.mark_retry_replied_exact(first, 10, 1).unwrap();
+        acknowledge_retry(&mut table, first, 10, 1);
         assert_eq!(table.take_promoted(2, 1, 101, 191).unwrap().tid, 1);
         let third = table.park(waiter(10, 3, 103)).unwrap();
         assert_eq!(third, first, "the freed low slot is deliberately reused");
@@ -372,7 +413,7 @@ mod tests {
         assert!(table.promote_exact(slot, 11, 1).is_none());
         table.promote_exact(slot, 10, 1).unwrap();
         assert!(table.take_promoted(2, 1, 101, 191).is_none());
-        table.mark_retry_replied_exact(slot, 10, 1).unwrap();
+        acknowledge_retry(&mut table, slot, 10, 1);
         assert!(table.take_promoted(3, 1, 101, 191).is_none());
         assert!(table.take_promoted(2, 1, 102, 191).is_none());
         assert!(table.take_promoted(2, 1, 101, 192).is_none());
@@ -388,7 +429,7 @@ mod tests {
         zero.service_number = 0;
         let slot = table.park(zero).unwrap();
         table.promote_exact(slot, 10, 1).unwrap();
-        table.mark_retry_replied_exact(slot, 10, 1).unwrap();
+        acknowledge_retry(&mut table, slot, 10, 1);
         let replay = table.take_promoted(2, 1, 101, 0).unwrap();
         assert_eq!(replay.service_number, 0);
         assert_eq!(replay.file_id, zero.file_id);
@@ -413,7 +454,7 @@ mod tests {
         table.park(waiter(10, 1, 101)).unwrap();
         let slot = table.park(waiter(20, 2, 102)).unwrap();
         table.promote_exact(slot, 20, 2).unwrap();
-        table.mark_retry_replied_exact(slot, 20, 2).unwrap();
+        acknowledge_retry(&mut table, slot, 20, 2);
         let mut taken = alloc::vec::Vec::new();
         assert_eq!(table.take_thread_with(2, |waiter| taken.push(waiter)), 1);
         assert_eq!(taken[0].state, SynchronousFileWaitState::Promoted);

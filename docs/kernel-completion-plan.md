@@ -314,6 +314,9 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   preparation, context-install, publication and Reply ACKs, then exact local retirement (tranche
   151, host/native build checkpoint). Failed handoffs retain indeterminate ownership; acknowledged
   cancellation/quiescence recovery and desktop runtime acceptance remain open.
+- [x] Retain synchronous File retry delivery through exact Reply acknowledgement and local
+  capability retirement, preserving the Busy grant and canonical route across uncertain delivery
+  (tranche 151, host/native checkpoint). Full application-record retry and cancellation remain open.
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30835,6 +30838,43 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/test-retained-callback-transfer-capture-20260909.log`). Final independent native review
     confirms the pre-mutation cancellation guards preserve valid initial/chained legacy paths.
     No new NT boot image or desktop runtime proof is claimed.
+
+    Tranche 151 synchronous File retry ownership (2026-09-09): the FIFO retains its exact native
+    reply, captured retry arguments, canonical File reference and promoted Busy grant through an
+    explicit Ready/Invoking/Acknowledged/Indeterminate lifecycle. Non-clone attempt tickets bind
+    table identity, slot admission sequence and immutable waiter data. Reply ACK alone cannot
+    authorize ingress; separate allocation-free local retirement clears the old reply capability
+    and exposes the exact promoted grant. Failed local retirement permits local-only redrive;
+    ambiguous or abandoned Reply never replays and never releases Busy to a younger waiter.
+    Retired-but-unconsumed grants also exclude another promotion or cleanup. Empty-table reset
+    preserves admission epochs; nonempty reset and table cloning cannot discard ownership.
+
+    The native adapter lives in synchronous_file_retry.rs. The old immediate mark-replied API,
+    global mutable borrow across Reply, unconditional reply-pool release and failure branch that
+    discarded the promoted grant/reference are removed. Thread/process mechanism teardown and
+    runtime release refuse outstanding retry delivery. All synchronous File rows block final VM
+    retirement. A new syscall from an uncertain-delivery thread is rejected before normal service
+    effects through only its new main reply, without consuming the old retry owner. Census reports
+    all retry phases plus delivered/locally-retired totals; the gate rejects unfinished delivery
+    rather than counting it as completion.
+
+    Validation: 1,131 affected unit tests, 49 integration tests and 18 compile-fail checks pass
+    (`.tmp/test-file-retry-retained-final-20260909.log`), including nine focused retry cases and
+    non-clone table/ticket checks. These prove stale/foreign attempts, slot reuse, dropped tickets,
+    immutable retry input, local failure/redrive, all teardown exclusions and same-file ordering.
+    The executive release build passes with unchanged 292 warnings
+    (`.tmp/build-file-retry-retained-executive-20260909.log`), and the full ntdll DLL build/import/
+    native-template/unwind gates pass (`.tmp/build-file-retry-retained-ntdll-20260909.log`).
+    This does not activate the new application-record ABI or solve suspended-thread completion.
+    APC acquisition staging still needs an exact pre-effect claim and acknowledged empty Reply;
+    its legacy read/stage/remove path is a separate open owner. General File completion/cleanup
+    reply paths also remain separate. The strict 27-import desktop frontier is unchanged.
+
+    Review refinement for cancellation: do not infer physical reply cancellation from logical
+    termination or from TCB Suspend alone without verifying microkernel semantics. Audit the MCS
+    reply chain against upstream seL4, including donated scheduling contexts. Cancelling a caller's
+    reply continuation and recovering a scheduling context from a callee are distinct operations;
+    a stronger NT provider-quiescence acknowledgement must not be fabricated from Suspend.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.

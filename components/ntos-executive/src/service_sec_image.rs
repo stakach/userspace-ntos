@@ -8,6 +8,8 @@ use crate::*;
 mod component_terminal;
 #[path = "component_callback_transfer.rs"]
 mod component_callback_transfer;
+#[path = "synchronous_file_retry.rs"]
+mod synchronous_file_retry;
 
 pub(crate) static FILE_IO_DELIVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static FILE_IO_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -15,6 +17,12 @@ static PIPE_TRANSCEIVE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static mut FILE_IO_COPY_WORK: [u8; 4096] = [0; 4096];
 static CALLBACK_MESSAGE_COMPLETION_TRACE: AtomicU64 = AtomicU64::new(0);
 static WINLOGON_MESSAGE_TRACE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn synchronous_file_retry_stats() -> (nt_io_manager::SynchronousFileRetryStats, u64, u64, u64) {
+    let stats = unsafe { (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).retry_stats() };
+    let (delivered, retired, failures) = synchronous_file_retry::counters();
+    (stats, delivered, retired, failures)
+}
 
 pub(crate) const SEC_IMAGE_FAULT_CAP: u64 = 15000;
 const SEC_IMAGE_PREFETCH_STEADY_PAGES: u64 = 16;
@@ -2440,6 +2448,7 @@ pub(crate) unsafe fn client_has_vm_continuations(pi: u32) -> bool {
             .any(|waiter| waiter.used && waiter.pi == pi)
         || (&*core::ptr::addr_of!(DEFERRED_CALLBACK_RETURNS)).iter()
             .any(|entry| entry.used && entry.pi == pi)
+        || (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_waiter_for_pi(pi)
     {
         return true;
     }
@@ -10770,6 +10779,23 @@ pub(crate) unsafe fn service_sec_image(
                     print_str(b"\n");
                     0
                 });
+            if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS))
+                .has_retry_delivery_for_thread(current_tid)
+            {
+                // An uncertain earlier retry is not a fresh File acquisition. Reject only this
+                // new request; its distinct main Reply cannot retire the old grant or reply.
+                let reply_main = REPLY_MAIN_SLOT.load(Ordering::Relaxed);
+                assert!(reply_parked_syscall(reply_main, 0xC000_00A3),
+                    "retained File retry ingress refusal lost its new reply");
+                let (nb, nmi, nm0, nm1, nm2, nm3) = recv_full_r12(fault_ep, reply_main);
+                badge = nb;
+                mi = nmi;
+                m0 = nm0;
+                m1 = nm1;
+                m2 = nm2;
+                m3 = nm3;
+                continue;
+            }
             let syscall_process_role = nt_handler.hosted_process_role(pi);
             if matches!(
                 syscall_process_role,
@@ -24335,76 +24361,27 @@ pub(crate) unsafe fn synchronous_file_wake_next(
     nt_handler: &mut ExecNtHandler,
     file_id: u64,
 ) -> bool {
-    let mut handled = false;
-    loop {
-        let table = &mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS);
-        let Some((slot, waiter)) = table.oldest_waiting_for_file(file_id) else {
-            if nt_handler
-                .file_completion
-                .promote_cleanup_if_ready(file_id)
-                .expect("synchronous File cleanup lost its policy owner")
-            {
-                start_file_cleanup(nt_handler, file_id);
-                return true;
-            }
-            return handled;
-        };
-        nt_handler
-            .file_completion
-            .promote_io_waiter(file_id, waiter.tid)
-            .expect("synchronous File waiter count lost its FIFO owner");
-        let promoted = table
-            .promote_exact(slot, file_id, waiter.tid)
-            .expect("synchronous File FIFO promotion lost exact waiter");
-        let replied = if promoted.native_call_transport {
-            set_reply_mr(4, promoted.reply_mrs[4]);
-            set_reply_mr(5, promoted.reply_mrs[5]);
-            client_reply_on(
-                promoted.reply_cap,
-                6,
-                nt_syscall_abi::NT_NATIVE_RETRY_REPLY,
-                promoted.reply_mrs[1],
-                promoted.reply_mrs[2],
-                promoted.reply_mrs[3],
-            )
-        } else {
-            for index in 4..15 {
-                set_reply_mr(index, promoted.reply_mrs[index]);
-            }
-            set_reply_mr(15, promoted.retry_ip);
-            set_reply_mr(16, promoted.resume_sp);
-            set_reply_mr(17, promoted.resume_flags);
-            client_reply_on(
-                promoted.reply_cap,
-                18,
-                promoted.service_number as u64,
-                promoted.reply_mrs[1],
-                promoted.reply_mrs[2],
-                promoted.reply_mrs[3],
-            )
-        };
-        release_reply_pool_cap(promoted.reply_cap);
-        handled = true;
-        if replied {
-            thread_wait_state_clear_badge_ready(nt_handler, promoted.badge);
-            table
-                .mark_retry_replied_exact(slot, file_id, promoted.tid)
-                .expect("promoted synchronous File reply owner disappeared");
-            return true;
-        }
-
-        table
-            .take_exact(slot, file_id, promoted.tid)
-            .expect("failed synchronous File reply lost its promoted owner");
-        let release = nt_handler
-            .file_completion
-            .cancel_promoted_io(file_id, promoted.tid)
-            .expect("failed synchronous File reply lost its policy grant");
-        nt_handler.release_file_reference(file_id);
-        if release.waiters == 0 {
-            return true;
-        }
+    if (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).has_promoted_for_file(file_id) {
+        synchronous_file_retry::deliver_file(nt_handler, file_id);
+        return true;
     }
+    let next = (&*core::ptr::addr_of!(SYNCHRONOUS_FILE_WAITERS)).oldest_waiting_for_file(file_id);
+    let Some((slot, waiter)) = next else {
+        if nt_handler.file_completion.promote_cleanup_if_ready(file_id)
+            .expect("synchronous File cleanup lost its policy owner")
+        {
+            start_file_cleanup(nt_handler, file_id);
+            return true;
+        }
+        return false;
+    };
+    nt_handler.file_completion.promote_io_waiter(file_id, waiter.tid)
+        .expect("synchronous File waiter count lost its FIFO owner");
+    (&mut *core::ptr::addr_of_mut!(SYNCHRONOUS_FILE_WAITERS))
+        .promote_exact(slot, file_id, waiter.tid)
+        .expect("synchronous File FIFO promotion lost exact waiter");
+    synchronous_file_retry::deliver_file(nt_handler, file_id);
+    true
 }
 
 pub(crate) unsafe fn synchronous_file_release_and_wake(
@@ -25071,6 +25048,7 @@ unsafe fn file_cleanup_wait_transfer(
 /// Publish terminal results for general pending File IRPs in NT completion order. The backend
 /// completion remains retained until every required surface and synchronous reply is visible.
 unsafe fn pending_file_io_redrive_all(nt_handler: &mut ExecNtHandler) -> u64 {
+    synchronous_file_retry::redrive_local(nt_handler);
     nt_handler.publish_local_byte_lock_completions();
     let saved_stack_base = ACTIVE_STACK_BASE.load(Ordering::Relaxed);
     let saved_stack_size = ACTIVE_STACK_SIZE.load(Ordering::Relaxed);

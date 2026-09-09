@@ -169,6 +169,9 @@ pub use retained_completion::{
 pub use store::{GenStore, IoId};
 pub use synchronous_io::{
     SynchronousFileWaitState, SynchronousFileWaitTable, SynchronousFileWaiter,
+    SynchronousFileRetryAttempt, SynchronousFileRetryError, SynchronousFileRetryIdentity,
+    SynchronousFileRetryOutcome, SynchronousFileRetryPhase, SynchronousFileRetryStats,
+    SynchronousFileRetryView,
 };
 pub use volume_information::{
     query_volume_information_contract, set_volume_information_contract,
