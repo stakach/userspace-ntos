@@ -288,6 +288,9 @@ desktop proofs are historical baselines, not acceptance of the current provider 
   complete replies and explicit scratch ownership before publishing any native caller-buffer bytes.
 - [x] Retain registry broker keys until acknowledged CM close, with retry-safe close receipts
   (tranche 114). Closing keys are inaccessible; no take-before-IPC or INVALID_HANDLE success fallback.
+- [x] Capture the mounted SYSTEM hardware-profile alias from real CurrentConfig authority and use
+  one resolver for leased opens, snapshots and durable mutation paths (2026-09-09). Ordinary selector
+  writes do not move the captured alias; missing selection never defaults to another profile.
 - [ ] Retain CM OPEN request/reply ownership through native path validation and publication
   (tranche 115). Pre-reserve ownership and remove ignored cleanup errors, including malformed replies.
 - [ ] Wire native subject capture, locks, privilege checking, release and audited security assignment
@@ -31115,6 +31118,41 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     authority, and has distinct Device Parameters creation/DACL behavior for unprofiled DEVICE keys.
     Existing path aliases and lease tokens are not access-checked NT Key handles. Do not copy ReactOS
     gaps in invalid-flag rejection or profile path selection, or fabricate a fixed profile number.
+
+    Hardware-profile namespace checkpoint (2026-09-09): completed the CM alias prerequisite for
+    the device-registry family. nt-hive-core now captures HardwareProfileAlias from the mounted
+    control set's Control\IDConfigDB CurrentConfig value, requiring REG_DWORD/exact four-byte data
+    and an existing selected profile. Decimal names use minimum four-digit width, not a fixed
+    profile or arbitrary numeric cap. Missing/malformed selection is retained as an unavailable
+    alias and does not prevent mounting SYSTEM or opening unrelated keys. The captured physical
+    source remains tied to its original control set; selector edits and target deletion never
+    silently retarget it. A replacement mount recaptures selection and invalidates old key leases.
+
+    The focused nt-config-server/system_hive_path module now handles leased opens, path snapshots,
+    path publication and mutation preparation. PREPARE resolves addresses once, before validation,
+    durable-log generation and retained commit; replay therefore changes the real selected profile,
+    never a persisted literal Hardware Profiles\Current subtree. Removed the old second snapshot
+    lookup wrapper. Alias capture uses checked allocation and completes before mount publication or
+    lease invalidation. Profile replacement reserves before mutating its path. This remains the
+    built-in boot alias contract, not a claim that general REG_LINK objects or live profile switching
+    are implemented. Existing Select\Current-driven control-set replacement is separate historical
+    alias debt; this change prevents it from transplanting a captured profile into another tree.
+
+    Host validation passes 91 nt-config-client tests, 66 nt-config-server tests, 94 nt-hive-core
+    tests, 18 hive-generator tests and seven doctests. Ten new tests cover selector width, exact
+    component matching, invalid state, retained opens, remounts, deletion and physical log replay.
+    Log: `.tmp/test-hardware-profile-final-20260909.log`. Allocation failures are handled before
+    publication by construction and review; allocator-failure injection was not run.
+    The freestanding executive release build also passes (293 existing warnings), including the
+    integrated CM server. Log: `.tmp/build-hardware-profile-executive-20260909.log`. No microkernel
+    changes or VM run were needed for this CM slice; desktop acceptance remains separately blocked.
+
+    Next: implement DEVICE/DRIVER with optional CURRENT_HWPROFILE (only 1, 2, 5, 6), preserving
+    DesiredAccess and unprofiled Device Parameters creation/DACL rules through canonical Key
+    objects, authenticated provider/PDO authority and retained handle publication/close. Replace
+    the legacy wrapper and global lease-as-handle broker together; do not bind win32k around them.
+    The strict missing-import frontier remains 27. Native suspension-fixture execution and genuine
+    Explorer desktop acceptance remain open; no guest execution is claimed for this checkpoint.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

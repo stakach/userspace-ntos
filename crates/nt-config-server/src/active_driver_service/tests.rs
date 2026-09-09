@@ -33,6 +33,8 @@ fn server(incarnation: u32) -> CmServer {
     let mut server =
         CmServer::with_config_for_incarnation(cm, NonZeroU32::new(incarnation).unwrap());
     server.system_hive = Some(MountedSystemHive {
+        hardware_profile: nt_hive_core::HardwareProfileAlias::capture(&hive, &control_set)
+            .unwrap(),
         hive,
         generation: 7,
         current_control_set: control_set,

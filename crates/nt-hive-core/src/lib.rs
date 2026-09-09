@@ -71,6 +71,8 @@ pub use hive::{
     MutableHiveSet, RegistryValueCopyProvenance, RegistryValueCopyProvenanceTable,
     RegistryValueType, ResolvedHiveKey, ResolvedHiveValue, SYSTEM_HIVE_PATH,
 };
+mod hardware_profile;
+pub use hardware_profile::{HardwareProfileAlias, HardwareProfileError};
 pub use io::{
     FaultInjectionHiveIoProvider, FlushMode, HiveBootError, HiveFlushError, HiveIoError,
     HiveIoProvider, HiveIoProviderKind, HiveIoStatus, HiveManager, MemoryHiveIoProvider,

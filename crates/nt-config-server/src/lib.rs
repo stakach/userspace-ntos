@@ -17,6 +17,7 @@ mod active_driver_service;
 mod retained_snapshot;
 mod mutation;
 mod snapshot;
+mod system_hive_path;
 
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -454,17 +455,6 @@ fn project_system_hive_mutations(
         }
     }
     Ok(enum_changed)
-}
-
-fn encode_hive_key_snapshot(
-    hive: &Hive,
-    mount_generation: u64,
-    current_control_set: &CurrentControlSet,
-    path: &str,
-) -> Option<Vec<u8>> {
-    let relative = system_hive_relative_path(path, current_control_set)?;
-    let key = hive.open_key(&relative)?;
-    encode_hive_key_snapshot_from_key(hive, mount_generation, key, path)
 }
 
 fn encode_hive_key_snapshot_from_key(
@@ -976,6 +966,7 @@ struct MountedSystemHive {
     hive: Hive,
     generation: u64,
     current_control_set: CurrentControlSet,
+    hardware_profile: nt_hive_core::HardwareProfileAlias,
 }
 
 struct PreparedSystemHiveMutation {
@@ -1901,6 +1892,12 @@ impl CmServer {
                 let Ok(current_control_set) = hive.current_control_set() else {
                     return reply(STATUS_REGISTRY_CORRUPT, 0);
                 };
+                let hardware_profile = match nt_hive_core::HardwareProfileAlias::capture(
+                    &hive, &current_control_set,
+                ) {
+                    Ok(alias) => alias,
+                    Err(_) => return reply(STATUS_INSUFFICIENT_RESOURCES, 0),
+                };
                 let current_generation = self
                     .system_hive
                     .as_ref()
@@ -1923,6 +1920,7 @@ impl CmServer {
                     hive,
                     generation,
                     current_control_set,
+                    hardware_profile,
                 });
                 self.hive_imports.swap_remove(index);
                 reply_with_info(STATUS_SUCCESS, 0, generation, req.transfer_token)
@@ -2222,9 +2220,14 @@ impl CmServer {
                     }
                     Err(_) => return reply(STATUS_INVALID_PARAMETER, current_generation),
                 };
-                let Some(mutations) = decode_mutation_journal(&journal) else {
+                let Some(mut mutations) = decode_mutation_journal(&journal) else {
                     return reply(STATUS_INVALID_PARAMETER, current_generation);
                 };
+                if let Err(status) = self.system_hive.as_ref().unwrap()
+                    .resolve_mutation_paths(&mut mutations)
+                {
+                    return reply(status, current_generation);
+                }
                 let Some(next_generation) = current_generation.checked_add(1) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, current_generation);
                 };
@@ -2576,17 +2579,17 @@ impl CmServer {
                 let Some(mounted) = self.system_hive.as_ref() else {
                     return reply(STATUS_DEVICE_NOT_READY, 0);
                 };
-                let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set)
-                else {
-                    return reply(STATUS_INVALID_PARAMETER, 0);
+                let relative = match mounted.resolve_relative_path(&path) {
+                    Ok(relative) => relative,
+                    Err(status) => return reply(status, 0),
                 };
-                if mounted.hive.open_key(&relative).is_none() {
+                let Some(key) = mounted.hive.open_key(&relative) else {
                     return reply(STATUS_OBJECT_NAME_NOT_FOUND, 0);
-                }
-                let Some(value) = encode_hive_key_snapshot(
+                };
+                let Some(value) = encode_hive_key_snapshot_from_key(
                     &mounted.hive,
                     mounted.generation,
-                    &mounted.current_control_set,
+                    key,
                     &path,
                 ) else {
                     return reply(STATUS_INSUFFICIENT_RESOURCES, 0);
@@ -2685,14 +2688,10 @@ impl CmServer {
         let Some(mounted) = self.system_hive.as_ref() else {
             return reply(STATUS_DEVICE_NOT_READY, 0);
         };
-        let Some(relative) = system_hive_relative_path(&path, &mounted.current_control_set) else {
-            return reply(STATUS_INVALID_PARAMETER, mounted.generation);
+        let physical_path = match mounted.resolve_physical_path(&path) {
+            Ok(path) => path,
+            Err(status) => return reply(status, mounted.generation),
         };
-        let mut physical_path = String::from(SYSTEM_HIVE_PATH);
-        if !relative.is_empty() {
-            physical_path.push('\\');
-            physical_path.push_str(&relative);
-        }
         let path_bytes = physical_path.as_bytes();
         if path_bytes.len() > out_buf.len() {
             return reply_with_info(
@@ -4862,10 +4861,11 @@ mod tests {
         let mut server = CmServer::new_for_incarnation(NonZeroU32::MIN);
         assert_eq!(publish_hive(&mut server, &first_image), 1);
         let mounted = server.system_hive.as_ref().unwrap();
-        let expected = encode_hive_key_snapshot(
+        let expected = encode_hive_key_snapshot_from_key(
             &mounted.hive,
             mounted.generation,
-            &mounted.current_control_set,
+            mounted.hive.open_key(&mounted.resolve_relative_path(path).unwrap())
+                .unwrap(),
             path,
         )
         .expect("snapshot");

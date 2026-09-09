@@ -3709,6 +3709,7 @@ impl<B: Backend> ConfigClient<B> {
 
 #[cfg(test)]
 mod tests {
+    mod hardware_profile;
     use super::*;
     use alloc::format;
     use alloc::string::String;

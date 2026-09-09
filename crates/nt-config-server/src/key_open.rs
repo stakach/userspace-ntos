@@ -184,13 +184,7 @@ fn acquire(
     path: &str,
 ) -> Result<OpenOutcome, i32> {
     let mounted = mounted.ok_or(STATUS_DEVICE_NOT_READY)?;
-    let mut relative = String::new();
-    relative
-        .try_reserve_exact(path.len() + mounted.current_control_set.as_str().len())
-        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
-    if !system_hive_relative_path_into(path, &mounted.current_control_set, &mut relative) {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
+    let relative = mounted.resolve_relative_path(path)?;
     let key = mounted
         .hive
         .open_key(&relative)
