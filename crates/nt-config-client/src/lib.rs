@@ -36,6 +36,11 @@ pub use key_close::{SystemHiveKeyCloseAcknowledgement, SystemHiveKeyCloseAcknowl
     SystemHiveKeyCloseReceipt};
 
 mod mutation_commit;
+mod mutation_begin;
+pub use mutation_begin::{
+    CmMutationBeginAttempt, CmMutationBeginAttempts, CmMutationBeginExchange,
+    CmMutationBeginOperation, CmMutationBeginResponse, SystemHiveMutationUpload,
+};
 pub use mutation_commit::{
     SystemHiveMutationCommitReceipt, SystemHiveMutationAcknowledgement,
     SystemHiveMutationAcknowledgementDisposition,

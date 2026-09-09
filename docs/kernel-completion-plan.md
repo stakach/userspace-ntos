@@ -31713,10 +31713,10 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     lifecycle. The client still best-effort-aborts and drops progress after preparation errors;
     do not activate error retries there without owning the complete exchange. APPEND replay ends
     when successful PREPARE consumes semantic bytes; a future owner must never rewind phases.
-    Historical whole-hive import still invalidates in-progress uploads. Decide retained remount
-    exclusion or acknowledged termination before claiming lifetime ownership across replacement.
-    Next, add service authority plus requester bank/slot/monotonic attempt identity before BEGIN,
-    using the existing retained-snapshot/OPEN ownership patterns. Equal generation and length do
+    Whole-hive import invalidation of in-progress uploads is removed by the retained BEGIN
+    checkpoint below, which excludes replacement until upload/prepared ownership is retired.
+    That checkpoint also adds service authority plus requester bank/slot/monotonic attempt identity
+    before BEGIN, using the existing retained-snapshot/OPEN patterns. Equal generation and length do
     not identify a caller or its mutation and must never deduplicate BEGIN. BEGIN acknowledgement
     transfers responsibility to an owner that already retains the token; it must not free that
     lease. Native first-journal/reserve ownership, complete caller migration and desktop acceptance
@@ -31737,6 +31737,57 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     log: `.tmp/build-cm-prepare-replay-executive-20260910.log`. No new native preparation owner,
     microkernel change or VM run occurred. Strict win32k admission still has 27 missing imports;
     desktop acceptance remains open.
+
+    Retained mutation BEGIN checkpoint (2026-09-10): add recoverable writer acquisition at 0x2161
+    without changing the mutation upload format or duplicating acquisition semantics.
+    - [x] Pre-grant bounded requester banks and slot watermarks through idempotent QUERY. Capture
+      authority, requester, slot, monotonic attempt, expected hive generation and semantic length
+      before writer acquisition. Retain both successful tokens and failed outcomes until ACK.
+      Exact replay never acquires another writer or re-evaluates BUSY/stale/resource failures.
+    - [x] Require the current success token (zero for a failed outcome) when acknowledging BEGIN.
+      Reject ACK of unexecuted/in-flight work. Retire only acquisition evidence, never its live
+      upload. Old ACKs cannot free a new attempt, and slot exhaustion cannot wrap or evict owners.
+    - [x] Gate use of an unacknowledged upload token. APPEND/PREPARE and legacy cleanup cannot
+      consume ownership before BEGIN handoff. Block import BEGIN and COMMIT while any mutation
+      upload exists, including after acquisition ACK; remove destructive upload invalidation.
+      Reuse one acquisition helper for legacy and retained BEGIN rather than retaining two bodies.
+    - [x] Add a non-Clone client attempt retaining exact encoded semantic bytes and caller state,
+      with detached fixed-size QUERY/BEGIN/ACK tickets and epoch-checked private response adoption.
+      Transport/protocol errors retain state; lost tickets stay in flight. Validate complete wire
+      geometry, every identity/input echo, status/token consistency and terminal dispositions.
+    - [x] Transfer acknowledged success into an opaque non-Clone upload handoff without copying
+      the journal or exposing its raw token. Acknowledged failure returns the original caller.
+      Release/reuse the BEGIN slot only after one of those explicit transfers. Keep registered
+      bank authority pinned across attempts; neither dropping an owner nor a new server nonce
+      silently cancels or restarts a submitted acquisition.
+
+    Review adjustment: this handoff still owns a live writer, not a prepared mutation or completed
+    caller. The next slice must consume it into retained APPEND/PREPARE/PULL progress and provide
+    acknowledged upload cancellation; do not pass it into one-shot preparation or expose a raw
+    token to sidestep that owner. Full cancellation before/after uncertain acquisition must resolve
+    BEGIN first, not acknowledge an unknown successful token away. Requester registrations and ACK
+    watermarks survive slot reuse within one CM authority, not service crash/reconstruction.
+    Native callers remain unchanged pending complete preparation/storage/caller integration and
+    atomic deletion of the historical one-shot client APIs. No desktop acceptance is implied.
+
+    Serialized validation passes all 1,359 tests/doctests: nt-config-abi 9, nt-config-server 99,
+    nt-config-client 133 plus 16 doctests, nt-config-manager 35, nt-fs 162 plus one doctest,
+    nt-hive-core 106 plus 18 generator cases, nt-security 223 plus two doctests, and nt-user-host
+    494 plus 49 integration cases and 12 doctests. Log:
+    `.tmp/test-cm-retained-begin-full-20260910.log`. Twenty-seven new tests/doctests cover fixed
+    unaligned wire geometry, pregranted capacity and identity exhaustion, exact BEGIN replay,
+    cached failures, early/incorrect/old ACKs, transfer gating, pre-uploaded import exclusion,
+    lost QUERY/BEGIN/ACK through the real server, exact retries, malformed replies, stale tickets,
+    pinned authority, caller retention, zero-copy handoff, and non-Clone ownership. Review caught
+    a positive nonzero outcome-status hole; STATUS_PENDING is now rejected rather than accepted
+    as terminal acquisition failure. Independent server/client reviews found no remaining issue.
+    Arbitrary allocator-failure injection was not run. Freestanding executive release passes in
+    36.93 seconds with 293 existing executive warnings; log:
+    `.tmp/build-cm-retained-begin-executive-20260910.log`. The client has one additional dead-field
+    warning for private handoff identity/token metadata awaiting the retained upload consumer.
+    No dummy reads or public token accessor were added to suppress it. No native BEGIN cutover,
+    microkernel change or VM run occurred; 27 strict missing win32k imports and desktop acceptance
+    remain open.
 
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is

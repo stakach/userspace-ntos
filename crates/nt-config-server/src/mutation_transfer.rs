@@ -21,6 +21,9 @@ impl CmServer {
         {
             return reply(STATUS_INVALID_PARAMETER, 0);
         }
+        if self.system_mutation_begins.blocks_transfer(req.lease_token) {
+            return reply(STATUS_DEVICE_BUSY, 0);
+        }
         let Some(current_generation) = self.system_hive.as_ref().map(|hive| hive.generation) else {
             return reply(STATUS_DEVICE_NOT_READY, 0);
         };
@@ -46,22 +49,9 @@ impl CmServer {
                         current_generation,
                     );
                 }
-                if self.prepared_system_mutation.is_some()
-                    || self.prepared_system_checkpoint.is_some()
-                    || self.system_mutation_outcomes.is_pending()
-                {
-                    return reply(STATUS_DEVICE_BUSY, current_generation);
-                }
-                match self
-                    .system_mutation_leases
-                    .begin(current_generation, journal_len)
-                {
+                match self.acquire_system_mutation_upload(current_generation, journal_len) {
                     Ok(token) => reply_with_info(STATUS_SUCCESS, 0, current_generation, token),
-                    Err(MutationLeaseError::Busy) => reply(STATUS_DEVICE_BUSY, current_generation),
-                    Err(MutationLeaseError::Exhausted) => {
-                        reply(STATUS_INSUFFICIENT_RESOURCES, current_generation)
-                    }
-                    Err(_) => reply(STATUS_INVALID_PARAMETER, current_generation),
+                    Err(status) => reply(status, current_generation),
                 }
             }
             hive_mutation_transfer::APPEND => {

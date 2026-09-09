@@ -183,10 +183,6 @@ impl MutationLeaseBank {
         matches
     }
 
-    pub(crate) fn invalidate(&mut self) {
-        self.lease = None;
-    }
-
     pub(crate) fn is_busy(&self) -> bool {
         self.lease.is_some()
     }
@@ -365,14 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn abort_and_invalidate_retire_only_the_live_lease() {
+    fn abort_retires_only_the_exact_live_lease() {
         let mut bank = bank();
         let first = bank.begin(1, 1).unwrap();
         assert!(!bank.abort(first + 1, 1, 1));
         assert!(bank.abort(first, 1, 1));
         let second = bank.begin(1, 1).unwrap();
-        bank.invalidate();
-        assert!(!bank.abort(second, 1, 1));
+        assert!(!bank.abort(first, 1, 1));
+        assert!(bank.abort(second, 1, 1));
     }
 
     #[test]

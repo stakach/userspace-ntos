@@ -14,6 +14,7 @@ mod key_lease;
 mod key_close;
 mod mutation_commit;
 mod mutation_transfer;
+mod mutation_begin;
 mod key_open;
 mod active_driver_service;
 mod retained_snapshot;
@@ -1022,6 +1023,7 @@ pub struct CmServer {
     hive_imports: Vec<HiveImport>,
     next_hive_import_token: u64,
     system_mutation_leases: MutationLeaseBank,
+    system_mutation_begins: mutation_begin::journal::BeginJournal,
     prepared_system_mutation: Option<PreparedSystemHiveMutation>,
     system_mutation_outcomes: mutation_commit::MutationOutcomeJournal,
     prepared_system_checkpoint: Option<PreparedSystemHiveCheckpoint>,
@@ -1080,6 +1082,7 @@ impl CmServer {
             hive_imports: Vec::new(),
             next_hive_import_token: 1,
             system_mutation_leases: MutationLeaseBank::new(identities.clone()),
+            system_mutation_begins: mutation_begin::journal::BeginJournal::new(),
             prepared_system_mutation: None,
             system_mutation_outcomes: mutation_commit::MutationOutcomeJournal::default(),
             prepared_system_checkpoint: None,
@@ -1148,6 +1151,7 @@ impl CmServer {
             }
             opcode::CM_OP_IMPORT_HIVE => self.op_import_hive(in_buf),
             opcode::CM_OP_MUTATE_SYSTEM_HIVE => self.op_mutate_system_hive(in_buf, out_buf),
+            opcode::CM_OP_SYSTEM_HIVE_MUTATION_BEGIN => self.op_system_hive_mutation_begin(in_buf, out_buf),
             opcode::CM_OP_CHECKPOINT_SYSTEM_HIVE => self.op_checkpoint_system_hive(in_buf, out_buf),
             opcode::CM_OP_QUERY_HIVE_KEY => self.op_query_hive_key(in_buf, out_buf),
             opcode::CM_OP_RESOLVE_SYSTEM_HIVE_PATH => self.op_resolve_system_hive_path(in_buf, out_buf),
@@ -1814,7 +1818,8 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                if self.prepared_system_mutation.is_some()
+                if self.system_mutation_leases.is_busy()
+                    || self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
                     || self.system_mutation_outcomes.is_pending()
                 {
@@ -1885,7 +1890,8 @@ impl CmServer {
                 {
                     return reply(STATUS_INVALID_PARAMETER, 0);
                 }
-                if self.prepared_system_mutation.is_some()
+                if self.system_mutation_leases.is_busy()
+                    || self.prepared_system_mutation.is_some()
                     || self.prepared_system_checkpoint.is_some()
                     || self.system_mutation_outcomes.is_pending()
                 {
@@ -1934,7 +1940,6 @@ impl CmServer {
                         return reply(device_action_journal_status(error), current_generation);
                     }
                 }
-                self.system_mutation_leases.invalidate();
                 self.system_key_leases.invalidate();
                 self.cm = cm;
                 self.system_hive = Some(MountedSystemHive {

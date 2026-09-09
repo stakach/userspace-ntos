@@ -8,6 +8,8 @@
 
 #![no_std]
 
+pub mod mutation_begin;
+
 /// The Configuration Manager's SURT opcode range.
 pub const CM_OPCODE_MIN: u16 = 0x2100;
 pub const CM_OPCODE_MAX: u16 = 0x21ff;
@@ -132,6 +134,8 @@ pub mod opcode {
     pub const CM_OP_SYSTEM_HIVE_MUTATION_COMMIT: u16 = 0x215f;
     /// Register a requester bank, capture/replay a retained snapshot, read it, or acknowledge it.
     pub const CM_OP_RETAINED_SNAPSHOT: u16 = 0x2160;
+    /// Register requester slots, acquire/replay a SYSTEM mutation upload, or acknowledge handoff.
+    pub const CM_OP_SYSTEM_HIVE_MUTATION_BEGIN: u16 = 0x2161;
 }
 
 pub mod hive_key_open_operation {
@@ -918,6 +922,8 @@ wire!(CmLeasedHiveRecordRequest);
 wire!(CmHiveMutationRequest);
 wire!(CmHiveMutationCommitRequest);
 wire!(CmHiveMutationCommitReply);
+wire!(mutation_begin::Request);
+wire!(mutation_begin::Reply);
 wire!(CmHiveCheckpointRequest);
 wire!(CmHiveCheckpointHeader);
 wire!(CmHiveMutationRecord);
