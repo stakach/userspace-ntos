@@ -1241,36 +1241,21 @@ unsafe fn boot_nt_create_file(
     create_disposition: u32,
     create_options: u32,
 ) -> NtStatus {
-    type NtCreateFile = unsafe extern "system" fn(
-        *mut u64,
-        u32,
-        *const BootObjectAttributes,
-        *mut [u64; 2],
-        *const i64,
-        u32,
-        u32,
-        u32,
-        u32,
-        *mut c_void,
-        u32,
-    ) -> NtStatus;
     // SAFETY: forwards the exact x64 NtCreateFile ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtCreateFile>(
-            nt_ntdll::trap_stubs::nt_create_file,
-        )(
-            file_handle,
-            desired_access,
-            object_attributes,
-            iosb,
-            core::ptr::null(),
-            file_attributes,
+        nt_ntdll::trap_stubs::nt_create_file(
+            file_handle as u64,
+            desired_access as u64,
+            object_attributes as u64,
+            iosb as u64,
             0,
-            create_disposition,
-            create_options,
-            core::ptr::null_mut(),
+            file_attributes as u64,
             0,
-        )
+            create_disposition as u64,
+            create_options as u64,
+            0,
+            0,
+        ) as NtStatus
     }
 }
 
@@ -1283,26 +1268,16 @@ unsafe fn boot_nt_open_file(
     share_access: u32,
     open_options: u32,
 ) -> NtStatus {
-    type NtOpenFile = unsafe extern "system" fn(
-        *mut u64,
-        u32,
-        *const BootObjectAttributes,
-        *mut [u64; 2],
-        u32,
-        u32,
-    ) -> NtStatus;
     // SAFETY: forwards the exact x64 NtOpenFile ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtOpenFile>(
-            nt_ntdll::trap_stubs::nt_open_file,
-        )(
-            file_handle,
-            desired_access,
-            object_attributes,
-            iosb,
-            share_access,
-            open_options,
-        )
+        nt_ntdll::trap_stubs::nt_open_file(
+            file_handle as u64,
+            desired_access as u64,
+            object_attributes as u64,
+            iosb as u64,
+            share_access as u64,
+            open_options as u64,
+        ) as NtStatus
     }
 }
 
@@ -1318,36 +1293,21 @@ unsafe fn boot_nt_query_directory_file(
     pattern: *const UnicodeString,
     restart_scan: u8,
 ) -> NtStatus {
-    type NtQueryDirectoryFile = unsafe extern "system" fn(
-        u64,
-        u64,
-        *mut c_void,
-        *mut c_void,
-        *mut [u64; 2],
-        *mut c_void,
-        u32,
-        u32,
-        u8,
-        *const UnicodeString,
-        u8,
-    ) -> NtStatus;
     // SAFETY: forwards the exact x64 NtQueryDirectoryFile ABI to the generated trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtQueryDirectoryFile>(
-            nt_ntdll::trap_stubs::nt_query_directory_file,
-        )(
+        nt_ntdll::trap_stubs::nt_query_directory_file(
             file_handle,
             0,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            iosb,
-            buffer,
-            length,
-            information_class,
-            return_single_entry,
-            pattern,
-            restart_scan,
-        )
+            0,
+            0,
+            iosb as u64,
+            buffer as u64,
+            length as u64,
+            information_class as u64,
+            return_single_entry as u64,
+            pattern as u64,
+            restart_scan as u64,
+        ) as NtStatus
     }
 }
 
@@ -1359,13 +1319,15 @@ unsafe fn boot_nt_query_volume_information_file(
     length: u32,
     information_class: u32,
 ) -> NtStatus {
-    type NtQueryVolumeInformationFile =
-        unsafe extern "system" fn(u64, *mut [u64; 2], *mut c_void, u32, u32) -> NtStatus;
     // SAFETY: forwards the exact x64 NtQueryVolumeInformationFile ABI to the generated trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtQueryVolumeInformationFile>(
-            nt_ntdll::trap_stubs::nt_query_volume_information_file,
-        )(file_handle, iosb, information, length, information_class)
+        nt_ntdll::trap_stubs::nt_query_volume_information_file(
+            file_handle,
+            iosb as u64,
+            information as u64,
+            length as u64,
+            information_class as u64,
+        ) as NtStatus
     }
 }
 
@@ -1374,13 +1336,12 @@ unsafe fn boot_nt_query_attributes_file(
     object_attributes: *const BootObjectAttributes,
     file_information: *mut c_void,
 ) -> NtStatus {
-    type NtQueryAttributesFile =
-        unsafe extern "system" fn(*const BootObjectAttributes, *mut c_void) -> NtStatus;
     // SAFETY: forwards the exact x64 NtQueryAttributesFile ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtQueryAttributesFile>(
-            nt_ntdll::trap_stubs::nt_query_attributes_file,
-        )(object_attributes, file_information)
+        nt_ntdll::trap_stubs::nt_query_attributes_file(
+            object_attributes as u64,
+            file_information as u64,
+        ) as NtStatus
     }
 }
 
@@ -1392,32 +1353,19 @@ unsafe fn boot_nt_read_file(
     len: u32,
     byte_offset: *const i64,
 ) -> NtStatus {
-    type NtReadFile = unsafe extern "system" fn(
-        u64,
-        u64,
-        *mut c_void,
-        *mut c_void,
-        *mut [u64; 2],
-        *mut c_void,
-        u32,
-        *const i64,
-        *mut u32,
-    ) -> NtStatus;
     // SAFETY: forwards the exact x64 NtReadFile ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtReadFile>(
-            nt_ntdll::trap_stubs::nt_read_file,
-        )(
+        nt_ntdll::trap_stubs::nt_read_file(
             file_handle,
             0,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            iosb,
-            buffer,
-            len,
-            byte_offset,
-            core::ptr::null_mut(),
-        )
+            0,
+            0,
+            iosb as u64,
+            buffer as u64,
+            len as u64,
+            byte_offset as u64,
+            0,
+        ) as NtStatus
     }
 }
 
@@ -1429,54 +1377,35 @@ unsafe fn boot_nt_write_file(
     len: u32,
     byte_offset: *const i64,
 ) -> NtStatus {
-    type NtWriteFile = unsafe extern "system" fn(
-        u64,
-        u64,
-        *mut c_void,
-        *mut c_void,
-        *mut [u64; 2],
-        *const c_void,
-        u32,
-        *const i64,
-        *mut u32,
-    ) -> NtStatus;
     // SAFETY: forwards the exact x64 NtWriteFile ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtWriteFile>(
-            nt_ntdll::trap_stubs::nt_write_file,
-        )(
+        nt_ntdll::trap_stubs::nt_write_file(
             file_handle,
             0,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            iosb,
-            buffer,
-            len,
-            byte_offset,
-            core::ptr::null_mut(),
-        )
+            0,
+            0,
+            iosb as u64,
+            buffer as u64,
+            len as u64,
+            byte_offset as u64,
+            0,
+        ) as NtStatus
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn boot_nt_flush_buffers_file(file_handle: u64, iosb: *mut [u64; 2]) -> NtStatus {
-    type NtFlushBuffersFile = unsafe extern "system" fn(u64, *mut [u64; 2]) -> NtStatus;
     // SAFETY: forwards the exact x64 NtFlushBuffersFile ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtFlushBuffersFile>(
-            nt_ntdll::trap_stubs::nt_flush_buffers_file,
-        )(file_handle, iosb)
+        nt_ntdll::trap_stubs::nt_flush_buffers_file(file_handle, iosb as u64) as NtStatus
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn boot_nt_close(file_handle: u64) -> NtStatus {
-    type NtClose = unsafe extern "system" fn(u64) -> NtStatus;
     // SAFETY: forwards the exact x64 NtClose ABI to the generated ntdll trap stub.
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtClose>(nt_ntdll::trap_stubs::nt_close)(
-            file_handle,
-        )
+        nt_ntdll::trap_stubs::nt_close(file_handle) as NtStatus
     }
 }
 
@@ -1485,22 +1414,18 @@ unsafe fn boot_nt_duplicate_current_process_handle(
     source_handle: u64,
     target_handle: *mut u64,
 ) -> NtStatus {
-    type NtDuplicateObject =
-        unsafe extern "system" fn(u64, u64, u64, *mut u64, u32, u32, u32) -> NtStatus;
     const CURRENT_PROCESS: u64 = u64::MAX;
     const DUPLICATE_SAME_ACCESS: u32 = 0x2;
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtDuplicateObject>(
-            nt_ntdll::trap_stubs::nt_duplicate_object,
-        )(
+        nt_ntdll::trap_stubs::nt_duplicate_object(
             CURRENT_PROCESS,
             source_handle,
             CURRENT_PROCESS,
-            target_handle,
+            target_handle as u64,
             0,
             0,
-            DUPLICATE_SAME_ACCESS,
-        )
+            DUPLICATE_SAME_ACCESS as u64,
+        ) as NtStatus
     }
 }
 
@@ -1926,16 +1851,13 @@ pub unsafe extern "system" fn rtl_unicode_string_to_ansi_string(
 unsafe fn critical_section_create_event() -> Result<u64, NtStatus> {
     let mut handle = 0u64;
     let status = unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut u64, u32, *mut c_void, u32, u8) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_create_event)(
-            &mut handle,
+        nt_ntdll::trap_stubs::nt_create_event(
+            &mut handle as *mut u64 as u64,
             0x001F_0003,
-            core::ptr::null_mut(),
+            0,
             1,
             0,
-        )
+        ) as NtStatus
     };
     if nt_success(status) {
         Ok(handle)
@@ -1947,9 +1869,7 @@ unsafe fn critical_section_create_event() -> Result<u64, NtStatus> {
 #[cfg(target_arch = "x86_64")]
 unsafe fn critical_section_close(handle: u64) -> NtStatus {
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(u64) -> NtStatus>(
-            nt_ntdll::trap_stubs::nt_close,
-        )(handle)
+        nt_ntdll::trap_stubs::nt_close(handle) as NtStatus
     }
 }
 
@@ -1977,21 +1897,16 @@ unsafe fn critical_section_wait(cs: *mut c_void) -> NtStatus {
     let handle = unsafe { critical_section_wait_handle(cs) };
     if handle == u64::MAX {
         unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u64, u64, u8, *const i64) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_wait_for_keyed_event)(
-                0, cs as u64, 0, core::ptr::null()
-            )
+            nt_ntdll::trap_stubs::nt_wait_for_keyed_event(
+                0,
+                cs as u64,
+                0,
+                0,
+            ) as NtStatus
         }
     } else {
         unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u64, u8, *const i64) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_wait_for_single_object)(
-                handle, 0, core::ptr::null()
-            )
+            nt_ntdll::trap_stubs::nt_wait_for_single_object(handle, 0, 0) as NtStatus
         }
     }
 }
@@ -2001,19 +1916,16 @@ unsafe fn critical_section_wake_one(cs: *mut c_void) -> NtStatus {
     let handle = unsafe { critical_section_wait_handle(cs) };
     if handle == u64::MAX {
         unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u64, u64, u8, *const i64) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_release_keyed_event)(
-                0, cs as u64, 0, core::ptr::null()
-            )
+            nt_ntdll::trap_stubs::nt_release_keyed_event(
+                0,
+                cs as u64,
+                0,
+                0,
+            ) as NtStatus
         }
     } else {
         unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u64, *mut i32) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_set_event)(handle, core::ptr::null_mut())
+            nt_ntdll::trap_stubs::nt_set_event(handle, 0) as NtStatus
         }
     }
 }
@@ -2662,23 +2574,25 @@ unsafe fn condvar_unlock(condition_variable: *mut c_void, remove_entry: *mut Con
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn nt_wait_for_keyed_event_raw(key: *mut c_void, timeout: *const i64) -> NtStatus {
-    type NtWaitForKeyedEvent =
-        unsafe extern "system" fn(u64, *mut c_void, u8, *const i64) -> NtStatus;
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtWaitForKeyedEvent>(
-            nt_ntdll::trap_stubs::nt_wait_for_keyed_event,
-        )(0, key, 0, timeout)
+        nt_ntdll::trap_stubs::nt_wait_for_keyed_event(
+            0,
+            key as u64,
+            0,
+            timeout as u64,
+        ) as NtStatus
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn nt_release_keyed_event_raw(key: *mut c_void, timeout: *const i64) -> NtStatus {
-    type NtReleaseKeyedEvent =
-        unsafe extern "system" fn(u64, *mut c_void, u8, *const i64) -> NtStatus;
     unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtReleaseKeyedEvent>(
-            nt_ntdll::trap_stubs::nt_release_keyed_event,
-        )(0, key, 0, timeout)
+        nt_ntdll::trap_stubs::nt_release_keyed_event(
+            0,
+            key as u64,
+            0,
+            timeout as u64,
+        ) as NtStatus
     }
 }
 
@@ -5185,22 +5099,18 @@ pub unsafe extern "system" fn rtl_assert(
             nt_ntdll::dbg::AssertAction::TerminateProcess => {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    let _ = core::mem::transmute::<
-                        unsafe extern "C" fn(),
-                        unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
-                    >(nt_ntdll::trap_stubs::nt_terminate_process)(
-                        -1, STATUS_UNSUCCESSFUL
+                    let _ = nt_ntdll::trap_stubs::nt_terminate_process(
+                        u64::MAX,
+                        STATUS_UNSUCCESSFUL as u64,
                     );
                 }
             }
             nt_ntdll::dbg::AssertAction::TerminateThread => {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    let _ = core::mem::transmute::<
-                        unsafe extern "C" fn(),
-                        unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
-                    >(nt_ntdll::trap_stubs::nt_terminate_thread)(
-                        -2, STATUS_UNSUCCESSFUL
+                    let _ = nt_ntdll::trap_stubs::nt_terminate_thread(
+                        (-2isize) as u64,
+                        STATUS_UNSUCCESSFUL as u64,
                     );
                 }
             }
@@ -16953,20 +16863,12 @@ pub unsafe extern "system" fn rtl_destroy_handle_table(table: *mut c_void) {
             const MEM_RELEASE: u32 = 0x0000_8000;
             let mut base = committed as *mut c_void;
             let mut size = 0usize;
-            let _ = core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *mut *mut c_void,
-                    *mut usize,
-                    u32,
-                ) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_free_virtual_memory)(
-                (-1isize) as *mut c_void,
-                &mut base,
-                &mut size,
-                MEM_RELEASE,
-            );
+            let _ = nt_ntdll::trap_stubs::nt_free_virtual_memory(
+                (-1isize) as *mut c_void as u64,
+                &mut base as *mut *mut c_void as u64,
+                &mut size as *mut usize as u64,
+                MEM_RELEASE as u64,
+            ) as NtStatus;
         }
     }
 }
@@ -17809,16 +17711,13 @@ unsafe fn resource_create_semaphore() -> Result<u64, NtStatus> {
     // SAFETY: forwards to the generated NtCreateSemaphore stub with the real x64 ABI. `&mut handle`
     // is a stack out-param the executive can write through its mirrored stack.
     let status = unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut u64, u32, *mut c_void, i32, i32) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_create_semaphore)(
-            &mut handle as *mut u64,
-            SEMAPHORE_ALL_ACCESS,
-            core::ptr::null_mut(),
+        nt_ntdll::trap_stubs::nt_create_semaphore(
+            &mut handle as *mut u64 as u64,
+            SEMAPHORE_ALL_ACCESS as u64,
+            0,
             0,
             65_535,
-        )
+        ) as NtStatus
     };
     if status == STATUS_SUCCESS {
         Ok(handle)
@@ -17839,31 +17738,21 @@ unsafe fn resource_close_handle(handle: u64) {
     // SAFETY: forwards to the generated NtClose stub. Close failures are ignored, matching
     // RtlDeleteResource's VOID contract.
     let _ = unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(u64) -> NtStatus>(
-            nt_ntdll::trap_stubs::nt_close,
-        )(handle)
+        nt_ntdll::trap_stubs::nt_close(handle) as NtStatus
     };
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn resource_wait_for_semaphore(handle: u64) -> NtStatus {
     unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(u64, u8, *const i64) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_wait_for_single_object)(handle, 0, core::ptr::null())
+        nt_ntdll::trap_stubs::nt_wait_for_single_object(handle, 0, 0) as NtStatus
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn resource_release_semaphore(handle: u64, count: u32) {
     let _ = unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(u64, i32, *mut i32) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_release_semaphore)(
-            handle, count as i32, core::ptr::null_mut()
-        )
+        nt_ntdll::trap_stubs::nt_release_semaphore(handle, count as u64, 0) as NtStatus
     };
 }
 
@@ -18871,12 +18760,6 @@ unsafe fn debug_buffer_reset_query(
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn debug_open_process(process_id: u32) -> Result<u64, NtStatus> {
-    type NtOpenProcess = unsafe extern "system" fn(
-        *mut u64,
-        u32,
-        *const BootObjectAttributes,
-        *const [u64; 2],
-    ) -> NtStatus;
     const PROCESS_VM_READ: u32 = 0x0010;
     const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 
@@ -18893,14 +18776,12 @@ unsafe fn debug_open_process(process_id: u32) -> Result<u64, NtStatus> {
     let client_id = [process_id as u64, 0];
     let mut handle = 0u64;
     let status = unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtOpenProcess>(
-            nt_ntdll::trap_stubs::nt_open_process,
-        )(
-            &mut handle,
-            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-            &object_attributes,
-            &client_id,
-        )
+        nt_ntdll::trap_stubs::nt_open_process(
+            &mut handle as *mut u64 as u64,
+            (PROCESS_VM_READ | PROCESS_QUERY_INFORMATION) as u64,
+            &object_attributes as *const BootObjectAttributes as u64,
+            &client_id as *const [u64; 2] as u64,
+        ) as NtStatus
     };
     if nt_success(status) {
         Ok(handle)
@@ -18911,21 +18792,17 @@ unsafe fn debug_open_process(process_id: u32) -> Result<u64, NtStatus> {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn debug_query_process_peb(process_handle: u64) -> Result<u64, NtStatus> {
-    type NtQueryInformationProcess =
-        unsafe extern "system" fn(u64, u32, *mut u8, u32, *mut u32) -> NtStatus;
 
     let mut information = [0u8; 48];
     let mut returned = 0u32;
     let status = unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtQueryInformationProcess>(
-            nt_ntdll::trap_stubs::nt_query_information_process,
-        )(
+        nt_ntdll::trap_stubs::nt_query_information_process(
             process_handle,
             0,
-            information.as_mut_ptr(),
-            information.len() as u32,
-            &mut returned,
-        )
+            information.as_mut_ptr() as u64,
+            information.len() as u32 as u64,
+            &mut returned as *mut u32 as u64,
+        ) as NtStatus
     };
     if !nt_success(status) {
         return Err(status);
@@ -18942,20 +18819,16 @@ unsafe fn debug_read_process_memory(
     address: u64,
     output: &mut [u8],
 ) -> Result<(), NtStatus> {
-    type NtReadVirtualMemory =
-        unsafe extern "system" fn(u64, u64, *mut u8, usize, *mut usize) -> NtStatus;
 
     let mut read = 0usize;
     let status = unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtReadVirtualMemory>(
-            nt_ntdll::trap_stubs::nt_read_virtual_memory,
-        )(
+        nt_ntdll::trap_stubs::nt_read_virtual_memory(
             process_handle,
             address,
-            output.as_mut_ptr(),
-            output.len(),
-            &mut read,
-        )
+            output.as_mut_ptr() as u64,
+            output.len() as u64,
+            &mut read as *mut usize as u64,
+        ) as NtStatus
     };
     if !nt_success(status) {
         return Err(status);
@@ -20608,22 +20481,13 @@ pub unsafe extern "system" fn rtl_read_out_of_process_memory_stream(
         #[cfg(target_arch = "x86_64")]
         {
             let mut local_read = 0usize;
-            let status = core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const c_void,
-                    *mut c_void,
-                    usize,
-                    *mut usize,
-                ) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_read_virtual_memory)(
-                process,
-                (*stream).current as *const c_void,
-                buffer,
-                copy_len,
-                &mut local_read,
-            );
+            let status = nt_ntdll::trap_stubs::nt_read_virtual_memory(
+                process as u64,
+                (*stream).current as *const c_void as u64,
+                buffer as u64,
+                copy_len as u64,
+                &mut local_read as *mut usize as u64,
+            ) as NtStatus;
             if status == STATUS_SUCCESS {
                 (*stream).current = (*stream).current.add(local_read);
                 if !bytes_read.is_null() {
@@ -21515,12 +21379,16 @@ pub(crate) fn process_cookie() -> Option<u32> {
 }
 
 fn query_process_cookie() -> Option<u32> {
-    type Query = unsafe extern "system" fn(isize, u32, *mut u32, u32, *mut u32) -> NtStatus;
-    let query: Query = unsafe {
-        core::mem::transmute(nt_ntdll::trap_stubs::nt_query_information_process as *const ())
-    };
     let mut cookie = 0u32;
-    let status = unsafe { query(-1, 36, &mut cookie, 4, core::ptr::null_mut()) };
+    let status = unsafe {
+        nt_ntdll::trap_stubs::nt_query_information_process(
+            u64::MAX,
+            36,
+            &mut cookie as *mut u32 as u64,
+            4,
+            0,
+        ) as NtStatus
+    };
     (status == STATUS_SUCCESS && cookie != 0).then_some(cookie)
 }
 
@@ -21578,15 +21446,12 @@ unsafe fn rtl_query_time_zone_bias() -> Result<i64, NtStatus> {
         let mut info = [0u8; SYSTEM_TIME_OF_DAY_INFORMATION_SIZE];
         let mut return_length = 0u32;
         let status = unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_query_system_information)(
-                SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
-                info.as_mut_ptr() as *mut c_void,
-                info.len() as u32,
-                &mut return_length,
-            )
+            nt_ntdll::trap_stubs::nt_query_system_information(
+                SYSTEM_TIME_OF_DAY_INFORMATION_CLASS as u64,
+                info.as_mut_ptr() as *mut c_void as u64,
+                info.len() as u32 as u64,
+                &mut return_length as *mut u32 as u64,
+            ) as NtStatus
         };
         if status != STATUS_SUCCESS {
             return Err(status);
@@ -22935,12 +22800,12 @@ pub unsafe extern "system" fn rtl_get_native_system_information(
     #[cfg(target_arch = "x86_64")]
     // SAFETY: forwards to the NtQuerySystemInformation native stub with the same ABI.
     unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_query_system_information)(
-            info_class, info, info_len, ret_len
-        )
+        nt_ntdll::trap_stubs::nt_query_system_information(
+            info_class as u64,
+            info as u64,
+            info_len as u64,
+            ret_len as u64,
+        ) as NtStatus
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -23557,10 +23422,7 @@ pub unsafe extern "system" fn rtl_exit_user_thread(status: NtStatus) {
     unsafe {
         let _ = ldr_shutdown_thread();
         (*(current_teb() as *mut Teb)).free_stack_on_termination = 1;
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_terminate_thread)(-2, status);
+        nt_ntdll::trap_stubs::nt_terminate_thread((-2isize) as u64, status as u64) as NtStatus;
         // Should not return; if it does, spin at a breakpoint.
         core::arch::asm!("int3");
     }
@@ -23582,10 +23444,7 @@ pub unsafe extern "system" fn rtl_exit_user_process(status: NtStatus) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let _ = ldr_shutdown_process();
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(isize, NtStatus) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_terminate_process)(-1, status);
+        nt_ntdll::trap_stubs::nt_terminate_process((-1isize) as u64, status as u64) as NtStatus;
         core::arch::asm!("int3");
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -23615,16 +23474,13 @@ pub unsafe extern "system" fn rtl_free_user_thread_stack(
 
         let mut basic_info = [0u8; THREAD_BASIC_INFORMATION_SIZE];
         let mut return_length = 0u32;
-        let query_status = core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_query_information_thread)(
-            thread_handle,
-            THREAD_BASIC_INFORMATION,
-            basic_info.as_mut_ptr() as *mut c_void,
-            THREAD_BASIC_INFORMATION_SIZE as u32,
-            &mut return_length,
-        );
+        let query_status = nt_ntdll::trap_stubs::nt_query_information_thread(
+            thread_handle as u64,
+            THREAD_BASIC_INFORMATION as u64,
+            basic_info.as_mut_ptr() as *mut c_void as u64,
+            THREAD_BASIC_INFORMATION_SIZE as u32 as u64,
+            &mut return_length as *mut u32 as u64,
+        ) as NtStatus;
         if (query_status as i32) < 0 {
             return;
         }
@@ -23638,22 +23494,13 @@ pub unsafe extern "system" fn rtl_free_user_thread_stack(
             (teb + core::mem::offset_of!(Teb, deallocation_stack)) as *const c_void;
         let mut stack_base: *mut c_void = core::ptr::null_mut();
         let mut bytes_read = 0usize;
-        let read_status = core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(
-                *mut c_void,
-                *const c_void,
-                *mut c_void,
-                usize,
-                *mut usize,
-            ) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_read_virtual_memory)(
-            process_handle,
-            remote_deallocation_stack,
-            &mut stack_base as *mut *mut c_void as *mut c_void,
-            core::mem::size_of::<*mut c_void>(),
-            &mut bytes_read,
-        );
+        let read_status = nt_ntdll::trap_stubs::nt_read_virtual_memory(
+            process_handle as u64,
+            remote_deallocation_stack as u64,
+            &mut stack_base as *mut *mut c_void as u64,
+            core::mem::size_of::<*mut c_void>() as u64,
+            &mut bytes_read as *mut usize as u64,
+        ) as NtStatus;
         if (read_status as i32) < 0
             || bytes_read != core::mem::size_of::<*mut c_void>()
             || stack_base.is_null()
@@ -23662,15 +23509,12 @@ pub unsafe extern "system" fn rtl_free_user_thread_stack(
         }
 
         let mut region_size = 0usize;
-        let _ = core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut usize, u32) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_free_virtual_memory)(
-            process_handle,
-            &mut stack_base,
-            &mut region_size,
-            MEM_RELEASE,
-        );
+        let _ = nt_ntdll::trap_stubs::nt_free_virtual_memory(
+            process_handle as u64,
+            &mut stack_base as *mut *mut c_void as u64,
+            &mut region_size as *mut usize as u64,
+            MEM_RELEASE as u64,
+        ) as NtStatus;
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -26367,10 +26211,7 @@ pub unsafe extern "system" fn rtl_run_encode_unicode_string(hash: *mut u8, strin
         let mut time = 0i64;
         #[cfg(target_arch = "x86_64")]
         let status = unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(*mut i64) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_query_system_time)(&mut time)
+            nt_ntdll::trap_stubs::nt_query_system_time(&mut time as *mut i64 as u64) as NtStatus
         };
         #[cfg(not(target_arch = "x86_64"))]
         let status = STATUS_NOT_IMPLEMENTED;
@@ -28090,10 +27931,7 @@ pub unsafe extern "system" fn dbg_query_debug_filter_state(component: u32, level
     {
         // SAFETY: forwards to the generated NtQueryDebugFilterState native stub.
         return unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u32, u32) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_query_debug_filter_state)(component, level)
+            nt_ntdll::trap_stubs::nt_query_debug_filter_state(component as u64, level as u64) as NtStatus
         };
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -28118,10 +27956,7 @@ pub unsafe extern "system" fn dbg_set_debug_filter_state(
     {
         // SAFETY: forwards to the generated NtSetDebugFilterState native stub.
         return unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u32, u32, u32) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_set_debug_filter_state)(component, level, state)
+            nt_ntdll::trap_stubs::nt_set_debug_filter_state(component as u64, level as u64, state as u64) as NtStatus
         };
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -28360,15 +28195,12 @@ pub unsafe extern "system" fn dbg_ui_connect_to_dbg() -> NtStatus {
         }
         let mut attributes = [0u64; 6];
         attributes[0] = OBJECT_ATTRIBUTES_SIZE_X64 as u64;
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut *mut c_void, u32, *mut c_void, u32) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_create_debug_object)(
-            (teb + TEB_DBGSS_RESERVED1_OFFSET) as *mut *mut c_void,
-            DEBUG_OBJECT_ALL_ACCESS,
-            attributes.as_mut_ptr().cast(),
-            DBGK_KILL_PROCESS_ON_EXIT,
-        )
+        nt_ntdll::trap_stubs::nt_create_debug_object(
+            (teb + TEB_DBGSS_RESERVED1_OFFSET) as *mut *mut c_void as u64,
+            DEBUG_OBJECT_ALL_ACCESS as u64,
+            attributes.as_mut_ptr() as u64,
+            DBGK_KILL_PROCESS_ON_EXIT as u64,
+        ) as NtStatus
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -28384,17 +28216,13 @@ pub unsafe extern "system" fn dbg_ui_continue(
     continue_status: NtStatus,
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: transmuting the generated `NtDebugContinue` trap stub to its real prototype; the
-    // debug-object handle comes from this thread's TEB slot.
+    // SAFETY: the generated entry receives the debug-object handle from this thread's TEB slot.
     unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void, *const c_void, NtStatus) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_debug_continue)(
-            dbg_ui_get_thread_debug_object(),
-            client_id,
-            continue_status,
-        )
+        nt_ntdll::trap_stubs::nt_debug_continue(
+            dbg_ui_get_thread_debug_object() as u64,
+            client_id as u64,
+            continue_status as u64,
+        ) as NtStatus
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -28426,16 +28254,13 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
             const THREAD_BASIC_INFORMATION: u32 = 0;
             const THREAD_BASIC_INFORMATION_SIZE: usize = 48;
             let mut information = [0u8; THREAD_BASIC_INFORMATION_SIZE];
-            let status = core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_query_information_thread)(
-                thread as *mut c_void,
-                THREAD_BASIC_INFORMATION,
-                information.as_mut_ptr().cast(),
-                THREAD_BASIC_INFORMATION_SIZE as u32,
-                core::ptr::null_mut(),
-            );
+            let status = nt_ntdll::trap_stubs::nt_query_information_thread(
+                thread as *mut c_void as u64,
+                THREAD_BASIC_INFORMATION as u64,
+                information.as_mut_ptr() as u64,
+                THREAD_BASIC_INFORMATION_SIZE as u32 as u64,
+                0,
+            ) as NtStatus;
             nt_success(status)
                 .then(|| core::ptr::read_unaligned(information.as_ptr().add(8).cast::<u64>()))
         }
@@ -28461,14 +28286,12 @@ pub unsafe extern "system" fn dbg_ui_convert_state_change_structure(
 #[export_name = "DbgUiDebugActiveProcess"]
 pub unsafe extern "system" fn dbg_ui_debug_active_process(process: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: transmuting the generated `NtDebugActiveProcess` trap stub to its real prototype.
+    // SAFETY: forward the process and this thread's debug-object handle to the generated entry.
     unsafe {
-        let status = core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void, *mut c_void) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_debug_active_process)(
-            process, dbg_ui_get_thread_debug_object()
-        );
+        let status = nt_ntdll::trap_stubs::nt_debug_active_process(
+            process as u64,
+            dbg_ui_get_thread_debug_object() as u64,
+        ) as NtStatus;
         if !nt_success(status) {
             return status;
         }
@@ -28489,14 +28312,12 @@ pub unsafe extern "system" fn dbg_ui_debug_active_process(process: *mut c_void) 
 #[export_name = "DbgUiStopDebugging"]
 pub unsafe extern "system" fn dbg_ui_stop_debugging(process: *mut c_void) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: transmuting the generated `NtRemoveProcessDebug` trap stub to its real prototype.
+    // SAFETY: forward the process and this thread's debug-object handle to the generated entry.
     unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void, *mut c_void) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_remove_process_debug)(
-            process, dbg_ui_get_thread_debug_object()
-        )
+        nt_ntdll::trap_stubs::nt_remove_process_debug(
+            process as u64,
+            dbg_ui_get_thread_debug_object() as u64,
+        ) as NtStatus
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -28537,10 +28358,7 @@ pub unsafe extern "system" fn dbg_ui_issue_remote_breakin(process: *mut c_void) 
             client_id.as_mut_ptr().cast(),
         );
         if nt_success(status) {
-            let _ = core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(*mut c_void) -> NtStatus,
-            >(nt_ntdll::trap_stubs::nt_close)(thread_handle);
+            let _ = nt_ntdll::trap_stubs::nt_close(thread_handle as u64) as NtStatus;
         }
         status
     }
@@ -28559,17 +28377,14 @@ pub unsafe extern "system" fn dbg_ui_wait_state_change(
     timeout: *const i64,
 ) -> NtStatus {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: transmuting the generated `NtWaitForDebugEvent` trap stub to its real prototype.
+    // SAFETY: the timeout/output pointers satisfy the generated NtWaitForDebugEvent contract.
     unsafe {
-        core::mem::transmute::<
-            unsafe extern "C" fn(),
-            unsafe extern "system" fn(*mut c_void, u8, *const i64, *mut c_void) -> NtStatus,
-        >(nt_ntdll::trap_stubs::nt_wait_for_debug_event)(
-            dbg_ui_get_thread_debug_object(),
+        nt_ntdll::trap_stubs::nt_wait_for_debug_event(
+            dbg_ui_get_thread_debug_object() as u64,
             1,
-            timeout,
-            wait_state_change,
-        )
+            timeout as u64,
+            wait_state_change as u64,
+        ) as NtStatus
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -29096,9 +28911,7 @@ pub unsafe extern "system" fn csr_new_thread() -> NtStatus {
     {
         let port = unsafe { crate::on_target::csr_api_port() };
         unsafe {
-            core::mem::transmute::<unsafe extern "C" fn(), unsafe extern "system" fn(u64) -> NtStatus>(
-                nt_ntdll::trap_stubs::nt_register_thread_terminate_port,
-            )(port)
+            nt_ntdll::trap_stubs::nt_register_thread_terminate_port(port) as NtStatus
         }
     }
     #[cfg(not(target_arch = "x86_64"))]

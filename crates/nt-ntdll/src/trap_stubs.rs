@@ -16,10 +16,11 @@
 //! (register + stack) untouched. (The seL4/SURT backends, which must *gather* the stack tail into an
 //! IPC message, use [`crate::marshal`] instead — that's where ">4 args" needs explicit work.)
 //!
-//! The bodies are `#[cfg(target_arch = "x86_64")]` naked functions (no host equivalent — a host
-//! can't issue the trap). What IS host-tested is that the generator covers every required service
-//! with the correct SSN + arity: see [`TRAP_STUBS`] and the tests. This keeps the
-//! generation itself under test even though the asm is target-only.
+//! Both transports use typed naked Windows-ABI functions. Native transport retains its argument
+//! vector on the stack and stages the complete request again after an explicit retry. Internal
+//! ntdll callers enter the same generated functions; there is no compiler-framed IPC emitter.
+//! Host tests check complete shared-service coverage and exact arity. Native PE execution probes
+//! separately validate the emitted assembly, including transport clobbers across retry.
 
 /// A generated trap stub's metadata: export name, SSN, and parameter count. On the x86_64 target the
 /// matching naked function exists (see [`generate_trap_stubs!`]); this table exists on every target
@@ -34,125 +35,242 @@ pub struct TrapStubMeta {
     pub argc: u8,
 }
 
-/// Emit a `#[unsafe(naked)]` x86_64 trap stub per `(fn_ident, "ExportName", ssn)` triple, and build
-/// the host-visible [`TRAP_STUBS`] coverage table over the same set.
-///
-/// On non-x86_64 hosts only the metadata table is emitted (no naked body) — the generation is still
-/// exercised by the tests. On x86_64 the naked bodies are the real exported ntdll stubs.
+/// Immutable code-address retention metadata, never an invocation API.
+#[cfg(target_arch = "x86_64")]
+#[repr(transparent)]
+pub struct TrapStubAddress(*const ());
+
+// These pointers name immutable generated code and are never dereferenced as data.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for TrapStubAddress {}
+
+macro_rules! define_stub_arity {
+    ($fn:ident, $name:literal, $ssn:literal, 0) => {
+        define_typed_stub!($fn, $name, $ssn, 0, ());
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 1) => {
+        define_typed_stub!($fn, $name, $ssn, 1, (a0));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 2) => {
+        define_typed_stub!($fn, $name, $ssn, 2, (a0, a1));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 3) => {
+        define_typed_stub!($fn, $name, $ssn, 3, (a0, a1, a2));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 4) => {
+        define_typed_stub!($fn, $name, $ssn, 4, (a0, a1, a2, a3));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 5) => {
+        define_typed_stub!($fn, $name, $ssn, 5, (a0, a1, a2, a3, a4));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 6) => {
+        define_typed_stub!($fn, $name, $ssn, 6, (a0, a1, a2, a3, a4, a5));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 7) => {
+        define_typed_stub!($fn, $name, $ssn, 7, (a0, a1, a2, a3, a4, a5, a6));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 8) => {
+        define_typed_stub!($fn, $name, $ssn, 8, (a0, a1, a2, a3, a4, a5, a6, a7));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 9) => {
+        define_typed_stub!($fn, $name, $ssn, 9, (a0, a1, a2, a3, a4, a5, a6, a7, a8));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 10) => {
+        define_typed_stub!($fn, $name, $ssn, 10, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 11) => {
+        define_typed_stub!($fn, $name, $ssn, 11, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 12) => {
+        define_typed_stub!($fn, $name, $ssn, 12, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 13) => {
+        define_typed_stub!($fn, $name, $ssn, 13, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 14) => {
+        define_typed_stub!($fn, $name, $ssn, 14, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 15) => {
+        define_typed_stub!($fn, $name, $ssn, 15, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14));
+    };
+    ($fn:ident, $name:literal, $ssn:literal, 16) => {
+        define_typed_stub!($fn, $name, $ssn, 16, (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15));
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+macro_rules! invoke_stub_arity {
+    ($fn:ident, 0, $args:ident) => { unsafe { $fn() } };
+    ($fn:ident, 1, $args:ident) => { unsafe { $fn($args[0]) } };
+    ($fn:ident, 2, $args:ident) => { unsafe { $fn($args[0], $args[1]) } };
+    ($fn:ident, 3, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2]) } };
+    ($fn:ident, 4, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3]) } };
+    ($fn:ident, 5, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4]) } };
+    ($fn:ident, 6, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5]) } };
+    ($fn:ident, 7, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6]) } };
+    ($fn:ident, 8, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7]) } };
+    ($fn:ident, 9, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8]) } };
+    ($fn:ident, 10, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9]) } };
+    ($fn:ident, 11, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10]) } };
+    ($fn:ident, 12, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11]) } };
+    ($fn:ident, 13, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12]) } };
+    ($fn:ident, 14, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13]) } };
+    ($fn:ident, 15, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14]) } };
+    ($fn:ident, 16, $args:ident) => { unsafe { $fn($args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7], $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14], $args[15]) } };
+}
+
+macro_rules! define_typed_stub {
+    ($fn:ident, $name:literal, $ssn:literal, $argc:literal, ($($arg:ident),*)) => {
+        #[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
+        #[unsafe(naked)]
+        #[export_name = $name]
+        #[allow(unused_variables)]
+        pub unsafe extern "win64" fn $fn($($arg: u64),*) -> u64 {
+            core::arch::naked_asm!(
+                "mov r10, rcx",
+                concat!("mov eax, ", stringify!($ssn)),
+                "syscall",
+                "ret",
+            );
+        }
+
+        #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+        #[unsafe(naked)]
+        #[export_name = $name]
+        #[allow(unused_variables)]
+        pub unsafe extern "win64" fn $fn($($arg: u64),*) -> u64 {
+            core::arch::naked_asm!(
+                // The argument vector belongs to this invocation, not the mutable IPC buffer.
+                "push rdi",
+                "push rsi",
+                "push r15",
+                "push r12",
+                "push r13",
+                "sub rsp, 128",
+                "mov [rsp], rcx",
+                "mov [rsp + 8], rdx",
+                "mov [rsp + 16], r8",
+                "mov [rsp + 24], r9",
+                "lea rsi, [rsp + 208]", // entry RSP + 0x28: fifth Windows argument
+                "lea rdi, [rsp + 32]",
+                concat!("mov ecx, ", stringify!($argc)),
+                "sub ecx, 4",
+                "jle 2f",
+                "rep movsq",
+                "2:",
+                // Recompute every transport coordinate and restage every argument after retry.
+                "mov rax, qword ptr gs:[0x30]",
+                "movabs r11, {sec_image_main_teb}",
+                "cmp rax, r11",
+                "je 3f",
+                "movabs r11, {pe_main_teb}",
+                "cmp rax, r11",
+                "jne 4f",
+                "3:",
+                "movabs rax, {main_ipc_buffer}",
+                "jmp 5f",
+                "4:",
+                "sub rax, {worker_ipc_delta}",
+                "5:",
+                "lea rsi, [rsp + 16]",
+                "lea rdi, [rax + 0x28]", // MR4 onward: arguments three and later
+                concat!("mov ecx, ", stringify!($argc)),
+                "sub ecx, 2",
+                "jle 6f",
+                "rep movsq",
+                "6:",
+                "mov r9, [rsp]",
+                "mov r15, [rsp + 8]",
+                "lea r8, [rsp + 168]", // original Windows entry RSP, not helper geometry
+                concat!("mov r10d, ", stringify!($ssn)),
+                "mov edi, 6",
+                "mov esi, {msginfo}",
+                "xor r12d, r12d",
+                "xor r13d, r13d",
+                "mov rdx, -1",
+                "syscall",
+                // Ordinary status and explicit acquisition retry have distinct exact envelopes.
+                "cmp rsi, 1",
+                "je 7f",
+                "cmp rsi, 6",
+                "jne 8f",
+                "movabs rax, {retry_reply}",
+                "cmp r10, rax",
+                "je 2b",
+                "8:",
+                "ud2",
+                "7:",
+                "mov rax, r10",
+                "add rsp, 128",
+                "pop r13",
+                "pop r12",
+                "pop r15",
+                "pop rsi",
+                "pop rdi",
+                "ret",
+                sec_image_main_teb = const nt_syscall_abi::NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA,
+                pe_main_teb = const nt_syscall_abi::NT_NATIVE_PE_MAIN_TEB_VA,
+                main_ipc_buffer = const nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA,
+                worker_ipc_delta = const nt_syscall_abi::NT_NATIVE_WORKER_IPC_BUFFER_DELTA,
+                msginfo = const nt_syscall_abi::native_syscall_message_info($argc),
+                retry_reply = const nt_syscall_abi::NT_NATIVE_RETRY_REPLY,
+            );
+        }
+    };
+}
+
+/// Generate typed exports, coverage metadata, and internal dispatch from the same service list.
 macro_rules! generate_trap_stubs {
-    ( $( ($fn:ident, $name:literal, $ssn:literal, $argc:literal) ),* $(,)? ) => {
-        $(
-            // ── TRAP transport (default): `mov r10,rcx; mov eax,<ssn>; syscall; ret` ────────────
-            // Faults as UnknownSyscall → serviced via the fault EP. Kept as the fallback (real ntdll
-            // / pi>=1). Selected when the `native_transport` feature is OFF.
-            #[cfg(all(target_arch = "x86_64", not(feature = "native_transport")))]
-            #[unsafe(naked)]
-            // Export under the REAL Windows `Nt*` name (not the snake_case fn ident), so the PE
-            // export directory lists `NtClose`/`NtCreateFile`/… — the names hosted binaries import.
-            #[export_name = $name]
-            /// Generated `Nt*` trap stub: `mov r10,rcx; mov eax,<ssn>; syscall; ret`.
-            pub extern "C" fn $fn() {
-                core::arch::naked_asm!(
-                    "mov r10, rcx",
-                    concat!("mov eax, ", stringify!($ssn)),
-                    "syscall",
-                    "ret",
-                );
-            }
+    ( $( ($fn:ident, $name:literal, $ssn:literal, $argc:tt) ),* $(,)? ) => {
+        $( define_stub_arity!($fn, $name, $ssn, $argc); )*
 
-            // ── NATIVE seL4-Call transport (ntdll_plan Step 6.A) ────────────────────────────────
-            // A real native seL4 `Call(CT_FAULT)` carrying the NT_NATIVE_SYSCALL request message
-            // (SSN + rsp + the exact argument vector), reading NTSTATUS from reply MR0. See
-            // `crate::native_call` for the wire layout. Selected when `native_transport` is ON.
-            //
-            // Windows-ABI entry: rcx=arg1, rdx=arg2, r8=arg3, r9=arg4, args5+ on the stack; rsp at
-            // entry points AT the return address (caller's stack args at [rsp+0x28]…). We preserve
-            // that entry rsp in MR1 and gather stack args into the IPC request. A native Call does
-            // not expose the caller's address space to the receiving executive component.
-            #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-            #[unsafe(naked)]
-            #[export_name = $name]
-            /// Generated `Nt*` native-Call stub (seL4 `Call` on CT_FAULT; NTSTATUS in reply MR0).
-            pub extern "C" fn $fn() {
-                core::arch::naked_asm!(
-                    // seL4's register-message ABI uses Windows x64 nonvolatile registers. Save them
-                    // before constructing the message; the original caller RSP is now rsp+24.
-                    "push rdi",
-                    "push rsi",
-                    "push r15",
-                    // Main threads retain the fixed IPC VA; runtime workers map a dedicated buffer
-                    // 64 KiB below the TEB reported by the standard gs:[0x30] self pointer.
-                    "mov rax, qword ptr gs:[0x30]",
-                    "movabs r11, {sec_image_main_teb}",
-                    "cmp rax, r11",
-                    "je 2f",
-                    "movabs r11, {pe_main_teb}",
-                    "cmp rax, r11",
-                    "jne 3f",
-                    "2:",
-                    "movabs rax, {main_ipc_buffer}",
-                    "jmp 4f",
-                    "3:",
-                    "sub rax, {worker_ipc_delta}",
-                    "4:",
-                    "mov qword ptr [rax + 0x28], r8",   // MR4 = arg3
-                    "mov qword ptr [rax + 0x30], r9",   // MR5 = arg4
-                    "mov r9, rcx",                      // MR2 = arg1
-                    "mov r15, rdx",                     // MR3 = arg2
-                    // Gather args5+ from the untouched Windows caller frame into MR6 onward. The
-                    // executive never has to infer native-call arguments through a mirrored VSpace.
-                    "lea r11, [rsp + 24]",              // original Windows entry RSP
-                    "lea rsi, [r11 + 0x28]",            // arg5 source
-                    "lea rdi, [rax + 0x38]",            // MR6 destination
-                    concat!("mov ecx, ", stringify!($argc)),
-                    "sub ecx, 4",
-                    "jle 1f",
-                    "rep movsq",
-                    "1:",
-                    "mov r8, r11",                      // MR1 = caller rsp
-                    "5:",
-                    concat!("mov r10d, ", stringify!($ssn)), // MR0 = SSN
-                    "mov edi, 6",                       // rdi = CT_FAULT cap slot
-                    "mov esi, {msginfo}",                // exact prefix + argc request length
-                    "mov rdx, -1",                      // rdx = SysCall (native seL4 Call)
-                    "syscall",                          // native seL4 Call → executive Recv/Reply
-                    "movabs rax, {retry_reply}",
-                    "cmp r10, rax",
-                    "je 5b",
-                    // Reply: MR0 (r10) = NTSTATUS. Restore every nonvolatile register before the
-                    // Windows caller resumes, then move the status to the C return register.
-                    "pop r15",
-                    "pop rsi",
-                    "pop rdi",
-                    "mov rax, r10",
-                    "ret",
-                    sec_image_main_teb = const nt_syscall_abi::NT_NATIVE_SEC_IMAGE_MAIN_TEB_VA,
-                    pe_main_teb = const nt_syscall_abi::NT_NATIVE_PE_MAIN_TEB_VA,
-                    main_ipc_buffer = const nt_syscall_abi::NT_NATIVE_MAIN_IPC_BUFFER_VA,
-                    worker_ipc_delta = const nt_syscall_abi::NT_NATIVE_WORKER_IPC_BUFFER_DELTA,
-                    msginfo = const nt_syscall_abi::native_syscall_message_info($argc),
-                    retry_reply = const nt_syscall_abi::NT_NATIVE_RETRY_REPLY,
-                );
-            }
-        )*
-
-        /// The full generated trap-stub coverage table (metadata; the naked bodies are target-only).
         pub const TRAP_STUBS: &[TrapStubMeta] = &[
             $( TrapStubMeta { name: $name, ssn: $ssn, argc: $argc }, )*
         ];
 
-        /// A `#[used]` array of every naked trap stub's address. Referencing the stubs here forces
-        /// the linker to RETAIN them when this rlib is linked into the [`nt-ntdll-dll`] cdylib —
-        /// otherwise dead-code elimination would drop the `Nt*` exports (nothing else references the
-        /// naked bodies). Target-only (the naked bodies only exist on x86_64). Not host-tested (it's
-        /// a linker-retention anchor, not logic); the coverage of the same set is under test via
-        /// [`TRAP_STUBS`].
+        /// Exact arity from the same generated service list as the callable entries.
+        pub const fn native_stub_argc(ssn: u32) -> Option<u8> {
+            match ssn {
+                $( $ssn => Some($argc), )*
+                _ => None,
+            }
+        }
+
         #[cfg(target_arch = "x86_64")]
         #[used]
-        pub static TRAP_STUB_ADDRS: &[unsafe extern "C" fn()] = &[
-            $( $fn, )*
+        pub static TRAP_STUB_ADDRS: &[TrapStubAddress] = &[
+            $( TrapStubAddress($fn as *const ()), )*
         ];
+
+        /// Invoke the same typed Windows-ABI entry point exported from ntdll.
+        ///
+        /// # Safety
+        /// This must run in a hosted native thread. Arguments must satisfy the selected NT
+        /// service's pointer, handle and lifetime contracts.
+        #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
+        pub unsafe fn invoke_native_stub(ssn: u32, arguments: &[u64]) -> Result<u64, NativeStubError> {
+            validate_native_stub_arguments(ssn, arguments.len())?;
+            match ssn {
+                $( $ssn => Ok(invoke_stub_arity!($fn, $argc, arguments)), )*
+                _ => Err(NativeStubError::UnknownService),
+            }
+        }
     };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeStubError {
+    UnknownService,
+    ArgumentCount,
+}
+
+/// Enforce the generated export's exact shared-service arity before reading argument slots.
+pub fn validate_native_stub_arguments(ssn: u32, count: usize) -> Result<(), NativeStubError> {
+    let argc = native_stub_argc(ssn).ok_or(NativeStubError::UnknownService)?;
+    if count != usize::from(argc) {
+        return Err(NativeStubError::ArgumentCount);
+    }
+    Ok(())
 }
 
 // Required Nt* services, sysfuncs.lst-derived SSNs. Sorted by SSN (matches the shared table).
@@ -428,5 +546,39 @@ mod tests {
         for s in TRAP_STUBS {
             assert_eq!(ssn_of(s.name), Some(s.ssn), "{} drifted", s.name);
         }
+    }
+
+    #[test]
+    fn native_internal_invocation_requires_exact_shared_arity() {
+        for stub in TRAP_STUBS {
+            let count = usize::from(stub.argc);
+            assert_eq!(native_stub_argc(stub.ssn), nt_syscall_abi::exact_argc_of(stub.name));
+            assert_eq!(validate_native_stub_arguments(stub.ssn, count), Ok(()));
+            assert_eq!(
+                validate_native_stub_arguments(stub.ssn, count + 1),
+                Err(NativeStubError::ArgumentCount)
+            );
+            if count != 0 {
+                assert_eq!(
+                    validate_native_stub_arguments(stub.ssn, count - 1),
+                    Err(NativeStubError::ArgumentCount)
+                );
+            }
+        }
+        assert_eq!(
+            validate_native_stub_arguments(u32::MAX, 0),
+            Err(NativeStubError::UnknownService)
+        );
+        assert_eq!(native_stub_argc(u32::MAX), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn generated_entries_have_callable_windows_signatures() {
+        let _: unsafe extern "win64" fn() -> u64 = nt_yield_execution;
+        let _: unsafe extern "win64" fn(u64) -> u64 = nt_close;
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64) -> u64 = nt_open_file;
+        let _: unsafe extern "win64" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+            nt_map_view_of_section;
     }
 }

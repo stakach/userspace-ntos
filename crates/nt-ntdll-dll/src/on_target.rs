@@ -2816,10 +2816,7 @@ unsafe fn syscall_map_view(
     alloc_type: u64,
     protect: u64,
 ) -> u64 {
-    // native_syscall8 handles a1..a4 in the message + a5..a8 on the stack; a9/a10 need two more
-    // stack slots. We place ALL six tail args on the stack ourselves and issue the native Call with
-    // a1..a4 in the message. Build the request array as native_syscall8 does but with the extra tail.
-    // SAFETY: on-target native transport.
+    // SAFETY: forward all ten arguments to the generated native Windows-ABI entry.
     unsafe {
         native_map_view(
             section,
@@ -4441,74 +4438,21 @@ unsafe fn native_syscall(ssn: u32, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, 
     unsafe { native_syscall8(ssn, a1, a2, a3, a4, a5, a6, 0, 0) }
 }
 
-/// Return the IPC-buffer VA bound to the current native-transport thread.
-///
-/// The address is derived from the standard TEB self pointer rather than process-global state, so
-/// concurrent hosted workers spill MR4/MR5 into their own kernel-bound IPC buffers.
+/// Invoke a generated native Windows-ABI stub with its complete exact-arity vector.
 #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
 #[inline]
-unsafe fn current_native_ipc_buffer_va() -> u64 {
-    // SAFETY: native transport is entered only after the executive installs this thread's TEB as
-    // its GS base and initializes NT_TIB.Self at offset 0x30.
-    let teb = unsafe { current_teb() } as u64;
-    nt_ntdll::abi::native_ipc_buffer_va(teb)
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-#[inline]
-unsafe fn stage_native_arguments(ipcbuf: u64, a3: u64, a4: u64, tail: &[u64]) {
-    // IPC word 0 is msginfo; MR i starts at word i+1.
-    unsafe {
-        core::ptr::write_volatile((ipcbuf + 0x28) as *mut u64, a3);
-        core::ptr::write_volatile((ipcbuf + 0x30) as *mut u64, a4);
-        for (index, argument) in tail.iter().copied().enumerate() {
-            core::ptr::write_volatile((ipcbuf + 0x38 + index as u64 * 8) as *mut u64, argument);
-        }
+unsafe fn native_invoke(ssn: u32, arguments: &[u64]) -> u64 {
+    match unsafe { nt_ntdll::trap_stubs::invoke_native_stub(ssn, arguments) } {
+        Ok(status) => status,
+        Err(nt_ntdll::trap_stubs::NativeStubError::UnknownService) => 0xC000_001C,
+        Err(nt_ntdll::trap_stubs::NativeStubError::ArgumentCount) => 0xC000_000D,
     }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
-#[inline]
-unsafe fn native_call_marshaled(ssn: u32, a1: u64, a2: u64, argc: u8) -> u64 {
-    let request = [
-        ssn as u64,
-        a1,
-        a2,
-        nt_ntdll::abi::native_syscall_message_info(argc),
-    ];
-    let status: u64;
-    unsafe {
-        core::arch::asm!(
-            "2:",
-            "mov r10, [{request} + 0x00]", // MR0 = SSN
-            "mov r9,  [{request} + 0x08]", // MR2 = a1
-            "mov r15, [{request} + 0x10]", // MR3 = a2
-            "mov rsi, [{request} + 0x18]", // exact message info
-            "mov r8, rsp",                 // MR1 = current caller stack
-            "mov edi, 6",                  // rdi = CT_FAULT cap slot
-            "mov rdx, -1",                 // rdx = SysCall
-            "syscall",
-            "movabs rax, {retry_reply}",
-            "cmp r10, rax",
-            "je 2b",
-            "mov {status}, r10",
-            request = in(reg) request.as_ptr(),
-            status = out(reg) status,
-            retry_reply = const nt_ntdll::abi::NT_NATIVE_RETRY_REPLY,
-            out("rax") _, out("rcx") _, out("r11") _, out("r8") _, out("r9") _,
-            out("r10") _, out("rsi") _, out("rdi") _, out("rdx") _, out("r15") _,
-        );
-    }
-    status
-}
-
-/// The general NATIVE seL4-Call transport primitive (ntdll_plan Step 6.A) — up to 8 args.
-///
-/// MR4 onward is staged in the thread's bound IPC buffer before the Call. The common primitive keeps
-/// only SSN, arg1, arg2, and exact message length live across the assembly boundary.
+/// Internal callers have up to eight argument slots; only the service's exact prefix is passed.
 ///
 /// # Safety
-/// On-target hosted-process; the register out-param pointers (in a1..a4) are valid stack locals.
+/// The selected NT service's pointer, handle and lifetime contracts must hold.
 #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -4523,43 +4467,43 @@ unsafe fn native_syscall8(
     a7: u64,
     a8: u64,
 ) -> u64 {
-    let ipcbuf = unsafe { current_native_ipc_buffer_va() };
-    unsafe {
-        stage_native_arguments(ipcbuf, a3, a4, &[a5, a6, a7, a8]);
-        native_call_marshaled(ssn, a1, a2, 8)
-    }
+    let Some(argc) = nt_ntdll::trap_stubs::native_stub_argc(ssn) else {
+        return 0xC000_001C;
+    };
+    let arguments = [a1, a2, a3, a4, a5, a6, a7, a8];
+    let Some(arguments) = arguments.get(..usize::from(argc)) else {
+        return 0xC000_000D;
+    };
+    unsafe { native_invoke(ssn, arguments) }
 }
 
-/// `NtMapViewOfSection` (10 args) over the NATIVE seL4-Call transport. Same message shape as
-/// [`native_syscall8`] with the six tail arguments staged as MR6..MR11.
+/// `NtMapViewOfSection` through its generated ten-argument Windows-ABI entry.
 ///
 /// # Safety
-/// On-target hosted-process; the out-param pointers (base_address/view_size) are valid stack locals.
+/// The out-parameter pointers must be valid for the selected service.
 #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_map_view(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 6]) -> u64 {
-    let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        stage_native_arguments(ipcbuf, a3, a4, &tail);
-        native_call_marshaled(SSN_NT_MAP_VIEW_OF_SECTION, a1, a2, 10)
+        native_invoke(SSN_NT_MAP_VIEW_OF_SECTION, &[
+            a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4], tail[5],
+        ])
     }
 }
 
-/// `NtSecureConnectPort` (9 args) over the NATIVE seL4-Call transport. Same message shape as
-/// [`native_syscall8`] / [`native_map_view`] with the five tail arguments staged as MR6..MR10.
+/// `NtSecureConnectPort` through its generated nine-argument Windows-ABI entry.
 ///
 /// # Safety
-/// On-target hosted-process; the pointer args (PortHandle/PortName/Qos/ClientView/ConnInfo) are valid
-/// stack locals whose out-fields the executive fills through its stack mirror.
+/// The port and connection-info pointers must satisfy the selected service contract.
 #[cfg(all(target_arch = "x86_64", feature = "native_transport"))]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn native_secure_connect_port(a1: u64, a2: u64, a3: u64, a4: u64, tail: [u64; 5]) -> u64 {
-    let ipcbuf = unsafe { current_native_ipc_buffer_va() };
     unsafe {
-        stage_native_arguments(ipcbuf, a3, a4, &tail);
-        native_call_marshaled(SSN_NT_SECURE_CONNECT_PORT, a1, a2, 9)
+        native_invoke(SSN_NT_SECURE_CONNECT_PORT, &[
+            a1, a2, a3, a4, tail[0], tail[1], tail[2], tail[3], tail[4],
+        ])
     }
 }
 
@@ -6509,12 +6453,7 @@ unsafe fn rtl_async_create_event(event_type: u64) -> Result<u64, u32> {
 
 unsafe fn rtl_async_set_event(handle: u64) {
     if handle != 0 {
-        let _ = unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "system" fn(u64, *mut c_void) -> u32,
-            >(nt_ntdll::trap_stubs::nt_set_event)(handle, core::ptr::null_mut())
-        };
+        let _ = unsafe { nt_ntdll::trap_stubs::nt_set_event(handle, 0) };
     }
 }
 
@@ -12082,17 +12021,13 @@ pub unsafe fn rtl_create_user_process(
     //     SectionHandle, DebugPort, ExceptionPort, JobMemberLevel=0). ---
     // (ZwCreateProcess in process.c maps to NtCreateProcessEx=50, the imported stub — the executive's
     // SSN-50 arm reads these; 49's args are a prefix.)
-    type NtCreateProcessEx =
-        unsafe extern "system" fn(*mut u64, u32, u64, u64, u32, u64, u64, u64, u32) -> u32;
     // SAFETY: forward the exact Windows x64 ABI to our canonical generated NtCreateProcessEx stub.
     // The naked stub preserves the compiler-built caller frame, including JobMemberLevel at the
     // fifth stack-argument slot, across both native seL4-Call and UnknownSyscall transports.
     let st = unsafe {
-        core::mem::transmute::<unsafe extern "C" fn(), NtCreateProcessEx>(
-            nt_ntdll::trap_stubs::nt_create_process_ex,
-        )(
-            ph_ptr,
-            PROCESS_ALL_ACCESS as u32,
+        nt_ntdll::trap_stubs::nt_create_process_ex(
+            ph_ptr as u64,
+            PROCESS_ALL_ACCESS,
             0,
             parent,
             if inherit_handles != 0 { 0x4 } else { 0 },
@@ -12101,7 +12036,7 @@ pub unsafe fn rtl_create_user_process(
             exception_port,
             0,
         )
-    };
+    } as u32;
     if (st as i32) < 0 {
         // SAFETY: close the section on failure.
         unsafe { syscall4(27, h_section, 0, 0, 0) };

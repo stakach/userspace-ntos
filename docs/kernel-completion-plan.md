@@ -30666,6 +30666,44 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     before removing the old suspension. Do not describe that existing fail-stop path as recovered.
     The strict 27-import desktop frontier and full native-call producer/consumer cutover remain open.
 
+    Tranche 151 producer consolidation (2026-09-09, host/artifact validation accepted): internal ntdll callers
+    now use the same generated, typed Windows-ABI entries as the exported Nt functions. The old
+    compiler-framed native marshaler and separate IPC-buffer staging helpers are removed. Existing
+    RTL call sites that cast zero-argument function pointers now use direct typed
+    calls with explicit argument widths; the linker-retention table is code-address metadata only.
+    Each native stub retains an immutable argument vector and restages every argument and transport
+    coordinate on every retry, including clearing composed receive destinations in R12/R13 while
+    preserving their Windows nonvolatile values. A one-word result is terminal even if its bits
+    equal the retry sentinel; only the exact six-word retry envelope repeats. Malformed replies
+    stop at UD2 rather than becoming fabricated NT results.
+
+    This is a prerequisite, not the new continuation ABI cutover. The active label remains 0x4e54;
+    the 176-byte application record and label 0x4e55 remain unissued/unaccepted until native runtime
+    ownership, ingress, retry, callback, context editing and terminal completion migrate together.
+    Actual-PE producer validation uses unmodified DLL instructions under Unicorn with only SYSCALL
+    intercepted by a destructive transport test double. It is not a replacement for microkernel
+    execution tests or desktop acceptance. The oracle covers zero/register/stack arities, both main
+    TEB identities and workers, repeated retries, Windows nonvolatiles and malformed reply framing;
+    the pre-change DLL must independently fail composed-destination and retry-vector checks.
+
+    Accepted validation: 657 nt-ntdll unit tests (`.tmp/test-ntdll-typed-callers-20260909.log`),
+    12 verifier tests including all-byte mutation/truncation rejection
+    (`.tmp/test-ntdll-native-template-20260909.log`), and the full DLL build/import/template gate
+    (`.tmp/build-ntdll-native-template-20260909.log`). The rebuilt DLL passes 32 actual-PE producer
+    cases and both old-artifact negative controls (`.tmp/test-ntdll-native-template-artifact-20260909.log`),
+    plus the executable RtlCaptureContext probe
+    (`.tmp/test-ntdll-native-template-capture-artifact-20260909.log`). The old duplicate native
+    marshaler, pointer-erased invocation sites and obsolete opcode-shape verifier are removed.
+    No desktop boot was attempted; the measured strict 27-import frontier is unchanged.
+
+    Unwind review found an existing gap requiring explicit closure: naked Nt exports have no
+    runtime-function coverage in the emitted PE exception directory. Their saved nonvolatiles and
+    stack allocation need matching COFF unwind records, including partial-prologue and epilogue
+    behavior. Validate real emitted metadata and fault/unwind behavior rather than treating these
+    non-leaf stubs as leaves. The application continuation record cannot repair a fault occurring
+    inside its producer before admission. Compiler-generated invoke_native_stub has metadata;
+    that does not cover the naked exports it invokes.
+
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
     Reuse the sealed mechanism phase engine with explicit registered-runtime ownership, not a

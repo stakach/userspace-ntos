@@ -8,9 +8,9 @@
 //! kernel — **no kernel change** (see the recon in `ntdll_plan.md`).
 //!
 //! This module holds the wire-format CONSTANTS + the pure msginfo pack/unpack (host-tested). The
-//! actual `seL4_Call` asm is target-only (in `nt-ntdll-dll::on_target` / the generated native stubs),
-//! but keeping the layout here — one source of truth shared by the ntdll stub side AND cross-checked
-//! against the executive's decode — is the discipline that keeps the two ends from drifting.
+//! actual `seL4_Call` asm is target-only in the generated native stubs. Internal ntdll callers use
+//! those same typed Windows-ABI entry points with the shared service's exact argument count.
+//! The shared layout is cross-checked against the executive decoder to keep both ends consistent.
 //!
 //! ## REQUEST (ntdll → executive), msginfo label = [`NT_NATIVE_SYSCALL_LABEL`]
 //! | MR | contents |
@@ -27,6 +27,12 @@
 //! | MR | contents |
 //! |----|----------|
 //! | 0  | NTSTATUS |
+//!
+//! An acquisition retry is a distinct exact six-word, zero-label reply whose MR0 equals
+//! `NT_NATIVE_RETRY_REPLY`. The producer restages every argument from its retained stack vector;
+//! returned argument words and the mutable IPC buffer are not authoritative. A one-word reply
+//! containing that same numeric value is an ordinary result, not a retry. Invalid reply envelopes
+//! stop at `UD2` rather than replaying a possibly completed service.
 //!
 //! ## Register/IPC-buffer mapping (matches the kernel's IPC ABI + the executive plumbing)
 //! On the wire a `Call`/`Recv` carries: rsi = msginfo, r10 = MR0, r8 = MR1, r9 = MR2, r15 = MR3, and

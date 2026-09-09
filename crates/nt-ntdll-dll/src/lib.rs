@@ -1263,7 +1263,7 @@ static ALLOCATOR: ProcessHeapAllocator = ProcessHeapAllocator;
 /// guarantees the linker walks it (and therefore every stub it points at). Marked `#[used]` again so
 /// this reference itself is never optimized away.
 #[used]
-static KEEP_TRAP_STUBS: &[unsafe extern "C" fn()] = nt_ntdll::trap_stubs::TRAP_STUB_ADDRS;
+static KEEP_TRAP_STUBS: &[nt_ntdll::trap_stubs::TrapStubAddress] = nt_ntdll::trap_stubs::TRAP_STUB_ADDRS;
 
 /// Anchor the Step-4.0b `Rtl*`/`Ldr*`/`Dbg*`/CRT exports (defined in [`exports`]) so the linker
 /// retains them into the DLL export directory. Analogous to [`KEEP_TRAP_STUBS`]: it references
