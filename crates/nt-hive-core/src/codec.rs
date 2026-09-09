@@ -3,7 +3,10 @@
 
 use alloc::vec::Vec;
 
-use nt_config_store::codec::{crc32c, Reader, Writer};
+use nt_config_store::codec::{crc32c, Reader};
+
+#[path = "created_child_log.rs"]
+mod created_child_log;
 
 use crate::hive::{Cell, CellId, Hive, HiveKind, KeyCell, RegistryValueType, ValueCell};
 
@@ -24,6 +27,7 @@ const OP_DELETE_VALUE: u16 = 3;
 const OP_DELETE_KEY: u16 = 4;
 const OP_SET_KEY_CLASS: u16 = 5;
 const OP_SET_KEY_SECURITY_DESCRIPTOR: u16 = 6;
+const OP_CREATE_CHILD: u16 = 7;
 
 /// Why decoding a hive image/log failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -45,6 +49,8 @@ pub enum HiveLogReplayError {
     UnsupportedOperation(u16),
     UnsupportedValueType(u32),
     InvalidPayload,
+    OutOfMemory,
+    CreateChild(crate::CreateChildError),
 }
 
 /// Why encoding a hive image failed.
@@ -797,6 +803,14 @@ fn map_decoded_cell_id(map: &mut Vec<(CellId, CellId)>, raw: CellId, next: &mut 
 
 /// A hive mutation to log (spec §12.4), path-addressed so it survives cell-ID rewrites.
 pub enum HiveLogOp<'a> {
+    /// One crash-atomic record for a child and its already assigned metadata. The parent must
+    /// exist; this operation cannot manufacture ancestors or overwrite an existing key.
+    CreateChild {
+        parent: &'a str,
+        name: &'a str,
+        class_name: Option<&'a str>,
+        descriptor: &'a [u8],
+    },
     CreateKey {
         path: &'a str,
     },
@@ -825,8 +839,33 @@ pub enum HiveLogOp<'a> {
 
 /// Encode one log record (spec §12.3): an `HLR1` header (op + sequence + CRCs) + payload.
 pub fn encode_log_record(op: &HiveLogOp, sequence: u64) -> Vec<u8> {
-    let mut p = Writer::new();
+    try_encode_log_record(op, sequence).expect("hive log encode failed")
+}
+
+/// Checked record encoding: reserve the complete header/payload before writing any bytes.
+pub fn try_encode_log_record(op: &HiveLogOp, sequence: u64) -> Result<Vec<u8>, HiveEncodeError> {
+    let payload_len = log_payload_len(op)?;
+    if payload_len > u32::MAX as usize {
+        return Err(HiveEncodeError::SizeOverflow);
+    }
+    let mut p = CheckedWriter::with_capacity(checked_add(LOG_HEADER_LEN, payload_len)?)?;
+    p.bytes(&[0u8; LOG_HEADER_LEN]);
     let code = match op {
+        HiveLogOp::CreateChild {
+            parent,
+            name,
+            class_name,
+            descriptor,
+        } => {
+            p.str16(parent);
+            p.str16(name);
+            p.u8(u8::from(class_name.is_some()));
+            if let Some(class_name) = class_name {
+                p.str16(class_name);
+            }
+            p.blob(descriptor);
+            OP_CREATE_CHILD
+        }
         HiveLogOp::CreateKey { path } => {
             p.str16(path);
             OP_CREATE_KEY
@@ -869,20 +908,49 @@ pub fn encode_log_record(op: &HiveLogOp, sequence: u64) -> Vec<u8> {
             OP_SET_KEY_SECURITY_DESCRIPTOR
         }
     };
-    let payload = p.buf;
-    let payload_crc = crc32c(&payload);
-    let mut h = Writer::new();
-    h.bytes(&LOG_MAGIC);
-    h.u16(LOG_HEADER_LEN as u16);
-    h.u16(code);
-    h.u64(sequence);
-    h.u32(payload.len() as u32);
-    h.u32(payload_crc);
-    let record_crc = crc32c(&h.buf);
-    h.u32(record_crc);
-    let mut out = h.buf;
-    out.extend_from_slice(&payload);
-    out
+    let payload_crc = crc32c(&p.buf[LOG_HEADER_LEN..]);
+    let header = &mut p.buf[..LOG_HEADER_LEN];
+    header[..4].copy_from_slice(&LOG_MAGIC);
+    header[4..6].copy_from_slice(&(LOG_HEADER_LEN as u16).to_le_bytes());
+    header[6..8].copy_from_slice(&code.to_le_bytes());
+    header[8..16].copy_from_slice(&sequence.to_le_bytes());
+    header[16..20].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    header[20..24].copy_from_slice(&payload_crc.to_le_bytes());
+    let record_crc = crc32c(&header[..24]);
+    header[24..28].copy_from_slice(&record_crc.to_le_bytes());
+    Ok(p.buf)
+}
+
+fn log_payload_len(op: &HiveLogOp<'_>) -> Result<usize, HiveEncodeError> {
+    let class_len = |class: Option<&str>| -> Result<usize, HiveEncodeError> {
+        checked_add(1, class.map(str16_record_len).transpose()?.unwrap_or(0))
+    };
+    match op {
+        HiveLogOp::CreateChild {
+            parent,
+            name,
+            class_name,
+            descriptor,
+        } => {
+            let len = checked_add(str16_record_len(parent)?, str16_record_len(name)?)?;
+            let len = checked_add(len, class_len(*class_name)?)?;
+            checked_add(len, blob_record_len(descriptor.len())?)
+        }
+        HiveLogOp::CreateKey { path } | HiveLogOp::DeleteKey { path } => str16_record_len(path),
+        HiveLogOp::DeleteValue { path, name } => {
+            checked_add(str16_record_len(path)?, str16_record_len(name)?)
+        }
+        HiveLogOp::SetValue { path, name, data, .. } => {
+            let len = checked_add(str16_record_len(path)?, str16_record_len(name)?)?;
+            checked_add(checked_add(len, 4)?, blob_record_len(data.len())?)
+        }
+        HiveLogOp::SetKeyClass { path, class_name } => {
+            checked_add(str16_record_len(path)?, class_len(*class_name)?)
+        }
+        HiveLogOp::SetKeySecurityDescriptor { path, descriptor } => {
+            checked_add(str16_record_len(path)?, blob_record_len(descriptor.len())?)
+        }
+    }
 }
 
 /// Replay log bytes onto `hive`, applying records with sequence > `base` (spec §12.5). Stops
@@ -916,7 +984,9 @@ pub fn replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> u64 {
             break;
         }
         if sequence > last {
-            apply_log(hive, op, payload);
+            if apply_log(hive, op, payload).is_err() {
+                break;
+            }
             last = sequence;
         }
     }
@@ -960,9 +1030,13 @@ pub fn try_replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> Result<u64, H
         if crc32c(payload) != payload_crc {
             return Err(HiveLogReplayError::BadChecksum);
         }
-        validate_log_payload(op, payload)?;
+        // Child application validates and owns all metadata before mutation. Avoid decoding it
+        // twice, but still validate skipped records so strict replay rejects malformed history.
+        if op != OP_CREATE_CHILD || sequence <= last {
+            validate_log_payload(op, payload)?;
+        }
         if sequence > last {
-            apply_log(hive, op, payload);
+            apply_log(hive, op, payload)?;
             last = sequence;
         }
     }
@@ -970,6 +1044,9 @@ pub fn try_replay_log(hive: &mut Hive, bytes: &[u8], base: u64) -> Result<u64, H
 }
 
 fn validate_log_payload(op: u16, payload: &[u8]) -> Result<(), HiveLogReplayError> {
+    if op == OP_CREATE_CHILD {
+        return created_child_log::decode(payload).map(|_| ());
+    }
     let mut r = Reader::new(payload);
     match op {
         OP_CREATE_KEY | OP_DELETE_KEY => {
@@ -1009,7 +1086,10 @@ fn validate_log_payload(op: u16, payload: &[u8]) -> Result<(), HiveLogReplayErro
     Ok(())
 }
 
-fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) {
+fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) -> Result<(), HiveLogReplayError> {
+    if op == OP_CREATE_CHILD {
+        return created_child_log::apply(hive, payload);
+    }
     let mut r = Reader::new(payload);
     match op {
         OP_CREATE_KEY => {
@@ -1058,6 +1138,7 @@ fn apply_log(hive: &mut Hive, op: u16, payload: &[u8]) {
         }
         _ => {}
     }
+    Ok(())
 }
 
 // Reconstruction helpers used only by the decoder (kept here to touch pub(crate) internals).

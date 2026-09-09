@@ -9,6 +9,10 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[path = "hive_create_child.rs"]
+mod create_child;
+pub use create_child::CreateChildError;
+
 pub use nt_config_manager::RegistryValueType;
 
 /// A stable in-hive cell handle (spec §6.3) — never a Rust pointer.

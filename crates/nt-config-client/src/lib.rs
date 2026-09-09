@@ -3710,6 +3710,7 @@ impl<B: Backend> ConfigClient<B> {
 #[cfg(test)]
 mod tests {
     mod hardware_profile;
+    mod key_creation;
     use super::*;
     use alloc::format;
     use alloc::string::String;

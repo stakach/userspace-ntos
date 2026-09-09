@@ -52,7 +52,7 @@ pub use reactos_registration::{
 };
 
 pub use codec::{
-    decode_image, encode_image, encode_log_record, encoded_image_len, image_len_if_valid,
+    decode_image, encode_image, encode_log_record, try_encode_log_record, encoded_image_len, image_len_if_valid,
     image_root_subkey_count_if_valid, image_value_len_if_valid, replay_log, try_encode_image,
     try_encode_subtree_image, try_replay_log, HiveDecodeError, HiveEncodeError, HiveLogOp,
     HiveLogReplayError, HiveSubtreeEncodeError, HIVE_IMAGE_MAGIC,
@@ -65,6 +65,7 @@ pub use config_import::{
     import_control_set_services_into_config_manager,
 };
 pub use hive::{
+    CreateChildError,
     compose_hive_overlay, compose_system_hive_overlay, CellId, CurrentControlSet,
     CurrentControlSetError, DeleteKeyError, Hive, HiveId, HiveKind, HiveMountTable,
     HiveOverlayError, HiveTransaction, HiveValueBlobCompactError, HiveValueBlobCompaction,

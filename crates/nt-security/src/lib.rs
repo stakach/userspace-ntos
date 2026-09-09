@@ -55,6 +55,8 @@ pub use job_token::{
     JOB_OBJECT_SECURITY_VALID_FLAGS, JOB_SECURITY_LIMIT_INFORMATION_SIZE,
 };
 pub use native_acl::{NativeAcl, NativeAclError, STATUS_INVALID_ACL};
+mod key_creation;
+pub use key_creation::{prepare_key_creation_security, KeyCreationAudit, KeyHandleSecurityAudit, PreparedKeyCreationSecurity};
 pub use native_acl_inheritance::{inherit_native_acl, NativeAclInheritance};
 pub use native_sd::{
     assign_registry_root_security, KEY_GENERIC_MAPPING,

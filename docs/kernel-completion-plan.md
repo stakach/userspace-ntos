@@ -31284,6 +31284,59 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     `.tmp/build-captured-object-access-executive-20260909.log`. No microkernel change or VM run
     occurred; the strict missing-import frontier remains 27.
 
+    Parent-authorized child/security checkpoint (2026-09-09): completed the ordinary new-Key
+    policy and checked storage primitives, without advertising native handle admission.
+    - [x] nt-security prepares ordinary new-Key security from the captured subject and existing
+      parent descriptor: KEY_CREATE_SUB_KEY on the parent, audited legacy container assignment,
+      then creation-handle grants. Zero desired access is valid for a new key; MAXIMUM_ALLOWED
+      maps to all valid Key rights even when its new DACL would deny a subsequent open. WOW64
+      selectors are stripped and the final grant is masked to Key rights plus ACCESS_SYSTEM_SECURITY.
+      The latter uses captured SePrivilegeCheck with retained success/denial and returned privilege
+      attributes, so KernelMode bypass is not reported as actual privilege use. KernelMode bypasses
+      parent ACL evaluation, but native assignment still validates/inherits the descriptor; a valid
+      audit-object ACE must not fail just because the access evaluator cannot interpret it.
+    - [x] HiveTransaction::try_create_child requires one absent component beneath an existing CellId
+      and moves owned class/security into the cell before linking. Checked allocation covers the
+      complete parent undo snapshot, cell arena and child list; counter exhaustion and all reported
+      allocation errors precede mutation. Existing open/collision paths never overwrite metadata.
+      Drop restores the exact pre-transaction image, including mixed earlier/later mutations.
+    - [x] Add one checksummed HiveLogOp::CreateChild record carrying parent path, child name, class
+      and assigned descriptor. Recovery applies it through the same checked transaction; it never
+      creates ancestors or overwrites an existing child. Every torn prefix leaves no child behind.
+      Strict replay reports malformed metadata and application errors; compatibility replay stops
+      without advancing past a failed child record. New record decoding uses checked allocation and
+      rejects invalid UTF-16 instead of substituting a different key name. Log encoding now shares
+      the checked writer, preflights all record sizes and offers try_encode_log_record; the previous
+      two-buffer unchecked encoder is removed, retaining the existing record format for old opcodes.
+
+    Review adjustment: separate CreateKey/SetKeySecurity records are NOT crash-atomic because log
+    recovery accepts a torn final record. Native activation must use the composite operation, not
+    merely put those two old operations in one live transaction. Next extend the CM wire mutation,
+    retained PREPARE/COMMIT owner and physical-path normalization with exact-parent CreateChild.
+    Authenticate the parent's current leased information mount_generation, not its original
+    opened_generation; preserve that authority until PREPARE excludes competing mutations.
+    Reserved PM handle ownership, required audit delivery, backup/restore and link/volatile/options
+    semantics, native counted-name validation, generated-hive descriptors and removal of legacy
+    Key handle/substitution paths remain open. These pure prepared bytes are not reusable authority
+    tickets. The hive layer treats assigned security as opaque metadata, not as its access policy.
+
+    Composition coverage uses a genuinely captured token, parent authorization, inherited/explicit
+    child assignment, transaction commit/drop and single-record recovery. It proves denied parents
+    create nothing, abandoned pre-publication work restores the parent, and an empty-DACL child
+    receives its creation grant while a later open is denied. It does not claim a native handle,
+    delivered audit event, durable-backend acknowledgment, or CM-generation race proof.
+
+    Serialized host validation passes all 1,072 tests/doctests: nt-security 223, nt-hive-core 106
+    plus 18 generator tests, nt-config-client 95, nt-config-server 66, nt-user-host 494 plus 49
+    integration cases, and 21 doctests. Twenty-three new cases cover the policy, checked storage,
+    replay and composition boundaries. Log: `.tmp/test-secured-child-final-20260909.log`.
+    Allocation validation includes deterministic arena capacity overflow and counter exhaustion;
+    arbitrary allocator-failure injection was not performed. Independent review findings about
+    kernel bypass and privilege-use reporting were fixed and covered before this acceptance.
+    The freestanding executive release build passes with 293 existing warnings in
+    `.tmp/build-secured-child-executive-20260909.log`. No VM was launched; the 27 strict missing
+    imports and native suspension/desktop acceptance remain open. No microkernel changes occurred.
+
     Review adjustment addressed by tranche 100: the previous PM/TokenStore were created after
     win32k DriverEntry and PID 4 was allocated to SMSS. The temporary provider GUI process body is
     still later re-keyed to CSRSS; it must not acquire canonical initial-System authority.
