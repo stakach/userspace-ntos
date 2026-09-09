@@ -317,6 +317,9 @@ desktop proofs are historical baselines, not acceptance of the current provider 
 - [x] Retain synchronous File retry delivery through exact Reply acknowledgement and local
   capability retirement, preserving the Busy grant and canonical route across uncertain delivery
   (tranche 151, host/native checkpoint). Full application-record retry and cancellation remain open.
+- [ ] Implement exact MCS reply-chain ownership and NT wait-preserving suspension together with
+  native suspension/completion admission. Do not equate seL4 cancel-IPC Suspend with NT's suspend
+  APC, or infer nested scheduling-context ownership from a receiver's latest reply target.
 - [~] Complete ordinary registered-thread retirement and live failure acceptance. Failed-construction
   mechanism/memory retirement is wired with retained ownership, separate delete/recycle phases,
   registry/external-alias handoff, exact exclusions and once-only reservation release. Successful
@@ -30875,6 +30878,37 @@ policy, no shell-specific paint path, and no fallback root-held image caps when 
     reply chain against upstream seL4, including donated scheduling contexts. Cancelling a caller's
     reply continuation and recovering a scheduling context from a callee are distinct operations;
     a stronger NT provider-quiescence acknowledgement must not be fabricated from Suspend.
+
+    Suspension audit decision (2026-09-09): a proposed single-hop TCBSuspend reply-unlink fix was
+    deliberately withdrawn after source review exposed two atomic-cutover prerequisites. Current
+    rust-micro Reply stores only bound_tcb. For A -> B -> C donating one SC, upstream seL4's
+    reply_remove_tcb severs both predecessor and successor links when B is suspended; A must no
+    longer reclaim C's live SC through a later reply. The receiver's latest reply_to is insufficient
+    because reply capabilities can be moved and retained across other receives. Implement real
+    Reply prev/next and SC-head ownership (or an equally exact retained representation), including
+    normal Call, Reply, deletion, restart and suspension, not a same-SC identity heuristic.
+
+    Separately, native NtSuspendThread currently increments the Ps suspend count then calls
+    TCBSuspend; NtResumeThread resumes the TCB directly. Correct seL4 Suspend cancels IPC, whereas
+    NT5 KeSuspendThread queues SuspendApc and KiSuspendThread waits on SuspendSemaphore without
+    discarding outstanding NT work. Self-suspend also enters the executive with a bound reply.
+    A query-then-Suspend check is racy and cannot repair this mismatch. Add an atomic execution
+    hold preserving endpoint/reply/fault state, retain terminal results while held, and release
+    only according to original wait readiness and NT suspend counts. Migrate native suspension
+    and completion admission with that mechanism; a zero-success Suspend ACK alone is not proof
+    that a provider or donated SC is quiescent.
+
+    Required physical tests: independent, donated and reacquired SCs; moved/aliased reply caps;
+    A -> B -> C suspension at each link; valid outer reply cannot steal a downstream callee's SC;
+    repeat Suspend and stale replies; remote counter checks at explicit quiescence ACKs. Native
+    tests must cover self-suspend, a blocked File/object/LPC wait, completion while suspended,
+    nested suspend counts and final resume without reissuing the syscall. Source references are
+    upstream seL4 src/kernel/thread.c, src/object/endpoint.c and src/object/reply.c, and local NT5
+    base/ntos/ke/thredobj.c and thredsup.c. The prototype compiled but was not runtime-tested or
+    accepted; its code was removed and pre-probe disk/rootserver staging restored byte-for-byte.
+    The restored microkernel source also builds with spec,microtest
+    (`.tmp/build-suspend-audit-restored-kernel-20260909.log`); no QEMU run was made for this audit.
+    This review does not claim microkernel cancellation or NT suspension fixed.
 
     Next ordinary teardown review: the active live-thread path still combines TCB deletion and
     slot recycling, then drops the runtime before void memory/SC/CNode cleanup and accounting.
